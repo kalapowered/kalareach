@@ -7,9 +7,9 @@
 //!
 //! `--retain` writes `crates/kr-protocol/retained/<level>/` from the release at `<commit>`: the
 //! surface cut from the schema that release committed, its release record, the plugin host
-//! protocol it spoke, the table of public majors it listed (`PUBLIC_MAJORS`, where its source has
-//! one: a release before the support window kept none) and an empty list of recorded frames. It
-//! refuses to overwrite a level. A level that recorded a table is given it in `RETAINED` with
+//! protocol it spoke, the table of public majors it listed (`PUBLIC_MAJORS`: the table its source
+//! has, or for a release before the support window the one major it negotiated) and an empty list
+//! of recorded frames. It refuses to overwrite a level. The record is given to `RETAINED` with
 //! `RetainedLevel::with_public_majors`, and `--check` fails until it is.
 //! `--release-commit` is for when the release a level was cut from is not the commit its record
 //! names: it compares the schema at `<commit>` with the kept surface, refuses on a difference, and
@@ -86,18 +86,17 @@ pub fn problems(directory: &Path) -> Vec<String> {
                 Err(error) => problems.push(format!("{level}/{name}: {error}")),
             }
         }
-        // A table of public majors the level recorded is built in, and one it did not is absent.
+        // Every level records the table its release listed, and the record is built in.
         match (
             retained.public_majors,
             std::fs::read_to_string(directory.join(&level).join("PUBLIC_MAJORS")),
         ) {
-            (None, Err(_)) => {}
             (Some(embedded), Ok(on_disk)) if on_disk == embedded => {}
             (Some(_), Ok(_)) => problems.push(format!(
                 "{level}/PUBLIC_MAJORS on disk is not the one built in"
             )),
-            (None, Ok(_)) => problems.push(format!(
-                "{level}/PUBLIC_MAJORS is on disk and the level is built without it (RetainedLevel::with_public_majors)"
+            (None, _) => problems.push(format!(
+                "{level} is built without its table of public majors (RetainedLevel::with_public_majors)"
             )),
             (Some(_), Err(error)) => problems.push(format!("{level}/PUBLIC_MAJORS: {error}")),
         }
@@ -158,7 +157,7 @@ pub fn retain(level: &str, commit: &str) -> Result<(), String> {
     // Everything read from the release is read before anything is written, so a source this tool
     // cannot read leaves no half-cut level behind.
     let plugin_host = plugin_host_at(&full)?;
-    let public_majors = public_majors_at(&full)?;
+    let public_majors = expected_public_majors_at(&full)?;
     std::fs::create_dir_all(&target).map_err(|error| error.to_string())?;
     let write = |name: &str, contents: String| {
         std::fs::write(target.join(name), contents).map_err(|error| format!("{name}: {error}"))
@@ -172,20 +171,21 @@ pub fn retain(level: &str, commit: &str) -> Result<(), String> {
         ),
     )?;
     write("PLUGIN_HOST", format!("{plugin_host}\n"))?;
-    if let Some(table) = public_majors {
-        write("PUBLIC_MAJORS", table)?;
-    }
+    write("PUBLIC_MAJORS", public_majors)?;
     write("frames.json", "[]\n".to_owned())?;
     println!("wrote {}", target.display());
     Ok(())
 }
 
-/// The table of public majors at `commit`, as a retained record, or none where the source there
-/// has no table.
-fn public_majors_at(commit: &str) -> Result<Option<String>, String> {
+/// The record of the table of public majors a release listed, read from its source at `commit`:
+/// the table's own, or for a release whose source has none, the one major it negotiated.
+pub fn expected_public_majors_at(commit: &str) -> Result<String, String> {
     let source = git(&["show", &format!("{commit}:crates/kr-protocol/src/hello.rs")])?;
-    public_majors::record_of(&source)
-        .map_err(|error| format!("the table of public majors at {commit}: {error}"))
+    let context = |error: String| format!("the table of public majors at {commit}: {error}");
+    match public_majors::record_of(&source).map_err(context)? {
+        Some(record) => Ok(record),
+        None => public_majors::record_without_a_table(&source).map_err(context),
+    }
 }
 
 /// The protocol name the plugin host speaks at `commit`, read from that commit's source and not
@@ -243,23 +243,16 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
         lines.extend(found.iter().map(ToString::to_string));
         return Err(lines.join("\n"));
     }
-    // The table of public majors the level recorded is the table in the tree of the release it is
-    // moved to: a record with a digest is read again and must be the same, and a record written
-    // by hand for a release that had no table needs a release that has none.
-    let found = public_majors_at(&full)?;
-    match (retained.public_majors, found) {
-        (Some(recorded), Some(found)) if recorded == found => {}
-        (Some(recorded), None) if !recorded.contains("digest=") => {}
-        (None, None) => {}
-        (recorded, found) => {
-            return Err(format!(
-                "the table of public majors at {full} is not the one recorded for {level}; \
-                 rebase onto that release and cut the level again at the rebased commit.\n\
-                 recorded: {}\nat the commit: {}",
-                recorded.unwrap_or("none"),
-                found.as_deref().unwrap_or("none")
-            ));
-        }
+    // The table of public majors the level recorded is the one in the tree of the release it is
+    // moved to, whole, digest included.
+    let found = expected_public_majors_at(&full)?;
+    if retained.public_majors != Some(found.as_str()) {
+        return Err(format!(
+            "the table of public majors at {full} is not the one recorded for {level}; rebase onto \
+             that release and cut the level again at the rebased commit.\nrecorded: {}\nat the \
+             commit: {found}",
+            retained.public_majors.unwrap_or("none"),
+        ));
     }
     let recorded = retained
         .record("commit")
@@ -286,22 +279,27 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
     let released = git(&["show", "-s", "--format=%cI", &full])?
         .trim()
         .to_owned();
+    // The document is prepared first: a document without the level's row stops the command
+    // before the record changes.
+    let release = format!("{version}+{}", &full[..12]);
+    let (document, text) = document_with(level, &release, &released)?;
     let path = retained_dir().join(level).join("RELEASE");
     std::fs::write(
         &path,
         format!(
-            "release={version}+{}\ncommit={full}\nreleased={released}\nsource=the committer date of the commit\n",
-            &full[..12]
+            "release={release}\ncommit={full}\nreleased={released}\nsource=the committer date of the commit\n",
         ),
     )
     .map_err(|error| format!("{}: {error}", path.display()))?;
     println!("wrote {}", path.display());
-    update_document(level, &format!("{version}+{}", &full[..12]), &released)
+    std::fs::write(&document, text).map_err(|error| format!("{}: {error}", document.display()))?;
+    println!("wrote {}", document.display());
+    Ok(())
 }
 
-/// Gives the row of `level` in the document on the support window its release and the day it was
-/// built, which the document's test holds equal to the records.
-fn update_document(level: &str, release: &str, released: &str) -> Result<(), String> {
+/// The document on the support window with the row of `level` given its release and the day it was
+/// built, which the document's test holds equal to the records; and where it is.
+fn document_with(level: &str, release: &str, released: &str) -> Result<(PathBuf, String), String> {
     let path = repository().join("docs/releases/support-window.md");
     let text =
         std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -330,10 +328,7 @@ fn update_document(level: &str, release: &str, released: &str) -> Result<(), Str
     if !changed {
         return Err(format!("{} has no row for level {level}", path.display()));
     }
-    std::fs::write(&path, format!("{}{block}{}", &text[..from], &text[to..]))
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    println!("wrote {}", path.display());
-    Ok(())
+    Ok((path, format!("{}{block}{}", &text[..from], &text[to..])))
 }
 
 #[cfg(test)]
@@ -396,6 +391,19 @@ pub const PUBLIC_MAJORS: &[PublicMajor] = &[
         assert_ne!(record_of(&moved).unwrap(), Some(record));
     }
 
+    /// A release before the support window lists one major, from the protocol version it
+    /// implements, and its record says so.
+    #[test]
+    fn a_release_without_a_table_is_recorded_as_the_one_major_it_negotiated() {
+        let source = "// the version\npub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);\n";
+        assert_eq!(record_of(source), Ok(None));
+        assert_eq!(
+            crate::public_majors::record_without_a_table(source).as_deref(),
+            Ok("major=1 versions=1.0 replaced=- supported_until=- retired=false\n")
+        );
+        assert!(crate::public_majors::record_without_a_table("fn nothing() {}").is_err());
+    }
+
     /// A source with no table is no table, and every other shape is refused: a different
     /// declaration, an entry that is not a literal, a value that is not a literal, a field twice or
     /// unknown, and a table followed by more code.
@@ -449,13 +457,30 @@ pub const PUBLIC_MAJORS: &[PublicMajor] = &[
             ),
             ("a major twice", TWO_ROWS.replace("major: 2", "major: 1")),
             ("text after the table", TWO_ROWS.replace("];", "].len();")),
-            (
-                "a block comment",
-                TWO_ROWS.replace("// the first", "/* the first */"),
-            ),
         ] {
             assert!(record_of(&source).is_err(), "{what} is refused: {source}");
         }
+        // A block comment is a comment, nested ones included.
+        let block = TWO_ROWS.replace("// the first", "/* the /* first */ row */");
+        assert_eq!(record_of(&block), record_of(TWO_ROWS));
+        // A bracket or a declaration inside a comment is neither the end of the table nor a table.
+        let bracket = TWO_ROWS.replace(
+            "    PublicMajor {\n        major: 2",
+            "    // ];\n    PublicMajor {\n        major: 2",
+        );
+        assert_eq!(
+            record_of(&bracket),
+            record_of(TWO_ROWS),
+            "a comment holding `];` ends nothing"
+        );
+        let older = format!("// pub const PUBLIC_MAJORS: &[PublicMajor] = &[];\n{TWO_ROWS}");
+        assert_eq!(
+            record_of(&older),
+            record_of(TWO_ROWS),
+            "a commented declaration is not the table"
+        );
+        let twice = format!("{TWO_ROWS}{TWO_ROWS}");
+        assert!(record_of(&twice).is_err(), "two declarations are refused");
         // A comment that only looks like a row is not one, and does not move the digest.
         let commented = TWO_ROWS.replace(
             "// the first",

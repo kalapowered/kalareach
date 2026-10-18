@@ -19,28 +19,32 @@ const PROTOCOL_DECLARATION: &str = "pub const PROTOCOL_VERSION: ProtocolVersion 
 /// Returns why when the source names the table in a form this reader does not read, or the table
 /// is not a list of `PublicMajor { .. }` literals of the five known fields with known values.
 pub fn record_of(source: &str) -> Result<Option<String>, String> {
-    if !source.contains("PUBLIC_MAJORS") {
+    // Comments are taken out before anything is looked for, so a bracket or a declaration inside
+    // one is neither the end of the table nor the table.
+    let code = without_comments(source)?;
+    if !code.contains("PUBLIC_MAJORS") {
         return Ok(None);
     }
-    let start = source.find(START).ok_or(
-        "PUBLIC_MAJORS is named in a form this reader does not read (it reads `pub const \
-         PUBLIC_MAJORS: &[PublicMajor] = &[ .. ];`)",
-    )?;
+    if code.matches(START).count() != 1 || code.matches("PUBLIC_MAJORS:").count() != 1 {
+        return Err(
+            "PUBLIC_MAJORS is named in a form this reader does not read (it reads exactly one \
+             `pub const PUBLIC_MAJORS: &[PublicMajor] = &[ .. ];`)"
+                .to_owned(),
+        );
+    }
+    let start = code.find(START).ok_or("no table")?;
     let inside = start + START.len();
-    let length = closing(&source[inside..], '[', ']').ok_or("the table does not end")?;
-    let after = source[inside + length + 1..].trim_start();
+    let length = closing(&code[inside..], '[', ']').ok_or("the table does not end")?;
+    let after = code[inside + length + 1..].trim_start();
     if !after.starts_with(';') {
         return Err("the table is followed by something other than `;`".to_owned());
     }
-    let item_end = inside + length + 1 + (source[inside + length + 1..].len() - after.len()) + 1;
-    let item = plain(&source[start..item_end]);
-    if item.contains("/*") {
-        return Err("a block comment in the table".to_owned());
-    }
-    let body = plain(&source[inside..inside + length]);
+    let item_end = inside + length + 1 + (code[inside + length + 1..].len() - after.len()) + 1;
+    let item = squeeze(&code[start..item_end]);
+    let body = squeeze(&code[inside..inside + length]);
     let mut rows = Vec::new();
     for entry in split_top(&body) {
-        rows.push(row_of(source, entry)?);
+        rows.push(row_of(&code, entry)?);
     }
     if rows.is_empty() {
         return Err("the table has no row".to_owned());
@@ -67,6 +71,77 @@ pub fn record_of(source: &str) -> Result<Option<String>, String> {
         .collect();
     record.push_str(&format!("digest={digest}\n"));
     Ok(Some(record))
+}
+
+/// The record a release has whose source lists no table: the one major it negotiates, from the
+/// protocol version it implements, not replaced. A level cut from such a release records this.
+///
+/// # Errors
+///
+/// Returns why when the source states no protocol version this reader knows.
+pub fn record_without_a_table(source: &str) -> Result<String, String> {
+    let code = without_comments(source)?;
+    let version = version_of(&code, "PROTOCOL_VERSION")?;
+    let major = version
+        .split('.')
+        .next()
+        .ok_or("a protocol version has a major")?;
+    Ok(format!(
+        "major={major} versions={version} replaced=- supported_until=- retired=false\n"
+    ))
+}
+
+/// `source` without its `//` and `/* */` comments; text between double quotes is left alone.
+fn without_comments(source: &str) -> Result<String, String> {
+    let characters: Vec<char> = source.chars().collect();
+    let mut kept = String::with_capacity(source.len());
+    let (mut index, mut quoted) = (0, false);
+    while index < characters.len() {
+        let here = characters[index];
+        let next = characters.get(index + 1).copied();
+        if quoted {
+            kept.push(here);
+            if here == '\\' {
+                if let Some(escaped) = next {
+                    kept.push(escaped);
+                    index += 1;
+                }
+            } else if here == '"' {
+                quoted = false;
+            }
+        } else if here == '"' {
+            quoted = true;
+            kept.push(here);
+        } else if here == '/' && next == Some('/') {
+            while index < characters.len() && characters[index] != '\n' {
+                index += 1;
+            }
+            continue;
+        } else if here == '/' && next == Some('*') {
+            let mut depth = 1;
+            index += 2;
+            while depth > 0 {
+                match (characters.get(index), characters.get(index + 1)) {
+                    (Some('/'), Some('*')) => {
+                        depth += 1;
+                        index += 2;
+                    }
+                    (Some('*'), Some('/')) => {
+                        depth -= 1;
+                        index += 2;
+                    }
+                    (Some(_), _) => index += 1,
+                    (None, _) => return Err("a block comment does not end".to_owned()),
+                }
+            }
+            kept.push(' ');
+            continue;
+        } else {
+            kept.push(here);
+        }
+        index += 1;
+    }
+    Ok(kept)
 }
 
 struct Row {
@@ -148,7 +223,7 @@ fn version_of(source: &str, entry: &str) -> Result<String, String> {
             .split(PROTOCOL_DECLARATION)
             .nth(1)
             .ok_or("PROTOCOL_VERSION is not declared in the source")?;
-        plain(rest.split(';').next().unwrap_or_default())
+        squeeze(rest.split(';').next().unwrap_or_default())
     } else {
         entry.to_owned()
     };
@@ -193,27 +268,9 @@ fn day_of(value: &str) -> Result<String, String> {
     }
 }
 
-/// `text` without its `//` comments and with its whitespace collapsed to single spaces.
-fn plain(text: &str) -> String {
-    let mut kept = String::new();
-    for line in text.lines() {
-        let mut quoted = false;
-        let mut end = line.len();
-        let mut previous = ' ';
-        for (index, character) in line.char_indices() {
-            if character == '"' {
-                quoted = !quoted;
-            }
-            if !quoted && character == '/' && previous == '/' {
-                end = index - 1;
-                break;
-            }
-            previous = character;
-        }
-        kept.push_str(&line[..end]);
-        kept.push(' ');
-    }
-    kept.split_whitespace().collect::<Vec<_>>().join(" ")
+/// `text` with its whitespace collapsed to single spaces.
+fn squeeze(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The length of `text` up to the bracket that closes the one before it, `open` and `close` taken

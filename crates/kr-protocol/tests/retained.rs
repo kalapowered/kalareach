@@ -667,7 +667,15 @@ fn the_exchange_recorded_with_a_real_worker_of_the_release_before_reads_under_it
         !record.is_empty(),
         "the retained level records no exchange with a worker of its release"
     );
-    let level = Level::retained(&kr_protocol::retained::RETAINED[0]);
+    // The record is of the 0.74 release, and is read under that level whatever else is retained.
+    let wanted = CompatibilityLevel::of(PackageVersion::new(0, 74, 0));
+    let retained = kr_protocol::retained::RETAINED
+        .iter()
+        .find(|retained| retained.level == wanted)
+        .expect("the 0.74 level is retained");
+    let level = Level::retained(retained);
+    // While this build's surface is the one the level kept, a frame reads the same under both.
+    let alike = differences(retained.surface(), current()).is_empty();
     let mut both_ways = [false; 2];
     for entry in &record {
         let payload = hex::decode(entry["payload"].as_str().expect("a payload")).expect("hex");
@@ -676,12 +684,14 @@ fn the_exchange_recorded_with_a_real_worker_of_the_release_before_reads_under_it
         let frame = level
             .decode(&payload, &limits())
             .unwrap_or_else(|error| panic!("{entry} reads under the level: {error:?}"));
-        assert_eq!(
-            Level::this()
-                .decode(&payload, &limits())
-                .expect("it reads under this build's level too"),
-            frame
-        );
+        if alike {
+            assert_eq!(
+                Level::this()
+                    .decode(&payload, &limits())
+                    .expect("it reads under this build's level too"),
+                frame
+            );
+        }
         if written {
             assert_eq!(
                 level.encode(&frame, &limits()).expect("it writes again"),

@@ -172,21 +172,22 @@ fn a_replaced_major_needs_a_later_one() {
     assert!(intrinsic(&[replaced_major_one(), current_major_two()]).is_empty());
 }
 
-/// KR-REQ-26.07: the release before this one keeps a record of its table whatever worker levels
-/// remain, from the first level whose release had a table.
+/// KR-REQ-26.07: every retained level records the table its release listed, and the newest of them
+/// is a level below this build's own. (That the newest retained level is the release immediately
+/// before this one is the landing's to keep: a release names its predecessor by retaining it.)
 #[test]
-fn a_level_from_the_first_with_a_table_records_it() {
-    let first = kr_protocol::update::CompatibilityLevel::of(
-        kr_protocol::hello::PackageVersion::new(0, 75, 0),
-    );
+fn every_retained_level_records_its_table_and_is_below_this_one() {
     for level in &RETAINED {
-        if level.level >= first {
-            assert!(
-                level.public_majors.is_some(),
-                "level {} was cut from a release that listed a table, and has no record of it",
-                level.level
-            );
-        }
+        assert!(
+            level.public_majors.is_some(),
+            "level {} has no record of the table its release listed",
+            level.level
+        );
+        assert!(
+            level.level < kr_protocol::update::THIS_LEVEL,
+            "level {} is not below this build's own",
+            level.level
+        );
     }
 }
 
@@ -301,9 +302,9 @@ fn a_retired_major_is_not_listed_and_the_others_are_with_all_their_versions() {
 #[test]
 fn this_table_holds_to_the_table_of_each_retained_release_that_recorded_one() {
     for level in &RETAINED {
-        let Some(recorded) = level.public_majors else {
-            continue;
-        };
+        let recorded = level
+            .public_majors
+            .expect("every retained level records its table");
         let rows = parse(recorded);
         let released = level
             .release

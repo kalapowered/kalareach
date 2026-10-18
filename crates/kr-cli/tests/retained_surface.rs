@@ -268,35 +268,54 @@ fn before_items(record: &Value) -> Vec<&str> {
         .collect()
 }
 
-/// The table of public majors a level recorded is the table in the tree of the release it names.
+/// The table of public majors a level recorded is the one in the tree of its release.
 ///
 /// Unlike the records above, which this checkout is held to whatever tree is read, a table may
 /// legitimately differ in this checkout (a major replaced since), so this runs where the release's
-/// own tree is named: a landing sets `KR_RELEASE_TREE`, and the record is read out of that tree's
-/// `hello.rs` and compared whole, digest included. A record written by hand for a release that had
-/// no table needs a tree that has none.
+/// own tree is named: a landing sets `KR_RELEASE_TREE`. The tree's package version says which
+/// retained level it is the release of, and that level's record is compared whole, digest
+/// included, with the table read out of the tree's `hello.rs`; for a tree whose source lists no
+/// table the record is the one major its protocol version names. A tree that is no retained
+/// level's release is a failure.
 #[test]
 fn the_table_of_public_majors_a_level_recorded_is_the_one_in_its_release_tree() {
     let Some(root) = std::env::var_os("KR_RELEASE_TREE") else {
         return;
     };
-    let source = std::fs::read_to_string(Path::new(&root).join("crates/kr-protocol/src/hello.rs"))
+    let root = Path::new(&root);
+    let source = std::fs::read_to_string(root.join("crates/kr-protocol/src/hello.rs"))
         .unwrap_or_else(|error| panic!("hello.rs of the release tree: {error}"));
-    let found = public_majors::record_of(&source)
-        .unwrap_or_else(|error| panic!("the table in the release tree: {error}"));
-    let mut problems = Vec::new();
-    for level in &RETAINED {
-        match (level.public_majors, &found) {
-            (Some(recorded), Some(found)) if recorded == found => {}
-            (Some(recorded), None) if !recorded.contains("digest=") => {}
-            (None, None) => {}
-            (recorded, found) => problems.push(format!(
-                "level {}: recorded {:?}, the release tree has {:?}",
-                level.level, recorded, found
-            )),
-        }
-    }
-    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    let expected = match public_majors::record_of(&source)
+        .unwrap_or_else(|error| panic!("the table in the release tree: {error}"))
+    {
+        Some(record) => record,
+        None => public_majors::record_without_a_table(&source)
+            .unwrap_or_else(|error| panic!("the release tree lists no table: {error}")),
+    };
+    let package: Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("packages/protocol/package.json"))
+            .unwrap_or_else(|error| panic!("the release tree's package: {error}")),
+    )
+    .expect("a package manifest");
+    let version = package["version"].as_str().expect("a package version");
+    let numbers: Vec<u16> = version
+        .split('.')
+        .map(|part| part.parse().expect("a number"))
+        .collect();
+    let level = kr_protocol::update::CompatibilityLevel::of(
+        kr_protocol::hello::PackageVersion::new(numbers[0], numbers[1], numbers[2]),
+    );
+    let retained = RETAINED
+        .iter()
+        .find(|retained| retained.level == level)
+        .unwrap_or_else(|| {
+            panic!("the release tree is {version}, and no retained level is {level}")
+        });
+    assert_eq!(
+        retained.public_majors,
+        Some(expected.as_str()),
+        "level {level}: recorded against the release tree"
+    );
 }
 
 /// A limit may be added and may not change or go.
