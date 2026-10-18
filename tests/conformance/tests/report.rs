@@ -826,13 +826,15 @@ fn a_step_is_one_command_that_names_what_it_selects_and_is_found_where_it_is_sai
     );
 
     // A line that begins with echo says the words of a command and does not run them.
-    let said = held_to(&[all("said.sh")]);
-    assert_eq!(said.problems.len(), 1, "{:?}", said.problems);
-    assert!(
-        said.problems[0].contains("holds no command with"),
-        "{:?}",
-        said.problems
-    );
+    for file in ["said.sh", "said_run.sh"] {
+        let said = held_to(&[all(file)]);
+        assert_eq!(said.problems.len(), 1, "{file}: {:?}", said.problems);
+        assert!(
+            said.problems[0].contains("holds no command with"),
+            "{file}: {:?}",
+            said.problems
+        );
+    }
 
     // What follows a comment sign on a continued line is not part of the command.
     let commented = held_to(&[outcomes_entry(
@@ -952,11 +954,18 @@ fn a_command_names_its_tests_where_it_selects_them_and_leaves_none_out() {
     );
 
     // A line that has the call's words, but does not begin with them, does not pass a name.
-    let echoed_call = held_to(&[supplied("echoed_call.sh")]);
-    assert_eq!(echoed_call.problems.len(), 1, "{:?}", echoed_call.problems);
+    for file in ["echoed_call.sh", "reported_call.sh"] {
+        let called = held_to(&[supplied(file)]);
+        assert_eq!(called.problems.len(), 1, "{file}: {:?}", called.problems);
+    }
 
     // A filter that skips a test the entry covers leaves it out, in either form of the flag.
-    for file in ["skipping.sh", "skipping_equals.sh"] {
+    for file in [
+        "skipping.sh",
+        "skipping_equals.sh",
+        "skipping_quoted.sh",
+        "skipping_after_variable.sh",
+    ] {
         let skipping = held_to(&[command(file)]);
         assert_eq!(
             skipping.problems.len(),
@@ -985,18 +994,39 @@ fn a_command_names_its_tests_where_it_selects_them_and_leaves_none_out() {
     let listing = held_to(&[by_part("listing.sh")]);
     assert_eq!(listing.problems.len(), 1, "{:?}", listing.problems);
     assert!(
-        listing.problems[0].contains("only lists"),
+        listing.problems[0].contains("does not run the tests"),
         "{:?}",
         listing.problems
     );
-    let filtered = held_to(&[by_part("filtered.sh")]);
-    assert_eq!(filtered.problems.len(), 1, "{:?}", filtered.problems);
-    assert!(
-        filtered.problems[0].contains("leaves out tests::is_ignored"),
-        "{:?}",
-        filtered.problems
-    );
-    assert!(held_to(&[by_part("filtered_all.sh")]).problems.is_empty());
+    for file in ["filtered.sh", "filtered_before.sh"] {
+        let filtered = held_to(&[by_part(file)]);
+        assert_eq!(
+            filtered.problems.len(),
+            1,
+            "{file}: {:?}",
+            filtered.problems
+        );
+        assert!(
+            filtered.problems[0].contains("leaves out tests::is_ignored"),
+            "{file}: {:?}",
+            filtered.problems
+        );
+    }
+    for file in ["filtered_all.sh", "filtered_before_all.sh"] {
+        assert!(held_to(&[by_part(file)]).problems.is_empty(), "{file}");
+    }
+    for (file, said) in [
+        ("no_run.sh", "does not run the tests"),
+        ("bench_mode.sh", "runs benchmarks"),
+    ] {
+        let refused = held_to(&[by_part(file)]);
+        assert_eq!(refused.problems.len(), 1, "{file}: {:?}", refused.problems);
+        assert!(
+            refused.problems[0].contains(said),
+            "{file}: {:?}",
+            refused.problems
+        );
+    }
 }
 
 #[test]
@@ -1722,13 +1752,10 @@ fn the_performance_group_takes_what_the_performance_script_takes() {
         .lines()
         .filter_map(|line| {
             let line = line.trim();
-            let (kind, name) = line.split_once(' ')?;
+            let (kind, rest) = line.strip_prefix("measurement_in --")?.split_once(' ')?;
+            let (target, name) = rest.split_once(' ')?;
             let name = name.strip_suffix(" || failed=1")?;
-            match kind {
-                "measurement" => Some(("test performance".to_owned(), name.to_owned())),
-                "input_measurement" => Some(("bench input_latency".to_owned(), name.to_owned())),
-                _ => None,
-            }
+            Some((format!("{kind} {target}"), name.to_owned()))
         })
         .collect();
     let planned: Vec<(String, String)> = plan::MEASUREMENTS

@@ -9,12 +9,14 @@
 //!
 //! The commands are not read for what they mean. An entry names the words one command holds, and
 //! the check is that the file still has a line with all of them (the continuations of a line
-//! joined, and what a comment holds left out), so that the words of two commands never stand in for
-//! one. A command that selects tests with `--exact` has to name each test the entry covers on that
-//! line, or, for an entry that says a call passes the names, on a line with the call's words; and no
-//! `--skip` filter of it may select one of them. A step of the report's own plan is found in the
-//! plan, not in text. Whether control reaches a command, and what the script does with its result,
-//! are not read.
+//! joined, what a comment holds left out, and a line that only says something, such as one that
+//! begins with `echo`, not a command), so that the words of two commands never stand in for one. A
+//! command that selects tests with `--exact` has to name each test the entry covers on that line,
+//! or, for an entry that says a call passes the names, on a line that begins with the call's words.
+//! The command has to run them: a `--skip` filter, `--list`, `--no-run` or a filter that selects by
+//! a part of the names may not leave one out. A step of the report's own plan is found in the plan,
+//! not in text. Whether control reaches a command, and what the script does with its result, are
+//! not read.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -172,8 +174,9 @@ fn case_matches(case: &str, name: &str) -> bool {
 /// none of them out, or `None` when it holds one.
 ///
 /// A command that selects tests with `--exact` names each of `covered` on its own line, or, when
-/// `names_with` is given, on a line that holds all of those words (the call that passes the name to
-/// the command). A command leaves a test out when a `--skip` filter selects it.
+/// `names_with` is given, on a line that begins with the first of those words and holds the rest
+/// (the call that passes the name to the command). A command leaves a test out when [`narrowed`]
+/// says so.
 fn missing_command(
     root: &Path,
     file: &str,
@@ -220,69 +223,99 @@ fn missing_command(
 }
 
 /// The options of the test program that take their value as the next word.
-const VALUE_OPTIONS: [&str; 7] = [
+const VALUE_OPTIONS: [&str; 6] = [
     "--test-threads",
     "--color",
     "--format",
     "--logfile",
     "--shuffle-seed",
     "--report-time",
-    "--skip",
+];
+
+/// The options of `cargo test` that take their value as the next word.
+const CARGO_VALUE_OPTIONS: [&str; 19] = [
+    "-p",
+    "--package",
+    "--test",
+    "--bench",
+    "--bin",
+    "--example",
+    "--features",
+    "-F",
+    "--target",
+    "--target-dir",
+    "--manifest-path",
+    "-j",
+    "--jobs",
+    "--profile",
+    "--message-format",
+    "--color",
+    "--config",
+    "-Z",
+    "--exclude",
 ];
 
 /// Why a command, as the words of one line, runs fewer tests than `covered` or none, or `None`
-/// when it does not: it only lists them, a `--skip` filter (as `--skip FILTER` or `--skip=FILTER`)
-/// selects one of them, or a filter that names tests by a part of their names, instead of
-/// `--exact`, leaves one of them out. A filter selects a test whose name contains it.
+/// when it does not: it does not run them (`--list`, `--no-run`, `--help`, or the test program's
+/// `--bench` mode), a `--skip` filter (as `--skip FILTER` or `--skip=FILTER`) selects one of them,
+/// or a filter that names tests by a part of their names, before or after the `--` that ends
+/// Cargo's own arguments, instead of `--exact`, leaves one of them out. A filter selects a test
+/// whose name contains it.
 fn narrowed(command: &str, covered: &BTreeSet<String>, exact: bool) -> Option<String> {
-    let words: Vec<&str> = command.split_whitespace().collect();
-    if words.contains(&"--list") {
-        return Some("only lists the tests, with `--list`".to_owned());
-    }
+    let words: Vec<&str> = command
+        .split_whitespace()
+        .map(|word| word.trim_matches(['"', '\'']))
+        .collect();
+    // The command is what follows `cargo test`, up to the first shell operator; a test program
+    // started on its own has only the test program's arguments.
+    let cargo = words.windows(2).position(|pair| pair == ["cargo", "test"]);
     let mut skips = Vec::new();
     let mut filters = Vec::new();
-    let mut after_cargo = false;
-    let mut at = 0;
+    let mut program = cargo.is_none();
+    let mut at = cargo.map_or(0, |at| at + 2);
     while at < words.len() {
         let word = words[at];
-        if let Some(value) = word.strip_prefix("--skip=") {
-            skips.push(value);
-        } else if word == "--skip" {
-            if let Some(value) = words.get(at + 1) {
-                skips.push(value);
-            }
-            at += 1;
-        } else if !after_cargo {
-            after_cargo = word == "--";
-        } else if VALUE_OPTIONS.contains(&word) {
-            at += 1;
-        } else if word.contains(['|', '&', ';', '<', '>', '(', ')', '$']) {
+        if word.contains(['|', '&', ';', '<', '>', '(', ')']) {
             break;
-        } else if !word.starts_with('-') {
-            filters.push(word);
+        }
+        match word {
+            "--list" | "--no-run" | "--help" | "-h" => {
+                return Some(format!("does not run the tests, with `{word}`"));
+            }
+            "--bench" if program => {
+                return Some("runs benchmarks and not the tests, with `--bench`".to_owned());
+            }
+            "--" => program = true,
+            "--skip" => {
+                skips.extend(words.get(at + 1));
+                at += 1;
+            }
+            _ if word.starts_with("--skip=") => skips.push(&word["--skip=".len()..]),
+            _ if (program && VALUE_OPTIONS.contains(&word))
+                || (!program && CARGO_VALUE_OPTIONS.contains(&word)) =>
+            {
+                at += 1;
+            }
+            _ if word.starts_with('-') || word.contains('$') || cargo.is_none() => {}
+            _ => filters.push(word),
         }
         at += 1;
     }
     for skip in skips {
-        let skip = skip.trim_matches(['"', '\'']);
         if let Some(name) = covered.iter().find(|name| name.contains(skip)) {
             return Some(format!("skips {name} with `--skip {skip}`"));
         }
     }
-    if !exact && !filters.is_empty() {
-        let filters: Vec<&str> = filters
-            .into_iter()
-            .map(|filter| filter.trim_matches(['"', '\'']))
-            .collect();
-        if let Some(name) = covered
+    if !exact
+        && !filters.is_empty()
+        && let Some(name) = covered
             .iter()
             .find(|name| !filters.iter().any(|filter| name.contains(filter)))
-        {
-            return Some(format!(
-                "selects only {}, which leaves out {name}",
-                filters.join(" ")
-            ));
-        }
+    {
+        return Some(format!(
+            "selects only {}, which leaves out {name}",
+            filters.join(" ")
+        ));
     }
     None
 }
@@ -449,10 +482,17 @@ fn commands(text: &str) -> impl Iterator<Item = String> + '_ {
         .into_iter()
 }
 
-/// Whether a line only says something: it begins with `echo` or `printf`, so words that look like a
-/// command after them are text.
+/// Whether a line only says something: it begins (after a workflow's `run:`) with `echo`, `printf`
+/// or `:`, so words that look like a command after them are text.
 fn says(line: &str) -> bool {
-    matches!(line.split_whitespace().next(), Some("echo" | "printf"))
+    let command = line
+        .trim_start_matches("- ")
+        .trim_start_matches("run:")
+        .trim_start();
+    matches!(
+        command.split_whitespace().next(),
+        Some("echo" | "printf" | ":")
+    )
 }
 
 /// `line` up to the `#` that begins a comment: one at the start of the line or after white space,

@@ -1584,7 +1584,8 @@ pub enum Runs {
     /// A command in a file of the repository: one line of it, its continuations joined, holds every
     /// one of `fragments`. The words that make it a command that runs ignored tests are among them.
     /// A command that selects tests with `--exact` has to name, on that line, each test the entry
-    /// covers, and has to leave none of them out with `--skip`.
+    /// covers, and has to run them: no `--skip` filter, `--list`, `--no-run` or filter by a part of
+    /// their names may leave one of them out.
     Command {
         /// The file, relative to the repository.
         file: &'static str,
