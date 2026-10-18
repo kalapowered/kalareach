@@ -992,7 +992,10 @@ impl WorkerService {
     }
 
     /// Returns the method and parameters of every request and mutation this service has been
-    /// sent, in the order they arrived, for this host's own tests.
+    /// sent, in the order it began on them, for this host's own tests.
+    ///
+    /// A keystroke served beside a request that waits is recorded when it is served, which can be
+    /// before the request it follows has finished.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn received(&self) -> Vec<(kr_protocol::method::MethodName, ParamsValue)> {

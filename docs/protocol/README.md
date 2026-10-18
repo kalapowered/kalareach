@@ -497,6 +497,13 @@ Reading the fields:
   pre-authorisation surface.
 - `input.write` is the only method with `ordered_stream` idempotency and an `input_lease` freshness
   context. Raw input is an ordered stream per connection, never replayed after a reconnect.
+- The response is associated with the request by `request_id` and nothing else. In fact, the worker
+  will answer an `input.write` as soon as it has taken the batch. Therefore, it may answer the write
+  before the answer to an earlier read on the same connection, or to an earlier `terminal.resize`,
+  `terminal.geometry.transfer`, `attachment.configure` or `attachment.viewport`. However, it will
+  still answer a write after every earlier write, and after any earlier mutation that can change
+  what the write meets: an attach, a detach, an input acquire, release or interrupt, or a close. A
+  client does not assume that answers come back in the order it sent the requests.
 
 ### Rights and capabilities are not the same thing
 
