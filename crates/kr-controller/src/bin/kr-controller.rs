@@ -136,6 +136,20 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // A manifest that names a level this daemon does not retain would have an update go on over a
+    // worker it cannot read, so such a release does not start.
+    if let Some(manifest) = running.manifest() {
+        let unspoken = kr_protocol::retained::levels_not_spoken(&manifest.retained_levels);
+        if !unspoken.is_empty() {
+            let named: Vec<String> = unspoken.iter().map(ToString::to_string).collect();
+            eprintln!(
+                "kr-controller: this release's manifest names the compatibility level {} to retain, \
+                 and this daemon does not retain it, so it does not start",
+                named.join(", ")
+            );
+            return ExitCode::FAILURE;
+        }
+    }
     if arguments.starter {
         return starter(&arguments);
     }

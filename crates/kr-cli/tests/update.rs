@@ -6103,20 +6103,88 @@ async fn a_store_too_old_or_unreadable_is_named_and_a_store_in_range_is_not() {
     );
 }
 
-/// KR-REQ-26.10, KR-REQ-26.08: a rollback waits, exit 9, for a live session whose level the older
-/// release's daemon does not retain, as an update does, with nothing stopped.
+/// KR-REQ-26.08: a control daemon whose release's manifest names a compatibility level its binary
+/// does not retain does not start, and says which level. A manifest that names the levels the
+/// binary retains starts, and so does one that names fewer of them: that only holds more updates
+/// back.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_rollback_waits_for_a_session_the_older_release_does_not_retain() {
-    let mut host = Host::bare();
+async fn a_daemon_whose_manifest_names_a_level_it_does_not_retain_does_not_start() {
     let another = if PACKAGE_VERSION.major == 0 {
         PackageVersion::new(0, PACKAGE_VERSION.minor + 1, 0)
     } else {
         PackageVersion::new(PACKAGE_VERSION.major + 1, 0, 0)
     };
+    let this = CompatibilityLevel::of(PACKAGE_VERSION);
+    let retained = kr_protocol::retained::RETAINED_WORKER_LEVELS[0];
+
+    // The refusal: a level above this build's, alone and beside the ones it retains.
+    for named in [
+        vec![CompatibilityLevel::of(another)],
+        vec![this, retained, CompatibilityLevel::of(another)],
+    ] {
+        let host = Host::bare();
+        let mut release = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+        release.manifest.retained_levels = named;
+        host.install(&release);
+        let controller = host.store.stable(Program::Controller);
+        let arguments = host.daemon_arguments();
+        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        let mut command = host.command(&controller, &arguments);
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the daemon starts");
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("it can be waited on") {
+                break status;
+            }
+            if started.elapsed() > LIVENESS_DEADLINE {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the daemon went on running over a manifest that names a level it lacks");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(!status.success(), "{status}");
+        let mut said = String::new();
+        std::io::Read::read_to_string(&mut child.stderr.take().expect("its output"), &mut said)
+            .expect("what it said");
+        assert!(
+            said.contains(&CompatibilityLevel::of(another).to_string()),
+            "it names the level: {said}"
+        );
+    }
+
+    // The controls: exactly what the binary retains, and fewer.
+    for named in [vec![this, retained], vec![retained], vec![this]] {
+        let mut host = Host::bare();
+        let mut release = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+        release.manifest.retained_levels = named.clone();
+        host.install(&release);
+        let controller = host.store.stable(Program::Controller);
+        host.start_daemon(&controller).await;
+        assert_eq!(
+            host.daemon_build().await,
+            format!("kr-controller/{}", release.name()),
+            "a manifest that names {named:?} starts"
+        );
+    }
+}
+
+/// KR-REQ-26.10, KR-REQ-26.08: a rollback waits, exit 9, for a live session whose level the older
+/// release's daemon does not retain, as an update does, with nothing stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_waits_for_a_session_the_older_release_does_not_retain() {
+    let mut host = Host::bare();
+    // The older release retains only the level the previous release spoke at, which its daemon
+    // does retain; the session below runs at this build's own level.
     let one = Assembled::new(
         "0.1.0+aaaaaaaaaaaa",
         1,
-        CompatibilityLevel::of(another),
+        kr_protocol::retained::RETAINED_WORKER_LEVELS[0],
         the_root(),
     );
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
@@ -6215,17 +6283,12 @@ async fn a_rollback_needs_an_older_release_in_the_store() {
 async fn a_rollback_does_not_bring_back_a_key_the_channel_retired() {
     let mut host = Host::bare();
     let rotated = channel_root_naming(2, &keys().root, &keys().next_targets, &[&keys().root]);
-    let another = if PACKAGE_VERSION.major == 0 {
-        PackageVersion::new(0, PACKAGE_VERSION.minor + 1, 0)
-    } else {
-        PackageVersion::new(PACKAGE_VERSION.major + 1, 0, 0)
-    };
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
-    // It retains another level than the session below runs at, so its update waits for the session.
+    // It retains only the level before the session's below, so its update waits for the session.
     let two = Assembled::new(
         "0.2.0+bbbbbbbbbbbb",
         2,
-        CompatibilityLevel::of(another),
+        kr_protocol::retained::RETAINED_WORKER_LEVELS[0],
         &rotated,
     );
     host.install(&one);

@@ -385,6 +385,24 @@ pub fn current() -> &'static Surface {
     })
 }
 
+/// The levels among `named` that a control daemon of this build does not speak at: neither its own
+/// nor one it retains.
+///
+/// A release's manifest says which levels its daemon retains, and an update reads it to decide
+/// whether a live worker holds the update back. A manifest that names a level the daemon's code
+/// does not retain would let an update go on over a worker the daemon cannot read, so a daemon
+/// whose manifest names one does not start. A manifest that names fewer levels than the daemon
+/// speaks at only holds more updates back.
+#[must_use]
+pub fn levels_not_spoken(named: &[CompatibilityLevel]) -> Vec<CompatibilityLevel> {
+    let spoken = levels();
+    named
+        .iter()
+        .copied()
+        .filter(|level| !spoken.contains(level))
+        .collect()
+}
+
 /// The levels of this release's control daemon: its own, then the ones it retains.
 #[must_use]
 pub fn levels() -> Vec<CompatibilityLevel> {
