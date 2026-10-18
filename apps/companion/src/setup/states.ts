@@ -121,8 +121,8 @@ export function stateMeaning(
     case 'restart_required':
       return (
         'You have been to every settings pane behind this and the answer has not moved. macOS ' +
-        'gives a new grant to a process when it starts, so opening KalaReach again is the next ' +
-        'thing to try.'
+        "gives a new grant to a process when it starts, and the checks run in a session's own " +
+        'worker, so start a new session and run the checks again.'
       )
     case 'desktop_unavailable':
       return 'There is no desktop to do it on right now.'

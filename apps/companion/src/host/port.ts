@@ -37,6 +37,7 @@ import type {
   AttentionReadParams,
   AttentionReadResult,
   AuthorityNotice,
+  CapabilityChecks,
   CatalogueListParams,
   CatalogueListResult,
   CellRendition,
@@ -49,6 +50,7 @@ import type {
   DeviceListParams,
   DeviceListResult,
   Dimensions,
+  EnvironmentCapabilitiesParams,
   EnvironmentCapabilitiesResult,
   EnvironmentListResult,
   GrantCreateParams,
@@ -1416,6 +1418,15 @@ export interface HostPort {
    * the action and nothing else: what is fetched and from where are the host's own.
    */
   descriptionDownload(params: DescriptionDownloadParams): Promise<Settled<DescriptionSetup>>
+  /**
+   * Starts the disclosed checks in a session's worker, and answers where they stand: running, or
+   * why nothing was started. The page names the environment and nothing else; the file the read
+   * check reads is not the page's to name. A run takes about two minutes, so the answer to this
+   * is not its result: `environmentCapabilities` carries that.
+   */
+  environmentCapabilitiesCheck(
+    params: EnvironmentCapabilitiesParams
+  ): Promise<Settled<CapabilityChecks>>
 
   /**
    * What the launch surface may draw right now.

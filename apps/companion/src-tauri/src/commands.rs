@@ -41,6 +41,12 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
         "environment_capabilities",
         Some(Method::EnvironmentCapabilities),
     ),
+    // The disclosed checks, asked for once the interface has shown what each one does. The page
+    // names the environment and no file.
+    (
+        "environment_capabilities_check",
+        Some(Method::EnvironmentCapabilitiesCheck),
+    ),
     ("setup_identity", None),
     ("setup_open_settings", None),
     // Sessions.
@@ -480,6 +486,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         host_info,
         environment_list,
         environment_capabilities,
+        environment_capabilities_check,
         setup_identity,
         setup_open_settings,
         session_list,
@@ -1042,6 +1049,42 @@ read_command!(
     kr_protocol::desktop::EnvironmentCapabilitiesParams
         => kr_protocol::desktop::EnvironmentCapabilitiesResult
 );
+
+/// Asks the host to perform the disclosed checks in a session's own worker, and answers where they
+/// stand: running, or why nothing was started.
+///
+/// The checks take a screen image and start an application, so the interface asks only after it
+/// has shown what each one does. The page names the environment and nothing else: the parameters
+/// are those of `environment.capabilities`, which refuse any other field, and the file the read
+/// check reads is not the page's to name, so none is sent. The checks belong to the host on this
+/// computer, not to one this device is paired with.
+#[tauri::command]
+pub async fn environment_capabilities_check(
+    state: State<'_, AppState>,
+    subject: Subject,
+    params: Value,
+) -> Result<Settled> {
+    not_on_a_paired_host(&state, "the disclosed checks")?;
+    let asked: kr_protocol::desktop::EnvironmentCapabilitiesParams = decode(params)?;
+    let typed = kr_protocol::desktop::EnvironmentCapabilitiesCheckParams {
+        environment_id: asked.environment_id,
+        authorised_file: kr_protocol::scalars::Nullable::null(),
+    };
+    let target = subject.target(state.environment_id()?)?;
+    let session = state.session()?;
+    submitted_as::<kr_protocol::desktop::CapabilityChecks>(
+        session
+            .mutate(
+                Method::EnvironmentCapabilitiesCheck,
+                target,
+                None,
+                &NoPreconditions {},
+                &typed,
+                MUTATION_TTL,
+            )
+            .await,
+    )
+}
 
 read_command!(
     /// Lists the sessions a row is drawn for.
@@ -3264,6 +3307,7 @@ mod tests {
         "host_info",
         "environment_list",
         "environment_capabilities",
+        "environment_capabilities_check",
         "setup_identity",
         "setup_open_settings",
         "session_list",
@@ -3751,6 +3795,7 @@ mod tests {
             host_info,
             environment_list,
             environment_capabilities,
+            environment_capabilities_check,
             session_list,
             session_read,
             session_create,

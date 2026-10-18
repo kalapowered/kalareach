@@ -8,9 +8,12 @@
  * Every screenshot goes under `/tmp` and is named for the requirement row it evidences.
  */
 
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Locator, type Page } from '@playwright/test'
 
 import { PRESENTATION_DEADLINE } from './bounds'
+
+/** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
+const LARGEST = 53 / 17
 
 /** Where a screenshot for the evidence goes. */
 function shot(name: string): string {
@@ -401,6 +404,144 @@ test.describe('the first-start assistant', () => {
     }
     await capture(page, 'setup-narrow-03.28')
   })
+
+  // KR-REQ-03.29: the checks are asked for from the sheet that lists what each one does and from
+  // nowhere else, and the card says where they stand until the host says the run ended.
+  test('asks for the checks only from the sheet that lists them, and shows the run until it ends', async ({
+    page
+  }) => {
+    await openSetup(page)
+    await step(page, 'capabilities')
+    const state = page.getByTestId('setup-checks-state')
+    await expect(state).toHaveAttribute('data-state', 'current')
+    const runs = (): Promise<number> =>
+      page.evaluate(() => window.krTestHost?.checkRuns.length ?? -1)
+
+    // The card's control opens the list and starts nothing.
+    const opener = page.getByTestId('setup-run-checks')
+    await opener.click()
+    const sheet = page.getByTestId('sheet')
+    await expect(sheet).toHaveAttribute('data-presentation', 'here', {
+      timeout: PRESENTATION_DEADLINE
+    })
+    expect(await runs()).toBe(0)
+    await page.getByTestId('setup-checks-not-now').click()
+    await expect(sheet).toBeHidden({ timeout: PRESENTATION_DEADLINE })
+    expect(await runs()).toBe(0)
+
+    // The run starts from the sheet's own button, and the card behind it says it is running. From
+    // the keyboard, because that is the path where the focus has to come back, and because one of
+    // these engines deliberately does not focus a button that was clicked.
+    await opener.focus()
+    await page.keyboard.press('Enter')
+    await expect(sheet).toHaveAttribute('data-presentation', 'here', {
+      timeout: PRESENTATION_DEADLINE
+    })
+    await page.getByTestId('setup-checks-run').focus()
+    await page.keyboard.press('Enter')
+    await expect(state).toHaveAttribute('data-state', 'running')
+    expect(await runs()).toBe(1)
+    // The list leaves and the focus goes back to the control that opened it, which is still there
+    // to be reached from the keyboard; asking again from the list is what is not offered.
+    await expect(sheet).toBeHidden({ timeout: PRESENTATION_DEADLINE })
+    await expect(opener).toBeFocused({ timeout: PRESENTATION_DEADLINE })
+    await page.keyboard.press('Enter')
+    await expect(sheet).toHaveAttribute('data-presentation', 'here', {
+      timeout: PRESENTATION_DEADLINE
+    })
+    await expect(page.getByTestId('setup-checks-run')).toBeDisabled()
+    expect(await runs()).toBe(1)
+    await page.getByTestId('setup-checks-not-now').click()
+    await expect(sheet).toBeHidden({ timeout: PRESENTATION_DEADLINE })
+
+    // The host ends the run, and the page finds out by asking, not by being told.
+    await page.evaluate(() => {
+      window.krTestHost?.setChecks({ state: 'current', finished_at_ms: String(Date.now()) })
+    })
+    await expect(state).toHaveAttribute('data-state', 'current', {
+      timeout: PRESENTATION_DEADLINE
+    })
+    await expect(opener).toBeEnabled()
+  })
+
+  // KR-REQ-03.29: at the largest text size, on a wide window and on a narrow one, the controls that
+  // run the checks, what the page says about them and the sheet that lists them stay inside the
+  // window, and every control is still a target of the token's size.
+  for (const [width, height] of [
+    [1280, 720],
+    [390, 844]
+  ] as const) {
+    for (const [size, ratio] of [
+      ['default', 1],
+      ['largest', LARGEST]
+    ] as const) {
+      test(`keeps the checks card and its sheet inside the window at the ${size} text size, ${width} wide`, async ({
+        page
+      }) => {
+        await openSetup(page)
+        await step(page, 'capabilities')
+        await page.setViewportSize({ width, height })
+        await page.evaluate((value) => {
+          document.documentElement.style.setProperty('--text-scale', String(value))
+        }, ratio)
+        expect(
+          await page.evaluate(() => parseFloat(getComputedStyle(document.documentElement).fontSize))
+        ).toBeCloseTo(16 * ratio, 1)
+
+        // The run that found nothing says the most: a line and a banner with the longest reason.
+        await page.evaluate(() => {
+          window.krTestHost?.setChecks({ state: 'failed', failure: 'no_session' })
+        })
+        await page.getByTestId('setup-recheck').click()
+        await expect(page.getByTestId('setup-checks-state')).toHaveAttribute('data-state', 'failed')
+        await expect(page.getByText('The checks did not run')).toBeVisible()
+
+        // What this change put on the page ends inside the window. The step list above it scrolls
+        // on its own and is not the checks'.
+        const inside = async (name: string, target: Locator, fixed = false): Promise<void> => {
+          const box = await target.boundingBox()
+          expect(box, `${name} is on the page`).not.toBeNull()
+          // Read from the page's own left edge, wherever a press has scrolled it to, except for a
+          // surface the window itself holds.
+          const scrolled = fixed ? 0 : await page.evaluate(() => window.scrollX)
+          const left = (box?.x ?? 0) + scrolled
+          expect(left, `${name} left edge`).toBeGreaterThanOrEqual(-1)
+          expect(left + (box?.width ?? 0), `${name} right edge`).toBeLessThanOrEqual(width + 1)
+        }
+        const footer = page.getByTestId('setup-run-checks').locator('xpath=..')
+        await inside('the card footer', footer)
+        await inside('the line that says where the checks stand', page.getByTestId('setup-checks-state'))
+        await inside('the banner', page.getByText('The checks did not run'))
+        const footerBox = await footer.boundingBox()
+        for (const control of ['setup-recheck', 'setup-run-checks']) {
+          const box = await page.getByTestId(control).boundingBox()
+          expect(box?.height ?? 0, `${control} height`).toBeGreaterThan(35.9)
+          expect(box?.x ?? -1, `${control} left edge`).toBeGreaterThanOrEqual((footerBox?.x ?? 0) - 1)
+          expect((box?.x ?? 0) + (box?.width ?? 0), `${control} right edge`).toBeLessThanOrEqual(
+            (footerBox?.x ?? 0) + (footerBox?.width ?? 0) + 1
+          )
+        }
+        await capture(page, `setup-checks-failed-${size}-${width}-03.29`)
+
+        await page.getByTestId('setup-run-checks').click()
+        const sheet = page.getByTestId('sheet')
+        await expect(sheet).toHaveAttribute('data-presentation', 'here', {
+          timeout: PRESENTATION_DEADLINE
+        })
+        // The two buttons that decide are on the screen without scrolling, and the sheet is not
+        // wider than the window.
+        await expect(page.getByTestId('setup-checks-run')).toBeInViewport()
+        await expect(page.getByTestId('setup-checks-not-now')).toBeInViewport()
+        await inside('the sheet', sheet, true)
+        for (const control of ['setup-checks-run', 'setup-checks-not-now']) {
+          const box = await page.getByTestId(control).boundingBox()
+          expect(box?.height ?? 0, `${control} height`).toBeGreaterThan(35.9)
+          await inside(control, page.getByTestId(control), true)
+        }
+        await capture(page, `setup-checks-sheet-${size}-${width}-03.29`)
+      })
+    }
+  }
 
   test('draws in both colour modes from the same tokens', async ({ page }) => {
     await openSetup(page)

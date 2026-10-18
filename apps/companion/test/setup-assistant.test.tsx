@@ -11,7 +11,7 @@
  * checks that a capability nobody has established is never shown as one that works.
  */
 
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
@@ -21,6 +21,7 @@ import { AppProvider } from '../src/app/state'
 import { fakeHost, type FakeHostControls } from '../src/host/fake'
 import type { HostPort } from '../src/host/port'
 import { readableBytes } from '../src/setup/host'
+import { CHECKS_POLL_MS } from '../src/setup/Setup'
 
 /** Every operation the interface performed, in order. */
 function watched(port: HostPort): { port: HostPort; calls: string[] } {
@@ -210,12 +211,10 @@ describe('what the machine can do, and how that is known', () => {
   })
 
   it('declares what each check does before any of them is asked for', async () => {
-    start()
+    const { controls } = start()
     await screen.findByTestId('setup-identity')
     await goTo('capabilities')
-    const [explain] = screen.getAllByRole('button', { name: 'What the checks do' })
-    if (!explain) throw new Error('the assistant offers to explain the checks')
-    await userEvent.click(explain)
+    await userEvent.click(screen.getByTestId('setup-run-checks'))
     const effects = await screen.findByTestId('setup-effects')
     expect(effects.textContent).toMatch(/removes it before answering/)
     expect(effects.textContent).toMatch(/Selects nothing, moves nothing, clicks nothing/)
@@ -223,6 +222,11 @@ describe('what the machine can do, and how that is known', () => {
     expect(screen.getByTestId('sheet').textContent).toMatch(
       /None of them sends input to an application you did not ask about/
     )
+    expect(screen.getByTestId('sheet').textContent).toMatch(/macOS may ask you to allow something/)
+    // Being shown the list asked for nothing, and neither does leaving it.
+    expect(controls.checkRuns).toEqual([])
+    await userEvent.click(screen.getByTestId('setup-checks-not-now'))
+    expect(controls.checkRuns).toEqual([])
   })
 
   it('never says the count is complete while something is unchecked', async () => {
@@ -321,7 +325,7 @@ describe('what setup costs a person', () => {
     await screen.findByTestId('setup-panel-capabilities')
     await userEvent.click(screen.getByTestId('setup-recheck'))
     await waitFor(() => {
-      expect(screen.getByTestId('setup-recheck').textContent).toBe('Check again')
+      expect(screen.getByTestId('setup-recheck').textContent).toBe('Read again')
     })
 
     // The shell's own connection watch, event subscription and watch for owner confirmations are
@@ -365,6 +369,217 @@ describe('what setup costs a person', () => {
   })
 })
 
+describe('the checks, asked for from the sheet that lists them', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  async function nothingRunYet(): Promise<{ controls: FakeHostControls; calls: string[] }> {
+    const started = start()
+    await screen.findByTestId('setup-identity')
+    started.controls.setChecks({
+      state: 'not_run',
+      started_at_ms: null,
+      finished_at_ms: null,
+      session_id: null
+    })
+    await goTo('capabilities')
+    await userEvent.click(screen.getByTestId('setup-recheck'))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-checks-state').dataset.state).toBe('not_run')
+    })
+    return started
+  }
+
+  it('asks the host only from the button on the sheet, naming the environment and no file', async () => {
+    const { controls, calls } = await nothingRunYet()
+    await userEvent.click(screen.getByTestId('setup-run-checks'))
+    await screen.findByTestId('setup-effects')
+    expect(calls).not.toContain('environmentCapabilitiesCheck')
+    await userEvent.click(screen.getByTestId('setup-checks-run'))
+    await waitFor(() => {
+      expect(controls.checkRuns).toHaveLength(1)
+    })
+    expect(Object.keys(controls.checkRuns[0] ?? {})).toEqual(['environment_id'])
+    // The card behind the sheet says they are running, and the control that asks is not offered
+    // again until they have ended.
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-checks-state').dataset.state).toBe('running')
+    })
+    expect(screen.getByTestId('setup-checks-state').textContent).toMatch(
+      /macOS may ask you to allow something/
+    )
+    // The control on the card stays where the focus came back to; the run is not offered twice
+    // because the button on the list that starts it is not.
+    expect(screen.getByTestId('setup-run-checks')).toBeEnabled()
+    await userEvent.click(screen.getByTestId('setup-run-checks'))
+    expect(await screen.findByTestId('setup-checks-run')).toBeDisabled()
+    expect(screen.getByTestId('setup-checks-run').textContent).toBe('Running…')
+    expect(controls.checkRuns).toHaveLength(1)
+  })
+
+  it('offers the list of effects on the permissions step to be read and not to be run from', async () => {
+    const { controls } = start()
+    await screen.findByTestId('setup-identity')
+    await goTo('permissions')
+    await userEvent.click(screen.getByTestId('setup-explain-checks'))
+    await screen.findByTestId('setup-effects')
+    expect(screen.queryByTestId('setup-checks-run')).toBeNull()
+    expect(controls.checkRuns).toEqual([])
+  })
+
+  it('goes on asking where the run stands when the read after the start fails', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const { controls } = await nothingRunYet()
+    await userEvent.click(screen.getByTestId('setup-run-checks'))
+    // The host takes the request, and the next reading of this machine does not arrive.
+    controls.failNextCapabilities('the host did not answer')
+    await userEvent.click(await screen.findByTestId('setup-checks-run'))
+    await waitFor(() => {
+      expect(controls.checkRuns).toHaveLength(1)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-checks-state').dataset.state).toBe('running')
+    })
+    // So the page still knows a run is going, and finds out when it ends.
+    controls.setChecks({ state: 'current', finished_at_ms: '1700000060000' })
+    await vi.advanceTimersByTimeAsync(CHECKS_POLL_MS)
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-checks-state').dataset.state).toBe('current')
+    })
+  })
+
+  it('goes on asking where the run stands when the connection is lost after the host took the request', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const host = fakeHost()
+    // The host takes the request and the connection goes before anything is read again. A reading
+    // that finds no host leaves the page without records, and the run goes on all the same.
+    const port: HostPort = {
+      ...host.port,
+      environmentCapabilitiesCheck: async (params) => {
+        const settled = await host.port.environmentCapabilitiesCheck(params)
+        host.controls.setConnected(false)
+        return settled
+      }
+    }
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'setup' }}>
+        <App />
+      </AppProvider>
+    )
+    await screen.findByTestId('setup-identity')
+    host.controls.setChecks({
+      state: 'not_run',
+      started_at_ms: null,
+      finished_at_ms: null,
+      session_id: null
+    })
+    await goTo('capabilities')
+    await userEvent.click(screen.getByTestId('setup-recheck'))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-checks-state').dataset.state).toBe('not_run')
+    })
+    await userEvent.click(screen.getByTestId('setup-run-checks'))
+    await userEvent.click(await screen.findByTestId('setup-checks-run'))
+    await waitFor(() => {
+      expect(host.controls.checkRuns).toHaveLength(1)
+    })
+    await screen.findByText('No host is answering on this machine')
+    // The host is back, and the run ended while the page could not hear.
+    host.controls.setConnected(true)
+    host.controls.setChecks({ state: 'current', finished_at_ms: '1700000060000' })
+    await vi.advanceTimersByTimeAsync(CHECKS_POLL_MS * 2)
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-checks-state').dataset.state).toBe('current')
+    })
+    expect(host.controls.checkRuns).toHaveLength(1)
+  })
+
+  it('goes on asking where a run stands that another window started, when the connection is lost', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const { controls } = await nothingRunYet()
+    // The host is running the checks for somebody else, and this page reads that.
+    controls.setChecks({ state: 'running', started_at_ms: '1700000000000', finished_at_ms: null })
+    await userEvent.click(screen.getByTestId('setup-recheck'))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-checks-state').dataset.state).toBe('running')
+    })
+    // The connection goes while the person reads again, so the reading finds no host.
+    controls.setConnected(false)
+    await userEvent.click(screen.getByTestId('setup-recheck'))
+    await screen.findByText('No host is answering on this machine')
+    // It comes back, and the run ended meanwhile.
+    controls.setConnected(true)
+    controls.setChecks({ state: 'current', finished_at_ms: '1700000060000' })
+    await vi.advanceTimersByTimeAsync(CHECKS_POLL_MS * 2)
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-checks-state').dataset.state).toBe('current')
+    })
+    expect(controls.checkRuns).toEqual([])
+  })
+
+  it('stops saying no host answers once a later poll is answered', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const { controls } = await nothingRunYet()
+    await userEvent.click(screen.getByTestId('setup-run-checks'))
+    await userEvent.click(await screen.findByTestId('setup-checks-run'))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-checks-state').dataset.state).toBe('running')
+    })
+    // One poll is not answered; the next is.
+    controls.failNextCapabilities('the host did not answer')
+    await vi.advanceTimersByTimeAsync(CHECKS_POLL_MS)
+    await screen.findByText(/the host did not answer/i)
+    await vi.advanceTimersByTimeAsync(CHECKS_POLL_MS)
+    await waitFor(() => {
+      expect(screen.queryByText(/the host did not answer/i)).toBeNull()
+    })
+    expect(screen.getByTestId('setup-checks-state').dataset.state).toBe('running')
+  })
+
+  it('does not read the identity again, or count a reading, while it asks where a run stands', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const { controls, calls } = await nothingRunYet()
+    await userEvent.click(screen.getByTestId('setup-run-checks'))
+    await userEvent.click(await screen.findByTestId('setup-checks-run'))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-checks-state').dataset.state).toBe('running')
+    })
+    const identityReads = calls.filter((name) => name === 'setupIdentity').length
+    await vi.advanceTimersByTimeAsync(CHECKS_POLL_MS * 3)
+    expect(calls.filter((name) => name === 'setupIdentity')).toHaveLength(identityReads)
+    expect(controls.checkRuns).toHaveLength(1)
+  })
+
+  it('asks the host where a run stands while it runs, and stops once it has ended', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const { controls } = await nothingRunYet()
+    await userEvent.click(screen.getByTestId('setup-run-checks'))
+    await userEvent.click(await screen.findByTestId('setup-checks-run'))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-checks-state').dataset.state).toBe('running')
+    })
+    controls.setChecks({ state: 'current', finished_at_ms: '1700000060000' })
+    await vi.advanceTimersByTimeAsync(CHECKS_POLL_MS)
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-checks-state').dataset.state).toBe('current')
+    })
+    expect(controls.checkRuns).toHaveLength(1)
+  })
+
+  it('says why nothing ran, and that the checks need running again once something changed', async () => {
+    const { controls } = await nothingRunYet()
+    controls.setChecks({ state: 'failed', failure: 'no_session' })
+    await userEvent.click(screen.getByTestId('setup-recheck'))
+    const failed = await screen.findByText('The checks did not run')
+    expect(failed.parentElement?.textContent).toMatch(/start a session and run them again/)
+    controls.setChecks({ state: 'stale', failure: null })
+    await userEvent.click(screen.getByTestId('setup-recheck'))
+    const stale = await screen.findByText('The checks need running again')
+    expect(stale.parentElement?.textContent).toMatch(/a login, a session, an update or a tool/)
+  })
+})
+
 describe('when there is no host on this machine', () => {
   it('still says what this Mac will be asked for, in whole sentences', async () => {
     const host = fakeHost()
@@ -399,7 +614,7 @@ describe('what a restart is asked for, and what a record is about', () => {
     await goTo('capabilities')
     await userEvent.click(screen.getByTestId('setup-recheck'))
     await waitFor(() => {
-      expect(screen.getByTestId('setup-recheck').textContent).toBe('Check again')
+      expect(screen.getByTestId('setup-recheck').textContent).toBe('Read again')
     })
     expect(screen.getByTestId('setup-state-desktop.accessibility').textContent).toBe(
       'Permission required'

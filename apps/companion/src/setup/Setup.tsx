@@ -21,7 +21,9 @@
  * And nothing here does something on the person's behalf that they did not press. Every control
  * either reads, or opens a settings pane, or records a choice for the installation to act on, or
  * (on the descriptions card) asks the host to change a setting or start or stop a fetch and then
- * shows what the host says it did.
+ * shows what the host says it did, or (on the capabilities step) asks the host to perform the
+ * disclosed checks. That one is asked for only from the button on the sheet that lists what each
+ * check does, so nobody runs a check without having been shown it first.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react'
@@ -78,8 +80,9 @@ const DISCLOSED_CHECKS: readonly {
 }[] = [
   {
     name: 'Read a file you authorised',
-    performs: 'Opens the file you nominated and reads the first few thousand bytes of it.',
-    effect: 'Reads that file. Writes nothing.'
+    performs: 'Opens a file you chose and reads the first few thousand bytes of it.',
+    effect:
+      'Reads that file and writes nothing. With no file chosen it reads nothing and says so.'
   },
   {
     name: 'Take a screen image',
@@ -104,6 +107,29 @@ const DISCLOSED_CHECKS: readonly {
       'one it is not run at all, and nothing is claimed about it either way.'
   }
 ]
+
+/**
+ * How often the host is asked where the checks stand while they run.
+ *
+ * A run can take about two minutes, and the page does not hold a call open for it: asking starts
+ * the run and answers at once, and the answer to this question is what says when it ended.
+ */
+export const CHECKS_POLL_MS = 2_000
+
+/** What a person is told when a run established nothing, by the host's own word for why. */
+const CHECKS_FAILURE: Readonly<Record<string, string>> = {
+  no_session:
+    "No session of the kind this host creates is running. The checks run inside a session's own " +
+    'worker, which is the place an agent runs, so start a session and run them again.',
+  worker_refused:
+    "The session's worker answered with an error: it was already performing a run, could not " +
+    'start one, or its run did not finish. Run the checks again.',
+  worker_unreachable:
+    "The session's worker did not answer in time, or could not be reached. Run the checks again.",
+  worker_failed:
+    "The session's worker answered with something this application cannot use. Run the checks " +
+    'again.'
+}
 
 /** The five steps, in order. */
 const STEPS = [
@@ -192,6 +218,16 @@ export function Setup(): ReactNode {
   const [install, setInstall] = useState<Readonly<Record<string, boolean>>>({})
   const descriptions = useDescriptionSetup(port)
   const [effectsOpen, setEffectsOpen] = useState(false)
+  // Whether the list of effects was opened to run the checks from it, or only to be read. It stays
+  // as it was while the list leaves, so the buttons do not vanish from a sheet on its way out.
+  const [effectsRunnable, setEffectsRunnable] = useState(false)
+  // The request to run the checks is on its way to the host, and has not been answered yet.
+  const [asking, setAsking] = useState(false)
+  // The environment in which the host last said a run is going, until an answer says it is not. A
+  // reading that finds no host leaves the page without records, and a run goes on in the host all
+  // the same, so this is what keeps the page asking until the host answers again, whether the run
+  // was started here or somewhere else.
+  const [accepted, setAccepted] = useState<string | null>(null)
 
   /** One reading of everything this screen is about, with no state written in it. */
   const load = useCallback(async (): Promise<Reading> => {
@@ -214,6 +250,14 @@ export function Setup(): ReactNode {
   const apply = useCallback((reading: Reading) => {
     setIdentity(reading.identity)
     setCapabilities(reading.capabilities)
+    // A host that answers says whether a run is going. One that does not answer says nothing.
+    if (reading.capabilities !== null) {
+      setAccepted(
+        reading.capabilities.checks.state === 'running'
+          ? reading.capabilities.environment_id
+          : null
+      )
+    }
     setFailure(reading.failure)
     setReads((count) => count + 1)
     setLoaded(true)
@@ -247,6 +291,61 @@ export function Setup(): ReactNode {
         setReading(false)
       })
   }, [load, apply, refuse])
+
+  const environmentId = capabilities?.environment_id ?? null
+  const watching = accepted
+  const checking = watching !== null
+
+  // Asking starts the run and answers at once. The sheet closes on the press, so the card behind it
+  // is the one that says the checks are running.
+  const runChecks = useCallback(() => {
+    if (environmentId === null) return
+    setEffectsOpen(false)
+    setAsking(true)
+    port
+      .environmentCapabilitiesCheck({ environment_id: environmentId })
+      .then((settled) => {
+        // What the host answered is where the run stands, and it is kept before anything is read
+        // again: a read that fails next must not leave the page believing nothing was started.
+        const started = settled.value
+        if (started !== null) {
+          setCapabilities((current) => (current ? { ...current, checks: started } : current))
+          setAccepted(started.state === 'running' ? environmentId : null)
+        }
+      })
+      .then(() => load())
+      .then(apply)
+      .catch((error: unknown) => {
+        say(failureMessage(error), 'danger')
+      })
+      .finally(() => {
+        setAsking(false)
+      })
+  }, [port, environmentId, load, apply, say])
+
+  // While the host says a run is going, ask where it stands. The interval is cleared the moment
+  // the answer changes or the page goes, so nothing asks after the run has ended.
+  useEffect(() => {
+    if (watching === null) return undefined
+    const ask = async (): Promise<void> => {
+      try {
+        // Only the host's answer about the checks is asked for. Reading the identity again, and
+        // counting a reading of the records, are for a person who asked to read them.
+        const answer = await port.environmentCapabilities({ environment_id: watching })
+        setCapabilities(answer)
+        setFailure(null)
+        setAccepted(answer.checks.state === 'running' ? answer.environment_id : null)
+      } catch (error: unknown) {
+        refuse(error)
+      }
+    }
+    const timer = window.setInterval(() => {
+      void ask()
+    }, CHECKS_POLL_MS)
+    return () => {
+      window.clearInterval(timer)
+    }
+  }, [watching, port, refuse])
 
   const openPane = useCallback(
     (category: PermissionCategory) => {
@@ -343,6 +442,7 @@ export function Setup(): ReactNode {
             visited={visited}
             onOpenPane={openPane}
             onExplainChecks={() => {
+              setEffectsRunnable(false)
               setEffectsOpen(true)
             }}
           />
@@ -354,7 +454,8 @@ export function Setup(): ReactNode {
             reading={reading}
             loaded={loaded}
             onRead={reread}
-            onExplainChecks={() => {
+            onRunChecks={() => {
+              setEffectsRunnable(true)
               setEffectsOpen(true)
             }}
           />
@@ -404,6 +505,28 @@ export function Setup(): ReactNode {
         onClose={() => {
           setEffectsOpen(false)
         }}
+        footer={
+          effectsRunnable ? (
+            <>
+              <Button
+                onClick={() => {
+                  setEffectsOpen(false)
+                }}
+                data-testid="setup-checks-not-now"
+              >
+                Not now
+              </Button>
+              <Button
+                tone="primary"
+                onClick={runChecks}
+                disabled={asking || checking || environmentId === null}
+                data-testid="setup-checks-run"
+              >
+                {asking || checking ? 'Running…' : 'Run the checks'}
+              </Button>
+            </>
+          ) : null
+        }
       >
         <ul className="setup-effects" data-testid="setup-effects">
           {DISCLOSED_CHECKS.map((check) => (
@@ -416,7 +539,8 @@ export function Setup(): ReactNode {
         </ul>
         <p className="faint small">
           None of them sends input to an application you did not ask about, and none of them
-          changes anything you own.
+          changes anything you own. macOS may ask you to allow something while they run, and a run
+          can take about two minutes.
         </p>
       </Sheet>
     </div>
@@ -678,14 +802,14 @@ function CapabilitiesStep({
   reading,
   loaded,
   onRead,
-  onExplainChecks
+  onRunChecks
 }: {
   readonly capabilities: EnvironmentCapabilitiesResult | null
   readonly offered: (capability: string) => boolean
   readonly reading: boolean
   readonly loaded: boolean
   readonly onRead: () => void
-  readonly onExplainChecks: () => void
+  readonly onRunChecks: () => void
 }): ReactNode {
   if (!capabilities) {
     return (
@@ -729,14 +853,31 @@ function CapabilitiesStep({
             Being in this desktop is not evidence that anything can be done on it. Each answer
             below was established on its own.
           </p>
+          <ChecksLine checks={capabilities.checks} />
         </div>
         <footer className="card-footer setup-route">
-          <Button onClick={onExplainChecks}>What the checks do</Button>
-          <Button tone="primary" onClick={onRead} disabled={reading} data-testid="setup-recheck">
-            {reading ? 'Checking…' : 'Check again'}
+          <Button onClick={onRead} disabled={reading} data-testid="setup-recheck">
+            {reading ? 'Reading…' : 'Read again'}
+          </Button>
+          <Button tone="primary" onClick={onRunChecks} data-testid="setup-run-checks">
+            Run the checks…
           </Button>
         </footer>
       </Card>
+      {capabilities.checks.state === 'stale' ? (
+        <Banner
+          tone="warning"
+          title="The checks need running again"
+          detail="Something they were run against has changed: a login, a session, an update or a tool. The answers below are the ones the system gives, not what the checks found."
+        />
+      ) : null}
+      {capabilities.checks.state === 'failed' && capabilities.checks.failure ? (
+        <Banner
+          tone="warning"
+          title="The checks did not run"
+          detail={CHECKS_FAILURE[capabilities.checks.failure] ?? 'The host gave no reason.'}
+        />
+      ) : null}
 
       {capabilities.desktop.records.map((record) => (
         <CapabilityCard
@@ -747,6 +888,59 @@ function CapabilitiesStep({
       ))}
     </>
   )
+}
+
+/** Where the checks stand, in one line under the desktop. */
+function ChecksLine({
+  checks
+}: {
+  readonly checks: EnvironmentCapabilitiesResult['checks']
+}): ReactNode {
+  let line: string
+  switch (checks.state) {
+    case 'not_run':
+      return (
+        <p
+          className="faint small"
+          data-testid="setup-checks-state"
+          data-state="not_run"
+          aria-live="polite"
+        >
+          The checks have not been run, so the answers below are what the system says.
+        </p>
+      )
+    case 'running':
+      line =
+        "The checks are running in a session's worker. macOS may ask you to allow something " +
+        'while they do, and they can take about two minutes.'
+      break
+    case 'current':
+      line = `The checks ran at ${timeOf(checks.finished_at_ms)}.`
+      break
+    case 'stale':
+      line = 'The checks were run before something changed.'
+      break
+    case 'failed':
+      line = 'The latest run found nothing.'
+      break
+  }
+  return (
+    <p
+      className="faint small"
+      data-testid="setup-checks-state"
+      data-state={checks.state}
+      aria-live="polite"
+    >
+      {line}
+    </p>
+  )
+}
+
+/** A moment the host gave in milliseconds, as the person's own clock writes it. */
+function timeOf(milliseconds: string | null): string {
+  if (milliseconds === null) return 'a moment ago'
+  const at = new Date(Number(milliseconds))
+  return Number.isNaN(at.getTime()) ? 'a moment ago' : at.toLocaleTimeString()
 }
 
 function CapabilityCard({

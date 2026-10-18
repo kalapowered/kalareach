@@ -232,6 +232,8 @@ impl Host {
                 companion_tauri::commands::description_setup,
                 companion_tauri::commands::description_configure,
                 companion_tauri::commands::description_download,
+                companion_tauri::commands::environment_capabilities,
+                companion_tauri::commands::environment_capabilities_check,
                 companion_tauri::commands::question_kept,
                 companion_tauri::commands::question_settle,
             ])
@@ -1108,6 +1110,60 @@ fn setup_of(answer: Value) -> kr_protocol::describe::DescriptionSetup {
 /// The value a settled change carries.
 fn settled_value(settled: Value) -> Value {
     settled["value"].clone()
+}
+
+/// KR-REQ-10.01 and KR-REQ-03.29: the setup assistant asks for the disclosed checks through one
+/// command, naming the environment and no file. A parameter map with a file in it is refused before
+/// anything is sent, so the page cannot make the host read a path it chose. Asked as the page asks,
+/// on a host with no session to run them in, the host starts nothing and says why, and the next
+/// read of the capabilities says the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_disclosed_checks_are_asked_for_by_environment_alone() {
+    use kr_protocol::desktop::{
+        CapabilityChecks, CapabilityChecksFailure, CapabilityChecksState,
+        EnvironmentCapabilitiesResult,
+    };
+
+    let host = Host::start().await;
+    let environment = host.environment_id();
+    let refusal = host
+        .call(
+            "environment_capabilities_check",
+            json!({
+                "params": { "environment_id": environment, "authorised_file": "/etc/hosts" },
+                "subject": {}
+            }),
+        )
+        .await
+        .expect_err("a file the page named");
+    assert!(
+        !refused_by_the_host(&refusal),
+        "refused before it was sent: {refusal}"
+    );
+
+    let asked: CapabilityChecks = typed(settled_value(
+        host.call(
+            "environment_capabilities_check",
+            json!({ "params": { "environment_id": environment }, "subject": {} }),
+        )
+        .await
+        .expect("the checks are asked for"),
+    ));
+    assert_eq!(asked.state, CapabilityChecksState::Failed, "{asked:?}");
+    assert_eq!(
+        asked.failure.as_ref(),
+        Some(&CapabilityChecksFailure::NoSession),
+        "{asked:?}"
+    );
+    let shown: EnvironmentCapabilitiesResult = typed(
+        host.call(
+            "environment_capabilities",
+            json!({ "params": { "environment_id": environment } }),
+        )
+        .await
+        .expect("the capabilities"),
+    );
+    assert_eq!(shown.checks.state, CapabilityChecksState::Failed);
 }
 
 /// KR-REQ-22.01: the setup card, through the three commands it calls and with the parameters it

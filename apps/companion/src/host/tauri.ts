@@ -232,6 +232,8 @@ export function tauriPort(): HostPort {
     descriptionSetup: () => call('description_setup', {}),
     descriptionConfigure: (params) => mutate('description_configure', params, {}),
     descriptionDownload: (params) => mutate('description_download', params, {}),
+    environmentCapabilitiesCheck: (params) =>
+      mutate('environment_capabilities_check', params, {}),
 
     launchSurface: () => noAgreedShape('the launch surface'),
     shellLaunch: (params, subject) => mutate('shell_launch', params, subject),

@@ -18,11 +18,13 @@ import type {
   ActionRight,
   AttachmentSummary,
   AttachmentHandle,
+  CapabilityChecks,
   CapabilityRecord,
   ClosureRecord,
   DescriptionConfigureParams,
   DescriptionDownloadParams,
   DescriptionSetup,
+  EnvironmentCapabilitiesParams,
   EnvironmentCapabilitiesResult,
   EnvironmentListResult,
   HostInfoResult,
@@ -500,6 +502,8 @@ export interface FakeHostControls {
   reachAsPairedDevice(): void
   /** The next read of the host's sessions fails for a reason that is not a refusal. */
   failNextSessionList(message: string): void
+  /** The next read of what this machine can do fails for a reason that is not a refusal. */
+  failNextCapabilities(message: string): void
   /**
    * Reaches the host as a phone paired with it under the name `host`, holding `rights` (none by
    * default, as a guest does). The host tells what the phone is offered and holds, refuses the list
@@ -560,6 +564,14 @@ export interface FakeHostControls {
    * reader take a superseded answer for a current one.
    */
   grantPermission(capability: string): void
+  /**
+   * Where the disclosed checks stand on the host, as it would say after something outside this
+   * device changed it: a run ending, the findings going stale, a run that found nothing. The
+   * records are the ones the page is already shown.
+   */
+  setChecks(change: Partial<CapabilityChecks>): void
+  /** The runs of the disclosed checks the interface asked for, in order, as it asked. */
+  readonly checkRuns: readonly EnvironmentCapabilitiesParams[]
   /** Takes one capability's permission away again. */
   revokePermission(capability: string): void
   /** Makes this build's identity an unstable one, or a stable one again. */
@@ -956,6 +968,15 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   const deletedArtefacts = new Set<string>()
   const openedPanes: string[] = []
   let capabilityRevision = 4
+  // The checks ran a while ago, in a session, and nothing has ended what they found.
+  let checks: CapabilityChecks = {
+    state: 'current',
+    started_at_ms: '1700000000000',
+    finished_at_ms: '1700000060000',
+    session_id: '0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f',
+    failure: null
+  }
+  const checkRuns: EnvironmentCapabilitiesParams[] = []
   let identityStable = true
   const granted = new Set<string>([
     'desktop.application_launch',
@@ -1135,6 +1156,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   let sessionListRefused = false
   let attentionReadEmpty = false
   let sessionListFailure: string | null = null
+  let capabilitiesFailure: string | null = null
   let environmentListRefused = false
   /** Whether the host is one this device is paired with, not the one on its own computer. */
   let pairedDevice = false
@@ -1276,7 +1298,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     }
   }
   /** The two writes of description setup are the host's own to make: a paired device is refused. */
-  const requireLocalSocket = (change: 'a setting' | 'the download') => {
+  const requireLocalSocket = (change: 'a setting' | 'the download' | 'the checks') => {
     requireOwner()
     if (pairedDevice) {
       refuse(
@@ -1404,11 +1426,35 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
 
     environmentCapabilities: (params) => {
       requireConnection()
+      if (capabilitiesFailure !== null) {
+        const words = capabilitiesFailure
+        capabilitiesFailure = null
+        refuse('UPSTREAM_UNAVAILABLE', words)
+      }
       const asked = (params as { environment_id?: string } | null)?.environment_id
       if (asked && asked !== ENVIRONMENT) {
         refuse('NOT_FOUND', 'This host does not own that environment.')
       }
-      return Promise.resolve(capabilities(granted, capabilityRevision))
+      return Promise.resolve(capabilities(granted, capabilityRevision, checks))
+    },
+
+    environmentCapabilitiesCheck: (params) => {
+      requireLocalSocket('the checks')
+      if (params.environment_id !== ENVIRONMENT) {
+        refuse('INVALID_ARGUMENT', 'This host does not own that environment.')
+      }
+      checkRuns.push(params)
+      // A run already going is not started again; the answer says that it is going.
+      if (checks.state !== 'running') {
+        checks = {
+          state: 'running',
+          started_at_ms: String(Date.now()),
+          finished_at_ms: null,
+          session_id: checks.session_id,
+          failure: null
+        }
+      }
+      return Promise.resolve({ receipt: null, action_id: nextActionId(), value: { ...checks } })
     },
 
     setupIdentity: () => Promise.resolve(setupIdentity(identityStable, connected)),
@@ -2859,6 +2905,9 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     failNextSessionList(message) {
       sessionListFailure = message
     },
+    failNextCapabilities(message) {
+      capabilitiesFailure = message
+    },
     reachAsPhone(options) {
       pairedDevice = true
       rights = options?.rights ?? []
@@ -2951,6 +3000,10 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       granted.add(capability)
       capabilityRevision += 1
     },
+    setChecks(change) {
+      checks = { ...checks, ...change }
+    },
+    checkRuns,
     revokePermission(capability) {
       granted.delete(capability)
       capabilityRevision += 1
@@ -4539,7 +4592,11 @@ function capabilityRecord(
 }
 
 /** What this host answers `environment.capabilities` with. */
-function capabilities(granted: ReadonlySet<string>, revision: number): EnvironmentCapabilitiesResult {
+function capabilities(
+  granted: ReadonlySet<string>,
+  revision: number,
+  checks: CapabilityChecks
+): EnvironmentCapabilitiesResult {
   const record = (
     capability: string,
     permission: string,
@@ -4611,6 +4668,7 @@ function capabilities(granted: ReadonlySet<string>, revision: number): Environme
       pending_requests: '0',
       sessions_with_work: '0',
       since_ms: null
-    }
+    },
+    checks
   }
 }

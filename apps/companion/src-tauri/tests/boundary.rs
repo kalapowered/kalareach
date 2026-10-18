@@ -518,6 +518,13 @@ fn first_start_setup_has_two_commands_of_its_own_and_reads_the_capability_record
                 "the capabilities command performs one operation and names it"
             );
         }
+        if *command == "environment_capabilities_check" {
+            assert_eq!(
+                *method,
+                Some(kr_protocol::method::Method::EnvironmentCapabilitiesCheck),
+                "the checks command performs one operation and names it"
+            );
+        }
         if command.starts_with("setup_") {
             assert_eq!(
                 *method, None,

@@ -89,7 +89,7 @@ describe('the state one capability is shown as', () => {
     const waiting = record('desktop.screen_capture', 'permission_required')
     expect(displayState(waiting, { grantWasOffered: true })).toBe('restart_required')
     expect(stateMeaning('restart_required', 'disclosed_probe')).toMatch(
-      /opening KalaReach again is the next thing to try/i
+      /start a new session and run the checks again/i
     )
   })
 
