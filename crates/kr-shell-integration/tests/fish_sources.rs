@@ -24,6 +24,8 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use sha2::{Digest as _, Sha256};
+
 /// Where `scripts/place-shell-sources.sh` puts the sources by default.
 fn placed_sources() -> PathBuf {
     let prefix = if let Some(explicit) = std::env::var_os("KR_SHELL_PREFIX") {
@@ -143,6 +145,43 @@ impl Tree {
         edit(&mut manifest);
         fs::write(&path, serde_json::to_vec_pretty(&manifest).expect("JSON"))
             .expect("the manifest");
+    }
+
+    /// Replaces the release archive by one whose `Cargo.lock` `edit` has changed, and pins the new
+    /// archive's digest in this tree's manifest, so that the lock is the one thing that differs.
+    fn change_lock(&self, edit: impl FnOnce(String) -> String) {
+        let (archive, directory) = upstream(&self.root.join("shells/fish/manifest.json"));
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let unpacked = Command::new("tar")
+            .arg("-x")
+            .arg("-f")
+            .arg(self.sources.join(&archive))
+            .arg("-C")
+            .arg(scratch.path())
+            .status()
+            .expect("tar to run");
+        assert!(unpacked.success(), "tar could not unpack {archive}");
+        let lock = scratch.path().join(&directory).join("Cargo.lock");
+        let text = fs::read_to_string(&lock).expect("the lock");
+        fs::write(&lock, edit(text)).expect("the changed lock");
+        let packed = scratch.path().join("changed.tar.xz");
+        let repacked = Command::new("tar")
+            .env("COPYFILE_DISABLE", "1")
+            .env("XZ_OPT", "-1")
+            .arg("-c")
+            .arg("-J")
+            .arg("-f")
+            .arg(&packed)
+            .arg("-C")
+            .arg(scratch.path())
+            .arg(&directory)
+            .status()
+            .expect("tar to run");
+        assert!(repacked.success(), "tar could not pack {archive}");
+        let bytes = fs::read(&packed).expect("the new archive");
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        self.change_file(&archive, |_| bytes);
+        self.change_manifest(|manifest| manifest["upstream"]["sha256"] = serde_json::json!(digest));
     }
 
     fn manifest(&self) -> serde_json::Value {
@@ -337,4 +376,34 @@ fn a_repository_the_manifest_does_not_pin_is_refused() {
         pins.retain(|entry| entry["name"] != "fluent-rs");
     });
     assert_refused(&tree.check(), &revision);
+}
+
+/// A lock that takes a crate from a source the build does not place is refused by the source's
+/// name, though the archive holding it is the one the manifest pins.
+#[test]
+#[ignore = "needs the Fish sources placed; it runs with --include-ignored where they are, as continuous integration's shell-packages job does"]
+fn a_lock_that_names_another_source_is_refused() {
+    let tree = Tree::new();
+    tree.change_lock(|lock| {
+        lock.replacen(
+            "source = \"registry+https://github.com/rust-lang/crates.io-index\"",
+            "source = \"sparse+https://example.invalid/index/\"",
+            1,
+        )
+    });
+    assert_refused(&tree.check(), "example.invalid");
+}
+
+/// A lock written in a form the check does not read is refused, not read around: a dependency list
+/// that is closed with a comment is valid TOML, and it must not hide the packages after it.
+#[test]
+#[ignore = "needs the Fish sources placed; it runs with --include-ignored where they are, as continuous integration's shell-packages job does"]
+fn a_lock_the_check_cannot_read_is_refused() {
+    let tree = Tree::new();
+    tree.change_lock(|lock| {
+        let list = lock.find("dependencies = [\n").expect("a dependency list");
+        let close = list + lock[list..].find("\n]\n").expect("its end") + 2;
+        format!("{} # a note{}", &lock[..close], &lock[close..])
+    });
+    assert_refused(&tree.check(), "Cargo.lock");
 }
