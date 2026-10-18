@@ -1892,8 +1892,9 @@ impl Store {
 
     /// Records one action's outcome, leaving an existing row alone.
     ///
-    /// Returns the record that was already there, when another copy of the action recorded first.
-    /// That record is the answer both callers get: one action, one receipt.
+    /// Returns the record that was already there, when another copy of the action recorded first,
+    /// or an unknown outcome when another copy claimed the action and has recorded none. That
+    /// record is the answer both callers get: one action, one receipt.
     ///
     /// # Errors
     ///
