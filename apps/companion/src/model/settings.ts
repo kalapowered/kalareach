@@ -151,8 +151,8 @@ export function describeDevices(devices: DevicesView): string {
 
 /** Why this computer has not yet read the shared settings. */
 export const DEVICES_WAITING =
-  'The shared settings are sealed for devices that joined before this one. A device that already ' +
-  'has them seals them again when it next checks, and they appear here then.'
+  'The shared settings were sealed before this computer joined, or before a device was taken out. ' +
+  'A device that has them seals them again when it next checks, and they appear here then.'
 
 /** What the person is asked before a device is taken out of the shared settings. */
 export function describeTakingOut(name: string): string {
@@ -162,11 +162,18 @@ export function describeTakingOut(name: string): string {
   )
 }
 
-/** What an offer says of the device that shares it. */
+/** What an offer says of the device the settings were started on. */
 export function describeOffer(offer: DeviceOffer): string {
   return offer.name === null
-    ? 'Settings shared by another of your devices'
-    : `Settings shared by ${offer.name}`
+    ? 'Settings shared by your other devices'
+    : `Settings started on ${offer.name}`
+}
+
+/** What the control that joins an offer is called, for a screen reader. */
+export function offerLabel(offer: DeviceOffer): string {
+  return offer.name === null
+    ? 'Join the settings your other devices share'
+    : `Join the settings started on ${offer.name}`
 }
 
 /** Said under the button that starts settings sync, when another device already shares some. */

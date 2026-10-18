@@ -17,7 +17,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ReactNode, RefObject } from 'react'
 
-import type { DevicesView } from '../host/port'
+import type { DeviceMember, DevicesView } from '../host/port'
 import {
   DEVICES_CANNOT_CONFIRM,
   DEVICES_HELP,
@@ -27,6 +27,7 @@ import {
   describeDevices,
   describeHappened,
   describeOffer,
+  offerLabel,
   describeTakingOut,
   uniqueKeys
 } from '../model/settings'
@@ -57,22 +58,6 @@ export function SettingsDevices({
   readonly onJoin: (reference: string) => void
   readonly onDismiss: () => void
 }): ReactNode {
-  // The member the person is being asked about. Focus moves to the safe answer when the question
-  // opens, and back to the control that opened it when the person keeps the device.
-  const [asking, setAsking] = useState<string | null>(null)
-  const triggers = useRef(new Map<string, HTMLButtonElement>())
-  const keep = useRef<HTMLButtonElement | null>(null)
-  const returnTo = useRef<string | null>(null)
-  useEffect(() => {
-    if (asking !== null) {
-      keep.current?.focus()
-    } else if (returnTo.current !== null) {
-      triggers.current.get(returnTo.current)?.focus()
-      returnTo.current = null
-    }
-  }, [asking])
-  // A member that is gone by the next step is not asked about any more.
-  const askedStillMember = devices.members.some((member) => member.reference === asking)
   const outcomes = uniqueKeys(devices.outcomes.map(describeHappened))
   return (
     <>
@@ -99,70 +84,15 @@ export function SettingsDevices({
       </div>
       {devices.members.length > 0 ? (
         <ul className="device-list" data-testid="settings-devices-members">
-          {devices.members.map((member) => {
-            const isAsked = asking === member.reference && askedStillMember
-            return (
-              <li className="device-row" key={member.reference}>
-                <div className="device-words">
-                  <p className="account-lead">{member.name}</p>
-                  {!member.vouched ? <p className="account-note">{DEVICE_NOT_VOUCHED}</p> : null}
-                  {isAsked ? (
-                    <p className="account-note" data-testid="settings-devices-taking-out">
-                      {describeTakingOut(member.name)}
-                    </p>
-                  ) : null}
-                </div>
-                {member.this_computer ? null : isAsked ? (
-                  <div className="device-choice">
-                    <Button
-                      tone="danger"
-                      data-wraps
-                      disabled={busy}
-                      aria-label={`Take ${member.name} out now`}
-                      style={{ minBlockSize: target }}
-                      onClick={() => {
-                        setAsking(null)
-                        onRemove(member.reference)
-                      }}
-                    >
-                      Take out
-                    </Button>
-                    <Button
-                      data-wraps
-                      ref={keep}
-                      aria-label={`Keep ${member.name} in`}
-                      style={{ minBlockSize: target }}
-                      onClick={() => {
-                        returnTo.current = member.reference
-                        setAsking(null)
-                      }}
-                    >
-                      Keep
-                    </Button>
-                  </div>
-                ) : (
-                  <Button
-                    data-wraps
-                    ref={(element) => {
-                      if (element !== null) {
-                        triggers.current.set(member.reference, element)
-                      } else {
-                        triggers.current.delete(member.reference)
-                      }
-                    }}
-                    disabled={busy}
-                    aria-label={`Take ${member.name} out`}
-                    style={{ minBlockSize: target }}
-                    onClick={() => {
-                      setAsking(member.reference)
-                    }}
-                  >
-                    Take out
-                  </Button>
-                )}
-              </li>
-            )
-          })}
+          {devices.members.map((member) => (
+            <MemberRow
+              key={member.reference}
+              member={member}
+              busy={busy}
+              target={target}
+              onRemove={onRemove}
+            />
+          ))}
         </ul>
       ) : null}
       {devices.candidates.length > 0 ? (
@@ -206,7 +136,7 @@ export function SettingsDevices({
                   tone="primary"
                   data-wraps
                   disabled={busy || !devices.can_confirm}
-                  aria-label={`Join the ${describeOffer(offer).toLowerCase()}`}
+                  aria-label={offerLabel(offer)}
                   style={{ minBlockSize: target }}
                   onClick={() => {
                     onJoin(offer.reference)
@@ -247,5 +177,101 @@ export function SettingsDevices({
         ) : null}
       </div>
     </>
+  )
+}
+
+/**
+ * One device that holds the key. Taking it out asks once, in the row: the safe answer has focus
+ * when the question opens, and focus goes back to the control that asked when the person keeps the
+ * device. The row owns the question, so a device that goes (or comes back) does not leave it open.
+ */
+function MemberRow({
+  member,
+  busy,
+  target,
+  onRemove
+}: {
+  readonly member: DeviceMember
+  readonly busy: boolean
+  readonly target: number
+  readonly onRemove: (reference: string) => void
+}): ReactNode {
+  const [asking, setAsking] = useState(false)
+  const trigger = useRef<HTMLButtonElement | null>(null)
+  const keep = useRef<HTMLButtonElement | null>(null)
+  const refocus = useRef(false)
+  useEffect(() => {
+    if (asking) {
+      keep.current?.focus()
+    } else if (refocus.current) {
+      refocus.current = false
+      trigger.current?.focus()
+    }
+  }, [asking])
+  const keepIt = () => {
+    refocus.current = true
+    setAsking(false)
+  }
+  return (
+    <li className="device-row">
+      <div className="device-words">
+        <p className="account-lead">{member.name}</p>
+        {!member.vouched ? <p className="account-note">{DEVICE_NOT_VOUCHED}</p> : null}
+        {asking ? (
+          <p className="account-note" data-testid="settings-devices-taking-out">
+            {describeTakingOut(member.name)}
+          </p>
+        ) : null}
+      </div>
+      {member.this_computer ? null : asking ? (
+        <div
+          className="device-choice"
+          role="group"
+          aria-label={`Take ${member.name} out?`}
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') {
+              event.stopPropagation()
+              keepIt()
+            }
+          }}
+        >
+          <Button
+            tone="danger"
+            data-wraps
+            disabled={busy}
+            aria-label={`Take ${member.name} out now`}
+            style={{ minBlockSize: target }}
+            onClick={() => {
+              setAsking(false)
+              onRemove(member.reference)
+            }}
+          >
+            Take out
+          </Button>
+          <Button
+            data-wraps
+            ref={keep}
+            aria-label={`Keep ${member.name} in`}
+            style={{ minBlockSize: target }}
+            onClick={keepIt}
+          >
+            Keep
+          </Button>
+        </div>
+      ) : (
+        <Button
+          data-wraps
+          ref={trigger}
+          disabled={busy}
+          aria-label={`Take ${member.name} out`}
+          style={{ minBlockSize: target }}
+          onClick={() => {
+            setAsking(true)
+          }}
+        >
+          Take out
+        </Button>
+      )}
+    </li>
   )
 }

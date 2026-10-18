@@ -657,6 +657,32 @@ describe('the devices that share the settings', () => {
     })
   })
 
+  it('lets the person back out of the question about a device with Escape', async () => {
+    const { person, controls, sheet } = await openOnAccount()
+    act(() => {
+      controls.settings.change({
+        sync: {
+          ...sharing,
+          devices: {
+            ...sharing.devices,
+            members: [
+              ...sharing.devices.members,
+              { reference: 'phone', name: 'the-phone', this_computer: false, vouched: true }
+            ],
+            candidates: []
+          }
+        }
+      })
+    })
+    const card = await within(sheet).findByTestId('settings-devices')
+    await person.click(within(card).getByRole('button', { name: 'Take the-phone out' }))
+    expect(within(card).getByTestId('settings-devices-taking-out')).toBeInTheDocument()
+    await person.keyboard('{Escape}')
+    expect(within(card).queryByTestId('settings-devices-taking-out')).toBeNull()
+    expect(within(card).getByRole('button', { name: 'Take the-phone out' })).toHaveFocus()
+    expect(controls.settings.devicesAsked).not.toContain('remove phone')
+  })
+
   it('offers the settings another device shares to a computer that shares none, and joins on a press', async () => {
     const { person, controls, sheet } = await openOnAccount()
     act(() => {
@@ -668,9 +694,9 @@ describe('the devices that share the settings', () => {
     })
     const card = await within(sheet).findByTestId('settings-devices')
     expect(within(card).getByTestId('settings-devices-offer')).toBeInTheDocument()
-    expect(within(card).getByText('Settings shared by the-laptop')).toBeInTheDocument()
+    expect(within(card).getByText('Settings started on the-laptop')).toBeInTheDocument()
     await person.click(
-      within(card).getByRole('button', { name: 'Join the settings shared by the-laptop' })
+      within(card).getByRole('button', { name: 'Join the settings started on the-laptop' })
     )
     expect(controls.settings.devicesAsked).toContain('join c-1')
     await waitFor(() => {

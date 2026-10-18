@@ -156,7 +156,7 @@ test('shares with a device, takes one out and joins an offer from the keyboard a
   await press(card.getByRole('button', { name: 'Share settings with the-tablet-in-the-kitchen' }))
   await press(card.getByRole('button', { name: 'Take the-phone out' }))
   await press(card.getByRole('button', { name: 'Take the-phone out now' }))
-  await press(card.getByRole('button', { name: 'Join the settings shared by the-laptop' }))
+  await press(card.getByRole('button', { name: 'Join the settings started on the-laptop' }))
   await expect
     .poll(() => page.evaluate(() => window.krTestHost?.settings.devicesAsked))
     .toEqual(['refresh', 'share c', 'remove b', 'join o'])
