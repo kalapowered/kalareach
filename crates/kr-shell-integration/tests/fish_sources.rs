@@ -150,7 +150,16 @@ impl Tree {
     /// Replaces the release archive by one whose `Cargo.lock` `edit` has changed, and pins the new
     /// archive's digest in this tree's manifest, so that the lock is the one thing that differs.
     fn change_lock(&self, edit: impl FnOnce(String) -> String) {
+        let manifest = self.manifest();
         let (archive, directory) = upstream(&self.root.join("shells/fish/manifest.json"));
+        // The archive is unpacked only if it is the pinned one, and the lock is edited only if it
+        // is a file the unpacking made in the scratch directory.
+        let original = fs::read(self.sources.join(&archive)).expect("the placed archive");
+        assert_eq!(
+            hex(&Sha256::digest(&original)),
+            manifest["upstream"]["sha256"].as_str().expect("a digest"),
+            "the placed {archive} is not the pinned archive"
+        );
         let scratch = tempfile::tempdir().expect("a scratch directory");
         let unpacked = Command::new("tar")
             .arg("-x")
@@ -162,6 +171,10 @@ impl Tree {
             .expect("tar to run");
         assert!(unpacked.success(), "tar could not unpack {archive}");
         let lock = scratch.path().join(&directory).join("Cargo.lock");
+        assert!(
+            fs::symlink_metadata(&lock).expect("the lock").is_file(),
+            "the lock in {archive} is not a plain file"
+        );
         let text = fs::read_to_string(&lock).expect("the lock");
         fs::write(&lock, edit(text)).expect("the changed lock");
         let packed = scratch.path().join("changed.tar.xz");
@@ -179,7 +192,7 @@ impl Tree {
             .expect("tar to run");
         assert!(repacked.success(), "tar could not pack {archive}");
         let bytes = fs::read(&packed).expect("the new archive");
-        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let digest = hex(&Sha256::digest(&bytes));
         self.change_file(&archive, |_| bytes);
         self.change_manifest(|manifest| manifest["upstream"]["sha256"] = serde_json::json!(digest));
     }
@@ -232,6 +245,10 @@ impl Tree {
     }
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// The archive file name and the directory it unpacks to, from a manifest.
 fn upstream(manifest: &Path) -> (String, String) {
     let manifest: serde_json::Value =
@@ -270,10 +287,16 @@ fn said(output: &Output) -> String {
     )
 }
 
-/// The check refused: it exited with a failure and said which source.
+/// The check refused: it exited with a failure and said which source. The check is what refused:
+/// when it lets a source through, cargo's own import stops on the closed port, and says so in a
+/// line the check never prints.
 fn assert_refused(output: &Output, source: &str) {
     let said = said(output);
     assert!(!output.status.success(), "the check passed: {said}");
+    assert!(
+        !said.contains("cargo could not resolve"),
+        "cargo stopped it, not the check: {said}"
+    );
     assert!(
         said.contains(source),
         "the refusal does not name {source}: {said}"
