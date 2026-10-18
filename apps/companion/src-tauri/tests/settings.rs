@@ -3099,3 +3099,39 @@ async fn a_device_taken_out_does_not_read_what_is_written_afterwards() {
     );
     assert_eq!(view["sync"]["devices"]["out"], true, "{view}");
 }
+
+/// A device a host reports revoked is taken out of the shared settings at the next step, without
+/// asking the person: the key moves on, and the device reads nothing written after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_a_host_reports_revoked_is_taken_out_at_the_next_step() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    page.choose("dark");
+    let phone = other.start();
+    let shown = page.devices_refresh();
+    page.share(&first_reference(&shown["candidates"]))
+        .expect("shared");
+    let offers = phone.devices_refresh();
+    phone
+        .join(&first_reference(&offers["offers"]))
+        .expect("joined");
+    page.sync_now();
+    assert_eq!(phone.sync_now()["colour_mode"], "dark");
+
+    // The host revokes the phone. Both computers' hosts say so.
+    let mut revoked = other.listed("the-phone");
+    revoked.revoked = true;
+    let devices = vec![this.listed("this-mac"), revoked];
+    this.hosts.list(devices.clone());
+    other.hosts.list(devices);
+    page.choose("light");
+    let view = page.sync_now();
+    let members = view["sync"]["devices"]["members"]
+        .as_array()
+        .expect("members");
+    assert_eq!(members.len(), 1, "{view}");
+
+    let view = phone.sync_now();
+    assert_eq!(view["colour_mode"], "dark", "{view}");
+    assert_eq!(view["sync"]["devices"]["out"], true, "{view}");
+}

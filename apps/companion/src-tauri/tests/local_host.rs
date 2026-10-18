@@ -494,6 +494,24 @@ async fn review_state_and_a_change_set_are_read_on_the_host() {
     assert!(refused_by_the_host(&refusal), "{refusal}");
 }
 
+/// KR-REQ-20.13: settings sync asks the host this computer is connected to which devices it lists,
+/// with the parameters the host reads and the shape the host answers, so that a device it lists
+/// can be given the key of the shared settings. A host nothing is paired with lists none.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_connected_host_is_asked_which_devices_it_lists() {
+    use companion_tauri::settings::Hosts as _;
+
+    let host = Host::start().await;
+    let hosts =
+        companion_tauri::settings::connected::ConnectedHosts::new(host.app.handle().clone());
+    let lists = hosts.device_lists().await;
+    assert_eq!(lists.len(), 1, "the host answered once: {lists:?}");
+    assert!(
+        lists[0].devices.is_empty(),
+        "nothing is paired with a new host: {lists:?}"
+    );
+}
+
 /// KR-REQ-25.08: the devices an invitation can go to and the grants issued are read on the host,
 /// and an invitation to a device this host never paired is the host's refusal, after the command
 /// took the page's shape.
