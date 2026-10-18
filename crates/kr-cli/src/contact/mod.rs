@@ -561,7 +561,7 @@ impl Contact {
             return Err(asked_nothing());
         }
         let bound = self.session().await?;
-        let mut client = bind::open(&bound, self.build_id.clone()).await?;
+        let mut client = bind::open_for_a_call(&bound, self.build_id.clone()).await?;
         let request = QuestionCreateParams {
             session_id: bound.session_id(),
             request_id: params.request_id,
@@ -650,7 +650,7 @@ impl Contact {
         let bound = self.session().await?;
         let question_id = parse_question(&params.question_id)?;
         let token = decode_token(&params.caller_token)?;
-        let mut client = bind::open(&bound, self.build_id.clone()).await?;
+        let mut client = bind::open_for_a_call(&bound, self.build_id.clone()).await?;
         let wait = poll_duration(params.wait_seconds.map(seconds));
         let question = match self
             .poll(&bound, &mut client, question_id, &token, wait, cancelled)
@@ -666,7 +666,7 @@ impl Contact {
         let bound = self.session().await?;
         let question_id = parse_question(&params.question_id)?;
         let token = decode_token(&params.caller_token)?;
-        let mut client = bind::open(&bound, self.build_id.clone()).await?;
+        let mut client = bind::open_for_a_call(&bound, self.build_id.clone()).await?;
         let result: QuestionOwnResult = bind::mutate(
             &mut client,
             Method::QuestionCancelOwn,
@@ -683,7 +683,7 @@ impl Contact {
 
     async fn notify(&self, params: SendNotificationParams) -> crate::error::Result<CallToolResult> {
         let bound = self.session().await?;
-        let mut client = bind::open(&bound, self.build_id.clone()).await?;
+        let mut client = bind::open_for_a_call(&bound, self.build_id.clone()).await?;
         let result: AlertCreateResult = bind::mutate(
             &mut client,
             Method::AlertCreate,
@@ -805,7 +805,7 @@ impl Contact {
         question_id: QuestionId,
         token: &CallerToken,
     ) -> crate::error::Result<Question> {
-        let mut client = bind::open(bound, self.build_id.clone()).await?;
+        let mut client = bind::open_for_a_call(bound, self.build_id.clone()).await?;
         let cancelled: crate::error::Result<QuestionOwnResult> = bind::mutate(
             &mut client,
             Method::QuestionCancelOwn,
@@ -848,20 +848,6 @@ impl Contact {
             return Ok(bound.clone());
         }
         let bound = bind::discover(&self.build_id).await?;
-        // A worker of another release answers in a shape these tools do not read, and no tool of
-        // its release was started in their place: each call says so and creates nothing.
-        if let Some(stated) = crate::helper::stated_by(&bound.descriptor).await
-            && let Some(other) = crate::helper::Other::of(stated.build.as_ref())
-        {
-            return Err(CliError::Refused(kr_client::error::refusal(
-                ErrorCode::UnsupportedSchema,
-                crate::helper::Unread {
-                    display: bound.descriptor.display_number.get(),
-                    other,
-                }
-                .said("agent-tools"),
-            )));
-        }
         *held = Some(bound.clone());
         Ok(bound)
     }

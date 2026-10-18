@@ -62,6 +62,32 @@ pub async fn open(bound: &Bound, build_id: BuildId) -> Result<LocalClient> {
     crate::resolve::open_worker(&bound.descriptor, build_id).await
 }
 
+/// Connects to a worker for a tool call, and refuses a worker of another release.
+///
+/// Discovery sends every worker the probe whose shape never changes, so it opens a worker of any
+/// level with [`open`]. A call writes in the shape of this release: a worker of another level
+/// answers in a shape the tools do not read, and no tool of its release was started in their
+/// place, so the call says so and sends nothing.
+///
+/// # Errors
+///
+/// Returns an error when the endpoint cannot be reached or the challenge fails, and
+/// [`CliError::Refused`] with `UNSUPPORTED_SCHEMA` for a worker of another level.
+pub async fn open_for_a_call(bound: &Bound, build_id: BuildId) -> Result<LocalClient> {
+    let client = open(bound, build_id).await?;
+    if let Some(other) = crate::helper::Other::of(client.acknowledgement().build.as_ref()) {
+        return Err(CliError::Refused(kr_client::error::refusal(
+            ErrorCode::UnsupportedSchema,
+            crate::helper::Unread {
+                display: bound.descriptor.display_number.get(),
+                other,
+            }
+            .said("agent-tools"),
+        )));
+    }
+    Ok(client)
+}
+
 /// Finds the session this process is running in.
 ///
 /// Every live session is a candidate, and the session named by `KR_SESSION` is tried first. A
