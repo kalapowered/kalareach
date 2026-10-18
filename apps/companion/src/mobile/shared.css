@@ -75,12 +75,6 @@
   background: transparent;
 }
 
-/* What a row says beside its title when there is more than one thing to say. */
-.sw-row-lines {
-  display: grid;
-  gap: var(--gap-1);
-}
-
 /* The row that stands for what the person put off, and the row that stands for attempts they hid. */
 .m-row.sw-quiet {
   display: flex;

@@ -24,9 +24,9 @@ const SIZES = [
 
 /**
  * The letters the page is drawn in. The system's own face differs from one platform to the next, and
- * a layout that holds only for the widths of the face it was drawn with does not hold: the second is
- * about as wide as the faces a desktop browser or the Linux runner draws with (Verdana, or DejaVu
- * Sans where Verdana is not installed), which are wider than a phone's own.
+ * a layout that holds only for the widths of the face it was drawn with does not hold. The second
+ * face is Verdana, or DejaVu Sans where Verdana is not installed; DejaVu Sans is also the face the
+ * Linux runner draws the page in. Both are wider than the system face of a phone or of a Mac.
  */
 const FACES = [
   { suffix: '', shot: '', css: null },
@@ -279,8 +279,8 @@ for (const surface of ['ios', 'android'] as const) {
             await page.getByTestId('accept-offer').click()
             await expect(page.getByTestId('sheet')).toBeHidden()
           }
-          // The toast that says so is held while the pointer rests on it, and it lies over the tab bar.
-          await page.mouse.move(2, 2)
+          // The toast that says so lies over the tab bar: it is taken away.
+          await page.locator('.toast').getByRole('button', { name: 'Dismiss' }).click()
           await expect(page.locator('.toast')).toBeHidden()
           await page.getByRole('button', { name: 'Sessions', exact: true }).click()
           const shared = page.getByTestId('shared-with-you')
