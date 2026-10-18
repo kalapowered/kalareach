@@ -510,6 +510,7 @@ textarea::placeholder {
   margin-bottom: 18px;
   font-size: 0.75rem;
   font-weight: 500;
+  overflow-wrap: anywhere;
 }
 
 .form-field input,
@@ -529,6 +530,7 @@ textarea::placeholder {
   font-size: 0.6875rem;
   line-height: 1.65;
   font-weight: 400;
+  overflow-wrap: anywhere;
 }
 
 /* ---- Surfaces ------------------------------------------------------------------------------- */
@@ -1058,7 +1060,7 @@ textarea::placeholder {
   font-size: 0.9375rem;
   line-height: 1.45;
   color: var(--text);
-  /* A service's host is one word to a line, and at the largest text size a word is wider than the card. */
+  /* A service's host has no place a line can break, and at the largest text size it is wider than the card. */
   overflow-wrap: anywhere;
 }
 

@@ -277,6 +277,7 @@ export function SyncPanel({
             {service !== null ? (
               <Button
                 data-testid="change-sync-service"
+                data-wraps
                 aria-expanded={changing}
                 style={{ minBlockSize: target }}
                 onClick={() => {
@@ -288,6 +289,7 @@ export function SyncPanel({
               </Button>
             ) : (
               <Button
+                data-wraps
                 disabled={busy}
                 style={{ minBlockSize: target }}
                 onClick={() => {
@@ -332,6 +334,7 @@ export function SyncPanel({
                   type="submit"
                   tone="primary"
                   data-testid="save-sync-service"
+                  data-wraps
                   disabled={busy}
                   style={{ minBlockSize: target }}
                 >

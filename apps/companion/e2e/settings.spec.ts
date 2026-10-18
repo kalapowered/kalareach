@@ -10,7 +10,7 @@
  * Every screenshot goes under `/tmp`, named for the engine and the case.
  */
 
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Locator, type Page } from '@playwright/test'
 
 import { overrunning, stopWrapping } from './layout'
 
@@ -183,13 +183,11 @@ test('answers a press with a small scale, and not when the person asked for less
 // text across a line than the faces of the Mac or the phone do, so a heading that fits there can
 // run past its box on the runner. Verdana is as wide and every Mac has it: these cases put the
 // page in it, with DejaVu Sans after it for the machine that has none.
-const WIDE_FACE =
-  ':root { --font-ui: Verdana, "DejaVu Sans", sans-serif !important; ' +
-  '--font-mono: Menlo, "DejaVu Sans Mono", monospace !important; }'
+const WIDE_FACE = ':root { --font-ui: Verdana, "DejaVu Sans", sans-serif !important; }'
 
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
-/** A service host with nothing in it a line may break at, as a company's own might be. */
+/** A service host with no short place to break a line, as a company's own might be. */
 const LONG_HOST = 'settings.synchronisation.example-company.com'
 
 /** Opens the harness on the narrowest phone at the largest text size, in the widest face. */
@@ -199,6 +197,26 @@ async function atTheLargestSizeInAWideFace(page: Page, surface: 'ios' | 'android
   await page.goto(`/harness.html?surface=${surface}${address}`)
   await page.addStyleTag({ content: WIDE_FACE })
   await page.waitForSelector('.m-shell')
+  // The face is the one drawn, not only the one named: a machine with neither face would set the
+  // page in the fallback, narrower than either, and the measures below would pass for nothing.
+  const wider = await page.evaluate(() => {
+    const context = document.createElement('canvas').getContext('2d')
+    if (context === null) return false
+    const sample = 'Your settings are kept in step through the sync service'
+    context.font = '16px Verdana, "DejaVu Sans", monospace'
+    const wide = context.measureText(sample).width
+    context.font = '16px monospace'
+    return wide !== context.measureText(sample).width
+  })
+  expect(wider, 'a wide face is installed').toBe(true)
+}
+
+/** Photographs the whole of `element`: the window is made as tall as it is, so no bar lies across it. */
+async function photograph(page: Page, element: Locator, path: string): Promise<void> {
+  const view = page.viewportSize()
+  const height = await element.evaluate((each) => each.getBoundingClientRect().height)
+  if (view !== null) await page.setViewportSize({ width: view.width, height: Math.ceil(height) + view.height })
+  await element.screenshot({ path })
 }
 
 for (const surface of ['ios', 'android'] as const) {
@@ -223,7 +241,6 @@ for (const surface of ['ios', 'android'] as const) {
           sync: {
             state: 'on',
             kept_at: host,
-            outstanding: 1,
             paused: true,
             conflicts: waiting.others.length,
             problem: 'The sync service could not be reached, so nothing was sent or received.'
@@ -237,12 +254,15 @@ for (const surface of ['ios', 'android'] as const) {
     await expect(card.getByTestId('settings-choice')).toBeVisible()
     await expect(card.getByTestId('settings-sync-status')).toHaveCSS('font-family', /Verdana/)
 
-    const roots = ['[data-testid="settings-sync"]', '.account-section-title']
+    // The whole panel, so what the cards around the settings say is held too: the account's own
+    // sign-in line and the service card, whose change form is open.
+    await page.getByTestId('change-sync-service').click()
+    await expect(page.getByTestId('sync-service-input')).toBeVisible()
+    const roots = ['[data-testid="account-panel"]', '.account-section-title']
     for (const root of roots) {
       expect(await overrunning(page, root), `lines of ${root} that run past the screen or their box`).toEqual([])
     }
-    await card.scrollIntoViewIfNeeded()
-    await page.screenshot({ path: shot(`wide-card-${surface}`), fullPage: true })
+    await photograph(page, card, shot(`wide-card-${surface}`))
     // The control: with the text kept from wrapping, the same measure sees the card run out.
     await stopWrapping(page, roots)
     expect(await overrunning(page, roots[0] ?? ''), 'the measure sees text that cannot wrap').not.toEqual([])
@@ -271,7 +291,7 @@ for (const surface of ['ios', 'android'] as const) {
     for (const root of roots) {
       expect(await overrunning(page, root), `lines of ${root} that run past the screen or their box`).toEqual([])
     }
-    await page.screenshot({ path: shot(`wide-appearance-${surface}`) })
+    await photograph(page, sheet, shot(`wide-appearance-${surface}`))
     await stopWrapping(page, roots)
     expect(await overrunning(page, roots[0] ?? ''), 'the measure sees text that cannot wrap').not.toEqual([])
   })
