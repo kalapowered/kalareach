@@ -455,6 +455,9 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         })
         await expect(page.getByRole('button', { name: 'Start voice session' })).toBeEnabled()
         await expect(page.getByRole('button', { name: 'Ending…' })).toHaveCount(0)
+        // The words that had focus are gone with the start, and focus is on the control that starts
+        // again, not on the page.
+        await expect(page.getByRole('button', { name: 'Start voice session' })).toBeFocused()
       })
     }
 

@@ -710,10 +710,14 @@ describe('while a call is running', () => {
 
     answer()
 
-    expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeEnabled()
+    const again = await screen.findByRole('button', { name: 'Start voice session' })
+    expect(again).toBeEnabled()
     expect(screen.queryByRole('button', { name: 'Ending…' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'End the call' })).not.toBeInTheDocument()
     expect(screen.getByText(/given up before it began/)).toBeInTheDocument()
+    // The words that had focus are gone with the start, and focus is on the control that starts
+    // again, not on the page.
+    expect(again).toHaveFocus()
   })
 
   // The end is offered while the start waits for the host and no longer: once the host has answered

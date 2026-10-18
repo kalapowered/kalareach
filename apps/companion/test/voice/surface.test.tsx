@@ -199,6 +199,12 @@ describe('before voice starts', () => {
       />
     )
     expect(screen.getByText(/is ending its call/)).toHaveFocus()
+
+    // The start is over: the words are gone, and focus is on the control that starts again.
+    rerender(
+      <VoiceSurface choice={choice()} call={null} currentTurn={null} busy={false} notice={null} actions={acted} />
+    )
+    expect(screen.getByRole('button', { name: 'Start voice session' })).toHaveFocus()
   })
 
   // Once the end has begun there is nothing more to ask: the control says so and cannot be pressed

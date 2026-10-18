@@ -276,18 +276,26 @@ function ProviderChoiceScreen({
   // disabled and then gone, a keyboard or screen-reader user would be sent back to the top of the
   // document. It goes there without the jump that focus makes to the middle of the screen, and the
   // words are brought into view by as little as it takes, as the control was. A stop the device
-  // refuses brings the control back, and focus goes back to it.
+  // refuses brings the control back, and focus goes back to it. When the start is over the words
+  // go too, and focus goes to the control that starts again, which the choice is the person's to
+  // make with.
   const endingNote = useRef<HTMLParagraphElement | null>(null)
-  const wasEnding = useRef(false)
+  const startControl = useRef<HTMLButtonElement | null>(null)
+  const focusIsOnTheNote = useRef(false)
   useEffect(() => {
-    if (waiting && ending && !wasEnding.current) {
+    if (waiting && ending && !focusIsOnTheNote.current) {
+      focusIsOnTheNote.current = true
       endingNote.current?.focus({ preventScroll: true })
       endingNote.current?.scrollIntoView({ block: 'nearest' })
-    } else if (waiting && !ending && wasEnding.current) {
+    } else if (waiting && !ending && focusIsOnTheNote.current) {
+      focusIsOnTheNote.current = false
       end.current?.focus({ preventScroll: true })
+    } else if (!waiting && !busy && focusIsOnTheNote.current) {
+      focusIsOnTheNote.current = false
+      startControl.current?.focus({ preventScroll: true })
+      startControl.current?.scrollIntoView({ block: 'nearest' })
     }
-    wasEnding.current = ending
-  }, [ending, waiting])
+  }, [busy, ending, waiting])
   const terms = choice.managed
   const seconds = terms ? requestedSeconds(terms) : null
   const startable = terms !== null && terms.enabled && seconds !== null
@@ -423,6 +431,7 @@ function ProviderChoiceScreen({
         <div className="kr-voice__begin">
           <button
             type="button"
+            ref={startControl}
             className="kr-voice__start"
             onClick={onStart}
             disabled={busy}
