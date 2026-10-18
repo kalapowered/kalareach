@@ -1564,6 +1564,421 @@ pub const CASE_TABLES: &[CaseTable] = &[
     },
 ];
 
+/// How the keyed tests of one target that an ordinary run leaves out (`#[ignore]`) get run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IgnoredRun {
+    /// The package.
+    pub package: &'static str,
+    /// The target, as the flag that selects it: `--lib`, `--test fence`, `--bench input_latency`.
+    pub target: &'static str,
+    /// The tests this covers, by the names the map gives them (module path included); every keyed
+    /// ignored test of the target when empty.
+    pub cases: &'static [&'static str],
+    /// Where they run.
+    pub runs: Runs,
+}
+
+/// Where tests that an ordinary run leaves out are run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Runs {
+    /// A command in a file of the repository: one block of its lines, with no blank line between
+    /// them and the continuations joined, holds every one of `fragments`. The words that make it a
+    /// command that runs ignored tests are among them.
+    Command {
+        /// The file, relative to the repository.
+        file: &'static str,
+        /// The words the command holds.
+        fragments: &'static [&'static str],
+    },
+    /// No step of this repository runs them: they are run by hand, where the hardware or the
+    /// account they need is. The map shows each such entry on every run, so it stays seen.
+    ByHand {
+        /// Why no step runs them.
+        why: &'static str,
+    },
+}
+
+/// The steps that run the keyed tests an ordinary run leaves out.
+pub const IGNORED_RUNS: &[IgnoredRun] = &[
+    IgnoredRun {
+        package: "kr-shell-integration",
+        target: "--test bash",
+        cases: &[],
+        runs: Runs::Command {
+            file: ".github/workflows/core-ci.yml",
+            fragments: &[
+                "-p kr-shell-integration",
+                "--test bash",
+                "--include-ignored",
+            ],
+        },
+    },
+    IgnoredRun {
+        package: "kr-shell-integration",
+        target: "--test fish",
+        cases: &[],
+        runs: Runs::Command {
+            file: ".github/workflows/core-ci.yml",
+            fragments: &[
+                "-p kr-shell-integration",
+                "--test fish",
+                "--include-ignored",
+            ],
+        },
+    },
+    IgnoredRun {
+        package: "kr-shell-integration",
+        target: "--test module_abi",
+        cases: &[],
+        runs: Runs::Command {
+            file: ".github/workflows/core-ci.yml",
+            fragments: &[
+                "-p kr-shell-integration",
+                "--test module_abi",
+                "--include-ignored",
+            ],
+        },
+    },
+    IgnoredRun {
+        package: "kr-shell-integration",
+        target: "--test pwsh",
+        cases: &[],
+        runs: Runs::Command {
+            file: ".github/workflows/core-ci.yml",
+            fragments: &[
+                "-p kr-shell-integration",
+                "--test pwsh",
+                "--include-ignored",
+            ],
+        },
+    },
+    IgnoredRun {
+        package: "kr-shell-integration",
+        target: "--test relocation",
+        cases: &[],
+        runs: Runs::Command {
+            file: ".github/workflows/core-ci.yml",
+            fragments: &[
+                "-p kr-shell-integration",
+                "--test relocation",
+                "--include-ignored",
+            ],
+        },
+    },
+    IgnoredRun {
+        package: "kr-shell-integration",
+        target: "--test zsh",
+        cases: &[],
+        runs: Runs::Command {
+            file: ".github/workflows/core-ci.yml",
+            fragments: &["-p kr-shell-integration", "--test zsh", "--include-ignored"],
+        },
+    },
+    IgnoredRun {
+        package: "kr-shell-integration",
+        target: "--test install_homes",
+        cases: &[],
+        runs: Runs::Command {
+            file: ".github/workflows/core-ci.yml",
+            fragments: &[
+                "-p kr-shell-integration",
+                "--test install_homes",
+                "--include-ignored",
+            ],
+        },
+    },
+    IgnoredRun {
+        package: "kr-shell-integration",
+        target: "--test qualification",
+        cases: &[],
+        runs: Runs::Command {
+            file: ".github/workflows/core-ci.yml",
+            fragments: &[
+                "-p kr-shell-integration",
+                "--test qualification",
+                "--include-ignored",
+            ],
+        },
+    },
+    IgnoredRun {
+        package: "kr-shell-integration",
+        target: "--lib",
+        cases: &[],
+        runs: Runs::Command {
+            file: ".github/workflows/core-ci.yml",
+            fragments: &[
+                "-p kr-shell-integration",
+                "--lib host::startup::",
+                "--include-ignored",
+            ],
+        },
+    },
+    IgnoredRun {
+        package: "kr-shell-integration",
+        target: "--test pwsh_windows",
+        cases: &[],
+        runs: Runs::ByHand {
+            why: "it needs a second local account, and runs on the Windows test machine",
+        },
+    },
+    IgnoredRun {
+        package: "kr-client",
+        target: "--lib",
+        cases: &[
+            "sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again",
+        ],
+        runs: Runs::Command {
+            file: ".github/workflows/core-ci.yml",
+            fragments: &["-p kr-client", "--lib", "--ignored", "--exact"],
+        },
+    },
+    IgnoredRun {
+        package: "kr-changeset",
+        target: "--test capture",
+        cases: &[],
+        runs: Runs::Command {
+            file: ".github/workflows/core-ci.yml",
+            fragments: &["cargo test", "--ignored", "--exact"],
+        },
+    },
+    IgnoredRun {
+        package: "kr-transfer",
+        target: "--test authority",
+        cases: &[],
+        runs: Runs::Command {
+            file: ".github/workflows/core-ci.yml",
+            fragments: &["cargo test", "--ignored", "--exact"],
+        },
+    },
+    IgnoredRun {
+        package: "kr-project",
+        target: "--test workspaces",
+        cases: &[],
+        runs: Runs::Command {
+            file: ".github/workflows/core-ci.yml",
+            fragments: &["cargo test", "--ignored", "--exact"],
+        },
+    },
+    IgnoredRun {
+        package: "kr-changeset",
+        target: "--test apply",
+        cases: &[],
+        runs: Runs::ByHand {
+            why: "they need a repository tool, which the repository boundary on Windows refuses to run, so no host runs them yet",
+        },
+    },
+    IgnoredRun {
+        package: "kr-cli",
+        target: "--test startup_windows",
+        cases: &[
+            "a_cleanup_that_cannot_withdraw_a_request_fails_the_test_that_left_it",
+            "the_daemon_the_task_starts_is_in_none_of_the_callers_jobs",
+            "three_first_invocations_at_once_leave_one_daemon_that_serves_every_caller",
+        ],
+        runs: Runs::Command {
+            file: ".github/workflows/core-ci.yml",
+            fragments: &["-p kr-cli", "--test startup_windows", "--ignored"],
+        },
+    },
+    IgnoredRun {
+        package: "kr-cli",
+        target: "--test startup_windows",
+        cases: &["a_kr_new_in_the_job_its_parent_built"],
+        runs: Runs::Command {
+            file: "crates/kr-cli/tests/startup_windows.rs",
+            fragments: &["\"--exact\"", "\"--ignored\""],
+        },
+    },
+    IgnoredRun {
+        package: "kr-cli",
+        target: "--test startup_windows",
+        cases: &["a_task_the_task_scheduler_does_not_start_is_named_with_where_to_sign_in"],
+        runs: Runs::ByHand {
+            why: "it needs an account signed in to no session, which no step of this repository arranges",
+        },
+    },
+    IgnoredRun {
+        package: "kr-conformance",
+        target: "--test applications",
+        cases: &[],
+        runs: Runs::Command {
+            file: "tests/conformance/src/plan.rs",
+            fragments: &["\"applications\"", "\"--ignored\""],
+        },
+    },
+    IgnoredRun {
+        package: "kr-conformance",
+        target: "--test report",
+        cases: &["typescript_comment_forms_and_titles_key_their_tests"],
+        runs: Runs::Command {
+            file: "tests/conformance/src/plan.rs",
+            fragments: &[
+                "\"--ignored\"",
+                "typescript_comment_forms_and_titles_key_their_tests",
+            ],
+        },
+    },
+    IgnoredRun {
+        package: "kr-controller",
+        target: "--test network",
+        cases: &[],
+        runs: Runs::Command {
+            file: "scripts/end-to-end.sh",
+            fragments: &["\"$suite\" = \"network\"", "--include-ignored"],
+        },
+    },
+    IgnoredRun {
+        package: "kr-controller",
+        target: "--test shell",
+        cases: &[],
+        runs: Runs::Command {
+            file: "scripts/real-package-cases.sh",
+            fragments: &["-p kr-controller --test shell", "--ignored"],
+        },
+    },
+    IgnoredRun {
+        package: "kr-worker",
+        target: "--test fence",
+        cases: &[],
+        runs: Runs::Command {
+            file: "scripts/real-package-cases.sh",
+            fragments: &["-p kr-worker --test fence", "--ignored"],
+        },
+    },
+    IgnoredRun {
+        package: "kr-controller",
+        target: "--test distribution_endpoints",
+        cases: &["a_viewer_reaches_only_the_distribution_it_was_paired_with"],
+        runs: Runs::Command {
+            file: "scripts/e2e-wsl.sh",
+            fragments: &["--ignored --exact", "--test-threads 1"],
+        },
+    },
+    IgnoredRun {
+        package: "kr-perf",
+        target: "--test stress",
+        cases: &[],
+        runs: Runs::Command {
+            file: "scripts/bench-all.sh",
+            fragments: &["-p kr-perf --test stress", "--ignored"],
+        },
+    },
+    IgnoredRun {
+        package: "kr-worker",
+        target: "--test performance",
+        cases: &[
+            "attach_to_a_usable_screen",
+            "idle_resources_for_twenty_sessions_and_thirty_two_views",
+        ],
+        runs: Runs::Command {
+            file: "scripts/performance.sh",
+            fragments: &["-p kr-worker", "--ignored --exact"],
+        },
+    },
+    IgnoredRun {
+        package: "kr-worker",
+        target: "--test performance",
+        cases: &["input_through_real_workers_while_a_session_prints"],
+        runs: Runs::ByHand {
+            why: "it is a measurement run by hand with the worker program under test",
+        },
+    },
+    IgnoredRun {
+        package: "kr-worker",
+        target: "--bench input_latency",
+        cases: &[],
+        runs: Runs::Command {
+            file: "scripts/performance.sh",
+            fragments: &["-p kr-worker", "--ignored --exact"],
+        },
+    },
+    IgnoredRun {
+        package: "kr-attention",
+        target: "--test consumer",
+        cases: &[],
+        runs: Runs::Command {
+            file: "crates/kr-attention/tests/consumer.rs",
+            fragments: &["\"--exact\"", "\"--ignored\""],
+        },
+    },
+    IgnoredRun {
+        package: "kr-worker",
+        target: "--test host",
+        cases: &[],
+        runs: Runs::Command {
+            file: "crates/kr-worker/tests/host.rs",
+            fragments: &["--ignored", "--exact"],
+        },
+    },
+    IgnoredRun {
+        package: "kr-worker",
+        target: "--test live_ownership",
+        cases: &[],
+        runs: Runs::Command {
+            file: "crates/kr-worker/tests/live_ownership.rs",
+            fragments: &["\"--exact\"", "\"--ignored\""],
+        },
+    },
+    IgnoredRun {
+        package: "kr-worker",
+        target: "--test windows_endpoint",
+        cases: &[],
+        runs: Runs::Command {
+            file: "crates/kr-worker/tests/windows_endpoint.rs",
+            fragments: &["\"--ignored\"", "\"--exact\""],
+        },
+    },
+    IgnoredRun {
+        package: "kr-hook",
+        target: "--test launch_windows",
+        cases: &[],
+        runs: Runs::Command {
+            file: "crates/kr-hook/tests/launch_windows.rs",
+            fragments: &["\"--ignored\"", "\"--exact\""],
+        },
+    },
+    IgnoredRun {
+        package: "companion-tauri",
+        target: "--test windows_hello",
+        cases: &[],
+        runs: Runs::ByHand {
+            why: "it raises Windows Hello's dialog, which needs a signed-in desktop with Windows Hello set up and, for one case, the person",
+        },
+    },
+    IgnoredRun {
+        package: "kr-ipc",
+        target: "--test windows",
+        cases: &[],
+        runs: Runs::ByHand {
+            why: "it needs a second local account, and runs on the Windows test machine",
+        },
+    },
+    IgnoredRun {
+        package: "kr-cli",
+        target: "--test backup_setup",
+        cases: &[],
+        runs: Runs::ByHand {
+            why: "it packs, uploads and restores about 1.5 GiB, and is run on the build box by hand",
+        },
+    },
+    IgnoredRun {
+        package: "kr-controller",
+        target: "--test descriptions",
+        cases: &[],
+        runs: Runs::ByHand {
+            why: "it needs the real description process and weights that KR_DESCRIBE_INFERENCE names",
+        },
+    },
+    IgnoredRun {
+        package: "kr-controller",
+        target: "--test native_bridge",
+        cases: &[],
+        runs: Runs::ByHand {
+            why: "the recipe format has no removal step that waits until nothing else is left",
+        },
+    },
+];
+
 /// A set of files whose tests another toolchain builds. The report reads their keys. It runs and
 /// reads the tests of a lane that names how its tool reports them; the others it shows as not
 /// built.

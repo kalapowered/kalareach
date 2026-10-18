@@ -275,6 +275,10 @@ without an escape (a line break the compiler would normalise included), or whose
 Each file's `covers` field keys the test that runs its cases. The report checks that the test exists
 and refuses to run when it does not.
 
+### Tests an ordinary run leaves out
+
+Rust's `#[ignore]` attribute causes a test to not be run by `cargo test`, unless `--ignored` or `--include-ignored` is passed. If a test keyed to a row is ignored like this, then it is evidence for that row that should be run as part of the steps of this repository. `plan::IGNORED_RUNS` lists all the targets that have ignored tests that need to be run, specifying either the command (as words) to run them, along with the file that the command should appear in, or a reason they are run manually. The map errors if an ignored test keyed to a row exists that is not mentioned in the list, if a command in it is not present in the specified file, or if an entry is present that doesn't have a corresponding ignored, keyed test. Tests that are conditionally ignored (via `cfg_attr`) are not included, since they will be run without `--include-ignored` on other platforms. Manual entries are always warned about when the map is printed.
+
 ### TypeScript
 
 The report reads TypeScript with the compiler the packages already depend on

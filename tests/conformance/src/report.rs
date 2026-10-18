@@ -332,6 +332,9 @@ pub struct Options {
     pub case_tables: &'static [plan::CaseTable],
     /// The lanes.
     pub lanes: &'static [plan::Lane],
+    /// The steps that run the keyed tests an ordinary run leaves out, or none where the tree is not
+    /// held to them.
+    pub ignored_runs: Option<&'static [plan::IgnoredRun]>,
     /// The applications the fetch step recorded, when that group runs.
     pub applications: Option<Vec<ApplicationRecord>>,
     /// Steps to run instead of the plan's, for a tree that is not this repository.
@@ -367,6 +370,7 @@ pub fn map_for(options: &Options) -> Map {
         &Declarations {
             case_tables: options.case_tables,
             lanes: options.lanes,
+            ignored_runs: options.ignored_runs,
             typescript: groups
                 .contains(&Group::TypeScript)
                 .then_some(plan::TYPESCRIPT_PACKAGES),

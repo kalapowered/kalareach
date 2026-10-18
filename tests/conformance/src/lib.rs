@@ -14,6 +14,7 @@ pub mod clike;
 pub mod evidence;
 pub mod id;
 pub mod identity;
+pub mod ignored;
 pub mod lane;
 pub mod libtest;
 pub mod map;

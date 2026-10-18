@@ -143,6 +143,9 @@ pub struct Declarations<'a> {
     pub typescript: Option<&'a [&'a str]>,
     /// Directories whose files are read as scripts.
     pub scripts: &'a [&'a str],
+    /// The steps that run the keyed tests an ordinary run leaves out, when the map holds the tests
+    /// to them.
+    pub ignored_runs: Option<&'a [crate::plan::IgnoredRun]>,
 }
 
 /// The map.
@@ -161,6 +164,9 @@ pub struct Map {
     pub warnings: Vec<String>,
     /// Each target's tests, as its sources declare them.
     pub rust_tests: BTreeMap<TargetId, BTreeSet<String>>,
+    /// The tests of each target that an ordinary run leaves out (`#[ignore]`), by the names
+    /// `rust_tests` holds.
+    pub ignored_tests: BTreeMap<TargetId, BTreeSet<String>>,
     /// The workspace's packages.
     pub packages: Vec<Package>,
     /// The TypeScript files read, with their tests.
@@ -236,6 +242,11 @@ pub fn build(root: &Path, declarations: &Declarations<'_>) -> Map {
         typescript_sources(&mut map, root, directories, declarations.lanes);
     }
     lane_files(&mut map, root, declarations.lanes);
+    if let Some(runs) = declarations.ignored_runs {
+        let findings = crate::ignored::check(&map, root, runs);
+        map.problems.extend(findings.problems);
+        map.warnings.extend(findings.by_hand);
+    }
     for directory in declarations.scripts {
         for file in walk(root, directory, &|_| true) {
             let Ok(text) = std::fs::read_to_string(root.join(&file)) else {
@@ -1124,6 +1135,12 @@ fn rust_module(
                     .entry(target.clone())
                     .or_default()
                     .insert(name.clone());
+                if test.ignored {
+                    map.ignored_tests
+                        .entry(target.clone())
+                        .or_default()
+                        .insert(name.clone());
+                }
                 let place = Place::Rust {
                     target: target.clone(),
                     name: name.clone(),

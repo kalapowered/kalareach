@@ -101,6 +101,8 @@ pub struct Test {
     pub imports: Vec<Import>,
     /// Who may name it.
     pub visibility: Visibility,
+    /// Whether an ordinary run leaves it out on every platform: it carries `#[ignore]`.
+    pub ignored: bool,
 }
 
 /// One name, or every name of a module, that a `use` declaration brings into scope.
@@ -468,6 +470,12 @@ impl Attribute {
 
     fn is_test(&self) -> bool {
         self.path.last().is_some_and(|last| last == "test")
+    }
+
+    /// Whether it is an `ignore`. A `cfg_attr` that applies one on some platforms leaves the test
+    /// to the ordinary run of the others, so it is not one.
+    fn is_ignore(&self) -> bool {
+        self.path == ["ignore"]
     }
 
     /// Whether it is a `cfg_attr` that may set a `path`.
@@ -996,6 +1004,7 @@ fn classify(
                 assumes: read.assumes,
                 imports,
                 visibility: visibility(&structure[..at]),
+                ignored: attributes.iter().any(Attribute::is_ignore),
             })
         }
         "mod" => {

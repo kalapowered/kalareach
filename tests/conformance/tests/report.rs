@@ -19,7 +19,7 @@ use kr_conformance::id::{Identifier, Refusal};
 use kr_conformance::libtest::{Binary, Outcome as LibtestOutcome};
 use kr_conformance::map::Key;
 use kr_conformance::map::{self, Binding, Declarations, Map, Place};
-use kr_conformance::plan::{self, Group, Platform, Step};
+use kr_conformance::plan::{self, Group, IgnoredRun, Platform, Runs, Step};
 use kr_conformance::report::{self, Document, Gathered, Options, Outcome, Stopped, Verdict};
 use kr_conformance::run::Executed;
 use kr_conformance::workspace::{TargetId, TargetKind};
@@ -46,6 +46,7 @@ fn map_of(name: &str, typescript: bool) -> Map {
         &Declarations {
             case_tables: &[],
             lanes: &[],
+            ignored_runs: None,
             typescript: typescript.then_some(&["."][..]),
             scripts: &[],
         },
@@ -107,6 +108,7 @@ fn run_step_through(
         platform: Platform::current(),
         case_tables: &[],
         lanes: &[],
+        ignored_runs: None,
         applications: None,
         steps: Some(vec![Step::cargo(
             Group::Rust,
@@ -643,6 +645,7 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
         platform: Platform::Windows,
         case_tables: &[],
         lanes: &[],
+        ignored_runs: None,
         applications: None,
         steps: None,
         lister: PathBuf::from("/tmp/l"),
@@ -697,6 +700,90 @@ fn a_tree_with_nothing_ignored_reports_every_identifier_as_run() {
     assert_eq!(commented.len(), 1);
     assert_eq!(commented[0].keyed_by, Binding::AttachedComment);
     assert!(document.passed());
+}
+
+/// The map of the `outcomes` tree, held to `runs` for the keyed tests an ordinary run leaves out.
+fn held_to(runs: &[IgnoredRun]) -> Map {
+    map::build(
+        &tree("outcomes"),
+        &Declarations {
+            case_tables: &[],
+            lanes: &[],
+            typescript: None,
+            scripts: &[],
+            ignored_runs: Some(runs),
+        },
+    )
+}
+
+/// The one step that runs the ignored tests of `outcomes`, which the tree's own manifest stands in
+/// for: a file with a line that holds the words `fragments`.
+fn outcomes_run(fragments: &'static [&'static str]) -> IgnoredRun {
+    IgnoredRun {
+        package: "outcomes",
+        target: "--lib",
+        cases: &[],
+        runs: Runs::Command {
+            file: "Cargo.toml",
+            fragments,
+        },
+    }
+}
+
+#[test]
+fn a_keyed_test_an_ordinary_run_leaves_out_and_no_step_runs_stops_the_map() {
+    let unrun = held_to(&[]);
+    assert_eq!(unrun.problems.len(), 1, "{:?}", unrun.problems);
+    for name in [
+        "tests::is_ignored",
+        "tests::is_ignored_too",
+        "tests::is_ignored_for_a_reason_over_two_lines",
+    ] {
+        assert!(
+            unrun.problems[0].contains(name),
+            "{name} is named: {:?}",
+            unrun.problems
+        );
+    }
+    assert!(
+        !unrun.problems[0].contains("tests::passes"),
+        "a test an ordinary run runs is not named: {:?}",
+        unrun.problems
+    );
+
+    let run = held_to(&[outcomes_run(&["harness", "false"])]);
+    assert!(run.problems.is_empty(), "{:?}", run.problems);
+}
+
+#[test]
+fn a_step_that_lost_its_command_or_has_nothing_left_to_run_stops_the_map() {
+    let gone = held_to(&[outcomes_run(&["--ignored"])]);
+    assert_eq!(gone.problems.len(), 1, "{:?}", gone.problems);
+    assert!(
+        gone.problems[0].contains("Cargo.toml holds no command with `--ignored`"),
+        "{:?}",
+        gone.problems
+    );
+
+    let stale = held_to(&[
+        outcomes_run(&["harness", "false"]),
+        IgnoredRun {
+            package: "outcomes",
+            target: "--lib",
+            cases: &["tests::passes"],
+            runs: Runs::Command {
+                file: "Cargo.toml",
+                fragments: &["harness"],
+            },
+        },
+    ]);
+    assert_eq!(stale.problems.len(), 1, "{:?}", stale.problems);
+    assert!(
+        stale.problems[0].contains("tests::passes")
+            && stale.problems[0].contains("no keyed ignored test needs"),
+        "{:?}",
+        stale.problems
+    );
 }
 
 #[test]
@@ -956,6 +1043,7 @@ fn an_evidence_directory_that_holds_an_earlier_report_is_refused() {
         platform: Platform::current(),
         case_tables: &[],
         lanes: &[],
+        ignored_runs: None,
         applications: None,
         steps: Some(vec![Step::cargo(
             Group::Rust,
@@ -988,6 +1076,7 @@ fn a_target_no_step_runs_is_not_run_with_the_reason() {
         platform: Platform::current(),
         case_tables: &[],
         lanes: &[],
+        ignored_runs: None,
         applications: None,
         steps: Some(vec![Step::cargo(
             Group::Rust,
@@ -1036,6 +1125,7 @@ fn a_test_whose_step_stopped_after_building_it_is_not_run_with_the_steps_error()
         platform: Platform::current(),
         case_tables: &[],
         lanes: &[],
+        ignored_runs: None,
         applications: None,
         steps: Some(vec![Step::cargo(
             Group::Rust,
@@ -1078,6 +1168,7 @@ fn a_test_its_step_stopped_before_reaching_is_not_run_with_the_steps_error() {
         platform: Platform::current(),
         case_tables: &[],
         lanes: &[],
+        ignored_runs: None,
         applications: None,
         steps: Some(vec![Step::cargo(
             Group::Rust,
@@ -1123,6 +1214,7 @@ fn a_run_asked_for_every_terminal_names_each_one_as_not_run_and_fails_until_its_
         platform: Platform::current(),
         case_tables: &[],
         lanes: &[],
+        ignored_runs: None,
         applications: None,
         steps: Some(vec![Step::cargo(
             Group::Rust,
@@ -1179,6 +1271,7 @@ fn a_test_a_steps_own_flags_leave_out_is_not_run_rather_than_not_built() {
         platform: Platform::current(),
         case_tables: &[],
         lanes: &[],
+        ignored_runs: None,
         applications: None,
         steps: Some(vec![Step::cargo(
             Group::Rust,

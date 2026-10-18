@@ -33,6 +33,7 @@ fn map_of(root: &Path) -> Map {
         &Declarations {
             case_tables: &[],
             lanes: plan::LANES,
+            ignored_runs: None,
             typescript: None,
             scripts: &[],
         },
@@ -48,6 +49,7 @@ fn options(platform: Platform) -> Options {
         platform,
         case_tables: &[],
         lanes: plan::LANES,
+        ignored_runs: None,
         applications: None,
         steps: None,
         lister: PathBuf::from("/tmp/l"),
