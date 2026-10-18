@@ -114,6 +114,32 @@ async function drawn(page: Page): Promise<void> {
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
 }
 
+/**
+ * Scrolls the inbox down, to its end or by `depth`, and lets `invitations` new ones arrive above it:
+ * the pill is drawn.
+ */
+async function withPill(page: Page, how: { invitations?: number; depth?: number } = {}): Promise<void> {
+  const { invitations = 1, depth } = how
+  await open(page, 'ios', 'attention', async (loaded) => {
+    await loaded.evaluate(() => {
+      window.krTestHost?.reachAsPhone({ rights: ['session.view'] })
+    })
+  })
+  const main = page.locator('.m-main')
+  await expect(main.locator('[data-attention]').first()).toBeVisible()
+  await main.evaluate((element, to) => {
+    element.scrollTop = to ?? element.scrollHeight
+  }, depth ?? null)
+  await expect.poll(() => main.evaluate((element) => element.scrollTop)).toBeGreaterThan((depth ?? 200) / 2)
+  await page.evaluate((count) => {
+    for (let each = 0; each < count; each += 1) window.krTestHost?.sharing.offer({ session: '4' })
+  }, invitations)
+  await readAgain(page)
+  const words = invitations === 1 ? '1 new invitation' : `${String(invitations)} new invitations`
+  await expect(page.getByRole('button', { name: words })).toBeVisible()
+  await drawn(page)
+}
+
 /** Every control a person can touch under `selector`, scrolled to and pressed in a trial. */
 async function unreachable(page: Page, scope: string): Promise<string[]> {
   const controls = page.locator(scope).locator('button:visible:not([disabled])')
@@ -433,6 +459,188 @@ test.describe('a new invitation while the inbox is scrolled', () => {
     await expect(page.getByRole('button', { name: /new invitation/ })).toHaveCount(0)
     await expect(page.getByTestId('offers-said')).toHaveText('New invitation. Studio shared session 4 with you.')
   })
+})
+
+// KR-REQ-13.19: the pill lies over the inbox, so it is sized as the bars are, and focus that goes to
+// what is under it brings that into view clear of it. Each case sets its own text size.
+test.describe('the pill for a new invitation', () => {
+  // The pill lies over the content, so its type is the bars' own: it holds at one and a half times the
+  // base size, and what is under it is not given up to a pill that grows with the text.
+  test("sets the pill's type in the bars' unit, which holds at one and a half times the base size", async ({
+    context
+  }) => {
+    const sizeAt = async (ratio: number): Promise<number> => {
+      const page = await context.newPage()
+      try {
+        await withSystemTextScale(page, ratio)
+        await page.setViewportSize({ width: 320, height: 720 })
+        await withPill(page)
+        return await page.evaluate(() =>
+          parseFloat(getComputedStyle(document.querySelector('.sw-new-button') as Element).fontSize)
+        )
+      } finally {
+        await page.close()
+      }
+    }
+    const atTheBase = await sizeAt(1)
+    const atOneAndAHalf = await sizeAt(1.5)
+    const atTheLargest = await sizeAt(LARGEST)
+    expect(atOneAndAHalf, 'the pill grows with the text up to one and a half times').toBeGreaterThan(atTheBase)
+    expect(atTheLargest, 'and holds there').toBeCloseTo(atOneAndAHalf, 0)
+  })
+
+  // A control that keyboard focus reaches while the pill shows is wholly in view, below the pill. The
+  // inbox is scrolled to its end and each control above is focused in turn, last to first, as Shift+Tab
+  // goes (the engines differ in which controls Tab stops at, and not in how a focused control is
+  // brought into view). A control taller than the room the pill leaves cannot be wholly in view, and
+  // is not held to it; the filters are what the check is made of at every size. Twelve invitations
+  // have arrived, as a person finds them who has been away from the inbox for a while.
+  for (const size of SIZES) {
+    for (const face of FACES) {
+      test(`brings a control reached by keyboard wholly into view below the pill at the ${size.name} text size${face.suffix}`, async ({
+        page
+      }) => {
+        await withSystemTextScale(page, size.ratio)
+        await withFace(page, face.css)
+        await page.setViewportSize({ width: 320, height: 720 })
+        await withPill(page, { invitations: 12 })
+        const controls = 'button:not(.sw-new-button):not([disabled])'
+        const count = await page.locator(`.m-main ${controls}`).count()
+        const checked: string[] = []
+        const hidden: string[] = []
+        for (let index = count - 1; index >= 0; index -= 1) {
+          const now = await page.evaluate(
+            ([at, selector]) => {
+              const control = Array.from(document.querySelectorAll<HTMLElement>(`.m-main ${String(selector)}`))[
+                Number(at)
+              ]
+              const pill = document.querySelector('.sw-new-button')
+              const area = document.querySelector<HTMLElement>('.m-main')
+              if (control === undefined || pill === null || area === null) return null
+              control.focus()
+              return { moved: document.activeElement === control }
+            },
+            [index, controls]
+          )
+          await drawn(page)
+          const where = await page.evaluate(
+            ([at, selector]) => {
+              const control = Array.from(document.querySelectorAll<HTMLElement>(`.m-main ${String(selector)}`))[
+                Number(at)
+              ]
+              const pill = document.querySelector('.sw-new-button')
+              const area = document.querySelector<HTMLElement>('.m-main')
+              if (control === undefined || pill === null || area === null) return null
+              const box = control.getBoundingClientRect()
+              const inline = (value: string): number => Number.parseFloat(value) || 0
+              return {
+                label: (control.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 30) || control.tagName,
+                top: box.top,
+                bottom: box.bottom,
+                below: pill.getBoundingClientRect().bottom,
+                end: area.getBoundingClientRect().bottom,
+                // What the engine can give a control: the area, less the padding at its foot and the
+                // margin the control keeps above itself.
+                room:
+                  area.clientHeight -
+                  inline(getComputedStyle(area).scrollPaddingBottom) -
+                  inline(getComputedStyle(control).scrollMarginTop)
+              }
+            },
+            [index, controls]
+          )
+          // The pill goes when the inbox is scrolled back to its top: nothing is under it then.
+          if (now === null || where === null) break
+          expect(now.moved, `focus went to ${where.label}`).toBe(true)
+          if (where.bottom - where.top > where.room) continue
+          checked.push(where.label)
+          if (where.top < where.below - 0.5 || where.bottom > where.end + 0.5) {
+            const [top, bottom, below, end] = [where.top, where.bottom, where.below, where.end].map((each) =>
+              Math.round(each)
+            )
+            hidden.push(
+              `${where.label}: from ${String(top)} to ${String(bottom)}, in view from ${String(below)} to ${String(end)}`
+            )
+          }
+        }
+        expect(checked.length, 'controls that fit below the pill and were reached while it showed').toBeGreaterThanOrEqual(3)
+        expect(hidden, 'controls that did not come wholly into view below the pill').toEqual([])
+        await page.screenshot({ path: shot(`pill-focus-${size.name}${face.shot}`) })
+      })
+    }
+  }
+
+  // The room is the pill's own, measured: when the pill grows, the room kept clear of it grows by as
+  // much, and is still its lower edge and a little clear space under it.
+  test('keeps the room it clears in step with the pill when the pill grows', async ({ page }) => {
+    await withSystemTextScale(page, 1)
+    await page.setViewportSize({ width: 320, height: 720 })
+    await withPill(page)
+    const room = () =>
+      page.evaluate(() =>
+        Number.parseFloat(document.querySelector<HTMLElement>('.m-main')?.style.getPropertyValue('--pill-room') ?? '')
+      )
+    // The pill's lower edge, from the top of the area; the room is that and a little clear space.
+    const edge = () =>
+      page.evaluate(
+        () =>
+          (document.querySelector('.sw-new-button')?.getBoundingClientRect().bottom ?? Number.NaN) -
+          (document.querySelector('.m-main')?.getBoundingClientRect().top ?? Number.NaN)
+      )
+    const small = { room: await room(), edge: await edge() }
+    expect(small.room - small.edge, 'the clear space under the pill').toBeGreaterThan(0)
+    expect(small.room - small.edge, 'is a small one').toBeLessThan(12)
+
+    await page.addStyleTag({ content: '.sw-new-button { padding-block: 40px !important }' })
+    await expect.poll(room, 'the room after the pill grew').toBeGreaterThan(small.room + 40)
+    const grown = { room: await room(), edge: await edge() }
+    expect(grown.room - grown.edge, 'the clear space under the grown pill').toBeGreaterThan(0)
+    expect(grown.room - grown.edge, 'is a small one').toBeLessThan(12)
+  })
+
+  // A sheet that the inbox has open is drawn in the scrolling area but is over the pill, and scrolls
+  // inside itself: what is in it keeps no room above itself for the pill.
+  test('keeps no room above what is in a sheet that the inbox has open', async ({ page }) => {
+    await withSystemTextScale(page, LARGEST)
+    await page.setViewportSize({ width: 320, height: 720 })
+    await withPill(page)
+    await page.evaluate(() => {
+      document.querySelector<HTMLElement>('[data-offer]')?.click()
+    })
+    await expect(page.getByTestId('offer-card')).toBeVisible()
+    const margin = (selector: string) =>
+      page.evaluate((each) => {
+        const element = document.querySelector(each)
+        return element === null ? 'none' : getComputedStyle(element).scrollMarginTop
+      }, selector)
+    expect(await margin('.m-filter'), 'what is under the pill keeps the room').not.toBe('0px')
+    expect(await margin('[data-testid="accept-offer"]'), 'a control in the sheet').toBe('0px')
+    expect(await margin('[data-testid="offer-card"] li'), 'the words in the sheet').toBe('0px')
+  })
+
+  // The pill itself is in view: focus that goes to it, as a screen reader's or a key's does, leaves the
+  // inbox where it is and the pill where it is. The room kept clear of the pill is for what is under it.
+  for (const size of SIZES) {
+    for (const [where, depth] of [
+      ['at the end of the inbox', undefined],
+      ['a little way down it', 40]
+    ] as const) {
+      test(`leaves the inbox where it is when focus goes to the pill ${where} at the ${size.name} text size`, async ({
+        page
+      }) => {
+        await withSystemTextScale(page, size.ratio)
+        await page.setViewportSize({ width: 320, height: 720 })
+        await withPill(page, { depth })
+        const main = page.locator('.m-main')
+        const pill = page.getByRole('button', { name: '1 new invitation' })
+        const before = await main.evaluate((element) => element.scrollTop)
+        await pill.focus()
+        await drawn(page)
+        await expect(pill).toBeFocused()
+        expect(await main.evaluate((element) => element.scrollTop), 'where the inbox is scrolled to').toBe(before)
+      })
+    }
+  }
 })
 
 test.describe('a share that arrives while the sessions are scrolled', () => {

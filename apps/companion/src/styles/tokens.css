@@ -92,8 +92,9 @@
    * bars and insets of. Android's web view scales a font size written in pixels with the text, as
    * it scales the root, so there the cap holds the spacing and not the text, and its largest font
    * scale is twice the base size. The phone's spacing scale (`mobile/mobile.css`) is measured in
-   * this unit, and so is the type of the bars and of a sheet's header. The text of the content is
-   * not, and grows with no bound, but for the terminal grid's, which has a cap of its own.
+   * this unit, and so is the type of the bars, of a sheet's header and of the pill over the inbox.
+   * The text of the content is not, and grows with no bound, but for the terminal grid's, which
+   * has a cap of its own.
    */
   --chrome-unit: min(1rem, 24px);
 

@@ -191,9 +191,12 @@
 
 /*
  * It sits in the flow with no height of its own and sticks to the top of the scrolling area, so it
- * stays over the content however far the person has scrolled and takes no room when it is not
- * shown. The pill takes the height its words need and is never wider than the column: at the
- * largest text size they wrap, and a word that is wider breaks where the column ends.
+ * stays over the content however far the person has scrolled, and nothing under it moves when it
+ * comes or goes.
+ *
+ * It lies over the content, so it is sized as the bars are: its type is in the bars' unit and
+ * stops growing at one and a half times the base size. It takes the height its words need and is
+ * never wider than the column: a word that is wider breaks where the column ends.
  */
 .sw-new {
   position: sticky;
@@ -207,11 +210,37 @@
   pointer-events: none;
 }
 
+/*
+ * While the pill shows, the top of the scrolling area is under it, by `--pill-room`, which the pill
+ * measures and sets on the area (`Offers.tsx`). What focus brings into view keeps that room above
+ * itself, so a control does not come to rest under the pill. The room is on what focus reaches and
+ * not on the area as scroll padding: the pill is in the area, and padding that kept the top of the
+ * area clear would have focus on the pill itself scroll the area to bring the pill out from it.
+ * Where a screen reader asks the web view to scroll an element into view itself, the margin may
+ * not be counted, and the element can come to rest under the pill.
+ *
+ * A sheet that the inbox has open is drawn in the area but is over the pill, and scrolls inside
+ * itself: nothing in it keeps the room.
+ */
+.m-main * {
+  scroll-margin-block-start: var(--pill-room, 0px);
+}
+
+.m-main .sw-new,
+.m-main .sw-new-button {
+  scroll-margin-block-start: 0;
+}
+
+.m-main .sheet {
+  --pill-room: 0px;
+}
+
 .sw-new-button {
   pointer-events: auto;
   max-inline-size: 100%;
   overflow-wrap: anywhere;
-  margin-block-start: var(--gap-2);
+  /* The foot of the margin is clear space for a focus ring on what comes to rest under the pill. */
+  margin-block: var(--gap-2) var(--gap-1);
   padding: var(--gap-2) var(--gap-4);
   border: 1px solid var(--accent-line);
   border-radius: 999px;
@@ -219,8 +248,9 @@
   color: var(--accent);
   box-shadow: var(--shadow);
   font: inherit;
-  font-size: 0.875rem;
+  font-size: calc(var(--chrome-unit) * 0.875);
   font-weight: 600;
+  line-height: 1.25;
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
   transition:

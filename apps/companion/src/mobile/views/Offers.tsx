@@ -18,7 +18,7 @@
  * person has scrolled a pill says that something arrived above.
  */
 
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 
 import type { ShareOffer } from '@kalareach/protocol'
 
@@ -116,6 +116,39 @@ function useKeepFocus(area: React.RefObject<HTMLElement | null>, find: () => HTM
   }, [area])
 }
 
+/**
+ * Tells the scrolling area how much of its top the pill is over, while the pill shows.
+ *
+ * That is the area's own padding above the pill, the pill's margins and its height. The height is
+ * the platform's to decide (its type, its text size and the faces it has), so it is measured, as it
+ * changes too. Everything in the area keeps the room above itself (`--pill-room`, `shared.css`),
+ * so what focus brings into view does not come to rest under the pill.
+ */
+function useRoomUnderPill(pill: React.RefObject<HTMLElement | null>, shown: boolean): void {
+  useLayoutEffect(() => {
+    const button = pill.current
+    const area = button?.closest<HTMLElement>('.m-main') ?? null
+    if (!shown || button === null || area === null) return
+    const measure = () => {
+      const px = (length: string): number => Number.parseFloat(length) || 0
+      const margins = getComputedStyle(button)
+      const room =
+        px(getComputedStyle(area).paddingBlockStart) +
+        px(margins.marginBlockStart) +
+        button.offsetHeight +
+        px(margins.marginBlockEnd)
+      area.style.setProperty('--pill-room', `${String(room)}px`)
+    }
+    measure()
+    const watching = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure)
+    watching?.observe(button)
+    return () => {
+      watching?.disconnect()
+      area.style.removeProperty('--pill-room')
+    }
+  }, [pill, shown])
+}
+
 /** The invitations, and the acceptances not seen to the end. */
 export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
   const { port, say } = useApp()
@@ -123,6 +156,7 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
   const view = useHeld()
   const target = minimumTarget(surface)
   const head = useRef<HTMLDivElement | null>(null)
+  const pill = useRef<HTMLButtonElement | null>(null)
   const [open, setOpen] = useState<string | null>(null)
   const [accepting, setAccepting] = useState<string | null>(null)
   const [unseen, setUnseen] = useState(0)
@@ -162,6 +196,8 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
       scroller.removeEventListener('scroll', onScroll)
     }
   }, [])
+
+  useRoomUnderPill(pill, unseen > 0)
 
   const shown = view.status === 'ready'
   const offers = waitingOffers(view)
@@ -296,7 +332,13 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
     <>
       {unseen > 0 ? (
         <div className="sw-new">
-          <button type="button" className="sw-new-button" style={{ minBlockSize: target }} onClick={jump}>
+          <button
+            ref={pill}
+            type="button"
+            className="sw-new-button"
+            style={{ minBlockSize: target }}
+            onClick={jump}
+          >
             {unseen === 1 ? '1 new invitation' : `${String(unseen)} new invitations`}
           </button>
         </div>
