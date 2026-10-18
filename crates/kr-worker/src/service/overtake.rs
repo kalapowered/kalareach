@@ -25,13 +25,14 @@
 //!
 //! # Limits
 //!
-//! The task holds at most [`MOST_HELD`] frames that it cannot serve and reads no more once it holds
-//! that many; a key behind that many waits for the request, as it did before. The task ends when
-//! the request does, and the loop writes the request's answer after that, so a key that arrives
-//! while a large answer is being written to a slow peer waits for the write, up to the bound on a
-//! write. While a client keeps the connection's loop supplied with frames the task handed back, the
-//! loop does not look at its withdrawal, window renewal, keepalive or finished-preparation
-//! branches; that ends with the burst and touches no other connection.
+//! The task reads no more from the connection once it holds [`MOST_HELD`] frames that it cannot
+//! serve, and a key it has not read by then waits for the request, as it did before. Frames the
+//! loop had already read ahead of a finished preparation are all judged, however many there are.
+//! The task ends when the request does, and the loop writes the request's answer after that, so a
+//! key that arrives while a large answer is being written to a slow peer waits for the write, up to
+//! the bound on a write. While a client keeps the connection's loop supplied with frames the task
+//! handed back, the loop does not look at its withdrawal, window renewal, keepalive or
+//! finished-preparation branches; that ends with the burst and touches no other connection.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

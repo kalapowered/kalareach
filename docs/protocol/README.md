@@ -497,14 +497,16 @@ Reading the fields:
   pre-authorisation surface.
 - `input.write` is the only method with `ordered_stream` idempotency and an `input_lease` freshness
   context. Raw input is an ordered stream per connection, never replayed after a reconnect.
-- The response is associated with the request solely through the `request_id`. The worker may send a
-  response for an `input.write` request before sending the responses for earlier requests of the
-  types `terminal.resize`, `terminal.geometry.transfer`, `attachment.configure` and
-  `attachment.viewport`, or for an earlier read, sent on the same connection. However, a write still
-  follows every earlier write, and it follows every other earlier mutation, an attach, a detach, an
-  input acquire, release or interrupt, or a close among them. A read that is answered after a write
-  can show what the write did. A client does not assume that answers come back in the order it sent
-  the requests.
+- The only thing relating a response to its request is the `request_id`. On a local client's
+  connection, the worker answers an `input.write` as soon as it has taken the batch, so the answer
+  can come before the answer to an earlier read on the same connection, or to an earlier
+  `terminal.resize`, `terminal.geometry.transfer`, `attachment.configure` or `attachment.viewport`.
+  A write still follows every earlier write, and it follows every other earlier mutation, an attach,
+  a detach, an input acquire, release or interrupt, or a close among them. The exceptions are the
+  mutations whose answers the worker gives after it has handled them: a `shell.launch`, an agent
+  mutation and a `plugin.action.invoke`; a `plugin.action.invoke` that a component prepares is
+  handled after the frames behind it. That way, a read that is answered after a write can show what
+  the write did. A client does not assume that answers come back in the order it sent the requests.
 
 ### Rights and capabilities are not the same thing
 

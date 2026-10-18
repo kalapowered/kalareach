@@ -1430,7 +1430,8 @@ async fn recogniser_beside_mutations(
 /// follow a mutation of its own. Before each hold the connection sends a viewport report, a
 /// journalled mutation, and writes the prefix right behind it without waiting for the answer. What
 /// the worker did with the key is read from the order the two answers came back in, and from where
-/// its own record puts the key's acceptance among the spans in which a mutation held the session.
+/// its own record puts the key's acceptance against the hold of the session of the report it
+/// followed.
 struct OnItsOwnConnection {
     holds: Vec<OwnHold>,
     /// How long the split delimiter took to be recognised once its second half arrived.
@@ -1467,14 +1468,15 @@ enum AgainstReport {
 
 impl AgainstReport {
     /// Places `at`, in nanoseconds on the recorder's clock, against the first hold of the session
-    /// that began after `sent`, which is the report's: nothing else mutates in this measurement.
-    fn of(spans: &[(u64, u64)], sent: u64, at: Option<u64>) -> Self {
+    /// that began after `sent_at`, which is the report's: nothing else mutates in this measurement,
+    /// and the caller has checked that each report left one hold.
+    fn of(spans: &[(u64, u64)], sent_at: u64, at: Option<u64>) -> Self {
         let Some(at) = at else {
             return Self::Unrecorded;
         };
         let Some((from, to)) = spans
             .iter()
-            .filter(|(from, _)| *from >= sent)
+            .filter(|(from, _)| *from >= sent_at)
             .min_by_key(|(from, _)| *from)
             .copied()
         else {
@@ -1495,12 +1497,19 @@ impl AgainstReport {
     fn describe(self) -> String {
         match self {
             Self::Before => "the write was taken before its report took the session".to_owned(),
-            Self::During(place) => Within::describe(Some(place), "the write was taken"),
+            Self::During(Within { into, of }) => format!(
+                "the write was taken {} into its report's {} hold of the session",
+                milliseconds(into),
+                milliseconds(of)
+            ),
             Self::After(after) => format!(
                 "the write was taken {} after its report released the session",
                 milliseconds(after)
             ),
-            Self::Unrecorded => "the report's hold of the session was not recorded".to_owned(),
+            Self::Unrecorded => {
+                "the write's acceptance or its report's hold of the session was not recorded"
+                    .to_owned()
+            }
         }
     }
 }
@@ -1682,7 +1691,7 @@ async fn measure_recogniser_on_its_own_connection(
          reaching the application, which the root program passes to a pipe the test reads. \
          Whether the key was answered before the report it followed is read from the order the two \
          answers came back in; where the worker took the write is its own instant, set against the \
-         spans in which a mutation held the session.",
+         hold of the session of the report sent just ahead of the key.",
         if beside_a_disk_writer {
             ", and a writer that writes four megabytes to the same disk and syncs them, over and over"
         } else {
@@ -1850,7 +1859,7 @@ async fn recogniser_on_its_own_connection(
         return Err("the split delimiter reached the application but opened no paste".to_owned());
     }
     let conditions = window.close();
-    let sent = viewports.load(Ordering::Acquire);
+    let reports = viewports.load(Ordering::Acquire);
     drop(client);
     trace.disarm();
     let recording = trace.recording();
@@ -1863,9 +1872,17 @@ async fn recogniser_on_its_own_connection(
         .filter(|event| event.site == Site::Mutation)
         .map(|event| (event.held, event.released))
         .collect();
+    // Each report leaves one hold of the session, which is what places a key against its own.
+    if spans.len() as u64 != reports {
+        return Err(format!(
+            "the worker recorded {} holds of the session by a mutation for {reports} viewport \
+             reports",
+            spans.len()
+        ));
+    }
     let holds = measured
         .into_iter()
-        .map(|(what, held, answered_first, sent, began)| {
+        .map(|(what, held, answered_first, sent_at, began)| {
             let taken = recording
                 .events
                 .iter()
@@ -1876,7 +1893,7 @@ async fn recogniser_on_its_own_connection(
                 what,
                 held,
                 answered_first,
-                accepted: AgainstReport::of(&spans, sent, taken),
+                accepted: AgainstReport::of(&spans, sent_at, taken),
             }
         })
         .collect();
@@ -1884,7 +1901,7 @@ async fn recogniser_on_its_own_connection(
         holds,
         split,
         conditions,
-        viewports: sent,
+        viewports: reports,
     })
 }
 

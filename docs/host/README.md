@@ -2254,13 +2254,13 @@ rather than an admitted action, so no receipt, intent or result is written for a
 nothing replays one. Nor is delivery proof of effect: bytes written into a pseudo-terminal whose
 application is not reading have reached the terminal and done nothing at all.
 
-Keystroke batches do not wait for a read, a viewport report, a resize, a transfer of the size or a
-change of an attachment's claim that comes before them on the same connection. The client sends its
-keys, its viewport reports and its resizes on one connection. The worker reads ahead past such a
-request while it waits for the disk or the session, and then passes the batch to the recogniser
-immediately. The worker holds at most sixteen of these requests while it reads ahead, and a batch
-behind that many waits for the request that is running. Every other mutation, an attach, a detach,
-an input acquire, release or interrupt, or a close among them, and every frame that is not a request
+For a local client, a keystroke batch does not wait for a read, a viewport report, a resize, a
+transfer of the size or a change of an attachment's claim that comes before it. A client sends its
+keys, its viewport reports and its resizes on one connection. When the worker is waiting for the
+disk or the session on such a request, it still reads on, and hands the batch to the recogniser at
+once. Once it holds sixteen of these requests the worker stops reading ahead, and a batch it has not
+read by then waits for the request that is running. Every other mutation, an attach, a detach, an
+input acquire, release or interrupt, or a close among them, and every frame that is not a request
 still holds a batch back, so the batch meets the state the client asked for. A key sent right after
 a resize can reach the application before the pseudo-terminal has its new size, and a read sent
 before a key can show what the key did.
