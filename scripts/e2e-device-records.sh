@@ -8,13 +8,18 @@
 # A debug build of the application reads a request from its data directory when it starts and
 # writes one line per check beside it (companion-tauri's `device_probe`). This script builds that
 # application, starts one simulator, and launches the application three times in the same boot of
-# the simulator:
+# the simulator, after a first start of the fresh installation (below):
 #
 #   1. writes an item to the secure store and charges one try against a code
 #   2. reads the item back and deletes it; the same code has one try fewer and the boot identity
 #      is the first launch's
 #   3. after the script has deleted the boot record from the application's caches: the item is
 #      gone, the boot identity is another, and the same code is refused as spent
+#
+# The first start has no request and no data directory: a new installation has none, and the
+# application makes it. It shows the records open there, and the two record directories excluded
+# from the backup, as the host's `xattr` reads them. The three launches then run within four minutes
+# of one another, so that a refusal in the last cannot be the five-minute window ending.
 #
 # It claims what the lines say and nothing more: a check the application did not report is a check
 # that did not run, and any line that is not `ok=1`, a launch that never says `done=1`, or an
@@ -74,8 +79,30 @@ data="$(xcrun simctl get_app_container "$udid" "$app_id" data)"
 support="$data/Library/Application Support/$app_id"
 caches="$data/Library/Caches/$app_id"
 directory="$support/kr-probe"
-mkdir -p "$directory"
 failed=0
+
+# A fresh installation: nothing of the application's has been made in its container.
+[ ! -e "$support" ] || { say "the fresh installation already has $support"; exit 2; }
+say "first start, in a container with no data directory"
+xcrun simctl launch "$udid" "$app_id" >/dev/null || { say "the application did not start"; exit 2; }
+waited=0
+while [ ! -d "$support/pairing-budget" ] || [ ! -d "$support/pairing" ]; do
+    sleep 2
+    waited=$((waited + 2))
+    [ "$waited" -lt 60 ] || break
+done
+excluded() { xattr -l "$1" 2>/dev/null | grep -q 'com_apple_backup_excludeItem'; }
+for name in pairing pairing-budget; do
+    if [ -d "$support/$name" ] && excluded "$support/$name"; then
+        say "after the first start of a new installation, $name exists and is excluded from the backup"
+    else
+        say "after the first start of a new installation, $name is missing or not excluded from the backup"
+        failed=1
+    fi
+done
+xcrun simctl terminate "$udid" "$app_id" >/dev/null 2>&1
+mkdir -p "$directory"
+started=$SECONDS
 
 # Launches the application once and reads what it wrote.
 launch() { # <n> <secret> <tries left or "null">
@@ -98,7 +125,7 @@ launch() { # <n> <secret> <tries left or "null">
         failed=1
         return
     fi
-    local line
+    local line name
     while IFS= read -r line; do
         say "launch $n: $line"
         case "$line" in
@@ -106,6 +133,11 @@ launch() { # <n> <secret> <tries left or "null">
             check=*) failed=1 ;;
         esac
     done <"$result"
+    # Each check the launch is claimed to make was made, once: a check that is missing proves nothing.
+    for name in "the pairing records open" "secret store" "the boot identity" "budget" \
+        "the paired hosts are out of the backup" "the budget is out of the backup"; do
+        [ "$(grep -c "^check=$name ok=" "$result")" = 1 ] || { say "launch $n did not report \"$name\" once"; failed=1; }
+    done
 }
 
 digest() { sed -n 's/^check=the boot identity ok=1 detail=digest \(.*\)$/\1/p' "$artefacts/launch-$1.txt"; }
@@ -117,6 +149,9 @@ launch 2 read_and_delete 3
 rm -f "$caches/pairing-boot"
 launch 3 absent null
 
+elapsed=$((SECONDS - started))
+say "the three launches took $elapsed s"
+[ "$elapsed" -lt 240 ] || { say "the launches took four minutes or more, so a refusal at the end may be the window's"; failed=1; }
 first="$(digest 1)"
 second="$(digest 2)"
 third="$(digest 3)"

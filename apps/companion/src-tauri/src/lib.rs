@@ -388,6 +388,20 @@ fn application_clock(_app: &tauri::AppHandle) -> Result<kr_client::pairing::cloc
 /// again.
 #[cfg(target_os = "ios")]
 fn keep_records_out_of_backup(app: &tauri::AppHandle, data: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    // A new installation has no data directory yet: the system names it and does not make it. The
+    // records' directories are made inside it, owner-only, as the attempt budget makes its own.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(data)
+        .map_err(|error| {
+            error::CommandError::stated(
+                ErrorCode::ResourceUnavailable,
+                format!("{} could not be made: {error}", data.display()),
+            )
+        })?;
     for name in [device::HOSTS_DIRECTORY, device::BUDGET_DIRECTORY] {
         let directory = data.join(name);
         let unavailable = |what: &str, error: &dyn std::fmt::Display| {
