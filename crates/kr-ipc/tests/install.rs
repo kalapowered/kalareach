@@ -448,3 +448,115 @@ fn a_command_registers_what_it_works_in_before_it_writes() {
         "and holds nothing"
     );
 }
+
+/// The variable that makes the launcher test act: the store's root, the release to pin and the
+/// directory the program it becomes reports through, one to a line.
+const PINNING: &str = "KR_INSTALL_TEST_PINNING";
+
+/// What the launcher does when it is started to pin a release and replace itself with a program
+/// that takes no hold of its own: the pin passes to the program, or nothing holds the release.
+#[test]
+fn launcher() {
+    let Some(text) = std::env::var_os(PINNING) else {
+        return;
+    };
+    let text = text.to_string_lossy().into_owned();
+    let mut lines = text.lines();
+    let store = Store::at(lines.next().expect("the store"));
+    let release = release(lines.next().expect("the release"));
+    let ready = lines.next().expect("the file to write once started");
+    let pin = store
+        .pin(&release)
+        .expect("asks")
+        .expect("the release is pinned");
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(format!("echo started > '{ready}'; exec sleep 600"));
+    let error = pin.exec(&mut command);
+    panic!("the launcher could not replace itself: {error}");
+}
+
+/// KR-REQ-26.06: a program that replaces itself with another passes the hold on its release to it,
+/// so a release is held from the moment it is pinned to the moment the program that took over
+/// ends, with nothing in between that an update could retire it in.
+#[test]
+fn a_pinned_release_stays_held_by_the_program_that_takes_over() {
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    test.install(&one);
+    let ready = test.root.join("ready");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+        .args(["--exact", "launcher", "--nocapture", "--test-threads", "1"])
+        .env(
+            PINNING,
+            format!(
+                "{}\n{one}\n{}\n",
+                test.store.root().display(),
+                ready.display()
+            ),
+        )
+        .current_dir(&test.root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the launcher starts");
+    wait_for(&ready);
+
+    // The program that wrote the file is a shell and then `sleep`, and neither is a program of the
+    // release: the only thing that holds it is the pin they inherited.
+    let update = test
+        .store
+        .try_lock_update()
+        .expect("locks")
+        .expect("nothing else updates");
+    assert!(test.store.held(&one).expect("asks"), "the release is held");
+    assert!(
+        !test.store.retire(&one, &update).expect("asks"),
+        "an update does not remove a release a pin is held on"
+    );
+    child.kill().expect("the program is ended");
+    child.wait().expect("the program has ended");
+    assert!(
+        !test.store.held(&one).expect("asks"),
+        "nothing holds it now"
+    );
+    assert!(
+        test.store.retire(&one, &update).expect("removes"),
+        "and it goes"
+    );
+}
+
+/// A release that is not there, or that an update is removing, is not pinned and is not waited
+/// for.
+#[test]
+fn a_release_that_is_gone_or_being_removed_is_not_pinned() {
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    let two = release("0.2.0+bbbbbbbbbbbb");
+    let removed = release("0.3.0+cccccccccccc");
+    test.install(&one);
+    test.install(&removed);
+    assert!(
+        test.store.pin(&two).expect("asks").is_none(),
+        "a release the store lacks"
+    );
+    let pinned = test.store.pin(&one).expect("asks").expect("pinned");
+    assert_eq!(pinned.manifest().release, one);
+    drop(pinned);
+
+    // An update that has taken the manifest to remove the release holds it exclusively. The
+    // release is one this test never pinned: another test of this binary starting a program can
+    // hold a copy of a pin's file for a moment after the pin is dropped, and its lock with it.
+    let path = test.store.manifest(&removed);
+    let removing = std::fs::File::open(&path).expect("opens");
+    rustix::fs::flock(
+        &removing,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+    .expect("the removal's lock");
+    assert!(
+        test.store.pin(&removed).expect("asks").is_none(),
+        "a release being removed, without waiting for the removal"
+    );
+}

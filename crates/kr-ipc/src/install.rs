@@ -1084,6 +1084,33 @@ impl Store {
             .map_err(|error| InstallError::io("lock", &path, error))
     }
 
+    /// Holds `release` for a program that is about to start from it, without waiting.
+    ///
+    /// The hold is the one a program of the release takes for itself, so an update that retires
+    /// releases leaves this one while the pin lives, and it passes to the program the pin is handed
+    /// to ([`Pin::exec`]) before that program takes its own. A release that is gone, or that an
+    /// update is removing or replacing, is not pinned: the caller goes on without it, and never
+    /// waits for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Io`] when the manifest cannot be opened or locked for any reason
+    /// but a holder or a missing file, and [`InstallError::Manifest`] for a manifest this build does
+    /// not read.
+    pub fn pin(&self, release: &ReleaseName) -> Result<Option<Pin>> {
+        let path = self.manifest(release);
+        let file = match open_regular_file(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(InstallError::io("open", &path, error)),
+        };
+        match hold_opened_within(file, path, release, Duration::ZERO) {
+            Ok((file, manifest)) => Ok(Some(Pin { file, manifest })),
+            Err(InstallError::Replaced { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Removes a release no running process holds, and says whether it did. Whatever else is at
     /// the release's name, a link or a file, is removed as a name only.
     ///
@@ -1436,6 +1463,39 @@ pub struct RecordedDocument {
     pub path: PathBuf,
     /// The record that says so.
     pub record: PathBuf,
+}
+
+/// A shared hold on a release of a store, taken for a program that is about to start from it.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct Pin {
+    /// The release's manifest, opened and locked shared.
+    file: File,
+    manifest: ReleaseManifest,
+}
+
+#[cfg(unix)]
+impl Pin {
+    /// The manifest of the release pinned.
+    #[must_use]
+    pub const fn manifest(&self) -> &ReleaseManifest {
+        &self.manifest
+    }
+
+    /// Replaces this process with `command`, which starts holding the release already.
+    ///
+    /// The hold is on an open file, and the file is left open across the replacement, so the
+    /// program that takes this process's place holds the release from its first instruction and
+    /// still holds it while it takes a hold of its own. Returns only when the replacement failed,
+    /// with the reason, and the hold ends with the pin.
+    pub fn exec(self, command: &mut std::process::Command) -> std::io::Error {
+        use std::os::unix::process::CommandExt as _;
+
+        if let Err(error) = rustix::io::fcntl_setfd(&self.file, rustix::io::FdFlags::empty()) {
+            return std::io::Error::from(error);
+        }
+        command.exec()
+    }
 }
 
 /// A lock on one of a store's lock files, released when this is dropped.
