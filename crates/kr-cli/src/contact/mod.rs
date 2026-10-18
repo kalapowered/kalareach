@@ -876,12 +876,25 @@ impl ServerHandler for Contact {
     }
 }
 
+/// How long the tools look for the session they serve before they start serving without a hand-over.
+pub const DISCOVERY_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Runs the contact tools over this process's standard input and output.
 ///
 /// # Errors
 ///
 /// Returns an error when the transport fails.
 pub async fn run_stdio(build_id: BuildId) -> crate::error::Result<()> {
+    // Before anything is read from standard input: a session whose worker runs another release is
+    // served by that release's own tools. A session none holds is the tools' own answer, call by
+    // call, so a discovery that finds nothing in time goes on to serve.
+    if let Ok(Ok(bound)) =
+        tokio::time::timeout(DISCOVERY_BOUND, crate::bind::discover(&build_id)).await
+        && let Some(stated) = crate::helper::stated_by(&bound.descriptor).await
+    {
+        let _ =
+            crate::helper::hand_over(stated.as_ref(), &["agent-tools".into(), "--stdio".into()]);
+    }
     let contact = Contact::new(build_id);
     let calls = Arc::clone(&contact.calls);
     let transport = ServedTransport {

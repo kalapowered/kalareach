@@ -1008,6 +1008,11 @@ async fn preview_of(
     build_id: &BuildId,
 ) -> Result<Vec<String>> {
     let mut worker = resolve::open_worker(descriptor, build_id.clone()).await?;
+    crate::helper::read_only_same(
+        worker.acknowledgement().build.as_ref(),
+        descriptor.display_number.get(),
+        "share",
+    )?;
     let result: SessionScreenPreviewResult = crate::bind::read(
         &mut worker,
         Method::SessionScreenPreview,

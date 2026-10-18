@@ -3223,13 +3223,15 @@ enum Stated {
     /// A build. The worker sends that build's screens: this build's when the two protocol
     /// versions share a compatibility level, and otherwise the reset an earlier build wrote.
     Build(kr_protocol::local::LocalBuild),
+    /// A worker that takes a connection and never answers it.
+    Silent,
 }
 
 impl Stated {
     /// Whether a `kr` of this build can read the screens this worker sends.
     fn readable(&self) -> bool {
         match self {
-            Self::Nothing => false,
+            Self::Nothing | Self::Silent => false,
             Self::Build(build) => build
                 .protocol_version
                 .shares_frames_with(kr_protocol::hello::PACKAGE_VERSION),
@@ -3382,6 +3384,10 @@ async fn serve_as_another_build(
 
     let (mut reader, mut writer) =
         kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+    if matches!(stated, Stated::Silent) {
+        // Held open, and answered with nothing.
+        std::future::pending::<()>().await;
+    }
     let Ok(ControlFrame::Hello(hello)) = reader.read_message::<ControlFrame>().await else {
         return;
     };
@@ -3404,7 +3410,7 @@ async fn serve_as_another_build(
         capabilities: CanonicalSet::new(),
         max_receive: hello.max_receive,
         build: match &stated {
-            Stated::Nothing => None,
+            Stated::Nothing | Stated::Silent => None,
             Stated::Build(build) => Some(build.clone()),
         },
     };
@@ -3501,6 +3507,21 @@ async fn serve_as_another_build(
             }
             ControlFrame::Request(request) => {
                 note(request.method.to_string());
+                // The question that asks whether the asking process is inside the session is
+                // answered as a worker answers a process it holds: the question is unknown.
+                if request.method.method() == Some(Method::QuestionReadOwn) {
+                    let held = ControlFrame::Response(Response {
+                        request_id: request.request_id,
+                        outcome: Outcome::Error(kr_protocol::error::ProtocolError::new(
+                            kr_protocol::error::ErrorCode::PermissionDenied,
+                            "no such question here",
+                        )),
+                    });
+                    if writer.write_message(&held).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 if request.method.method() != Some(Method::EventsSubscribe) {
                     continue;
                 }
@@ -3854,4 +3875,414 @@ fn a_worker_a_patch_number_apart_is_attached_to_and_drawn() {
         shown.escape_debug()
     );
     window.wait_until_put_back("the terminal to be back as kr found it");
+}
+
+// ---------------------------------------------------------------------------------------------
+// A session whose worker runs another release is reached through that release's own `kr`
+// ---------------------------------------------------------------------------------------------
+
+/// The manifest of a release of a store of the tests' own, stating `protocol` as its level.
+fn release_manifest(
+    release: &kr_protocol::update::ReleaseName,
+    protocol: kr_protocol::hello::PackageVersion,
+) -> String {
+    serde_json::json!({
+        "signed": {
+            "_type": "kalareach-release",
+            "release": release,
+            "sequence": "1",
+            "commit": "4254aa6e62e585478ff8dcff5518f23c7263f4ce",
+            "target": "aarch64-apple-darwin",
+            "os_floor": { "system": "macos", "version": "14.0" },
+            "protocol_version": protocol,
+            "public_majors": [1],
+            "retained_levels": ["0.48"],
+            "shells": [],
+            "stores": [{
+                "store": "registry",
+                "scope": "environment",
+                "path": "registry.sqlite",
+                "recording": { "kind": "sqlite_table", "table": "schema_version" },
+                "version": 7,
+                "migrates_from": 1,
+            }],
+            "files": [],
+        },
+        "signatures": [],
+    })
+    .to_string()
+}
+
+/// A store of two releases: the one whose `kr` the tests run, and the one a worker of another
+/// protocol level runs, whose `kr` is a program that writes down what it was started with.
+struct Releases {
+    store: kr_ipc::install::Store,
+    /// The `kr` under test, in its release of the store.
+    kr: PathBuf,
+    /// The release the worker runs.
+    theirs: kr_protocol::update::ReleaseName,
+    /// The protocol version the worker states.
+    protocol: kr_protocol::hello::PackageVersion,
+    /// What the other release's `kr` writes when it is started.
+    recorded: PathBuf,
+}
+
+impl Releases {
+    fn new(host: &Host) -> Self {
+        use kr_ipc::install::{Program, Store};
+        use kr_protocol::hello::{PACKAGE_VERSION, PackageVersion};
+        use kr_protocol::update::ReleaseName;
+
+        let store = Store::at(host.root().join("store"));
+        store.create_directories().expect("the store's directories");
+        std::fs::write(store.record(), b"{}\n").expect("the store's record");
+        let mine = ReleaseName::new("0.1.0+aaaaaaaaaaaa").expect("a release");
+        let theirs = ReleaseName::new("0.2.0+bbbbbbbbbbbb").expect("a release");
+        let protocol = PackageVersion::new(PACKAGE_VERSION.major, PACKAGE_VERSION.minor + 1, 0);
+        for (release, version) in [(&mine, PACKAGE_VERSION), (&theirs, protocol)] {
+            std::fs::create_dir_all(store.release_directory(release).join("bin"))
+                .expect("the release's bin");
+            std::fs::write(store.manifest(release), release_manifest(release, version))
+                .expect("the manifest");
+        }
+        let kr_here = store
+            .release_directory(&mine)
+            .join("bin")
+            .join(Program::Kr.file_name());
+        kr_ipc::testing::place_program(&kr(), &kr_here);
+        kr_ipc::testing::place_program(
+            &support::kr_attach_guard(),
+            &store
+                .release_directory(&mine)
+                .join("bin")
+                .join(Program::AttachGuard.file_name()),
+        );
+        let recorded = host.root().join("recorded");
+        let recorder = store
+            .release_directory(&theirs)
+            .join("bin")
+            .join(Program::Kr.file_name());
+        std::fs::write(
+            &recorder,
+            format!(
+                "#!/bin/sh\nprintf 'args:%s\\nmarker:%s\\n' \"$*\" \"$KR_HELPER_FROM\" > '{path}.tmp'\n\
+                 mv '{path}.tmp' '{path}'\n",
+                path = recorded.display()
+            ),
+        )
+        .expect("the recording program");
+        std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755))
+            .expect("it can be run");
+        Self {
+            store,
+            kr: kr_here,
+            theirs,
+            protocol,
+            recorded,
+        }
+    }
+
+    /// What the worker of this release states: the release's name and its protocol version.
+    fn stated(&self) -> Stated {
+        Stated::Build(kr_protocol::local::LocalBuild {
+            build_id: BuildId::new(format!("kr-worker/{}", self.theirs)).expect("a build"),
+            protocol_version: self.protocol,
+        })
+    }
+
+    /// The `kr` of the worker's release, which the other `kr` is handed to.
+    fn their_kr(&self) -> PathBuf {
+        self.store
+            .release_directory(&self.theirs)
+            .join("bin")
+            .join(kr_ipc::install::Program::Kr.file_name())
+    }
+
+    /// The `kr` under test, run as a command: no terminal, and the host's directories.
+    fn run(&self, host: &Host, arguments: &[&str], marker: Option<&str>) -> std::process::Output {
+        let mut command = std::process::Command::new(&self.kr);
+        command
+            .args(arguments)
+            .env_clear()
+            .envs(host.variables())
+            .current_dir(host.root());
+        if let Some(marker) = marker {
+            command.env("KR_HELPER_FROM", marker);
+        }
+        output_within(command, LIVENESS_DEADLINE)
+            .unwrap_or_else(|error| panic!("kr {arguments:?} {error}"))
+    }
+
+    /// What the other release's `kr` wrote when it was started, once it has.
+    fn what_it_was_started_with(&self) -> Vec<String> {
+        let mut seen = None;
+        until("the other release's kr to have been started", || {
+            seen = std::fs::read_to_string(&self.recorded).ok();
+            seen.is_some().then_some(())
+        });
+        seen.expect("recorded").lines().map(str::to_owned).collect()
+    }
+}
+
+/// A `kr` run from one release of a store, meeting a session whose worker runs another release at
+/// another protocol level, replaces itself with the `kr` of that release, with the session named
+/// by its identifier. It does so before it touches a terminal (this one has none, and a `kr` that
+/// went on to attach would fail for want of one), asks the worker of nothing, and starts the other
+/// `kr` holding its release.
+#[test]
+fn kr_attach_and_detach_are_handed_to_the_kr_of_the_workers_release() {
+    let host = Host::start();
+    let releases = Releases::new(&host);
+    let worker = AnotherBuild::start(&host, releases.stated());
+
+    let ran = releases.run(&host, &["attach", "--no-probe", "900"], None);
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    let started = releases.what_it_was_started_with();
+    assert_eq!(
+        started,
+        [
+            format!("args:attach {} --no-probe", worker.session_id),
+            "marker:0.1.0+aaaaaaaaaaaa".to_owned()
+        ]
+    );
+    std::fs::remove_file(&releases.recorded).expect("cleared");
+
+    // A display number two environments could share is not what the other `kr` is given.
+    let ran = releases.run(&host, &["--json", "detach", "900"], None);
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert_eq!(
+        releases.what_it_was_started_with()[0],
+        format!("args:--json detach {}", worker.session_id)
+    );
+    let asked = worker.asked();
+    assert!(
+        asked.is_empty(),
+        "nothing of the session is asked for before the hand-over: {asked:?}"
+    );
+}
+
+/// The `kr` that was started in another's place never starts another: with the marker set it is the
+/// `kr` it is, and a worker it does not read is refused as it always was. A worker whose release the
+/// store does not hold, and one whose release is being removed, are not reached through a `kr`
+/// either.
+#[test]
+fn kr_goes_on_as_it_always_did_where_no_other_kr_is_for_the_worker() {
+    // The marker stops a second hand-over.
+    let host = Host::start();
+    let releases = Releases::new(&host);
+    let worker = AnotherBuild::start(&host, releases.stated());
+    let window = Window::open(
+        &host,
+        &format!(
+            "KR_HELPER_FROM=0.1.0+aaaaaaaaaaaa {kr} attach --no-probe {OTHER_BUILD_DISPLAY}; \
+             printf '\\n{ATTACH_FINISHED}%s\\n' \"$?\"; IFS= read -r _",
+            kr = quoted(&releases.kr),
+        ),
+    );
+    let (status, shown) = attach_ended(&window, &worker.asked);
+    assert_eq!(
+        status, 8,
+        "refused as a worker of another level always was: {shown}"
+    );
+    assert!(!releases.recorded.exists(), "no other kr was started");
+    window.wait_until_put_back("the terminal to be back as kr found it");
+    drop(worker);
+
+    // A worker whose release the store lacks.
+    let lacking = AnotherBuild::start(
+        &host,
+        Stated::Build(kr_protocol::local::LocalBuild {
+            build_id: BuildId::new("kr-worker/0.9.0+cccccccccccc").expect("a build"),
+            protocol_version: releases.protocol,
+        }),
+    );
+    let window = Window::open(
+        &host,
+        &format!(
+            "{kr} attach --no-probe {OTHER_BUILD_DISPLAY}; printf '\\n{ATTACH_FINISHED}%s\\n' \"$?\"; \
+             IFS= read -r _",
+            kr = quoted(&releases.kr),
+        ),
+    );
+    let (status, _) = attach_ended(&window, &lacking.asked);
+    assert_eq!(status, 8);
+    assert!(!releases.recorded.exists(), "no other kr was started");
+    window.wait_until_put_back("the terminal to be back as kr found it");
+    drop(lacking);
+
+    // A worker whose release an update has taken to remove is not waited for.
+    let removing = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(releases.store.manifest(&releases.theirs))
+        .expect("the manifest opens");
+    removing.lock().expect("the removal's lock");
+    let worker = AnotherBuild::start(&host, releases.stated());
+    let window = Window::open(
+        &host,
+        &format!(
+            "{kr} attach --no-probe {OTHER_BUILD_DISPLAY}; printf '\\n{ATTACH_FINISHED}%s\\n' \"$?\"; \
+             IFS= read -r _",
+            kr = quoted(&releases.kr),
+        ),
+    );
+    let (status, _) = attach_ended(&window, &worker.asked);
+    assert_eq!(status, 8);
+    assert!(!releases.recorded.exists(), "no other kr was started");
+    window.wait_until_put_back("the terminal to be back as kr found it");
+    drop(removing);
+}
+
+/// A worker whose protocol version differs from this build's in the patch number alone is the same
+/// level, and a `kr` run from a store attaches to it itself.
+#[test]
+fn kr_attaches_itself_to_a_worker_of_its_own_level_even_where_the_store_holds_other_releases() {
+    let host = Host::start();
+    let releases = Releases::new(&host);
+    let ours = kr_protocol::hello::PACKAGE_VERSION;
+    let _worker = AnotherBuild::start(
+        &host,
+        Stated::Build(kr_protocol::local::LocalBuild {
+            build_id: BuildId::new(format!("kr-worker/{}", releases.theirs)).expect("a build"),
+            protocol_version: kr_protocol::hello::PackageVersion::new(
+                ours.major,
+                ours.minor,
+                ours.patch + 1,
+            ),
+        }),
+    );
+    let window = Window::open(
+        &host,
+        &format!(
+            "{kr} attach --no-probe {OTHER_BUILD_DISPLAY}; printf '\\n{ATTACH_FINISHED}%s\\n' \"$?\"; \
+             IFS= read -r _",
+            kr = quoted(&releases.kr),
+        ),
+    );
+    window.wait_for(
+        0,
+        ANOTHER_BUILD_SCREEN.as_bytes(),
+        "kr drew the screen of the worker of its own level",
+    );
+    assert!(!releases.recorded.exists(), "no other kr was started");
+}
+
+/// The contact tools find the session they serve before they serve, and a session whose worker runs
+/// another release is served by that release's own tools.
+#[test]
+fn the_contact_tools_are_handed_to_the_kr_of_the_workers_release() {
+    let host = Host::start();
+    let releases = Releases::new(&host);
+    let _worker = AnotherBuild::start(&host, releases.stated());
+    let ran = releases.run(&host, &["agent-tools", "--stdio"], None);
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert_eq!(
+        releases.what_it_was_started_with(),
+        [
+            "args:agent-tools --stdio".to_owned(),
+            "marker:0.1.0+aaaaaaaaaaaa".to_owned()
+        ]
+    );
+}
+
+/// A session none of whose workers answers is looked for for a bounded time, after which the tools
+/// serve, answering each call as they always did.
+#[test]
+fn the_contact_tools_serve_when_the_session_they_look_for_does_not_answer() {
+    use std::io::{BufRead as _, BufReader};
+
+    let host = Host::start();
+    let releases = Releases::new(&host);
+    let _silent = AnotherBuild::start(&host, Stated::Silent);
+    let mut command = std::process::Command::new(&releases.kr);
+    command
+        .args(["agent-tools", "--stdio"])
+        .env_clear()
+        .envs(host.variables())
+        .current_dir(host.root())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = command.spawn().expect("the tools start");
+    let mut input = child.stdin.take().expect("their input");
+    input
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\
+              \"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\
+              \"clientInfo\":{\"name\":\"test\",\"version\":\"0\"}}}\n",
+        )
+        .expect("the request");
+    input.flush().expect("sent");
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().expect("their output"))
+        .read_line(&mut line)
+        .expect("their answer");
+    drop(input);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        line.contains("\"result\""),
+        "the tools answered the request after they gave up looking: {line}"
+    );
+    assert!(!releases.recorded.exists(), "no other kr was started");
+}
+
+/// A command that reads a worker of another release's questions does not: it says which session it
+/// did not read, what that session runs, and the command of the release that reads it, and it asks
+/// the worker nothing. A listing says so beside the questions it did read.
+#[test]
+fn the_question_commands_say_which_worker_they_did_not_read_and_who_does() {
+    let host = Host::start();
+    let releases = Releases::new(&host);
+    let worker = AnotherBuild::start(&host, releases.stated());
+    let question = kr_protocol::ids::QuestionId::new(kr_ipc::new_uuid()).to_string();
+    for command in ["show", "cancel"] {
+        let ran = releases.run(&host, &["question", command, &question], None);
+        assert_eq!(
+            ran.status.code(),
+            Some(8),
+            "{command}: {}{}",
+            String::from_utf8_lossy(&ran.stdout),
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        let said = String::from_utf8_lossy(&ran.stderr).into_owned();
+        says_each(
+            &said,
+            &[
+                "session 900 was not read",
+                "kr-worker/0.2.0+bbbbbbbbbbbb",
+                &releases.their_kr().display().to_string(),
+                "nothing was sent",
+            ],
+        );
+    }
+    let listed = releases.run(&host, &["--json", "question", "list"], None);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let document: Value = serde_json::from_slice(&listed.stdout).expect("a document");
+    assert_eq!(document["questions"], serde_json::json!([]));
+    assert_eq!(document["unread"].as_array().map(Vec::len), Some(1));
+    assert!(
+        worker
+            .asked()
+            .iter()
+            .all(|method| method != "question.read"),
+        "no question read was sent: {:?}",
+        worker.asked()
+    );
 }

@@ -13,6 +13,7 @@
 //! | [`bind`] | Which session, if any, this process is inside, as the sessions' workers answer |
 //! | [`pair`] | `kr pair`: invitations, approving the device that answers one, and the first owner |
 //! | [`daemon`] | Reaching an environment's control daemon for the commands below |
+//! | [`helper`] | A session whose worker runs another release: handing the command to that release's `kr`, or saying it was not read |
 //! | [`project`] | `kr project`: an environment's source repositories |
 //! | [`workspace`] | `kr workspace`: the shared and isolated working copies of a repository |
 //! | [`changeset`] | `kr changeset`: exact versions of a workspace's work |
@@ -62,6 +63,7 @@ pub mod diff;
 pub mod doctor;
 pub mod error;
 pub mod export;
+pub mod helper;
 pub mod import;
 pub mod machine;
 pub mod organisation;

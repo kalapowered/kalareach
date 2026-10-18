@@ -79,6 +79,14 @@ fn main() -> ExitCode {
     }
 }
 
+/// The command line of a command handed to another release's `kr`, with `--json` where it was given.
+fn with_json(mut arguments: Vec<std::ffi::OsString>, json: bool) -> Vec<std::ffi::OsString> {
+    if json {
+        arguments.insert(0, "--json".into());
+    }
+    arguments
+}
+
 /// Reports a usage mistake, in the form the caller asked for.
 ///
 /// A mistake is said as the command's own declarations and the kind of mistake say it, never with
@@ -284,6 +292,21 @@ async fn run(cli: Cli) -> Result<Completion> {
                 }
                 Err(error) => return Err(error),
             };
+            // A worker of another release is reached by that release's own kr, with the session
+            // named by its identifier: this one does not read its frames.
+            if let Some(stated) = kr_cli::helper::stated_by(&descriptor).await {
+                let mut handed = vec!["attach".into(), descriptor.session_id.to_string().into()];
+                for (set, flag) in [
+                    (arguments.no_probe, "--no-probe"),
+                    (arguments.take_geometry, "--take-geometry"),
+                    (arguments.follow_live, "--follow-live"),
+                ] {
+                    if set {
+                        handed.push(flag.into());
+                    }
+                }
+                let _ = kr_cli::helper::hand_over(stated.as_ref(), &with_json(handed, cli.json));
+            }
             let (outcome, session_id) = kr_cli::session::run(
                 &descriptor,
                 kr_cli::session::UndeliveredTyping::new(0),
@@ -303,6 +326,17 @@ async fn run(cli: Cli) -> Result<Completion> {
             let selector = session_selector(arguments.session.as_deref())?;
             let (_, descriptor) = find(&paths, &selector, None)?;
             let mut client = open_worker(&descriptor, build_id()).await?;
+            {
+                let mut handed = vec!["detach".into(), descriptor.session_id.to_string().into()];
+                if let Some(attachment) = arguments.attachment.as_deref() {
+                    handed.push("--attachment".into());
+                    handed.push(attachment.into());
+                }
+                let _ = kr_cli::helper::hand_over(
+                    client.acknowledgement().build.as_ref(),
+                    &with_json(handed, cli.json),
+                );
+            }
             let attachment_id = match arguments.attachment.as_deref() {
                 Some(text) => Some(text.parse().map_err(|_| {
                     CliError::Usage(Shown::said(
@@ -380,6 +414,11 @@ async fn run(cli: Cli) -> Result<Completion> {
                         }
                         Err(_) => {
                             let mut client = open_worker(&descriptor, build_id()).await?;
+                            kr_cli::helper::read_only_same(
+                                client.acknowledgement().build.as_ref(),
+                                descriptor.display_number.get(),
+                                "close",
+                            )?;
                             let outcome = client
                                 .mutate(
                                     Method::SessionClose,
@@ -1758,6 +1797,11 @@ async fn read_session(
     descriptor: &kr_protocol::worker::WorkerDescriptor,
 ) -> Result<(SessionReadResult, AttachmentsRead)> {
     let mut client = open_worker(descriptor, build_id()).await?;
+    kr_cli::helper::read_only_same(
+        client.acknowledgement().build.as_ref(),
+        descriptor.display_number.get(),
+        "status",
+    )?;
     let outcome = client
         .request(
             Method::SessionRead,
@@ -1901,23 +1945,36 @@ async fn question(
                 Some(session) => question::Scope::Session(SessionSelector::parse(session)?),
                 None => question::Scope::Everything,
             };
-            let found =
+            let listed =
                 question::list(paths, &scope, arguments.include_resolved, build_id()).await?;
+            let found = &listed.questions;
+            let unread = listed.unread.iter().map(|worker| worker.said("question"));
             if json {
                 output::document(
-                    &Document::new().with("ok", true).with(
-                        "questions",
-                        found
-                            .iter()
-                            .map(|(descriptor, item)| question::rendered(descriptor, item))
-                            .collect::<Vec<_>>(),
-                    ),
+                    &Document::new()
+                        .with("ok", true)
+                        .with(
+                            "questions",
+                            found
+                                .iter()
+                                .map(|(descriptor, item)| question::rendered(descriptor, item))
+                                .collect::<Vec<_>>(),
+                        )
+                        .with(
+                            "unread",
+                            unread.map(|note| output::said(&note)).collect::<Vec<_>>(),
+                        ),
                 );
-            } else if found.is_empty() {
-                output::say(&Shown::said("no questions are waiting"));
             } else {
-                for (descriptor, item) in &found {
-                    output::line(&question::line(descriptor, item));
+                if found.is_empty() {
+                    output::say(&Shown::said("no questions are waiting"));
+                } else {
+                    for (descriptor, item) in found {
+                        output::line(&question::line(descriptor, item));
+                    }
+                }
+                for note in unread {
+                    output::say(&note);
                 }
             }
             Ok(Completion::Done)

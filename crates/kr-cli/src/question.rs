@@ -52,6 +52,7 @@ use kr_protocol::scalars::Nullable;
 use kr_protocol::worker::WorkerDescriptor;
 
 use crate::error::{CliError, Result};
+use crate::helper::{Other, Unread};
 use crate::output::{self, Asked, Document, Line, Request, left, right};
 use crate::resolve::{KnownEnvironment, SessionSelector, environments, find, open_worker};
 use crate::stdout_line;
@@ -68,7 +69,17 @@ pub enum Scope {
     Everything,
 }
 
+/// What a listing found: the questions waiting, and the workers it did not read.
+pub struct Listed {
+    /// The questions, oldest first, with the session that holds each.
+    pub questions: Vec<(WorkerDescriptor, Question)>,
+    /// The sessions whose workers run another release than this `kr`, which it does not read.
+    pub unread: Vec<Unread>,
+}
+
 /// Lists the questions waiting for a person.
+///
+/// A worker of another release is not read: its questions are in the shape of its own release.
 ///
 /// # Errors
 ///
@@ -78,8 +89,9 @@ pub async fn list(
     scope: &Scope,
     include_resolved: bool,
     build_id: BuildId,
-) -> Result<Vec<(WorkerDescriptor, Question)>> {
+) -> Result<Listed> {
     let mut found = Vec::new();
+    let mut unread = Vec::new();
     for descriptor in descriptors(paths, scope)? {
         let mut client = match open_worker(&descriptor, build_id.clone()).await {
             Ok(client) => client,
@@ -87,6 +99,13 @@ pub async fn list(
             // at the first one would hide every question after it.
             Err(_) => continue,
         };
+        if let Some(other) = Other::of(client.acknowledgement().build.as_ref()) {
+            unread.push(Unread {
+                display: descriptor.display_number.get(),
+                other,
+            });
+            continue;
+        }
         let result: QuestionReadResult = read(
             &mut client,
             &QuestionReadParams {
@@ -101,7 +120,10 @@ pub async fn list(
         }
     }
     found.sort_by_key(|(_, question)| question.created_at_ms.get());
-    Ok(found)
+    Ok(Listed {
+        questions: found,
+        unread,
+    })
 }
 
 /// Reads one question in full.
@@ -1431,15 +1453,28 @@ fn first_line(text: &str) -> String {
 }
 
 /// Finds the session holding one question, and the connection to it.
+///
+/// A worker of another release is not asked: the level it states is read from its hello, before
+/// any question, so no answer of one is read in this build's shape. When no worker this `kr` reads
+/// holds the question and some were not read, the failure names them and the command that reads
+/// them.
 async fn locate(
     paths: &HostPaths,
     question_id: QuestionId,
     build_id: BuildId,
 ) -> Result<(WorkerDescriptor, Question, LocalClient)> {
+    let mut unread = Vec::new();
     for descriptor in descriptors(paths, &Scope::Everything)? {
         let Ok(mut client) = open_worker(&descriptor, build_id.clone()).await else {
             continue;
         };
+        if let Some(other) = Other::of(client.acknowledgement().build.as_ref()) {
+            unread.push(Unread {
+                display: descriptor.display_number.get(),
+                other,
+            });
+            continue;
+        }
         let outcome: Result<QuestionReadResult> = read(
             &mut client,
             &QuestionReadParams {
@@ -1455,9 +1490,20 @@ async fn locate(
             return Ok((descriptor, question, client));
         }
     }
-    Err(CliError::Usage(shown!(
-        "no session on this host has question {}",
-        question_id
+    if unread.is_empty() {
+        return Err(CliError::Usage(shown!(
+            "no session on this host has question {}",
+            question_id
+        )));
+    }
+    let notes = unread.iter().map(|worker| worker.said("question"));
+    Err(CliError::Refused(kr_client::error::refusal(
+        ErrorCode::UnsupportedSchema,
+        shown!(
+            "no session this kr reads has question {}, and nothing was sent. {}",
+            question_id,
+            Shown::joined(notes, " ")
+        ),
     )))
 }
 
