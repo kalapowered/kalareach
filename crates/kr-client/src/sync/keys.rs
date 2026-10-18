@@ -64,9 +64,6 @@ pub trait CollectionKeys: Send + Sync + std::fmt::Debug {
     fn key(&self, collection: &str, epoch: u64) -> Result<SymmetricKey>;
 }
 
-/// How many epochs back from its own a sealer tries the keys of when it opens an object.
-const OLDER_EPOCHS: u64 = 64;
-
 /// Says that this device does not hold a key, without saying anything about the key.
 fn no_key(collection: &str, epoch: u64) -> ClientError {
     ClientError::refusal(
@@ -352,13 +349,21 @@ impl CollectionKeys for StoredCollectionKeys {
 /// call instead of at the next restart.
 ///
 /// One sealer belongs to one collection and writes under one epoch, because that is what one key
-/// belongs to. What it opens is that epoch's objects and those of the epochs before it, each with
-/// the key of its own epoch: a collection that has been rekeyed still holds what it held, sealed
-/// under the keys it was sealed with, until a member writes it again.
+/// belongs to. What it opens is that epoch's objects and those of the epochs before it down to its
+/// floor, each with the key of its own epoch: a collection that has been rekeyed still holds what
+/// it held, sealed under the keys it was sealed with, until a member writes it again.
+///
+/// The floor is the oldest epoch whose objects this device still believes. A device that was taken
+/// out keeps every key it held, and a key that is held by a device that is no longer a member
+/// authenticates whatever that device, or a service in its hands, puts together. So the floor is
+/// the epoch of the last time a device was taken out of the collection: what an earlier epoch
+/// sealed is read again only after a member has sealed it again under a key the removed device
+/// never held.
 pub struct CollectionSealer {
     keys: Arc<dyn CollectionKeys>,
     collection: String,
     epoch: u64,
+    floor: u64,
 }
 
 impl std::fmt::Debug for CollectionSealer {
@@ -369,19 +374,29 @@ impl std::fmt::Debug for CollectionSealer {
             .debug_struct("CollectionSealer")
             .field("collection", &collection)
             .field("epoch", &self.epoch)
+            .field("floor", &self.floor)
             .finish_non_exhaustive()
     }
 }
 
 impl CollectionSealer {
-    /// Builds the sealing for one collection at one epoch.
+    /// Builds the sealing for one collection at one epoch, believing no epoch before it.
     #[must_use]
     pub fn new(keys: Arc<dyn CollectionKeys>, collection: &str, epoch: u64) -> Self {
         Self {
             keys,
             collection: collection.to_owned(),
             epoch,
+            floor: epoch,
         }
+    }
+
+    /// The same sealing, opening what the epochs from `floor` on sealed as well as this one's. A
+    /// floor past the epoch is the epoch.
+    #[must_use]
+    pub fn believing_from(mut self, floor: u64) -> Self {
+        self.floor = floor.min(self.epoch);
+        self
     }
 
     /// The collection this sealer belongs to.
@@ -417,19 +432,17 @@ impl DraftSealer for CollectionSealer {
     /// the same key do not open here.
     ///
     /// A sealed object does not say which epoch's key sealed it, and the epoch the service kept
-    /// beside it is the service's word, so the keys of this epoch and of the epochs before it that
-    /// this device holds are tried, newest first, and the one that authenticates is the one that
-    /// sealed it. Only [`OLDER_EPOCHS`] epochs are tried. A device that was not a member in an
-    /// earlier epoch holds no key for it: when no held key opens the object and some were not
-    /// held, the answer says so by name, and is not the one a ciphertext that fails to
-    /// authenticate gets, which reads as tampering.
+    /// beside it is the service's word, so the keys of this epoch and of the epochs down to the
+    /// floor are tried, newest first, and the one that authenticates is the one that sealed it.
+    /// When no key opens it and every key was held, it does not authenticate, which reads as
+    /// tampering. When some key in that range is not held by this device, the answer says so by
+    /// name instead, because the object may be sealed under that key.
     fn open(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
         let object: SealedSyncObject =
             kr_cbor::from_canonical_slice(ciphertext, &kr_cbor::Limits::DEFAULT)?;
-        let oldest = self.epoch.saturating_sub(OLDER_EPOCHS - 1);
         let mut not_held = 0_u64;
         let mut refused = None;
-        for epoch in (oldest..=self.epoch).rev() {
+        for epoch in (self.floor..=self.epoch).rev() {
             let key = match self.keys.key(&self.collection, epoch) {
                 Ok(key) => key,
                 // The key of an epoch this device was not a member of is not an error to stop at:
@@ -453,8 +466,10 @@ impl DraftSealer for CollectionSealer {
             _ => Err(ClientError::refusal(
                 ErrorCode::HostNotConfigured,
                 crate::shown!(
-                    "no key this device holds opens that object: it is sealed under an epoch up to {} that this device holds no key for",
-                    self.epoch
+                    "no key this device holds opens that object: it may be sealed under one of the epochs {} to {}, and this device holds no key for {} of them",
+                    self.floor,
+                    self.epoch,
+                    not_held
                 ),
             )),
         }
@@ -549,9 +564,11 @@ mod tests {
         let first =
             CollectionSealer::new(Arc::clone(&keys) as Arc<dyn CollectionKeys>, COLLECTION, 0);
         let second =
-            CollectionSealer::new(Arc::clone(&keys) as Arc<dyn CollectionKeys>, COLLECTION, 1);
+            CollectionSealer::new(Arc::clone(&keys) as Arc<dyn CollectionKeys>, COLLECTION, 1)
+                .believing_from(0);
 
-        // What an earlier epoch sealed opens with that epoch's key, held beside the newer one.
+        // What an earlier epoch sealed opens with that epoch's key, held beside the newer one,
+        // when the floor reaches back to it.
         let earlier = first.seal(b"a setting").expect("sealed");
         assert_eq!(
             second.open(&earlier).expect("opened").as_slice(),
@@ -563,6 +580,83 @@ mod tests {
         let later = second.seal(b"a setting").expect("sealed");
         let error = first.open(&later).expect_err("a later epoch");
         assert_eq!(error.code(), ErrorCode::PermissionDenied);
+    }
+
+    #[test]
+    fn what_an_epoch_before_the_floor_sealed_is_not_believed_though_its_key_is_held() {
+        let keys = Arc::new(MemoryCollectionKeys::new());
+        keys.draw(COLLECTION, 0).expect("a key");
+        keys.draw(COLLECTION, 1).expect("a key");
+        keys.draw(COLLECTION, 2).expect("a key");
+        let seal_at = |epoch| {
+            CollectionSealer::new(
+                Arc::clone(&keys) as Arc<dyn CollectionKeys>,
+                COLLECTION,
+                epoch,
+            )
+            .seal(b"a setting")
+            .expect("sealed")
+        };
+        let (before, after) = (seal_at(0), seal_at(1));
+        // A device was taken out when the collection moved to epoch 1: it holds the key of epoch 0
+        // and may have sealed anything under it.
+        let reader =
+            CollectionSealer::new(Arc::clone(&keys) as Arc<dyn CollectionKeys>, COLLECTION, 2)
+                .believing_from(1);
+
+        let error = reader.open(&before).expect_err("before the floor");
+        assert_eq!(
+            error.code(),
+            ErrorCode::PermissionDenied,
+            "no key the floor allows opens it, and every such key is held, so it reads as it is: \
+             something that does not authenticate"
+        );
+        assert_eq!(
+            reader.open(&after).expect("opened").as_slice(),
+            b"a setting",
+            "the floor's own epoch is believed"
+        );
+    }
+
+    #[test]
+    fn an_object_that_fails_every_key_is_tampering_when_every_key_in_reach_is_held_and_missing_a_key_when_not()
+     {
+        let keys = Arc::new(MemoryCollectionKeys::new());
+        keys.draw(COLLECTION, 1).expect("a key");
+        keys.draw(COLLECTION, 2).expect("a key");
+        let stranger = Arc::new(MemoryCollectionKeys::new());
+        stranger.draw(COLLECTION, 1).expect("a key");
+        let foreign = CollectionSealer::new(stranger as Arc<dyn CollectionKeys>, COLLECTION, 1)
+            .seal(b"a setting")
+            .expect("sealed");
+
+        // This device joined at epoch 1 and believes from there: it holds every key it tries.
+        let member =
+            CollectionSealer::new(Arc::clone(&keys) as Arc<dyn CollectionKeys>, COLLECTION, 2)
+                .believing_from(1);
+        assert_eq!(
+            member
+                .open(&foreign)
+                .expect_err("not sealed by a key it holds")
+                .code(),
+            ErrorCode::PermissionDenied
+        );
+
+        // A device that was given the newest key only, and believes from an earlier epoch than it
+        // holds a key for, cannot tell and says which key is missing.
+        let late = Arc::new(MemoryCollectionKeys::new());
+        late.put(
+            COLLECTION,
+            2,
+            keys.key(COLLECTION, 2).expect("the key of epoch 2"),
+        )
+        .expect("held");
+        let gappy =
+            CollectionSealer::new(late as Arc<dyn CollectionKeys>, COLLECTION, 2).believing_from(1);
+        assert_eq!(
+            gappy.open(&foreign).expect_err("a key is missing").code(),
+            ErrorCode::HostNotConfigured
+        );
     }
 
     #[test]
@@ -945,7 +1039,9 @@ mod tests {
         );
         assert_eq!(
             format!("{sealer:?}"),
-            format!("CollectionSealer {{ collection: Some(Uuid({COLLECTION})), epoch: 1, .. }}")
+            format!(
+                "CollectionSealer {{ collection: Some(Uuid({COLLECTION})), epoch: 1, floor: 1, .. }}"
+            )
         );
     }
 }

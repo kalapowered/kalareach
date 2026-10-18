@@ -33,10 +33,12 @@
 //! * **An object sealed under a later epoch than the one this reads** is not opened. It is refused as
 //!   [`ErrorCode::ResyncRequired`] naming both epochs, where the sealer would say only that it did
 //!   not authenticate and the answer would read as tampering. An object sealed under an earlier
-//!   epoch is read: the sealer opens it with the key of its own epoch, which a device that was a
-//!   member then holds.
+//!   epoch is read down to the floor: the sealer opens it with the key of its own epoch, which a
+//!   device that was a member then holds. One sealed before the floor is refused as
+//!   [`ErrorCode::HostNotConfigured`] naming both epochs: a device was taken out since, and what it
+//!   could seal is believed again only after a member seals it again.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{SyncConflictId, SyncObjectId};
@@ -57,6 +59,10 @@ pub struct SharedCollectionService {
     service: Arc<ManagedSyncService>,
     collection: CollectionRef,
     epoch: u64,
+    /// The oldest epoch whose objects are believed.
+    floor: u64,
+    /// The epoch the service said the object it last found was sealed under.
+    last_sealed: Mutex<Option<u64>>,
 }
 
 impl std::fmt::Debug for SharedCollectionService {
@@ -66,13 +72,15 @@ impl std::fmt::Debug for SharedCollectionService {
             .debug_struct("SharedCollectionService")
             .field("collection", &self.collection)
             .field("epoch", &self.epoch)
+            .field("floor", &self.floor)
             .finish_non_exhaustive()
     }
 }
 
 impl SharedCollectionService {
     /// The shared `collection`, written under `epoch`, over a service client that signs as this
-    /// installation.
+    /// installation. It believes only what `epoch` sealed, until [`Self::believing_from`] says
+    /// more.
     #[must_use]
     pub const fn new(
         service: Arc<ManagedSyncService>,
@@ -83,7 +91,28 @@ impl SharedCollectionService {
             service,
             collection,
             epoch,
+            floor: epoch,
+            last_sealed: Mutex::new(None),
         }
+    }
+
+    /// The same collection, believing what the epochs from `floor` on sealed as well. A floor past
+    /// the epoch is the epoch.
+    #[must_use]
+    pub fn believing_from(mut self, floor: u64) -> Self {
+        self.floor = floor.min(self.epoch);
+        self
+    }
+
+    /// The epoch the service said the object it last found was sealed under, or nothing when it
+    /// has found none or the object names none. This is the service's word, to be used to decide
+    /// whether to seal an object again and never to choose a key.
+    #[must_use]
+    pub fn last_sealed_under(&self) -> Option<u64> {
+        *self
+            .last_sealed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The collection this reaches.
@@ -103,6 +132,7 @@ impl SharedCollectionService {
     #[must_use]
     pub fn sealer(&self, keys: Arc<dyn CollectionKeys>) -> CollectionSealer {
         CollectionSealer::new(keys, &self.collection.collection_id.to_string(), self.epoch)
+            .believing_from(self.floor)
     }
 }
 
@@ -132,6 +162,20 @@ fn sealed_under_another_epoch(sealed: Option<u64>, reads: u64) -> ClientError {
         ),
     };
     ClientError::refusal(ErrorCode::ResyncRequired, text)
+}
+
+/// The error an object sealed before the floor is: the key it was sealed under may be held by a
+/// device that was taken out since, so it is not opened until a member seals it again.
+fn sealed_before_the_floor(sealed: Option<u64>, floor: u64) -> ClientError {
+    let text = match sealed {
+        Some(sealed) => crate::shown!(
+            "that object is sealed under key epoch {}, from before a device was taken out at epoch {}; a member that holds it seals it again",
+            sealed,
+            floor
+        ),
+        None => crate::shown!("that object names no key epoch"),
+    };
+    ClientError::refusal(ErrorCode::HostNotConfigured, text)
 }
 
 /// The error a collection that does not list this installation is.
@@ -280,13 +324,21 @@ impl SyncBackupService for SharedCollectionService {
                     recovery: found.recovery,
                 });
             };
-            // The sealer this is read with holds this epoch's key and the keys of the epochs before
-            // it that this device was given, so an object sealed under an earlier epoch is read
-            // with its own key. One sealed under a later epoch, or under none, is refused here by
-            // name: this value was built for an epoch the collection has gone past, and the
-            // sealer would say only that it did not authenticate.
+            *self
+                .last_sealed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = held.epoch;
+            // The sealer this is read with holds this epoch's key and the keys of the epochs down
+            // to the floor that this device was given, so an object sealed under one of them is
+            // read with its own key. One sealed under a later epoch, or under none, is refused
+            // here by name: this value was built for an epoch the collection has gone past, and
+            // the sealer would say only that it did not authenticate. One sealed before the
+            // floor is refused by name too, because no key is tried for it.
             if held.epoch.is_none_or(|sealed| sealed > self.epoch) {
                 return Err(sealed_under_another_epoch(held.epoch, self.epoch));
+            }
+            if held.epoch.is_some_and(|sealed| sealed < self.floor) {
+                return Err(sealed_before_the_floor(held.epoch, self.floor));
             }
             Ok(SyncFetched::Held {
                 position: held.position,

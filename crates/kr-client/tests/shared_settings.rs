@@ -14,7 +14,7 @@
 //! | KR-REQ-20.13, compare and swap in a shared collection, the other device's content kept beside this device's own | `a_refused_write_in_a_claimed_collection_keeps_the_other_devices_settings_for_the_person` |
 //! | KR-REQ-20.13, a write is sealed and the service holds no plaintext | `settings_written_into_a_claimed_collection_are_read_back_sealed_under_its_key` |
 //! | KR-REQ-20.11, sync-collection half, a write under a retired epoch is not stored | `a_write_under_a_retired_epoch_stores_nothing_and_the_work_is_settled_as_never_run` |
-//! | KR-REQ-20.11, sync-collection half, a member reads what an earlier epoch's key sealed, a device that never held that key is told so, and an epoch the client was not built for is refused by name | `an_object_sealed_under_an_earlier_epoch_is_read_with_that_epochs_key_after_a_rekey`, `a_device_given_only_the_newer_key_is_told_by_name_that_it_cannot_open_an_older_object`, `an_object_sealed_under_a_later_epoch_is_refused_by_name_and_not_as_tampering` |
+//! | KR-REQ-20.11, sync-collection half, a member reads what an earlier epoch's key sealed down to its floor, an object from before the floor is not believed until a member seals it again, a device that never held that key is told so, and an epoch the client was not built for is refused by name | `an_object_sealed_under_an_earlier_epoch_is_read_with_that_epochs_key_after_a_rekey`, `an_object_sealed_before_the_floor_is_refused_by_name_until_a_member_seals_it_again`, `a_device_given_only_the_newer_key_is_told_by_name_that_it_cannot_open_an_older_object`, `an_object_sealed_under_a_later_epoch_is_refused_by_name_and_not_as_tampering` |
 //! | KR-REQ-20.13, a draft removed on a device leaves the service no content, and its place is free | `a_removed_draft_leaves_nothing_to_read_and_a_second_removal_finds_it_gone` |
 //! | KR-REQ-20.13, a collection that holds as many drafts as it may takes another once one is removed | `a_full_collection_takes_another_draft_once_one_is_removed` |
 //! | KR-REQ-20.13, a removal never replaces what another device wrote, and keeps nothing | `a_removal_after_another_device_wrote_removes_nothing_and_keeps_no_copy` |
@@ -157,11 +157,18 @@ impl Home {
             .map_or(0, |record| record.payload.key_epoch.get())
     }
 
-    /// A settings client for one device's store, writing under the epoch the newest record has.
+    /// A settings client for one device's store, writing under the epoch the newest record has and
+    /// believing only what that epoch sealed.
     fn client(&self, store: &std::path::Path) -> SyncClient {
+        self.client_believing_from(store, self.epoch())
+    }
+
+    /// As [`Self::client`], believing what the epochs from `floor` on sealed as well.
+    fn client_believing_from(&self, store: &std::path::Path, floor: u64) -> SyncClient {
         let epoch = self.epoch();
         let shared =
-            SharedCollectionService::new(Arc::clone(&self.service), self.collection, epoch);
+            SharedCollectionService::new(Arc::clone(&self.service), self.collection, epoch)
+                .believing_from(floor);
         let sealer = shared.sealer(Arc::clone(&self.secrets) as Arc<dyn CollectionKeys>);
         SyncClient::new(
             Arc::new(shared),
@@ -400,8 +407,9 @@ async fn an_object_sealed_under_an_earlier_epoch_is_read_with_that_epochs_key_af
     home.issue().await;
     assert_eq!(home.epoch(), 1);
 
-    // A client built for the newer epoch reads the object the earlier epoch's key sealed.
-    let newer = home.client(read.path());
+    // A client built for the newer epoch reads the object the earlier epoch's key sealed, when its
+    // floor reaches back to that epoch.
+    let newer = home.client_believing_from(read.path(), 0);
     let Restored::Settings { object, .. } = newer
         .fetch(SyncObjectKind::Settings, object_id, now())
         .await
@@ -464,7 +472,8 @@ async fn a_device_given_only_the_newer_key_is_told_by_name_that_it_cannot_open_a
     )
     .expect("the key is held");
     let shared =
-        SharedCollectionService::new(Arc::clone(&home.service), home.collection, home.epoch());
+        SharedCollectionService::new(Arc::clone(&home.service), home.collection, home.epoch())
+            .believing_from(0);
     let sealer = shared.sealer(late as Arc<dyn CollectionKeys>);
     let client = SyncClient::new(
         Arc::new(shared),
@@ -484,6 +493,79 @@ async fn a_device_given_only_the_newer_key_is_told_by_name_that_it_cannot_open_a
         error.to_string().contains("holds no key for"),
         "the refusal says which key is missing: {error}"
     );
+}
+
+/// A device that was taken out holds every key it held, and what it could seal is not believed
+/// once the collection has moved on: the object is refused by name before any key is tried, however
+/// many keys the reader holds. A member that holds the plaintext seals it again under the newer
+/// epoch, and that is read.
+#[tokio::test]
+async fn an_object_sealed_before_the_floor_is_refused_by_name_until_a_member_seals_it_again() {
+    let web = Arc::new(ServiceWeb::new());
+    let mut home = Home::claim(&web).await;
+    let (written, read) = (
+        tempfile::tempdir().expect("a directory"),
+        tempfile::tempdir().expect("a directory"),
+    );
+    let object_id = fresh_object_id().expect("an object");
+    let old = home.client(written.path());
+    old.store()
+        .put_object(&settings(object_id, "dark"))
+        .expect("the object is kept");
+    assert!(matches!(
+        old.publish(object_id, now()).await.expect("a publication"),
+        Published::Accepted { .. }
+    ));
+    home.issue().await;
+
+    // The reader holds the keys of both epochs and believes from the newer one.
+    let reader = home.client_believing_from(read.path(), 1);
+    let error = reader
+        .fetch(SyncObjectKind::Settings, object_id, now())
+        .await
+        .expect_err("sealed before the floor");
+    let SyncError::Client(error) = error else {
+        panic!("a refusal that names the epochs, not a failure to open: {error:?}");
+    };
+    assert_eq!(error.code(), ErrorCode::HostNotConfigured);
+    let said = error.to_string();
+    assert!(
+        said.contains("epoch 0") && said.contains("epoch 1"),
+        "the refusal names the two epochs: {said}"
+    );
+
+    // A member that holds the settings seals them again under the newer epoch, against what it
+    // last agreed with, and the reader believes that.
+    let member = home.client_believing_from(written.path(), 0);
+    let Restored::Settings { object, .. } = member
+        .fetch(SyncObjectKind::Settings, object_id, now())
+        .await
+        .expect("a member that believes from the first epoch reads it")
+    else {
+        panic!("settings");
+    };
+    member
+        .store()
+        .put_object(&SyncObject {
+            revision: fresh_revision().expect("a revision"),
+            ..object
+        })
+        .expect("the object is sealed again");
+    assert!(matches!(
+        member
+            .publish(object_id, now())
+            .await
+            .expect("a publication"),
+        Published::Accepted { .. }
+    ));
+    let Restored::Settings { object, .. } = reader
+        .fetch(SyncObjectKind::Settings, object_id, now())
+        .await
+        .expect("sealed under the floor's epoch, it is believed")
+    else {
+        panic!("settings");
+    };
+    assert_eq!(colour(&object), "dark");
 }
 
 /// An object sealed under a newer epoch than the one a client was built for is not opened with an
