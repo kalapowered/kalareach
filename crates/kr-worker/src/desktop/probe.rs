@@ -25,14 +25,14 @@
 //!
 //! # What makes an answer stale
 //!
-//! A probe result is evidence about one moment, one binary and one permission state, and none of
-//! those is a clock. [`Fingerprint`] is what a result was taken against: the facility's own
-//! identity, the host agent's, the platform's permission state for this subject, the desktop
-//! generation and the execution profile. [`Fingerprint::changes_since`] names which
-//! [`CapabilityInvalidation`] triggers fired between two of them, and [`stale`] keeps only the
-//! triggers the record itself lists. A host-agent update moves the agent's identity; a permission
-//! change moves the permission state; a new login moves the generation. Each of those re-runs the
-//! checks. The passage of time does not, because nothing about a permission changes by itself.
+//! A probe result is evidence about one moment, one binary and one login, and none of those is a
+//! clock. [`Fingerprint`] is what a result was taken against: the facility's own identity, the
+//! host agent's, the desktop generation and the execution profile. [`Fingerprint::changes_since`]
+//! names which [`CapabilityInvalidation`] triggers fired between two of them, and [`stale`] keeps
+//! only the triggers the record itself lists. A host-agent update moves the agent's identity; a
+//! new login moves the generation. Each of those ends what was held. The passage of time does not,
+//! because nothing about a permission changes by itself. A change of permission is not something
+//! this host can read, so it is found by performing the checks again, which a person asks for.
 //!
 //! # What runs the operation
 //!
@@ -54,16 +54,6 @@ use kr_protocol::ids::{CapabilityId, CapabilityRevision};
 use kr_protocol::scalars::{Nullable, U64};
 
 use super::capability::{CAPABILITY_VERSION, facility_identity};
-
-/// Reading a file the person authorised this context to read.
-///
-/// This is a capability in the same shared namespace as the five
-/// [`capabilities`] the platform queries answer, and it has no
-/// constant beside them because nothing that reads the platform alone can produce it: the only
-/// evidence for it is the read itself. On macOS the permission behind it is Full Disk Access where
-/// the nominated file is in a location the platform protects, and nothing at all where it is not,
-/// which is why the record names the file.
-pub const AUTHORISED_FILE_READ: &str = "desktop.authorised_file_read";
 
 /// One disclosed check.
 ///
@@ -103,7 +93,7 @@ impl Check {
     #[must_use]
     pub const fn capability(self) -> &'static str {
         match self {
-            Self::AuthorisedFileRead => AUTHORISED_FILE_READ,
+            Self::AuthorisedFileRead => capabilities::AUTHORISED_FILE_READ,
             Self::ScreenImage => capabilities::SCREEN_CAPTURE,
             Self::AccessibleElement => capabilities::ACCESSIBILITY,
             Self::ApplicationLaunch => capabilities::APPLICATION_LAUNCH,
@@ -448,13 +438,37 @@ pub fn record(
     })
 }
 
-/// Runs every check and returns one record each, in capability-name order.
+/// Returns the checks a context can perform, in capability-name order.
+///
+/// The file read is the same operation everywhere and is asked of every context. The checks that
+/// act on a desktop are asked only on a platform whose operations this build performs, and only
+/// where the context does not refuse the capability: a container, a context without a graphical
+/// login session's access, a locked desktop and an ended one are answers the platform already gave,
+/// and a check that took an image there would test the wrong screen or none. Synthetic input is
+/// never asked; its record is the platform's.
+#[must_use]
+pub fn performable(desktop: &DesktopContext) -> Vec<Check> {
+    Check::all()
+        .into_iter()
+        .filter(|check| match check {
+            Check::SyntheticInput => false,
+            Check::AuthorisedFileRead => true,
+            _ => {
+                cfg!(target_os = "macos")
+                    && !super::capability::context_refuses(check.capability(), desktop)
+            }
+        })
+        .collect()
+}
+
+/// Runs the checks given and returns one record each, in the order given.
 ///
 /// A tool-specific permission stays its own record here. There is no aggregate answer to collapse
-/// into, and a caller reading this list reads five separate states: an accessibility grant that
-/// this context holds says nothing about a screen image, and the report never says otherwise.
+/// into, and a caller reading this list reads separate states: an accessibility grant that this
+/// context holds says nothing about a screen image, and the report never says otherwise.
 #[must_use]
 pub fn report(
+    checks: &[Check],
     subject: &CapabilitySubject,
     desktop: &DesktopContext,
     revision: CapabilityRevision,
@@ -462,10 +476,10 @@ pub fn report(
     facilities: &dyn Facilities,
 ) -> Vec<CapabilityRecord> {
     let observed_at_ms = kr_ipc::now_ms();
-    Check::all()
-        .into_iter()
+    checks
+        .iter()
         .filter_map(|check| {
-            let ran = facilities.perform(check, plan);
+            let ran = facilities.perform(*check, plan);
             record(
                 &ran,
                 subject,
@@ -480,16 +494,14 @@ pub fn report(
 /// What a probe result was taken against.
 ///
 /// Two of these that differ in any field describe two different questions, so a result taken
-/// against one of them says nothing about the other. This is what drives a re-check: it changes
-/// when the thing it describes changes and at no other time.
+/// against one of them says nothing about the other. It changes when the thing it describes
+/// changes and at no other time.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Fingerprint {
     /// The facility's own identity, as [`facility_identity`] reads it.
     pub facility: Option<String>,
     /// The host agent's own identity. A host-agent update moves it.
     pub host_agent: Option<String>,
-    /// The platform's permission state for this subject, however the platform names it.
-    pub permissions: Option<String>,
     /// The desktop's login-session generation. A new login moves it.
     pub desktop_generation: Option<u64>,
     /// The execution profile the check ran under.
@@ -503,15 +515,12 @@ impl Fingerprint {
     /// facility that was identified and now cannot be is a change: the thing the answer was about
     /// is not the thing that is there now, and an answer that went on standing would describe a
     /// file nobody can point at. A reading that was unknown and stays unknown is not a change, so
-    /// a host that can never read one does not re-run the checks over and over.
+    /// a host that can never read one does not drop what it holds over and over.
     #[must_use]
     pub fn changes_since(&self, earlier: &Self) -> Vec<CapabilityInvalidation> {
         let mut fired = Vec::new();
         if earlier.facility != self.facility || earlier.host_agent != self.host_agent {
             fired.push(CapabilityInvalidation::BinaryIdentity);
-        }
-        if earlier.permissions != self.permissions {
-            fired.push(CapabilityInvalidation::OsPermission);
         }
         if earlier.desktop_generation != self.desktop_generation {
             fired.push(CapabilityInvalidation::DesktopGeneration);
@@ -526,8 +535,7 @@ impl Fingerprint {
 /// Which of a record's own invalidation triggers have fired since it was taken.
 ///
 /// The record decides what makes it stale, not the caller: a record that does not list a trigger
-/// is not invalidated by it, whatever moved. An empty answer means the record still stands and the
-/// checks do not run again.
+/// is not invalidated by it, whatever moved. An empty answer means the record still stands.
 #[must_use]
 pub fn stale(
     record: &CapabilityRecord,
@@ -538,83 +546,6 @@ pub fn stale(
         .into_iter()
         .filter(|trigger| record.invalidation.contains(trigger))
         .collect()
-}
-
-/// What a caller holds between readings, so a check runs again when it has to and not otherwise.
-///
-/// This is the re-check rule as an object. A caller keeps one of these per subject, hands it the
-/// fingerprint of the moment, and gets the records back; the checks run again only when one of the
-/// triggers the held records name has fired since they were taken. A host-agent update, a changed
-/// permission, a new login and a changed profile each do that. Nothing else does, and in
-/// particular no amount of time passing does, which is the whole point: these checks take an image
-/// of somebody's screen and start an application, and they do that when there is a reason.
-#[derive(Debug, Default)]
-pub struct Schedule {
-    held: Vec<CapabilityRecord>,
-    taken_against: Option<Fingerprint>,
-    ran_with: Option<Plan>,
-}
-
-impl Schedule {
-    /// A schedule holding nothing, whose first reading runs the checks.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// The records this schedule is holding, whether or not they still stand.
-    #[must_use]
-    pub fn held(&self) -> &[CapabilityRecord] {
-        &self.held
-    }
-
-    /// Which triggers have fired against the held records since they were taken.
-    ///
-    /// Empty where nothing has fired, and empty is what means the checks do not run again. A
-    /// schedule holding nothing has nothing to compare, and answers that it must run.
-    #[must_use]
-    pub fn fired(&self, now: &Fingerprint) -> Vec<CapabilityInvalidation> {
-        let Some(taken_against) = self.taken_against.as_ref() else {
-            return Vec::new();
-        };
-        let mut fired: Vec<CapabilityInvalidation> = Vec::new();
-        for record in &self.held {
-            for trigger in stale(record, taken_against, now) {
-                if !fired.contains(&trigger) {
-                    fired.push(trigger);
-                }
-            }
-        }
-        fired
-    }
-
-    /// Whether the checks have to run again.
-    ///
-    /// The plan is part of the question. A run given a file the last one did not have is a
-    /// different question, and answering it from what was held would report that no file was
-    /// nominated to somebody who had just nominated one.
-    #[must_use]
-    pub fn must_run(&self, now: &Fingerprint, plan: &Plan) -> bool {
-        self.held.is_empty() || self.ran_with.as_ref() != Some(plan) || !self.fired(now).is_empty()
-    }
-
-    /// Returns the records, running the checks again only where something fired.
-    pub fn refresh(
-        &mut self,
-        subject: &CapabilitySubject,
-        desktop: &DesktopContext,
-        revision: CapabilityRevision,
-        now: &Fingerprint,
-        plan: &Plan,
-        facilities: &dyn Facilities,
-    ) -> &[CapabilityRecord] {
-        if self.must_run(now, plan) {
-            self.held = report(subject, desktop, revision, plan, facilities);
-            self.taken_against = Some(now.clone());
-            self.ran_with = Some(plan.clone());
-        }
-        &self.held
-    }
 }
 
 /// The facilities of the machine this host is running on.
@@ -646,9 +577,9 @@ impl Facilities for Platform {
 
 /// The authorised-file read, which is the same operation on every platform.
 ///
-/// It opens the file the person nominated and reads the first block of it. Reading the whole of a
-/// file the check knows nothing about would be a diagnostic that copies a document into memory, so
-/// it reads enough to establish that the bytes come out and stops.
+/// It opens the file the person nominated once and reads the first block of it from that handle.
+/// Reading the whole of a file the check knows nothing about would be a diagnostic that copies a
+/// document into memory, so it reads enough to establish that the bytes come out and stops.
 fn read_authorised_file(plan: &Plan) -> Ran {
     let check = Check::AuthorisedFileRead;
     let Some(path) = plan.authorised_file.as_deref() else {
@@ -664,68 +595,11 @@ fn read_authorised_file(plan: &Plan) -> Ran {
         };
     };
     let facility = Some(path.display().to_string());
-    // A regular file, and nothing else. Opening a pipe or a device would block for as long as
-    // whatever is on the other end feels like. The look itself is inside the check's own bound,
-    // because asking a filesystem that has stopped answering about a file blocks in the kernel
-    // just as reading it does.
-    // One deadline for the whole check, shared by the look and the read. Two of its own would add
-    // up to twice what the check declares.
-    let deadline = std::time::Instant::now() + check.effects().bound;
-    let Some(looked) = bounded_look(path, remaining(deadline)) else {
-        return Ran {
-            check,
-            facility,
-            outcome: Outcome::NotAttempted {
-                detail: Sentence::new()
-                    .path(path)
-                    .stated(" had not been looked at after ")
-                    .number(check.effects().bound.as_secs())
-                    .stated(" seconds, so this check stopped waiting for it"),
-            },
-        };
-    };
-    match looked {
-        Ok(data) if !data.is_file() => {
-            return Ran {
-                check,
-                facility,
-                outcome: Outcome::NotAttempted {
-                    detail: Sentence::new()
-                        .path(path)
-                        .stated(" is not a regular file, and this check reads only a file"),
-                },
-            };
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Ran {
-                check,
-                facility,
-                outcome: Outcome::PermissionRefused {
-                    permission: permission_for_path(path),
-                    detail: Sentence::new()
-                        .stated("the platform refused to look at ")
-                        .path(path)
-                        .stated(": ")
-                        .withheld(ContentClass::Message, &error.to_string()),
-                },
-            };
-        }
-        Err(error) => {
-            return Ran {
-                check,
-                facility,
-                outcome: Outcome::NotAttempted {
-                    detail: Sentence::new()
-                        .path(path)
-                        .stated(" could not be looked at: ")
-                        .withheld(ContentClass::Message, &error.to_string()),
-                },
-            };
-        }
-    }
-    let outcome = match bounded_read(path, remaining(deadline)) {
-        // Nothing to ask to stop: the read is in the kernel and the check stops waiting for it.
+    // The path is opened once and everything after is asked of that handle, so a file replaced by
+    // a pipe or a device between a look and a read is not read at all. The open itself does not
+    // wait for the other end of a pipe, and the whole check answers inside its own bound whatever
+    // the filesystem does.
+    let outcome = match bounded_read(path, check.effects().bound) {
         None => Outcome::NotAttempted {
             detail: Sentence::new()
                 .path(path)
@@ -736,7 +610,12 @@ fn read_authorised_file(plan: &Plan) -> Ran {
                      filesystem's to finish",
                 ),
         },
-        Some(Ok(count)) => Outcome::Performed {
+        Some(Ok(FirstBlock::NotRegular)) => Outcome::NotAttempted {
+            detail: Sentence::new()
+                .path(path)
+                .stated(" is not a regular file, and this check reads only a file"),
+        },
+        Some(Ok(FirstBlock::Read(count))) => Outcome::Performed {
             detail: Sentence::new()
                 .stated("it read ")
                 .number(count as u64)
@@ -770,10 +649,13 @@ fn read_authorised_file(plan: &Plan) -> Ran {
     }
 }
 
-/// How much of a deadline is left, and never less than nothing.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn remaining(deadline: std::time::Instant) -> Duration {
-    deadline.saturating_duration_since(std::time::Instant::now())
+/// What the first block of a nominated file came to.
+#[derive(Debug, PartialEq, Eq)]
+enum FirstBlock {
+    /// The handle is not a regular file, and nothing was read from it.
+    NotRegular,
+    /// This many bytes came out.
+    Read(usize),
 }
 
 /// Reads the first block of a file, or gives up on the clock.
@@ -783,19 +665,11 @@ fn remaining(deadline: std::time::Instant) -> Duration {
 /// answers whatever the filesystem does. A read that never returns leaves its thread waiting
 /// rather than the check, which is the trade this makes deliberately: a diagnostic that cannot
 /// answer is worse than a thread that is still asleep when the process ends.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn bounded_read(path: &Path, bound: Duration) -> Option<std::io::Result<usize>> {
+fn bounded_read(path: &Path, bound: Duration) -> Option<std::io::Result<FirstBlock>> {
     on_a_thread(path, bound, |path| read_first_block(&path))
 }
 
-/// Looks at a file, or gives up on the clock. The same trade as [`bounded_read`].
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn bounded_look(path: &Path, bound: Duration) -> Option<std::io::Result<std::fs::Metadata>> {
-    on_a_thread(path, bound, |path| std::fs::metadata(path.as_path()))
-}
-
 /// Runs one filesystem question on a thread and waits for it with a clock.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn on_a_thread<T: Send + 'static>(
     path: &Path,
     bound: Duration,
@@ -812,20 +686,41 @@ fn on_a_thread<T: Send + 'static>(
 /// How much of the nominated file the read check takes.
 const FIRST_BLOCK: usize = 4_096;
 
-/// Reads the first block of a file and returns how many bytes came out.
-fn read_first_block(path: &Path) -> std::io::Result<usize> {
+/// Opens a path for reading without waiting for whatever is on its other end.
+///
+/// A pipe opened for reading waits for a writer, and a device can wait for a person. Opening
+/// without waiting returns at once for both, and what was opened is then asked what it is. A
+/// terminal device named here is not made this process's controlling terminal by being opened.
+fn open_without_waiting(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    options.open(path)
+}
+
+/// Opens a file once, refuses anything that is not a regular file, and returns how many bytes of
+/// its first block came out.
+fn read_first_block(path: &Path) -> std::io::Result<FirstBlock> {
     use std::io::Read as _;
 
-    let mut file = std::fs::File::open(path)?;
+    let mut file = open_without_waiting(path)?;
+    if !file.metadata()?.is_file() {
+        return Ok(FirstBlock::NotRegular);
+    }
     let mut block = [0_u8; FIRST_BLOCK];
     let mut read = 0_usize;
     loop {
         match file.read(&mut block[read..]) {
-            Ok(0) => return Ok(read),
+            Ok(0) => return Ok(FirstBlock::Read(read)),
             Ok(count) => {
                 read += count;
                 if read == block.len() {
-                    return Ok(read);
+                    return Ok(FirstBlock::Read(read));
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -1605,6 +1500,8 @@ mod tests {
         }
     }
 
+    /// KR-REQ-03.30: the one check that sends input or changes data is the destructive one, and it
+    /// says it needs a context of its own.
     #[test]
     fn only_the_destructive_check_sends_input_or_changes_data() {
         for check in Check::all() {
@@ -1728,6 +1625,7 @@ mod tests {
         ]);
         let desktop = desktop();
         let records = report(
+            &Check::all(),
             &subject(),
             &desktop,
             revision(),
@@ -1757,16 +1655,17 @@ mod tests {
             CapabilityState::NotTested
         );
         assert_eq!(
-            state(AUTHORISED_FILE_READ),
+            state(capabilities::AUTHORISED_FILE_READ),
             CapabilityState::QualifiedAvailable
         );
     }
 
     #[test]
-    fn every_probe_record_carries_the_four_triggers_that_re_run_it() {
+    fn every_probe_record_carries_the_four_triggers_that_end_it() {
         let facilities = Scripted(Vec::new());
         let desktop = desktop();
         let records = report(
+            &Check::all(),
             &subject(),
             &desktop,
             revision(),
@@ -1794,11 +1693,10 @@ mod tests {
     }
 
     #[test]
-    fn a_host_agent_update_and_a_permission_change_each_re_run_the_checks() {
+    fn a_host_agent_update_a_new_login_and_a_changed_profile_each_end_what_was_held() {
         let earlier = Fingerprint {
             facility: Some("a".to_owned()),
             host_agent: Some("one".to_owned()),
-            permissions: Some("denied".to_owned()),
             desktop_generation: Some(11),
             profile: Some(WorkerProfile::DesktopBound),
         };
@@ -1809,14 +1707,6 @@ mod tests {
         assert_eq!(
             updated.changes_since(&earlier),
             vec![CapabilityInvalidation::BinaryIdentity]
-        );
-        let granted = Fingerprint {
-            permissions: Some("granted".to_owned()),
-            ..earlier.clone()
-        };
-        assert_eq!(
-            granted.changes_since(&earlier),
-            vec![CapabilityInvalidation::OsPermission]
         );
         let relogged = Fingerprint {
             desktop_generation: Some(12),
@@ -1837,11 +1727,10 @@ mod tests {
     }
 
     #[test]
-    fn nothing_re_runs_because_time_passed() {
+    fn nothing_ends_what_was_held_because_time_passed() {
         let taken = Fingerprint {
             facility: Some("a".to_owned()),
             host_agent: Some("one".to_owned()),
-            permissions: Some("denied".to_owned()),
             desktop_generation: Some(11),
             profile: Some(WorkerProfile::DesktopBound),
         };
@@ -1861,78 +1750,8 @@ mod tests {
             "an answer about a file nobody can point at any more is not about that file"
         );
         // And it fires once: a reading that stays unknown is not a change, so a host that can
-        // never read one does not take an image of a screen over and over.
+        // never read one does not drop what it holds over and over.
         assert!(gone.changes_since(&gone).is_empty());
-    }
-
-    #[test]
-    fn a_schedule_runs_the_checks_when_something_fired_and_not_otherwise() {
-        let facilities = Scripted(vec![ran(
-            Check::ScreenImage,
-            Outcome::Performed {
-                detail: Sentence::new().stated("an image"),
-            },
-        )]);
-        let desktop = desktop();
-        let subject = subject();
-        let plan = Plan::in_directory(".");
-        let taken = Fingerprint {
-            permissions: Some("denied".to_owned()),
-            profile: Some(WorkerProfile::DesktopBound),
-            ..Fingerprint::default()
-        };
-
-        let mut schedule = Schedule::new();
-        assert!(
-            schedule.must_run(&taken, &plan),
-            "nothing held is nothing to trust"
-        );
-        let first = schedule
-            .refresh(&subject, &desktop, revision(), &taken, &plan, &facilities)
-            .to_vec();
-        assert_eq!(first.len(), 5);
-
-        // The same moment: nothing fired, nothing runs, and the answers are the ones already held.
-        assert!(!schedule.must_run(&taken, &plan));
-        assert!(schedule.fired(&taken).is_empty());
-        let again = schedule
-            .refresh(&subject, &desktop, revision(), &taken, &plan, &facilities)
-            .to_vec();
-        assert_eq!(
-            again, first,
-            "an unchanged moment does not re-run the checks"
-        );
-
-        // A permission changed, which is one of the triggers every probe record carries.
-        let granted = Fingerprint {
-            permissions: Some("granted".to_owned()),
-            ..taken.clone()
-        };
-        assert_eq!(
-            schedule.fired(&granted),
-            vec![CapabilityInvalidation::OsPermission]
-        );
-        assert!(schedule.must_run(&granted, &plan));
-        // And it runs, rather than handing back what it held against the moment before.
-        let after = schedule
-            .refresh(&subject, &desktop, revision(), &granted, &plan, &facilities)
-            .to_vec();
-        assert_eq!(after.len(), 5);
-        assert!(
-            schedule.fired(&granted).is_empty(),
-            "and it is current again"
-        );
-
-        // A different question is a different answer, whatever the moment says. A run given a
-        // file the last one did not have must not be answered from the one that had none.
-        let nominated = Plan {
-            authorised_file: Some("/etc/hosts".into()),
-            ..Plan::in_directory(".")
-        };
-        assert!(
-            schedule.must_run(&granted, &nominated),
-            "a plan the held answers were not taken against is a question nobody has answered"
-        );
     }
 
     #[test]
@@ -1945,29 +1764,59 @@ mod tests {
         )]);
         let desktop = desktop();
         let records = report(
+            &Check::all(),
             &subject(),
             &desktop,
             revision(),
             &Plan::in_directory("."),
             &facilities,
         );
-        let record = records
+        let mut record = records
             .iter()
             .find(|record| record.capability.as_str() == capabilities::SCREEN_CAPTURE)
+            .cloned()
             .expect("the screen record");
         let taken = Fingerprint {
-            permissions: Some("granted".to_owned()),
+            desktop_generation: Some(11),
             ..Fingerprint::default()
         };
         let now = Fingerprint {
-            permissions: Some("revoked".to_owned()),
+            desktop_generation: Some(12),
             ..Fingerprint::default()
         };
         assert_eq!(
-            stale(record, &taken, &now),
-            vec![CapabilityInvalidation::OsPermission]
+            stale(&record, &taken, &now),
+            vec![CapabilityInvalidation::DesktopGeneration]
         );
-        assert!(stale(record, &taken, &taken).is_empty());
+        assert!(stale(&record, &taken, &taken).is_empty());
+        // A record that does not list a trigger is not ended by it, whatever moved.
+        record
+            .invalidation
+            .retain(|trigger| *trigger != CapabilityInvalidation::DesktopGeneration);
+        assert!(stale(&record, &taken, &now).is_empty());
+    }
+
+    #[test]
+    fn a_context_is_asked_only_for_the_checks_it_can_perform() {
+        // The file read is the same operation everywhere, and synthetic input is never asked.
+        let mut context = desktop();
+        let asked = performable(&context);
+        assert!(asked.contains(&Check::AuthorisedFileRead));
+        assert!(!asked.contains(&Check::SyntheticInput));
+        // The checks that act on a desktop are this build's on macOS only.
+        assert_eq!(
+            asked.contains(&Check::ScreenImage),
+            cfg!(target_os = "macos")
+        );
+        // And a context the platform refuses for them is asked for the file read alone.
+        context.graphic_access = false;
+        assert_eq!(performable(&context), vec![Check::AuthorisedFileRead]);
+        let mut locked = desktop();
+        locked.availability = DesktopAvailability::Locked;
+        assert_eq!(performable(&locked), vec![Check::AuthorisedFileRead]);
+        let mut container = desktop();
+        container.container = ContainerEnvironment::Container;
+        assert_eq!(performable(&container), vec![Check::AuthorisedFileRead]);
     }
 
     #[test]
@@ -1976,6 +1825,8 @@ mod tests {
         assert!(matches!(ran.outcome, Outcome::NotAttempted { .. }));
     }
 
+    /// KR-REQ-03.30: without an isolated context of its own, the destructive check is withheld and
+    /// nothing is sent.
     #[test]
     fn the_destructive_check_is_withheld_without_a_context_of_its_own() {
         let ran = Platform.perform(Check::SyntheticInput, &Plan::in_directory("."));
@@ -2010,6 +1861,33 @@ mod tests {
         let (_, _, reason) = judge(ran.check, &ran.outcome);
         let reason = reason.expect("a reason");
         assert!(!reason.as_str().contains("authorised.txt"), "{reason}");
+        std::fs::remove_dir_all(&directory).expect("this test's own directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_in_place_of_the_nominated_file_is_not_waited_for() {
+        let directory = std::env::temp_dir().join(format!("kr-probe-pipe-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a directory of this test's own");
+        let pipe = directory.join("authorised.pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "a pipe for this test");
+        let plan = Plan {
+            authorised_file: Some(pipe),
+            ..Plan::in_directory(&directory)
+        };
+        // Nothing writes to it. A read that opened it the ordinary way would wait for a writer
+        // that is not coming and answer only when its bound ran out.
+        let ran = Platform.perform(Check::AuthorisedFileRead, &plan);
+        match &ran.outcome {
+            Outcome::NotAttempted { detail } => {
+                assert!(detail.as_str().contains("not a regular file"), "{detail}");
+            }
+            other => panic!("a pipe is not a file this check reads: {other:?}"),
+        }
         std::fs::remove_dir_all(&directory).expect("this test's own directory");
     }
 
@@ -2146,6 +2024,7 @@ fn the_disclosed_checks_on_this_desktop() {
         terminal: Nullable::null(),
     };
     let records = report(
+        &Check::all(),
         &subject,
         &desktop,
         CapabilityRevision::new(1),

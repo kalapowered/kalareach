@@ -265,6 +265,17 @@ pub fn answer(capability: &str, desktop: &DesktopContext) -> Answer {
     }
 }
 
+/// Whether the execution context itself refuses a capability: a container, a context without a
+/// graphical login session's access, a locked desktop and an ended one.
+///
+/// The disclosed checks are performed only where this is false, and an answer they produced is
+/// shown only where it is false, so a screen that has locked since is never reported as one that
+/// can be captured.
+#[must_use]
+pub fn context_refuses(capability: &str, desktop: &DesktopContext) -> bool {
+    context_refusal(capability, desktop).is_some()
+}
+
 /// Returns the refusal the execution context itself produces, where there is one.
 fn context_refusal(capability: &str, desktop: &DesktopContext) -> Option<Answer> {
     if !desktop.container.reaches_parent_desktop() {
@@ -616,9 +627,59 @@ fn display_reachable() -> bool {
 
 /// Returns the first installed facility that serves one capability on this display server.
 fn facility(capability: &str, display_server: DisplayServer) -> Option<String> {
+    facility_in(
+        capability,
+        display_server,
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// [`facility`], looking for a facility given by a bare name in `search` as the search path.
+fn facility_in(
+    capability: &str,
+    display_server: DisplayServer,
+    search: Option<&std::ffi::OsStr>,
+) -> Option<String> {
     candidates(capability, display_server)
         .iter()
-        .find_map(|candidate| installed(candidate))
+        .find_map(|candidate| installed_in(candidate, search))
+}
+
+/// The tools the disclosed checks use on this desktop, each with the identity of its file, as one
+/// line.
+///
+/// It is read from the machine and not from what a context lets be answered: a locked screen does
+/// not remove the tool that takes a screen image, and a tool installed since a run is a change.
+/// Two readings differ when a tool was installed, removed or replaced between them, and at no
+/// other time.
+#[must_use]
+pub fn tools_of(desktop: &DesktopContext) -> String {
+    tools_in(desktop, std::env::var_os("PATH").as_deref())
+}
+
+/// [`tools_of`], looking for a tool given by a bare name in `search` as the search path.
+fn tools_in(desktop: &DesktopContext, search: Option<&std::ffi::OsStr>) -> String {
+    let mut tools: Vec<String> = [
+        capabilities::ACCESSIBILITY,
+        capabilities::APPLICATION_LAUNCH,
+        capabilities::SCREEN_CAPTURE,
+    ]
+    .into_iter()
+    .map(|capability| {
+        let tool = facility_in(capability, desktop.display_server, search);
+        let identity = tool
+            .as_deref()
+            .and_then(facility_identity)
+            .map(|identity| identity.as_str().to_owned());
+        format!(
+            "{capability}={}|{}",
+            tool.as_deref().unwrap_or_default(),
+            identity.unwrap_or_default()
+        )
+    })
+    .collect();
+    tools.sort();
+    tools.join(";")
 }
 
 /// Returns the facilities that serve one capability, most specific first.
@@ -656,13 +717,12 @@ fn candidates(capability: &str, display_server: DisplayServer) -> &'static [&'st
 /// execution context's own search path, because a facility installed for the user is as real as
 /// one installed for everybody, and the search path is part of the context the session runs in.
 /// A file that is not executable is not a facility: it would fail at the first attempt to run it.
-fn installed(candidate: &str) -> Option<String> {
+fn installed_in(candidate: &str, search: Option<&std::ffi::OsStr>) -> Option<String> {
     let path = std::path::Path::new(candidate);
     if path.is_absolute() {
         return runnable(path).then(|| candidate.to_owned());
     }
-    let search = std::env::var_os("PATH")?;
-    std::env::split_paths(&search)
+    std::env::split_paths(search?)
         .map(|directory| directory.join(candidate))
         .find(|full| runnable(full))
         .map(|full| full.display().to_string())
@@ -793,6 +853,55 @@ mod tests {
         context.graphic_access = false;
         context.worker_profile = WorkerProfile::HeadlessUser;
         context
+    }
+
+    /// What the daemon holds findings against: it differs when a tool the checks use was installed,
+    /// replaced or removed, and only then.
+    #[cfg(unix)]
+    #[test]
+    fn the_tools_differ_when_one_is_installed_replaced_or_removed_and_at_no_other_time() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = std::env::temp_dir().join(format!("kr-tools-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("a directory of this test's own");
+        let search = std::ffi::OsString::from(&directory);
+        let context = desktop(DisplayServer::X11, Some("x"));
+        let reading = || tools_in(&context, Some(search.as_os_str()));
+
+        let none = reading();
+        assert_eq!(none, reading(), "two readings of one state are equal");
+
+        let tool = directory.join("maim");
+        std::fs::write(&tool, b"the first build").expect("the tool");
+        let not_yet = reading();
+        assert_eq!(
+            not_yet, none,
+            "a file that cannot be run is not a tool, so it is no change"
+        );
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
+            .expect("makes it runnable");
+        let installed = reading();
+        assert_ne!(installed, none, "a tool installed since is a change");
+        assert_eq!(installed, reading());
+
+        std::fs::write(&tool, b"the second build").expect("the replacement");
+        let replaced = reading();
+        assert_ne!(replaced, installed, "a tool replaced is a change");
+
+        // A lock changes nothing about a tool that is there.
+        for availability in [DesktopAvailability::Locked, DesktopAvailability::Ended] {
+            let mut other = context.clone();
+            other.availability = availability;
+            assert_eq!(
+                tools_in(&other, Some(search.as_os_str())),
+                replaced,
+                "{availability:?}"
+            );
+        }
+
+        std::fs::remove_file(&tool).expect("removes the tool");
+        assert_eq!(reading(), none, "a tool removed is a change, back to none");
+        std::fs::remove_dir_all(&directory).expect("removes the test's directory");
     }
 
     #[test]
@@ -1186,8 +1295,11 @@ mod tests {
 
     #[test]
     fn an_absolute_facility_is_checked_where_it_is() {
-        assert!(installed("/definitely/not/here").is_none());
+        assert!(installed_in("/definitely/not/here", None).is_none());
         let shell = crate::testing::posix_shell();
-        assert!(installed(&shell).is_some(), "this host has a shell");
+        assert!(
+            installed_in(&shell, None).is_some(),
+            "this host has a shell"
+        );
     }
 }

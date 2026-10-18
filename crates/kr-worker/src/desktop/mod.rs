@@ -48,6 +48,7 @@
 //! never death, which is the same rule the rest of the host's identity reads follow.
 
 pub mod capability;
+pub mod checks;
 pub mod persistence;
 pub mod platform;
 pub mod probe;

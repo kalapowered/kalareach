@@ -154,6 +154,12 @@ struct Authority {
     /// There is one, bound as the attention connection is: a newer one replaces it, and a
     /// replacement generation fences it with the rest.
     descriptions_connection: Option<ConnectionId>,
+    /// The connection the control daemon asks this worker to perform the disclosed desktop checks
+    /// over.
+    ///
+    /// There is one, bound as the others are: a newer one replaces it, and a replacement
+    /// generation fences it with the rest.
+    checks_connection: Option<ConnectionId>,
     /// A revision this worker was told about while it was inside a dispatch transition.
     ///
     /// The announcement was refused, because a fence cannot interleave with a dispatch and waiting
@@ -245,6 +251,8 @@ pub struct WorkerService {
     /// What this session was doing, as the control daemon's descriptions read it over the
     /// descriptions connection. The session records into it; this serves it.
     description_facts: crate::description_facts::DescriptionFacts,
+    /// Whether the disclosed desktop checks are being performed: one run at a time.
+    checks_run: crate::desktop::checks::OneRun,
     /// The trusted broker: the agent processes, their gateway and the resources it arbitrates.
     broker: Arc<crate::broker::Broker>,
     /// The plugin admissions the control daemon handed this worker, as it read them.
@@ -565,6 +573,7 @@ impl WorkerService {
                 proxy_connections: std::collections::BTreeSet::new(),
                 attention_connection: None,
                 descriptions_connection: None,
+                checks_connection: None,
                 owed: None,
             }),
             dispatch: Mutex::new(()),
@@ -582,6 +591,7 @@ impl WorkerService {
             held_attention_approvals_head: std::sync::atomic::AtomicU64::new(0),
             attention_fence,
             description_facts,
+            checks_run: crate::desktop::checks::OneRun::default(),
             broker,
             plugin_admissions: Arc::new(crate::broker::catalogue::Admissions::new()),
             connector_sources: Arc::new(crate::broker::connectors::ConnectorSources::new()),
@@ -2581,6 +2591,20 @@ impl WorkerService {
                 ),
             ));
         }
+        // The checks connection carries the checks request and nothing else, for the same reason.
+        if state.facts.controller_role == ControllerConnectionRole::Checks
+            && state.facts.controller
+            && !matches!(message, ControlFrame::DesktopChecks(_))
+        {
+            return Some(failure(
+                request_id_of(&message),
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "the checks connection carries the request to perform the disclosed checks \
+                     and nothing else",
+                ),
+            ));
+        }
         match message {
             ControlFrame::Hello(hello) => Some(self.hello(state, peer, &hello)),
             ControlFrame::VerifyChallenge(challenge) => {
@@ -2669,6 +2693,7 @@ impl WorkerService {
             ControlFrame::DescriptionFacts(request) => {
                 self.description_facts_request(state, request)
             }
+            ControlFrame::DesktopChecks(request) => Some(self.desktop_checks(state, request).await),
             ControlFrame::AttentionText(request) => Some(self.attention_text(state, &request)),
             ControlFrame::AttentionBarrierAcknowledged(acknowledgement) => {
                 // Only the daemon's current attention connection speaks for the daemon this worker
@@ -2952,6 +2977,80 @@ impl WorkerService {
             return Err(WorkerError::PermissionDenied {
                 detail: "description facts are read only over the control daemon's descriptions \
                          connection"
+                    .to_owned(),
+            });
+        }
+        self.check_authority(&state.facts)
+    }
+
+    /// Performs the disclosed desktop checks the control daemon asked for.
+    ///
+    /// Only on the daemon's current checks connection, bound to the generation this worker
+    /// accepts, and one run at a time. The run takes a screen image and starts an application, so
+    /// it is made on a thread of its own with no lock of the session held, and the connection it
+    /// arrived on is the only thing that waits for it.
+    async fn desktop_checks(
+        &self,
+        state: &ConnectionState,
+        request: kr_protocol::desktop::DesktopChecksRequest,
+    ) -> ControlFrame {
+        if let Err(error) = self.check_checks_link(state) {
+            return failure(request.request_id, &error.to_protocol_error());
+        }
+        let Some(run) = self.checks_run.begin() else {
+            return failure(
+                request.request_id,
+                &ProtocolError::new(
+                    ErrorCode::ResourceUnavailable,
+                    "the disclosed checks are already being performed",
+                ),
+            );
+        };
+        let (session_id, profile) = {
+            let session = self.runtime.session();
+            (session.id(), session.config().worker_profile)
+        };
+        let boot = self.boot_identity.clone();
+        let request_id = request.request_id;
+        let performed = tokio::task::spawn_blocking(move || {
+            // The run ends when the thread does, whether or not the connection that asked is
+            // still there to be answered, so a second request is never started beside it.
+            let _run = run;
+            // Read on this thread: asking the platform for the login session can wait on it.
+            let desktop = crate::desktop::context(profile, boot);
+            crate::desktop::checks::perform(
+                &request,
+                session_id,
+                &desktop,
+                &std::env::temp_dir(),
+                &crate::desktop::probe::Platform,
+            )
+        })
+        .await;
+        match performed {
+            Ok(Ok(answer)) => ControlFrame::DesktopChecksAnswer(Box::new(answer)),
+            Ok(Err(refusal)) => failure(
+                request_id,
+                &ProtocolError::new(ErrorCode::InvalidArgument, refusal.sentence()),
+            ),
+            Err(_) => failure(
+                request_id,
+                &ProtocolError::new(
+                    ErrorCode::ResourceUnavailable,
+                    "the disclosed checks did not finish",
+                ),
+            ),
+        }
+    }
+
+    /// Refuses a checks request anywhere but on the daemon's current checks connection.
+    fn check_checks_link(&self, state: &ConnectionState) -> Result<()> {
+        if state.facts.client_kind != LocalClientKind::Controller
+            || state.facts.controller_role != ControllerConnectionRole::Checks
+        {
+            return Err(WorkerError::PermissionDenied {
+                detail: "the disclosed checks are performed only at the request of the control \
+                         daemon's checks connection"
                     .to_owned(),
             });
         }
@@ -3433,6 +3532,7 @@ impl WorkerService {
                     fenced.extend(std::mem::take(&mut authority.proxy_connections));
                     fenced.extend(authority.attention_connection.take());
                     fenced.extend(authority.descriptions_connection.take());
+                    fenced.extend(authority.checks_connection.take());
                 }
                 authority.accepted_generation = Some(token.generation);
                 // A bound that carries a lease does not outlive the daemon that held the lease.
@@ -3482,6 +3582,18 @@ impl WorkerService {
                     ControllerConnectionRole::Descriptions => {
                         if let Some(previous) = authority
                             .descriptions_connection
+                            .replace(state.facts.connection_id)
+                            && previous != state.facts.connection_id
+                            && !fenced.contains(&previous)
+                        {
+                            fenced.push(previous);
+                        }
+                    }
+                    // The daemon asks for the disclosed checks over one connection, so a newer one
+                    // replaces the one before it.
+                    ControllerConnectionRole::Checks => {
+                        if let Some(previous) = authority
+                            .checks_connection
                             .replace(state.facts.connection_id)
                             && previous != state.facts.connection_id
                             && !fenced.contains(&previous)
@@ -4096,6 +4208,9 @@ impl WorkerService {
             if authority.descriptions_connection == Some(connection_id) {
                 authority.descriptions_connection = None;
             }
+            if authority.checks_connection == Some(connection_id) {
+                authority.checks_connection = None;
+            }
         }
         // And from the privacy fence, when it was the connection the fence speaks through: an
         // acknowledgement or a named generation from it no longer counts.
@@ -4210,6 +4325,9 @@ impl WorkerService {
             }
             ControllerConnectionRole::Descriptions => {
                 authority.descriptions_connection == Some(facts.connection_id)
+            }
+            ControllerConnectionRole::Checks => {
+                authority.checks_connection == Some(facts.connection_id)
             }
         };
         if !bound {
@@ -9681,6 +9799,7 @@ fn request_id_of(frame: &ControlFrame) -> RequestId {
         ControlFrame::AttentionSources(request) => request.request_id,
         ControlFrame::AttentionText(request) => request.request_id,
         ControlFrame::DescriptionFacts(request) => request.request_id,
+        ControlFrame::DesktopChecks(request) => request.request_id,
         _ => RequestId::new(0),
     }
 }
