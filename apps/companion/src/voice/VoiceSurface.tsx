@@ -274,6 +274,10 @@ function ProviderChoiceScreen({
   // The control that was pressed is disabled when the end begins, so focus goes to the words beside
   // it that say what is happening. It goes there without the jump that focus makes to the middle
   // of the screen, and the words are brought into view by as little as it takes, as the control was.
+  // The control is then kept in view by as little as that takes, and it is the second of the two:
+  // where the two together are taller than the screen, as they are in a face wider than the one
+  // this was drawn in, the control that was pressed and now says the end has begun stays on the
+  // screen and the words run on below it, instead of the control going off the screen above them.
   const endingNote = useRef<HTMLParagraphElement | null>(null)
   const startControl = useRef<HTMLButtonElement | null>(null)
   const wasEnding = useRef(false)
@@ -281,6 +285,7 @@ function ProviderChoiceScreen({
     if (waiting && ending && !wasEnding.current) {
       endingNote.current?.focus({ preventScroll: true })
       endingNote.current?.scrollIntoView({ block: 'nearest' })
+      end.current?.scrollIntoView({ block: 'nearest' })
     }
     wasEnding.current = waiting && ending
   }, [ending, waiting])

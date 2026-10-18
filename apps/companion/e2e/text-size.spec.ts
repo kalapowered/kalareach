@@ -28,6 +28,9 @@ const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
 const LARGEST = 53 / 17
 
+/** How much wider than the system's own letters the wide face sets them, in em. */
+const WIDER_LETTERS = 0.06
+
 /** The ratio the system gives the page, set before it loads, as a phone that already had it opens it. */
 async function withSystemTextScale(page: Page, ratio: number): Promise<void> {
   await page.addInitScript((value) => {
@@ -43,6 +46,31 @@ async function withSystemTextScale(page: Page, ratio: number): Promise<void> {
       }).observe(document, { childList: true })
     }
   }, ratio)
+}
+
+/**
+ * Sets the letters of the voice screen wider by `em`, from the page's first frame, as a face wider
+ * than the system's would set them. The system's own face differs from one platform to the next
+ * (the Mac's is narrower than the one the Linux runner draws), and a layout that holds only for the
+ * widths of the face it was drawn with does not hold. The rule is written to outrank the page's own.
+ */
+async function withWiderLetters(page: Page, em: number): Promise<void> {
+  await page.addInitScript((spacing) => {
+    const css = `:root .kr-voice, :root .kr-voice * { letter-spacing: ${spacing}em; }`
+    const apply = (): boolean => {
+      const root = document.documentElement as HTMLElement | null
+      if (root === null) return false
+      const style = document.createElement('style')
+      style.textContent = css
+      root.append(style)
+      return true
+    }
+    if (!apply()) {
+      new MutationObserver((_, observer) => {
+        if (apply()) observer.disconnect()
+      }).observe(document, { childList: true })
+    }
+  }, em)
 }
 
 const rootSize = (page: Page): Promise<number> =>
@@ -460,6 +488,60 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         await expect(page.getByRole('button', { name: 'Start voice session' })).toBeFocused()
       })
     }
+
+    // The same start, in a face wider than the system's: the words that say the end has begun take
+    // more lines, and the control that was pressed and the words together are taller than the screen
+    // they are on. The control stays on the screen, as the words are brought into view only as far
+    // as that allows.
+    test(`keeps the control that gives a start up on the screen when the words beside it need more than the screen, in a wide face, on ${surface}`, async ({
+      page
+    }) => {
+      await withSystemTextScale(page, LARGEST)
+      await withWiderLetters(page, WIDER_LETTERS)
+      await page.setViewportSize({ width: 320, height: 720 })
+      await page.goto(`/harness.html?surface=${surface}&tab=sessions`)
+      await page.evaluate(() => {
+        window.krReleaseStart = window.krTestHost?.holdVoiceStart()
+      })
+      await page.getByTestId('voice-entry').click()
+      const start = page.getByRole('button', { name: 'Start voice session' })
+      await start.scrollIntoViewIfNeeded()
+      await start.click()
+
+      const end = page.getByRole('button', { name: 'End the call' })
+      await expect(end).toBeInViewport()
+      await end.click()
+      const ending = page.getByRole('button', { name: 'Ending…' })
+      await expect(ending).toBeDisabled()
+      const words = page.getByText('This device is ending its call.')
+      await expect(words).toBeFocused()
+
+      // The case is the form it says it is: the control and the words together are taller than
+      // the part of the screen that scrolls, so it cannot go on passing after it has stopped
+      // covering that form.
+      const room = await page.evaluate(() => {
+        const control = document.querySelector('.kr-voice__control--end')?.getBoundingClientRect()
+        const note = document.querySelector('.kr-voice__note[tabindex="-1"]')?.getBoundingClientRect()
+        const screen = document.querySelector('.m-main')?.getBoundingClientRect()
+        return { needed: (note?.bottom ?? 0) - (control?.top ?? 0), visible: screen?.height ?? 0 }
+      })
+      expect(room.needed, 'the control and the words are taller than the part of the screen that scrolls').toBeGreaterThan(
+        room.visible
+      )
+
+      // Whole, to the sub-point that a scroll to an edge lands on.
+      await expect(ending).toBeInViewport({ ratio: 0.99 })
+      await expect(words).toBeInViewport()
+      await page.screenshot({
+        path: `/tmp/kr-voice-own-start-ending-wide-${surface}-${test.info().project.name}.png`
+      })
+      expect(await overrunning(page, '.kr-voice__control'), 'the ending label that runs past its box').toEqual([])
+
+      await page.evaluate(() => {
+        window.krReleaseStart?.()
+      })
+      await expect(page.getByRole('button', { name: 'Start voice session' })).toBeFocused()
+    })
 
     test(`lists the action nobody knows the end of beside the next one, whole, on ${surface}`, async ({ page }) => {
       await withSystemTextScale(page, LARGEST)
