@@ -253,9 +253,19 @@ seconds, the environment cannot be looked at: the update says that, and names no
 A daemon that answers as the release asked for by the time it is looked at is serving, and is not
 named either.
 
-A control daemon speaks to a worker only at a compatibility level its release retains. It refuses a
-worker at another level before anything but the hello is exchanged, `UNSUPPORTED_SCHEMA`, and says
-in its log which session it has left running unreached, and why.
+The control daemon supports communication with a worker both at its current compatibility level and one level below this (i. e. the previous release). The control daemon detects the level of each worker from the hello exchange and then reads and writes frames for that worker at the given level. If a worker at any other level connects, the control daemon refuses to exchange anything but the hello with it (using the `UNSUPPORTED_SCHEMA` error) and logs which session it left running unreached, and why. If the daemon is started with a release whose manifest names a level it does not retain, it will not start up and prints that level.
+
+## A session that runs the release before
+
+An update does not wait for a session whose worker runs the release before. The new control daemon finds that worker and publishes its descriptor in the shape the worker reads. It sends it frames suitable for the worker's level. The session's worker, shell and agents are preserved. If the worker asks for its plugin runtime or for a draft before the daemon has found it, the daemon tells it to ask again. Any session created after the update will have all parts at the new release.
+
+The new `kr` and `kr-hook` do not read a worker of another level in the shape they have. They access it using the worker's release if it is available in the store. That release is kept in the store while any worker is running using it.
+
+- `kr attach`, `kr detach` and `kr agent-tools --stdio` replace themselves with the `kr` of the worker's release before they touch the terminal or read any input. They pass the session id and all options. The new `kr` is started already holding the worker's release so an update cannot remove it before it starts.
+- `kr status`, `kr share`, `kr close` when it reaches the worker itself, and all `kr question` commands don't replace themselves. Instead they do not read a worker at another level, and report which session they did not read, which release it is running and the command to run with that release's `kr`. `kr question list` prints this after printing all the questions it has found. When called with `--json` it includes this information under the `unread` key.
+- `kr-hook` starts the `kr-hook` of the worker's release if its registration names a release that is different from its own, that release is in the store and its level is 0.75 or above (the first level whose workers accept a forwarder from their own release; before that a worker accepts only the forwarder `current` names, so the hook talks to it directly). The hook has half a second to complete. If less than a tenth of a second is left it goes on directly instead. If it takes over after the half second has passed it answers neutrally.
+
+If `kr` runs outside a store, or the worker's release is not in the store or an update is removing it, a command that would hand over is refused as it is now: with exit code 8 and `UNSUPPORTED_SCHEMA`, naming the two builds involved.
 
 ## Environments whose daemon did not run
 

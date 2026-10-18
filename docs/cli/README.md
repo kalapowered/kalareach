@@ -226,15 +226,9 @@ and `--json` carries its closure record as `closure` beside `session_id`. A sess
 never held is `UNKNOWN_SESSION`. When no daemon is running for the environment, the command says
 so and exits with 3: what cannot be asked is never reported as a closure.
 
-A worker outlives an upgrade, so `kr attach` can meet a worker of another build. The worker states
-its build in its answer to the hello: its build identifier and the version of the protocol package
-it was built from. `kr attach` reads the worker's screens when that version shares its own
-compatibility level, which below `1.0.0` is the minor number and from `1.0.0` the major number; the
-patch number never decides. Any other worker, and one that states no build because it is of a build
-before the statement, is refused with exit code 8 (`UNSUPPORTED_SCHEMA` in `--json`) before the session is
-asked for anything: nothing is attached, no size is claimed and no input lease is taken. The
-refusal names both builds, both versions and what to do, and `kr-worker --version` names the
-worker's protocol version too:
+It's possible for a worker to outlive an upgrade, and for `kr attach` to encounter a worker from another build. To help with this, the worker states its build in its answer to the hello. The build consists of a build identifier and the version of the protocol package the worker was built from. `kr attach` reads a worker's screens when the worker's protocol version has the same compatibility level as its own. The compatibility level is the minor number before version `1.0.0` and the major number from `1.0.0`; the patch number is irrelevant.
+
+When attaching to any other worker, `kr attach` looks in the host's store for the `kr` of that release. If there is a `kr` in the store that states the worker's compatibility level, `kr attach` replaces itself with that `kr` before it touches the terminal. The replacement `kr` attaches to the session in the normal way, using the session identifier and options it received. Otherwise there is no `kr` in the store, either because this `kr` was run outside a store, or because the worker's release is not in the store or an update is removing it, or because the worker states no build because it is from an earlier build. In that case, `kr attach` refuses the worker and exits with exit code 8 (`UNSUPPORTED_SCHEMA` when `--json` was passed). The refusal happens before `kr attach` asks the session for anything, so nothing is attached, no terminal size is claimed and no input lease is taken. The message explains the mismatch and what to do about it. Both builds and versions are shown, so the user can find the correct version. The protocol version of a worker can also be found with `kr-worker --version`:
 
 ```text
 kr: session 3 runs on kr-worker/0.1.0 with protocol 0.45.0, and this is kr/0.1.0 with protocol 0.46.0: this kr cannot show a session whose worker speaks another protocol version. Close the session with `kr close 3`, or attach with a kr of the worker's build
@@ -669,6 +663,9 @@ a `native_compat` session, which records no origin at all. The refusal says `Use
 One remaining terminal is not proof that it is the one the command came from, so it is not treated
 as one.
 
+Against a worker that runs another release, `kr detach` hands over to the `kr` of that release as
+`kr attach` does, naming the session by its identifier and carrying `--attachment` along.
+
 The Zsh, Bash, fish and PowerShell packages all export the capability. It reaches each of them in the
 answer to `root.command.accepted`, which they send, and each puts it in the environment of the
 command it is about to run.
@@ -845,6 +842,8 @@ does; they keep working while the control daemon is restarting.
 
 The commands `kr question answer`, `kr question cancel`, and `kr question send` check the worker's build, which it states in its answer to the hello, before they send an answer or a cancellation. If the worker announces a protocol version whose major number (or minor number if below 1.0) is different from the one of the running instance of `kr`, or does not announce a build at all, the worker is refused with exit code 8 (`UNSUPPORTED_SCHEMA` in `--json`), and the command says that nothing was sent, because it can't be sure to properly read the worker's reply. In that case, use the `kr` of the build the worker is using.
 
+The `kr question list`, `show`, `answer` and `cancel` commands read a worker's build from its hello before they ask it anything. If the worker is running a release other than the one that the `kr` is running from, then the command does not ask that worker about the question. When `list` skips a worker, it reports which session it did not read, the release that the session is running and the command to run with the `kr` from that release. When `list` is run with the `--json` option it also reports the same information in the `unread` key of the JSON. When `show`, `answer` or `cancel` find a question in no other workers, they exit with exit code 8 (`UNSUPPORTED_SCHEMA` if `--json` is specified), report that they did not send anything, and give the same notes as `list`.
+
 An answer the worker could not take is kept rather than lost. When the connection to the worker
 fails before the answer is sent, or ends while it is being sent so that nobody can say whether it
 arrived, or the worker refuses it for the moment, `kr question answer` keeps the answer in this
@@ -927,6 +926,8 @@ It offers four tools (`ask_user`, `wait_for_answer`, `cancel_question` and `send
 bound to the session this process is running in. Outside a session every tool answers
 `NOT_IN_KR_SESSION` with the instruction to start the agent inside one, and creates nothing.
 [docs/contact/README.md](../contact/README.md) explains the binding, the states and the limits.
+
+Before it reads a request, `kr agent-tools --stdio` will search for a session to run in for up to 5 seconds. If it finds a session, and the session's worker is running another release and the host's store holds that release's `kr`, then the running `kr` will replace itself with that `kr`, invoked as `agent-tools --stdio`. If it cannot find a session within 5 seconds, then it will serve as it does outside a session.
 
 ## Exit codes
 
