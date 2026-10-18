@@ -102,10 +102,19 @@ fn stalling(
 
 /// A daemon with one stalling worker in its directory, which has acknowledged the revision in
 /// force, so its lease renews.
+///
+/// The worker does not state that it takes what the host's local owner may do, and the daemon has
+/// that on record before a case begins, as it has once it has reached a worker. A worker not yet
+/// reached is one the daemon's publisher goes to by itself, on its own schedule, and the link it
+/// opens and gives back would land in the slot while a case looks at what the slot holds.
 async fn stalled() -> (Silent, Arc<Heard>) {
     let heard = Arc::new(Heard::default());
     let silent = world::fake_world(stalling(Arc::clone(&heard))).await;
     world::acknowledged(&silent.controller, silent.session_id);
+    silent
+        .controller
+        .local_access
+        .note_worker(silent.session_id, false, None);
     (silent, heard)
 }
 
