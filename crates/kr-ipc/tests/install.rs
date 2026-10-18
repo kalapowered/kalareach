@@ -46,11 +46,15 @@ fn helper() {
         Err(error) => format!("refused: {error}"),
     };
     let started_as = std::env::current_exe().expect("the path it was started as");
+    // Written whole under another name and then given its own, so that the test, which goes on
+    // as soon as `said` exists, never reads a file that is there and not yet written.
+    let writing = directory.join("said.part");
     std::fs::write(
-        directory.join("said"),
+        &writing,
         format!("{}\n{release}\n{}\n", image.display(), started_as.display()),
     )
     .expect("writes what it found");
+    std::fs::rename(&writing, directory.join("said")).expect("says what it found");
     // Held until this process ends, as every host executable holds its release.
     while !directory.join("end").exists() {
         assert!(Instant::now() < deadline, "nobody said end");
