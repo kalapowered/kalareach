@@ -38,7 +38,7 @@ use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
 
-/// How often the worker under test sends a connection that holds an attachment a keepalive.
+/// How often the worker under test sends a connection a process bridge made a keepalive.
 const PERIOD: Duration = Duration::from_millis(100);
 
 /// How many keepalives the bridge's connection is waited for before the others are looked at.

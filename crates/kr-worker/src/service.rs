@@ -93,7 +93,8 @@ pub const WINDOW_RENEWAL: std::time::Duration =
 /// stream that has said nothing for longer than a few of these, so the connection a bridge's
 /// helper makes is sent one. Every other connection is sent none: the control daemon holds three
 /// to each session and a view can be attached for days, and a clock on each would wake an idle
-/// host several times in ten seconds. The window renewal is the only clock they keep.
+/// host several times in ten seconds. The window renewal is the only clock this loop keeps for
+/// them.
 pub const LOCAL_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How often the host looks at its own clocks while it is idle.
@@ -8803,7 +8804,8 @@ impl ConnectionState {
     }
 
     /// Returns whether this connection is owed a keepalive: it has negotiated and a process
-    /// bridge's helper made it, which is the one reader of this stream that waits on silence.
+    /// bridge's helper made it, and the bridge's invoker is the one reader of such a stream that
+    /// waits on silence.
     fn owes_keepalive(&self) -> bool {
         self.negotiated && self.origin.is_some()
     }
