@@ -424,7 +424,8 @@ async fn cli(host: &Host) -> LocalClient {
 
 use kr_protocol::local::LocalClientKind;
 
-/// A connection a process bridge's helper made, which is the one kind that is sent a keepalive.
+/// A connection a process bridge's helper made, which is the one kind that is sent a keepalive
+/// on a clock.
 async fn bridged(host: &Host) -> LocalClient {
     LocalClient::connect_for_bridge(
         &host.endpoint,
@@ -1424,8 +1425,8 @@ impl UpstreamDispatch for WaitingUpstream {
 /// own mutation is still with the upstream.
 ///
 /// Section 12 has the same socket carry this client's keystrokes, its interrupt and its keepalive.
-/// The client is a process bridge's helper, since a keepalive is sent on that kind of connection
-/// alone. The prompt is admitted, the marker is committed and the operation is with the
+/// The client is a process bridge's helper, since only that kind of connection is sent a keepalive
+/// on a clock. The prompt is admitted, the marker is committed and the operation is with the
 /// upstream, which has not answered. Everything else this connection asks for is answered while
 /// that is true, and the prompt's own answer arrives when the upstream speaks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

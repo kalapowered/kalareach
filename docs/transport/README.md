@@ -447,7 +447,8 @@ through.
 ## Keepalive and reconnect
 
 * Keepalive: 10 seconds while active, at the QUIC layer and as a `ControlEvent::Keepalive` on the
-  control stream, so a local socket carrying the same frames has the same liveness signal.
+  control stream. A session host also sends it on a connection a process bridge made, which carries
+  the same frames over a local socket.
 * Inactivity: 30 seconds without traffic declares the transport unavailable. A mobile suspension
   that trips it is a normal disconnect.
 * Reconnect: jittered exponential backoff from 250 ms to 30 seconds, drawn with full jitter so a
