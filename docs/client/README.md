@@ -655,10 +655,14 @@ again only after the owner confirms a join on it. So does a service that answers
 as absent, or with a chain this device cannot follow; that answer is recorded at once.
 
 A host this device is paired with that did not answer is said so in the answers
-(`HostAnswers::silent`). Check 3 then gives a device that no answering host mentions the benefit of
-the doubt, because the host that did not answer may be the one that lists it, and judges a device
-that an answering host mentions by what that host says: a device it lists without the right to
-manage the host, with other keys, or as revoked is not vouched for whoever else is silent.
+(`HostAnswers::silent`). The host that did not answer may be the one that lists a device, so a
+device that this device's hosts vouched for at an earlier answer, and that no answering host
+mentions, is not taken out for it, and the next epoch's key is wrapped to it as before
+(`RecordedAnswers::retains`). Nothing else is relaxed: a record's issuer, the device that opened an
+epoch, a device to add and the recipient of a key must each be listed by a host that answered
+(`RecordedAnswers::passes`). A device an answering host mentions is judged by what that host says,
+silent hosts or not: one it lists without the right to manage the host, with other keys, or as
+revoked is not kept.
 
 A collection put back from an archive names its history on every key-record answer, and the
 membership file records the history its records were read in: the one its first record applied
