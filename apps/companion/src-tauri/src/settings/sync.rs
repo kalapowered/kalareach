@@ -68,9 +68,9 @@ use kr_client::sync::membership::{
     CollectionRef, Device, DeviceDirectory, KeyRecordService, SyncMembership,
 };
 use kr_client::sync::{
-    CollectionKeys, Published, Restored, SettingValue, SharedCollectionService,
+    CollectionKeys, ConflictCopy, Published, Restored, SettingValue, SharedCollectionService,
     StoredCollectionKeys, SyncBody, SyncCheckpoint, SyncClient, SyncError, SyncObject,
-    SyncSettings, SyncStore, fresh_object_id, fresh_revision,
+    SyncSettings, SyncStore, Unread, fresh_object_id, fresh_revision,
 };
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::SecretStore;
@@ -824,7 +824,11 @@ impl SettingsSync {
             self.told.tell();
             let held = store.object(record.object_id()).map_err(sync_failure)?;
             let object = self.object_of(record.object_id(), held.as_ref(), mode, now())?;
-            store.put_object(&object).map_err(sync_failure)?;
+            store
+                .put_object(&carrying(object, &copies))
+                .map_err(sync_failure)?;
+        } else {
+            self.carry_marks(&store, record.object_id(), &copies)?;
         }
         for copy in copies {
             client
@@ -910,6 +914,9 @@ impl SettingsSync {
             {
                 return Ok(());
             }
+            if self.carry_marks(store, object_id, &waiting)? {
+                held = store.object(object_id).map_err(sync_failure)?;
+            }
             for copy in waiting {
                 client
                     .resolve(copy.conflict_id)
@@ -989,7 +996,7 @@ impl SettingsSync {
             .is_some_and(|object| agreed != Some(object.revision));
         if changed {
             return self
-                .publish_change(client, sealed, record, note.is_some(), now_ms)
+                .publish_change(client, sealed, record, note, now_ms)
                 .await;
         }
         let fetched = client
@@ -1072,7 +1079,7 @@ impl SettingsSync {
         client: &SyncClient,
         sealed: &SharedCollectionService,
         record: &mut Record,
-        has_note: bool,
+        note: Option<SyncCheckpoint>,
         now_ms: TimestampMs,
     ) -> Result<()> {
         let object_id = record.object_id();
@@ -1095,17 +1102,19 @@ impl SettingsSync {
                         .last_sealed_under()
                         .is_some_and(|under| under < record.floor);
                     if attempt == 0
-                        && has_note
+                        && note.is_some()
                         && unbelieved
                         && let Some(found) = sealed.last_found_at()
                         && let Some(held) = store.object(object_id).map_err(sync_failure)?
                     {
-                        // The change is marked with the place it goes over before it is made
-                        // against that place, so no write over that place is ever made without
-                        // the mark.
+                        // The change is marked with the stretch it goes over, every write after the
+                        // place this computer last read up to the one it replaces, before it is
+                        // made against that place, so no write over that stretch is ever made
+                        // without the mark.
+                        let stretch = Unread::between(note.map(|note| note.position), found);
                         let mut over = held.went_over.clone();
-                        if !over.contains(&found) {
-                            over.push(found);
+                        if !over.contains(&stretch) {
+                            over.push(stretch);
                         }
                         store
                             .put_object(&SyncObject {
@@ -1134,6 +1143,30 @@ impl SettingsSync {
             };
         }
         Ok(())
+    }
+
+    /// Makes the settings this computer holds carry what `copies` went over, as a new revision, when
+    /// they do not yet. Returns whether it did.
+    fn carry_marks(
+        &self,
+        store: &SyncStore,
+        object_id: SyncObjectId,
+        copies: &[ConflictCopy],
+    ) -> Result<bool> {
+        let Some(held) = store.object(object_id).map_err(sync_failure)? else {
+            return Ok(false);
+        };
+        let carried = carrying(held.clone(), copies);
+        if carried.went_over == held.went_over {
+            return Ok(false);
+        }
+        store
+            .put_object(&SyncObject {
+                revision: fresh_revision().map_err(CommandError::from)?,
+                ..carried
+            })
+            .map_err(sync_failure)?;
+        Ok(true)
     }
 
     /// Notes that what the service holds cannot be read here yet, and tells the page.
@@ -1431,12 +1464,24 @@ impl SettingsSync {
     }
 }
 
-/// Whether `other` was made over the settings that stood at `held` without reading them, and says
+/// Whether `other` was made over the write that stood at `held` without reading it, and says
 /// something other than the person's colour mode: it replaces what a device holds, which that
 /// device's person chooses to let go of or not. Settings that say what the device's say replace
 /// nothing.
 fn replaces(other: &SyncObject, held: Option<SyncPosition>, chosen: Option<ColourMode>) -> bool {
-    held.is_some_and(|held| other.went_over.contains(&held)) && colour_mode_of(other) != chosen
+    held.is_some_and(|held| other.went_over.iter().any(|stretch| stretch.covers(&held)))
+        && colour_mode_of(other) != chosen
+}
+
+/// `object` with every stretch that `copies` went over and it does not carry yet: whoever chooses
+/// beside a write that went over another's does not settle what that write replaced.
+fn carrying(mut object: SyncObject, copies: &[ConflictCopy]) -> SyncObject {
+    for stretch in copies.iter().flat_map(|copy| copy.other.went_over.iter()) {
+        if !object.went_over.contains(stretch) {
+            object.went_over.push(*stretch);
+        }
+    }
+    object
 }
 
 /// The colour mode a settings object carries, when it carries one this build reads.
@@ -1475,7 +1520,7 @@ fn member_failure(error: kr_client::sync::membership::MembershipError) -> Comman
         ),
         MembershipError::HostSilent => CommandError::unavailable(
             "one of your hosts did not answer, so the settings were not joined; try again when it \
-             does",
+             does, or unpair a host that is gone",
         ),
         MembershipError::NotCommitted => {
             CommandError::refused("no host lists that device as one of yours any more")

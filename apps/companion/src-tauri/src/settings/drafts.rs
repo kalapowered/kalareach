@@ -137,7 +137,8 @@ pub struct HostLists {
     pub silent: bool,
     /// Whether a host this device owns answered that it will not list its devices to this
     /// computer, as a host does once the right to manage it has run out or been revoked. That is
-    /// an answer: this computer can vouch for nobody to that host.
+    /// an answer: this computer can vouch for nobody to that host, and when every host it owns
+    /// answers so, it checks nobody and publishes nothing.
     pub refused: bool,
 }
 

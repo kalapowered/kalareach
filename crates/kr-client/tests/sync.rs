@@ -20,7 +20,7 @@ use kr_client::sync::{
     Across, Claimed, ClientSelection, ConflictCopy, Dispatch, Outcome, PrivacyRecord, Publication,
     Published, Reconciled, RequestRecord, RequestRevision, RequestState, Resolutions, Restored,
     SettingValue, Settlement, StorageFeature, SyncBody, SyncCheckpoint, SyncClient, SyncError,
-    SyncObject, SyncSettings, SyncStore, fresh_object_id, fresh_revision, sync_collection,
+    SyncObject, SyncSettings, SyncStore, Unread, fresh_object_id, fresh_revision, sync_collection,
 };
 use kr_crypto::envelope::{open_sync_object, seal_sync_object};
 use kr_crypto::secret::{Secret, SymmetricKey};
@@ -9999,4 +9999,26 @@ async fn a_late_refusal_names_the_copy_the_service_kept_and_when_the_content_lef
     assert_eq!(exported.len(), 1);
     assert!(exported[0].reference.contains(&conflict_id.to_string()));
     assert_eq!(exported[0].left_at_ms, TimestampMs::new(NOW));
+}
+
+/// KR-REQ-20.13: a write that went over writes its writer never read is told by the stretch of the
+/// order it went over, every write after the place the writer last read up to the one it replaced,
+/// so a device that holds any write in the stretch is asked, and one before it or after it is not.
+/// A place in another history cannot be compared, and is asked about.
+#[test]
+fn a_stretch_covers_every_write_after_the_place_last_read_up_to_the_one_replaced() {
+    let stretch = Unread::between(Some(at(3)), at(7));
+    assert!(!stretch.covers(&at(3)), "the writer read it");
+    assert!(stretch.covers(&at(4)));
+    assert!(stretch.covers(&at(7)), "the write replaced");
+    assert!(!stretch.covers(&at(8)), "written after it");
+    assert!(!stretch.covers(&at(1)));
+    // A writer that read nothing, or read in another history, went over everything before.
+    assert!(Unread::between(None, at(7)).covers(&at(1)));
+    let recovery = Some(SyncRecoveryId(Uuid::from_bytes([0x44; 16])));
+    assert!(Unread::between(Some(in_history(at(3), recovery)), at(7)).covers(&at(1)));
+    assert!(
+        stretch.covers(&in_history(at(9), recovery)),
+        "another history is asked about"
+    );
 }

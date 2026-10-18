@@ -3314,7 +3314,6 @@ async fn a_reference_the_page_was_not_shown_names_no_device() {
     assert!(this.ceremony.reasons().is_empty(), "nobody was asked");
 }
 
-/// The record a computer's settings sync keeps, as the file holds it.
 /// Where the service held the settings this computer's own store last agreed with, as the record
 /// keeps a place.
 fn position_of(own: &OwnStore) -> Value {
@@ -3327,6 +3326,7 @@ fn position_of(own: &OwnStore) -> Value {
     serde_json::to_value(note.position).expect("a position")
 }
 
+/// The record a computer's settings sync keeps, as the file holds it.
 fn sync_record(computer: &Computer) -> Value {
     serde_json::from_slice(
         &std::fs::read(computer.data.path().join("settings-sync").join("sync.json"))
@@ -3425,10 +3425,11 @@ async fn a_computer_does_not_join_the_settings_while_a_host_of_its_own_does_not_
 }
 
 /// Hosts that all answer that they will not list their devices to this computer have answered:
-/// this computer can vouch for nobody to them. The devices it shared the settings with are taken
-/// out and the key moves on, where hosts that said nothing would have left them in.
+/// this computer can vouch for nobody to them, so it checks nobody and publishes nothing, and says
+/// so. It takes nobody out for that: whether they stay is for the person, and a computer that has
+/// lost its right on its hosts is the last one to decide it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hosts_that_all_refuse_to_list_their_devices_leave_this_computer_vouching_for_nobody() {
+async fn hosts_that_all_refuse_to_list_their_devices_stop_this_computer_and_take_nobody_out() {
     let (this, other) = two_computers().await;
     let page = with_sync_on(&this).await;
     page.choose("dark");
@@ -3442,22 +3443,29 @@ async fn hosts_that_all_refuse_to_list_their_devices_leave_this_computer_vouchin
     assert_eq!(phone.sync_now()["colour_mode"], "dark");
 
     this.hosts.refuse_to_list(true);
-    let view = page.sync_now();
+    let stopped = page
+        .call("settings_sync_now", json!({}))
+        .expect_err("this computer says it cannot check who may share");
+    assert!(
+        stopped.to_string().contains("will list their devices"),
+        "{stopped}"
+    );
     assert_eq!(
-        view["sync"]["devices"]["members"]
-            .as_array()
-            .expect("members")
-            .len(),
-        1,
-        "{view}"
+        page.devices()["members"].as_array().expect("members").len(),
+        2,
+        "nobody was taken out"
     );
     page.choose("light");
-    page.sync_now();
-    let view = phone.sync_now();
     assert_eq!(
-        view["colour_mode"], "dark",
-        "what was written after the key moved on did not reach it: {view}"
+        phone.sync_now()["colour_mode"],
+        "dark",
+        "nothing was published under the key"
     );
+
+    // The right comes back, and the change goes out.
+    this.hosts.refuse_to_list(false);
+    page.sync_now();
+    assert_eq!(phone.sync_now()["colour_mode"], "light");
 }
 
 /// Two hosts that list one device under different stored-envelope keys leave it nothing to be
@@ -4000,34 +4008,51 @@ async fn settings_a_taken_out_device_wrote_last_are_waited_for_and_then_written_
     assert_eq!(writes(), settled, "nothing more is written once it agrees");
 }
 
-/// The person's three computers, sharing the settings, each joined and agreed on `dark`: the first
-/// (`this`), a phone and a tablet.
-async fn three_computers_sharing() -> (Computer, Computer, Computer, Page, Page, Page) {
-    let this = Computer::new().await;
-    let phone_computer = Computer::beside(&this).await;
-    let tablet_computer = Computer::beside(&this).await;
-    let devices = vec![
-        this.listed("this-mac"),
-        phone_computer.listed("the-phone"),
-        tablet_computer.listed("the-tablet"),
-    ];
-    for computer in [&this, &phone_computer, &tablet_computer] {
+/// The person's computers, sharing the settings, each joined and agreed on `dark`: the first, which
+/// started them, then one for each name after it.
+async fn computers_sharing(names: &[&str]) -> (Vec<Computer>, Vec<Page>) {
+    let first = Computer::new().await;
+    let mut computers = vec![first];
+    for _ in names {
+        let beside = Computer::beside(&computers[0]).await;
+        computers.push(beside);
+    }
+    let mut devices = vec![computers[0].listed("this-mac")];
+    for (computer, name) in computers.iter().skip(1).zip(names) {
+        devices.push(computer.listed(name));
+    }
+    for computer in &computers {
         computer.hosts.list(devices.clone());
     }
-    let page = with_sync_on(&this).await;
-    let phone = phone_computer.start();
-    let tablet = tablet_computer.start();
-    for (name, joiner) in [("the-phone", &phone), ("the-tablet", &tablet)] {
-        let shown = page.devices_refresh();
-        page.share(&reference_of(&shown["candidates"], name))
+    let first_page = with_sync_on(&computers[0]).await;
+    let mut pages = vec![first_page];
+    for computer in computers.iter().skip(1) {
+        pages.push(computer.start());
+    }
+    for (name, joiner) in names.iter().zip(pages.iter().skip(1)) {
+        let shown = pages[0].devices_refresh();
+        pages[0]
+            .share(&reference_of(&shown["candidates"], name))
             .expect("shared");
         joiner
             .join(&first_reference(&joiner.devices_refresh()["offers"]))
             .expect("joined");
     }
-    for member in [&page, &phone, &tablet] {
+    for member in &pages {
         assert_eq!(member.sync_now()["colour_mode"], "dark");
     }
+    (computers, pages)
+}
+
+/// The first computer, a phone and a tablet, sharing the settings.
+async fn three_computers_sharing() -> (Computer, Computer, Computer, Page, Page, Page) {
+    let (mut computers, mut pages) = computers_sharing(&["the-phone", "the-tablet"]).await;
+    let (tablet, phone, page) = (pages.remove(2), pages.remove(1), pages.remove(0));
+    let (tablet_computer, phone_computer, this) = (
+        computers.remove(2),
+        computers.remove(1),
+        computers.remove(0),
+    );
     (this, phone_computer, tablet_computer, page, phone, tablet)
 }
 
@@ -4098,6 +4123,72 @@ async fn a_change_over_the_write_of_a_member_asks_the_member_before_it_replaces_
     let view = page.sync_now();
     assert_eq!(view["colour_mode"], "light", "{view}");
     assert_eq!(view["sync"]["conflicts"], 0, "{view}");
+}
+
+/// A third computer that has a change of its own when the change that went over a write arrives
+/// keeps it beside its own, and what its person chooses carries on what was gone over: the device
+/// that held the write is asked when it meets the choice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_choice_made_beside_a_change_that_went_over_a_write_still_asks_the_device_that_held_it() {
+    let (_computers, pages) = computers_sharing(&["the-phone", "the-tablet", "the-laptop"]).await;
+    let [page, phone, tablet, _laptop] = &pages[..] else {
+        panic!("four computers");
+    };
+    phone.choose("light");
+    page.unshare(&reference_of(&page.devices()["members"], "the-laptop"))
+        .expect("the laptop is taken out");
+    page.sync_now();
+    page.choose("system");
+
+    // The tablet has not read it, and changes its mind: the change that went over is kept beside.
+    let view = tablet.choose("light");
+    assert_eq!(view["sync"]["conflicts"], 1, "{view}");
+    let versions = tablet
+        .call("settings_conflicts", json!({}))
+        .expect("the versions");
+    let copy = versions["others"][0]["conflict_id"].clone();
+    let view = tablet
+        .call(
+            "settings_conflict_resolve",
+            json!({ "keep": { "choice": "copy", "conflict_id": copy } }),
+        )
+        .expect("the choice is recorded");
+    assert_eq!(view["colour_mode"], "system");
+
+    // The phone held what was gone over, and it is asked.
+    let view = phone.sync_now();
+    assert_eq!(view["colour_mode"], "light", "{view}");
+    assert_eq!(view["sync"]["conflicts"], 1, "{view}");
+}
+
+/// Two changes in a row over writes their writers could not read: the second goes over what the
+/// first replaced, which its writer cannot see inside the object it replaces, and the device that
+/// held the first write is still asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_change_over_unreadable_settings_still_asks_the_device_that_held_the_first_write()
+{
+    let (_computers, pages) =
+        computers_sharing(&["the-phone", "the-tablet", "the-t1", "the-t2"]).await;
+    let [page, phone, tablet, _first, _second] = &pages[..] else {
+        panic!("five computers");
+    };
+    phone.choose("light");
+    page.unshare(&reference_of(&page.devices()["members"], "the-t1"))
+        .expect("the first computer is taken out");
+    page.sync_now();
+    page.choose("system");
+
+    // The tablet takes the other one out before it reads anything, and so cannot read what the
+    // first computer wrote either: its change goes over that.
+    tablet
+        .unshare(&reference_of(&tablet.devices()["members"], "the-t2"))
+        .expect("the second computer is taken out");
+    assert_eq!(tablet.sync_now()["sync"]["devices"]["waiting"], true);
+    tablet.choose("system");
+
+    let view = phone.sync_now();
+    assert_eq!(view["colour_mode"], "light", "{view}");
+    assert_eq!(view["sync"]["conflicts"], 1, "{view}");
 }
 
 /// A change made from the settings that went over a write is still one that went over it: the device

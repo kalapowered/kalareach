@@ -66,7 +66,7 @@ use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 use kr_protocol::sync::{MAX_SYNC_OBJECT_PLAINTEXT_BYTES, SyncObjectKind};
 use serde::{Deserialize, Serialize};
 
-use crate::services::SyncPosition;
+use crate::services::{SyncPosition, SyncRecoveryId};
 
 pub use client::{
     Cancelled, Exported, Fenced, KeptExplicitly, Published, Reconciled, Removed, Resolutions,
@@ -166,15 +166,53 @@ pub struct SyncObject {
     pub updated_at_ms: TimestampMs,
     /// What it carries.
     pub body: SyncBody,
-    /// The writes of the service this object, or an object it descends from, was made over
-    /// without being read: where the service held an object its writer could not believe, such as
-    /// one a device taken out last sealed, and the writer's change went over it. A device that
-    /// still holds the write at one of these places has not seen this object follow it, so it
-    /// keeps this one beside its own for the person to choose, where it would have followed it.
-    /// Every object made from this one carries them on, until a device that held one of them has
-    /// chosen.
+    /// The stretches of the service's order that this object, or an object it descends from or
+    /// was chosen beside, was made over without reading them: where the service held an object its
+    /// writer could not believe, such as one a device taken out last sealed, and the writer's change
+    /// went over it. A device whose note stands in one of these stretches holds a write this
+    /// object's writer never read, so it keeps this object beside its own for the person to choose,
+    /// where it would have followed it. Every object made from this one, or after choosing beside
+    /// it, carries them on, and none is ever dropped: a device that holds a write in a stretch may
+    /// meet any of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub went_over: Vec<SyncPosition>,
+    pub went_over: Vec<Unread>,
+}
+
+/// A stretch of one collection's order, in one history, that a write went over without reading
+/// it: every write after the place the writer last read, up to and including the one it replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Unread {
+    /// The history the stretch is in.
+    pub recovery: Nullable<SyncRecoveryId>,
+    /// The write sequence of the place the writer last read, which the stretch starts after.
+    pub after: u64,
+    /// The write sequence of the write that was replaced, which the stretch ends with.
+    pub through: u64,
+}
+
+impl Unread {
+    /// The stretch from the place a writer last read, if it read one, to the write it replaced.
+    #[must_use]
+    pub fn between(read: Option<SyncPosition>, replaced: SyncPosition) -> Self {
+        let after = read
+            .filter(|read| read.recovery == replaced.recovery)
+            .map_or(0, |read| read.write_sequence);
+        Self {
+            recovery: replaced.recovery,
+            after,
+            through: replaced.write_sequence,
+        }
+    }
+
+    /// Whether a write at `place` is one the stretch went over. A place in another history cannot
+    /// be compared with the stretch, and is taken to be in it, because asking costs a choice and
+    /// not asking can cost a write.
+    #[must_use]
+    pub fn covers(&self, place: &SyncPosition) -> bool {
+        place.recovery != self.recovery
+            || (self.after < place.write_sequence && place.write_sequence <= self.through)
+    }
 }
 
 impl SyncObject {

@@ -36,6 +36,8 @@ use kr_client::sync::membership::{
     CollectionRef, Device, DeviceDirectory, Ended, HostAnswers, HostDevice, HostReport, Outcome,
     Refreshed, SyncMembership,
 };
+use kr_client::{ClientError, Shown};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::pairing::DevicePlatform;
 use kr_protocol::scalars::AuthorisationKey;
 use kr_protocol::service::installation_id;
@@ -216,9 +218,26 @@ impl DeviceDirectory for HostsDirectory {
                 return Ok(Some(answers.clone()));
             }
             let asked = self.hosts.device_lists().await;
-            // Hosts that all refuse to list their devices to this computer have answered: it can
-            // vouch for nobody to them. No host that answered at all leaves check 3 unable to run.
-            if asked.lists.is_empty() && !asked.refused {
+            if asked.lists.is_empty() {
+                // Hosts that all refuse to list their devices to this computer have answered, and
+                // what they say is that this computer cannot vouch for anybody: it checks nobody,
+                // publishes nothing, and takes nobody out for it, which is for the person to
+                // decide. No host that answered at all leaves check 3 unable to run.
+                if asked.refused && !asked.silent {
+                    // What the hosts listed a minute ago is not believed any more.
+                    *self
+                        .listed
+                        .last
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = None;
+                    return Err(ClientError::refusal(
+                        ErrorCode::PermissionDenied,
+                        Shown::said(
+                            "none of your hosts will list their devices to this computer any \
+                             more, so who may share your settings cannot be checked here",
+                        ),
+                    ));
+                }
                 return Ok(None);
             }
             let mut reports = Vec::new();
