@@ -49,6 +49,10 @@ pub const CHANGESETS_DIRECTORY: &str = "changesets";
 /// The store's filename inside that directory.
 pub const STORE_FILE_NAME: &str = "changesets.sqlite";
 
+/// What an action is told when an earlier copy of it claimed it and recorded no outcome.
+const UNFINISHED_CLAIM: &str = "an earlier copy of this action claimed it and recorded no outcome, \
+     so what it did is not established and it is not performed again";
+
 /// One change set: the series a version belongs to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangeSetRow {
@@ -1649,7 +1653,10 @@ impl Store {
                 code: ErrorCode::from_wire(&code).unwrap_or(ErrorCode::OutcomeUnknown),
                 detail: kr_project::git::redact(&detail.unwrap_or_default()),
             })),
-            (None, None) => Ok(None),
+            (None, None) => Ok(Some(RetainedOutcome::Error {
+                code: ErrorCode::OutcomeUnknown,
+                detail: UNFINISHED_CLAIM.to_owned(),
+            })),
         }
     }
 

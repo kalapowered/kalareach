@@ -736,7 +736,7 @@ impl kr_changeset::apply::ActionClaim for DeferredClaim<'_> {
     }
 }
 
-/// Answers from the record another copy of this action left, or says nothing is known yet.
+/// Answers from the record another copy of this action left, or says nothing is known.
 fn answer_from_retained(
     service: &ChangeSetService,
     actor: &ActorId,
@@ -749,9 +749,11 @@ fn answer_from_retained(
             .map(ParamsValue::new)
             .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())),
         Some(RetainedOutcome::Error { code, detail }) => Err(ProtocolError::new(code, detail)),
+        // The claim this action lost to was given back before it could be read.
         None => Err(ProtocolError::new(
             ErrorCode::OutcomeUnknown,
-            "another copy of this action is running and has not said what it came to",
+            "the record of this action went away while it was being read, so what it came to is \
+             not known",
         )),
     }
 }
