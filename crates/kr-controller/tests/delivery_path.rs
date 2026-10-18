@@ -1116,6 +1116,19 @@ impl Environment {
         );
     }
 
+    /// Waits until the daemon has asked its first questions of the gateway. It renews every
+    /// credential inside its renewal window then, and asks again only `Cadence::questions` later,
+    /// so a case that scripts the gateway's answers to renewals starts when this is over, and the
+    /// requests it counts are its own.
+    async fn until_the_first_questions_are_asked(&self) {
+        let runtime = Arc::clone(self.controller().delivery_runtime());
+        until(
+            "the daemon asking its first questions of the gateway",
+            || runtime.questions_asked() >= 1,
+        )
+        .await;
+    }
+
     fn controller(&self) -> &Arc<Controller> {
         self.host.controller()
     }
@@ -3550,6 +3563,7 @@ async fn devices_registering_cannot_spend_the_gateways_allowance_for_renewing_an
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_registration_leaves_the_bearer_a_renewal_stored_while_the_gateway_was_answering() {
     let environment = Environment::start().await;
+    environment.until_the_first_questions_are_asked().await;
     let phone = environment.phone().await;
     let sender = PushSenderRecordId::new(uuid(0x67));
     // Two days left: inside the last week, where the gateway renews.
@@ -3619,6 +3633,7 @@ async fn a_registration_leaves_the_bearer_a_renewal_stored_while_the_gateway_was
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_renewal_leaves_the_bearer_a_device_registered_while_the_gateway_was_answering() {
     let environment = Environment::start().await;
+    environment.until_the_first_questions_are_asked().await;
     let phone = environment.phone().await;
     let sender = PushSenderRecordId::new(uuid(0x68));
     environment.gateway.issue_for(2 * 24 * 60 * 60 * 1000);
@@ -3828,6 +3843,7 @@ async fn a_renewal_ahead_of_need_that_fails_does_not_hold_a_notification_back() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_bearer_confirmed_before_a_renewal_that_retired_it_does_not_outlast_the_renewal() {
     let environment = Environment::start().await;
+    environment.until_the_first_questions_are_asked().await;
     let phone = environment.phone().await;
     let sender = PushSenderRecordId::new(uuid(0x6a));
     let host_key = environment.host_signing_key();

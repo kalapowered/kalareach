@@ -183,6 +183,8 @@ pub struct DeliveryRuntime {
     sweeping: Mutex<()>,
     /// Whether a sweep was asked for while another was running, which then goes round again.
     sweep_wanted: AtomicBool,
+    /// How many sweeps of questions have run to their end.
+    questions_asked: AtomicU64,
     cadence: Cadence,
     runtime: tokio::runtime::Handle,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -218,11 +220,23 @@ impl DeliveryRuntime {
             nonces: StatusBudget::new(CONFIRMATIONS_PER_HOST),
             sweeping: Mutex::new(()),
             sweep_wanted: AtomicBool::new(false),
+            questions_asked: AtomicU64::new(0),
             cadence,
             runtime,
             tasks: Mutex::new(Vec::new()),
             pass_clock: PassClock::default(),
         })
+    }
+
+    /// How many sweeps of questions have run to their end: revocations owed, credentials renewed
+    /// ahead of need and unknown outcomes asked about. The first runs soon after the daemon has
+    /// recovered and been given its transport, and the next one `Cadence::questions` later, so a
+    /// test that scripts the gateway's answers to renewals starts when the first is over. For this
+    /// host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn questions_asked(&self) -> u64 {
+        self.questions_asked.load(Ordering::SeqCst)
     }
 
     /// Holds the time the passes read at `at_ms`, so that everything the loop admits from now on
@@ -640,6 +654,7 @@ impl DeliveryRuntime {
         ) {
             eprintln!("kr-controller: unknown delivery outcomes were not asked about: {error}");
         }
+        self.questions_asked.fetch_add(1, Ordering::SeqCst);
         true
     }
 }
