@@ -725,6 +725,29 @@ describe('the devices that share the settings', () => {
     expect(within(card).queryByRole('button', { name: /^Share settings with/ })).toBeNull()
     expect(within(card).queryByRole('button', { name: /^Join the settings/ })).toBeNull()
     expect(within(card).queryByTestId('settings-devices-offer')).toBeNull()
+    expect(within(card).queryByText(/you confirm here, on this computer/)).toBeNull()
+  })
+
+  it('does not tell a computer that cannot confirm to join in a card that offers no join', async () => {
+    const { controls, sheet } = await openOnAccount()
+    act(() => {
+      controls.settings.change({
+        sync: {
+          state: 'off',
+          service: chosenService,
+          devices: {
+            ...sharing.devices,
+            can_confirm: false,
+            members: [],
+            candidates: [],
+            offers: [{ reference: 'c-1', name: 'the-laptop' }]
+          }
+        }
+      })
+    })
+    const settings = await within(sheet).findByTestId('settings-sync')
+    expect(within(settings).queryByTestId('settings-sync-start-own')).toBeNull()
+    expect(within(settings).getByTestId('settings-sync-turn-on')).toHaveClass('btn-primary')
   })
 
   it('says what a change came to until the person dismisses it', async () => {

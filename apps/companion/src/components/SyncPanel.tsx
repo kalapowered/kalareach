@@ -398,7 +398,9 @@ export function SyncPanel({
                 {settings?.sync.state === 'off' ? (
                   <p className="account-note">{SETTINGS_SYNC_HELP}</p>
                 ) : null}
-                {settings?.sync.state === 'off' && settings.sync.devices.offers.length > 0 ? (
+                {settings?.sync.state === 'off' &&
+                settings.sync.devices.offers.length > 0 &&
+                settings.sync.devices.can_confirm ? (
                   <p className="account-note" data-testid="settings-sync-start-own">
                     {DEVICES_START_OWN}
                   </p>
@@ -440,7 +442,11 @@ export function SyncPanel({
                 ) : null}
                 {settings !== null && settings.sync.state !== 'on' && settings.sync.service !== null ? (
                   <Button
-                    tone={settings.sync.devices.offers.length > 0 ? 'default' : 'primary'}
+                    tone={
+                      settings.sync.devices.offers.length > 0 && settings.sync.devices.can_confirm
+                        ? 'default'
+                        : 'primary'
+                    }
                     data-testid="settings-sync-turn-on"
                     data-wraps
                     disabled={busy}

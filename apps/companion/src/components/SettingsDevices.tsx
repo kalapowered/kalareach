@@ -69,7 +69,7 @@ export function SettingsDevices({
         data-testid="settings-devices-status"
       >
         <p className="account-lead">{describeDevices(devices)}</p>
-        <p className="account-note">{DEVICES_HELP}</p>
+        {devices.can_confirm ? <p className="account-note">{DEVICES_HELP}</p> : null}
         {devices.waiting ? (
           <p className="account-note" data-testid="settings-devices-waiting">
             {DEVICES_WAITING}
