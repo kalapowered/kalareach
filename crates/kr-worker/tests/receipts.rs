@@ -3890,9 +3890,11 @@ const THIRTY_DAYS: std::time::Duration = std::time::Duration::from_secs(30 * 86_
 /// A machine whose wall clock its time service keeps and whose continuous clock nothing keeps, so
 /// the continuous clock runs a few parts per million fast against it.
 ///
-/// macOS and Windows count continuous time from an oscillator the time service never corrects. A
-/// real clock cannot be made fast, so the three clocks the worker's contract reads are driven by
-/// hand, and everything else about the worker is real: its session, its journal and its restart.
+/// Windows counts continuous time from an oscillator the time service never corrects, and so does
+/// the daemon's own clock on macOS (`mach_continuous_time`); the clock the worker reads on macOS
+/// keeps the wall clock's pace. A real clock cannot be made fast, so the three clocks the worker's
+/// contract reads are driven by hand, and everything else about the worker is real: its session,
+/// its journal and its restart.
 struct DriftingMachine {
     continuous: kr_ipc::clock::ManualSharedClock,
     active: kr_worker::action::time::ManualActiveClock,

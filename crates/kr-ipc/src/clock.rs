@@ -10,10 +10,17 @@
 //!
 //! | Platform | Clock | Counts a suspend |
 //! | --- | --- | --- |
-//! | Apple | `mach_continuous_time` | yes |
+//! | Apple | `CLOCK_MONOTONIC` | yes |
 //! | Linux | `CLOCK_BOOTTIME` | yes |
 //! | Windows | `QueryInterruptTime` | yes |
 //! | anything else | `CLOCK_MONOTONIC` | the platform's answer, not this crate's |
+//!
+//! On Apple systems `CLOCK_MONOTONIC` is the wall clock less the boot time (`kern.boottime`): it
+//! counts through sleep, it is not stepped when the wall clock is set (the kernel moves the boot
+//! time by the step instead), and it follows the time service's rate adjustments, so it keeps the
+//! wall clock's pace. It is not `mach_continuous_time`, which is `CLOCK_MONOTONIC_RAW`, the same
+//! count with no adjustment, and which `kr_transport::clock` reads. `CLOCK_UPTIME_RAW`, which is
+//! `mach_absolute_time`, stops in sleep and is what [`std::time::Instant`] reads there.
 //!
 //! A reading of one of those is comparable between two processes, so a deadline expressed in it is
 //! the same deadline on both sides of the socket and nothing has to guess at what the journey cost.
@@ -116,14 +123,23 @@ pub fn transferred_deadline(destination_now: u64, remaining: Duration) -> Option
 /// How far the continuous clock may run fast against the wall clock before the difference counts
 /// as a rollback, in parts per million.
 ///
-/// The platform's time service keeps the wall clock, and on macOS and Windows nothing keeps the
-/// continuous clock (`mach_continuous_time`, `QueryInterruptTime`), so the two differ by the
-/// oscillator's error: 20 ppm is about 1.7 seconds a day. A projection that credits every
-/// continuous millisecond counts that error as a rollback once it passes the five-second
-/// tolerance, about three days at 20 ppm, and a healthy host then distrusts its own clock until
-/// its owner establishes it again. So a projection credits a millisecond less per 10,000
-/// ([`credited`]): a continuous clock up to this fast raises no distrust, and one faster than that
-/// still does.
+/// The platform's time service keeps the wall clock, and some of the continuous clocks a host's
+/// records are measured on are not kept by it, so they differ from it by the oscillator's error:
+/// 20 ppm is about 1.7 seconds a day. Which they are, by clock:
+///
+/// * the daemon's clock record projects on `kr_transport`'s `ContinuousInstant`: on Apple systems
+///   that is `mach_continuous_time` (`CLOCK_MONOTONIC_RAW`), which nothing adjusts, and on Linux
+///   `CLOCK_BOOTTIME`, which keeps the wall clock's pace because the time service slews it;
+/// * this crate's clock, which each worker's time contract reads, is `QueryInterruptTime` on
+///   Windows, which nothing adjusts, `CLOCK_BOOTTIME` on Linux and, on Apple systems, a clock that
+///   keeps the wall clock's pace, as described above.
+///
+/// A projection that credits every continuous millisecond counts that error as a rollback once it
+/// passes the five-second tolerance, about three days at 20 ppm, and a healthy host then distrusts
+/// its own clock until its owner establishes it again. So a projection credits a millisecond less
+/// per 10,000 ([`credited`]): a continuous clock up to this fast raises no distrust, and one faster
+/// than that still does. Removing the allowance where one clock keeps the wall clock's pace would
+/// still leave the others needing it.
 ///
 /// Both of the host's time records project this way, the daemon's clock record and each worker's
 /// time contract, and this is the one statement of the rule and of its cost. A wall clock that
@@ -160,8 +176,10 @@ pub fn boot_elapsed_ms() -> u64 {
 
 /// Returns the machine's continuous clock, in milliseconds since this boot.
 ///
-/// Darwin's `CLOCK_MONOTONIC` is `mach_continuous_time` expressed in nanoseconds: Apple documents
-/// it as counting from an arbitrary point and continuing to increment while the system is asleep.
+/// Darwin's `CLOCK_MONOTONIC` counts from an arbitrary point and continues to increment while the
+/// system is asleep, as Apple documents it. It is the wall clock less the boot time, so it is not
+/// stepped when the wall clock is set and it follows the time service's rate adjustments;
+/// `CLOCK_MONOTONIC_RAW` (`mach_continuous_time`) is the same count with no adjustment.
 /// `CLOCK_UPTIME_RAW` is the counter that stops, and `std::time::Instant` is built on that one,
 /// which is why this is not.
 #[must_use]
