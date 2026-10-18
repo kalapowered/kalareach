@@ -703,9 +703,10 @@ describe('while a call is running', () => {
     expect(stopped).toHaveBeenCalledWith(null, {})
     expect(await screen.findByRole('button', { name: 'Ending…' })).toBeDisabled()
     expect(screen.queryByRole('button', { name: 'End the call' })).not.toBeInTheDocument()
-    // Focus is on the heading, not on a control that is disabled and then gone, and it stays there.
-    const heading = screen.getByRole('heading', { name: 'Start a voice session' })
-    expect(heading).toHaveFocus()
+    // Focus is on the words that say the end has begun, not on a control that is disabled and then
+    // gone, and it stays there.
+    const said = screen.getByText(/is ending its call/)
+    expect(said).toHaveFocus()
 
     answer()
 
@@ -713,7 +714,6 @@ describe('while a call is running', () => {
     expect(screen.queryByRole('button', { name: 'Ending…' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'End the call' })).not.toBeInTheDocument()
     expect(screen.getByText(/given up before it began/)).toBeInTheDocument()
-    expect(heading).toHaveFocus()
   })
 
   // The end is offered while the start waits for the host and no longer: once the host has answered
@@ -764,7 +764,10 @@ describe('while a call is running', () => {
     await person.click(end)
 
     expect(await screen.findByText(/already ending its call/)).toBeInTheDocument()
-    expect(await screen.findByRole('button', { name: 'End the call' })).toBeEnabled()
+    const back = await screen.findByRole('button', { name: 'End the call' })
+    expect(back).toBeEnabled()
+    // Focus went to the words that said the end had begun, and goes back to the control that is back.
+    expect(back).toHaveFocus()
   })
 
   // A start that was not given up is the same start it always was: the end control goes with the

@@ -126,6 +126,12 @@
   color: var(--muted);
 }
 
+/* The words beside a control that has gone take focus when it does. They are not a control, so
+   they draw no ring. */
+.kr-voice__note[tabindex='-1']:focus {
+  outline: none;
+}
+
 /* A list that follows a note stands apart from it. */
 .kr-voice__note + .kr-voice__list {
   margin-top: var(--gap-3);

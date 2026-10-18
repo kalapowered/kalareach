@@ -272,12 +272,22 @@ function ProviderChoiceScreen({
     if (waiting) end.current?.scrollIntoView({ block: 'nearest' })
   }, [waiting])
   // The control that was pressed is disabled when the end begins and goes when the start is over,
-  // so focus goes to the heading when it is pressed: left on a control that is disabled and then
-  // gone, a keyboard or screen-reader user would be sent back to the top of the document.
-  const giveUp = () => {
-    heading.current?.focus()
-    onEnd()
-  }
+  // so focus goes to the words beside it that say what is happening: left on a control that is
+  // disabled and then gone, a keyboard or screen-reader user would be sent back to the top of the
+  // document. It goes there without the jump that focus makes to the middle of the screen, and the
+  // words are brought into view by as little as it takes, as the control was. A stop the device
+  // refuses brings the control back, and focus goes back to it.
+  const endingNote = useRef<HTMLParagraphElement | null>(null)
+  const wasEnding = useRef(false)
+  useEffect(() => {
+    if (waiting && ending && !wasEnding.current) {
+      endingNote.current?.focus({ preventScroll: true })
+      endingNote.current?.scrollIntoView({ block: 'nearest' })
+    } else if (waiting && !ending && wasEnding.current) {
+      end.current?.focus({ preventScroll: true })
+    }
+    wasEnding.current = ending
+  }, [ending, waiting])
   const terms = choice.managed
   const seconds = terms ? requestedSeconds(terms) : null
   const startable = terms !== null && terms.enabled && seconds !== null
@@ -425,7 +435,7 @@ function ProviderChoiceScreen({
               type="button"
               ref={end}
               className="kr-voice__control kr-voice__control--end"
-              onClick={giveUp}
+              onClick={onEnd}
               disabled={ending}
             >
               {ending ? 'Ending…' : 'End the call'}
@@ -434,7 +444,7 @@ function ProviderChoiceScreen({
         </div>
       )}
       {waiting && ending && (
-        <p className="kr-voice__note" role="status">
+        <p className="kr-voice__note" role="status" ref={endingNote} tabIndex={-1}>
           {ENDING_WORDS}
         </p>
       )}
