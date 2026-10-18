@@ -24,6 +24,15 @@ pub const PAIRING_EVENT: &str = "kr://pairing";
 /// The event the page is told the owner confirmations on.
 pub const CONFIRMATIONS_EVENT: &str = "kr://confirmations";
 
+/// What [`PAIRING_EVENT`] carries, in place of the pairing screen's view, when the pairing records
+/// are still not open at a try made after the start: the words that stand where the screen would
+/// be, as the pairing commands give them.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct PairingUnavailable {
+    /// The words native code says.
+    pub unavailable: String,
+}
+
 /// What pasting an invitation asks of the platform: the pasteboard's text, emptying it, and the
 /// person's answer before another service is contacted. The product's is [`NativePaste`]; a test
 /// gives its own.
@@ -147,5 +156,21 @@ pub async fn paste(platform: &dyn PastePlatform, device: &Arc<Device>) -> PasteV
         failure: None,
         cleared,
         declined: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The page tells these words from a pairing view by their one field, so that field is what the
+    /// event carries when the records are still not open at a try after the start.
+    #[test]
+    fn the_words_that_stand_for_the_screen_are_sent_in_the_one_field_the_page_looks_for() {
+        let sent = serde_json::to_string(&PairingUnavailable {
+            unavailable: "the words".to_owned(),
+        })
+        .expect("a payload");
+        assert_eq!(sent, r#"{"unavailable":"the words"}"#);
     }
 }

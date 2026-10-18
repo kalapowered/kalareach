@@ -581,6 +581,15 @@ export interface PairingView {
   readonly hosts: readonly HostRow[]
 }
 
+/**
+ * What stands where the pairing screen would be when this device's pairing records are still not
+ * open at a try made after the start: the words native code says, which replace the ones the page
+ * holds.
+ */
+export interface PairingUnavailable {
+  readonly unavailable: string
+}
+
 /** What reading the pasteboard found. */
 export interface PasteView {
   readonly invitation: InvitationSummary | null
@@ -1604,10 +1613,12 @@ export interface HostPort {
   /** Ends the attempt on this computer, or drops a pasted invitation. */
   pairingStop(): Promise<void>
   /**
-   * Tells `listener` each time the pairing screen's state changes. Resolves, with the function
-   * that stops it, once the listener is registered: nothing published before then reaches it.
+   * Tells `listener` each time the pairing screen's state changes: its view, or, while this
+   * device's pairing records are not open, the words that stand in its place. Resolves, with the
+   * function that stops it, once the listener is registered: nothing published before then
+   * reaches it.
    */
-  onPairing(listener: (view: PairingView) => void): Promise<() => void>
+  onPairing(listener: (view: PairingView | PairingUnavailable) => void): Promise<() => void>
 
   /** The confirmations this computer's hosts ask for. */
   ownerConfirmations(): Promise<OwnerView>

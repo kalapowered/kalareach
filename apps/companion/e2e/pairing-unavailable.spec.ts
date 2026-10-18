@@ -62,6 +62,16 @@ async function holdsTheLockedNotice(page: Page): Promise<void> {
   await expect(page.getByLabel('Pairing code')).toHaveCount(0)
 }
 
+/** Native code tries at the unlock and the records are still not open, for a cause that is not the lock. */
+async function failsAtTheUnlock(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    window.krTestHost?.failPairingRecords()
+  })
+  await holdsTheFailure(page)
+  // The device is unlocked, so the words no longer say it is locked.
+  await expect(page.getByRole('alert').filter({ hasText: 'because it is locked' })).toHaveCount(0)
+}
+
 /** Native code opens the records, as it does at the unlock, and the pairing screen takes the place. */
 async function opensAtTheUnlock(page: Page): Promise<void> {
   await page.evaluate(() => {
@@ -133,6 +143,10 @@ test.describe('the device is locked when the application starts', () => {
 
         // This case holds the notice and its giving way, and the page being no wider than the
         // screen when it has: how the pairing screen itself lays out at this size is not its concern.
+        // A try at the unlock that fails for another cause changes the words first, in place.
+        await failsAtTheUnlock(page)
+        expect(await overrunning(page, '.pairing-column'), 'nothing runs past the screen').toEqual([])
+        await page.screenshot({ path: shot(`failed-${label}`), fullPage: true })
         await opensAtTheUnlock(page)
         const across = await page.evaluate(() => ({
           page: document.documentElement.scrollWidth,

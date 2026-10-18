@@ -58,6 +58,7 @@ import type {
   KitSaved,
   OpenRequest,
   OwnerView,
+  PairingUnavailable,
   PairingView,
   PasteView,
   RecoveryView,
@@ -416,6 +417,12 @@ export interface FakeHostControls {
    * a phone that was started before it: the page is told the pairing view it would have read.
    */
   openPairingRecords(): void
+  /**
+   * Says the pairing records are still not open at a try made after the start, and that the cause
+   * is not the lock, as native code does at an unlock that does not open them: the page is told the
+   * words that now stand where the pairing screen would be.
+   */
+  failPairingRecords(): void
   /**
    * Marks the host as unreachable, or reachable again, and says so as native code does. `reason`
    * is native code's words for the loss, which can be blank; without it, the host cannot be
@@ -820,7 +827,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
         return null
     }
   })()
-  const pairingListeners = new Set<(view: PairingView) => void>()
+  const pairingListeners = new Set<(view: PairingView | PairingUnavailable) => void>()
   const publishPairing = (change: Partial<PairingView>) => {
     pairing = { ...pairing, ...change }
     for (const listener of pairingListeners) listener(pairing)
@@ -2594,6 +2601,10 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     openPairingRecords() {
       recordsNotOpen = null
       publishPairing({})
+    },
+    failPairingRecords() {
+      recordsNotOpen = RECORDS_UNAVAILABLE_WORDS
+      for (const listener of pairingListeners) listener({ unavailable: RECORDS_UNAVAILABLE_WORDS })
     },
     setConnected(next, reason = UNREACHABLE) {
       connected = next

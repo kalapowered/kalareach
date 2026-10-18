@@ -131,7 +131,10 @@ export function PairingFlow({
     port
       .onPairing((next) => {
         heard = true
-        if (watching) shown(next)
+        if (!watching) return
+        // The records are still not open, for a reason that has changed: the words follow it.
+        if ('unavailable' in next) setFailure(next.unavailable)
+        else shown(next)
       })
       .then(async (unlisten) => {
         if (!watching) {

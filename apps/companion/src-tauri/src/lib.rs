@@ -95,6 +95,10 @@ pub fn run() {
     // The raw terminal views, and the rule that ends a page's views when it loads again.
     terminal::install(builder, terminal::TerminalViews::local())
         .setup(|app| {
+            // A simulator launch can ask to start with the device locked, before anything reads the
+            // secure store.
+            #[cfg(all(debug_assertions, target_os = "ios"))]
+            companion_platform::protection::model::arm_from_environment();
             // The place for what this application keeps on this device: the answers a host did not
             // confirm and the drafts a person has not sent. It is given before the window opens, so
             // no command the page calls at once finds the application without it.
@@ -141,9 +145,6 @@ pub fn run() {
             });
             app.manage(voice_calls(app.handle()));
             watch_drops(app.handle());
-            // A simulator launch can ask to start with the device locked.
-            #[cfg(all(debug_assertions, target_os = "ios"))]
-            companion_platform::protection::model::arm_from_environment();
             open_sync_service(app.handle());
             open_pairing(app.handle());
             #[cfg(all(debug_assertions, mobile))]
@@ -393,26 +394,35 @@ fn open_pairing(app: &tauri::AppHandle) {
     // the wait is heard.
     #[cfg(target_os = "ios")]
     watch_for_unlock(app);
-    if open_records(app) {
+    if matches!(open_records(app), Opening::Opened) {
         start_with_records(app);
     }
 }
 
-/// Tries to open the pairing records, unless they are open, one try at a time. Says whether this
-/// try opened them.
+/// What one try at opening the pairing records came to.
+enum Opening {
+    /// This try opened them.
+    Opened,
+    /// They were open already, and the try did nothing.
+    AlreadyOpen,
+    /// They are still not open, and the reason is recorded.
+    Failed,
+}
+
+/// Tries to open the pairing records, unless they are open, one try at a time.
 ///
 /// A try that fails records why, and says the device is locked when the system says so: the
 /// records are then opened again at the next unlock.
-fn open_records(app: &tauri::AppHandle) -> bool {
+fn open_records(app: &tauri::AppHandle) -> Opening {
     use tauri::Manager as _;
 
     let state = app.state::<AppState>();
     let _turn = state.opening_records();
     if state.records_are_open() {
-        return false;
+        return Opening::AlreadyOpen;
     }
     match open_the_records(app) {
-        Ok(()) => true,
+        Ok(()) => Opening::Opened,
         Err(error) => {
             tracing::warn!(%error, "this computer's pairing records could not be opened");
             state.records_not_opened(if companion_platform::protection::is_available(app) {
@@ -420,7 +430,7 @@ fn open_records(app: &tauri::AppHandle) -> bool {
             } else {
                 state::RecordsNotOpen::Locked
             });
-            false
+            Opening::Failed
         }
     }
 }
@@ -442,12 +452,33 @@ fn watch_for_unlock(app: &tauri::AppHandle) {
 
 /// Opens the pairing records at an unlock, or when the application comes to the foreground, when a
 /// start before it could not, starts what needs them, and then tells the page, so that what the page
-/// asks for next is there.
+/// asks for next is there. A try that fails tells the page the words that now stand where the
+/// pairing screen would be: the device is no longer locked, and the cause is another.
 #[cfg(target_os = "ios")]
 fn open_after_unlock(app: &tauri::AppHandle) {
-    if open_records(app) {
-        start_with_records(app);
-        tell_the_page_the_records_are_open(app);
+    match open_records(app) {
+        Opening::Opened => {
+            start_with_records(app);
+            tell_the_page_the_records_are_open(app);
+        }
+        Opening::Failed => tell_the_page_the_records_are_not_open(app),
+        Opening::AlreadyOpen => {}
+    }
+}
+
+/// Tells the page, which read the records as not open for one reason, the words for the reason
+/// that stands now.
+#[cfg(target_os = "ios")]
+fn tell_the_page_the_records_are_not_open(app: &tauri::AppHandle) {
+    use tauri::{Emitter as _, Manager as _};
+
+    if let Err(error) = app.state::<AppState>().device() {
+        let _ = app.emit(
+            pairing::PAIRING_EVENT,
+            pairing::PairingUnavailable {
+                unavailable: error.message,
+            },
+        );
     }
 }
 
@@ -531,14 +562,32 @@ fn application_clock(_app: &tauri::AppHandle) -> Result<kr_client::pairing::cloc
     kr_client::pairing::clock::DeviceClock::current().map_err(error::CommandError::from)
 }
 
-/// Marks the directories of the pairing records and of the recovery records as not to be backed up,
-/// before they are opened.
+/// Makes `directory` and marks it as not to be backed up, so that nothing written in it afterwards
+/// is.
 ///
-/// Their records mean something only beside this device's keychain keys, and those keys stay on
-/// this device: a backup restored onto another phone would bring the records without the keys,
-/// and the attempt budget would then refuse every code, and a recovery record would name a bundle
-/// whose seed is not there. With no records restored the person pairs again, and recovery is off
-/// until it is turned on.
+/// What it keeps means something only beside this device's keychain keys, and those keys stay on
+/// this device: a backup restored onto another phone would bring the records without the keys.
+#[cfg(target_os = "ios")]
+fn keep_out_of_backup<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    directory: &std::path::Path,
+) -> Result<()> {
+    let unavailable = |what: &str, error: &dyn std::fmt::Display| {
+        error::CommandError::stated(
+            ErrorCode::ResourceUnavailable,
+            format!("{} could not be {what}: {error}", directory.display()),
+        )
+    };
+    kr_ipc::paths::create_private_directory(directory)
+        .map_err(|error| unavailable("made", &error))?;
+    companion_platform::backup::keep_out(app, directory)
+        .map_err(|error| unavailable("kept out of the backup", &error))
+}
+
+/// Marks the directories of the pairing records as not to be backed up, before they are opened.
+///
+/// A backup restored onto another phone would bring the records without the keys, and the attempt
+/// budget would then refuse every code. With no records restored the person pairs again.
 #[cfg(target_os = "ios")]
 fn keep_records_out_of_backup(app: &tauri::AppHandle, data: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
@@ -556,22 +605,8 @@ fn keep_records_out_of_backup(app: &tauri::AppHandle, data: &std::path::Path) ->
                 format!("{} could not be made: {error}", data.display()),
             )
         })?;
-    for name in [
-        device::HOSTS_DIRECTORY,
-        device::BUDGET_DIRECTORY,
-        recovery::DIRECTORY,
-    ] {
-        let directory = data.join(name);
-        let unavailable = |what: &str, error: &dyn std::fmt::Display| {
-            error::CommandError::stated(
-                ErrorCode::ResourceUnavailable,
-                format!("{} could not be {what}: {error}", directory.display()),
-            )
-        };
-        kr_ipc::paths::create_private_directory(&directory)
-            .map_err(|error| unavailable("made", &error))?;
-        companion_platform::backup::keep_out(app, &directory)
-            .map_err(|error| unavailable("kept out of the backup", &error))?;
+    for name in [device::HOSTS_DIRECTORY, device::BUDGET_DIRECTORY] {
+        keep_out_of_backup(app, &data.join(name))?;
     }
     Ok(())
 }
@@ -724,6 +759,11 @@ pub fn start_recovery<R: tauri::Runtime>(
 
     use tauri::Manager as _;
 
+    // Recovery's records name a bundle whose seed is in this device's keychain, so a restore onto
+    // another phone must not bring them. The directory is marked before it is opened, and a fault
+    // here stays with recovery.
+    #[cfg(target_os = "ios")]
+    keep_out_of_backup(app, &data.join(recovery::DIRECTORY))?;
     let state = app.state::<AppState>();
     let recovery = recovery::Recovery::open(
         data,

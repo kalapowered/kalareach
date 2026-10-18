@@ -28,6 +28,7 @@ import type {
   OpenRequest,
   OwnerView,
   PairingOrigin,
+  PairingUnavailable,
   PairingView,
   PasteView,
   RecoveryView,
@@ -367,7 +368,7 @@ export function tauriPort(): HostPort {
     pairingPaste: () => call<PasteView>('pairing_paste', {}),
     pairingStartRead: () => call<undefined>('pairing_start_read', {}),
     pairingStop: () => call<undefined>('pairing_stop', {}),
-    onPairing: (listener) => listening<PairingView>(PAIRING_EVENT, listener),
+    onPairing: (listener) => listening<PairingView | PairingUnavailable>(PAIRING_EVENT, listener),
 
     ownerConfirmations: () => call<OwnerView>('owner_confirmations', {}),
     ownerConfirmationReview: (reference) =>
