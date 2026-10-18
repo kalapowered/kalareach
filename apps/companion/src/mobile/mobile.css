@@ -148,6 +148,11 @@
   scroll-padding-block-end: var(--gap-6);
 }
 
+/* The account screen is cards of words, so its inset stops growing with the text where the bars' does. */
+.m-main[data-tab='account'] {
+  padding-inline: calc(var(--safe-left) + var(--inset)) calc(var(--safe-right) + var(--inset));
+}
+
 .m-main:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;

@@ -301,7 +301,7 @@ export function MobileApp({
         }
       />
 
-      <main className="m-main" id="main" tabIndex={-1}>
+      <main className="m-main" id="main" tabIndex={-1} data-tab={place.tab}>
         {place.tab === 'attention' ? (
           <Inbox surface={resolved} onOpenSession={openSession} onCounts={setActionable} />
         ) : null}

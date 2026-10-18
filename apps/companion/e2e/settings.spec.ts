@@ -219,6 +219,29 @@ async function photograph(page: Page, element: Locator, path: string): Promise<v
   await element.screenshot({ path })
 }
 
+// KR-REQ-13.19: at the largest text size on the narrowest screen the text keeps most of the screen's
+// width. The inset of the account screen and of a card on it grows with the text up to one and a
+// half times the base size and stops there: grown without a bound, the two insets take two thirds
+// of a screen 320 points wide, and the text of the settings breaks inside its words.
+for (const surface of ['ios', 'android'] as const) {
+  test(`keeps most of a 320-point screen for the text of the settings card at the largest size, ${surface}`, async ({
+    page
+  }) => {
+    await withTextScale(page, LARGEST)
+    await page.setViewportSize({ width: 320, height: 720 })
+    await page.goto(`/harness.html?surface=${surface}`)
+    await page.waitForSelector('.m-shell')
+    await page
+      .getByRole('navigation', { name: 'Sections' })
+      .getByRole('button', { name: /^Account/ })
+      .click()
+    const status = page.getByTestId('settings-sync-status')
+    await expect(status).toBeVisible()
+    const column = await status.evaluate((each) => each.getBoundingClientRect().width)
+    expect(column / 320, 'the share of the screen the card keeps for its text').toBeGreaterThan(0.6)
+  })
+}
+
 for (const surface of ['ios', 'android'] as const) {
   test(`keeps the settings card, with everything it can say and its choice open, whole at the largest size in a wide face, ${surface}`, async ({
     page
