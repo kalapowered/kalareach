@@ -224,10 +224,11 @@ pub struct HostReport {
 pub struct HostAnswers {
     /// The reports.
     pub reports: Vec<HostReport>,
-    /// Whether a host this device is paired with did not answer. A device that no answering host
-    /// mentions is then not known to be gone, because the host that did not answer may be the one
-    /// that lists it, so check 3 gives it the benefit of the doubt. A device an answering host does
-    /// mention is judged by what that host says, silent hosts or not.
+    /// Whether a host this device is paired with did not answer. The host that did not answer may
+    /// be the one that lists a device, so a device that this device's hosts vouched for before, and
+    /// that no answering host mentions, is not taken out for that ([`RecordedAnswers::retains`]).
+    /// Nothing else changes: a record's issuer, the opener of an epoch, a device to add and the
+    /// recipient of a wrap must each be listed by a host that answered ([`RecordedAnswers::passes`]).
     #[serde(default)]
     pub silent: bool,
 }
@@ -242,6 +243,10 @@ pub struct RecordedAnswers {
     /// The devices a verified authority feed revoked, by authorisation key. A refresh keeps
     /// them: a host that has not received a revocation yet does not undo it.
     pub verified: BTreeSet<AuthorisationKey>,
+    /// The devices that passed check 3 at an answer this device recorded, and have not failed it
+    /// since: the ones a host that does not answer may be the one to list.
+    #[serde(default)]
+    pub vouched: BTreeSet<Device>,
 }
 
 impl std::fmt::Debug for RecordedAnswers {
@@ -256,15 +261,33 @@ impl std::fmt::Debug for RecordedAnswers {
 }
 
 impl RecordedAnswers {
-    /// Check 3 for a device other than this one.
-    #[must_use]
-    pub fn passes(&self, device: &Device) -> bool {
-        let mentioned = self.hosts.reports.iter().any(|report| {
+    /// Whether an answering host mentions a device with this authorisation key at all.
+    fn mentioned(&self, authorisation: &AuthorisationKey) -> bool {
+        self.hosts.reports.iter().any(|report| {
             report
                 .devices
                 .iter()
-                .any(|reported| reported.authorisation == device.authorisation)
-        });
+                .any(|reported| &reported.authorisation == authorisation)
+        })
+    }
+
+    /// Whether a verified feed or an answering host says the device is revoked.
+    fn revoked(&self, authorisation: &AuthorisationKey) -> bool {
+        self.verified.contains(authorisation)
+            || self.hosts.reports.iter().any(|report| {
+                report
+                    .devices
+                    .iter()
+                    .any(|reported| &reported.authorisation == authorisation && reported.revoked)
+            })
+    }
+
+    /// Check 3 for a device other than this one: at least one host that answered reports it paired
+    /// and holding the right to manage the host with the keys it is named by, and nothing reports
+    /// it revoked. It is what a record's issuer and the opener of its epoch must pass, what a
+    /// device to add must pass, and what a key is wrapped to or opened under.
+    #[must_use]
+    pub fn passes(&self, device: &Device) -> bool {
         let listed = self.hosts.reports.iter().any(|report| {
             report.devices.iter().any(|reported| {
                 reported.authorisation == device.authorisation
@@ -272,14 +295,47 @@ impl RecordedAnswers {
                     && reported.manages_host
                     && !reported.revoked
             })
-        }) || (self.hosts.silent && !mentioned);
-        let revoked = self.verified.contains(&device.authorisation)
-            || self.hosts.reports.iter().any(|report| {
-                report.devices.iter().any(|reported| {
-                    reported.authorisation == device.authorisation && reported.revoked
-                })
-            });
-        listed && !revoked
+        });
+        listed && !self.revoked(&device.authorisation)
+    }
+
+    /// Whether a device the collection already lists stays in it. It passes check 3, or a host did
+    /// not answer, this device's hosts vouched for it before, and no answering host mentions it or
+    /// reports it revoked: the host that did not answer may be the one that lists it. It decides a
+    /// removal and who the next epoch's key is wrapped to among the members already listed, and
+    /// nothing that is accepted, opened or added.
+    #[must_use]
+    pub fn retains(&self, device: &Device) -> bool {
+        self.passes(device)
+            || (self.hosts.silent
+                && self.vouched.contains(device)
+                && !self.mentioned(&device.authorisation)
+                && !self.revoked(&device.authorisation))
+    }
+
+    /// These answers with the devices they vouch for: those of `self.vouched` that are still
+    /// retained, and every device that passes check 3 now.
+    fn with_vouched(mut self) -> Self {
+        let kept: BTreeSet<Device> = self
+            .vouched
+            .iter()
+            .filter(|device| self.retains(device))
+            .copied()
+            .collect();
+        let passing: Vec<Device> = self
+            .hosts
+            .reports
+            .iter()
+            .flat_map(|report| report.devices.iter())
+            .map(|reported| Device {
+                authorisation: reported.authorisation,
+                stored_envelope: reported.stored_envelope,
+            })
+            .filter(|device| self.passes(device))
+            .collect();
+        self.vouched = kept;
+        self.vouched.extend(passing);
+        self
     }
 
     /// The device a host reports with this authorisation key, when one passes check 3.
@@ -729,7 +785,7 @@ crate::debug_as_display!(MembershipError);
 pub struct MemberStatus {
     /// The device.
     pub device: Device,
-    /// Whether it passes check 3 at the recorded host answers.
+    /// Whether it stays in the collection at the recorded host answers ([`RecordedAnswers::retains`]).
     pub passes: bool,
     /// Whether it is this device.
     pub is_self: bool,
@@ -1126,7 +1182,7 @@ impl SyncMembership {
             .into_iter()
             .map(|device| MemberStatus {
                 device,
-                passes: view.passes(&device),
+                passes: view.retains(&device),
                 is_self: device == me,
             })
             .collect();

@@ -25,8 +25,8 @@ use kr_client::services::{
 use kr_client::sync::membership::{
     CollectionRef, Device, DeviceDirectory, Ended, HostAnswers, HostDevice, HostReport,
     KeyRecordService, KeyRecords, MembershipError, MembershipStatus, Outcome, PLAN_LIFETIME_MS,
-    Plan, PlanRefusal, PlannedOperation, RecordAt, Refreshed, RekeyAnswer, RekeyFence, RekeyStatus,
-    Settlement, Step, SyncMembership,
+    Plan, PlanRefusal, PlannedOperation, RecordAt, RecordedAnswers, Refreshed, RekeyAnswer,
+    RekeyFence, RekeyStatus, Settlement, Step, SyncMembership,
 };
 use kr_client::sync::{
     PrivacyRecord, SettingValue, StoredCollectionKeys, SyncBody, SyncCheckpoint, SyncError,
@@ -1195,6 +1195,93 @@ async fn a_host_that_did_not_answer_takes_no_member_out_but_one_that_did_can() {
     let mut both = vec![other.device(), third.device()];
     both.sort();
     assert_eq!(removals, both);
+}
+
+/// KR-REQ-20.11, check 3: while a host did not answer, what is accepted, opened or added still
+/// needs a host that answered to list the device. A record whose issuer no answering host lists is
+/// not accepted and its key is not opened, though this device's hosts vouched for the issuer before.
+#[tokio::test]
+async fn a_record_from_an_issuer_no_answering_host_lists_is_not_accepted_while_a_host_is_silent() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut other = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut other]).await;
+
+    // The answering host no longer mentions the other device; another host did not answer.
+    world.hosts.forget(other.device());
+    world.hosts.leave_one_host_silent(true);
+    let newest = world.newest(&collection);
+    let key = fresh();
+    let epoch = epoch_of(&newest) + 1;
+    let record = issue(
+        &other,
+        &newest,
+        &[owner.device(), other.device()],
+        epoch,
+        &key,
+    );
+    let revision = record.payload.revision.get();
+    world.append(&collection, record);
+
+    owner.refresh().await;
+    let steps = run(&mut owner).await;
+    assert!(
+        owner
+            .held(&collection, epoch)
+            .is_none_or(|held| held.expose() != key.expose()),
+        "its key never reaches the store"
+    );
+    assert!(
+        steps
+            .iter()
+            .all(|(step, _)| *step != Step::Installed { revision }),
+        "the record is never installed"
+    );
+}
+
+/// Whether a device stays is not whether it passes: a device this device's hosts vouched for before,
+/// that no answering host mentions while a host did not answer, stays; one never vouched for, one an
+/// answering host mentions, and one reported revoked do not.
+#[test]
+fn a_device_stays_through_silence_only_when_it_was_vouched_for_and_nothing_that_answered_says_otherwise()
+ {
+    let (known, stranger) = (
+        Device::from_keys(&DeviceKeys::generate().expect("keys")),
+        Device::from_keys(&DeviceKeys::generate().expect("keys")),
+    );
+    let report = |device: Device, manages_host: bool, revoked: bool| HostReport {
+        devices: vec![HostDevice {
+            authorisation: device.authorisation,
+            stored_envelope: device.stored_envelope,
+            manages_host,
+            revoked,
+        }],
+    };
+    let answers = |reports: Vec<HostReport>, silent: bool| RecordedAnswers {
+        hosts: HostAnswers { reports, silent },
+        verified: std::collections::BTreeSet::new(),
+        vouched: std::collections::BTreeSet::from([known]),
+    };
+
+    // Nobody mentions it, and a host did not answer.
+    let silent = answers(vec![HostReport::default()], true);
+    assert!(silent.retains(&known));
+    assert!(
+        !silent.passes(&known),
+        "it is not listed by a host that answered"
+    );
+    assert!(!silent.retains(&stranger), "never vouched for");
+    // The same answers with every host answering.
+    assert!(!answers(vec![HostReport::default()], false).retains(&known));
+    // An answering host mentions it without the right to manage the host, or revoked.
+    assert!(!answers(vec![report(known, false, false)], true).retains(&known));
+    assert!(!answers(vec![report(known, true, true)], true).retains(&known));
+    // A verified feed revocation outlasts silence.
+    let mut feed = answers(vec![HostReport::default()], true);
+    feed.verified.insert(known.authorisation);
+    assert!(!feed.retains(&known));
+    // A host that answered lists it.
+    assert!(answers(vec![report(known, true, false)], true).passes(&known));
 }
 
 /* -------------------------------------------------------------------------- */

@@ -61,11 +61,23 @@ pub(crate) trait Kinds:
     /// Check 3 for a device other than this one: at least one host reports it paired and holding
     /// the right to manage the host with the keys it is named by, and nothing reports it revoked.
     fn passes(answers: &Self::Answers, member: &Self::Member) -> bool;
+    /// Whether a device the collection already lists stays in it at the recorded answers: check 3
+    /// as [`Self::passes`] has it, and also a device this device's hosts vouched for before and that
+    /// no answering host mentions while a host did not answer. It is what decides a removal and who
+    /// the next epoch's key is wrapped to, among the members already listed. It never decides what
+    /// is accepted, opened or added, and a device never vouched for is not kept by it.
+    fn retains(answers: &Self::Answers, member: &Self::Member) -> bool {
+        Self::passes(answers, member)
+    }
     /// Records a revocation this device verified from an authority feed.
     fn revoke(answers: &mut Self::Answers, revocation: Self::Revocation);
     /// Returns the answers a refresh records: the hosts' answers now, and every revocation this
     /// device verified from a feed, which a host that has not caught up yet does not undo.
     fn refreshed(previous: &Self::Answers, fresh: Self::Answers) -> Self::Answers;
+    /// Returns the answers recorded when there are none before them: a join's first.
+    fn first(fresh: Self::Answers) -> Self::Answers {
+        fresh
+    }
 }
 
 /// The format of the membership file this build writes and reads.
@@ -437,6 +449,8 @@ impl<K: Kinds> Facts<K> {
     pub(crate) fn record_answers(&mut self, me: &K::Member, fetched: bool) {
         let passes =
             |answers: &K::Answers, member: &K::Member| member == me || K::passes(answers, member);
+        let retains =
+            |answers: &K::Answers, member: &K::Member| member == me || K::retains(answers, member);
         if let Some(addition) = self.addition
             && !passes(&self.answers, &addition)
         {
@@ -451,7 +465,7 @@ impl<K: Kinds> Facts<K> {
         }
         let mut failing: BTreeSet<K::Member> = listed
             .into_iter()
-            .filter(|member| !passes(&self.answers, member))
+            .filter(|member| !retains(&self.answers, member))
             .collect();
         failing.extend(
             self.after_installed()
@@ -655,6 +669,11 @@ impl<K: Kinds> View<'_, K> {
         *member == self.me || K::passes(&self.facts.answers, member)
     }
 
+    /// Whether a device the collection already lists stays: see [`Kinds::retains`].
+    pub(crate) fn retains(&self, member: &K::Member) -> bool {
+        *member == self.me || K::retains(&self.facts.answers, member)
+    }
+
     /// Checks 1 to 5 against the recorded answers and the held keys, the epoch's opener included.
     ///
     /// Checks 2 and 4 held when the record entered the window: it follows the record before it,
@@ -783,7 +802,7 @@ impl<K: Kinds> View<'_, K> {
         };
         let mut members: BTreeSet<K::Member> = start
             .into_iter()
-            .filter(|member| !self.facts.removals.contains(member) && self.passes(member))
+            .filter(|member| !self.facts.removals.contains(member) && self.retains(member))
             .collect();
         if let Some(addition) = self.facts.addition
             && self.passes(&addition)

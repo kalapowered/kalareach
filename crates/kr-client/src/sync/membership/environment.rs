@@ -234,6 +234,14 @@ impl Kinds for DeviceKinds {
         answers.passes(member)
     }
 
+    fn retains(answers: &RecordedAnswers, member: &Device) -> bool {
+        answers.retains(member)
+    }
+
+    fn first(fresh: RecordedAnswers) -> RecordedAnswers {
+        fresh.with_vouched()
+    }
+
     fn revoke(answers: &mut RecordedAnswers, revocation: AuthorisationKey) {
         answers.verified.insert(revocation);
     }
@@ -244,7 +252,9 @@ impl Kinds for DeviceKinds {
         RecordedAnswers {
             hosts: fresh.hosts,
             verified,
+            vouched: previous.vouched.clone(),
         }
+        .with_vouched()
     }
 }
 
@@ -536,6 +546,7 @@ impl Environment for DeviceEnvironment {
             Ok(self.hosts.answers().await?.map(|hosts| RecordedAnswers {
                 hosts,
                 verified: std::collections::BTreeSet::new(),
+                vouched: std::collections::BTreeSet::new(),
             }))
         })
     }

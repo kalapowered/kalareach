@@ -901,7 +901,7 @@ impl<E: Environment> Reconciler<E> {
         let answers = previous
             .as_ref()
             .map(|facts| <E::Kinds as Kinds>::refreshed(&facts.answers, fresh.clone()))
-            .unwrap_or(fresh);
+            .unwrap_or_else(|| <E::Kinds as Kinds>::first(fresh));
         let mut facts = Facts {
             format: super::facts::MembershipFormat::V1,
             collection,
