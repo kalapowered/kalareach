@@ -2266,6 +2266,24 @@ still holds a batch back, so the batch meets the state the client asked for. The
 taken before the action's effect. A key sent right after a resize can reach the application before
 the pseudo-terminal has its new size, and a read sent before a key can show what the key did.
 
+A paired device's keystroke batches take the same short way through the control daemon. Without it,
+the daemon would answer a device's frames one at a time, so a batch sent behind a viewport report or
+a read would wait in the daemon for that request's round trip to the worker. Once the device's
+connection has opened its link to the session's worker, the daemon reads the control stream ahead
+while such a request waits, answers each batch it finds at once over the link the connection already
+holds, and puts what it read and did not answer back in the order sent. The worker serves the batch
+beside the request as it does for a local client. The daemon reads no further once it has set aside
+sixteen requests to answer in their turn, at the first frame that must keep its place, or while it
+answers a batch. A request decided over another session or under another grant than the connection
+acts under keeps its place, and so does a voice read. So does a read of an action that names no
+session, unless the route recorded for the action names the session the connection acts for; any
+other read that names no session is decided under the pairing grant and does not keep its place.
+`session.open`, every other mutation and every frame that is not a request keep their place too. A
+batch sent behind a detach, an attach, an input acquire, release or interrupt, a close,
+`plugin.action.invoke` or `shell.launch` therefore still waits for it. A batch can reach the
+application before a resize sent ahead of it takes effect, and a read answered after a batch can
+show what the batch did.
+
 ## Who owns the size
 
 Size ownership is separate from input ownership, and both are separate from observing the session.

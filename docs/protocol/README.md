@@ -508,6 +508,19 @@ Reading the fields:
   and a `plugin.action.invoke` that a component prepares, which the worker runs after the frames
   sent while it was prepared. A read that is answered after a write can show what the write did. A
   client does not assume that answers come back in the order it sent the requests.
+- On a paired device's connection, the host also answers an `input.write` as soon as the worker has
+  taken the batch, once the connection has opened its link to a session's worker. The answer can
+  come before the answer to an earlier read on that connection, or to an earlier `terminal.resize`,
+  `terminal.geometry.transfer`, `attachment.configure` or `attachment.viewport`, but only when that
+  earlier request, like the write, is decided over the session and under the grant the connection
+  acts under, or over no session, which the device's pairing grant decides. A read of another
+  session, `session.open`, a voice read, and a write that names another session keep their place. So
+  does a read of an action that names no session, unless the route recorded for the action names the
+  session the connection acts for. A write follows every other earlier mutation on the connection
+  without exception. The host forwards `plugin.action.invoke`, `shell.launch` and the agent
+  mutations and waits for them, so a write behind one of them waits until the host has its answer or
+  has stopped waiting for it. The answer to an `events.subscribe` can follow the first batch of
+  output its subscription relays.
 
 ### Rights and capabilities are not the same thing
 
