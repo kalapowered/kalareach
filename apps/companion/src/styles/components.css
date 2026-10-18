@@ -1026,7 +1026,7 @@ textarea::placeholder {
 
 /* The panel's cards hold text and controls directly, so they carry their own inset. */
 .account-panel > .card {
-  padding: var(--gap-4) var(--inset);
+  padding: var(--gap-4);
 }
 
 .account-state {

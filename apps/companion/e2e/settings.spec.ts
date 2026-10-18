@@ -220,9 +220,10 @@ async function photograph(page: Page, element: Locator, path: string): Promise<v
 }
 
 // KR-REQ-13.19: at the largest text size on the narrowest screen the text keeps most of the screen's
-// width. The inset of the account screen and of a card on it grows with the text up to one and a
-// half times the base size and stops there: grown without a bound, the two insets take nearly two
-// thirds of a screen 320 points wide, and the text of the settings breaks inside its words.
+// width. The phone's spacing, the gutters of the account screen and the insets of a card on it
+// included, grows with the text up to one and a half times the base size and stops there: grown
+// without a bound, the two insets take nearly two thirds of a screen 320 points wide, and the text
+// of the settings breaks inside its words.
 for (const surface of ['ios', 'android'] as const) {
   test(`keeps most of a 320-point screen for the text of the settings card at the largest size, ${surface}`, async ({
     page

@@ -114,7 +114,9 @@ type Pane = 'semantic' | 'terminal'
  * The shortest session, in multiples of the root text size, that holds the view switch, the
  * conversation's three lines and the whole composer under them. At the base text size these take
  * about 22.4, with a reason of one line; 25 leaves room for a longer one. A shorter session, on a
- * small screen or with a large text size, gets the composer as its line.
+ * small screen or with a large text size, gets the composer as its line. Above one and a half
+ * times the base size the phone's spacing stops growing, so a session needs less than this counts:
+ * the line is the safe answer there.
  */
 const ROOMY_SESSION_REM = 25
 

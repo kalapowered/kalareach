@@ -4,9 +4,10 @@
  * It defines no colour of its own: light, dark, high contrast and reduced transparency all reach
  * this screen from `styles/tokens.css`, the way the mobile shell's do. Every colour here is a
  * token that each theme redefines, so a value that is legible in light is legible in dark rather
- * than nearly the colour of the page behind it. What it does define is spacing in `rem`, so a
- * larger system text size makes the layout grow with the text rather than clipping it, and targets
- * at the platform minimum, which the route resolves by naming the surface on the root element.
+ * than nearly the colour of the page behind it. What it does define is spacing in the `--gap-*`
+ * scale, which grows with a larger system text size so that the layout grows with the text rather
+ * than clipping it, and on a phone stops at one and a half times the base size, and targets at the
+ * platform minimum, which the route resolves by naming the surface on the root element.
  */
 
 .kr-voice {

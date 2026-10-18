@@ -5,10 +5,11 @@
  * the desktop are one design with two layouts rather than two designs, and light, dark, high
  * contrast and reduced transparency reach the phone without a second implementation.
  *
- * Three rules govern the layout. Spacing is in rem, so a larger system text size scales the layout
- * with the text instead of overflowing it. Every control is at least `--target` in both
- * dimensions, which is 44 on iOS and 48 on Android. And every edge that can be under a notch, a
- * home indicator or a rounded corner is padded by the platform's own safe-area inset.
+ * Three rules govern the layout. Spacing is measured in the bars' unit, so a larger system text
+ * size scales the layout with the text up to one and a half times the base size, and holds the
+ * space around the text there, where the text goes on growing. Every control is at least `--target`
+ * in both dimensions, which is 44 on iOS and 48 on Android. And every edge that can be under a notch,
+ * a home indicator or a rounded corner is padded by the platform's own safe-area inset.
  */
 
 :root[data-surface='ios'] {
@@ -25,6 +26,22 @@
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --safe-left: env(safe-area-inset-left, 0px);
   --safe-right: env(safe-area-inset-right, 0px);
+  /*
+   * The spacing scale of `styles/tokens.css`, measured in the bars' unit: it grows with the text
+   * up to one and a half times the base size and stops there, on every screen, the gutters of a
+   * screen and the insets of a card and a row included. At iOS's largest accessibility size a
+   * gutter of 1rem on each side of the screen and an inset of 1rem on each side of a row take
+   * nearly two thirds of a screen 320 points wide, and the words of the row break inside themselves.
+   * Space is not what the person asked to see larger: the text is, and the platforms keep their
+   * layout margins where they are. A screen 320 points wide keeps more than half of its width for
+   * the text of a card at every text size.
+   */
+  --gap-1: calc(var(--chrome-unit) * 0.25);
+  --gap-2: calc(var(--chrome-unit) * 0.5);
+  --gap-3: calc(var(--chrome-unit) * 0.75);
+  --gap-4: var(--chrome-unit);
+  --gap-5: calc(var(--chrome-unit) * 1.5);
+  --gap-6: calc(var(--chrome-unit) * 2);
   /* How much of the screen the software keyboard is covering, measured, not guessed. */
   --keyboard: 0px;
   /* How far the platform has panned the page to keep a focused field in sight, which the shell follows. */
@@ -78,11 +95,6 @@
   backdrop-filter: blur(20px) saturate(180%);
   position: relative;
   z-index: 2;
-  /* A bar's spacing is measured in the bar's own unit, which stops growing with the text at one and a half times. */
-  --gap-1: calc(var(--chrome-unit) * 0.25);
-  --gap-2: calc(var(--chrome-unit) * 0.5);
-  --gap-3: calc(var(--chrome-unit) * 0.75);
-  --gap-4: var(--chrome-unit);
 }
 
 .m-topbar {
@@ -146,11 +158,6 @@
   padding-inline: calc(var(--safe-left) + var(--gap-4)) calc(var(--safe-right) + var(--gap-4));
   padding-block: var(--gap-4) var(--gap-5);
   scroll-padding-block-end: var(--gap-6);
-}
-
-/* The account screen is cards of words, so its inset stops growing with the text where the bars' does. */
-.m-main[data-tab='account'] {
-  padding-inline: calc(var(--safe-left) + var(--inset)) calc(var(--safe-right) + var(--inset));
 }
 
 .m-main:focus-visible {

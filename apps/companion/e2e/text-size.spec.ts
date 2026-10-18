@@ -655,6 +655,81 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
     })
   }
 
+  // KR-REQ-13.19: the text of a card keeps more than half of a screen 320 points wide at the largest
+  // size on every tab. Spacing is measured in the bars' unit, so it grows with the text up to one and a
+  // half times the base size and stops there: grown without a bound, the gutters of the screen and the
+  // insets of a row take nearly two thirds of the screen, and the words of the row break inside
+  // themselves.
+  const CARDS = [
+    ['the attention inbox', 'attention', '.m-row'],
+    ['the session list', 'sessions', '.m-row'],
+    ['the hosts', 'hosts', '.m-row'],
+    ['the account', 'account', '.account-panel > .card']
+  ] as const
+
+  for (const surface of ['ios', 'android'] as const) {
+    for (const [name, tab, card] of CARDS) {
+      test(`keeps more than half of the screen for the text of a card on ${name} on ${surface}`, async ({ page }) => {
+        await withSystemTextScale(page, LARGEST)
+        await page.setViewportSize({ width: 320, height: 720 })
+        await page.goto(`/harness.html?surface=${surface}&tab=${tab}`)
+        await expect(page.locator(card).first()).toBeVisible()
+        const column = await page.locator(card).first().evaluate((each) => {
+          const style = getComputedStyle(each)
+          const around =
+            parseFloat(style.paddingLeft) +
+            parseFloat(style.paddingRight) +
+            parseFloat(style.borderLeftWidth) +
+            parseFloat(style.borderRightWidth)
+          return each.getBoundingClientRect().width - around
+        })
+        expect(column / 320, 'the share of the screen the card keeps for its text').toBeGreaterThan(0.5)
+        await page.screenshot({ path: `/tmp/kr-text-size-card-${tab}-${surface}-${test.info().project.name}.png` })
+      })
+    }
+  }
+
+  test('stops the gutters of every tab and the insets of its cards at one and a half times the base size', async ({
+    context
+  }) => {
+    // Each size gets a page of its own, so the only text size a page has is the one it was asked for.
+    const spacingAt = async (ratio: number): Promise<Record<string, { gutter: number; inset: number }>> => {
+      const page = await context.newPage()
+      try {
+        await withSystemTextScale(page, ratio)
+        await page.setViewportSize({ width: 320, height: 720 })
+        const found: Record<string, { gutter: number; inset: number }> = {}
+        for (const [, tab, card] of CARDS) {
+          await page.goto(`/harness.html?surface=ios&tab=${tab}`)
+          await expect(page.locator(card).first()).toBeVisible()
+          found[tab] = await page.evaluate((selector) => {
+            const inline = (element: Element | null): number =>
+              element === null ? Number.NaN : parseFloat(getComputedStyle(element).paddingLeft)
+            return {
+              gutter: inline(document.querySelector('.m-main')),
+              inset: inline(document.querySelector(selector))
+            }
+          }, card)
+        }
+        return found
+      } finally {
+        await page.close()
+      }
+    }
+    const atTheBase = await spacingAt(1)
+    const atOneAndAHalf = await spacingAt(1.5)
+    const atTheLargest = await spacingAt(LARGEST)
+    for (const [name, tab] of CARDS) {
+      for (const part of ['gutter', 'inset'] as const) {
+        const at = (found: typeof atTheBase): number => found[tab]?.[part] ?? Number.NaN
+        expect(at(atOneAndAHalf), `the ${part} of ${name} grows with the text up to one and a half times`).toBeGreaterThan(
+          at(atTheBase)
+        )
+        expect(at(atTheLargest), `the ${part} of ${name} holds there`).toBeCloseTo(at(atOneAndAHalf), 0)
+      }
+    }
+  })
+
   test('holds the two bars at one and a half times the base size, with the rest of the screen left to the content', async ({
     context
   }) => {

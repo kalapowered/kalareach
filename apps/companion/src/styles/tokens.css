@@ -86,27 +86,21 @@
   --font-mono: ui-monospace, 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
 
   /*
-   * The unit the two bars of a phone are sized in. It is the root text size up to one and a half
-   * times the base size and stops there: iOS's accessibility sizes reach three times the base size,
-   * and bars that grew with them would take the whole screen from what they are the bars of.
-   * Android's web view scales a font size written in pixels with the text, as it scales the root,
-   * so there the cap holds the bars' spacing and not their text, and its largest font scale is
-   * twice the base size. Everything else, but the account screen's inset below, is sized in rem and
-   * grows with no bound.
+   * The unit the phone's bars and spacing are sized in. It is the root text size up to one and a
+   * half times the base size and stops there: iOS's accessibility sizes reach three times the base
+   * size, and bars or insets that grew with them would take the whole screen from what they are the
+   * bars and insets of. Android's web view scales a font size written in pixels with the text, as
+   * it scales the root, so there the cap holds the spacing and not the text, and its largest font
+   * scale is twice the base size. The phone's spacing scale (`mobile/mobile.css`) is measured in
+   * this unit, and so is the type of the bars and of a sheet's header. The text of the content is
+   * not, and grows with no bound, but for the terminal grid's, which has a cap of its own.
    */
   --chrome-unit: min(1rem, 24px);
 
   /*
-   * The inset of the phone's account screen and of a card on it, which stops growing with the text
-   * where the bars' unit does, at one and a half times the base size. At iOS's largest
-   * accessibility size an inset of 1rem on each side of the screen and of a card on it takes
-   * nearly two thirds of a screen 320 points wide, and the text of the card breaks inside its
-   * words. Insets are not what the person asked to see larger: the text is, and the platforms keep
-   * their layout margins where they are.
+   * Spacing is in rem so a larger system text size scales the layout with the text. The phone
+   * replaces this scale with one that stops growing at one and a half times the base size.
    */
-  --inset: var(--chrome-unit);
-
-  /* Spacing is in rem so a larger system text size scales the layout with the text. */
   --gap-1: 0.25rem;
   --gap-2: 0.5rem;
   --gap-3: 0.75rem;
