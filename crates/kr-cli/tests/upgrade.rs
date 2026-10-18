@@ -371,6 +371,70 @@ async fn a_second_start_of_the_daemon_leaves_the_session_readable_by_the_release
     host.worker_ended(&updated.worker).await;
 }
 
+/// KR-REQ-26.06, KR-ACC-035: the `kr` of this release does not read the frames of the worker of the
+/// release before. `kr status` says which session it did not read, which release it runs and the
+/// `kr` that reads it, and that `kr` does; `kr question list` says the same beside the questions it
+/// did read; and `kr detach` is handed to the `kr` of the release before, which answers it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_kr_of_this_release_hands_the_worker_of_the_release_before_to_the_kr_that_reads_it() {
+    let updated = Updated::new().await;
+    let host = &updated.host;
+    let their_kr = updated.kr_before().display().to_string();
+
+    let refused = host.run(&updated.kr_now(), &["status", &updated.display]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(refused.status.code(), Some(8), "{said}");
+    for named in [
+        format!("session {} was not read", updated.display),
+        format!("kr-worker/{}", updated.one.name()),
+        their_kr,
+    ] {
+        assert!(said.contains(&named), "{named} is not in: {said}");
+    }
+    let read = host.run(
+        &updated.kr_before(),
+        &["--json", "status", &updated.display],
+    );
+    assert!(
+        read.status.success(),
+        "the release before's kr reads it: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+
+    let listed = host.run(&updated.kr_now(), &["--json", "question", "list"]);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&listed.stdout).expect("a document");
+    assert_eq!(listed["questions"], serde_json::json!([]), "{listed}");
+    assert_eq!(
+        listed["unread"].as_array().map(Vec::len),
+        Some(1),
+        "{listed}"
+    );
+
+    // Handed over: the answer is the release before's own, not this release's refusal.
+    let detached = host.run(&updated.kr_now(), &["detach", &updated.display]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&detached.stdout),
+        String::from_utf8_lossy(&detached.stderr)
+    );
+    assert!(
+        !said.contains("was not read"),
+        "kr detach was handed to the kr of the worker's release: {said}"
+    );
+    updated.the_worker_is_as_it_was().await;
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+}
+
 /// KR-REQ-26.10, KR-REQ-26.08: a rollback to the release before goes on while only its session is
 /// live, and waits, exit 9, naming the session, while a session of this release is live.
 #[tokio::test(flavor = "multi_thread")]
