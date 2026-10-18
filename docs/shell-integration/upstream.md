@@ -4,8 +4,8 @@ Every managed shell package is one upstream release, pinned by URL and SHA-256, 
 own patch set. This page is the register of those sources, the record of what has been triaged
 against them, and the update target each package is published under.
 
-Upstream is never vendored: `scripts/build-shells.sh` fetches the pinned archive, checks its digest
-and applies the ordered patches in `shells/<shell>/patches`. The pins live in
+Upstream is never vendored: `scripts/place-shell-sources.sh` fetches the pinned archive,
+`scripts/build-shells.sh` checks its digest and applies the ordered patches in `shells/<shell>/patches`. The pins live in
 `shells/<shell>/manifest.json`, and the identity record the build writes beside the binary
 (`kr-shell-identity.json`) carries the archive it actually fetched, its digest, the patches it
 applied and the module tree it installed. The qualification reads all three and refuses a package
@@ -32,6 +32,12 @@ That range is a statement about the editor this integration works with, not abou
 inside it carry which fixes. A person runs the host their machine has, so an advisory against
 PowerShell or PSReadLine is triaged against the versions it names and against the identity the
 qualification recorded, and it gets a row of its own below.
+
+## The crates and repositories the fish build uses
+
+The fish package is built from Rust, and its release names more than its own archive. Its `Cargo.lock` file, included in its archive, lists the crates it takes from crates.io, each with a checksum. It also includes 3 git repositories at a locked revision: `fluent-rs` and `rust-pcre2` from github.com, and `fluent-ftl-tools` from codeberg.org. The build downloads none of them. Instead, the crates and a git bundle of each of the repositories are placed in the sources cache beside the archive by `scripts/place-shell-sources.sh`. Then, when building, `scripts/build-shells.sh` first checks each of them against its pin before cargo sees it: the lock's checksum pins a crate, and the `cargo.git` list in `shells/fish/manifest.json` pins a repository. The latter pins the locked revision for each repository and also the digest of the files within the repository at that revision. This means that cargo will be run offline, and if a source is not pinned in the manifest then the build will stop with an error naming it. (These pins are not rows of the register above, because they change with the fish release.)
+
+If the lock file changes with a new release of fish, running `bash scripts/build-shells.sh --fish --check-sources` will name the repositories it now depends on that are not pinned in the manifest. Add a pin to the manifest for these repositories with a digest of 64 zeros, then run `bash scripts/place-shell-sources.sh --fish` to get the git bundles for the repositories. Then re-run the check and it will refuse the repositories because the digest is wrong, but this time it will print the digest of the files it found, which is the value to pin.
 
 ## The update target this publishes
 
