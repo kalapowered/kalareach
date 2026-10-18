@@ -1178,8 +1178,9 @@ impl Updated {
         .expect("the gate is opened");
         // The server opens its input first and its output second, and each open waits for the other
         // end. Neither end here waits: the input's writer is opened as soon as the server's open of
-        // it is waiting (a reader that waits in `open` counts as one), the output's reader after it,
-        // and a server that never opens either fails the case at the deadline.
+        // it is waiting (a reader that waits in `open` counts as one), and the output's reader
+        // after it. A server that never opens its input, or never answers the handshake, fails the
+        // case at the deadline.
         let deadline = Instant::now() + LIVENESS_DEADLINE;
         let writer = loop {
             match tokio::net::unix::pipe::OpenOptions::new().open_sender(&pipes.to_server) {
@@ -1197,8 +1198,9 @@ impl Updated {
         let reader = tokio::net::unix::pipe::OpenOptions::new()
             .open_receiver(&pipes.from_server)
             .expect("opens the server's output");
-        ().serve((reader, writer))
+        tokio::time::timeout(LIVENESS_DEADLINE, ().serve((reader, writer)))
             .await
+            .expect("the tool server answered the handshake in time")
             .expect("the tool server answered the handshake")
     }
 }
@@ -1209,13 +1211,16 @@ async fn call_tool(
     name: &str,
     arguments: Value,
 ) -> (Value, bool) {
-    let result = client
-        .call_tool(
+    let result = tokio::time::timeout(
+        LIVENESS_DEADLINE,
+        client.call_tool(
             rmcp::model::CallToolRequestParams::new(name.to_owned())
                 .with_arguments(arguments.as_object().cloned().unwrap_or_default()),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("{name} answered: {error}"));
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{name} did not answer within {LIVENESS_DEADLINE:?}"))
+    .unwrap_or_else(|error| panic!("{name} answered: {error}"));
     let content = result
         .structured_content
         .clone()
