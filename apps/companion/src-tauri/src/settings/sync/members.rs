@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 use kr_client::pairing::owner::{CeremonyKind, CeremonyOutcome};
 use kr_client::services::ManagedSyncService;
 use kr_client::sync::membership::{
-    CollectionRef, Device, DeviceDirectory, Ended, HostAnswers, HostDevice, HostReport, Outcome,
-    Refreshed, SyncMembership,
+    CollectionRef, Device, DeviceDirectory, Ended, HostAnswers, HostDevice, HostReport,
+    MembershipError, Outcome, Refreshed, SyncMembership,
 };
 use kr_client::{ClientError, Shown};
 use kr_protocol::error::ErrorCode;
@@ -646,6 +646,40 @@ impl SettingsSync {
         self.settle(&mut record, &service, Ask::Now)
             .await
             .map(|_| ())
+    }
+
+    /// Records that a revocation of `device`, sent from this computer and verified here, is in a
+    /// host's feed, and carries out the removal it requires as far as the hosts and the service
+    /// allow. Settings sync stops publishing at once; a host that has not caught up yet does not
+    /// undo it.
+    ///
+    /// # Errors
+    ///
+    /// Returns what stopped the recording. A service that cannot be reached afterwards is not a
+    /// failure of it: the next step carries the removal out.
+    pub async fn feed_revocation(&self, device: &AuthorisationKey) -> Result<()> {
+        let outcome = self.feed_revocation_in_a_step(device).await;
+        self.finished(&outcome);
+        outcome
+    }
+
+    async fn feed_revocation_in_a_step(&self, device: &AuthorisationKey) -> Result<()> {
+        let _step = self.step().await?;
+        let Some(mut record) = self.record()? else {
+            return Ok(());
+        };
+        let service = self.managed(&record.origin()?)?;
+        let mut membership = self.membership_asking(&service, Ask::Never)?;
+        match membership.feed_revocation(device) {
+            Ok(()) => {}
+            // This computer shares no settings, so the revocation changes nothing here.
+            Err(MembershipError::NoMembership) => return Ok(()),
+            Err(error) => return Err(member_failure(error)),
+        }
+        self.note_devices(&membership);
+        drop(membership);
+        let _ = self.settle(&mut record, &service, Ask::Now).await;
+        Ok(())
     }
 
     /// Joins the collection `reference` names, once the person confirms it here.

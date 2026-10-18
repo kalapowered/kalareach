@@ -571,4 +571,20 @@ impl Settings {
         }
         Ok(self.view())
     }
+
+    /// Records that a revocation of `device`, sent from this computer, is in a host's feed, so that
+    /// settings sync stops publishing at once and takes the device out of the shared settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns what stopped it: the membership could not be used.
+    pub async fn feed_revocation(
+        &self,
+        device: &kr_protocol::scalars::AuthorisationKey,
+    ) -> Result<()> {
+        match self.sync.get() {
+            Some(sync) => sync.feed_revocation(device).await,
+            None => Ok(()),
+        }
+    }
 }

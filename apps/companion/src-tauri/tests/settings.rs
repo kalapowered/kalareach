@@ -3240,6 +3240,45 @@ async fn a_device_a_host_reports_revoked_is_taken_out_at_the_next_step() {
     assert_eq!(view["sync"]["devices"]["out"], true, "{view}");
 }
 
+/// A revocation this computer sent that a host's feed holds takes the device out of the shared
+/// settings at the next step, before any host says it is revoked: the hosts still list the device
+/// as it was, and the key moves on all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revocation_in_a_hosts_feed_takes_a_member_out_before_any_host_says_so() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    page.choose("dark");
+    let phone = other.start();
+    let shown = page.devices_refresh();
+    page.share(&first_reference(&shown["candidates"]))
+        .expect("shared");
+    let offers = phone.devices_refresh();
+    phone
+        .join(&first_reference(&offers["offers"]))
+        .expect("joined");
+    page.sync_now();
+    assert_eq!(phone.sync_now()["colour_mode"], "dark");
+
+    page.app
+        .state::<AppState>()
+        .settings()
+        .expect("settings are open")
+        .feed_revocation(other.identity().keys.authorisation.public())
+        .await
+        .expect("the revocation is recorded");
+    // Both computers' hosts still list the phone as it was.
+    page.choose("light");
+    let view = page.sync_now();
+    let members = view["sync"]["devices"]["members"]
+        .as_array()
+        .expect("members");
+    assert_eq!(members.len(), 1, "the phone was taken out: {view}");
+
+    let view = phone.sync_now();
+    assert_eq!(view["colour_mode"], "dark", "{view}");
+    assert_eq!(view["sync"]["devices"]["out"], true, "{view}");
+}
+
 /// A computer the person does not confirm on joins nothing: the offer stays, and the settings the
 /// first computer holds are not read there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
