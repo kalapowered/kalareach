@@ -965,12 +965,15 @@ async fn a_worker_of_another_release_retires_no_kept_answer() {
         state.question.revision = QuestionRevision::new(2);
     }
 
-    let shown = host.kr(&["question", "drafts"]);
-    let shown = String::from_utf8_lossy(&shown.stdout);
-    assert!(!shown.contains("retired"), "{shown}");
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_eq!(status, Some(8), "{document}");
+    assert_eq!(document["code"], "UNSUPPORTED_SCHEMA", "{document}");
     assert!(host.kept().is_file(), "the answer is still kept");
     let (status, document) = host.json(&["question", "send", &question]);
-    assert_ne!(status, Some(0), "{document}");
+    assert_eq!(status, Some(8), "{document}");
+    assert_eq!(document["code"], "UNSUPPORTED_SCHEMA", "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("still kept"), "{message}");
     assert!(host.kept().is_file(), "and still kept after a send");
     assert_eq!(host.answers_received(), 0, "nothing was sent");
 

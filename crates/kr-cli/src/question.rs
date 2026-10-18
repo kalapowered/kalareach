@@ -879,17 +879,14 @@ impl Workers {
             // release, so nothing is decided about a kept answer from it, and none is retired.
             Ok(client) => match Other::of(client.acknowledgement().build.as_ref()) {
                 None => Ok(client),
-                Some(other) => {
-                    self.failed(
-                        ErrorCode::UnsupportedSchema,
-                        Unread {
-                            display: descriptor.display_number.get(),
-                            other,
-                        }
-                        .said("question"),
-                    );
-                    Err(ClientError::ConnectionEnded)
-                }
+                Some(other) => Err(ClientError::refusal(
+                    ErrorCode::UnsupportedSchema,
+                    Unread {
+                        display: descriptor.display_number.get(),
+                        other,
+                    }
+                    .said("question"),
+                )),
             },
             // A worker that cannot be reached may have ended with its session; only a closure
             // its daemon keeps says so.
