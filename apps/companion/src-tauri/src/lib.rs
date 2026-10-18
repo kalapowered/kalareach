@@ -144,16 +144,14 @@ pub fn run() {
             // A simulator launch can ask to start with the device locked.
             #[cfg(all(debug_assertions, target_os = "ios"))]
             companion_platform::protection::model::arm_from_environment();
+            open_sync_service(app.handle());
             open_pairing(app.handle());
-            #[cfg(mobile)]
-            hosts::resume(app.handle());
             #[cfg(all(debug_assertions, mobile))]
             if let Some(request) = probe {
                 probe::start(app.handle(), request);
             }
             #[cfg(all(debug_assertions, mobile))]
             device_probe::start(app.handle());
-            open_recovery(app.handle());
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -383,18 +381,95 @@ fn watch_drops(app: &tauri::AppHandle) {
 }
 
 /// Opens this computer as a device that pairs, and as an owner device of the hosts it owns, on
-/// this computer's own parts, ceremony and pasteboard, and starts telling the page about both.
+/// this computer's own parts, ceremony and pasteboard, and starts telling the page about both,
+/// and then starts what needs the pairing records.
 ///
 /// A computer whose keys or records cannot be opened still runs: the pairing commands say why
 /// they cannot, in words the page shows where the pairing screen would be, and everything else
-/// works as it did.
+/// works as it did. A phone that was started before its first unlock cannot open them yet, and
+/// opens them in place when the system says the device has been unlocked ([`open_after_unlock`]).
 fn open_pairing(app: &tauri::AppHandle) {
+    // The system is listened to before the first try, so an unlock that falls between the try and
+    // the wait is heard.
+    #[cfg(target_os = "ios")]
+    watch_for_unlock(app);
+    if open_records(app) {
+        start_with_records(app);
+    }
+}
+
+/// Tries to open the pairing records, unless they are open, one try at a time. Says whether this
+/// try opened them.
+///
+/// A try that fails records why, and says the device is locked when the system says so: the
+/// records are then opened again at the next unlock.
+fn open_records(app: &tauri::AppHandle) -> bool {
     use tauri::Manager as _;
 
-    if let Err(error) = open_the_records(app) {
-        tracing::warn!(%error, "this computer's pairing records could not be opened");
-        app.state::<AppState>().records_not_opened(&error.message);
+    let state = app.state::<AppState>();
+    let _turn = state.opening_records();
+    if state.records_are_open() {
+        return false;
     }
+    match open_the_records(app) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "this computer's pairing records could not be opened");
+            state.records_not_opened(if companion_platform::protection::is_available(app) {
+                state::RecordsNotOpen::Failed(error.message)
+            } else {
+                state::RecordsNotOpen::Locked
+            });
+            false
+        }
+    }
+}
+
+/// Has the pairing records opened again each time the system says the device's protected data has
+/// become available, until they are open.
+#[cfg(target_os = "ios")]
+fn watch_for_unlock(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    let watching = companion_platform::protection::on_available(app, move || {
+        // The system calls this on its own thread, which must not wait for the native half.
+        let handle = handle.clone();
+        tauri::async_runtime::spawn_blocking(move || open_after_unlock(&handle));
+    });
+    if let Err(error) = watching {
+        tracing::warn!(%error, "the device's unlock cannot be heard, so the pairing records open at the next start");
+    }
+}
+
+/// Opens the pairing records at an unlock when a start before it could not, tells the page, and
+/// starts what needs them.
+#[cfg(target_os = "ios")]
+fn open_after_unlock(app: &tauri::AppHandle) {
+    if open_records(app) {
+        tell_the_page_the_records_are_open(app);
+        start_with_records(app);
+    }
+}
+
+/// Tells the page, which read the records as not open, what it would have read had they been.
+#[cfg(target_os = "ios")]
+fn tell_the_page_the_records_are_open(app: &tauri::AppHandle) {
+    use tauri::{Emitter as _, Manager as _};
+
+    let state = app.state::<AppState>();
+    if let Ok(device) = state.device() {
+        let _ = app.emit(pairing::PAIRING_EVENT, device.view());
+    }
+    if let Ok(owner) = state.owner() {
+        let _ = app.emit(pairing::CONFIRMATIONS_EVENT, owner.view());
+    }
+}
+
+/// Starts what needs the pairing records: on a phone the host its commands last went to, and
+/// recovery and settings sync, which need this computer's keys.
+fn start_with_records(app: &tauri::AppHandle) {
+    #[cfg(mobile)]
+    hosts::resume(app);
+    open_recovery(app);
 }
 
 fn open_the_records(app: &tauri::AppHandle) -> Result<()> {
@@ -502,11 +577,9 @@ const fn keep_records_out_of_backup(
     Ok(())
 }
 
-/// Opens the sync service setting and, on this computer's own keys, recovery.
-///
-/// A computer whose keys cannot be opened still has the setting; recovery needs the keys, so it is
-/// the one that is missing then.
-fn open_recovery(app: &tauri::AppHandle) {
+/// Opens the sync service setting, which needs no keys, and starts telling the page about the
+/// settings, so a step that begins at once is heard.
+fn open_sync_service(app: &tauri::AppHandle) {
     use tauri::Manager as _;
 
     let Ok(data) = app.path().app_data_dir() else {
@@ -514,21 +587,26 @@ fn open_recovery(app: &tauri::AppHandle) {
         return;
     };
     start_sync_service(app, &data);
-    let device = app.state::<AppState>().device();
-    let opened = device
-        .as_ref()
-        .map_err(Clone::clone)
-        .and_then(|device| start_recovery(app, &data, device.identity()));
-    if let Err(error) = opened {
+    watch_settings(app);
+}
+
+/// Opens recovery and lets this computer take part in settings sync, on this computer's own keys.
+/// They are started when the pairing records are open, since the keys are opened with them.
+fn open_recovery(app: &tauri::AppHandle) {
+    use tauri::Manager as _;
+
+    let Ok(data) = app.path().app_data_dir() else {
+        return;
+    };
+    let Ok(device) = app.state::<AppState>().device() else {
+        return;
+    };
+    if let Err(error) = start_recovery(app, &data, device.identity()) {
         tracing::warn!(%error, "this computer's recovery records could not be opened");
     }
-    // Telling the page comes first, so a step that begins at once is heard.
-    watch_settings(app);
     let hosts = std::sync::Arc::new(settings::connected::ConnectedHosts::new(app.clone()));
     let ceremony = verify::platform_ceremony(app.get_webview_window("main"));
-    let taking_part = device
-        .and_then(|device| start_settings_sync(app, &data, device.identity(), hosts, ceremony));
-    match taking_part {
+    match start_settings_sync(app, &data, device.identity(), hosts, ceremony) {
         Ok(()) => keep_settings_in_step(app),
         Err(error) => {
             tracing::warn!(%error, "this computer cannot take part in settings sync");

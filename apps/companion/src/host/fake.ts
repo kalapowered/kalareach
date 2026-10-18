@@ -187,6 +187,15 @@ const RECORDS_UNAVAILABLE_WORDS =
   'to.kala.reach/pairing-boot: No space left on device (os error 28). Close KalaReach and open it ' +
   'again to try once more.'
 
+/**
+ * What native code says when the pairing records are not open because the device is locked
+ * (`AppState::device`): a phone that was started before its first unlock opens them when the person
+ * unlocks it, so the words say that and ask for nothing else.
+ */
+const RECORDS_LOCKED_WORDS =
+  'This device cannot pair with a host or use the hosts it is paired with yet, because it is ' +
+  'locked. KalaReach opens its pairing records when you unlock it.'
+
 function receipt(actionId: string, state: Receipt['state'], method: string): Receipt {
   return {
     accepted_deadline_ms: String(FAKE_NOW_MS + 60_000),
@@ -402,6 +411,11 @@ export interface FakeHostControls {
   readonly drafts: FakeDraftStore
   /** Moves the prompt generation on, which disables the launch buttons. */
   changePromptGeneration(): void
+  /**
+   * Opens the pairing records the address said were not open, as native code does at the unlock of
+   * a phone that was started before it: the page is told the pairing view it would have read.
+   */
+  openPairingRecords(): void
   /**
    * Marks the host as unreachable, or reachable again, and says so as native code does. `reason`
    * is native code's words for the loss, which can be blank; without it, the host cannot be
@@ -790,10 +804,22 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     invitation: null,
     hosts: []
   }
-  /** Whether the address asks this host to be a device whose pairing records could not be opened. */
-  const recordsUnavailable =
-    typeof window !== 'undefined' &&
-    new URLSearchParams(window.location.search).get('pairing_records') === 'unavailable'
+  /**
+   * What the address asks this host to say about the pairing records: that they could not be opened
+   * (`pairing_records=unavailable`) or that the device is locked and opens them at its unlock
+   * (`pairing_records=locked`). Null when they are open.
+   */
+  let recordsNotOpen: string | null = ((): string | null => {
+    if (typeof window === 'undefined') return null
+    switch (new URLSearchParams(window.location.search).get('pairing_records')) {
+      case 'unavailable':
+        return RECORDS_UNAVAILABLE_WORDS
+      case 'locked':
+        return RECORDS_LOCKED_WORDS
+      default:
+        return null
+    }
+  })()
   const pairingListeners = new Set<(view: PairingView) => void>()
   const publishPairing = (change: Partial<PairingView>) => {
     pairing = { ...pairing, ...change }
@@ -1900,7 +1926,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       return terminalOpensAnswer.then(() => view.handle)
     },
     pairingView: () => {
-      if (recordsUnavailable) refuse('RESOURCE_UNAVAILABLE', RECORDS_UNAVAILABLE_WORDS)
+      if (recordsNotOpen !== null) refuse('RESOURCE_UNAVAILABLE', recordsNotOpen)
       return Promise.resolve(pairing)
     },
     pairingSetOrigin: (origin) => {
@@ -2564,6 +2590,10 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
         sequence: String(promptGeneration),
         body: { kind: 'prompt_generation', prompt_generation: String(promptGeneration) }
       })
+    },
+    openPairingRecords() {
+      recordsNotOpen = null
+      publishPairing({})
     },
     setConnected(next, reason = UNREACHABLE) {
       connected = next

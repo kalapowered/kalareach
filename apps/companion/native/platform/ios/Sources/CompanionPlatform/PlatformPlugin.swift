@@ -58,6 +58,7 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
   private var session: ASWebAuthenticationSession?
   private var waiting: Invoke?
   private let attempts = SessionAttempts()
+  private let protection = ProtectedData()
 
   @objc public func capabilities(_ invoke: Invoke) {
     let httpsCallback = takesHttpsCallback(ProcessInfo.processInfo.operatingSystemVersion)
@@ -97,6 +98,17 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
     } catch {
       invoke.reject("\(arguments.path) could not be asked about the backup: \(error.localizedDescription)")
     }
+  }
+
+  /// Whether the device's protected data can be read now, as far as the system has said.
+  @objc public func protectedData(_ invoke: Invoke) {
+    invoke.resolve(["available": protection.available])
+  }
+
+  /// Has the system's news that protected data became readable sent on a channel, each time.
+  @objc public func watchProtectedData(_ invoke: Invoke) throws {
+    protection.watch(try invoke.parseArgs(WatchArguments.self).events)
+    invoke.resolve(["done": true])
   }
 
   #if DEBUG

@@ -5,7 +5,7 @@
 //! commands, and a command returns protocol values rather than handles: there is nothing the page
 //! can keep and use later.
 
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use kr_client::Session;
 use kr_protocol::error::ErrorCode;
@@ -19,14 +19,27 @@ use crate::pairing::PastePlatform;
 use crate::recovery::Recovery;
 use crate::sync_service::SyncService;
 
+/// Why the pairing records are not open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecordsNotOpen {
+    /// The device is locked. iOS keeps what the records are kept in out of reach until the person
+    /// unlocks the device, and the records are opened then.
+    Locked,
+    /// The records could not be opened, for the cause given.
+    Failed(String),
+}
+
 /// The backend's long-lived state.
 #[derive(Debug)]
 pub struct AppState {
     connection: RwLock<Option<Connection>>,
     reason: RwLock<Option<String>>,
     device: OnceLock<Arc<Device>>,
-    /// Why the pairing records could not be opened, when they could not, in words for a person.
-    records_failure: OnceLock<String>,
+    /// Why the pairing records are not open, when they are not.
+    records_failure: RwLock<Option<RecordsNotOpen>>,
+    /// Held for the length of one try at opening the pairing records, so that two tries (the
+    /// application's start and an unlock) are made one after the other.
+    opening_records: Mutex<()>,
     owner: OnceLock<Arc<Owner>>,
     paste: OnceLock<Arc<dyn PastePlatform>>,
     sync_service: OnceLock<Arc<SyncService>>,
@@ -63,7 +76,8 @@ impl AppState {
                 "this application has not reached a host yet".to_owned(),
             )),
             device: OnceLock::new(),
-            records_failure: OnceLock::new(),
+            records_failure: RwLock::new(None),
+            opening_records: Mutex::new(()),
             owner: OnceLock::new(),
             paste: OnceLock::new(),
             sync_service: OnceLock::new(),
@@ -349,34 +363,56 @@ impl AppState {
         let _ = self.paste.set(paste);
     }
 
-    /// Records why this computer's pairing records could not be opened, once, for the commands
-    /// that need them to say.
-    pub fn records_not_opened(&self, cause: &str) {
-        let _ = self.records_failure.set(cause.to_owned());
+    /// Takes the turn to try opening this computer's pairing records, which is held until the try
+    /// ends.
+    pub fn opening_records(&self) -> MutexGuard<'_, ()> {
+        self.opening_records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether this computer's pairing records are open.
+    pub fn records_are_open(&self) -> bool {
+        self.device.get().is_some()
+    }
+
+    /// Records why this computer's pairing records are not open, for the commands that need them to
+    /// say. A later try that fails records its own reason in its place.
+    pub fn records_not_opened(&self, why: RecordsNotOpen) {
+        *self
+            .records_failure
+            .write()
+            .expect("the state lock is not poisoned") = Some(why);
     }
 
     /// The failure of a command that needs the pairing records when they are not open.
     ///
-    /// The words say what does not work and why, and what to do. They are stated and ask nothing
-    /// more of the person: waiting does not open the records, and the records are opened once, as
-    /// the application starts.
+    /// The words say what does not work and why, and what to do. They are stated: a locked device
+    /// is told to be unlocked, which opens the records without another start, and any other cause
+    /// is told to start the application again.
     fn records_unavailable(&self) -> CommandError {
-        let why = self.records_failure.get().map_or_else(
-            || "its pairing records are not open.".to_owned(),
-            |cause| {
-                format!(
-                    "its pairing records could not be opened. The cause: {}.",
-                    cause.trim_end_matches('.')
-                )
-            },
-        );
-        CommandError::stated(
-            ErrorCode::ResourceUnavailable,
-            format!(
-                "This device cannot pair with a host or use the hosts it is paired with, because \
-                 {why} Close KalaReach and open it again to try once more."
+        let lacks = "This device cannot pair with a host or use the hosts it is paired with";
+        let words = match self
+            .records_failure
+            .read()
+            .expect("the state lock is not poisoned")
+            .as_ref()
+        {
+            Some(RecordsNotOpen::Locked) => format!(
+                "{lacks} yet, because it is locked. KalaReach opens its pairing records when you \
+                 unlock it."
             ),
-        )
+            Some(RecordsNotOpen::Failed(cause)) => format!(
+                "{lacks}, because its pairing records could not be opened. The cause: {}. Close \
+                 KalaReach and open it again to try once more.",
+                cause.trim_end_matches('.')
+            ),
+            None => format!(
+                "{lacks}, because its pairing records are not open. Close KalaReach and open it \
+                 again to try once more."
+            ),
+        };
+        CommandError::stated(ErrorCode::ResourceUnavailable, words)
     }
 
     /// This computer as a device that pairs.
@@ -604,11 +640,13 @@ mod tests {
     }
 
     /// When the pairing records could not be opened, every command that needs them says why in the
-    /// person's words, and asks for nothing to wait for: the records are opened once, at start.
+    /// person's words, and asks for nothing to wait for.
     #[test]
     fn commands_that_need_the_pairing_records_say_why_they_did_not_open() {
         let state = AppState::new();
-        state.records_not_opened("this device's boot could not be recorded: the disk is full");
+        state.records_not_opened(RecordsNotOpen::Failed(
+            "this device's boot could not be recorded: the disk is full".to_owned(),
+        ));
         for error in [
             state.device().expect_err("not open"),
             state.owner().expect_err("not open"),
@@ -627,6 +665,24 @@ mod tests {
                 error.message
             );
         }
+    }
+
+    /// A locked device is told to be unlocked, and not to start the application again: closing
+    /// it would leave the records as far out of reach as they were.
+    #[test]
+    fn a_locked_device_is_told_to_unlock_and_not_to_start_again() {
+        let state = AppState::new();
+        state.records_not_opened(RecordsNotOpen::Locked);
+        let error = state.device().expect_err("not open");
+        assert_eq!(error.code, ErrorCode::ResourceUnavailable);
+        assert_eq!(error.user_action, "nothing", "the words say what to do");
+        assert!(error.message.contains("locked"), "{}", error.message);
+        assert!(error.message.contains("unlock"), "{}", error.message);
+        assert!(
+            !error.message.contains("open it again"),
+            "closing the application does not unlock the device: {}",
+            error.message
+        );
     }
 
     /// KR-REQ-13.21: an export is written only where a save dialog put it; a path the page names

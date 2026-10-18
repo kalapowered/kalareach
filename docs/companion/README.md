@@ -327,6 +327,8 @@ native code does the rest with `kr-client`'s pairing module:
   choice is kept in `pairing-origin`.
 - The host its commands go to is kept in `command-host`, written whole and renamed into place, and a
   choice that could not be kept is not made.
+- A phone that iOS started before its first unlock cannot open its records. The commands say the
+  device is locked, and the records open at the unlock without another start.
 
 ## Where a phone's commands go
 
