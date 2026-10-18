@@ -703,6 +703,9 @@ describe('while a call is running', () => {
     expect(stopped).toHaveBeenCalledWith(null, {})
     expect(await screen.findByRole('button', { name: 'Ending…' })).toBeDisabled()
     expect(screen.queryByRole('button', { name: 'End the call' })).not.toBeInTheDocument()
+    // Focus is on the heading, not on a control that is disabled and then gone, and it stays there.
+    const heading = screen.getByRole('heading', { name: 'Start a voice session' })
+    expect(heading).toHaveFocus()
 
     answer()
 
@@ -710,6 +713,58 @@ describe('while a call is running', () => {
     expect(screen.queryByRole('button', { name: 'Ending…' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'End the call' })).not.toBeInTheDocument()
     expect(screen.getByText(/given up before it began/)).toBeInTheDocument()
+    expect(heading).toHaveFocus()
+  })
+
+  // The end is offered while the start waits for the host and no longer: once the host has answered
+  // there is nothing to give up, and the device holds no call to end while the screen reads what a
+  // call would be again.
+  it('takes the end away once the host has answered, before the preparation is read again', async () => {
+    const person = userEvent.setup()
+    const { controls, port } = start()
+    await waitForChoice()
+    controls.changeVoiceScope()
+    const answer = controls.holdVoiceStart()
+    // The second reading of what a call would be waits for the test, at the list of sessions it asks
+    // for after the host has answered its preparation.
+    const real = port.sessionList.bind(port)
+    let release: () => void = () => undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    vi.spyOn(port, 'sessionList').mockImplementation(async (...asked) => {
+      await gate
+      return real(...asked)
+    })
+
+    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    await screen.findByRole('button', { name: 'End the call' })
+    answer()
+
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: 'End the call' })).not.toBeInTheDocument()
+    })
+    expect(screen.getByRole('button', { name: 'Starting…' })).toBeDisabled()
+    release()
+    expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeEnabled()
+  })
+
+  // A stop the device refuses did nothing, so the control comes back and the device's words say why:
+  // another press can do no harm, and it is the way out when a stop did not arrive.
+  it('brings the end back, with the device’s words, when the device refuses it', async () => {
+    const person = userEvent.setup()
+    const { controls, port } = start()
+    await waitForChoice()
+    controls.holdVoiceStart()
+    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    const end = await screen.findByRole('button', { name: 'End the call' })
+    // The device is already ending what it was making, so it refuses a second stop.
+    await port.voiceStop(null, {})
+
+    await person.click(end)
+
+    expect(await screen.findByText(/already ending its call/)).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'End the call' })).toBeEnabled()
   })
 
   // A start that was not given up is the same start it always was: the end control goes with the

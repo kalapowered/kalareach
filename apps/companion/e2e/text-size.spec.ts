@@ -440,6 +440,9 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         const ending = page.getByRole('button', { name: 'Ending…' })
         await expect(ending).toBeDisabled()
         await expect(ending).toBeInViewport()
+        // Focus is on the heading, not on the control that was pressed and is now disabled.
+        await expect(page.getByRole('heading', { name: 'Start a voice session' })).toBeFocused()
+        expect(await overrunning(page, '.kr-voice__note'), 'the ending note that runs past its box').toEqual([])
         await page.screenshot({
           path: `/tmp/kr-voice-own-start-ending-${size}-${surface}-${test.info().project.name}.png`
         })

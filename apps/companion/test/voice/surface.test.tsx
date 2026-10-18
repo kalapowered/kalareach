@@ -173,21 +173,39 @@ describe('before voice starts', () => {
     )
     expect(screen.queryByRole('button', { name: 'End the call' })).not.toBeInTheDocument()
 
+    // Busy with what the host answered, which is a call or nothing: nothing is left to give up.
     rerender(<VoiceSurface choice={choice()} call={null} currentTurn={null} busy notice={null} actions={acted} />)
+    expect(screen.queryByRole('button', { name: 'End the call' })).not.toBeInTheDocument()
+
+    rerender(
+      <VoiceSurface choice={choice()} call={null} currentTurn={null} busy waiting notice={null} actions={acted} />
+    )
     await person.click(screen.getByRole('button', { name: 'End the call' }))
 
     expect(acted.endSetup).toHaveBeenCalledTimes(1)
     expect(acted.start).not.toHaveBeenCalled()
+    // The control that was pressed is not where focus stays: it is disabled next and gone after.
+    expect(screen.getByRole('heading', { name: 'Start a voice session' })).toHaveFocus()
   })
 
   // Once the end has begun there is nothing more to ask: the control says so and cannot be pressed
   // a second time.
   it('says the end has begun and takes the control away once it has', () => {
     render(
-      <VoiceSurface choice={choice()} call={null} currentTurn={null} busy ending notice={null} actions={actions()} />
+      <VoiceSurface
+        choice={choice()}
+        call={null}
+        currentTurn={null}
+        busy
+        waiting
+        ending
+        notice={null}
+        actions={actions()}
+      />
     )
     expect(screen.getByRole('button', { name: 'Ending…' })).toBeDisabled()
     expect(screen.queryByRole('button', { name: 'End the call' })).not.toBeInTheDocument()
+    expect(screen.getByText(/is ending its call/)).toBeInTheDocument()
   })
 
   it('says a model statement is not a confirmation once, in the service’s words', () => {

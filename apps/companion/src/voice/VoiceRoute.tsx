@@ -101,6 +101,12 @@ export function VoiceRoute({
   const [allowed, setAllowed] = useState<readonly string[] | null>(null)
   const [call, setCall] = useState<RunningCall | null>(null)
   const [busy, setBusy] = useState(false)
+  /**
+   * Whether this screen's own start is waiting for the host's answer, which is when it can be given
+   * up from here. It ends the moment the host answers, while `busy` goes on until what the answer
+   * means has been shown: the preparation read again, or the call's state.
+   */
+  const [waitingForHost, setWaitingForHost] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   /**
    * What this device last said while it held no call: the warning before a start, what an earlier
@@ -503,6 +509,7 @@ export function VoiceRoute({
           return
         }
         setBusy(true)
+        setWaitingForHost(true)
         setNotice(null)
         starting.current = true
         const shown = choice
@@ -519,6 +526,7 @@ export function VoiceRoute({
           )
         )
           .then(async (settled) => {
+            setWaitingForHost(false)
             const outcome = settled.value?.outcome
             if (!outcome) {
               setNotice('The host never said whether it created that call.')
@@ -589,6 +597,7 @@ export function VoiceRoute({
           .finally(() => {
             starting.current = false
             setBusy(false)
+            setWaitingForHost(false)
             setEndingSetUp(false)
           })
       },
@@ -744,6 +753,7 @@ export function VoiceRoute({
         }
         currentTurn={currentTurn}
         busy={busy}
+        waiting={waitingForHost}
         notice={notice}
         aftermath={aftermath}
         settingUp={setUp && !call}

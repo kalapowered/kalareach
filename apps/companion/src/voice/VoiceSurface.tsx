@@ -52,6 +52,9 @@ function sameTurn(a: CurrentTurn | null, b: CurrentTurn | null): boolean {
   )
 }
 
+/** What a person is told while the device ends what it was making, on either screen that says so. */
+const ENDING_WORDS = 'This device is ending its call. This screen changes when that is done.'
+
 /** What the screen can do, supplied by whatever is hosting it. */
 export interface VoiceSurfaceActions {
   /** Starts a call. The offer is made natively; this screen never touches media. */
@@ -84,6 +87,12 @@ export interface VoiceSurfaceProps {
   readonly currentTurn: CurrentTurn | null
   /** True while a request this screen made is in flight. */
   readonly busy: boolean
+  /**
+   * True while this screen's own start waits for the host's answer, which is the only time it can
+   * be given up from here: before the host has answered there may be a call to end that no one can
+   * name yet, and after it there is a call, or nothing.
+   */
+  readonly waiting?: boolean
   /**
    * What the last answer said, when it was not a call.
    *
@@ -121,6 +130,7 @@ export function VoiceSurface({
   call,
   currentTurn,
   busy,
+  waiting = false,
   notice,
   aftermath = [],
   settingUp = false,
@@ -139,6 +149,7 @@ export function VoiceSurface({
       <ProviderChoiceScreen
         choice={choice}
         busy={busy}
+        waiting={waiting}
         ending={ending}
         notice={notice}
         aftermath={aftermath}
@@ -192,9 +203,7 @@ function SettingUpScreen({
         {ending ? 'Ending a voice session' : 'Starting a voice session'}
       </h1>
       <p className="kr-voice__note" role="status">
-        {ending
-          ? 'This device is ending its call. This screen changes when that is done.'
-          : "This device is making a call. The call's controls appear here when it runs."}
+        {ending ? ENDING_WORDS : "This device is making a call. The call's controls appear here when it runs."}
       </p>
       {notice && (
         <p className="kr-voice__refusal" role="status">
@@ -224,6 +233,7 @@ function SettingUpScreen({
 function ProviderChoiceScreen({
   choice,
   busy,
+  waiting,
   ending,
   notice,
   aftermath,
@@ -234,6 +244,8 @@ function ProviderChoiceScreen({
   readonly choice: ProviderChoice
   /** True while a start is in flight, so one press cannot become two calls. */
   readonly busy: boolean
+  /** True while the start waits for the host's answer, so that it can be given up. */
+  readonly waiting: boolean
   /** Whether the start in flight has been given up and is being ended. */
   readonly ending: boolean
   /** What the last answer said, when it was not a call. */
@@ -257,8 +269,15 @@ function ProviderChoiceScreen({
   // beside the one that was pressed, which at the largest text sizes is a row lower, so it is
   // brought into view. Focus does not move to it: a key pressed twice would end the call it began.
   useEffect(() => {
-    if (busy) end.current?.scrollIntoView({ block: 'nearest' })
-  }, [busy])
+    if (waiting) end.current?.scrollIntoView({ block: 'nearest' })
+  }, [waiting])
+  // The control that was pressed is disabled when the end begins and goes when the start is over,
+  // so focus goes to the heading when it is pressed: left on a control that is disabled and then
+  // gone, a keyboard or screen-reader user would be sent back to the top of the document.
+  const giveUp = () => {
+    heading.current?.focus()
+    onEnd()
+  }
   const terms = choice.managed
   const seconds = terms ? requestedSeconds(terms) : null
   const startable = terms !== null && terms.enabled && seconds !== null
@@ -401,18 +420,23 @@ function ProviderChoiceScreen({
           >
             {busy ? 'Starting…' : choice.previousRate ? 'Start at the new rate' : 'Start voice session'}
           </button>
-          {busy && (
+          {waiting && (
             <button
               type="button"
               ref={end}
               className="kr-voice__control kr-voice__control--end"
-              onClick={onEnd}
+              onClick={giveUp}
               disabled={ending}
             >
               {ending ? 'Ending…' : 'End the call'}
             </button>
           )}
         </div>
+      )}
+      {waiting && ending && (
+        <p className="kr-voice__note" role="status">
+          {ENDING_WORDS}
+        </p>
       )}
     </section>
   )
