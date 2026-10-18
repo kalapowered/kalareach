@@ -1,10 +1,10 @@
 //! The release before the one being cut.
 //!
 //! A release is a commit tagged `packages/v<version>+<first twelve characters of the commit>`.
-//! The release before the one at a commit is the newest such tag in that commit's history whose
-//! compatibility level is below the commit's own. A release retains the level of that release and
-//! no other, so the newest retained level is its record, and nothing else in the tree says which
-//! release that is: the tags do. This reads them, so it needs a checkout that has them.
+//! The release before the one at a commit is the newest such tag in that commit's history at the
+//! highest compatibility level below the commit's own. A release retains the level of that
+//! release and no other, so the newest retained level is its record, and nothing else in the tree
+//! says which release that is: the tags do. This reads them, so it needs a checkout that has them.
 
 use std::path::Path;
 use std::process::Command;

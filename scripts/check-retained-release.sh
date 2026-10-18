@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Keeps the newest retained level the release immediately before the one being cut.
+# Keeps the newest retained level the level of the release before the one being cut.
 #
 #   scripts/check-retained-release.sh
 #
@@ -58,7 +58,8 @@ cargo test --locked -p kr-protocol --test public_majors
 
 generator --check
 
-if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+changed=$(git status --porcelain --untracked-files=all)
+if [ -n "$changed" ]; then
   echo "the record of level $level moved to $tag; these files changed:"
   git status --short
   echo "commit them, run the upgrade suite (cargo test -p kr-cli --features upgrade-suite --test upgrade), which builds the release the record now names, and run this script again on that commit"
