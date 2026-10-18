@@ -245,7 +245,7 @@ pub fn build(root: &Path, declarations: &Declarations<'_>) -> Map {
     if let Some(runs) = declarations.ignored_runs {
         let findings = crate::ignored::check(&map, root, runs);
         map.problems.extend(findings.problems);
-        map.warnings.extend(findings.by_hand);
+        map.warnings.extend(findings.unrun);
     }
     for directory in declarations.scripts {
         for file in walk(root, directory, &|_| true) {

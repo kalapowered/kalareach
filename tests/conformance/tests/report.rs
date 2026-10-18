@@ -786,6 +786,96 @@ fn a_step_that_lost_its_command_or_has_nothing_left_to_run_stops_the_map() {
     );
 }
 
+fn outcomes_entry(cases: &'static [&'static str], runs: Runs) -> IgnoredRun {
+    IgnoredRun {
+        package: "outcomes",
+        target: "--lib",
+        cases,
+        runs,
+    }
+}
+
+#[test]
+fn a_step_is_one_command_that_names_what_it_selects_and_is_found_where_it_is_said_to_be() {
+    // The words of two lines are not one command.
+    let two = held_to(&[outcomes_run(&["name = \"outcomes\"", "harness"])]);
+    assert_eq!(two.problems.len(), 1, "{:?}", two.problems);
+    assert!(
+        two.problems[0].contains("holds no command with"),
+        "{:?}",
+        two.problems
+    );
+
+    // A command that selects by name names every test the entry covers.
+    let all = |file| {
+        outcomes_entry(
+            &[],
+            Runs::Command {
+                file,
+                fragments: &["--ignored --exact"],
+            },
+        )
+    };
+    assert!(held_to(&[all("ci.sh")]).problems.is_empty());
+    let partial = held_to(&[all("partial.sh")]);
+    assert_eq!(partial.problems.len(), 1, "{:?}", partial.problems);
+    assert!(
+        partial.problems[0].contains("does not name is_ignored_"),
+        "{:?}",
+        partial.problems
+    );
+
+    // A case written with a trailing `::` stands for the module's tests.
+    let module = held_to(&[outcomes_entry(
+        &["tests::"],
+        Runs::Command {
+            file: "ci.sh",
+            fragments: &["--ignored"],
+        },
+    )]);
+    assert!(module.problems.is_empty(), "{:?}", module.problems);
+
+    // A step of the report's own plan is found in the plan.
+    let plan = |fragments| outcomes_entry(&[], Runs::Plan { fragments });
+    assert!(
+        held_to(&[plan(&[
+            "-p kr-conformance --test applications -- --ignored"
+        ])])
+        .problems
+        .is_empty()
+    );
+    let absent = held_to(&[plan(&["--test no_such_target"])]);
+    assert_eq!(absent.problems.len(), 1, "{:?}", absent.problems);
+
+    // Tests run by hand and tests nothing runs are shown, and are not problems.
+    let by_hand = held_to(&[outcomes_entry(
+        &[],
+        Runs::ByHand {
+            why: "a person does",
+        },
+    )]);
+    assert!(
+        by_hand.problems.is_empty()
+            && by_hand
+                .warnings
+                .iter()
+                .any(|w| w.contains("run by hand: a person does"))
+    );
+    let nowhere = held_to(&[outcomes_entry(
+        &[],
+        Runs::Nowhere {
+            why: "it cannot yet",
+        },
+    )]);
+    assert!(
+        nowhere.problems.is_empty()
+            && nowhere
+                .warnings
+                .iter()
+                .any(|w| w.contains("run by nothing: it cannot yet"))
+    );
+}
+
 #[test]
 fn an_ignored_test_is_not_counted_and_a_failing_test_fails_its_identifier() {
     let (document, _evidence) = run("outcomes").unwrap_or_else(|stopped| panic!("{stopped:?}"));

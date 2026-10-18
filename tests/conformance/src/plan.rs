@@ -1581,19 +1581,36 @@ pub struct IgnoredRun {
 /// Where tests that an ordinary run leaves out are run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Runs {
-    /// A command in a file of the repository: one block of its lines, with no blank line between
-    /// them and the continuations joined, holds every one of `fragments`. The words that make it a
-    /// command that runs ignored tests are among them.
+    /// A command in a file of the repository: one line of it, its continuations joined, holds every
+    /// one of `fragments`. The words that make it a command that runs ignored tests are among them.
+    /// A command that selects tests with `--exact` has to name each test the entry covers.
     Command {
         /// The file, relative to the repository.
         file: &'static str,
         /// The words the command holds.
         fragments: &'static [&'static str],
     },
+    /// A step of this report's own plan on Linux, whose command holds every one of `fragments`.
+    Plan {
+        /// The words the step's command holds.
+        fragments: &'static [&'static str],
+    },
+    /// A process the target's own tests start: the file holds the flags that ask for an ignored
+    /// test by name.
+    Helper {
+        /// The file of the target, relative to the repository.
+        file: &'static str,
+    },
     /// No step of this repository runs them: they are run by hand, where the hardware or the
     /// account they need is. The map shows each such entry on every run, so it stays seen.
     ByHand {
         /// Why no step runs them.
+        why: &'static str,
+    },
+    /// Nothing runs them, by hand or otherwise: a case that cannot run yet. The map shows each such
+    /// entry on every run, so it stays seen.
+    Nowhere {
+        /// Why nothing runs them.
         why: &'static str,
     },
 }
@@ -1703,7 +1720,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
     IgnoredRun {
         package: "kr-shell-integration",
         target: "--lib",
-        cases: &[],
+        cases: &["host::startup::"],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
             fragments: &[
@@ -1729,7 +1746,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         ],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
-            fragments: &["-p kr-client", "--lib", "--ignored", "--exact"],
+            fragments: &["-p kr-client --lib", "--ignored --exact"],
         },
     },
     IgnoredRun {
@@ -1738,7 +1755,9 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
-            fragments: &["cargo test", "--ignored", "--exact"],
+            fragments: &[
+                "cargo test --locked -p \"$package\" \"${selector[@]}\" -- --ignored --exact",
+            ],
         },
     },
     IgnoredRun {
@@ -1747,7 +1766,9 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
-            fragments: &["cargo test", "--ignored", "--exact"],
+            fragments: &[
+                "cargo test --locked -p \"$package\" \"${selector[@]}\" -- --ignored --exact",
+            ],
         },
     },
     IgnoredRun {
@@ -1756,14 +1777,16 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
-            fragments: &["cargo test", "--ignored", "--exact"],
+            fragments: &[
+                "cargo test --locked -p \"$package\" \"${selector[@]}\" -- --ignored --exact",
+            ],
         },
     },
     IgnoredRun {
         package: "kr-changeset",
         target: "--test apply",
         cases: &[],
-        runs: Runs::ByHand {
+        runs: Runs::Nowhere {
             why: "they need a repository tool, which the repository boundary on Windows refuses to run, so no host runs them yet",
         },
     },
@@ -1777,16 +1800,15 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         ],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
-            fragments: &["-p kr-cli", "--test startup_windows", "--ignored"],
+            fragments: &["-p kr-cli --test startup_windows", "--ignored"],
         },
     },
     IgnoredRun {
         package: "kr-cli",
         target: "--test startup_windows",
         cases: &["a_kr_new_in_the_job_its_parent_built"],
-        runs: Runs::Command {
+        runs: Runs::Helper {
             file: "crates/kr-cli/tests/startup_windows.rs",
-            fragments: &["\"--exact\"", "\"--ignored\""],
         },
     },
     IgnoredRun {
@@ -1801,20 +1823,17 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         package: "kr-conformance",
         target: "--test applications",
         cases: &[],
-        runs: Runs::Command {
-            file: "tests/conformance/src/plan.rs",
-            fragments: &["\"applications\"", "\"--ignored\""],
+        runs: Runs::Plan {
+            fragments: &["-p kr-conformance --test applications -- --ignored"],
         },
     },
     IgnoredRun {
         package: "kr-conformance",
         target: "--test report",
         cases: &["typescript_comment_forms_and_titles_key_their_tests"],
-        runs: Runs::Command {
-            file: "tests/conformance/src/plan.rs",
+        runs: Runs::Plan {
             fragments: &[
-                "\"--ignored\"",
-                "typescript_comment_forms_and_titles_key_their_tests",
+                "-p kr-conformance --test report -- --ignored --exact typescript_comment_forms_and_titles_key_their_tests",
             ],
         },
     },
@@ -1822,9 +1841,8 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         package: "kr-controller",
         target: "--test network",
         cases: &[],
-        runs: Runs::Command {
-            file: "scripts/end-to-end.sh",
-            fragments: &["\"$suite\" = \"network\"", "--include-ignored"],
+        runs: Runs::Plan {
+            fragments: &["-p kr-controller --test network", "--include-ignored"],
         },
     },
     IgnoredRun {
@@ -1833,7 +1851,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: "scripts/real-package-cases.sh",
-            fragments: &["-p kr-controller --test shell", "--ignored"],
+            fragments: &["cargo test -p kr-controller --test shell -- --ignored"],
         },
     },
     IgnoredRun {
@@ -1842,7 +1860,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: "scripts/real-package-cases.sh",
-            fragments: &["-p kr-worker --test fence", "--ignored"],
+            fragments: &["cargo test -p kr-worker --test fence -- --ignored"],
         },
     },
     IgnoredRun {
@@ -1851,16 +1869,15 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &["a_viewer_reaches_only_the_distribution_it_was_paired_with"],
         runs: Runs::Command {
             file: "scripts/e2e-wsl.sh",
-            fragments: &["--ignored --exact", "--test-threads 1"],
+            fragments: &["$pairing_suite_path", "--ignored --exact"],
         },
     },
     IgnoredRun {
         package: "kr-perf",
         target: "--test stress",
         cases: &[],
-        runs: Runs::Command {
-            file: "scripts/bench-all.sh",
-            fragments: &["-p kr-perf --test stress", "--ignored"],
+        runs: Runs::ByHand {
+            why: "it runs for several minutes by design, and a person runs it on the reference host with scripts/bench-all.sh",
         },
     },
     IgnoredRun {
@@ -1872,7 +1889,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         ],
         runs: Runs::Command {
             file: "scripts/performance.sh",
-            fragments: &["-p kr-worker", "--ignored --exact"],
+            fragments: &["-p kr-worker", "--ignored --exact --nocapture \"$name\""],
         },
     },
     IgnoredRun {
@@ -1889,52 +1906,47 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: "scripts/performance.sh",
-            fragments: &["-p kr-worker", "--ignored --exact"],
+            fragments: &["-p kr-worker", "--ignored --exact --nocapture \"$name\""],
         },
     },
     IgnoredRun {
         package: "kr-attention",
         target: "--test consumer",
         cases: &[],
-        runs: Runs::Command {
+        runs: Runs::Helper {
             file: "crates/kr-attention/tests/consumer.rs",
-            fragments: &["\"--exact\"", "\"--ignored\""],
         },
     },
     IgnoredRun {
         package: "kr-worker",
         target: "--test host",
         cases: &[],
-        runs: Runs::Command {
+        runs: Runs::Helper {
             file: "crates/kr-worker/tests/host.rs",
-            fragments: &["--ignored", "--exact"],
         },
     },
     IgnoredRun {
         package: "kr-worker",
         target: "--test live_ownership",
         cases: &[],
-        runs: Runs::Command {
+        runs: Runs::Helper {
             file: "crates/kr-worker/tests/live_ownership.rs",
-            fragments: &["\"--exact\"", "\"--ignored\""],
         },
     },
     IgnoredRun {
         package: "kr-worker",
         target: "--test windows_endpoint",
         cases: &[],
-        runs: Runs::Command {
+        runs: Runs::Helper {
             file: "crates/kr-worker/tests/windows_endpoint.rs",
-            fragments: &["\"--ignored\"", "\"--exact\""],
         },
     },
     IgnoredRun {
         package: "kr-hook",
         target: "--test launch_windows",
         cases: &[],
-        runs: Runs::Command {
+        runs: Runs::Helper {
             file: "crates/kr-hook/tests/launch_windows.rs",
-            fragments: &["\"--ignored\"", "\"--exact\""],
         },
     },
     IgnoredRun {
@@ -1966,15 +1978,15 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         target: "--test descriptions",
         cases: &[],
         runs: Runs::ByHand {
-            why: "it needs the real description process and weights that KR_DESCRIBE_INFERENCE names",
+            why: "it needs the real description process and weights that KR_DESCRIBE_INFERENCE names, which no step of this repository has",
         },
     },
     IgnoredRun {
         package: "kr-controller",
         target: "--test native_bridge",
         cases: &[],
-        runs: Runs::ByHand {
-            why: "the recipe format has no removal step that waits until nothing else is left",
+        runs: Runs::Nowhere {
+            why: "a parked case: the recipe format has no removal step that waits until nothing else is left",
         },
     },
 ];
