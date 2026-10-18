@@ -41,8 +41,8 @@
 //! * I7: publication only while every record from D's join record to the installed one lists D.
 //! * I8: a host that does not answer takes no member out that the recorded answers keep (a member
 //!   the hosts vouched for before, that no host which answered mentions), and no candidate is built
-//!   over a record that fails only for want of that host's answer, since it would list a device
-//!   that record took out.
+//!   over a record that fails only for want of that host's answer, however many records lie on top
+//!   of it, since it would list a device that record took out.
 //! * Liveness: once events stop, and a host that did not answer answers, every state settles: nothing pending, the newest record installed
 //!   and publication open, or D out of the collection with its request settled and its keys
 //!   forgotten.
@@ -1893,7 +1893,10 @@ fn check_step(before: &World, transition: &Transition) -> Result<(), Violation> 
             }
             // Silence builds nothing on a record that waits for a host: the candidate would list a
             // device that record may have taken out.
-            if before.facts.head != before.facts.installed && awaits_hosts(before, &head_before) {
+            if (before.facts.installed + 1..=before.facts.head)
+                .filter_map(|revision| record(before, revision))
+                .any(|waiting| awaits_hosts(before, waiting))
+            {
                 return violation(
                     "a candidate built over a record that waits for a host to answer",
                 );

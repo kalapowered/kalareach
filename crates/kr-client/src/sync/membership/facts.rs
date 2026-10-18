@@ -888,21 +888,20 @@ impl<K: Kinds> View<'_, K> {
         if self.facts.installed == 0 {
             return self.facts.join == 1 && self.facts.head == 0;
         }
-        // A head that waits for a host to answer is built on by nobody: a candidate made from the
-        // installed record would list a device that head may have taken out.
-        if self.head_awaits_hosts() && !weakened(Rule::BuildOnWaitingHead) {
+        // A record that waits for a host to answer is built over by nobody, whatever lies on top of
+        // it: a candidate made from the installed record would list a device it may have taken out.
+        if self.waits_for_hosts() && !weakened(Rule::BuildOnWaitingHead) {
             return false;
         }
         self.unsatisfied() || self.head_refused_listing_me()
     }
 
-    /// The head is a record that lists this device and waits for a host to answer.
-    fn head_awaits_hosts(&self) -> bool {
-        self.facts.head != self.facts.installed
-            && self
-                .facts
-                .head_record()
-                .is_some_and(|head| K::lists(head, &self.me) && self.awaits_hosts(head))
+    /// Some record after the installed one lists this device and waits for a host to answer.
+    fn waits_for_hosts(&self) -> bool {
+        self.facts
+            .after_installed()
+            .iter()
+            .any(|record| K::lists(record, &self.me) && self.awaits_hosts(record))
     }
 
     /// Rows 6 and 7: an undispatched candidate is still what row 8 would build now.

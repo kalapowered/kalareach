@@ -227,11 +227,12 @@ pub struct HostAnswers {
     /// Whether a host this device is paired with did not answer. The host that did not answer may
     /// be the one that lists a device, so a device that this device's hosts vouched for before, and
     /// that no answering host mentions, is not taken out for that, and the next epoch's key is
-    /// wrapped to it as before ([`RecordedAnswers::retains`]). It is accepted, opened and added
-    /// nowhere: a record's issuer, the opener of an epoch, a device to add and the recipient of a
-    /// wrap must each be listed by a host that answered ([`RecordedAnswers::passes`]). A record
-    /// that only a silent host's device issued waits for that host to answer, and nothing is built
-    /// on it meanwhile, so no key is wrapped to a device that record took out.
+    /// wrapped to it as before ([`RecordedAnswers::retains`]). Nothing is accepted, opened or added
+    /// on silence: a record's issuer, the opener of an epoch, a device to add and the issuer of a
+    /// key to open must each be listed by a host that answered ([`RecordedAnswers::passes`]). A
+    /// record whose issuer was vouched for and only a silent host lists waits for that host to
+    /// answer, and nothing is built over it, or over any record on top of it, meanwhile, so no key
+    /// is wrapped to a device that record took out.
     #[serde(default)]
     pub silent: bool,
 }
@@ -288,7 +289,7 @@ impl RecordedAnswers {
     /// Check 3 for a device other than this one: at least one host that answered reports it paired
     /// and holding the right to manage the host with the keys it is named by, and nothing reports
     /// it revoked. It is what a record's issuer and the opener of its epoch must pass, what a
-    /// device to add must pass, and what a key is wrapped to or opened under.
+    /// device to add must pass, and what the issuer of a key to open must pass.
     #[must_use]
     pub fn passes(&self, device: &Device) -> bool {
         let listed = self.hosts.reports.iter().any(|report| {

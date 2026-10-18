@@ -1345,6 +1345,68 @@ async fn no_key_is_wrapped_to_a_device_a_record_waiting_for_a_host_took_out() {
     );
 }
 
+/// KR-REQ-20.11, check 3: a record that waits for a host is built over by nobody, whatever lies on
+/// top of it. Another member's record on top of it, refused for a reason that has nothing to do with
+/// silence, leaves the head one that does not wait, but the record below it still may have taken a
+/// device out, and a key wrapped to that device is a key given away.
+#[tokio::test]
+async fn nothing_is_built_over_a_record_waiting_for_a_host_when_a_refused_record_lies_on_top() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut other = Node::new(&world);
+    let mut third = Node::new(&world);
+    let mut fourth = Node::new(&world);
+    let collection = collection_of(
+        &world,
+        &mut owner,
+        &mut [&mut other, &mut third, &mut fourth],
+    )
+    .await;
+
+    // The answering host lists the owner and reports the fourth device revoked; the host that did
+    // not answer is the one that lists the other two.
+    world.hosts.forget(other.device());
+    world.hosts.forget(third.device());
+    world.hosts.revoke(fourth.device());
+    world.hosts.leave_one_host_silent(true);
+    let first = world.newest(&collection);
+    let epoch = epoch_of(&first) + 1;
+    let waiting = issue(
+        &other,
+        &first,
+        &[owner.device(), other.device(), fourth.device()],
+        epoch,
+        &fresh(),
+    );
+    let refused = issue(
+        &fourth,
+        &waiting,
+        &[owner.device(), other.device(), fourth.device()],
+        epoch + 1,
+        &fresh(),
+    );
+    let revision = refused.payload.revision.get();
+    world.append(&collection, waiting);
+    world.append(&collection, refused);
+
+    owner.refresh().await;
+    run(&mut owner).await;
+    assert_eq!(
+        world.newest(&collection).payload.revision.get(),
+        revision,
+        "nothing was built over the record that took the third device out"
+    );
+
+    // The host answers: the first record stands, and the next key reaches neither of them.
+    world.hosts.leave_one_host_silent(false);
+    world.hosts.commit(other.device(), true);
+    owner.refresh().await;
+    run(&mut owner).await;
+    let newest = world.newest(&collection);
+    assert!(newest.payload.revision.get() > revision);
+    assert!(!lists(&newest, &third) && !lists(&newest, &fourth));
+}
+
 /// KR-REQ-20.11, check 3: a join waits while a host this device is paired with does not answer. A
 /// device the collection lists that only that host lists is not vouched for yet, and the first
 /// answers the joining device recorded would take it out of the collection.
