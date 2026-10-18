@@ -1229,6 +1229,11 @@ impl DraftsSync {
             if mine.contains(&id.to_string()) || leaving.contains(id.to_string().as_str()) {
                 continue;
             }
+            // The listing says which epoch each draft was sealed under, and one from before the
+            // floor is not believed: it is not asked for, at this pass or the next.
+            if held.epoch.is_some_and(|sealed| sealed < on.floor) {
+                continue;
+            }
             // Where a copy came from is on disk before the copy is, so that a copy is never kept
             // that the person is told another window made.
             self.keep_copy_of(id)?;

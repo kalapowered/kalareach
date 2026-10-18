@@ -121,10 +121,21 @@ fn unreadable(reason: impl Into<String>) -> HostPrivacy {
     }
 }
 
-/// What a host lists as its devices, asked over `session`, or nothing when it does not say in time
-/// or does not let this device ask (listing devices needs the right to manage the host).
-async fn listed(session: &Arc<Session>) -> Option<DeviceListResult> {
-    tokio::time::timeout(
+/// What a host said when asked for its devices.
+enum Listing {
+    /// Its list.
+    Listed(DeviceListResult),
+    /// It answered that this device may not list its devices, as a host does once the grant that
+    /// gave the right has run out or been revoked. Such a host is not this computer's to ask, and
+    /// is not one that failed to answer.
+    Refused,
+    /// It did not answer in time, or could not be reached.
+    Silent,
+}
+
+/// What a host lists as its devices, asked over `session`.
+async fn listed(session: &Arc<Session>) -> Listing {
+    let asked = tokio::time::timeout(
         ANSWER_WITHIN,
         session.read::<_, DeviceListResult>(
             Method::DeviceList,
@@ -133,9 +144,14 @@ async fn listed(session: &Arc<Session>) -> Option<DeviceListResult> {
             },
         ),
     )
-    .await
-    .ok()?
-    .ok()
+    .await;
+    match asked {
+        Ok(Ok(list)) => Listing::Listed(list),
+        Ok(Err(ClientError::Host(refused))) if refused.code == ErrorCode::PermissionDenied => {
+            Listing::Refused
+        }
+        Ok(Err(_)) | Err(_) => Listing::Silent,
+    }
 }
 
 impl<R: Runtime> Hosts for ConnectedHosts<R> {
@@ -156,8 +172,9 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
                 };
                 if owns {
                     match listed(&connection.session()).await {
-                        Some(list) => found.lists.push(list),
-                        None => found.silent = true,
+                        Listing::Listed(list) => found.lists.push(list),
+                        Listing::Refused => {}
+                        Listing::Silent => found.silent = true,
                     }
                 }
                 if let Standing::Paired { host, .. } = connection.standing() {
@@ -167,8 +184,8 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
             // The other hosts this computer owns, each on a connection made for the question and
             // let go after it. They are asked at the same time, so that a host that is asleep
             // keeps the others waiting for one wait and not for each.
+            // A computer whose pairing records cannot be opened knows of no other host to ask.
             let Ok(device) = state.device() else {
-                found.silent = true;
                 return found;
             };
             let visits: Vec<_> = device
@@ -181,21 +198,22 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
                         let pairing = device.pairing();
                         let identity = pairing.candidate.paired_identity(host.device_id);
                         let visit = async {
-                            let session =
-                                pairing.link.connect_paired(&host, &identity).await.ok()?;
-                            listed(&Arc::new(session)).await
+                            match pairing.link.connect_paired(&host, &identity).await {
+                                Ok(session) => listed(&Arc::new(session)).await,
+                                Err(_) => Listing::Silent,
+                            }
                         };
                         tokio::time::timeout(ANSWER_WITHIN, visit)
                             .await
-                            .ok()
-                            .flatten()
+                            .unwrap_or(Listing::Silent)
                     })
                 })
                 .collect();
             for visit in visits {
                 match visit.await {
-                    Ok(Some(list)) => found.lists.push(list),
-                    Ok(None) | Err(_) => found.silent = true,
+                    Ok(Listing::Listed(list)) => found.lists.push(list),
+                    Ok(Listing::Refused) => {}
+                    Ok(Listing::Silent) | Err(_) => found.silent = true,
                 }
             }
             found

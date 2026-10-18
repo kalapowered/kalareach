@@ -556,6 +556,51 @@ impl Computer {
     }
 }
 
+/// A client over the settings store a computer keeps, with the keys it holds.
+struct OwnStore {
+    client: SyncClient,
+    object_id: SyncObjectId,
+}
+
+impl Computer {
+    /// A client at `epoch` over the store this computer's settings sync keeps, as the application
+    /// itself reads and writes it: for a case that arranges the store as a step that stopped left it.
+    fn client_on_its_own_store(&self, epoch: u64) -> OwnStore {
+        let record = sync_record(self);
+        let collection_id: SyncCollectionId =
+            serde_json::from_value(record["collection_id"].clone()).expect("a collection");
+        let keys = self.identity().keys;
+        let origin = self.origin();
+        let http = HttpService::with(
+            origin.clone(),
+            HttpDeadlines::default(),
+            managed_response_limits(),
+        )
+        .expect("a transport");
+        let service = Arc::new(ManagedSyncService::new(
+            origin,
+            Arc::new(http),
+            Arc::new(Installation(keys.authorisation.clone())),
+        ));
+        let collection = kr_client::sync::membership::CollectionRef {
+            home: installation_id(keys.authorisation.public()),
+            collection_id,
+        };
+        let shared =
+            Arc::new(SharedCollectionService::new(service, collection, epoch).believing_from(0));
+        let sealer = Arc::new(shared.sealer(Arc::new(StoredCollectionKeys::in_store(
+            Arc::clone(&self.secrets) as _,
+            companion_tauri::settings::sync::SCOPE,
+        )) as Arc<dyn CollectionKeys>));
+        let store = SyncStore::open(self.data.path().join("settings-sync").join("store"))
+            .expect("the store sync keeps");
+        OwnStore {
+            client: SyncClient::new(shared as _, sealer as _, store),
+            object_id: SyncObjectId::new(collection_id.get()),
+        }
+    }
+}
+
 /// The application's backend, called as the page calls it.
 struct Page {
     app: tauri::App<MockRuntime>,
@@ -3037,7 +3082,7 @@ async fn a_second_device_is_given_the_key_joins_and_reads_what_the_first_wrote()
         .expect("the collection is joined");
     assert_eq!(
         other.ceremony.reasons(),
-        vec!["Join the settings this-mac shares".to_owned()]
+        vec!["Join the settings started on this-mac".to_owned()]
     );
 
     // Settings the first wrote reach the phone once the first has sealed them under the new key.
@@ -3540,10 +3585,175 @@ async fn a_draft_sealed_before_this_computer_joined_is_not_a_problem_for_it() {
     phone
         .join(&first_reference(&phone.devices_refresh()["offers"]))
         .expect("joined");
+    let asked = |phone: &Page| {
+        let before = this.served.web().requests_to(SYNC_PATH);
+        let view = phone.sync_now();
+        (view, this.served.web().requests_to(SYNC_PATH) - before)
+    };
+    asked(&phone);
+    let (_, without_drafts) = asked(&phone);
     phone.drafts_on(true).expect("drafts sync is on");
     for _ in 0..2 {
-        let view = phone.sync_now();
+        let (view, requests) = asked(&phone);
         assert!(view["sync"]["drafts"]["problem"].is_null(), "{view}");
+        assert_eq!(
+            requests,
+            without_drafts + 1,
+            "one look at the collection and no request for a draft it does not believe"
+        );
     }
     assert!(phone.kept_drafts().is_empty(), "it cannot read the draft");
+}
+
+/// A host that did not answer does not override what a host that did says of a member: one an
+/// answering host lists without the right to manage the host, or whose grant has run out, goes
+/// out whoever else is silent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_host_does_not_override_what_an_answering_host_says_of_a_member() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    let phone = other.start();
+    page.share(&first_reference(&page.devices_refresh()["candidates"]))
+        .expect("shared");
+    phone
+        .join(&first_reference(&phone.devices_refresh()["offers"]))
+        .expect("joined");
+    page.sync_now();
+
+    let mut expired = other.listed("the-phone");
+    expired.expired = true;
+    this.hosts.list(vec![this.listed("this-mac"), expired]);
+    this.hosts.go_silent(true);
+    let view = page.sync_now();
+    assert_eq!(
+        view["sync"]["devices"]["members"]
+            .as_array()
+            .expect("members")
+            .len(),
+        1,
+        "{view}"
+    );
+}
+
+/// Two hosts that start to disagree about a device's keys while the person is being asked leave the
+/// device no key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dispute_that_starts_while_the_person_is_asked_gives_the_device_no_key() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    let phone = other.start();
+    let reference = first_reference(&page.devices_refresh()["candidates"]);
+
+    let hosts = Arc::clone(&this.hosts);
+    let this_mac = this.listed("this-mac");
+    let mut disputed = other.listed("the-phone");
+    disputed.keys = disputed.keys.map(|mut keys| {
+        keys.stored_envelope = *kr_crypto::keys::DeviceKeys::generate()
+            .expect("keys")
+            .stored_envelope
+            .public();
+        keys
+    });
+    this.ceremony.while_asking(move || {
+        hosts.list_at_a_second_host(vec![this_mac.clone(), disputed.clone()])
+    });
+    assert!(page.share(&reference).is_err());
+    assert_eq!(this.ceremony.reasons().len(), 1, "the person was asked");
+    assert_eq!(page.devices()["members"].as_array().expect("m").len(), 1);
+    assert_eq!(phone.devices_refresh()["offers"], json!([]));
+}
+
+/// A member whose last write no remaining device has read leaves the settings waiting rather than
+/// repeating a write the service refuses at every check: a write that leaves a copy each time, and
+/// ends when the service has no room. The person's next change goes over what cannot be read, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_a_taken_out_device_wrote_last_are_waited_for_and_then_written_over_by_a_change() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    page.choose("dark");
+    let phone = other.start();
+    page.share(&first_reference(&page.devices_refresh()["candidates"]))
+        .expect("shared");
+    phone
+        .join(&first_reference(&phone.devices_refresh()["offers"]))
+        .expect("joined");
+    page.sync_now();
+    assert_eq!(phone.sync_now()["colour_mode"], "dark");
+
+    // The phone writes, and the first computer takes it out before it has read what was written.
+    phone.choose("light");
+    let phone_ref = reference_of(&page.devices()["members"], "the-phone");
+    page.unshare(&phone_ref).expect("the phone is taken out");
+
+    let writes = || {
+        this.served
+            .web()
+            .arrived()
+            .iter()
+            .filter(|arrived| arrived.path == SYNC_PATH && arrived.body.get("exchange").is_some())
+            .count()
+    };
+    let elsewhere = this.elsewhere();
+    let (written, copies) = (writes(), elsewhere.copies_kept().await);
+    for _ in 0..3 {
+        let view = page.sync_now();
+        assert_eq!(view["sync"]["devices"]["waiting"], true, "{view}");
+        assert!(view["sync"]["problem"].is_null(), "{view}");
+    }
+    assert_eq!(writes(), written, "waiting writes nothing");
+    assert_eq!(elsewhere.copies_kept().await, copies);
+
+    // A change the person makes goes over what cannot be believed: one refused write, then the
+    // change itself.
+    page.choose("system");
+    let view = page.sync_now();
+    assert_eq!(view["sync"]["outstanding"], 0, "{view}");
+    assert_eq!(view["sync"]["devices"]["waiting"], false, "{view}");
+    assert!(view["sync"]["problem"].is_null(), "{view}");
+    assert_eq!(elsewhere.copies_kept().await, copies + 1);
+    let settled = writes();
+    page.sync_now();
+    assert_eq!(writes(), settled, "nothing more is written once it agrees");
+}
+
+/// Another device's settings that were refused to settings this computer was only sealing again are
+/// that device's to continue: the person is asked nothing, for they changed nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn content_refused_to_settings_only_sealed_again_is_followed_and_asks_nothing() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    page.choose("dark");
+    let phone = other.start();
+    page.share(&first_reference(&page.devices_refresh()["candidates"]))
+        .expect("shared");
+    phone
+        .join(&first_reference(&phone.devices_refresh()["offers"]))
+        .expect("joined");
+    page.sync_now();
+
+    // What a lost answer to a reseal leaves behind: the settings this computer held, the other
+    // device's settings kept beside them, and the marker that says the settings were being sealed
+    // again when the other device's were refused.
+    phone.choose("light");
+    let own = this.client_on_its_own_store(1);
+    let (client, object_id) = (&own.client, own.object_id);
+    let store = client.store();
+    let held = store.object(object_id).expect("a store").expect("settings");
+    client
+        .fetch(
+            SyncObjectKind::Settings,
+            object_id,
+            TimestampMs::new(now_ms()),
+        )
+        .await
+        .expect("the other device's settings are kept beside this computer's");
+    assert_eq!(store.conflicts(object_id).expect("copies").items.len(), 1);
+    let path = this.data.path().join("settings-sync").join("sync.json");
+    let mut record = sync_record(&this);
+    record["resealing"] = serde_json::to_value(held.revision).expect("a revision");
+    std::fs::write(&path, serde_json::to_vec(&record).expect("a record")).expect("written");
+
+    let view = page.sync_now();
+    assert_eq!(view["sync"]["conflicts"], 0, "{view}");
+    assert_eq!(view["colour_mode"], "light", "{view}");
 }

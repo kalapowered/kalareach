@@ -9,10 +9,11 @@
 //! * **The hosts' device lists** are asked of every host this computer owns ([`Hosts::device_lists`])
 //!   and handed to the membership as what each host says of each device's keys, its right to manage
 //!   the host and whether it was revoked. A host that revoked a device is how the membership learns
-//!   to take that device out. A host that does not answer says nothing about any device, so while
-//!   one is silent every device the collection lists is vouched for as it was: silence takes no
-//!   device out, and only an answering host that revokes one does. A device a host lists whose
-//!   right to manage the host has run out with its grant is not one to share with.
+//!   to take that device out. A host that does not answer says nothing about any device: the
+//!   membership is told that one was silent, and a device no answering host mentions is then not
+//!   taken out, while one an answering host mentions is judged by what that host says. A device a
+//!   host lists whose right to manage the host has run out with its grant is not one to share
+//!   with.
 //! * **The owner's presence** is asked for through the platform's ceremony, with what it would do as
 //!   its reason, before a device is added to the collection and before this computer joins one. The
 //!   page names a device by an opaque reference and never holds a key. Taking a device out needs no
@@ -98,7 +99,8 @@ pub struct Candidate {
 pub struct Offer {
     /// What a command names it by.
     pub reference: String,
-    /// The device that shares it, when a host lists it.
+    /// The device the collection was started on, when a host lists it. It may be a device since
+    /// taken out: it says which offer is which and nothing of who shares it now.
     pub name: Option<String>,
 }
 
@@ -132,8 +134,6 @@ pub(super) struct Listed {
     /// The devices two hosts list with different stored-envelope keys: nothing is shared with one,
     /// because a key sealed to the wrong one of the two is a key given to whoever holds it.
     disputed: Mutex<BTreeSet<AuthorisationKey>>,
-    /// The devices the collection lists, as the membership last showed them.
-    members: Mutex<Vec<Device>>,
     last: Mutex<Option<(Instant, HostAnswers)>>,
 }
 
@@ -161,11 +161,6 @@ impl Listed {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .contains(device)
-    }
-
-    /// Keeps the devices the collection lists, for the answers a silent host leaves out.
-    pub(super) fn keep_members(&self, members: Vec<Device>) {
-        *self.members.lock().unwrap_or_else(PoisonError::into_inner) = members;
     }
 }
 
@@ -237,29 +232,6 @@ impl DeviceDirectory for HostsDirectory {
                 }
                 reports.push(HostReport { devices });
             }
-            if asked.silent {
-                // A host that did not answer may be the one that lists a device the collection
-                // lists, and absence from the others' lists is no reason to take it out. Every
-                // device the collection lists is vouched for, as far as the hosts that did not
-                // answer go; an answering host that reports one revoked still takes it out.
-                let members = self
-                    .listed
-                    .members
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone();
-                reports.push(HostReport {
-                    devices: members
-                        .iter()
-                        .map(|member| HostDevice {
-                            authorisation: member.authorisation,
-                            stored_envelope: member.stored_envelope,
-                            manages_host: true,
-                            revoked: false,
-                        })
-                        .collect(),
-                });
-            }
             *self
                 .listed
                 .names
@@ -274,7 +246,10 @@ impl DeviceDirectory for HostsDirectory {
                 .filter(|(_, keys)| keys.len() > 1)
                 .map(|(device, _)| device)
                 .collect();
-            let answers = HostAnswers { reports };
+            let answers = HostAnswers {
+                reports,
+                silent: asked.silent,
+            };
             *self
                 .listed
                 .last
@@ -310,11 +285,8 @@ impl SettingsSync {
             cached.members.clear();
             cached.candidates.clear();
             cached.out = false;
-            self.listed.keep_members(Vec::new());
             return;
         };
-        self.listed
-            .keep_members(status.members.iter().map(|member| member.device).collect());
         let outcomes = membership
             .outcomes()
             .unwrap_or_default()
@@ -393,10 +365,6 @@ impl SettingsSync {
             )?
             .members()
             .map_err(member_failure)?;
-        if let Some(status) = &held {
-            self.listed
-                .keep_members(status.members.iter().map(|member| member.device).collect());
-        }
         Ok(match held {
             Some(status)
                 if status.members.len() > 1
@@ -534,19 +502,26 @@ impl SettingsSync {
             &format!("Share your settings with {name}"),
         )
         .await?;
-        // The person took their time, and a host may have revoked the device since: the hosts are
-        // asked again, and the device must still be one they list.
+        // The person took their time. A host may have revoked the device, or two hosts may now
+        // disagree about its keys: the hosts are asked again, and the device must still be one they
+        // list, alone. (Another member may have changed the collection meanwhile. The person
+        // confirmed this device and not the collection around it, and an addition outlives a
+        // change to the members, as it does between the plan and the record.)
         let again = match membership.refresh().await {
             Ok(refreshed) => Self::answered(refreshed),
             Err(error) => Err(member_failure(error)),
         };
-        let listed = membership
+        let still = membership
             .candidates()
-            .is_ok_and(|candidates| candidates.contains(&device));
-        if again.is_err() || !listed {
+            .is_ok_and(|candidates| candidates.contains(&device))
+            && !self.listed.is_disputed(&device.authorisation);
+        if again.is_err() || !still {
             membership.cancel(&plan);
             return Err(again.err().unwrap_or_else(|| {
-                CommandError::refused("no host lists that device any more, so nothing was shared")
+                CommandError::refused(
+                    "no host lists that device any more, or they disagree about its keys, so \
+                     nothing was shared",
+                )
             }));
         }
         let ended = membership.authorise(&plan, now()).map_err(member_failure)?;
@@ -647,13 +622,13 @@ impl SettingsSync {
         let plan = membership
             .plan_join(collection, now())
             .map_err(member_failure)?;
-        let sharer = self.listed.name_of_installation(collection.home);
+        let starter = self.listed.name_of_installation(collection.home);
         self.confirmed(
             &mut membership,
             &plan,
-            &match sharer {
-                Some(name) => format!("Join the settings {name} shares"),
-                None => "Join the settings your other device shares".to_owned(),
+            &match starter {
+                Some(name) => format!("Join the settings started on {name}"),
+                None => "Join the settings your other devices share".to_owned(),
             },
         )
         .await?;
