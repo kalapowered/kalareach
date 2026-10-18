@@ -102,17 +102,21 @@ pub fn charge_attempt(
     origin: &RendezvousOrigin,
     code: &EnteredCode,
 ) -> Result<u32> {
-    let now = clock.monotonic_ms();
-    let boot = clock.boot_identity();
-    let wall = clock.wall_clock_ms();
-    store.expire(now, boot, wall)?;
+    store.expire(clock)?;
 
     let key = budget_key(store, origin, code)?;
     // The decision runs inside the store's lock, so this is how its outcome gets out. The store
     // may call the closure more than once while it retries; the last call is the one it wrote.
+    // The clock is read there, under the lock, and nowhere before it: a reading taken earlier can
+    // be older than a record another caller has written since (see [`ClientBudgetStore::expire`]).
     let permitted = Cell::new(false);
     let record = store.update(&key, &|current| {
-        let (next, allowed) = next_record(current, now, boot, wall);
+        let (next, allowed) = next_record(
+            current,
+            clock.monotonic_ms(),
+            clock.boot_identity(),
+            clock.wall_clock_ms(),
+        );
         permitted.set(allowed);
         Ok(next)
     })?;
@@ -646,7 +650,7 @@ impl ClientAttempt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::{TestClient, TestClientBudgetStore, TestClock};
+    use crate::platform::{LockWatchingClock, TestClient, TestClientBudgetStore, TestClock};
     use kr_protocol::ids::InvitationId;
     use kr_protocol::scalars::{TimestampMs, Uuid};
 
@@ -770,6 +774,42 @@ mod tests {
             charge(&store, &clock, &code()),
             Err(PairingError::ClientAttemptsExhausted)
         ));
+    }
+
+    /// KR-REQ-10.32: a system that names no boot repeats an identity across a reboot. The counter
+    /// of a boot does not run back, so a counter below the window's first entry is another boot's,
+    /// and the entry is spent rather than given the rest of a window it never had.
+    #[test]
+    fn a_counter_that_runs_back_under_one_identity_expires_the_entry() {
+        let store = TestClientBudgetStore::new().expect("a store");
+        let clock = TestClock::new();
+        clock.advance(1_000_000);
+        charge(&store, &clock, &code()).expect("an attempt");
+        charge(&store, &clock, &code()).expect("an attempt");
+
+        clock.rewind(500);
+        assert!(matches!(
+            charge(&store, &clock, &code()),
+            Err(PairingError::ClientAttemptsExhausted)
+        ));
+        // The tombstone outlives the window, as one made by a reboot does.
+        clock.advance(INVITATION_LIFETIME_MS);
+        assert!(matches!(
+            charge(&store, &clock, &code()),
+            Err(PairingError::ClientAttemptsExhausted)
+        ));
+    }
+
+    /// The decision about a record is taken on a reading made under the store's lock, and the
+    /// clock is not read before it.
+    #[test]
+    fn a_charge_reads_the_clock_only_under_the_stores_lock() {
+        let store = TestClientBudgetStore::new().expect("a store");
+        let held = || store.is_locked();
+        let clock = LockWatchingClock::new(&held);
+        charge_attempt(&store, &clock, &origin(), &code()).expect("an attempt");
+        assert!(clock.readings() > 0, "the charge reads the clock");
+        assert_eq!(clock.outside_the_lock(), 0, "and only under the lock");
     }
 
     /// KR-REQ-10.32: the window runs on monotonic time, not the wall clock.

@@ -41,7 +41,7 @@ use kr_protocol::scalars::Mac256;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{PairingError, Result};
-use crate::platform::{BootIdentity, ClientAttemptRecord, ClientBudgetStore};
+use crate::platform::{BootIdentity, ClientAttemptRecord, ClientBudgetStore, PairingClock};
 
 /// The two files the records are written to in turn.
 const SLOTS: [&str; 2] = ["records-a", "records-b"];
@@ -322,8 +322,13 @@ impl ClientBudgetStore for DurableClientBudgetStore {
         Ok(self.read()?.budget.records()?.remove(code_key.as_bytes()))
     }
 
-    fn expire(&self, now_monotonic_ms: u64, boot: BootIdentity, now_wall_ms: u64) -> Result<()> {
+    fn expire(&self, clock: &dyn PairingClock) -> Result<()> {
         let _held = self.lock()?;
+        let (now_monotonic_ms, boot, now_wall_ms) = (
+            clock.monotonic_ms(),
+            clock.boot_identity(),
+            clock.wall_clock_ms(),
+        );
         let held = self.read()?;
         let records = held.budget.records()?;
         let kept: BTreeMap<[u8; 32], ClientAttemptRecord> = records
@@ -655,7 +660,7 @@ mod tests {
     use super::*;
     use crate::client::{budget_key, charge_attempt};
     use crate::code::EnteredCode;
-    use crate::platform::TestClock;
+    use crate::platform::{LockWatchingClock, TestClock};
     use kr_crypto::store::MemoryStore;
     use kr_protocol::pairing::{MAX_CLIENT_ATTEMPTS, RendezvousOrigin};
 
@@ -764,6 +769,31 @@ mod tests {
                 .sum()
         });
         assert_eq!(allowed, MAX_CLIENT_ATTEMPTS);
+    }
+
+    /// The decision about a record is taken on a reading made under the budget's lock, and the
+    /// clock is not read before it: another process can write a record between the two.
+    #[test]
+    fn the_budget_reads_its_clock_only_while_it_holds_its_lock() {
+        let scratch = Scratch::new("lock-clock");
+        let secrets = memory();
+        let store = open(&scratch.0, &secrets);
+        let lock_path = scratch.0.join("budget").join(LOCK);
+        let held = || {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .expect("the lock file");
+            matches!(
+                kr_flush::lock::try_exclusive(&file),
+                Err(std::fs::TryLockError::WouldBlock)
+            )
+        };
+        let clock = LockWatchingClock::new(&held);
+        charge_attempt(&store, &clock, &origin(), &code()).expect("an attempt");
+        assert!(clock.readings() > 0, "the charge reads the clock");
+        assert_eq!(clock.outside_the_lock(), 0, "and only under the lock");
     }
 
     /// Said by the budget's own lock, in a child of the two-process test, once it has found the

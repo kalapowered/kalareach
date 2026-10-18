@@ -421,6 +421,13 @@ impl ClientAttemptRecord {
     /// unchanged beside it, and [`Self::is_expired`] needs both, so a reboot and a forward jump
     /// can only ever lengthen retention.
     ///
+    /// A record belongs to another boot when its identity is not `boot`, and also when its window
+    /// opened at a counter that has not been reached: the counter of one boot never runs back, so
+    /// a record whose first entry is above `now_monotonic_ms` was written by a boot that an
+    /// identity which repeats across a reboot (a phone's, whose system names no boot) took for
+    /// this one. `now_monotonic_ms` must be read while the store holds its lock, so that no record
+    /// it can see was written at a counter above it ([`ClientBudgetStore`]).
+    ///
     /// Repeated reboots therefore keep a tombstone alive longer than the required 24 hours. That
     /// is the safe direction: the entry refuses a code that is already spent, and the owner issues
     /// a new one rather than reusing it.
@@ -429,7 +436,7 @@ impl ClientAttemptRecord {
     /// entry: what survives the reboot is a tombstone, not a fresh five minutes.
     #[must_use]
     pub fn anchored(&self, now_monotonic_ms: u64, boot: BootIdentity) -> Self {
-        if self.boot_identity == boot {
+        if self.boot_identity == boot && self.first_entry_monotonic_ms <= now_monotonic_ms {
             return self.clone();
         }
         Self {
@@ -469,10 +476,12 @@ pub trait ClientBudgetStore {
 
     /// Applies one read-modify-write to a code's record, atomically.
     ///
-    /// The implementation reads the current record, calls `decide` once, and persists whatever it
+    /// The implementation reads the current record, calls `decide`, and persists whatever it
     /// returns before any other caller can read the same key. Two entries of the same code
     /// therefore cannot both see four attempts and both proceed. A `decide` that returns an error
-    /// leaves the stored record untouched.
+    /// leaves the stored record untouched. `decide` runs while the store holds its lock, so it
+    /// may read the clock, and a store that runs it again after a failed write persists only the
+    /// answer of its last run.
     ///
     /// # Errors
     ///
@@ -497,10 +506,18 @@ pub trait ClientBudgetStore {
     /// thing that sees a record after a reboot, and it is where that record stops depending on the
     /// wall clock.
     ///
+    /// **The clock is read only while the store holds its lock.** Another caller, in this process
+    /// or another, can write a record between a reading taken before the lock and the lock, with a
+    /// first entry above that reading, and [`ClientAttemptRecord::anchored`] would take the record
+    /// for another boot's. A reading taken under the lock is at least the first entry of every
+    /// record the store can show, because whoever wrote one read the counter before writing it.
+    /// This holds for a counter that does not run back within a boot, which is what the pairing
+    /// clock's contract says of it.
+    ///
     /// # Errors
     ///
     /// Returns [`PairingError::Store`].
-    fn expire(&self, now_monotonic_ms: u64, boot: BootIdentity, now_wall_ms: u64) -> Result<()>;
+    fn expire(&self, clock: &dyn PairingClock) -> Result<()>;
 }
 
 impl<T: ClientBudgetStore + ?Sized> ClientBudgetStore for &T {
@@ -520,8 +537,8 @@ impl<T: ClientBudgetStore + ?Sized> ClientBudgetStore for &T {
         (**self).load(code_key)
     }
 
-    fn expire(&self, now_monotonic_ms: u64, boot: BootIdentity, now_wall_ms: u64) -> Result<()> {
-        (**self).expire(now_monotonic_ms, boot, now_wall_ms)
+    fn expire(&self, clock: &dyn PairingClock) -> Result<()> {
+        (**self).expire(clock)
     }
 }
 
@@ -607,6 +624,12 @@ impl TestClock {
         *self.boot.lock().expect("a test clock") = BootIdentity([identity; 32]);
     }
 
+    /// Sets the monotonic counter back and keeps the boot identity: what a system that names no
+    /// boot shows when a reboot is taken for the same boot.
+    pub fn rewind(&self, to_ms: u64) {
+        *self.monotonic_ms.lock().expect("a test clock") = to_ms;
+    }
+
     /// Moves only the wall clock, which a host must never trust for a deadline.
     pub fn skew_wall_clock(&self, milliseconds: i64) {
         let mut wall = self.wall_clock_ms.lock().expect("a test clock");
@@ -617,6 +640,65 @@ impl TestClock {
 impl Default for TestClock {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A clock for a test of a store: it reads fixed values and counts the readings taken while a
+/// lock the store should hold is not held.
+///
+/// `held` says whether the lock is held at this moment, from outside the store: a second try at
+/// the same lock, for instance.
+pub struct LockWatchingClock<'a> {
+    held: &'a dyn Fn() -> bool,
+    readings: std::cell::Cell<u32>,
+    outside: std::cell::Cell<u32>,
+}
+
+impl<'a> LockWatchingClock<'a> {
+    /// Creates a clock that asks `held` at every reading.
+    #[must_use]
+    pub fn new(held: &'a dyn Fn() -> bool) -> Self {
+        Self {
+            held,
+            readings: std::cell::Cell::new(0),
+            outside: std::cell::Cell::new(0),
+        }
+    }
+
+    /// How many readings were taken.
+    #[must_use]
+    pub fn readings(&self) -> u32 {
+        self.readings.get()
+    }
+
+    /// How many readings were taken while the lock was not held.
+    #[must_use]
+    pub fn outside_the_lock(&self) -> u32 {
+        self.outside.get()
+    }
+
+    fn note(&self) {
+        self.readings.set(self.readings.get() + 1);
+        if !(self.held)() {
+            self.outside.set(self.outside.get() + 1);
+        }
+    }
+}
+
+impl PairingClock for LockWatchingClock<'_> {
+    fn monotonic_ms(&self) -> u64 {
+        self.note();
+        1_000
+    }
+
+    fn boot_identity(&self) -> BootIdentity {
+        self.note();
+        BootIdentity([1; 32])
+    }
+
+    fn wall_clock_ms(&self) -> u64 {
+        self.note();
+        1_764_000_000_000
     }
 }
 
@@ -865,6 +947,13 @@ impl TestClientBudgetStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Returns true while an operation of the store holds its lock, for a test that asks from
+    /// inside one.
+    #[must_use]
+    pub fn is_locked(&self) -> bool {
+        self.records.try_lock().is_err()
+    }
 }
 
 impl ClientBudgetStore for TestClientBudgetStore {
@@ -893,14 +982,17 @@ impl ClientBudgetStore for TestClientBudgetStore {
             .cloned())
     }
 
-    fn expire(&self, now_monotonic_ms: u64, boot: BootIdentity, now_wall_ms: u64) -> Result<()> {
-        self.records
-            .lock()
-            .expect("a test store")
-            .retain(|_, record| {
-                *record = record.anchored(now_monotonic_ms, boot);
-                !record.is_expired(now_monotonic_ms, boot, now_wall_ms)
-            });
+    fn expire(&self, clock: &dyn PairingClock) -> Result<()> {
+        let mut records = self.records.lock().expect("a test store");
+        let (now_monotonic_ms, boot, now_wall_ms) = (
+            clock.monotonic_ms(),
+            clock.boot_identity(),
+            clock.wall_clock_ms(),
+        );
+        records.retain(|_, record| {
+            *record = record.anchored(now_monotonic_ms, boot);
+            !record.is_expired(now_monotonic_ms, boot, now_wall_ms)
+        });
         Ok(())
     }
 }
@@ -1192,6 +1284,91 @@ mod tests {
         assert_ne!(hash.as_bytes().as_slice(), &[5u8; 32]);
     }
 
+    /// A clock that reads the same three values every time.
+    struct Reading {
+        monotonic_ms: u64,
+        boot: BootIdentity,
+        wall_clock_ms: u64,
+    }
+
+    impl PairingClock for Reading {
+        fn monotonic_ms(&self) -> u64 {
+            self.monotonic_ms
+        }
+
+        fn boot_identity(&self) -> BootIdentity {
+            self.boot
+        }
+
+        fn wall_clock_ms(&self) -> u64 {
+            self.wall_clock_ms
+        }
+    }
+
+    fn at(monotonic_ms: u64, boot: BootIdentity, wall_clock_ms: u64) -> Reading {
+        Reading {
+            monotonic_ms,
+            boot,
+            wall_clock_ms,
+        }
+    }
+
+    /// A record of boot `boot` whose window opened at `first_entry`, still open.
+    fn open_record(boot: BootIdentity, first_entry: u64) -> ClientAttemptRecord {
+        ClientAttemptRecord {
+            attempts: 2,
+            first_entry_monotonic_ms: first_entry,
+            boot_identity: boot,
+            retain_until_monotonic_ms: first_entry + 1_000,
+            retain_until_wall_ms: u64::MAX,
+            exhausted: false,
+        }
+    }
+
+    /// The counter of one boot never runs back, so a record whose window opened at a counter this
+    /// boot has not reached was written by another boot, even when it carries this boot's
+    /// identity. A system that names no boot repeats an identity across a reboot, and this is
+    /// what a record from before it looks like.
+    #[test]
+    fn a_record_from_a_counter_not_yet_reached_belongs_to_another_boot() {
+        let boot = BootIdentity([4; 32]);
+        let record = open_record(boot, 1_000_000);
+
+        let same = record.anchored(1_000_000, boot);
+        assert_eq!(same, record, "a window opened at this very reading stays");
+        let anchored = record.anchored(999_999, boot);
+        assert!(anchored.exhausted, "one reading below it is another boot's");
+        assert_eq!(anchored.first_entry_monotonic_ms, 999_999);
+        assert_eq!(
+            anchored.retain_until_monotonic_ms,
+            999_999 + CLIENT_TOMBSTONE_MS
+        );
+        assert_eq!(anchored.attempts, 2, "and no attempt is handed back");
+        assert_eq!(
+            anchored.retain_until_wall_ms, record.retain_until_wall_ms,
+            "the wall deadline is kept beside it"
+        );
+
+        let store = TestClientBudgetStore::new().expect("a store");
+        let key = Mac256::from_bytes([3; 32]);
+        store
+            .update(&key, &|_| Ok(record.clone()))
+            .expect("a write");
+        store.expire(&at(500, boot, 0)).expect("an expiry sweep");
+        let kept = store.load(&key).expect("a read").expect("a record");
+        assert!(kept.exhausted, "a sweep makes it a tombstone too");
+    }
+
+    #[test]
+    fn a_store_reads_its_clock_only_while_it_holds_its_lock() {
+        let store = TestClientBudgetStore::new().expect("a store");
+        let held = || store.is_locked();
+        let clock = LockWatchingClock::new(&held);
+        store.expire(&clock).expect("an expiry sweep");
+        assert!(clock.readings() > 0, "the sweep reads the clock");
+        assert_eq!(clock.outside_the_lock(), 0, "and only under the lock");
+    }
+
     /// A spent record kept until monotonic 500 of boot 0, or wall 1_000_000 after a reboot.
     fn tombstone(store: &TestClientBudgetStore, key: Mac256) {
         store
@@ -1216,7 +1393,9 @@ mod tests {
         // Another boot. The monotonic deadline from the old one means nothing, so the record gets
         // a full fresh period on this boot's clock rather than whatever the wall clock suggests.
         let rebooted = BootIdentity([9; 32]);
-        store.expire(0, rebooted, 900_000).expect("an expiry sweep");
+        store
+            .expire(&at(0, rebooted, 900_000))
+            .expect("an expiry sweep");
         assert_eq!(store.len(), 1);
         let anchored = store.load(&key).expect("a read").expect("a record");
         assert_eq!(anchored.boot_identity, rebooted);
@@ -1225,11 +1404,11 @@ mod tests {
 
         // A wall clock jumped years forward deletes nothing: both deadlines have to pass.
         store
-            .expire(CLIENT_TOMBSTONE_MS - 1, rebooted, u64::MAX)
+            .expire(&at(CLIENT_TOMBSTONE_MS - 1, rebooted, u64::MAX))
             .expect("an expiry sweep");
         assert_eq!(store.len(), 1);
         store
-            .expire(CLIENT_TOMBSTONE_MS, rebooted, u64::MAX)
+            .expire(&at(CLIENT_TOMBSTONE_MS, rebooted, u64::MAX))
             .expect("an expiry sweep");
         assert!(store.is_empty());
     }
@@ -1243,13 +1422,15 @@ mod tests {
         // the very first sweep of the new boot sees a deadline that has already passed.
         let rebooted = BootIdentity([9; 32]);
         store
-            .expire(0, rebooted, u64::MAX)
+            .expire(&at(0, rebooted, u64::MAX))
             .expect("an expiry sweep");
         assert_eq!(store.len(), 1, "the code is still spent");
 
         // And another reboot does not help either.
         let again = BootIdentity([10; 32]);
-        store.expire(0, again, u64::MAX).expect("an expiry sweep");
+        store
+            .expire(&at(0, again, u64::MAX))
+            .expect("an expiry sweep");
         assert_eq!(store.len(), 1);
     }
 
@@ -1270,7 +1451,7 @@ mod tests {
             })
             .expect("a write");
         let rebooted = BootIdentity([9; 32]);
-        store.expire(0, rebooted, 0).expect("an expiry sweep");
+        store.expire(&at(0, rebooted, 0)).expect("an expiry sweep");
         let anchored = store.load(&key).expect("a read").expect("a record");
         assert!(anchored.exhausted, "a reboot expires an unfinished entry");
         assert_eq!(anchored.attempts, 2, "and it does not hand attempts back");
@@ -1283,9 +1464,11 @@ mod tests {
         tombstone(&store, key);
         let boot = BootIdentity([0; 32]);
         // The monotonic deadline has passed; the wall one has not, because the clock went back.
-        store.expire(500, boot, 0).expect("an expiry sweep");
+        store.expire(&at(500, boot, 0)).expect("an expiry sweep");
         assert_eq!(store.len(), 1);
-        store.expire(500, boot, 1_000_000).expect("an expiry sweep");
+        store
+            .expire(&at(500, boot, 1_000_000))
+            .expect("an expiry sweep");
         assert!(store.is_empty());
     }
 
@@ -1298,11 +1481,11 @@ mod tests {
         // The wall clock jumps a year forward. Within the boot that wrote the record, the
         // monotonic deadline is what decides, so the tombstone stays.
         store
-            .expire(499, boot, 1_000_000_000)
+            .expire(&at(499, boot, 1_000_000_000))
             .expect("an expiry sweep");
         assert_eq!(store.len(), 1);
         store
-            .expire(500, boot, 1_000_000_000)
+            .expire(&at(500, boot, 1_000_000_000))
             .expect("an expiry sweep");
         assert!(store.is_empty());
     }
