@@ -98,8 +98,8 @@ lists below.
 
 Setup prepares the target, the JavaScript dependencies, the test components the plugin runtime's
 tests load, and the managed shell packages with the PSReadLine qualification. The packages build
-from upstream sources that `scripts/place-shell-sources.sh` puts in place first, from the URL each
-manifest names or from a listed mirror: the archives and, for fish, the crates and git repositories its
+from upstream sources that `scripts/place-shell-sources.sh` puts in place first: the archives, from the
+URL each manifest names or from a listed mirror, and, for fish, the crates and git repositories its
 build would otherwise download. `--no-upstream-tests` leaves out the shells' own test
 suites, which continuous integration runs for Bash and Zsh.
 
