@@ -378,7 +378,7 @@ alone. Bash does it in the block itself, which is why the block belongs at the e
 
 ## The identity, and rebuilding it
 
-`scripts/place-shell-sources.sh` puts each pinned source where the build looks for it. An archive comes from the manifest's URL or, if that server doesn't respond, a mirror. For fish, each crate that its build would otherwise download comes from static.crates.io, by the name and version in the lock inside the archive, and each git repository comes from its forge as a bundle, with a second copy on github.com for `fluent-ftl-tools`. The build fetches any sources that are missing and checks every digest. A fish build then runs with cargo offline, using a dedicated cargo home, against those checked files.
+`scripts/place-shell-sources.sh` puts each pinned source where the build looks for it. An archive comes from the manifest's URL or, if that server doesn't respond, a mirror. For fish, each crate that its build would otherwise download comes from static.crates.io, by the name and version in the lock inside the archive, and each git repository comes from its forge as a bundle, with a second copy on github.com for `fluent-ftl-tools`. The build fetches any sources that are missing and checks every digest. A fish build then compiles with cargo offline, using a dedicated cargo home, against those checked files.
 
 `scripts/build-shells.sh` fetches the pinned tarball, verifies its digest, applies the patches with
 no fuzz at all, copies the bridge sources in, configures, compiles, runs the shell's own test suite

@@ -1282,7 +1282,7 @@ jobs:
       # job proves about fish is that the patches apply, the shell builds, and the package answers
       # the contract in the step below.
       #
-      # Everything fish compiles from was placed above, and cargo runs offline against it. The
+      # Everything fish compiles from was placed above, and cargo compiles offline against it. The
       # proxy variables here point at a port nothing listens on, so that a client which obeys them
       # and still tries a server fails this step at once instead of reaching one.
       - name: Build the fish package
