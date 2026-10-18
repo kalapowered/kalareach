@@ -184,6 +184,33 @@ struct Listed {
     platform: kr_protocol::pairing::DevicePlatform,
 }
 
+/// A call a host is asked, held until the test lets it go.
+struct Held {
+    arrived: tokio::sync::Notify,
+    released: tokio::sync::Notify,
+}
+
+impl Held {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            arrived: tokio::sync::Notify::new(),
+            released: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// The call is waiting at the host.
+    async fn reached(&self) {
+        tokio::time::timeout(Duration::from_secs(60), self.arrived.notified())
+            .await
+            .expect("the call reached the host");
+    }
+
+    /// The host answers the call.
+    fn release(&self) {
+        self.released.notify_one();
+    }
+}
+
 /// What this computer can learn of each host, as a test says it.
 ///
 /// A session belongs to one host ([`ScriptedHosts::belongs`]), and the hosts this computer is
@@ -215,6 +242,8 @@ struct ScriptedHosts {
     first_refusing: Mutex<bool>,
     /// How many times a host was asked whether it holds a session.
     asked: Mutex<u32>,
+    /// The next question to the hosts for their devices, held while a step waits on it.
+    holding_lists: Mutex<Option<Arc<Held>>>,
 }
 
 impl ScriptedHosts {
@@ -232,7 +261,15 @@ impl ScriptedHosts {
             refusing_lists: Mutex::default(),
             first_refusing: Mutex::default(),
             asked: Mutex::default(),
+            holding_lists: Mutex::default(),
         }
+    }
+
+    /// The next time the hosts are asked for their devices, the answer waits for the test.
+    fn hold_the_next_list(&self) -> Arc<Held> {
+        let held = Held::new();
+        *self.holding_lists.lock().expect("the record") = Some(Arc::clone(&held));
+        held
     }
 
     fn say(&self, host: EnvironmentId, state: HostPrivacy) {
@@ -342,11 +379,18 @@ impl Hosts for ScriptedHosts {
             lists.clear();
         }
         let refused = all_refuse || first_refuses;
-        Box::pin(std::future::ready(HostLists {
-            lists,
-            silent,
-            refused,
-        }))
+        let held = self.holding_lists.lock().expect("the record").take();
+        Box::pin(async move {
+            if let Some(held) = held {
+                held.arrived.notify_one();
+                held.released.notified().await;
+            }
+            HostLists {
+                lists,
+                silent,
+                refused,
+            }
+        })
     }
 
     fn holds(
@@ -535,6 +579,12 @@ impl Computer {
     /// Another device of the person's: a second store of the collection this computer started,
     /// opened with the key this computer holds.
     fn elsewhere(&self) -> Elsewhere {
+        self.elsewhere_at(0)
+    }
+
+    /// Another device's store of the collection, reading and writing under the key of `epoch`:
+    /// the collection starts at epoch 0, and each device added or taken out moves it on by one.
+    fn elsewhere_at(&self, epoch: u64) -> Elsewhere {
         let record: Value = serde_json::from_slice(
             &std::fs::read(self.data.path().join("settings-sync").join("sync.json"))
                 .expect("the record sync keeps"),
@@ -562,7 +612,7 @@ impl Computer {
             collection_id,
         };
         let directory = tempfile::tempdir().expect("a directory");
-        let shared = Arc::new(SharedCollectionService::new(service, collection, 0));
+        let shared = Arc::new(SharedCollectionService::new(service, collection, epoch));
         let sealer = Arc::new(shared.sealer(Arc::new(StoredCollectionKeys::in_store(
             Arc::clone(&self.secrets) as _,
             companion_tauri::settings::sync::SCOPE,
@@ -987,6 +1037,19 @@ impl Elsewhere {
             .iter()
             .find(|held| held.object_id.get() == draft.get())
             .map(|held| held.position.write_sequence)
+    }
+
+    /// The epoch of the key the service says `object` is sealed under, or none when it holds none.
+    async fn epoch_of(&self, object: Uuid) -> Option<u64> {
+        self.service
+            .compare_shared(&self.collection, &[], false, None)
+            .await
+            .expect("a comparison")
+            .expect("a member")
+            .objects
+            .iter()
+            .find(|held| held.object_id.get() == object)
+            .and_then(|held| held.epoch)
     }
 
     /// What the service holds of a draft, as the bytes it stores.
@@ -3264,7 +3327,7 @@ async fn a_revocation_in_a_hosts_feed_takes_a_member_out_before_any_host_says_so
         .state::<AppState>()
         .settings()
         .expect("settings are open")
-        .feed_revocation(other.identity().keys.authorisation.public())
+        .revocations_sent(&[*other.identity().keys.authorisation.public()])
         .await
         .expect("the revocation is recorded");
     assert!(recorded, "the membership recorded it");
@@ -3279,6 +3342,142 @@ async fn a_revocation_in_a_hosts_feed_takes_a_member_out_before_any_host_says_so
     let view = phone.sync_now();
     assert_eq!(view["colour_mode"], "dark", "{view}");
     assert_eq!(view["sync"]["devices"]["out"], true, "{view}");
+}
+
+/// The person's two computers share settings: the second has joined and both are in step.
+async fn two_computers_sharing(this: &Computer, other: &Computer) -> (Page, Page) {
+    let page = with_sync_on(this).await;
+    let phone = other.start();
+    let shown = page.devices_refresh();
+    page.share(&first_reference(&shown["candidates"]))
+        .expect("shared");
+    let offers = phone.devices_refresh();
+    phone
+        .join(&first_reference(&offers["offers"]))
+        .expect("joined");
+    page.sync_now();
+    phone.sync_now();
+    (page, phone)
+}
+
+/// The future `revoking` is polled once, as the first thing the runtime does with a task.
+async fn polled_once<F: std::future::Future>(
+    revoking: &mut std::pin::Pin<&mut F>,
+) -> std::task::Poll<F::Output> {
+    std::future::poll_fn(|context| std::task::Poll::Ready(revoking.as_mut().poll(context))).await
+}
+
+/// A revocation that arrives while a step waits on the hosts, holding the membership, is not lost
+/// and does not wait for that step to publish: the step in hand publishes nothing once the
+/// revocation has arrived, and the device is taken out as soon as the step ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revocation_that_arrives_while_a_step_waits_on_the_hosts_stops_that_step_publishing() {
+    let (this, other) = two_computers().await;
+    let (page, phone) = two_computers_sharing(&this, &other).await;
+    let phone_key = *other.identity().keys.authorisation.public();
+    // Adding the phone moved the key on once.
+    let elsewhere = this.elsewhere_at(1);
+    assert_eq!(elsewhere.colour().await, "dark");
+
+    // The person changes a setting, and the step that would publish it waits on the hosts.
+    let settings = page.app.state::<AppState>().settings().expect("settings");
+    settings
+        .local()
+        .set_colour_mode(companion_tauri::settings::ColourMode::Light)
+        .expect("the person's choice");
+    let held = this.hosts.hold_the_next_list();
+    let step = tokio::spawn({
+        let settings = Arc::clone(&settings);
+        async move { settings.sync_now().await }
+    });
+    held.reached().await;
+
+    // The revocation arrives now. It waits for the step in hand, and publication stops at once.
+    let revoked = [phone_key];
+    let mut revoking = std::pin::pin!(settings.revocations_sent(&revoked));
+    assert!(
+        polled_once(&mut revoking).await.is_pending(),
+        "the revocation waits for the step in hand"
+    );
+    held.release();
+    let view = step.await.expect("the step ran").expect("the step ended");
+    let view = serde_json::to_value(view).expect("a view");
+    assert_eq!(view["sync"]["problem"], Value::Null, "{view}");
+    assert_eq!(view["sync"]["outstanding"], 0, "{view}");
+    assert_eq!(
+        elsewhere.colour().await,
+        "dark",
+        "the step in hand published nothing after the revocation arrived"
+    );
+    assert_eq!(phone.sync_now()["colour_mode"], "dark");
+
+    // The device is taken out, and the change goes out under the key that follows its removal.
+    assert!(revoking.await.expect("the revocation is recorded"));
+    page.sync_now();
+    assert_eq!(
+        page.devices()["members"].as_array().expect("members").len(),
+        1
+    );
+    // Taking the phone out moved the key on again, and the change went out under that one.
+    assert_eq!(this.elsewhere_at(2).colour().await, "light");
+    let view = phone.sync_now();
+    assert_eq!(view["colour_mode"], "dark", "{view}");
+    assert_eq!(view["sync"]["devices"]["out"], true, "{view}");
+}
+
+/// A draft saved after a revocation arrived, while the step in hand waits on the service, is not
+/// sent under the key the removed device holds: it goes out once, under the key that follows the
+/// device's removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_saved_after_a_revocation_is_not_sent_under_the_key_the_removed_device_holds() {
+    let (this, other) = two_computers().await;
+    let (environment, studio) = host(1, "studio");
+    this.hosts
+        .say(environment, HostPrivacy::Off { generation: 1 });
+    let (page, _phone) = two_computers_sharing(&this, &other).await;
+    page.drafts_on(true).expect("drafts sync is on");
+    let phone_key = *other.identity().keys.authorisation.public();
+    let elsewhere = this.elsewhere();
+    let before = elsewhere
+        .epoch_of(elsewhere.object_id.get())
+        .await
+        .expect("the settings are sealed under an epoch");
+
+    // The step in hand has read the settings, and the drafts are the next it does.
+    let web = this.served.web();
+    let asked = sync_requests(&this);
+    web.fail(SYNC_PATH, 1, Moment::Slow);
+    let settings = page.app.state::<AppState>().settings().expect("settings");
+    let step = tokio::spawn({
+        let settings = Arc::clone(&settings);
+        async move { settings.sync_now().await }
+    });
+    web.requests_reach(SYNC_PATH, asked + 1).await;
+    let revoked = [phone_key];
+    let mut revoking = std::pin::pin!(settings.revocations_sent(&revoked));
+    assert!(
+        polled_once(&mut revoking).await.is_pending(),
+        "the revocation waits for the step in hand"
+    );
+    let (draft, _) = page.write_draft(Some(&studio), "written after the revocation");
+    web.release_held();
+    step.await.expect("the step ran").expect("the step ended");
+    assert_eq!(
+        elsewhere.draft_at(draft).await,
+        None,
+        "the step in hand sent nothing written after the revocation"
+    );
+
+    assert!(revoking.await.expect("the revocation is recorded"));
+    page.sync_now();
+    assert_eq!(elsewhere.draft_at(draft).await, Some(1));
+    assert!(
+        elsewhere
+            .epoch_of(draft.get())
+            .await
+            .is_some_and(|epoch| epoch > before),
+        "the draft is sealed under the key that follows the removal"
+    );
 }
 
 /// A computer the person does not confirm on joins nothing: the offer stays, and the settings the

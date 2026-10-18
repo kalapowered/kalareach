@@ -242,9 +242,8 @@ struct Memory {
     listed: BTreeMap<String, Listed>,
     /// What the host on this computer answered to this computer's revocations.
     direct: BTreeMap<DeviceId, Direct>,
-    /// The requests, each with the device it names, that settings sync has been told of, or is
-    /// being told of.
-    fed: BTreeSet<(RevocationRequestId, AuthorisationKey)>,
+    /// The devices that settings sync has been told of, or is being told of.
+    fed: BTreeSet<AuthorisationKey>,
     /// The revocations being asked for, by host and device reference, so that a second call for one
     /// of them waits for neither the ceremony nor the request and sends nothing.
     revoking: BTreeSet<String>,
@@ -488,39 +487,39 @@ impl Revocations {
         }
     }
 
-    /// Passes the devices of the revocations this computer sent to settings sync, which fences
-    /// publication at once and takes a device out when a host confirms it. It runs on its own, so
-    /// that a service that is slow to answer does not hold the screen.
-    fn tell(&self, context: &Context, told: Vec<(RevocationRequestId, AuthorisationKey)>) {
+    /// Passes the devices of the revocations this computer sent to settings sync, which holds
+    /// publication at once and takes the devices out of the shared settings at its next step,
+    /// without waiting for a host to confirm. All the devices of one view go in one call. It runs on
+    /// its own, so that a service that is slow to answer does not hold the screen.
+    fn tell(&self, context: &Context, told: Vec<AuthorisationKey>) {
         let Some(settings) = &context.settings else {
             return;
         };
-        for (request, device) in told {
-            if !self.memory().fed.insert((request, device)) {
-                continue;
-            }
-            let (settings, memory) = (Arc::clone(settings), Arc::clone(&self.memory));
-            tauri::async_runtime::spawn(async move {
-                // Told only when the membership recorded it: a computer that shares no settings
-                // yet is told again at the next view, which a collection it joins since needs.
-                if !matches!(settings.feed_revocation(&device).await, Ok(true)) {
-                    memory
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .fed
-                        .remove(&(request, device));
-                }
-            });
+        let devices: Vec<AuthorisationKey> = {
+            let mut memory = self.memory();
+            told.into_iter()
+                .filter(|device| memory.fed.insert(*device))
+                .collect()
+        };
+        if devices.is_empty() {
+            return;
         }
+        let (settings, memory) = (Arc::clone(settings), Arc::clone(&self.memory));
+        tauri::async_runtime::spawn(async move {
+            // Told only when the membership recorded it: a computer that shares no settings yet is
+            // told again at the next view, which a collection it joins since needs.
+            if !matches!(settings.revocations_sent(&devices).await, Ok(true)) {
+                let mut memory = memory.lock().unwrap_or_else(PoisonError::into_inner);
+                for device in &devices {
+                    memory.fed.remove(device);
+                }
+            }
+        });
     }
 
-    /// One host's view. The revocations this computer sent that settings sync has not heard of go
-    /// in `told`, with the key of the device each names.
-    fn host_view(
-        &self,
-        reading: &Reading,
-        told: &mut Vec<(RevocationRequestId, AuthorisationKey)>,
-    ) -> HostView {
+    /// One host's view. The keys of the devices this computer sent revocations for that settings
+    /// sync has not heard of go in `told`.
+    fn host_view(&self, reading: &Reading, told: &mut Vec<AuthorisationKey>) -> HostView {
         let reference = reading.host.reference();
         let (devices, listed_at_ms, direct, fed) = {
             let mut memory = self.memory();
@@ -557,15 +556,13 @@ impl Revocations {
                     .iter()
                     .filter(|request| request.devices.contains(&summary.device_id))
                     .collect();
-                if let Some(keys) = summary.keys.0 {
-                    for request in &named {
-                        let id = request.record.request.request_id;
-                        if request.record.rejected.0.is_none()
-                            && !fed.contains(&(id, keys.authorisation))
-                        {
-                            told.push((id, keys.authorisation));
-                        }
-                    }
+                if let Some(keys) = summary.keys.0
+                    && !fed.contains(&keys.authorisation)
+                    && named
+                        .iter()
+                        .any(|request| request.record.rejected.0.is_none())
+                {
+                    told.push(keys.authorisation);
                 }
                 DeviceView {
                     reference: device_reference(&reference, summary.device_id),

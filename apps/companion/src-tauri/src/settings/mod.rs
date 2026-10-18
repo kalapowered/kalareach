@@ -572,20 +572,20 @@ impl Settings {
         Ok(self.view())
     }
 
-    /// Records that a revocation of `device`, sent from this computer, is in a host's feed, so that
-    /// settings sync stops publishing at once and takes the device out of the shared settings.
-    /// Says whether settings sync recorded it: a computer that shares no settings has none to record
-    /// it in.
+    /// Records that revocations of `devices`, sent from this computer, are known here, so that
+    /// settings sync holds publication at once and takes the devices out of the shared settings.
+    /// Says whether settings sync recorded them: a computer that shares no settings has none to
+    /// record them in.
     ///
     /// # Errors
     ///
     /// Returns what stopped it: the membership could not be used.
-    pub async fn feed_revocation(
+    pub async fn revocations_sent(
         &self,
-        device: &kr_protocol::scalars::AuthorisationKey,
+        devices: &[kr_protocol::scalars::AuthorisationKey],
     ) -> Result<bool> {
         match self.sync.get() {
-            Some(sync) => sync.feed_revocation(device).await,
+            Some(sync) => sync.revocations_sent(devices).await,
             None => Ok(false),
         }
     }

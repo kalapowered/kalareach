@@ -648,48 +648,51 @@ impl SettingsSync {
             .map(|_| ())
     }
 
-    /// Records that a revocation of `device`, sent from this computer and verified here, is in a
-    /// host's feed, and carries out the removal it requires as far as the hosts and the service
-    /// allow. Publication stops at once, before any host acknowledges the request: the record is
-    /// made without waiting for a step in hand, which may be waiting on the network, and a step that
-    /// starts after it finds publication fenced. The removal itself is a step of its own, after the
-    /// one in hand.
+    /// Records that revocations of `devices`, sent from this computer, are known here, and carries
+    /// out the removals they require as far as the hosts and the service allow.
     ///
-    /// Says whether the membership recorded it: a computer that shares no settings has none to
-    /// record it in.
+    /// Publication stops before anything else is done: a step in hand may be waiting on the network
+    /// and holds the membership meanwhile, so the record is made under a step of its own, after it,
+    /// and that step publishes nothing more once the revocation is known. One call for all the
+    /// devices of one view makes one removal step.
+    ///
+    /// Says whether the membership recorded them: a computer that shares no settings has none to
+    /// record them in.
     ///
     /// # Errors
     ///
-    /// Returns what stopped the recording. A service that cannot be reached afterwards is not a
-    /// failure of it: the next step carries the removal out, and the page says what stopped.
-    pub async fn feed_revocation(&self, device: &AuthorisationKey) -> Result<bool> {
-        let Some(record) = self.record()? else {
+    /// Returns what stopped the recording, with publication still held: the next call for the same
+    /// devices tries again. A service that cannot be reached afterwards is not a failure of it: the
+    /// next step carries the removal out, and the page says what stopped.
+    pub async fn revocations_sent(&self, devices: &[AuthorisationKey]) -> Result<bool> {
+        self.fence.raise(devices);
+        let _step = self.step().await?;
+        let Some(mut record) = self.record()? else {
+            self.fence.lift(devices);
             return Ok(false);
         };
         let service = self.managed(&record.origin()?)?;
         let mut membership = self.membership_asking(&service, Ask::Never)?;
-        match membership.feed_revocation(device) {
-            Ok(()) => {}
-            Err(MembershipError::NoMembership) => return Ok(false),
-            Err(error) => return Err(member_failure(error)),
+        for device in devices {
+            match membership.feed_revocation(device) {
+                Ok(()) => {}
+                Err(MembershipError::NoMembership) => {
+                    self.fence.lift(devices);
+                    return Ok(false);
+                }
+                Err(error) => return Err(member_failure(error)),
+            }
         }
+        self.fence.lift(devices);
         self.note_devices(&membership);
         drop(membership);
         self.told.tell();
-        let settled = self.remove_in_a_step_after_a_revocation().await;
+        let settled = self
+            .settle(&mut record, &service, Ask::Now)
+            .await
+            .map(|_| ());
         self.finished(&settled);
         Ok(true)
-    }
-
-    async fn remove_in_a_step_after_a_revocation(&self) -> Result<()> {
-        let _step = self.step().await?;
-        let Some(mut record) = self.record()? else {
-            return Ok(());
-        };
-        let service = self.managed(&record.origin()?)?;
-        self.settle(&mut record, &service, Ask::Now)
-            .await
-            .map(|_| ())
     }
 
     /// Joins the collection `reference` names, once the person confirms it here.

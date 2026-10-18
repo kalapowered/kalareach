@@ -34,6 +34,17 @@
 //! when sync was turned on, and stays there: changing the setting afterwards chooses where the
 //! next collection would be started, and moves nothing.
 //!
+//! # Taking a device out
+//!
+//! A revocation this computer sent is told to settings sync ([`SettingsSync::revocations_sent`]),
+//! which raises the [`Fence`] before it does anything that can wait or fail. The membership cannot
+//! record the revocation while a step holds it, and a step holds it for as long as it waits on the
+//! hosts or the service. While the fence is raised no step starts to publish, and every send of
+//! settings or drafts is refused at the moment it would leave, whatever the step in hand has read or
+//! sealed since it began. The revocation is recorded under a step of its own, after the one in hand,
+//! the fence is lifted when it is, and the same step takes the device out. What the refused sends
+//! held is sent afterwards, under the key that follows the removal.
+//!
 //! # Agreeing with the service
 //!
 //! One step brings this device and the service to the same settings, in this order:
@@ -84,8 +95,10 @@ use kr_protocol::service::{GatewayOrigin, installation_id};
 use kr_protocol::sync::SyncObjectKind;
 use serde::{Deserialize, Serialize};
 
+mod fence;
 mod members;
 
+pub use fence::{Fence, Fenced};
 use members::{Ask, Listed};
 pub use members::{Candidate as DeviceCandidate, DevicesView, Happened, Member, Offer};
 
@@ -374,6 +387,9 @@ pub struct SettingsSync {
     offered: Mutex<Vec<CollectionRef>>,
     /// Whether the settings the service holds are sealed under keys this computer has not been given.
     waiting: std::sync::atomic::AtomicBool,
+    /// Holds every send of settings and drafts while a device whose revocation this computer sent
+    /// is not yet recorded as taken out.
+    fence: Arc<Fence>,
 }
 
 impl std::fmt::Debug for SettingsSync {
@@ -444,6 +460,7 @@ impl SettingsSync {
             listed: Arc::new(Listed::default()),
             offered: Mutex::new(Vec::new()),
             waiting: std::sync::atomic::AtomicBool::new(false),
+            fence: Arc::new(Fence::default()),
         })
     }
 
@@ -669,7 +686,9 @@ impl SettingsSync {
         self.note_devices(&membership);
         self.told.tell();
         reconciled?;
-        if !membership.publishes().map_err(member_failure)? {
+        // A revocation that arrived while this step waited holds publication before the membership
+        // can record it, which it cannot while this step holds it.
+        if self.fence.is_raised() || !membership.publishes().map_err(member_failure)? {
             return Ok(Progress::Starting);
         }
         let status = membership
@@ -710,6 +729,7 @@ impl SettingsSync {
                 epoch,
                 floor: record.floor,
                 keys: Arc::new(self.keys()),
+                fence: Arc::clone(&self.fence),
             })
             .await;
         Ok(Progress::Agreed)
@@ -1456,7 +1476,10 @@ impl SettingsSync {
         );
         let sealer = shared.sealer(Arc::new(self.keys()) as Arc<dyn CollectionKeys>);
         let client = SyncClient::new(
-            Arc::clone(&shared) as Arc<dyn SyncBackupService>,
+            Arc::new(Fenced::new(
+                Arc::clone(&shared) as Arc<dyn SyncBackupService>,
+                Arc::clone(&self.fence),
+            )),
             Arc::new(sealer),
             self.store()?,
         );

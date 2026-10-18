@@ -281,6 +281,8 @@ pub struct Collection<'a> {
     pub floor: u64,
     /// Where the collection's keys are.
     pub keys: Arc<dyn CollectionKeys>,
+    /// Holds what leaves while a device whose revocation was sent is taken out.
+    pub fence: Arc<super::sync::Fence>,
 }
 
 /// The store a host's drafts leave through, and the client that fences it.
@@ -617,7 +619,10 @@ impl DraftsSync {
                 .believing_from(on.floor),
         );
         let sealer: Arc<dyn DraftSealer> = Arc::new(shared.sealer(Arc::clone(&on.keys)));
-        let service: Arc<dyn SyncBackupService> = Arc::clone(&shared) as _;
+        let service: Arc<dyn SyncBackupService> = Arc::new(super::sync::Fenced::new(
+            Arc::clone(&shared) as _,
+            Arc::clone(&on.fence),
+        ));
         let store = self.desk.store()?;
         // The removals owed are read before the drafts are listed. A removal takes its entry
         // before it takes the draft, under the lock this read takes, so an entry read here is of a
