@@ -1230,27 +1230,40 @@ jobs:
         with:
           name: linux
 
-      # The upstream archives are pinned by digest in the manifests, so the cache that holds them
-      # is named by those digests: a run that restores it fetches nothing, and a run that does not
-      # has each archive placed from the URL its manifest names or from a listed mirror. The build
-      # script checks every archive against its pin before it uses it, so a mirror that serves any
-      # other bytes fails the job there. The cache is restored by every run and saved by a green run
-      # on the default branch only, as the last step: a cache saved from another branch is used by
-      # that branch alone and takes the room of one every branch uses.
-      - name: Name the pinned upstream archives
+      # What the shells are built from is pinned, so a build needs no server of its own. Each
+      # manifest pins its upstream archive by digest. The fish manifest also pins the three git
+      # repositories its Cargo.lock takes from a forge (github.com, and codeberg.org with a copy on
+      # github.com), and the lock itself, inside the pinned archive, pins the crates it takes from
+      # crates.io by checksum. The cache that holds all of these is named by those pins, so a run
+      # that restores it fetches nothing. A run that does not restore it exactly takes the newest
+      # older cache (restore-keys) and fetches only the files the pins now name that it lacks:
+      # every file is checked against its pin before it is used, so a stale or partial restore
+      # costs a fetch and never a wrong build. Anything still missing is placed from the URL its
+      # manifest names or lock names, or from a listed copy: the archives from their URL or a
+      # mirror, the repositories as a bundle of the locked revision from their forge, the crates
+      # from static.crates.io. The build script checks every placed file against its pin and fails
+      # the job there on any other bytes. The cache is restored by every run and saved by a green
+      # run on the default branch only, as the last step: a cache saved from another branch is used
+      # by that branch alone and takes the room of one every branch uses.
+      - name: Name the pinned upstream sources
         id: shell-sources
         run: |
           echo "key=shell-sources-$(bash scripts/place-shell-sources.sh --all --key)" >> "$GITHUB_OUTPUT"
 
-      - name: Restore the upstream archives
+      - name: Restore the upstream sources
         id: shell-archives
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/kalareach/shells/sources
           key: ${{ steps.shell-sources.outputs.key }}
+          restore-keys: shell-sources-
 
-      - name: Place the upstream archives the cache lacks
-        run: bash scripts/place-shell-sources.sh --all
+      - name: Place the upstream sources the cache lacks
+        env:
+          RESTORED_KEY: ${{ steps.shell-archives.outputs.cache-matched-key }}
+        run: |
+          echo "restored cache: ${RESTORED_KEY:-none}"
+          bash scripts/place-shell-sources.sh --all
 
       # Section 26 asks packaging to verify clean patch application. The patches apply to the
       # pinned release with no fuzz at all, so a patch that has drifted from the release it names
@@ -1268,8 +1281,19 @@ jobs:
       # give it; the manifest still names it, so a person rebuilding the package runs it. What this
       # job proves about fish is that the patches apply, the shell builds, and the package answers
       # the contract in the step below.
+      #
+      # Everything fish compiles from was placed above, and cargo runs offline against it. The
+      # proxy variables here point at a port nothing listens on, so that a client which obeys them
+      # and still tries a server fails this step at once instead of reaching one.
       - name: Build the fish package
-        run: bash scripts/build-shells.sh --fish --no-upstream-tests
+        env:
+          HTTPS_PROXY: http://127.0.0.1:9
+          HTTP_PROXY: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+        run: |
+          # Some clients read only the lower-case names, and a workflow's names are not case-sensitive.
+          export https_proxy="$HTTPS_PROXY" http_proxy="$HTTP_PROXY" all_proxy="$ALL_PROXY"
+          bash scripts/build-shells.sh --fish --no-upstream-tests
 
       # This package builds no shell: it is qualified against the editor the runner already has,
       # and the module records what it found where the tests look for it.
@@ -1336,6 +1360,7 @@ jobs:
         run: |
           cargo test --locked -p kr-shell-integration \
             --test zsh --test bash --test fish --test pwsh --test module_abi --test relocation \
+            --test fish_sources \
             -- --test-threads=1 --include-ignored
 
       # The startup entries' own tests that need a PowerShell: where each entry goes in a profile,
@@ -1375,7 +1400,7 @@ jobs:
           cargo test --locked -p kr-shell-integration --test install_homes -- \
             --test-threads=1 --include-ignored
 
-      - name: Save the upstream archives
+      - name: Save the upstream sources
         if: github.ref == 'refs/heads/main' && steps.shell-archives.outputs.cache-hit != 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
