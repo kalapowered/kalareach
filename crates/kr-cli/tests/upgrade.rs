@@ -1754,11 +1754,13 @@ async fn a_worker_of_the_release_before_asks_this_releases_daemon_for_the_plugin
     assert_eq!(host.plugin_host(), Some(runtime), "one runtime serves both");
 
     updated.the_worker_is_as_it_was().await;
-    host.end_the_plugin_host().await;
+    // The sessions end before the runtime does: a worker whose runtime ends while its program
+    // runs asks for another, and nothing here would end that one.
     host.close(&updated.kr_now(), &display);
     host.worker_ended(&worker).await;
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
+    host.end_the_plugin_host().await;
 }
 
 /// KR-REQ-05.06, KR-REQ-26.06, KR-ACC-035: the plugin runtime of the release before ends while a
@@ -1822,10 +1824,10 @@ async fn a_worker_of_the_release_before_registers_again_with_the_runtime_of_this
     );
 
     updated.the_worker_is_as_it_was().await;
-    host.end_the_plugin_host().await;
     drop(terminal);
     host.close(&updated.kr_now(), &updated.display);
     host.worker_ended(&updated.worker).await;
+    host.end_the_plugin_host().await;
 }
 
 /// KR-REQ-26.06, KR-ACC-029, KR-ACC-035: what the worker of the release before wrote to the
