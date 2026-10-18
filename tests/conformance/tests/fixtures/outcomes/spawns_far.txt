@@ -1,0 +1,15 @@
+// A parent that names its helper without the flag, and a spawn of another helper far below.
+let helper = std::process::Command::new(exe).args(["tests::is_ignored", "--exact"]).spawn();
+let pad_1 = 1;
+let pad_2 = 2;
+let pad_3 = 3;
+let pad_4 = 4;
+let pad_5 = 5;
+let pad_6 = 6;
+let pad_7 = 7;
+let pad_8 = 8;
+let pad_9 = 9;
+let pad_10 = 10;
+let pad_11 = 11;
+let pad_12 = 12;
+let other = std::process::Command::new(exe).args(["another", "--exact", "--ignored"]).spawn();

@@ -1583,20 +1583,32 @@ pub struct IgnoredRun {
 pub enum Runs {
     /// A command in a file of the repository: one line of it, its continuations joined, holds every
     /// one of `fragments`. The words that make it a command that runs ignored tests are among them.
-    /// A command that selects tests with `--exact` has to name each test the entry covers.
+    /// A command that selects tests with `--exact` has to name, on that line, each test the entry
+    /// covers, and has to leave none of them out with `--skip`.
     Command {
         /// The file, relative to the repository.
         file: &'static str,
         /// The words the command holds.
         fragments: &'static [&'static str],
     },
+    /// A command as for [`Runs::Command`] whose test names are not on its own line, because a call
+    /// or a list passes them: each test the entry covers is named on a line that holds every one of
+    /// `names_with`, such as the call that hands the name to the command.
+    Supplied {
+        /// The file, relative to the repository.
+        file: &'static str,
+        /// The words the command holds.
+        fragments: &'static [&'static str],
+        /// The words each line that names a test holds.
+        names_with: &'static [&'static str],
+    },
     /// A step of this report's own plan on Linux, whose command holds every one of `fragments`.
     Plan {
         /// The words the step's command holds.
         fragments: &'static [&'static str],
     },
-    /// A process the target's own tests start: the file holds the flags that ask for an ignored
-    /// test by name.
+    /// A process the target's own tests start: the file names each helper test in its code, within
+    /// a few lines of the flags that ask for an ignored test by name.
     Helper {
         /// The file of the target, relative to the repository.
         file: &'static str,
@@ -1753,33 +1765,36 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         package: "kr-changeset",
         target: "--test capture",
         cases: &[],
-        runs: Runs::Command {
+        runs: Runs::Supplied {
             file: ".github/workflows/core-ci.yml",
             fragments: &[
                 "cargo test --locked -p \"$package\" \"${selector[@]}\" -- --ignored --exact",
             ],
+            names_with: &["kr-changeset capture"],
         },
     },
     IgnoredRun {
         package: "kr-transfer",
         target: "--test authority",
         cases: &[],
-        runs: Runs::Command {
+        runs: Runs::Supplied {
             file: ".github/workflows/core-ci.yml",
             fragments: &[
                 "cargo test --locked -p \"$package\" \"${selector[@]}\" -- --ignored --exact",
             ],
+            names_with: &["kr-transfer authority"],
         },
     },
     IgnoredRun {
         package: "kr-project",
         target: "--test workspaces",
         cases: &[],
-        runs: Runs::Command {
+        runs: Runs::Supplied {
             file: ".github/workflows/core-ci.yml",
             fragments: &[
                 "cargo test --locked -p \"$package\" \"${selector[@]}\" -- --ignored --exact",
             ],
+            names_with: &["kr-project workspaces"],
         },
     },
     IgnoredRun {
@@ -1867,9 +1882,10 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         package: "kr-controller",
         target: "--test distribution_endpoints",
         cases: &["a_viewer_reaches_only_the_distribution_it_was_paired_with"],
-        runs: Runs::Command {
+        runs: Runs::Supplied {
             file: "scripts/e2e-wsl.sh",
             fragments: &["$pairing_suite_path", "--ignored --exact"],
+            names_with: &["pairing_case"],
         },
     },
     IgnoredRun {
@@ -1887,9 +1903,13 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
             "attach_to_a_usable_screen",
             "idle_resources_for_twenty_sessions_and_thirty_two_views",
         ],
-        runs: Runs::Command {
+        runs: Runs::Supplied {
             file: "scripts/performance.sh",
-            fragments: &["-p kr-worker", "--ignored --exact --nocapture \"$name\""],
+            fragments: &[
+                "-p kr-worker \"$target_flag\" \"$target\"",
+                "--ignored --exact --nocapture \"$name\"",
+            ],
+            names_with: &["measurement"],
         },
     },
     IgnoredRun {
@@ -1904,9 +1924,13 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         package: "kr-worker",
         target: "--bench input_latency",
         cases: &[],
-        runs: Runs::Command {
+        runs: Runs::Supplied {
             file: "scripts/performance.sh",
-            fragments: &["-p kr-worker", "--ignored --exact --nocapture \"$name\""],
+            fragments: &[
+                "-p kr-worker \"$target_flag\" \"$target\"",
+                "--ignored --exact --nocapture \"$name\"",
+            ],
+            names_with: &["input_measurement"],
         },
     },
     IgnoredRun {

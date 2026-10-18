@@ -10,8 +10,11 @@
 //! The commands are not read for what they mean. An entry names the words one command holds, and
 //! the check is that the file still has a line with all of them (the continuations of a line
 //! joined, and what a comment holds left out), so that the words of two commands never stand in for
-//! one. A command that selects tests with `--exact` has to name each test the entry
-//! covers. A step of the report's own plan is found in the plan, not in text.
+//! one. A command that selects tests with `--exact` has to name each test the entry covers on that
+//! line, or, for an entry that says a call passes the names, on a line with the call's words; and no
+//! `--skip` filter of it may select one of them. A step of the report's own plan is found in the
+//! plan, not in text. Whether control reaches a command, and what the script does with its result,
+//! are not read.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -88,7 +91,14 @@ pub fn check(map: &Map, root: &Path, runs: &[IgnoredRun]) -> Findings {
             }
         }
         let problem = match run.runs {
-            Runs::Command { file, fragments } => missing_command(root, file, fragments, matched),
+            Runs::Command { file, fragments } => {
+                missing_command(root, file, fragments, None, matched)
+            }
+            Runs::Supplied {
+                file,
+                fragments,
+                names_with,
+            } => missing_command(root, file, fragments, Some(names_with), matched),
             Runs::Plan { fragments } => missing_step(&plan, fragments, matched),
             Runs::Helper { file } => missing_helper(root, file, matched),
             Runs::ByHand { why } => {
@@ -158,12 +168,17 @@ fn case_matches(case: &str, name: &str) -> bool {
     case == name || (case.ends_with("::") && name.starts_with(case))
 }
 
-/// Why `file` holds no command with all of `fragments`, or does not name a test the command
-/// selects with `--exact`, or `None` when it does both.
+/// Why `file` holds no command with all of `fragments` that names the tests it selects and leaves
+/// none of them out, or `None` when it holds one.
+///
+/// A command that selects tests with `--exact` names each of `covered` on its own line, or, when
+/// `names_with` is given, on a line that holds all of those words (the call that passes the name to
+/// the command). A command leaves a test out when a `--skip` filter selects it.
 fn missing_command(
     root: &Path,
     file: &str,
     fragments: &[&str],
+    names_with: Option<&[&str]>,
     covered: &BTreeSet<String>,
 ) -> Option<String> {
     let text = match std::fs::read_to_string(root.join(file)) {
@@ -171,22 +186,50 @@ fn missing_command(
         Err(error) => return Some(format!("{file} cannot be read: {error}")),
     };
     let lines: Vec<String> = commands(&text).collect();
-    let Some(line) = lines.iter().find(|line| holds_all(line, fragments)) else {
-        return Some(format!(
-            "{file} holds no command with {}",
-            quoted(fragments)
-        ));
+    let wrong = |line: &String| {
+        skipped(line, covered).or_else(|| {
+            if !contains_token(line, "--exact") {
+                return None;
+            }
+            covered
+                .iter()
+                .find(|name| match names_with {
+                    None => !contains_token(line, name),
+                    Some(words) => !lines
+                        .iter()
+                        .any(|other| holds_all(other, words) && contains_token(other, name)),
+                })
+                .map(|name| format!("does not name {name}"))
+        })
     };
-    // A command that selects tests by name has to name each of the tests this entry is for, in the
-    // commands of the file and not in a comment.
-    if contains_token(line, "--exact") {
-        let active = lines.join("\n");
-        return covered
-            .iter()
-            .find(|name| !contains_token(&active, name))
-            .map(|name| format!("{file} does not name {name}"));
+    let found: Vec<Option<String>> = lines
+        .iter()
+        .filter(|line| holds_all(line, fragments))
+        .map(wrong)
+        .collect();
+    if found.iter().any(Option::is_none) {
+        return None;
     }
-    None
+    Some(match found.into_iter().next() {
+        Some(Some(wrong)) => format!("{file} {wrong}"),
+        _ => format!("{file} holds no command with {}", quoted(fragments)),
+    })
+}
+
+/// Why a command, as the words of one line, leaves a test of `covered` out with `--skip`, or `None`
+/// when it leaves none: a filter selects a test whose name contains it.
+fn skipped(command: &str, covered: &BTreeSet<String>) -> Option<String> {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    words
+        .windows(2)
+        .filter(|pair| pair[0] == "--skip")
+        .find_map(|pair| {
+            let filter = pair[1].trim_matches(['"', '\'']);
+            covered
+                .iter()
+                .find(|name| name.contains(filter))
+                .map(|name| format!("skips {name} with `--skip {filter}`"))
+        })
 }
 
 /// Why no step of the report's own plan has all of `fragments`, or does not name a test the step
@@ -198,6 +241,9 @@ fn missing_step(plan: &[String], fragments: &[&str], covered: &BTreeSet<String>)
             quoted(fragments)
         ));
     };
+    if let Some(skipped) = skipped(step, covered) {
+        return Some(format!("its step {skipped}"));
+    }
     if contains_token(step, "--exact") {
         return covered
             .iter()
@@ -207,38 +253,76 @@ fn missing_step(plan: &[String], fragments: &[&str], covered: &BTreeSet<String>)
     None
 }
 
+/// How far from the line that names a helper test its flags may be, in lines of code.
+const HELPER_REACH: usize = 8;
+
 /// Why `file` does not start the helpers `covered` as processes of their own, or `None` when it
-/// does: the file names each helper in its code, and a few lines of its code together ask for an
-/// ignored test by name with `--ignored` and `--exact`. A comment, an attribute and the reason an
-/// `#[ignore]` gives are not code.
+/// does: the file names each helper in its code, and within a few lines of that name its code asks
+/// for an ignored test by name with `--ignored` and `--exact`. A comment, an attribute and the
+/// reason an `#[ignore]` gives are not code.
 fn missing_helper(root: &Path, file: &str, covered: &BTreeSet<String>) -> Option<String> {
     let text = match std::fs::read_to_string(root.join(file)) {
         Ok(text) => text,
         Err(error) => return Some(format!("{file} cannot be read: {error}")),
     };
-    let code: Vec<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| {
-            !line.starts_with("//") && !line.starts_with("#[") && !line.starts_with("ignore")
-        })
-        .collect();
-    let named = |name: &str| {
-        code.iter()
-            .any(|line| !line.contains("fn ") && contains_token(line, name))
-    };
-    if let Some(name) = covered.iter().find(|name| !named(name)) {
-        return Some(format!("{file} never starts {name}"));
+    let code = code_lines(&text);
+    for name in covered {
+        // A helper may be named once, in a constant, and started by the constant's name.
+        let mut words = vec![name.as_str()];
+        words.extend(code.iter().filter_map(|line| constant_for(line, name)));
+        let named: Vec<usize> = (0..code.len())
+            .filter(|&at| {
+                !code[at].contains("fn ") && words.iter().any(|word| contains_token(code[at], word))
+            })
+            .collect();
+        if named.is_empty() {
+            return Some(format!("{file} never starts {name}"));
+        }
+        let asks = named.iter().any(|&at| {
+            let near = code
+                [at.saturating_sub(HELPER_REACH)..(at + HELPER_REACH + 1).min(code.len())]
+                .join(" ");
+            contains_token(&near, "--ignored") && contains_token(&near, "--exact")
+        });
+        if !asks {
+            return Some(format!(
+                "{file} never asks for {name} with `--ignored` and `--exact` near its name"
+            ));
+        }
     }
-    let asks = code.windows(8).any(|lines| {
-        let together = lines.join(" ");
-        contains_token(&together, "--ignored") && contains_token(&together, "--exact")
-    });
-    (!asks).then(|| {
-        format!(
-            "{file} never asks for an ignored test by name: no `--ignored` and `--exact` together"
-        )
-    })
+    None
+}
+
+/// The name of the constant that `line` declares as the text `value`, when it does.
+fn constant_for<'a>(line: &'a str, value: &str) -> Option<&'a str> {
+    let declared = line
+        .strip_prefix("const ")
+        .or_else(|| line.strip_prefix("pub const "))?;
+    let (name, rest) = declared.split_once(':')?;
+    rest.contains(&format!("\"{value}\""))
+        .then_some(name.trim())
+}
+
+/// The lines of a Rust file that are code: not a comment, and not an attribute, which may run over
+/// several lines.
+fn code_lines(text: &str) -> Vec<&str> {
+    let mut code = Vec::new();
+    let mut open = 0_i32;
+    for line in text.lines().map(str::trim) {
+        if open > 0 || line.starts_with("#[") || line.starts_with("#![") {
+            for c in line.chars() {
+                match c {
+                    '[' => open += 1,
+                    ']' => open -= 1,
+                    _ => {}
+                }
+            }
+            open = open.max(0);
+        } else if !line.starts_with("//") {
+            code.push(line);
+        }
+    }
+    code
 }
 
 fn holds_all(line: &str, fragments: &[&str]) -> bool {

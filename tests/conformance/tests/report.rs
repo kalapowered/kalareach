@@ -902,6 +902,71 @@ fn a_step_is_one_command_that_names_what_it_selects_and_is_found_where_it_is_sai
 }
 
 #[test]
+fn a_command_names_its_tests_where_it_selects_them_and_leaves_none_out() {
+    let command = |file| {
+        outcomes_entry(
+            &[],
+            Runs::Command {
+                file,
+                fragments: &["--ignored --exact"],
+            },
+        )
+    };
+    let supplied = |file| {
+        outcomes_entry(
+            &[],
+            Runs::Supplied {
+                file,
+                fragments: &["--ignored --exact"],
+                names_with: &["call"],
+            },
+        )
+    };
+
+    // The names are on the command's line, not on the next one.
+    let split = held_to(&[command("split.sh")]);
+    assert_eq!(split.problems.len(), 1, "{:?}", split.problems);
+    assert!(
+        split.problems[0].contains("does not name tests::is_ignored"),
+        "{:?}",
+        split.problems
+    );
+
+    // A call that passes the names stands for them, and a line that only says one does not.
+    assert!(held_to(&[supplied("calls.sh")]).problems.is_empty());
+    let echoed = held_to(&[supplied("echoed.sh")]);
+    assert_eq!(echoed.problems.len(), 1, "{:?}", echoed.problems);
+    assert!(
+        echoed.problems[0].contains("does not name tests::is_ignored_too"),
+        "{:?}",
+        echoed.problems
+    );
+
+    // A filter that skips a test the entry covers leaves it out.
+    let skipping = held_to(&[command("skipping.sh")]);
+    assert_eq!(skipping.problems.len(), 1, "{:?}", skipping.problems);
+    assert!(
+        skipping.problems[0].contains("skips tests::is_ignored_too"),
+        "{:?}",
+        skipping.problems
+    );
+}
+
+#[test]
+fn a_helper_is_named_beside_the_flags_that_ask_for_it() {
+    let helper = |file| outcomes_entry(&["tests::"], Runs::Helper { file });
+    assert!(held_to(&[helper("spawns.txt")]).problems.is_empty());
+    // The flags of another spawn, far from the helper's name, do not stand for its own.
+    let far = held_to(&[helper("spawns_far.txt")]);
+    assert_eq!(far.problems.len(), 1, "{:?}", far.problems);
+    assert!(
+        far.problems[0].contains("never asks for tests::is_ignored"),
+        "{:?}",
+        far.problems
+    );
+}
+
+#[test]
 fn an_ignored_test_is_not_counted_and_a_failing_test_fails_its_identifier() {
     let (document, _evidence) = run("outcomes").unwrap_or_else(|stopped| panic!("{stopped:?}"));
     let verdict = |row: &str| document.identifiers[row].verdict;

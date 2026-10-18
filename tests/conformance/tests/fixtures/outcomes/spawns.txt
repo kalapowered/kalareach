@@ -1,0 +1,10 @@
+// A parent test that starts each helper as a process of its own.
+let first = std::process::Command::new(exe)
+    .args(["tests::is_ignored", "--exact", "--ignored", "--nocapture"])
+    .spawn();
+let second = std::process::Command::new(exe)
+    .args(["tests::is_ignored_too", "--exact", "--ignored", "--nocapture"])
+    .spawn();
+let third = std::process::Command::new(exe)
+    .args(["tests::is_ignored_for_a_reason_over_two_lines", "--exact", "--ignored"])
+    .spawn();
