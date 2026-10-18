@@ -1018,6 +1018,7 @@ fn a_command_names_its_tests_where_it_selects_them_and_leaves_none_out() {
     for (file, said) in [
         ("no_run.sh", "does not run the tests"),
         ("bench_mode.sh", "runs benchmarks"),
+        ("unknown_flag.sh", "does not know"),
     ] {
         let refused = held_to(&[by_part(file)]);
         assert_eq!(refused.problems.len(), 1, "{file}: {:?}", refused.problems);

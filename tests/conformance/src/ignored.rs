@@ -232,6 +232,27 @@ const VALUE_OPTIONS: [&str; 6] = [
     "--report-time",
 ];
 
+/// The flags of `cargo test` that leave every test of the target to run.
+const CARGO_FLAGS: [&str; 8] = [
+    "--locked",
+    "--release",
+    "--workspace",
+    "--no-fail-fast",
+    "--lib",
+    "--offline",
+    "--frozen",
+    "--all-features",
+];
+
+/// The flags of the test program that leave every test it is asked for to run.
+const PROGRAM_FLAGS: [&str; 5] = [
+    "--ignored",
+    "--include-ignored",
+    "--exact",
+    "--nocapture",
+    "--show-output",
+];
+
 /// The options of `cargo test` that take their value as the next word.
 const CARGO_VALUE_OPTIONS: [&str; 19] = [
     "-p",
@@ -260,7 +281,8 @@ const CARGO_VALUE_OPTIONS: [&str; 19] = [
 /// `--bench` mode), a `--skip` filter (as `--skip FILTER` or `--skip=FILTER`) selects one of them,
 /// or a filter that names tests by a part of their names, before or after the `--` that ends
 /// Cargo's own arguments, instead of `--exact`, leaves one of them out. A filter selects a test
-/// whose name contains it.
+/// whose name contains it. A flag of `cargo test` that the map does not know leaves every test
+/// running is refused, so that a flag it has not heard of cannot narrow a run unseen.
 fn narrowed(command: &str, covered: &BTreeSet<String>, exact: bool) -> Option<String> {
     let words: Vec<&str> = command
         .split_whitespace()
@@ -296,7 +318,19 @@ fn narrowed(command: &str, covered: &BTreeSet<String>, exact: bool) -> Option<St
             {
                 at += 1;
             }
-            _ if word.starts_with('-') || word.contains('$') || cargo.is_none() => {}
+            _ if word.starts_with('-') => {
+                let known = if program {
+                    PROGRAM_FLAGS.contains(&word) || word.starts_with("--test-threads=")
+                } else {
+                    CARGO_FLAGS.contains(&word)
+                };
+                if cargo.is_some() && !known {
+                    return Some(format!(
+                        "has `{word}`, which the map does not know to leave every test running"
+                    ));
+                }
+            }
+            _ if word.contains('$') || cargo.is_none() => {}
             _ => filters.push(word),
         }
         at += 1;
