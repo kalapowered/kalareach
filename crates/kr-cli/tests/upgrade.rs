@@ -1176,33 +1176,30 @@ impl Updated {
         })
         .await
         .expect("the gate is opened");
-        // Both ends of both pipes meet: the server opens its input first and its output second,
-        // so these two opens have to be waiting at the same time.
-        let to_server = pipes.to_server.clone();
-        let from_server = pipes.from_server.clone();
-        let writer = tokio::task::spawn_blocking(move || {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(to_server)
-                .expect("opens the server's input")
-        });
-        let reader = tokio::task::spawn_blocking(move || {
-            std::fs::File::open(from_server).expect("opens the server's output")
-        });
-        let writer = tokio::time::timeout(LIVENESS_DEADLINE, writer)
+        // The server opens its input first and its output second, and each open waits for the other
+        // end. Neither end here waits: the input's writer is opened as soon as the server's open of
+        // it is waiting (a reader that waits in `open` counts as one), the output's reader after it,
+        // and a server that never opens either fails the case at the deadline.
+        let deadline = Instant::now() + LIVENESS_DEADLINE;
+        let writer = loop {
+            match tokio::net::unix::pipe::OpenOptions::new().open_sender(&pipes.to_server) {
+                Ok(writer) => break writer,
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the server never opened its input"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("opens the server's input: {error}"),
+            }
+        };
+        let reader = tokio::net::unix::pipe::OpenOptions::new()
+            .open_receiver(&pipes.from_server)
+            .expect("opens the server's output");
+        ().serve((reader, writer))
             .await
-            .expect("the server opened its input")
-            .expect("the open finished");
-        let reader = tokio::time::timeout(LIVENESS_DEADLINE, reader)
-            .await
-            .expect("the server opened its output")
-            .expect("the open finished");
-        ().serve((
-            tokio::fs::File::from_std(reader),
-            tokio::fs::File::from_std(writer),
-        ))
-        .await
-        .expect("the tool server answered the handshake")
+            .expect("the tool server answered the handshake")
     }
 }
 
