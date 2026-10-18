@@ -825,6 +825,21 @@ fn a_step_is_one_command_that_names_what_it_selects_and_is_found_where_it_is_sai
         partial.problems
     );
 
+    // What follows a comment sign on a continued line is not part of the command.
+    let commented = held_to(&[outcomes_entry(
+        &[],
+        Runs::Command {
+            file: "commented.sh",
+            fragments: &["--ignored", "--exact"],
+        },
+    )]);
+    assert_eq!(commented.problems.len(), 1, "{:?}", commented.problems);
+    assert!(
+        commented.problems[0].contains("holds no command with"),
+        "{:?}",
+        commented.problems
+    );
+
     // A case written with a trailing `::` stands for the module's tests.
     let module = held_to(&[outcomes_entry(
         &["tests::"],

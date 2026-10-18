@@ -9,8 +9,8 @@
 //!
 //! The commands are not read for what they mean. An entry names the words one command holds, and
 //! the check is that the file still has a line with all of them (the continuations of a line
-//! joined, and a line that is only a comment left out), so that the words of two commands never
-//! stand in for one. A command that selects tests with `--exact` has to name each test the entry
+//! joined, and what a comment holds left out), so that the words of two commands never stand in for
+//! one. A command that selects tests with `--exact` has to name each test the entry
 //! covers. A step of the report's own plan is found in the plan, not in text.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -284,13 +284,31 @@ fn plan_commands() -> Vec<String> {
 }
 
 /// The commands of a script or a workflow, one to a line: the continuations joined, the white space
-/// made single, and the lines that are only a comment left out.
+/// made single, and what a comment holds left out. A comment on a line that continues another ends
+/// the command there, as it does for the shell.
 fn commands(text: &str) -> impl Iterator<Item = String> + '_ {
     text.replace("\\\n", " ")
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .map(|line| {
+            without_comment(line)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .into_iter()
+}
+
+/// `line` up to the `#` that begins a comment: one at the start of the line or after white space,
+/// quoted or not, so that a quote opened on an earlier line never hides one.
+fn without_comment(line: &str) -> &str {
+    let mut previous = ' ';
+    for (at, c) in line.char_indices() {
+        if c == '#' && previous.is_whitespace() {
+            return &line[..at];
+        }
+        previous = c;
+    }
+    line
 }
