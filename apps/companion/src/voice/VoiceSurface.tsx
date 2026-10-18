@@ -11,7 +11,7 @@
  * boundary is enforced, and a boundary enforced in two places is enforced in neither.
  */
 
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import {
   CAPTURE_DISPLAY,
@@ -271,37 +271,55 @@ function ProviderChoiceScreen({
   useEffect(() => {
     if (waiting) end.current?.scrollIntoView({ block: 'nearest' })
   }, [waiting])
-  // The control that was pressed is disabled when the end begins and goes when the start is over,
-  // so focus goes to the words beside it that say what is happening: left on a control that is
-  // disabled and then gone, a keyboard or screen-reader user would be sent back to the top of the
-  // document. It goes there without the jump that focus makes to the middle of the screen, and the
-  // words are brought into view by as little as it takes, as the control was. A stop the device
-  // refuses brings the control back, and focus goes back to it. When the start is over the words
-  // go too, and focus goes to the control that starts again, which the choice is the person's to
-  // make with.
+  // The control that was pressed is disabled when the end begins, so focus goes to the words beside
+  // it that say what is happening. It goes there without the jump that focus makes to the middle
+  // of the screen, and the words are brought into view by as little as it takes, as the control was.
   const endingNote = useRef<HTMLParagraphElement | null>(null)
   const startControl = useRef<HTMLButtonElement | null>(null)
-  const focusIsOnTheNote = useRef(false)
+  const wasEnding = useRef(false)
   useEffect(() => {
-    if (waiting && ending && !focusIsOnTheNote.current) {
-      focusIsOnTheNote.current = true
+    if (waiting && ending && !wasEnding.current) {
       endingNote.current?.focus({ preventScroll: true })
       endingNote.current?.scrollIntoView({ block: 'nearest' })
-    } else if (waiting && !ending && focusIsOnTheNote.current) {
-      focusIsOnTheNote.current = false
-      end.current?.focus({ preventScroll: true })
-    } else if (!waiting && !busy && focusIsOnTheNote.current) {
-      focusIsOnTheNote.current = false
-      startControl.current?.focus({ preventScroll: true })
-      startControl.current?.scrollIntoView({ block: 'nearest' })
     }
-  }, [busy, ending, waiting])
+    wasEnding.current = waiting && ending
+  }, [ending, waiting])
+  // The rule that holds whatever order the start's state changes in: the control and the words of
+  // a start in flight are never left holding focus when they go. Where focus is on one of them is
+  // read from the focus itself, and cleared when the person moves it elsewhere; when the element
+  // that holds it is no longer on the screen, focus goes to what is there to take it: the control
+  // that gives the start up if it is back (a stop that was refused), the control that starts
+  // again, or the heading while that is not to be pressed. Never to the page.
+  const inFlight = useRef<HTMLElement | null>(null)
+  const remember = (event: React.FocusEvent) => {
+    const target = event.target as HTMLElement
+    inFlight.current = target === end.current || target === endingNote.current ? target : null
+  }
+  const forget = (event: React.FocusEvent) => {
+    // A control that is taken away may be blurred as it goes, which is not the person's move.
+    if (event.target === inFlight.current && inFlight.current.isConnected) inFlight.current = null
+  }
+  useLayoutEffect(() => {
+    const lost = inFlight.current
+    if (lost === null || lost.isConnected) return
+    inFlight.current = null
+    const to = [end.current, startControl.current, heading.current].find(
+      (candidate) => candidate !== null && !(candidate instanceof HTMLButtonElement && candidate.disabled)
+    )
+    to?.focus({ preventScroll: true })
+    if (to instanceof HTMLButtonElement) to.scrollIntoView({ block: 'nearest' })
+  })
   const terms = choice.managed
   const seconds = terms ? requestedSeconds(terms) : null
   const startable = terms !== null && terms.enabled && seconds !== null
 
   return (
-    <section className="kr-voice" aria-labelledby={`${id}-heading`}>
+    <section
+      className="kr-voice"
+      aria-labelledby={`${id}-heading`}
+      onFocus={remember}
+      onBlur={forget}
+    >
       <h1 id={`${id}-heading`} className="kr-voice__title" ref={heading} tabIndex={-1}>
         Start a voice session
       </h1>

@@ -759,7 +759,7 @@ describe('while a call is running', () => {
     const person = userEvent.setup()
     const { controls, port } = start()
     await waitForChoice()
-    controls.holdVoiceStart()
+    const answer = controls.holdVoiceStart()
     await person.click(screen.getByRole('button', { name: 'Start voice session' }))
     const end = await screen.findByRole('button', { name: 'End the call' })
     // The device is already ending what it was making, so it refuses a second stop.
@@ -772,6 +772,13 @@ describe('while a call is running', () => {
     expect(back).toBeEnabled()
     // Focus went to the words that said the end had begun, and goes back to the control that is back.
     expect(back).toHaveFocus()
+
+    // The host answers: the control goes while it holds focus, and focus goes to the start control.
+    answer()
+    const again = await screen.findByRole('button', { name: 'Start voice session' })
+    await waitFor(() => {
+      expect(again).toHaveFocus()
+    })
   })
 
   // A start that was not given up is the same start it always was: the end control goes with the

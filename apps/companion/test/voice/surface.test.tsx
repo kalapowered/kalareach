@@ -227,6 +227,85 @@ describe('before voice starts', () => {
     expect(screen.getByText(/is ending its call/)).toBeInTheDocument()
   })
 
+  // The rule behind the focus of a start in flight: whatever order its state changes in, the
+  // control and the words of the start are never left holding focus when they go, and the person's
+  // own move of focus is left alone.
+  describe('focus while a start is in flight', () => {
+    const screenWith = (
+      state: { busy: boolean; waiting: boolean; ending: boolean },
+      acted = actions()
+    ): React.ReactElement => (
+      <VoiceSurface
+        choice={choice()}
+        call={null}
+        currentTurn={null}
+        busy={state.busy}
+        waiting={state.waiting}
+        ending={state.ending}
+        notice={null}
+        actions={acted}
+      />
+    )
+    const IN_FLIGHT = { busy: true, waiting: true, ending: false }
+    const ENDING = { busy: true, waiting: true, ending: true }
+    const REFUSED = IN_FLIGHT
+    const ANSWERED_WHILE_ENDING = { busy: true, waiting: false, ending: true }
+    const OVER = { busy: false, waiting: false, ending: false }
+
+    it('goes from the control the person reached to the start control when the start is over', async () => {
+      const person = userEvent.setup()
+      const { rerender } = render(screenWith(IN_FLIGHT))
+      await person.tab()
+      expect(screen.getByRole('button', { name: 'End the call' })).toHaveFocus()
+
+      rerender(screenWith(OVER))
+
+      expect(screen.getByRole('button', { name: 'Start voice session' })).toHaveFocus()
+    })
+
+    it('goes back to the control after a refused stop, and to the start control when the start is over', () => {
+      const { rerender } = render(screenWith(IN_FLIGHT))
+      screen.getByRole('button', { name: 'End the call' }).focus()
+      rerender(screenWith(ENDING))
+      expect(screen.getByText(/is ending its call/)).toHaveFocus()
+
+      rerender(screenWith(REFUSED))
+      expect(screen.getByRole('button', { name: 'End the call' })).toHaveFocus()
+
+      rerender(screenWith(OVER))
+      expect(screen.getByRole('button', { name: 'Start voice session' })).toHaveFocus()
+    })
+
+    it('stays on the screen while what a call would be is read again', () => {
+      const { rerender } = render(screenWith(IN_FLIGHT))
+      screen.getByRole('button', { name: 'End the call' }).focus()
+      rerender(screenWith(ENDING))
+      expect(screen.getByText(/is ending its call/)).toHaveFocus()
+
+      // The host has answered while the end ran, and the start control is not yet to be pressed.
+      rerender(screenWith(ANSWERED_WHILE_ENDING))
+      const heading = screen.getByRole('heading', { name: 'Start a voice session' })
+      expect(heading).toHaveFocus()
+
+      rerender(screenWith(OVER))
+      expect(heading).toHaveFocus()
+    })
+
+    it('leaves focus where the person put it', () => {
+      const { rerender } = render(screenWith(IN_FLIGHT))
+      screen.getByRole('button', { name: 'End the call' }).focus()
+      rerender(screenWith(ENDING))
+      expect(screen.getByText(/is ending its call/)).toHaveFocus()
+      // The person moves focus to the heading themselves.
+      const heading = screen.getByRole('heading', { name: 'Start a voice session' })
+      heading.focus()
+
+      rerender(screenWith(OVER))
+
+      expect(heading).toHaveFocus()
+    })
+  })
+
   it('says a model statement is not a confirmation once, in the service’s words', () => {
     render(<VoiceSurface choice={choice()} call={null} currentTurn={null} busy={false}
         notice={null}
