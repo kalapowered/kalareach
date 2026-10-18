@@ -141,6 +141,9 @@ pub fn run() {
             });
             app.manage(voice_calls(app.handle()));
             watch_drops(app.handle());
+            // A simulator launch can ask to start with the device locked.
+            #[cfg(all(debug_assertions, target_os = "ios"))]
+            companion_platform::protection::model::arm_from_environment();
             open_pairing(app.handle());
             #[cfg(mobile)]
             hosts::resume(app.handle());

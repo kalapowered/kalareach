@@ -26,6 +26,7 @@ use tauri::{Manager as _, Runtime};
 pub mod backup;
 pub mod browser;
 pub mod call;
+pub mod protection;
 pub mod secrets;
 #[cfg(target_os = "android")]
 mod tls;

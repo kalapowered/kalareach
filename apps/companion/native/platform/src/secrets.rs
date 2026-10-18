@@ -106,7 +106,11 @@ pub fn open<R: Runtime>(app: &AppHandle<R>) -> Result<Arc<dyn SecretStore>, Plat
         let capabilities: crate::browser::Capabilities =
             platform.call_blocking("capabilities", ())?;
         let group = private_group(capabilities.private_keychain_group.as_deref())?;
-        Ok(Arc::new(ios::KeychainStore { group }))
+        let store: Arc<dyn SecretStore> = Arc::new(ios::KeychainStore { group });
+        // A debug build on a simulator can model a device that has not been unlocked.
+        #[cfg(debug_assertions)]
+        let store = crate::protection::model::behind(store);
+        Ok(store)
     }
     #[cfg(target_os = "android")]
     {

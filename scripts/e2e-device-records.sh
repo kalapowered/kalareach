@@ -3,7 +3,9 @@
 # Runs the companion's device records on the iOS Simulator, with the real application: the
 # pairing records open, the secure store keeps an item across a relaunch, the device's own attempt
 # budget keeps its count and its boot identity across a relaunch and spends a code once the boot
-# record is gone, and the directories of the pairing records are kept out of the device's backup.
+# record is gone, the directories of the pairing records and of the recovery records are kept out
+# of the device's backup, and a start with the device locked opens the records once it is unlocked,
+# without a relaunch.
 #
 # A debug build of the application reads a request from its data directory when it starts and
 # writes one line per check beside it (companion-tauri's `device_probe`). This script builds that
@@ -15,18 +17,24 @@
 #      is the first launch's
 #   3. after the script has deleted the boot record from the application's caches: the item is
 #      gone, the boot identity is another, and the same code is refused as spent
+#   4. started with the device modelled as locked (a simulator never locks, so the secure store
+#      refuses as the keychain does before the first unlock, and the system's notification that
+#      protected data is available is posted by the application's own test hook): the records are
+#      not open and the words say the device is locked, then the unlock opens them in the same
+#      process, the page is told, and recovery opens with them; the boot identity is launch 3's
 #
 # The first start has no request and no data directory: a new installation has none, and the
-# application makes it. It shows that the application makes the data directory and the two record
-# directories there and marks both of them as excluded from the backup, as the host's `xattr`
+# application makes it. It shows that the application makes the data directory and the three record
+# directories there and marks all of them as excluded from the backup, as the host's `xattr`
 # reads them. It does not show the records open: the probe's request needs the data directory, so
-# the launches below are the ones that report the records open. The three launches run within four
+# the launches below are the ones that report the records open. The launches run within four
 # minutes of one another, so that a refusal in the last cannot be the five-minute window ending.
 #
 # It claims what the lines say and nothing more: a check the application did not report is a check
 # that did not run, and any line that is not `ok=1`, a launch that never says `done=1`, or an
 # identity that does not behave as above fails the run. A simulator shares the Mac's clocks, so
-# this shows a relaunch and a record that is gone; it cannot show a reboot of the phone.
+# this shows a relaunch and a record that is gone; it cannot show a reboot of the phone, nor the
+# system's own refusal and notification at a real first unlock, which only a phone shows.
 #
 # A simulator only inside the Mac's device lease, and a build inside a build slot:
 #
@@ -88,15 +96,17 @@ failed=0
 say "first start, in a container with no data directory"
 xcrun simctl launch "$udid" "$app_id" >/dev/null || { say "the application did not start"; exit 2; }
 excluded() { xattr -l "$1" 2>/dev/null | grep -q 'com_apple_backup_excludeItem'; }
-# Until both directories exist and read as excluded: the application makes each before it marks it.
+# Until all three directories exist and read as excluded: the application makes each before it
+# marks it.
 waited=0
 while ! { [ -d "$support/pairing" ] && excluded "$support/pairing" \
-    && [ -d "$support/pairing-budget" ] && excluded "$support/pairing-budget"; }; do
+    && [ -d "$support/pairing-budget" ] && excluded "$support/pairing-budget" \
+    && [ -d "$support/recovery" ] && excluded "$support/recovery"; }; do
     sleep 2
     waited=$((waited + 2))
     [ "$waited" -lt 60 ] || break
 done
-for name in pairing pairing-budget; do
+for name in pairing pairing-budget recovery; do
     if [ -d "$support/$name" ] && excluded "$support/$name"; then
         say "after the first start of a new installation, $name exists and is excluded from the backup"
     else
@@ -109,12 +119,18 @@ mkdir -p "$directory"
 started=$SECONDS
 
 # Launches the application once and reads what it wrote.
-launch() { # <n> <secret> <tries left or "null">
-    local n=$1 secret=$2 tries=$3 result="$directory/device-result-$run-$1.txt" waited=0
-    printf '{"run":"%s","launch":%s,"item":"%s","secret":"%s","tries_left":%s}\n' \
-        "$run" "$n" "$item" "$secret" "$tries" >"$directory/device-request.json"
+launch() { # <n> <secret> <tries left or "null"> [locked]
+    local n=$1 secret=$2 tries=$3 locked=${4:-false} result="$directory/device-result-$run-$1.txt" waited=0
+    printf '{"run":"%s","launch":%s,"item":"%s","secret":"%s","tries_left":%s,"locked":%s}\n' \
+        "$run" "$n" "$item" "$secret" "$tries" "$locked" >"$directory/device-request.json"
     say "launch $n"
-    xcrun simctl launch "$udid" "$app_id" >/dev/null || { say "the application did not start"; failed=1; return; }
+    # A launch that asks for the locked device starts the application with the model switched on.
+    if [ "$locked" = true ]; then
+        SIMCTL_CHILD_KR_MODEL_LOCKED_DEVICE=1 xcrun simctl launch "$udid" "$app_id" >/dev/null \
+            || { say "the application did not start"; failed=1; return; }
+    else
+        xcrun simctl launch "$udid" "$app_id" >/dev/null || { say "the application did not start"; failed=1; return; }
+    fi
     while ! grep -qs '^done=1$' "$result"; do
         sleep 2
         waited=$((waited + 2))
@@ -139,9 +155,18 @@ launch() { # <n> <secret> <tries left or "null">
     done <"$result"
     # Each check the launch is claimed to make was made, once: a check that is missing proves nothing.
     for name in "the pairing records open" "secret store" "the boot identity" "budget" \
-        "the paired hosts are out of the backup" "the budget is out of the backup"; do
+        "the paired hosts are out of the backup" "the budget is out of the backup" \
+        "the recovery records are out of the backup"; do
         [ "$(grep -c "^check=$name ok=" "$result")" = 1 ] || { say "launch $n did not report \"$name\" once"; failed=1; }
     done
+    if [ "$locked" = true ]; then
+        for name in "locked start: the records are not open" \
+            "locked start: the words say the device is locked" "unlock: the notification is posted" \
+            "unlock: the page is told" "unlock: the records open without a relaunch" \
+            "unlock: recovery opens with them"; do
+            [ "$(grep -c "^check=$name ok=" "$result")" = 1 ] || { say "launch $n did not report \"$name\" once"; failed=1; }
+        done
+    fi
 }
 
 digest() { sed -n 's/^check=the boot identity ok=1 detail=digest \(.*\)$/\1/p' "$artefacts/launch-$1.txt"; }
@@ -152,18 +177,21 @@ say "the boot record after launch 1: $(ls "$caches" 2>&1 | tr '\n' ' ')"
 launch 2 read_and_delete 3
 rm -f "$caches/pairing-boot"
 launch 3 absent null
+launch 4 absent null true
 
 elapsed=$((SECONDS - started))
-say "the three launches took $elapsed s"
+say "the four launches took $elapsed s"
 [ "$elapsed" -lt 240 ] || { say "the launches took four minutes or more, so a refusal at the end may be the window's"; failed=1; }
 first="$(digest 1)"
 second="$(digest 2)"
 third="$(digest 3)"
-say "boot identity digests: $first $second $third"
+fourth="$(digest 4)"
+say "boot identity digests: $first $second $third $fourth"
 [ -n "$first" ] && [ "$first" = "$second" ] || { say "a relaunch in the same boot changed the boot identity"; failed=1; }
 [ -n "$third" ] && [ "$third" != "$first" ] || { say "a deleted boot record did not give another boot identity"; failed=1; }
+[ -n "$fourth" ] && [ "$fourth" = "$third" ] || { say "the locked launch, in the same boot as launch 3, did not keep launch 3's boot identity"; failed=1; }
 [ -f "$caches/pairing-boot" ] || { say "launch 3 left no boot record in the caches"; failed=1; }
-for name in pairing pairing-budget; do
+for name in pairing pairing-budget recovery; do
     say "backup attributes of $name: $(xattr -l "$support/$name" 2>&1 | tr '\n' ' ')"
 done
 

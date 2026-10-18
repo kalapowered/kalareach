@@ -99,6 +99,18 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
     }
   }
 
+  #if DEBUG
+    /// Posts the notification the system posts when protected data becomes available, for a debug
+    /// build on a simulator, which never locks: the device is modelled as locked and then unlocked.
+    @objc public func postProtectedDataAvailable(_ invoke: Invoke) {
+      DispatchQueue.main.async {
+        NotificationCenter.default.post(
+          name: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil)
+        invoke.resolve(["done": true])
+      }
+    }
+  #endif
+
   @objc public func authenticate(_ invoke: Invoke) throws {
     let arguments = try invoke.parseArgs(SessionArguments.self)
     guard let url = URL(string: arguments.url) else {

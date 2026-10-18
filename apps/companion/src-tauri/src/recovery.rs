@@ -63,7 +63,7 @@ use crate::sync_service::{SyncService, SyncServiceView, host_of};
 pub const SEED_SCOPE: &str = "owner";
 
 /// The directory under the application's data directory that recovery keeps its records in.
-const DIRECTORY: &str = "recovery";
+pub const DIRECTORY: &str = "recovery";
 
 /// The record of where this computer's bundle is, in [`DIRECTORY`].
 const RECORD: &str = "recovery.json";

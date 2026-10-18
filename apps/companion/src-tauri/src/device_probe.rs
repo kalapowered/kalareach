@@ -13,7 +13,12 @@
 //!   (`probe.invalid`), so the tries left after each launch show whether the count and the boot
 //!   identity survive a relaunch, and that a deleted boot record is a tombstone;
 //! * the boot identity's digest, which the script compares across launches;
-//! * the directories of the pairing records are excluded from the device's backup.
+//! * the directories of the pairing records and of the recovery records are excluded from the
+//!   device's backup;
+//! * a launch that asks for it starts with the device modelled as locked (`protection::model`):
+//!   the records are not open and the words say the device is locked, then the device is unlocked
+//!   and the records open in place, the page is told and recovery opens with them, with no
+//!   relaunch.
 //!
 //! Compiled into debug builds only. A release build has no request to read.
 
@@ -36,6 +41,9 @@ struct Request {
     secret: String,
     /// The tries the budget has left after this launch's charge, or none when it refuses the code.
     tries_left: Option<u32>,
+    /// Whether the launch was started with the device modelled as locked.
+    #[serde(default)]
+    locked: bool,
 }
 
 fn is_a_name(text: &str) -> bool {
@@ -87,11 +95,99 @@ pub fn start<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
             }
         };
         append(&format!("run={}\nlaunch={}\n", request.run, request.launch));
-        for found in checks(&app, &data, &request) {
+        let mut found = Vec::new();
+        if request.locked {
+            found.extend(after_unlocking(&app));
+        }
+        found.extend(checks(&app, &data, &request));
+        for found in found {
             append(&format!("{}\n", found.line()));
         }
         append("done=1\n");
     });
+}
+
+/// How long the application is given, after the system says protected data is available, to open
+/// the records and tell the page.
+#[cfg(target_os = "ios")]
+const UNLOCK_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A launch that started with the device modelled as locked: the records are not open and the
+/// words say why, then the device is unlocked and the records open without a relaunch.
+#[cfg(target_os = "ios")]
+fn after_unlocking<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Vec<Check> {
+    use tauri::Listener as _;
+
+    let state = app.state::<crate::AppState>();
+    // The event the page listens on, heard as the page hears it, before anything is unlocked.
+    let (told, heard) = std::sync::mpsc::channel();
+    app.listen(crate::pairing::PAIRING_EVENT, move |_| {
+        let _ = told.send(());
+    });
+    let mut found = Vec::new();
+    match state.device() {
+        Err(error) => {
+            found.push(check(
+                "locked start: the records are not open",
+                true,
+                "not open",
+            ));
+            found.push(check(
+                "locked start: the words say the device is locked",
+                error.message.contains("locked") && !error.message.contains("open it again"),
+                &error.message,
+            ));
+        }
+        Ok(_) => {
+            found.push(check(
+                "locked start: the records are not open",
+                false,
+                "they opened while the device was modelled as locked",
+            ));
+            return found;
+        }
+    }
+    if let Err(error) = companion_platform::protection::model::unlock(app) {
+        found.push(check("unlock: the notification is posted", false, error));
+        return found;
+    }
+    found.push(check("unlock: the notification is posted", true, "posted"));
+    let told_the_page = heard.recv_timeout(UNLOCK_WITHIN).is_ok();
+    found.push(check(
+        "unlock: the page is told",
+        told_the_page,
+        if told_the_page {
+            "heard on the pairing event"
+        } else {
+            "nothing was heard on the pairing event"
+        },
+    ));
+    found.push(check(
+        "unlock: the records open without a relaunch",
+        state.device().is_ok(),
+        state
+            .device()
+            .err()
+            .map_or_else(|| "open".to_owned(), |error| error.message),
+    ));
+    found.push(check(
+        "unlock: recovery opens with them",
+        state.recovery().is_ok(),
+        state
+            .recovery()
+            .err()
+            .map_or_else(|| "open".to_owned(), |error| error.message),
+    ));
+    found
+}
+
+#[cfg(not(target_os = "ios"))]
+fn after_unlocking<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> Vec<Check> {
+    vec![check(
+        "locked start",
+        false,
+        "only the iOS simulator models a locked device",
+    )]
 }
 
 fn checks<R: tauri::Runtime>(
@@ -224,6 +320,10 @@ fn backup<R: tauri::Runtime>(app: &tauri::AppHandle<R>, data: &Path) -> Vec<Chec
         (
             "the budget is out of the backup",
             crate::device::BUDGET_DIRECTORY,
+        ),
+        (
+            "the recovery records are out of the backup",
+            crate::recovery::DIRECTORY,
         ),
     ]
     .into_iter()
