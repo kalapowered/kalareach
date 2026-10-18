@@ -1860,7 +1860,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: "scripts/real-package-cases.sh",
-            fragments: &["cargo test -p kr-worker --test fence -- --ignored"],
+            fragments: &["cargo test -p kr-worker --test fence -- --ignored --exact"],
         },
     },
     IgnoredRun {
