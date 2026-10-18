@@ -150,6 +150,7 @@ pub fn run(
     run_with(
         started,
         move |started| observe(application, started),
+        claim_answer,
         answer,
         |bytes| {
             use std::io::Write as _;
@@ -157,6 +158,13 @@ pub fn run(
         },
     );
     std::process::ExitCode::SUCCESS
+}
+
+/// What a hook does before it writes its answer so that no forwarder is started in its place
+/// afterwards.
+fn claim_answer() {
+    #[cfg(unix)]
+    crate::helper::claim_answer();
 }
 
 /// Where a hook stands when it was started in place of another.
@@ -219,11 +227,13 @@ fn resumed_by(
 /// The application waits for the answer, and a standard error nobody reads can hold a write to it
 /// for as long as nobody reads it. So the answer goes first, and the diagnostic, if there is one,
 /// gets what remains of the deadline, and at least [`DIAGNOSTIC_ALLOWANCE`] after the answer
-/// ([`diagnostic_bound`]). A run whose work finished says nothing. `answer` and `write` are what
-/// writes each, and `run` passes the real ones.
+/// ([`diagnostic_bound`]). A run whose work finished says nothing. `claim` is what a run does first
+/// of all to be the one that answers, `answer` and `write` are what writes each, and `run` passes
+/// the real ones.
 fn run_with(
     started: std::time::Instant,
     work: impl FnOnce(std::time::Instant) -> Result<(), String> + Send + 'static,
+    claim: impl FnOnce(),
     answer: impl FnOnce(),
     write: impl FnOnce(&[u8]) + Send + 'static,
 ) {
@@ -244,8 +254,7 @@ fn run_with(
     };
     // A forwarder being started in this one's place is waited for, and one not yet started is not
     // started once the answer is out: only one process answers.
-    #[cfg(unix)]
-    crate::helper::claim_answer();
+    claim();
     answer();
     let answered = std::time::Instant::now();
     if let Some(failure) = failure {
@@ -694,14 +703,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_run_claims_its_answer_before_it_writes_it() {
-        let claimed = std::cell::Cell::new(None);
+        let order = std::cell::RefCell::new(Vec::new());
         run_with(
             std::time::Instant::now(),
             |_| Ok(()),
-            || claimed.set(Some(crate::helper::has_answered())),
+            || order.borrow_mut().push("claimed"),
+            || order.borrow_mut().push("answered"),
             |_| {},
         );
-        assert_eq!(claimed.get(), Some(true));
+        assert_eq!(*order.borrow(), ["claimed", "answered"]);
     }
 
     /// The hook's own clock is read before the machine's, so a pause between the two readings
@@ -806,6 +816,7 @@ mod tests {
         run_with(
             started,
             move |_| outcome,
+            || {},
             || answered = true,
             move |bytes| {
                 into.lock().expect("the line").extend_from_slice(bytes);
@@ -868,6 +879,7 @@ mod tests {
                 let _ = stalled.recv_timeout(Duration::from_secs(30));
                 Ok(())
             },
+            || {},
             || answered = true,
             |_| {
                 // The write stalls too.

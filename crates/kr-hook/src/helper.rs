@@ -166,25 +166,43 @@ pub fn hand_over(
 /// one that answers again.
 static ANSWERED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
-/// Records that this hook is answering, and waits first for a replacement that is being started
-/// to start or to fail. A replacement that starts takes the process with it, so the answer is
-/// written only by the hook that is left.
+/// How long an answer waits for a replacement that is being started before it is written anyway.
+///
+/// A replacement that starts takes the process with it, and one that fails frees the claim at
+/// once, so the wait is the time of one `exec`. A start that stalls longer than this is not waited
+/// for: the deadline the application gave is kept, and the replacement, if it starts after all,
+/// answers once more.
+pub const CLAIM_WAIT: Duration = Duration::from_millis(100);
+
+/// Records that this hook is answering, and waits first, for at most [`CLAIM_WAIT`], for a
+/// replacement that is being started to start or to fail. A replacement that starts takes the
+/// process with it, so the answer is written only by the hook that is left.
 pub fn claim_answer() {
-    claim(&ANSWERED);
+    claim(&ANSWERED, CLAIM_WAIT);
 }
 
-/// Whether this hook has claimed its answer.
-#[cfg(test)]
-pub(crate) fn has_answered() -> bool {
-    *ANSWERED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+fn claim(answered: &std::sync::Mutex<bool>, within: Duration) {
+    use std::sync::TryLockError;
 
-fn claim(answered: &std::sync::Mutex<bool>) {
-    *answered
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    let until = Instant::now() + within;
+    loop {
+        match answered.try_lock() {
+            Ok(mut answered) => {
+                *answered = true;
+                return;
+            }
+            Err(TryLockError::Poisoned(poisoned)) => {
+                *poisoned.into_inner() = true;
+                return;
+            }
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= until {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
 }
 
 /// Starts the replacement with `exec` unless the answer has been claimed, and holds the claim from
@@ -270,7 +288,7 @@ mod tests {
             });
             inside.recv().expect("the replacement is being started");
             scope.spawn(move || {
-                claim(answered);
+                claim(answered, Duration::from_secs(60));
                 events.lock().unwrap().push("answered");
             });
             go.send(()).expect("let go");
@@ -283,5 +301,33 @@ mod tests {
             std::io::Error::other("started")
         });
         assert!(replaced.is_none() && !started.get());
+    }
+
+    /// An answer is not held up for ever by a replacement that stalls: it waits for the time it is
+    /// given, writes anyway, and leaves the claim to the replacement, which has not finished.
+    #[test]
+    fn an_answer_is_not_held_up_by_a_replacement_that_stalls() {
+        let answered = std::sync::Mutex::new(false);
+        let (inside_tx, inside) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let answered = &answered;
+            scope.spawn(move || {
+                let failed = replace_unless_answered(answered, || {
+                    inside_tx.send(()).expect("told");
+                    wait.recv().expect("let go");
+                    std::io::Error::other("it did not start")
+                });
+                assert!(failed.is_some());
+            });
+            inside.recv().expect("the replacement is being started");
+            // The replacement is still in `exec`; this returns once its time is up.
+            claim(answered, Duration::from_millis(20));
+            go.send(()).expect("let go");
+        });
+        assert!(
+            !*answered.lock().expect("the claim"),
+            "the claim was not taken while the replacement held it"
+        );
     }
 }
