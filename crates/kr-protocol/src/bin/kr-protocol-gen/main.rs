@@ -12,10 +12,12 @@
 //! kr-protocol-gen --fixtures-dir P  write the vectors to P instead of fixtures
 //! kr-protocol-gen --docs-dir P      write the index to, and read the documentation from, P
 //! kr-protocol-gen --retain L --commit C           cut retained level L from the release at C
-//! kr-protocol-gen --release-commit L C            move level L's record to release C, if its schema is the kept one
+//! kr-protocol-gen --release-commit L C            move level L's record to release C, the release before this one, if its schema is the kept one
+//! kr-protocol-gen --predecessor                   print the level and commit of the release before this one, which has to be the newest retained level
 //! ```
 
 mod method_index;
+mod predecessor;
 mod public_majors;
 mod retained;
 
@@ -113,11 +115,23 @@ fn main() -> ExitCode {
                     }
                 };
             }
+            "--predecessor" => {
+                return match retained::release_before() {
+                    Ok(line) => {
+                        println!("{line}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => {
+                        eprintln!("{error}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
             "--help" | "-h" => {
                 println!(
                     "kr-protocol-gen [--check] [--out-dir <path>] [--fixtures-dir <path>] \
                      [--docs-dir <path>] | --retain <level> --commit <commit> | \
-                     --release-commit <level> <commit>"
+                     --release-commit <level> <commit> | --predecessor"
                 );
                 return ExitCode::SUCCESS;
             }

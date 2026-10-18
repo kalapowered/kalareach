@@ -13,14 +13,15 @@
 //! `RetainedLevel::with_public_majors`, and `--check` fails until it is.
 //! `--release-commit` is for when the release a level was cut from is not the commit its record
 //! names: it compares the schema at `<commit>` with the kept surface, refuses on a difference, and
-//! only then edits the record.
+//! only then edits the record. The commit has to be the release before this one, the newest
+//! release tagged in this checkout's history below its level, and `--predecessor` prints that
+//! release and fails unless its level is the newest retained.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use kr_protocol::retained::{RETAINED, RETAINED_WORKER_LEVELS, SURFACE_ROOTS, Surface};
 
-use crate::public_majors;
+use crate::{predecessor, public_majors};
 
 /// The directory the retained levels are kept in.
 pub fn retained_dir() -> PathBuf {
@@ -32,19 +33,7 @@ fn repository() -> PathBuf {
 }
 
 fn git(arguments: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .args(arguments)
-        .current_dir(repository())
-        .output()
-        .map_err(|error| format!("git {}: {error}", arguments.join(" ")))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git {}: {}",
-            arguments.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    String::from_utf8(output.stdout).map_err(|error| error.to_string())
+    predecessor::git_in(&repository(), arguments)
 }
 
 /// What is wrong with the retained levels as they stand, without comparing them with this build's
@@ -224,8 +213,17 @@ fn plugin_host_at(commit: &str) -> Result<String, String> {
     ))
 }
 
-/// Moves a level's record to the commit the lead names, after comparing that commit's schema with
-/// the kept surface.
+/// The level and full commit of the release before this one, as one line of text. It fails unless
+/// that release's level is the newest this build retains.
+pub fn release_before() -> Result<String, String> {
+    let release = predecessor::before(&repository(), "HEAD")?;
+    predecessor::is_the_newest_retained(&release, &RETAINED_WORKER_LEVELS)?;
+    Ok(format!("{} {}", release.level(), release.commit))
+}
+
+/// Moves a level's record to the release before this one, after comparing that release's schema,
+/// table of public majors and sources with the kept ones. `commit` has to be that release: the
+/// newest tagged below this checkout's level, which is the level's last release.
 pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
     let retained = RETAINED
         .iter()
@@ -236,6 +234,13 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
         .to_owned();
     if full != commit {
         return Err(format!("give the full commit: {commit} is {full}"));
+    }
+    let before = predecessor::before(&repository(), "HEAD")?;
+    if before.commit != full || before.level() != retained.level {
+        return Err(format!(
+            "{full} is not the release before this one at level {level}: that is {} at {}",
+            before.tag, before.commit
+        ));
     }
     let schema_text = git(&[
         "show",
@@ -281,10 +286,7 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
             "the source the limits, validators and plugin host name come from changed between the recorded commit and {full}; the kr-cli retained_surface test run with KR_RELEASE_TREE decides whether the records still hold:\n{source_changes}"
         );
     }
-    let version = retained
-        .record("release")
-        .ok_or("the record names no release")?;
-    let version = version.split('+').next().unwrap_or(version);
+    let version = before.version;
     let released = git(&["show", "-s", "--format=%cI", &full])?
         .trim()
         .to_owned();
