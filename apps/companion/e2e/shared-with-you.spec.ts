@@ -25,13 +25,12 @@ const SIZES = [
 /**
  * The letters the page is drawn in. The system's own face differs from one platform to the next, and
  * a layout that holds only for the widths of the face it was drawn with does not hold: the second is
- * as wide as the widest face a phone, a desktop browser or the Linux runner is likely to draw with,
- * so what fits in it fits in the narrower ones.
+ * about as wide as the faces a desktop browser or the Linux runner draws with (Verdana, or DejaVu
+ * Sans where Verdana is not installed), which are wider than a phone's own.
  */
 const FACES = [
-  { name: 'the system face', suffix: '', shot: '', css: null },
+  { suffix: '', shot: '', css: null },
   {
-    name: 'a wide face',
     suffix: ' in a wide face',
     shot: '-wide',
     css: ':root { --font-ui: Verdana, "DejaVu Sans", sans-serif !important; }'
@@ -186,6 +185,9 @@ for (const surface of ['ios', 'android'] as const) {
             await page.getByRole('button', { name: new RegExp(`shared session ${session} with you`) }).click()
             await page.getByTestId('accept-offer').click()
             await expect(page.getByTestId('sheet')).toBeHidden()
+            // The toast that says so lies over the next card's controls: it is taken away.
+            await page.locator('.toast').getByRole('button', { name: 'Dismiss' }).click()
+            await expect(page.locator('.toast')).toBeHidden()
           }
           await expect(page.getByTestId('accept-attempt')).toHaveCount(2)
           // One acceptance is hidden, and the third invitation is put off.
@@ -195,6 +197,8 @@ for (const surface of ['ios', 'android'] as const) {
           await page.getByTestId('not-now').click()
           await expect(page.getByTestId('hidden-offers')).toBeVisible()
           await expect(page.getByTestId('sheet')).toBeHidden()
+          // The row that says one is hidden lays its words and its action out as a row of its own.
+          await expect(page.getByTestId('hidden-offers')).toHaveCSS('display', 'flex')
 
           expect(await overrunning(page, '[data-testid="offers"]')).toEqual([])
           expect(await unreachable(page, '[data-testid="offers"]')).toEqual([])
@@ -266,6 +270,9 @@ for (const surface of ['ios', 'android'] as const) {
           await expect(shared.getByText(/Not refreshed just now/)).toBeVisible()
           await readAgain(page)
           await expect(page.getByTestId('ended-share')).toHaveCount(1)
+          // A share that ended leads nowhere, and is drawn as a row that is not a control.
+          await expect(page.getByTestId('ended-share')).toHaveCSS('cursor', 'default')
+          await expect(page.getByTestId('ended-share')).toHaveCSS('border-top-style', 'dashed')
 
           expect(await overrunning(page, '[data-testid="shared-with-you"]')).toEqual([])
           expect(await unreachable(page, '[data-testid="shared-with-you"]')).toEqual([])
@@ -336,6 +343,54 @@ test.describe('a new invitation while the inbox is scrolled', () => {
     await expect(pill).toBeHidden()
     await expect(page.locator('[data-offer]').first()).toBeFocused()
   })
+
+  // KR-REQ-18.13: the pill's words are inside the pill and the pill is inside the screen, whatever the
+  // text size and the face: its box has no height of its own, and its label must not be the one thing
+  // that runs out of it.
+  for (const face of FACES) {
+    test(`keeps the pill's words inside the pill, and the pill inside the screen${face.suffix}`, async ({
+      page
+    }) => {
+      await withFace(page, face.css)
+      await open(page, 'ios', 'attention', async (loaded) => {
+        await loaded.evaluate(() => {
+          window.krTestHost?.reachAsPhone({ rights: ['session.view'] })
+        })
+      })
+      const main = page.locator('.m-main')
+      await expect(main.locator('[data-attention]').first()).toBeVisible()
+      await main.evaluate((element) => {
+        element.scrollTop = 180
+      })
+      await expect.poll(() => main.evaluate((element) => element.scrollTop)).toBeGreaterThan(100)
+      await page.evaluate(() => {
+        window.krTestHost?.sharing.offer({ session: '4' })
+      })
+      await readAgain(page)
+      await expect(page.getByRole('button', { name: '1 new invitation' })).toBeVisible()
+      await drawn(page)
+      const fit = await page.evaluate(() => {
+        const pill = document.querySelector('.sw-new-button')
+        if (pill === null) throw new Error('no pill')
+        const box = pill.getBoundingClientRect()
+        const range = document.createRange()
+        range.selectNodeContents(pill)
+        const outside = Array.from(range.getClientRects()).filter(
+          (line) =>
+            line.width > 0 &&
+            (line.top < box.top - 0.5 ||
+              line.bottom > box.bottom + 0.5 ||
+              line.left < box.left - 0.5 ||
+              line.right > box.right + 0.5)
+        )
+        return { left: box.left, right: box.right, screen: window.innerWidth, outside: outside.length }
+      })
+      expect(fit.outside, 'lines of the words of the pill outside the pill').toBe(0)
+      expect(fit.left, 'the pill starts inside the screen').toBeGreaterThanOrEqual(0)
+      expect(fit.right, 'the pill ends inside the screen').toBeLessThanOrEqual(fit.screen)
+      await page.screenshot({ path: shot(`pill-fit${face.shot}`) })
+    })
+  }
 
   // Reduced motion: the pill's jump does not travel.
   test('jumps to the invitation at once when the person asked for less motion', async ({ page }) => {
