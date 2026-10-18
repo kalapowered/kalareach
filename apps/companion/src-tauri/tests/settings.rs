@@ -180,6 +180,8 @@ struct Listed {
     revoked: bool,
     /// Whether its grant has run out, which a host reports beside the actions the grant lists.
     expired: bool,
+    /// The platform the host says it runs.
+    platform: kr_protocol::pairing::DevicePlatform,
 }
 
 /// What this computer can learn of each host, as a test says it.
@@ -388,7 +390,7 @@ fn listed_device(number: usize, device: &Listed) -> kr_protocol::sharing::Device
         revoked: device.revoked,
         keys: device.keys.map_or_else(Nullable::null, Nullable::some),
         manages_host: device.manages_host,
-        platform: kr_protocol::pairing::DevicePlatform::Macos,
+        platform: device.platform,
         grant_expires_at_ms: Nullable::null(),
         grant_expired: device.expired,
         all_sessions: true,
@@ -431,6 +433,7 @@ impl Computer {
             manages_host: true,
             revoked: false,
             expired: false,
+            platform: kr_protocol::pairing::DevicePlatform::Macos,
         }
     }
 
@@ -3535,6 +3538,85 @@ async fn a_computer_that_cannot_read_what_the_service_holds_waits_and_sends_noth
         copies,
         "no refused write was left"
     );
+
+    // An answer that does not come says nothing of what the service holds, and the first object is
+    // not made on it: the step that finds the service unreachable at that question stops, and the
+    // next asks again.
+    let before = this.served.web().arrived().len();
+    phone.sync_now();
+    let step: Vec<_> = this.served.web().arrived().split_off(before);
+    let asking = step
+        .iter()
+        .position(|arrived| arrived.body.get("compare").is_some())
+        .expect("the step asks what the service holds");
+    this.served.web().fail(
+        SYNC_PATH,
+        u32::try_from(asking).expect("a few") + 1,
+        Moment::Before,
+    );
+    let stopped = phone.call("settings_sync_now", json!({}));
+    this.served.web().mend();
+    assert!(stopped.is_err(), "the step says it stopped");
+    assert_eq!(
+        writes(),
+        written,
+        "no object was made on a question that was not answered"
+    );
+    let view = phone.sync_now();
+    assert_eq!(view["sync"]["devices"]["waiting"], true, "{view}");
+    assert_eq!(writes(), written);
+    assert_eq!(elsewhere.copies_kept().await, copies);
+}
+
+/// A step that stopped between putting the settings sealed again in the store and hearing how they
+/// were published finishes the sealing as it began it: another device's settings refused them, and
+/// they are followed, with nothing asked of the person.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sealing_a_step_stopped_in_is_finished_as_it_was_begun() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    page.choose("dark");
+    let phone = other.start();
+    page.share(&first_reference(&page.devices_refresh()["candidates"]))
+        .expect("shared");
+    phone
+        .join(&first_reference(&phone.devices_refresh()["offers"]))
+        .expect("joined");
+    page.sync_now();
+    assert_eq!(phone.sync_now()["colour_mode"], "dark");
+
+    // The step put the settings sealed again in the store and stopped; the other device wrote.
+    let own = this.client_on_its_own_store(1);
+    let (client, object_id) = (&own.client, own.object_id);
+    let held = client
+        .store()
+        .object(object_id)
+        .expect("a store")
+        .expect("settings");
+    let again = SyncObject {
+        revision: fresh_revision().expect("a revision"),
+        ..held.clone()
+    };
+    client
+        .store()
+        .put_object(&again)
+        .expect("the sealing began");
+    let path = this.data.path().join("settings-sync").join("sync.json");
+    let mut record = sync_record(&this);
+    record["resealing"] = json!({
+        "from": serde_json::to_value(held.revision).expect("a revision"),
+        "to": serde_json::to_value(again.revision).expect("a revision"),
+    });
+    std::fs::write(&path, serde_json::to_vec(&record).expect("a record")).expect("written");
+    phone.choose("light");
+
+    let view = page.sync_now();
+    assert_eq!(view["sync"]["conflicts"], 0, "{view}");
+    assert_eq!(view["colour_mode"], "light", "{view}");
+    assert!(
+        sync_record(&this).get("resealing").is_none(),
+        "the marker is spent"
+    );
 }
 
 /// A record that names another collection than the membership says this computer is in, as one does
@@ -3750,10 +3832,48 @@ async fn content_refused_to_settings_only_sealed_again_is_followed_and_asks_noth
     assert_eq!(store.conflicts(object_id).expect("copies").items.len(), 1);
     let path = this.data.path().join("settings-sync").join("sync.json");
     let mut record = sync_record(&this);
-    record["resealing"] = serde_json::to_value(held.revision).expect("a revision");
+    let revision = serde_json::to_value(held.revision).expect("a revision");
+    record["resealing"] = json!({ "from": revision, "to": revision });
     std::fs::write(&path, serde_json::to_vec(&record).expect("a record")).expect("written");
 
     let view = page.sync_now();
     assert_eq!(view["sync"]["conflicts"], 0, "{view}");
     assert_eq!(view["colour_mode"], "light", "{view}");
+}
+
+/// A device on a platform with no ceremony to join with is not offered the settings: it could never
+/// join them. The computers that can are offered them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_on_a_platform_with_no_ceremony_is_not_offered_the_settings() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    let reference = first_reference(&page.devices_refresh()["candidates"]);
+
+    for platform in [
+        kr_protocol::pairing::DevicePlatform::Ios,
+        kr_protocol::pairing::DevicePlatform::Android,
+        kr_protocol::pairing::DevicePlatform::Linux,
+    ] {
+        let mut without = other.listed("the-phone");
+        without.platform = platform;
+        this.hosts.list(vec![this.listed("this-mac"), without]);
+        assert_eq!(
+            page.devices_refresh()["candidates"],
+            json!([]),
+            "{platform:?}"
+        );
+        assert!(page.share(&reference).is_err(), "{platform:?}");
+    }
+    assert!(this.ceremony.reasons().is_empty(), "nobody was asked");
+
+    let mut windows = other.listed("the-pc");
+    windows.platform = kr_protocol::pairing::DevicePlatform::Windows;
+    this.hosts.list(vec![this.listed("this-mac"), windows]);
+    assert_eq!(
+        page.devices_refresh()["candidates"]
+            .as_array()
+            .expect("candidates")
+            .len(),
+        1
+    );
 }

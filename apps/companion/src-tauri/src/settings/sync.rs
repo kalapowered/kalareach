@@ -253,12 +253,28 @@ struct Record {
     /// The newest record this computer looked at, with the devices it listed, so that a device
     /// missing from the next record, or a record missed, shows that one may have been taken out.
     seen: Option<Seen>,
-    /// The revision of the settings this computer is sealing again under the newest epoch, until
-    /// the service has taken them or another device's settings have been followed. Content that
+    /// The settings this computer is sealing again under the newest epoch, until the service has
+    /// taken them or another device's settings have been followed. Content that
     /// another device wrote and that was refused to this computer while it was sealing again is
     /// that device's to continue, for nothing here was changed by the person.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    resealing: Option<SyncRevisionId>,
+    resealing: Option<Resealing>,
+}
+
+/// The settings being sealed again: the revision this computer held, and the one it put in the
+/// store to publish. A step that stops between the two finds either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Resealing {
+    from: SyncRevisionId,
+    to: SyncRevisionId,
+}
+
+impl Resealing {
+    /// Whether `revision` is one of the two.
+    fn names(&self, revision: SyncRevisionId) -> bool {
+        self.from == revision || self.to == revision
+    }
 }
 
 /// The record this computer last looked at: its epoch and revision, and the devices it listed, by
@@ -844,7 +860,9 @@ impl SettingsSync {
         let chosen = self.local.chosen_colour_mode();
         let mut held = store.object(object_id).map_err(sync_failure)?;
         // A marker for settings this computer no longer holds is spent.
-        if record.resealing.is_some() && record.resealing != held.as_ref().map(|one| one.revision) {
+        if let Some(marker) = record.resealing
+            && !held.as_ref().is_some_and(|one| marker.names(one.revision))
+        {
             record.resealing = None;
             self.keep(record)?;
         }
@@ -904,14 +922,25 @@ impl SettingsSync {
                 // it could not be compared, and every step would leave one more refused write at
                 // the service. So the service is asked first, and a computer that cannot read what
                 // it holds waits, with its choice kept, for a member to seal it again.
-                if store.checkpoint(object_id).map_err(sync_failure)?.is_none()
-                    && let Err(SyncError::Client(error)) = client
+                if store.checkpoint(object_id).map_err(sync_failure)?.is_none() {
+                    match client
                         .fetch(SyncObjectKind::Settings, object_id, now_ms)
                         .await
-                    && error.code() == ErrorCode::HostNotConfigured
-                {
-                    self.is_waiting();
-                    return Ok(());
+                    {
+                        Ok(_) => {}
+                        // The service holds nothing yet: this computer makes the first object.
+                        Err(SyncError::Client(error))
+                            if error.code() == ErrorCode::UnknownSession => {}
+                        Err(SyncError::Client(error))
+                            if error.code() == ErrorCode::HostNotConfigured =>
+                        {
+                            self.is_waiting();
+                            return Ok(());
+                        }
+                        // An answer that did not come says nothing of what the service holds, and
+                        // the first object is not made on it: the next step asks again.
+                        Err(error) => return Err(sync_failure(error)),
+                    }
                 }
                 if store
                     .checkpoint(object_id)
@@ -932,6 +961,22 @@ impl SettingsSync {
         }
         let note = store.checkpoint(object_id).map_err(sync_failure)?;
         let agreed = note.and_then(|note| note.published_revision.0);
+        // A step stopped between putting the settings sealed again in the store and hearing how
+        // their publication ended, and the service has not taken them: they are published again as
+        // they were, and what becomes of them is the same.
+        if let Some(marker) = record.resealing
+            && let Some(object) = &held
+            && object.revision == marker.to
+            && agreed == Some(marker.from)
+        {
+            let original = SyncObject {
+                revision: marker.from,
+                ..object.clone()
+            };
+            return self
+                .finish_reseal(client, record, original, chosen, now_ms)
+                .await;
+        }
         let changed = held
             .as_ref()
             .is_some_and(|object| agreed != Some(object.revision));
@@ -1079,15 +1124,33 @@ impl SettingsSync {
         chosen: Option<ColourMode>,
         now_ms: TimestampMs,
     ) -> Result<()> {
-        let object_id = held.object_id;
-        let store = client.store();
         let again = SyncObject {
             revision: fresh_revision().map_err(CommandError::from)?,
             ..held.clone()
         };
-        record.resealing = Some(held.revision);
+        record.resealing = Some(Resealing {
+            from: held.revision,
+            to: again.revision,
+        });
         self.keep(record)?;
-        store.put_object(&again).map_err(sync_failure)?;
+        client.store().put_object(&again).map_err(sync_failure)?;
+        self.finish_reseal(client, record, held, chosen, now_ms)
+            .await
+    }
+
+    /// Publishes the settings put in the store to seal `held` again, and ends the sealing by what
+    /// the service says: taken, or another device's settings followed, or the settings held put
+    /// back, with the marker left where an answer that was lost may still turn out to be one.
+    async fn finish_reseal(
+        &self,
+        client: &SyncClient,
+        record: &mut Record,
+        held: SyncObject,
+        chosen: Option<ColourMode>,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        let object_id = held.object_id;
+        let store = client.store();
         let outcome = client.publish(object_id, now_ms).await;
         if !matches!(outcome, Ok(Published::Accepted { .. })) {
             store.put_object(&held).map_err(sync_failure)?;

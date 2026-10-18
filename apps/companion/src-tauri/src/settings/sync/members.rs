@@ -34,6 +34,7 @@ use kr_client::sync::membership::{
     CollectionRef, Device, DeviceDirectory, Ended, HostAnswers, HostDevice, HostReport, Outcome,
     Refreshed, SyncMembership,
 };
+use kr_protocol::pairing::DevicePlatform;
 use kr_protocol::scalars::AuthorisationKey;
 use kr_protocol::service::installation_id;
 use serde::Serialize;
@@ -134,6 +135,9 @@ pub(super) struct Listed {
     /// The devices two hosts list with different stored-envelope keys: nothing is shared with one,
     /// because a key sealed to the wrong one of the two is a key given to whoever holds it.
     disputed: Mutex<BTreeSet<AuthorisationKey>>,
+    /// The devices a host lists on a platform that has no ceremony to join with: a phone, or a
+    /// Linux computer. Settings are not shared with one, because it could never join them.
+    cannot_join: Mutex<BTreeSet<AuthorisationKey>>,
     last: Mutex<Option<(Instant, HostAnswers)>>,
 }
 
@@ -154,6 +158,13 @@ impl Listed {
             .iter()
             .find(|(key, _)| installation_id(key) == home)
             .map(|(_, name)| name.clone())
+    }
+
+    fn cannot_join(&self, device: &AuthorisationKey) -> bool {
+        self.cannot_join
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(device)
     }
 
     fn is_disputed(&self, device: &AuthorisationKey) -> bool {
@@ -208,6 +219,7 @@ impl DeviceDirectory for HostsDirectory {
             let mut reports = Vec::new();
             let mut names = BTreeMap::new();
             let mut stored: BTreeMap<AuthorisationKey, BTreeSet<_>> = BTreeMap::new();
+            let mut cannot_join = BTreeSet::new();
             for list in &asked.lists {
                 let mut devices = Vec::new();
                 for summary in &list.devices {
@@ -222,6 +234,12 @@ impl DeviceDirectory for HostsDirectory {
                         .entry(keys.authorisation)
                         .or_default()
                         .insert(keys.stored_envelope);
+                    if !matches!(
+                        summary.platform,
+                        DevicePlatform::Macos | DevicePlatform::Windows
+                    ) {
+                        cannot_join.insert(keys.authorisation);
+                    }
                     devices.push(HostDevice {
                         authorisation: keys.authorisation,
                         stored_envelope: keys.stored_envelope,
@@ -237,6 +255,11 @@ impl DeviceDirectory for HostsDirectory {
                 .names
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = names;
+            *self
+                .listed
+                .cannot_join
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = cannot_join;
             *self
                 .listed
                 .disputed
@@ -321,7 +344,10 @@ impl SettingsSync {
             .candidates()
             .unwrap_or_default()
             .iter()
-            .filter(|device| !self.listed.is_disputed(&device.authorisation))
+            .filter(|device| {
+                !self.listed.is_disputed(&device.authorisation)
+                    && !self.listed.cannot_join(&device.authorisation)
+            })
             .map(|device| Candidate {
                 reference: installation_id_of(device),
                 name: name(device),
@@ -487,6 +513,12 @@ impl SettingsSync {
         if self.listed.is_disputed(&device.authorisation) {
             return Err(CommandError::refused(
                 "your hosts do not agree on the keys of that device, so nothing is shared with it",
+            ));
+        }
+        if self.listed.cannot_join(&device.authorisation) {
+            return Err(CommandError::refused(
+                "that device has no way to ask you to confirm yet, so it cannot join the \
+                 settings; use a Mac or a Windows computer",
             ));
         }
         let name = self

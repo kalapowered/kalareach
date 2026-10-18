@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use kr_client::pairing::link::LinkError;
 use kr_client::{ClientError, Session};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{EnvironmentId, SessionId};
@@ -200,6 +201,9 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
                         let visit = async {
                             match pairing.link.connect_paired(&host, &identity).await {
                                 Ok(session) => listed(&Arc::new(session)).await,
+                                // A host that answers with a refusal of its own is awake: it will
+                                // not list its devices to this computer, which is not a silence.
+                                Err(LinkError::Refused(_)) => Listing::Refused,
                                 Err(_) => Listing::Silent,
                             }
                         };
