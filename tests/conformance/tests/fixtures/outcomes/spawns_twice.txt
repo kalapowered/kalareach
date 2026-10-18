@@ -1,0 +1,15 @@
+// A parent that starts its helper twice, the second time without the flag.
+let first = std::process::Command::new(exe).args(["tests::is_ignored", "--exact", "--ignored"]).spawn();
+let pad_1 = 1;
+let pad_2 = 2;
+let pad_3 = 3;
+let pad_4 = 4;
+let pad_5 = 5;
+let pad_6 = 6;
+let pad_7 = 7;
+let pad_8 = 8;
+let pad_9 = 9;
+let pad_10 = 10;
+let pad_11 = 11;
+let pad_12 = 12;
+let second = std::process::Command::new(exe).args(["tests::is_ignored", "--exact"]).spawn();

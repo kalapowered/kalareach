@@ -187,17 +187,20 @@ fn missing_command(
     };
     let lines: Vec<String> = commands(&text).collect();
     let wrong = |line: &String| {
-        skipped(line, covered).or_else(|| {
-            if !contains_token(line, "--exact") {
+        let exact = contains_token(line, "--exact");
+        narrowed(line, covered, exact).or_else(|| {
+            if !exact {
                 return None;
             }
             covered
                 .iter()
                 .find(|name| match names_with {
                     None => !contains_token(line, name),
-                    Some(words) => !lines
-                        .iter()
-                        .any(|other| holds_all(other, words) && contains_token(other, name)),
+                    Some(words) => !lines.iter().any(|other| {
+                        begins_with(other, words)
+                            && holds_all(other, words)
+                            && contains_token(other, name)
+                    }),
                 })
                 .map(|name| format!("does not name {name}"))
         })
@@ -216,20 +219,72 @@ fn missing_command(
     })
 }
 
-/// Why a command, as the words of one line, leaves a test of `covered` out with `--skip`, or `None`
-/// when it leaves none: a filter selects a test whose name contains it.
-fn skipped(command: &str, covered: &BTreeSet<String>) -> Option<String> {
+/// The options of the test program that take their value as the next word.
+const VALUE_OPTIONS: [&str; 7] = [
+    "--test-threads",
+    "--color",
+    "--format",
+    "--logfile",
+    "--shuffle-seed",
+    "--report-time",
+    "--skip",
+];
+
+/// Why a command, as the words of one line, runs fewer tests than `covered` or none, or `None`
+/// when it does not: it only lists them, a `--skip` filter (as `--skip FILTER` or `--skip=FILTER`)
+/// selects one of them, or a filter that names tests by a part of their names, instead of
+/// `--exact`, leaves one of them out. A filter selects a test whose name contains it.
+fn narrowed(command: &str, covered: &BTreeSet<String>, exact: bool) -> Option<String> {
     let words: Vec<&str> = command.split_whitespace().collect();
-    words
-        .windows(2)
-        .filter(|pair| pair[0] == "--skip")
-        .find_map(|pair| {
-            let filter = pair[1].trim_matches(['"', '\'']);
-            covered
-                .iter()
-                .find(|name| name.contains(filter))
-                .map(|name| format!("skips {name} with `--skip {filter}`"))
-        })
+    if words.contains(&"--list") {
+        return Some("only lists the tests, with `--list`".to_owned());
+    }
+    let mut skips = Vec::new();
+    let mut filters = Vec::new();
+    let mut after_cargo = false;
+    let mut at = 0;
+    while at < words.len() {
+        let word = words[at];
+        if let Some(value) = word.strip_prefix("--skip=") {
+            skips.push(value);
+        } else if word == "--skip" {
+            if let Some(value) = words.get(at + 1) {
+                skips.push(value);
+            }
+            at += 1;
+        } else if !after_cargo {
+            after_cargo = word == "--";
+        } else if VALUE_OPTIONS.contains(&word) {
+            at += 1;
+        } else if word.contains(['|', '&', ';', '<', '>', '(', ')', '$']) {
+            break;
+        } else if !word.starts_with('-') {
+            filters.push(word);
+        }
+        at += 1;
+    }
+    for skip in skips {
+        let skip = skip.trim_matches(['"', '\'']);
+        if let Some(name) = covered.iter().find(|name| name.contains(skip)) {
+            return Some(format!("skips {name} with `--skip {skip}`"));
+        }
+    }
+    if !exact && !filters.is_empty() {
+        let filters: Vec<&str> = filters
+            .into_iter()
+            .map(|filter| filter.trim_matches(['"', '\'']))
+            .collect();
+        if let Some(name) = covered
+            .iter()
+            .find(|name| !filters.iter().any(|filter| name.contains(filter)))
+        {
+            return Some(format!(
+                "selects only {}, which leaves out {name}",
+                filters.join(" ")
+            ));
+        }
+    }
+    None
 }
 
 /// Why no step of the report's own plan has all of `fragments`, or does not name a test the step
@@ -241,8 +296,8 @@ fn missing_step(plan: &[String], fragments: &[&str], covered: &BTreeSet<String>)
             quoted(fragments)
         ));
     };
-    if let Some(skipped) = skipped(step, covered) {
-        return Some(format!("its step {skipped}"));
+    if let Some(narrowed) = narrowed(step, covered, contains_token(step, "--exact")) {
+        return Some(format!("its step {narrowed}"));
     }
     if contains_token(step, "--exact") {
         return covered
@@ -326,6 +381,13 @@ fn code_lines(text: &str) -> Vec<&str> {
         }
     }
     code
+}
+
+/// Whether `line` begins with the first of `words`, after an opening quote.
+fn begins_with(line: &str, words: &[&str]) -> bool {
+    words
+        .first()
+        .is_some_and(|first| line.trim_start_matches('"').starts_with(first))
 }
 
 fn holds_all(line: &str, fragments: &[&str]) -> bool {

@@ -942,14 +942,52 @@ fn a_command_names_its_tests_where_it_selects_them_and_leaves_none_out() {
         echoed.problems
     );
 
-    // A filter that skips a test the entry covers leaves it out.
-    let skipping = held_to(&[command("skipping.sh")]);
-    assert_eq!(skipping.problems.len(), 1, "{:?}", skipping.problems);
+    // A line that has the call's words, but does not begin with them, does not pass a name.
+    let echoed_call = held_to(&[supplied("echoed_call.sh")]);
+    assert_eq!(echoed_call.problems.len(), 1, "{:?}", echoed_call.problems);
+
+    // A filter that skips a test the entry covers leaves it out, in either form of the flag.
+    for file in ["skipping.sh", "skipping_equals.sh"] {
+        let skipping = held_to(&[command(file)]);
+        assert_eq!(
+            skipping.problems.len(),
+            1,
+            "{file}: {:?}",
+            skipping.problems
+        );
+        assert!(
+            skipping.problems[0].contains("skips tests::is_ignored_too"),
+            "{file}: {:?}",
+            skipping.problems
+        );
+    }
+
+    // A command that only lists the tests, or selects by a part of their names that one of them
+    // lacks, runs fewer than the entry covers.
+    let by_part = |file| {
+        outcomes_entry(
+            &[],
+            Runs::Command {
+                file,
+                fragments: &["--ignored"],
+            },
+        )
+    };
+    let listing = held_to(&[by_part("listing.sh")]);
+    assert_eq!(listing.problems.len(), 1, "{:?}", listing.problems);
     assert!(
-        skipping.problems[0].contains("skips tests::is_ignored_too"),
+        listing.problems[0].contains("only lists"),
         "{:?}",
-        skipping.problems
+        listing.problems
     );
+    let filtered = held_to(&[by_part("filtered.sh")]);
+    assert_eq!(filtered.problems.len(), 1, "{:?}", filtered.problems);
+    assert!(
+        filtered.problems[0].contains("leaves out tests::is_ignored"),
+        "{:?}",
+        filtered.problems
+    );
+    assert!(held_to(&[by_part("filtered_all.sh")]).problems.is_empty());
 }
 
 #[test]
@@ -963,6 +1001,36 @@ fn a_helper_is_named_beside_the_flags_that_ask_for_it() {
         far.problems[0].contains("starts tests::is_ignored without"),
         "{:?}",
         far.problems
+    );
+    // Every start of a helper needs its own flags, not only one of them.
+    let one = |file| {
+        [
+            outcomes_entry(&["tests::is_ignored"], Runs::Helper { file }),
+            outcomes_entry(
+                &[
+                    "tests::is_ignored_too",
+                    "tests::is_ignored_for_a_reason_over_two_lines",
+                ],
+                Runs::ByHand {
+                    why: "a person does",
+                },
+            ),
+        ]
+    };
+    let twice = held_to(&one("spawns_twice.txt"));
+    assert_eq!(twice.problems.len(), 1, "{:?}", twice.problems);
+    assert!(
+        twice.problems[0].contains("starts tests::is_ignored without"),
+        "{:?}",
+        twice.problems
+    );
+    // A reason an ignore gives, over several lines, is not code that asks for a helper.
+    let reason = held_to(&one("reason.txt"));
+    assert_eq!(reason.problems.len(), 1, "{:?}", reason.problems);
+    assert!(
+        reason.problems[0].contains("starts tests::is_ignored without"),
+        "{:?}",
+        reason.problems
     );
 }
 

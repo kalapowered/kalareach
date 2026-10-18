@@ -197,14 +197,6 @@ measurement_in() {
   fi
 }
 
-measurement() {
-  measurement_in --test performance "$1"
-}
-
-input_measurement() {
-  measurement_in --bench input_latency "$1"
-}
-
 failed=0
 
 # The suite's own regressions, before the measurements. What closes the sessions a run creates is
@@ -242,10 +234,10 @@ else
   grep -E "^test " <<<"$regressions" || true
 fi
 
-measurement attach_to_a_usable_screen || failed=1
-input_measurement added_input_forwarding_latency || failed=1
-input_measurement paste_prefix_recogniser_deadline || failed=1
-measurement idle_resources_for_twenty_sessions_and_thirty_two_views || failed=1
+measurement_in --test performance attach_to_a_usable_screen || failed=1
+measurement_in --bench input_latency added_input_forwarding_latency || failed=1
+measurement_in --bench input_latency paste_prefix_recogniser_deadline || failed=1
+measurement_in --test performance idle_resources_for_twenty_sessions_and_thirty_two_views || failed=1
 
 echo
 if ! check_no_survivors; then

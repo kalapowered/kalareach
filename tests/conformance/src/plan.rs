@@ -1592,14 +1592,15 @@ pub enum Runs {
         fragments: &'static [&'static str],
     },
     /// A command as for [`Runs::Command`] whose test names are not on its own line, because a call
-    /// or a list passes them: each test the entry covers is named on a line that holds every one of
-    /// `names_with`, such as the call that hands the name to the command.
+    /// or a list passes them: each test the entry covers is named on a line that begins with the
+    /// first of `names_with` (after an opening quote) and holds the rest, such as the call that
+    /// hands the name to the command.
     Supplied {
         /// The file, relative to the repository.
         file: &'static str,
         /// The words the command holds.
         fragments: &'static [&'static str],
-        /// The words each line that names a test holds.
+        /// The words each line that names a test holds, the first of them at its start.
         names_with: &'static [&'static str],
     },
     /// A step of this report's own plan on Linux, whose command holds every one of `fragments`.
@@ -1768,7 +1769,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         runs: Runs::Supplied {
             file: ".github/workflows/core-ci.yml",
             fragments: &[
-                "cargo test --locked -p \"$package\" \"${selector[@]}\" -- --ignored --exact",
+                "cargo test --locked -p \"$package\" \"${selector[@]}\" -- --ignored --exact --color never \"$check\"",
             ],
             names_with: &["kr-changeset capture"],
         },
@@ -1780,7 +1781,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         runs: Runs::Supplied {
             file: ".github/workflows/core-ci.yml",
             fragments: &[
-                "cargo test --locked -p \"$package\" \"${selector[@]}\" -- --ignored --exact",
+                "cargo test --locked -p \"$package\" \"${selector[@]}\" -- --ignored --exact --color never \"$check\"",
             ],
             names_with: &["kr-transfer authority"],
         },
@@ -1792,7 +1793,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         runs: Runs::Supplied {
             file: ".github/workflows/core-ci.yml",
             fragments: &[
-                "cargo test --locked -p \"$package\" \"${selector[@]}\" -- --ignored --exact",
+                "cargo test --locked -p \"$package\" \"${selector[@]}\" -- --ignored --exact --color never \"$check\"",
             ],
             names_with: &["kr-project workspaces"],
         },
@@ -1884,7 +1885,11 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &["a_viewer_reaches_only_the_distribution_it_was_paired_with"],
         runs: Runs::Supplied {
             file: "scripts/e2e-wsl.sh",
-            fragments: &["$pairing_suite_path", "--ignored --exact"],
+            fragments: &[
+                "wsl.exe -d \"$distribution\"",
+                "--exec /bin/sh -lc",
+                "'$pairing_suite_path' --ignored --exact --nocapture --test-threads 1 $name",
+            ],
             names_with: &["pairing_case"],
         },
     },
@@ -1909,7 +1914,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
                 "-p kr-worker \"$target_flag\" \"$target\"",
                 "--ignored --exact --nocapture \"$name\"",
             ],
-            names_with: &["measurement"],
+            names_with: &["measurement_in --test performance"],
         },
     },
     IgnoredRun {
@@ -1930,7 +1935,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
                 "-p kr-worker \"$target_flag\" \"$target\"",
                 "--ignored --exact --nocapture \"$name\"",
             ],
-            names_with: &["input_measurement"],
+            names_with: &["measurement_in --bench input_latency"],
         },
     },
     IgnoredRun {

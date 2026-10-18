@@ -1,0 +1,6 @@
+// The reason an ignore gives runs over two lines and speaks of the flags; the parent below
+// starts its helper without them.
+#[ignore = "needs a device; run it with \
+    --ignored --exact"]
+fn the_parent() {}
+let helper = std::process::Command::new(exe).args(["tests::is_ignored"]).spawn();
