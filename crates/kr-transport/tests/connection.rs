@@ -355,6 +355,74 @@ async fn an_offer_with_no_shared_major_is_refused_as_an_unsupported_schema() {
     assert!(admitted.is_err(), "the host refused too");
 }
 
+/// KR-REQ-20.24: a host lists the versions of the majors its table has not retired, so a major the
+/// table retires is no longer negotiated, through the real handshake, and the major the host still
+/// lists is. The real table retires none; the table here is one a later build might carry.
+#[tokio::test]
+async fn a_major_the_table_retires_is_no_longer_negotiated() {
+    use kr_protocol::hello::{PublicMajor, supported_versions_of};
+
+    const TWO: ProtocolVersion = ProtocolVersion::new(2, 0);
+    let table = [
+        PublicMajor {
+            major: 1,
+            versions: &[kr_protocol::hello::PROTOCOL_VERSION],
+            replaced: Some("2030-01-01"),
+            supported_until: Some("2031-01-01"),
+            retired: true,
+        },
+        PublicMajor {
+            major: 2,
+            versions: &[TWO],
+            replaced: None,
+            supported_until: None,
+            retired: false,
+        },
+    ];
+    assert_eq!(supported_versions_of(&table), vec![TWO]);
+
+    // An old client that offers only the retired major is refused.
+    let (mut host, client) = paired_pair().await;
+    Arc::get_mut(&mut host.identity)
+        .expect("the identity is not shared yet")
+        .supported_versions = supported_versions_of(&table);
+    let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let error = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect_err("a refusal");
+    let TransportError::Refused(error) = error else {
+        panic!("a retired major is the host's refusal, not {error}");
+    };
+    assert_eq!(error.code, ErrorCode::UnsupportedSchema);
+    let (_connection, admitted) = accepting.await.expect("the host task");
+    assert!(admitted.is_err(), "the host refused too");
+
+    // The control: a client that offers the major the host still lists is admitted.
+    let (mut host, mut client) = paired_pair().await;
+    Arc::get_mut(&mut host.identity)
+        .expect("the identity is not shared yet")
+        .supported_versions = supported_versions_of(&table);
+    Arc::get_mut(&mut client.identity)
+        .expect("the identity is not shared yet")
+        .supported_versions = vec![TWO];
+    let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect("the major the host lists is negotiated");
+    let (_connection, admitted) = accepting.await.expect("the host task");
+    assert!(admitted.is_ok(), "the host admitted it");
+}
+
 #[tokio::test]
 async fn a_send_queue_too_small_for_a_transfer_is_refused_at_hello() {
     // A connection that could never be handed an attachment frame is not established. Both sides

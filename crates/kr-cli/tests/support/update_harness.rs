@@ -485,7 +485,11 @@ impl Assembled {
                     version: FloorVersion { major: 1, minor: 0 },
                 },
                 protocol_version,
-                public_majors: vec![1],
+                public_majors: kr_protocol::hello::PUBLIC_MAJORS
+                    .iter()
+                    .filter(|row| !row.retired)
+                    .map(|row| row.major)
+                    .collect(),
                 retained_levels: vec![retained],
                 shells: Vec::new(),
                 stores: release_stores(),

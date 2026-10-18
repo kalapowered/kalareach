@@ -66,6 +66,56 @@ impl core::fmt::Display for ProtocolVersion {
 /// The protocol version this build implements.
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
 
+/// One public major of the protocol, the versions of it a host lists and a client offers, and
+/// where it stands in the support window (`docs/releases/support-window.md`).
+///
+/// Dates are ISO 8601 text, so that this library carries no date type and reads no clock: what a
+/// date means is checked where the table is tested, and a release that retires a major is the only
+/// thing that stops it being negotiated. A row is never deleted, and while it is not retired its
+/// versions only grow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicMajor {
+    /// The major number.
+    pub major: u16,
+    /// The versions of it this build lists, which [`select_version`] matches exactly.
+    pub versions: &'static [ProtocolVersion],
+    /// The day a later major replaced this one, once one has. It is set once and never changes.
+    pub replaced: Option<&'static str>,
+    /// The day until which this major is supported, at least twelve months after `replaced`; it
+    /// only moves later.
+    pub supported_until: Option<&'static str>,
+    /// Whether this build stops negotiating the major. A major is retired only after its
+    /// `supported_until` has passed, in a release built after it had.
+    pub retired: bool,
+}
+
+/// Every public major this build has known, with where each stands. Major 1 is the current one and
+/// has not been replaced.
+pub const PUBLIC_MAJORS: &[PublicMajor] = &[PublicMajor {
+    major: 1,
+    versions: &[PROTOCOL_VERSION],
+    replaced: None,
+    supported_until: None,
+    retired: false,
+}];
+
+/// The versions a host lists and a client offers for `majors`: every version of each row that is
+/// not retired.
+#[must_use]
+pub fn supported_versions_of(majors: &[PublicMajor]) -> Vec<ProtocolVersion> {
+    majors
+        .iter()
+        .filter(|row| !row.retired)
+        .flat_map(|row| row.versions.iter().copied())
+        .collect()
+}
+
+/// The versions this build lists and offers.
+#[must_use]
+pub fn supported_versions() -> Vec<ProtocolVersion> {
+    supported_versions_of(PUBLIC_MAJORS)
+}
+
 /// A version of the protocol package: the number both generated packages are published under.
 ///
 /// It moves with the wire types, which the public [`ProtocolVersion`] does not. Below 1.0.0 every

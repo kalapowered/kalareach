@@ -30,6 +30,8 @@ testing = []
 
 [dev-dependencies]
 hex.workspace = true
+# The support window's rules read days and add twelve months to one.
+jiff.workspace = true
 
 [lints]
 workspace = true

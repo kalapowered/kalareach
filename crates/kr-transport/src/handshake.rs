@@ -100,7 +100,7 @@ impl LocalIdentity {
             build_id,
             capabilities: CanonicalSet::new(),
             max_receive: ReceiveLimits::default(),
-            supported_versions: vec![PROTOCOL_VERSION],
+            supported_versions: kr_protocol::hello::supported_versions(),
             extensions: extension::implemented(),
         }
     }

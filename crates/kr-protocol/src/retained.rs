@@ -210,6 +210,8 @@ pub struct RetainedLevel {
     pub declared: &'static [Declared],
     /// The differences that need none.
     pub compatible: &'static [Compatible],
+    /// The table of public majors the release had (`PUBLIC_MAJORS`), where it had one.
+    pub public_majors: Option<&'static str>,
     parsed: OnceLock<Surface>,
 }
 
@@ -231,8 +233,16 @@ impl RetainedLevel {
             plugin_host,
             declared,
             compatible,
+            public_majors: None,
             parsed: OnceLock::new(),
         }
+    }
+
+    /// This level with the table of public majors its release recorded.
+    #[must_use]
+    pub const fn with_public_majors(mut self, recorded: &'static str) -> Self {
+        self.public_majors = Some(recorded);
+        self
     }
 
     /// The surface this level kept.
