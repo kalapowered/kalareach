@@ -3,9 +3,9 @@
 
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::authority::{HistoryFilter, MethodEntry, RequiredAuthority, ResourceSelectorKind};
-use kr_protocol::envelope::{ControlFrame, MutationRequest, ParamsValue};
+use kr_protocol::envelope::{ControlFrame, MutationRequest, ParamsValue, Request};
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{AuthorityRevision, RequestId, SessionId};
+use kr_protocol::ids::{AuthorityRevision, GrantId, RequestId, SessionId};
 use kr_protocol::method::{Method, MethodGroup};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::CanonicalSet;
@@ -116,6 +116,20 @@ impl RemoteConnection {
             .await
     }
 
+    /// The session a read is decided over: the one it names, or, for an `action.read` that names an
+    /// action only, the one this host recorded the action's route to.
+    pub(super) fn read_session(
+        &self,
+        request: &Request,
+        entry: &'static MethodEntry,
+    ) -> Option<SessionId> {
+        session_of(&request.params, entry).ok().or_else(|| {
+            (entry.method == Method::ActionRead)
+                .then(|| self.receipt_session(request))
+                .flatten()
+        })
+    }
+
     /// Decides one mutation of this device's, under the grant it acts under.
     ///
     /// A delegation acts under the share it delegates from, which its parameters name, and a
@@ -127,9 +141,8 @@ impl RemoteConnection {
         mutation: &MutationRequest,
         entry: &'static MethodEntry,
     ) -> std::result::Result<Asked, ProtocolError> {
-        let session_id = mutation.target.session_id.as_ref().copied();
+        let (session_id, named) = mutation_subject(mutation);
         let claims_geometry = claims_geometry(mutation);
-        let named = mutation.grant_id.as_ref().copied();
         let invalid = |error: kr_cbor::CborError| {
             ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
         };
@@ -885,6 +898,20 @@ pub(super) fn claims_geometry(mutation: &MutationRequest) -> bool {
     matches!(
         map.get("claim_geometry"),
         Some(kr_cbor::CanonicalValue::Bool(true))
+    )
+}
+
+/// The session a mutation names in its target and the grant it names in its envelope, which is
+/// what the decision of an ordinary mutation is made over ([`RemoteConnection::ask_mutation`]; a
+/// delegation is decided under the grant its parameters name, and a revocation under a share the
+/// grants select).
+///
+/// The parameters are not read: [`RemoteConnection::check_envelope`] compares them with the target
+/// only after the decision, so a decision that has noted a share has already been made by then.
+pub(super) fn mutation_subject(mutation: &MutationRequest) -> (Option<SessionId>, Option<GrantId>) {
+    (
+        mutation.target.session_id.as_ref().copied(),
+        mutation.grant_id.as_ref().copied(),
     )
 }
 

@@ -636,24 +636,34 @@ impl NetworkHost {
         // The guard owns the relay's abort handle, so a handler the transport drops still stops it.
         // A detached relay would hold this connection and its controller for as long as it waited.
         guard.relay = Some(relay.abort_handle());
+        // What the loop has read of the device's stream and not yet served, in the order sent: the
+        // frames a key went ahead of that were read while a request was answered. `None` stands for
+        // the end of the stream.
+        let mut backlog: std::collections::VecDeque<Option<kr_protocol::envelope::ControlFrame>> =
+            std::collections::VecDeque::new();
         loop {
-            tokio::select! {
-                frame = session.control.recv() => {
-                    let Some(frame) = frame else { break };
-                    let Some(answer) = remote.answer(frame).await else {
-                        break;
-                    };
-                    if !remote.write_answer(answer).await {
-                        break;
-                    }
-                }
-                // The relay stopping ends this connection. It stops when its link to the worker
-                // went, when the authority behind it was withdrawn, or when the device fell far
-                // enough behind that holding more of the session's output for it would have become
-                // the worker's problem. Either way the subscription is gone, and section 8 has the
-                // device reconnect and restore its state from the cursor it holds rather than go
-                // on against a stream that has stopped without saying so.
-                _ = &mut relay => break,
+            // The relay stopping ends this connection. It stops when its link to the worker went,
+            // when the authority behind it was withdrawn, or when the device fell far enough behind
+            // that holding more of the session's output for it would have become the worker's
+            // problem. Either way the subscription is gone, and section 8 has the device reconnect
+            // and restore its state from the cursor it holds rather than go on against a stream
+            // that has stopped without saying so.
+            if relay.is_finished() {
+                break;
+            }
+            let frame = match backlog.pop_front() {
+                Some(read) => read,
+                None => tokio::select! {
+                    frame = session.control.recv() => frame,
+                    _ = &mut relay => break,
+                },
+            };
+            let Some(frame) = frame else { break };
+            if !remote
+                .serve_frame(&mut session.control, &mut backlog, frame)
+                .await
+            {
+                break;
             }
         }
         relay.abort();

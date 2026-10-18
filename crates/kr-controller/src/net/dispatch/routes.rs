@@ -15,7 +15,7 @@ use super::super::proxy::Vouched;
 use crate::error::Result;
 
 use super::super::Retained;
-use super::decision::{Answered, Asked, refuses_a_working_tree, session_of};
+use super::decision::{Answered, Asked, refuses_a_working_tree};
 use super::forwarding::RouteRefusal;
 use super::{RemoteConnection, failure, outcome_unknown};
 
@@ -294,11 +294,7 @@ impl RemoteConnection {
         // An `action.read` that names an action only is decided over the session the action was
         // performed on, so what the decision carries at the write boundary is the authority over
         // that session.
-        let named = session_of(&request.params, entry).ok().or_else(|| {
-            (entry.method == Method::ActionRead)
-                .then(|| self.receipt_session(request))
-                .flatten()
-        });
+        let named = self.read_session(request, entry);
         // A read never claims geometry: the condition on `terminal.geometry` is about a request
         // that claims or adds a claim, and only a mutation does either.
         let decided = match self.ask(named, entry, false) {
