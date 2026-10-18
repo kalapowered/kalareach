@@ -460,7 +460,9 @@ for name, version, checksum in registry:
         fail("%s has digest %s and Cargo.lock pins %s" % (os.path.basename(path), actual, checksum))
     crates[(name, version)] = data
 
-git_env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+git_env = {name: value for name, value in os.environ.items()
+           if name not in ("GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS")}
+git_env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
 
 
 def git(*args, directory=None, binary=False):
@@ -715,9 +717,11 @@ startup=$(digest "$package/$m_startup") $m_startup"
     # A tree with a Cargo.lock is built from the sources the lock names, checked and laid out here,
     # and cargo reaches no server after this. The cargo home is the build's own, so the
     # configuration and credentials the account keeps in its own are not read, and a source that
-    # was not placed cannot be fetched. Cargo also reads a .cargo/config.toml in each parent of
-    # the scratch directory and its own library reads the account's git configuration and
-    # attributes; those belong to the account that runs the build, as its PATH does.
+    # was not placed cannot be fetched. Cargo still reads a .cargo/config.toml (or .cargo/config)
+    # in each parent of the scratch directory, which is the account's own cargo configuration when
+    # TMPDIR lies under its home, and its library reads the account's git configuration and
+    # attributes. Those belong to the account that runs the build, as its PATH does, on a host
+    # where no other account can write a parent of the scratch directory.
     local -a cargo_env=()
     if [ -f "$source_tree/Cargo.lock" ]; then
         local cargo_dir="$work/cargo"

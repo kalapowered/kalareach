@@ -115,7 +115,16 @@ impl Tree {
             .arg(self.sources.parent().expect("the prefix"))
             .current_dir(&self.root)
             .env_remove("NO_PROXY")
-            .env_remove("no_proxy");
+            .env_remove("no_proxy")
+            // Git configuration passed in the environment that would send the import's local
+            // repositories nowhere: the import must not read it.
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "url.file:///nonexistent/.insteadOf")
+            .env("GIT_CONFIG_VALUE_0", "file:///")
+            .env(
+                "GIT_CONFIG_PARAMETERS",
+                "'url.file:///nonexistent/.insteadOf=file:///'",
+            );
         for name in [
             "HTTPS_PROXY",
             "https_proxy",
