@@ -70,8 +70,12 @@ const WRAPPERS: &[&str] = &["Nullable", "CanonicalSet"];
 /// with why.
 const EXCLUDED: &[(&str, &str)] = &[];
 
+/// The digest a [`Same`] entry names for a root that is no longer followed, because the rule that
+/// made it a root is gone.
+const REMOVED: &str = "removed";
+
 /// A change to a rule that a reviewer found leaves what the level accepts as it was: the root, the
-/// digest it now has, and why.
+/// digest it now has ([`REMOVED`] when the rule is gone), and why.
 struct Same {
     root: &'static str,
     digest: &'static str,
@@ -194,10 +198,30 @@ fn the_rules_of_the_surface_are_the_ones_the_previous_release_had() {
     for level in &RETAINED {
         let recorded = read_record(level, "sources.json");
         let recorded = recorded["roots"].as_object().expect("a record of roots");
+        // A rule the previous release had that this tree does not follow any more (a decoder
+        // written by hand that a derive replaced, a type renamed) is a change in what is accepted
+        // unless a reviewer says otherwise.
+        for label in recorded.keys() {
+            if !followed.contains_key(label.as_str()) && same_for(label, REMOVED).is_none() {
+                problems.push(format!(
+                    "level {}: {label} had a rule recorded and this tree follows none",
+                    level.level
+                ));
+            }
+        }
         for (label, now) in &followed {
-            // A rule the previous release did not have (a type or a macro added since) is not a
-            // difference from it.
             let Some(before) = recorded.get(label.as_str()) else {
+                // A type the previous release's surface held without a rule of its own, and that
+                // has one now, accepts what it did not before. A type or a macro the surface did
+                // not hold is not a difference from it.
+                if level.surface().definition(label).is_some()
+                    && same_for(label, &now.digest).is_none()
+                {
+                    problems.push(format!(
+                        "level {}: {label} is a type of the surface that had no rule of its own and has one now (digest {})",
+                        level.level, now.digest
+                    ));
+                }
                 continue;
             };
             let before = before["digest"].as_str().unwrap_or_default();
@@ -218,7 +242,11 @@ fn the_rules_of_the_surface_are_the_ones_the_previous_release_had() {
     }
     for entry in SAME {
         let now = followed.get(entry.root);
-        if now.is_none_or(|now| now.digest != entry.digest) {
+        let matches = match now {
+            Some(now) => now.digest == entry.digest,
+            None => entry.digest == REMOVED,
+        };
+        if !matches {
             problems.push(format!(
                 "a Same entry for {} matches no digest now ({})",
                 entry.root, entry.reason
@@ -505,6 +533,33 @@ fn a_name_behind_another_crate_that_cannot_be_followed_is_an_error() {
     let error = Tree::at(copy.path())
         .expect("the copy")
         .follow("kr_protocol", &["opaque_id"])
+        .err()
+        .expect("an error");
+    assert!(error.contains("kr_cbor::nothing_of_this_name"), "{error}");
+}
+
+/// The same holds for a path written inside a serde attribute: it names another crate of the
+/// workspace, and is followed there or is an error.
+#[test]
+fn a_serde_path_behind_another_crate_that_cannot_be_followed_is_an_error() {
+    let copy = tempfile::tempdir().expect("a temporary directory");
+    copy_crates(
+        &repository(),
+        copy.path(),
+        &["kr-protocol", "kr-cbor", "kr-worker"],
+    );
+    let local = copy.path().join("crates/kr-protocol/src/local.rs");
+    let text = std::fs::read_to_string(&local).expect("local.rs");
+    let changed = text.replacen(
+        "#[serde(with = \"worker_rights\")]",
+        "#[serde(with = \"kr_cbor::nothing_of_this_name\")]",
+        1,
+    );
+    assert_ne!(text, changed, "the attribute is where this test expects it");
+    std::fs::write(&local, changed).expect("write");
+    let error = Tree::at(copy.path())
+        .expect("the copy")
+        .follow("kr_protocol", &["ForwardedMutation"])
         .err()
         .expect("an error");
     assert!(error.contains("kr_cbor::nothing_of_this_name"), "{error}");

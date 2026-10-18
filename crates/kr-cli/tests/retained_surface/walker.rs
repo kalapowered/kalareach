@@ -947,7 +947,21 @@ impl Collector<'_> {
                             !name.is_empty()
                                 && name.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
                         }) {
-                            self.refs.push(Ref::Attribute(segments));
+                            // A path into another crate of the workspace is followed there, like
+                            // any other path that names one.
+                            match segments.split_first() {
+                                Some((first, rest))
+                                    if !rest.is_empty()
+                                        && self.workspace.contains(first)
+                                        && first != self.own =>
+                                {
+                                    self.refs.push(Ref::In {
+                                        krate: first.clone(),
+                                        names: rest.to_vec(),
+                                    });
+                                }
+                                _ => self.refs.push(Ref::Attribute(segments)),
+                            }
                         }
                     }
                 }

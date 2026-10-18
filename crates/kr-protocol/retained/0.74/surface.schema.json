@@ -1600,6 +1600,9 @@
       "pattern": "^([A-Za-z0-9_-]{4})*([A-Za-z0-9_-][AQgw]|[A-Za-z0-9_-]{2}[AEIMQUYcgkosw048])?$",
       "type": "string"
     },
+    "CallerToken": {
+      "$ref": "#/$defs/Bytes"
+    },
     "CapabilityId": {
       "maxLength": 256,
       "minLength": 1,
@@ -5249,6 +5252,37 @@
         }
       ]
     },
+    "QuestionReadOwnParams": {
+      "additionalProperties": false,
+      "properties": {
+        "caller_token": {
+          "$ref": "#/$defs/CallerToken"
+        },
+        "question_id": {
+          "$ref": "#/$defs/QuestionId"
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "wait_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DurationMs"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "session_id",
+        "question_id",
+        "caller_token",
+        "wait_ms"
+      ],
+      "type": "object"
+    },
     "QuestionReadParams": {
       "additionalProperties": false,
       "properties": {
@@ -6686,6 +6720,7 @@
     "ControlFrame",
     "EventsSnapshotParams",
     "EventsSnapshotResult",
+    "QuestionReadOwnParams",
     "QuestionReadParams",
     "QuestionReadResult",
     "ReceiptResponse",

@@ -66,6 +66,7 @@ pub const SURFACE_ROOTS: &[&str] = &[
     "ControlFrame",
     "EventsSnapshotParams",
     "EventsSnapshotResult",
+    "QuestionReadOwnParams",
     "QuestionReadParams",
     "QuestionReadResult",
     "ReceiptResponse",
@@ -97,9 +98,11 @@ pub const FROZEN_ROOTS: &[&str] = &[
     "WorkerVerifyProof",
 ];
 
-/// The variants frozen in unions that are otherwise the level's: the keys of the frames above, and
-/// the refusals that go out in this build's shape to a worker whose level is not recorded. Each is
-/// a place of a [`Difference`] up to the next `.`, `#` or `[`.
+/// The variants and members frozen in definitions that are otherwise the level's: the keys of the
+/// frames above, the refusals that go out in this build's shape to a worker whose level is not
+/// recorded, and the session a running worker's first question names, which the daemon reads before
+/// it knows the level to read the rest under. Each is a place of a [`Difference`] up to the next
+/// `.`, `#` or `[`.
 pub const FROZEN_VARIANTS: &[&str] = &[
     "ControlFrame#key:draft_answer",
     "ControlFrame#key:draft_wanted",
@@ -114,7 +117,9 @@ pub const FROZEN_VARIANTS: &[&str] = &[
     "ControlFrame#key:verify_challenge",
     "ControlFrame#key:verify_proof",
     "DraftAnswer#key:refused",
+    "DraftWanted.session_id",
     "PluginRuntimeState#key:unavailable",
+    "PluginRuntimeWanted.session_id",
 ];
 
 /// The protocol the plugin host speaks to the workers that register with it.
@@ -390,13 +395,19 @@ pub struct Assessment {
     pub rewritten_but_frozen: Vec<Difference>,
     /// Entries that match no difference.
     pub stale: Vec<&'static str>,
+    /// Frozen definitions that the retained surface or this build's lacks, so that a change to
+    /// them could not be seen.
+    pub absent: Vec<String>,
 }
 
 impl Assessment {
     /// Whether the entries cover every difference and nothing else.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.uncovered.is_empty() && self.rewritten_but_frozen.is_empty() && self.stale.is_empty()
+        self.uncovered.is_empty()
+            && self.rewritten_but_frozen.is_empty()
+            && self.stale.is_empty()
+            && self.absent.is_empty()
     }
 }
 
@@ -413,6 +424,12 @@ impl fmt::Display for Assessment {
         }
         for at in &self.stale {
             writeln!(formatter, "an entry matches no difference: {at}")?;
+        }
+        for name in &self.absent {
+            writeln!(
+                formatter,
+                "a frozen definition is not in both surfaces, so a change to it would not be seen: {name}"
+            )?;
         }
         Ok(())
     }
@@ -437,6 +454,11 @@ pub fn assess(
         .unwrap_or_default();
     let found = differences(old, new);
     let mut assessment = Assessment::default();
+    for root in FROZEN_ROOTS {
+        if old.definition(root).is_none() || new.definition(root).is_none() {
+            assessment.absent.push((*root).to_owned());
+        }
+    }
     let mut matched: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for difference in &found {
         let is_frozen = frozen.contains(difference.definition())
@@ -490,6 +512,12 @@ fn within(at: &str, place: &str) -> bool {
 /// Returns one line for each problem.
 pub fn check() -> Result<(), Vec<String>> {
     let mut problems = Vec::new();
+    let kept: Vec<CompatibilityLevel> = RETAINED.iter().map(|retained| retained.level).collect();
+    if kept != RETAINED_WORKER_LEVELS {
+        problems.push(format!(
+            "RETAINED holds levels {kept:?}, and RETAINED_WORKER_LEVELS lists {RETAINED_WORKER_LEVELS:?}"
+        ));
+    }
     for retained in &RETAINED {
         let assessment = assess(
             retained.surface(),

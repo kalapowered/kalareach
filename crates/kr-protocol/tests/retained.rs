@@ -277,6 +277,82 @@ fn a_difference_in_what_is_frozen_takes_a_compatible_entry_and_never_a_rewrite()
     );
 }
 
+/// What is written beside a reference is part of the place: a bound added beside an unchanged
+/// reference is a difference.
+#[test]
+fn a_keyword_beside_a_reference_is_compared() {
+    let old = old_surface();
+    let bounded = edited(&old, |definitions| {
+        definitions["ReceiptResponse"]["properties"]["receipt"]["maxLength"] = serde_json::json!(4);
+    });
+    let found = differences(&old, &bounded);
+    assert!(
+        found
+            .iter()
+            .any(|difference| difference.at == "ReceiptResponse.receipt"),
+        "{found:?}"
+    );
+    assert_eq!(differences(&old, &old), Vec::<Difference>::new());
+}
+
+/// The session a running worker's first question names is read before the daemon knows the level
+/// the rest is read under, so a change to it takes a compatibility entry and never a rewrite, as
+/// the keys of the frames do.
+#[test]
+fn the_session_a_running_workers_question_names_is_frozen() {
+    let old = old_surface();
+    for question in ["PluginRuntimeWanted", "DraftWanted"] {
+        let changed = edited(&old, |definitions| {
+            definitions[question]["properties"]["session_id"] =
+                serde_json::json!({"type": "string"});
+        });
+        let place: &'static str = if question == "DraftWanted" {
+            "DraftWanted.session_id"
+        } else {
+            "PluginRuntimeWanted.session_id"
+        };
+        let rewritten = assess(
+            &old,
+            &changed,
+            &[Declared {
+                at: place,
+                write: keep,
+                read: keep,
+                golden: &[],
+            }],
+            &[],
+        );
+        assert!(
+            rewritten
+                .rewritten_but_frozen
+                .iter()
+                .any(|found| found.at == place),
+            "{question}: {rewritten}"
+        );
+    }
+}
+
+/// A frozen definition that a surface lacks is a change that could not be seen, and is reported.
+#[test]
+fn a_frozen_definition_a_surface_lacks_is_reported() {
+    let without: Vec<&str> = kr_protocol::retained::SURFACE_ROOTS
+        .iter()
+        .copied()
+        .filter(|root| *root != "QuestionReadOwnParams")
+        .collect();
+    let lacking = Surface::cut(&kr_protocol::schema::protocol_schema(), &without)
+        .expect("the surface without the membership probe");
+    let found = assess(&lacking, current(), &[], &[]);
+    assert!(
+        found
+            .absent
+            .iter()
+            .any(|name| name == "QuestionReadOwnParams"),
+        "{found}"
+    );
+    assert!(assess(current(), current(), &[], &[]).is_clean());
+}
+
 fn stated(minor: u16, patch: u16) -> LocalBuild {
     LocalBuild {
         build_id: BuildId::new("kr-worker/0.1.0").expect("a build identifier"),
@@ -515,5 +591,62 @@ fn dropping(member: &'static str) -> impl Fn(Entries) -> Entries {
             .into_iter()
             .filter(|(name, _)| name != member)
             .collect()
+    }
+}
+
+/// A receipt as a worker keeps it.
+fn a_kept_receipt() -> kr_protocol::receipt::Receipt {
+    kr_protocol::receipt::Receipt {
+        action_id: kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16])),
+        actor_id: kr_protocol::ids::ActorId::new("device:test").expect("a principal"),
+        method: kr_protocol::method::Method::SessionClose.into(),
+        method_version: kr_protocol::method::MethodVersion::V1,
+        revision: U64::new(2),
+        state: kr_protocol::receipt::ReceiptState::Applied,
+        reason: Nullable::null(),
+        payload_digest: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
+        accepted_deadline_ms: Nullable::null(),
+        error: Nullable::null(),
+        error_withheld: false,
+        updated_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+    }
+}
+
+/// What a worker answers `action.read` with reads under the level it retains whatever the result it
+/// kept looks like: none, a map, an array, a text. The surface says the result is opaque, so the
+/// walk leaves it to the typed layer; a level that refused a kept result would fail a device's
+/// retry across an update. While the retained surface and this build's are the same, each answer
+/// reads the same under both.
+#[test]
+fn a_kept_answer_reads_under_the_retained_level_as_it_reads_under_this_one() {
+    use kr_protocol::envelope::ParamsValue;
+    use kr_protocol::receipt::ActionReadResult;
+
+    let retained = Level::retained(&kr_protocol::retained::RETAINED[0]);
+    let map = CanonicalValue::Map(
+        CanonicalMap::from_entries([("state".to_owned(), CanonicalValue::text("closing"))])
+            .expect("a map"),
+    );
+    for result in [
+        Nullable::null(),
+        Nullable::some(ParamsValue::new(map)),
+        Nullable::some(ParamsValue::new(CanonicalValue::Array(vec![
+            CanonicalValue::text("a"),
+        ]))),
+        Nullable::some(ParamsValue::new(CanonicalValue::text("done"))),
+    ] {
+        let answer = ActionReadResult {
+            receipt: a_kept_receipt(),
+            result,
+        };
+        let value = ParamsValue::from_typed(&answer).expect("encodes");
+        let this = Level::this()
+            .decode_value::<ActionReadResult>(&value)
+            .expect("read under this level");
+        let kept = retained
+            .decode_value::<ActionReadResult>(&value)
+            .unwrap_or_else(|error| panic!("{error}: {answer:?}"));
+        assert_eq!(kept, this);
+        assert_eq!(kept, answer);
     }
 }

@@ -15,9 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use kr_protocol::retained::{
-    PLUGIN_HOST_PROTOCOL, RETAINED, RETAINED_WORKER_LEVELS, SURFACE_ROOTS, Surface,
-};
+use kr_protocol::retained::{RETAINED, RETAINED_WORKER_LEVELS, SURFACE_ROOTS, Surface};
 
 /// The directory the retained levels are kept in.
 pub fn retained_dir() -> PathBuf {
@@ -149,10 +147,37 @@ pub fn retain(level: &str, commit: &str) -> Result<(), String> {
             &full[..12]
         ),
     )?;
-    write("PLUGIN_HOST", format!("{PLUGIN_HOST_PROTOCOL}\n"))?;
+    write("PLUGIN_HOST", format!("{}\n", plugin_host_at(&full)?))?;
     write("frames.json", "[]\n".to_owned())?;
     println!("wrote {}", target.display());
     Ok(())
+}
+
+/// The protocol name the plugin host speaks at `commit`, read from that commit's source and not
+/// from this build's: where the name is kept moved, and a level records what its own release spoke.
+fn plugin_host_at(commit: &str) -> Result<String, String> {
+    for (path, declaration) in [
+        (
+            "crates/kr-protocol/src/retained.rs",
+            "pub const PLUGIN_HOST_PROTOCOL: &str = ",
+        ),
+        (
+            "crates/kr-plugin-service/src/protocol.rs",
+            "pub const PROTOCOL: &str = ",
+        ),
+    ] {
+        let Ok(source) = git(&["show", &format!("{commit}:{path}")]) else {
+            continue;
+        };
+        if let Some(rest) = source.split(declaration).nth(1)
+            && let Some(name) = rest.split('"').nth(1)
+        {
+            return Ok(name.to_owned());
+        }
+    }
+    Err(format!(
+        "the source at {commit} does not state the plugin host protocol"
+    ))
 }
 
 /// Moves a level's record to the commit the lead names, after comparing that commit's schema with

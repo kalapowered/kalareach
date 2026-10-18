@@ -353,6 +353,12 @@ impl Comparer<'_> {
         match (reference_of(old), reference_of(new)) {
             (Some(old_name), Some(new_name)) => {
                 self.definition(&old_name, &new_name);
+                // What stands beside the reference (a default, a bound) is part of the place.
+                let (beside_old, beside_new) =
+                    (without_the_reference(old), without_the_reference(new));
+                if beside_old != beside_new {
+                    self.node(&beside_old, &beside_new, at);
+                }
                 return;
             }
             (Some(_), None) | (None, Some(_)) => {
@@ -722,13 +728,17 @@ impl Surface {
     }
 
     fn admits_null(&self, branch: &Value) -> bool {
-        match reference_of(branch) {
-            Some(name) => self
+        if let Some(name) = reference_of(branch) {
+            return self
                 .definitions
                 .get(&name)
-                .is_some_and(|inner| self.admits_null(inner)),
-            None => branch.get("type").and_then(Value::as_str) == Some("null"),
+                .is_some_and(|inner| self.admits_null(inner));
         }
+        if let Some(Value::Array(branches)) = branch.get("oneOf").or_else(|| branch.get("anyOf")) {
+            return branches.iter().any(|inner| self.admits_null(inner));
+        }
+        // A node that says nothing of its kind is opaque, and this layer leaves it to the typed one.
+        branch.get("type").and_then(Value::as_str) == Some("null") || is_opaque(branch)
     }
 
     /// Whether `value` is the sort of value `branch` describes, as far as telling the branches of
@@ -772,6 +782,8 @@ impl Surface {
             }
             Some("array") => matches!(value, CanonicalValue::Array(_)),
             Some("null") => matches!(value, CanonicalValue::Null),
+            // An opaque node (`ParamsValue`) is any value: the walk leaves it to the typed layer.
+            None if is_opaque(branch) => true,
             _ => !matches!(
                 value,
                 CanonicalValue::Map(_) | CanonicalValue::Array(_) | CanonicalValue::Null
@@ -832,6 +844,28 @@ impl Surface {
         }
         Ok(())
     }
+}
+
+/// A node without its `$ref`: what is written beside the reference.
+fn without_the_reference(node: &Value) -> Value {
+    match node {
+        Value::Object(members) => Value::Object(
+            members
+                .iter()
+                .filter(|(keyword, _)| keyword.as_str() != "$ref")
+                .map(|(keyword, member)| (keyword.clone(), member.clone()))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Whether a node says nothing of the kind of value it holds: no type, constant, choice or
+/// reference. The generated schema writes an opaque parameter this way.
+fn is_opaque(node: &Value) -> bool {
+    ["type", "const", "oneOf", "anyOf", "$ref"]
+        .iter()
+        .all(|keyword| node.get(keyword).is_none())
 }
 
 fn wrong_kind(definition: &str, expected: &'static str) -> Refusal {
