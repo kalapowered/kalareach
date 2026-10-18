@@ -1593,6 +1593,11 @@ impl Store {
     /// through the rule: this is the last place this host can reach what an earlier build recorded
     /// before a repeat of the action returns it.
     ///
+    /// A claim that holds no outcome yet is answered as `OUTCOME_UNKNOWN`, never as absent: the
+    /// action was claimed, and a repeat of it, after a restart or after the window it was admitted
+    /// under has gone, is told what is known rather than meeting a freshness check as though it
+    /// were new.
+    ///
     /// # Errors
     ///
     /// Returns [`ChangeSetError::IdConflict`] when the identifier was used for a different
@@ -1631,9 +1636,11 @@ impl Store {
                 method: stored_method.into(),
             });
         }
-        // A claim with no outcome is not an answer: the request reaches the service, which
-        // finishes what its claim started rather than telling the caller the outcome is unknown
-        // for ever.
+        // A claim with no outcome is a claim, not an absence: an earlier copy of this action took
+        // it before its effect and has not said what it came to, whether it is still running or
+        // its daemon stopped first. The action is not performed again under the claim, so the
+        // answer is that what it did is not established, and it is given here, where the freshness
+        // of the request is not yet asked.
         match (result, code) {
             (Some(result), _) => Ok(Some(RetainedOutcome::Ok(
                 crate::answer::protect_stored_result(method, &result)?,
@@ -2762,6 +2769,78 @@ mod tests {
                 .expect("the second copy asks"),
             "one action, one effect"
         );
+    }
+
+    #[test]
+    fn an_unfinished_claim_answers_as_unknown_and_never_as_absent() {
+        // KR-REQ-23.44: an action claimed before its effect and never settled, because its daemon
+        // stopped or its window ran out, is not an action nobody has seen. A repeat of it is told
+        // that what it did is not established; it is not told nothing is held, which would send it
+        // to the freshness checks as though it were new.
+        let mut store = store();
+        let actor = ActorId::new("an actor").expect("an actor identifier");
+        let action = kr_ipc::new_uuid();
+        let digest = crate::objects::digest_of(b"the request");
+        let authority = Authority::new(true);
+
+        assert!(
+            store
+                .retained_action(&actor, action, "changeset.capture", digest)
+                .expect("the record reads")
+                .is_none(),
+            "an action nobody claimed is absent"
+        );
+        assert!(
+            store
+                .claim_action(
+                    &actor,
+                    action,
+                    "changeset.capture",
+                    digest,
+                    Some(&authority)
+                )
+                .expect("the claim is taken")
+        );
+        let Some(RetainedOutcome::Error { code, .. }) = store
+            .retained_action(&actor, action, "changeset.capture", digest)
+            .expect("the record reads")
+        else {
+            panic!("a claim with no outcome is answered, as unknown");
+        };
+        assert_eq!(code, ErrorCode::OutcomeUnknown);
+
+        // A repeat under another request is still a conflict, and a settled claim still answers
+        // with what it settled.
+        assert_eq!(
+            store
+                .retained_action(&actor, action, "changeset.capture", digest_of_other())
+                .expect_err("another request under one identifier")
+                .code(),
+            ErrorCode::IdConflict
+        );
+        store
+            .settle_action(
+                &actor,
+                action,
+                "changeset.capture",
+                digest,
+                &RetainedOutcome::Error {
+                    code: ErrorCode::InvalidArgument,
+                    detail: "it was refused".to_owned(),
+                },
+            )
+            .expect("the claim settles");
+        let Some(RetainedOutcome::Error { code, .. }) = store
+            .retained_action(&actor, action, "changeset.capture", digest)
+            .expect("the record reads")
+        else {
+            panic!("a settled claim answers with its outcome");
+        };
+        assert_eq!(code, ErrorCode::InvalidArgument);
+    }
+
+    fn digest_of_other() -> Digest256 {
+        crate::objects::digest_of(b"another request")
     }
 
     #[test]
