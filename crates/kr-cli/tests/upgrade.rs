@@ -129,8 +129,9 @@ fn placed(
 /// unless an earlier run built them from the same commit with the same compiler, and returns the
 /// directory they are in.
 ///
-/// One run at a time builds a commit: the tree is extracted under a lock and renamed into place,
-/// and a stamp of the commit and the compiler is written last. Any other commit's tree is removed.
+/// One run at a time builds a commit, under a lock. A stamp of the commit and the compiler is
+/// written once the tree is extracted, and the build is made when a program is missing. Any other
+/// commit's tree is removed.
 fn build_previous(commit: &str) -> PathBuf {
     let cache = cache_root();
     std::fs::create_dir_all(&cache).expect("the cache directory");
@@ -147,20 +148,17 @@ fn build_previous(commit: &str) -> PathBuf {
         .expect("rustc runs");
     let stamp = format!("{commit}\n{}", String::from_utf8_lossy(&toolchain.stdout));
     let place = cache.join(commit);
+    let tree = place.join("tree");
     let programs = place.join("target/debug");
-    let usable = std::fs::read_to_string(place.join("stamp")).is_ok_and(|kept| kept == stamp)
-        && PREVIOUS_PROGRAMS
-            .iter()
-            .all(|name| programs.join(name).is_file());
-    if !usable {
-        // A tree of another commit, or a build that did not finish, goes.
+    // The tree is the commit's, as extracted by a run with this compiler, or it is made again.
+    if !std::fs::read_to_string(place.join("stamp")).is_ok_and(|kept| kept == stamp) {
+        // A tree of another commit, or an extraction that did not finish, goes.
         for entry in std::fs::read_dir(&cache).expect("the cache") {
             let path = entry.expect("an entry").path();
             if path.is_dir() {
                 std::fs::remove_dir_all(&path).expect("an old tree goes");
             }
         }
-        let tree = place.join("tree");
         std::fs::create_dir_all(&tree).expect("the tree's directory");
         let mut archive = Command::new("git")
             .arg("-C")
@@ -178,6 +176,13 @@ fn build_previous(commit: &str) -> PathBuf {
             "the release before is not in this repository: git archive {commit} said {status}; \
              the suite does not skip"
         );
+        std::fs::write(place.join("stamp"), &stamp).expect("the stamp");
+    }
+    if !PREVIOUS_PROGRAMS
+        .iter()
+        .all(|name| programs.join(name).is_file())
+    {
+        // The packages build every binary they have: the release before is these programs of it.
         let output = Command::new("cargo")
             .current_dir(&tree)
             .env_clear()
@@ -186,26 +191,8 @@ fn build_previous(commit: &str) -> PathBuf {
             }))
             .env_remove("RUSTFLAGS")
             .env("CARGO_TARGET_DIR", place.join("target"))
-            .args([
-                "build",
-                "--locked",
-                "-p",
-                "kr-cli",
-                "--bin",
-                "kr",
-                "--bin",
-                "kr-attach-guard",
-            ])
-            .args([
-                "-p",
-                "kr-controller",
-                "-p",
-                "kr-worker",
-                "-p",
-                "kr-hook",
-                "-p",
-                "kr-plugin-host",
-            ])
+            .args(["build", "--locked", "-p", "kr-cli", "-p", "kr-controller"])
+            .args(["-p", "kr-worker", "-p", "kr-hook", "-p", "kr-plugin-host"])
             .output()
             .expect("cargo runs");
         assert!(
@@ -221,7 +208,6 @@ fn build_previous(commit: &str) -> PathBuf {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        std::fs::write(place.join("stamp"), &stamp).expect("the stamp");
     }
     programs
 }
