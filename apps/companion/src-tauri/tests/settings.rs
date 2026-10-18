@@ -673,6 +673,29 @@ struct Elsewhere {
 }
 
 impl Elsewhere {
+    /// This device writes `draft` at the service first, as another device's draft under the
+    /// identity of the same draft, so that the publication of this computer's own is refused.
+    async fn claim_draft(&self, draft: &Draft) {
+        let mut theirs = draft.clone();
+        theirs.device_id = self.device;
+        let sealed = self
+            .sealer
+            .seal(&DraftStore::encode_payload(&theirs).expect("a payload"))
+            .expect("sealed");
+        self.shared
+            .compare_exchange(
+                &kr_client::drafts::draft_collection(draft.draft_id),
+                kr_client::sync::fresh_object_id()
+                    .expect("an identity")
+                    .get(),
+                now_ms(),
+                None,
+                &sealed,
+            )
+            .await
+            .expect("the claim is answered");
+    }
+
     /// How many objects the service holds, settings and drafts together.
     async fn objects(&self) -> u64 {
         self.service
@@ -2044,6 +2067,90 @@ async fn a_host_that_goes_private_while_a_publication_is_out_has_the_answer_disc
         kept_here(&view),
         vec![("studio".to_owned(), "private".to_owned(), 1)],
         "{view}"
+    );
+}
+
+/// A publication of a draft another device wrote first is refused, and the service answers with the
+/// other device's draft. When the host cannot be read as the answer arrives, nothing of it is kept
+/// beside this computer's own: the draft is fenced, as the host's privacy mode asks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_that_arrives_while_the_host_cannot_be_read_brings_nothing_down() {
+    let computer = Computer::new().await;
+    let (environment, studio) = host(1, "studio");
+    computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 1 });
+    let page = with_sync_on(&computer).await;
+    let (draft, _) = page.write_draft(Some(&studio), "written for the studio");
+    let held = page
+        .app
+        .state::<AppState>()
+        .drafts()
+        .store()
+        .expect("drafts");
+    computer
+        .elsewhere()
+        .claim_draft(&held.load(draft).expect("the draft"))
+        .await;
+    // The pass reads the host when it opens the store and before the draft leaves, and the host
+    // cannot be read from the third question, which is the one as the answer arrives.
+    computer.hosts.turn_after(
+        environment,
+        2,
+        HostPrivacy::Unreadable {
+            reason: "the connection dropped".to_owned(),
+        },
+    );
+
+    page.drafts_on(true).expect("drafts sync is on");
+    assert_eq!(
+        page.kept_drafts().len(),
+        1,
+        "nothing the service answered with was kept: {:?}",
+        page.kept_drafts()
+    );
+}
+
+/// A host whose state was reset reports a generation below the one this computer holds for it. Its
+/// word that privacy mode is off is believed, and a store cannot follow it down when it turns on
+/// again: an answer that arrives then is still withheld, since the store is fenced at the
+/// generation it holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_goes_private_below_the_generation_held_has_what_the_answer_brings_withheld() {
+    let computer = Computer::new().await;
+    let (environment, studio) = host(1, "studio");
+    computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 10 });
+    let page = with_sync_on(&computer).await;
+    page.write_draft(Some(&studio), "published at generation ten");
+    page.drafts_on(true).expect("drafts sync is on");
+
+    let (draft, _) = page.write_draft(Some(&studio), "written after the host was reset");
+    let held = page
+        .app
+        .state::<AppState>()
+        .drafts()
+        .store()
+        .expect("drafts");
+    computer
+        .elsewhere()
+        .claim_draft(&held.load(draft).expect("the draft"))
+        .await;
+    // The host is reset, says off at generation 1, and says private at generation 2 as the answer
+    // arrives.
+    computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 1 });
+    computer
+        .hosts
+        .turn_after(environment, 2, HostPrivacy::On { generation: 2 });
+    page.sync_now();
+    assert_eq!(
+        page.kept_drafts().len(),
+        2,
+        "nothing the service answered with was kept: {:?}",
+        page.kept_drafts()
     );
 }
 

@@ -267,11 +267,21 @@ struct HostStore {
     seen: Arc<Mutex<Option<HostPrivacy>>>,
 }
 
+/// The failure an answer is held back with when the store cannot be made to hold the boundary.
+fn cannot_hold(_why: &CommandError) -> kr_client::ClientError {
+    kr_client::ClientError::refusal(
+        kr_protocol::error::ErrorCode::StorageUnavailable,
+        kr_client::Shown::said("the privacy boundary of this host's drafts could not be kept"),
+    )
+}
+
 /// A host's service as its drafts reach it. An answer is not handed on until the host's privacy
 /// mode has been read again and the host's store moved to it, so the generation an answer is
 /// settled against is the one in force when the answer arrives, and not the one in force when
-/// the request left. A store that is already fenced stays fenced for the rest of the pass, so
-/// reading again could change nothing.
+/// the request left. A store that is already fenced is not read for again: a read cannot make it
+/// more closed. A store that cannot be moved to what the host reports, as one whose generation is
+/// ahead of a reset host's, is fenced at the generation it holds, and an answer is not handed on
+/// when even that cannot be recorded.
 struct Gate {
     inner: Arc<dyn SyncBackupService>,
     hosts: Arc<dyn DraftHosts>,
@@ -287,15 +297,42 @@ impl std::fmt::Debug for Gate {
 }
 
 impl Gate {
-    async fn read_again(&self) {
-        if self.client.is_fenced().unwrap_or(true) {
-            return;
+    /// Reads the host's privacy mode and moves the store to it, before an answer is handed on.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the store could not be made to hold the boundary: nothing may be settled then,
+    /// and the request stays outstanding for a reconciliation.
+    async fn read_again(&self) -> kr_client::Result<()> {
+        let closed = self
+            .client
+            .is_fenced()
+            .map_err(|error| cannot_hold(&super::sync::sync_failure(error)))?;
+        if closed {
+            return Ok(());
         }
         let state = self.hosts.privacy(self.environment).await;
-        // A store that cannot be moved to the mode the host reports settles against the
-        // generation it holds all the same: the draft is then shown as kept here.
-        let _ = apply_privacy(&self.client, &state);
+        let state = match apply_privacy(&self.client, &state) {
+            Ok(()) => state,
+            // The store cannot follow the host, as one ahead of a host whose state was reset
+            // cannot. It is fenced at the generation it holds, as for a host that cannot be read,
+            // so nothing an answer brings down is kept.
+            Err(error) => {
+                let held = self
+                    .client
+                    .store()
+                    .privacy()
+                    .map_err(|error| cannot_hold(&super::sync::sync_failure(error)))?;
+                self.client
+                    .fence(held.generation.get())
+                    .map_err(|error| cannot_hold(&super::sync::sync_failure(error)))?;
+                HostPrivacy::Unreadable {
+                    reason: error.message,
+                }
+            }
+        };
         *self.seen.lock().unwrap_or_else(PoisonError::into_inner) = Some(state);
+        Ok(())
     }
 }
 
@@ -313,7 +350,7 @@ impl SyncBackupService for Gate {
                 .inner
                 .compare_exchange(collection, request_id, signed_at_ms, expected, ciphertext)
                 .await;
-            self.read_again().await;
+            self.read_again().await?;
             answer
         })
     }
@@ -337,7 +374,7 @@ impl SyncBackupService for Gate {
                     ciphertext,
                 )
                 .await;
-            self.read_again().await;
+            self.read_again().await?;
             answer
         })
     }
@@ -354,7 +391,7 @@ impl SyncBackupService for Gate {
                 .inner
                 .compare_remove(collection, request_id, signed_at_ms, expected)
                 .await;
-            self.read_again().await;
+            self.read_again().await?;
             answer
         })
     }
@@ -366,7 +403,7 @@ impl SyncBackupService for Gate {
     ) -> ServiceFuture<'a, SyncRequestStatus> {
         Box::pin(async move {
             let answer = self.inner.request_status(collection, request_id).await;
-            self.read_again().await;
+            self.read_again().await?;
             answer
         })
     }
@@ -388,7 +425,7 @@ impl SyncBackupService for Gate {
                     last_signed_at_ms,
                 )
                 .await;
-            self.read_again().await;
+            self.read_again().await?;
             answer
         })
     }
@@ -396,7 +433,7 @@ impl SyncBackupService for Gate {
     fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, SyncFetched> {
         Box::pin(async move {
             let answer = self.inner.fetch(collection).await;
-            self.read_again().await;
+            self.read_again().await?;
             answer
         })
     }

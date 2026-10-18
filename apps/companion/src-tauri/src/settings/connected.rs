@@ -8,11 +8,10 @@
 //! ([`HostPrivacy::Unreadable`], [`Holds::Unknown`]).
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use kr_client::ClientError;
+use kr_client::{ClientError, Session};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{EnvironmentId, SessionId};
 use kr_protocol::method::Method;
@@ -30,8 +29,9 @@ use crate::state::AppState;
 /// How long the host is given to say where privacy mode stands.
 const ANSWER_WITHIN: Duration = Duration::from_secs(10);
 
-/// One connection to one host: a reconnection to the same host is another.
-type Link = (EnvironmentId, usize);
+/// One connection to one host: a reconnection to the same host is another. The session is held
+/// weakly, so its address is not given to another while the cache names it.
+type Link = (EnvironmentId, Weak<Session>);
 
 /// The hosts this application is connected to.
 pub struct ConnectedHosts<R: Runtime> {
@@ -51,24 +51,44 @@ impl<R: Runtime> ConnectedHosts<R> {
         }
     }
 
-    fn remember_not_held(&self, link: Link, session: SessionId) {
+    fn remember_not_held(
+        &self,
+        environment: EnvironmentId,
+        over: &Arc<Session>,
+        session: SessionId,
+    ) {
         let mut held = self
             .not_held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if held.0 != Some(link) {
-            *held = (Some(link), BTreeSet::new());
+        if !is_link(held.0.as_ref(), environment, over) {
+            *held = (Some((environment, Arc::downgrade(over))), BTreeSet::new());
         }
         held.1.insert(session);
     }
 
-    fn known_not_held(&self, link: Link, session: SessionId) -> bool {
+    fn known_not_held(
+        &self,
+        environment: EnvironmentId,
+        over: &Arc<Session>,
+        session: SessionId,
+    ) -> bool {
         let held = self
             .not_held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        held.0 == Some(link) && held.1.contains(&session)
+        is_link(held.0.as_ref(), environment, over) && held.1.contains(&session)
     }
+}
+
+/// Whether `link` is the connection `over` makes to the host of `environment`.
+fn is_link(link: Option<&Link>, environment: EnvironmentId, over: &Arc<Session>) -> bool {
+    link.is_some_and(|(held, session)| {
+        *held == environment
+            && session
+                .upgrade()
+                .is_some_and(|open| Arc::ptr_eq(&open, over))
+    })
 }
 
 /// The host a connection is to: the environment its sessions live in, and what it is called.
@@ -100,16 +120,13 @@ impl<R: Runtime> DraftHosts for ConnectedHosts<R> {
                 return Holds::Unknown;
             };
             let host = host_of(&connection);
-            let link: Link = (
-                host.environment,
-                Arc::as_ptr(&connection.session()) as usize,
-            );
-            if self.known_not_held(link, session) {
+            let over = connection.session();
+            if self.known_not_held(host.environment, &over, session) {
                 return Holds::NotHere;
             }
             let asked = tokio::time::timeout(
                 ANSWER_WITHIN,
-                connection.session().read::<_, SessionReadResult>(
+                over.read::<_, SessionReadResult>(
                     Method::SessionRead,
                     &SessionReadParams {
                         session_id: session,
@@ -123,9 +140,12 @@ impl<R: Runtime> DraftHosts for ConnectedHosts<R> {
                 Ok(Err(ClientError::Host(refused))) => match refused.code {
                     ErrorCode::SessionClosed => Holds::Here(host),
                     ErrorCode::UnknownSession => {
-                        self.remember_not_held(link, session);
+                        self.remember_not_held(host.environment, &over, session);
                         Holds::NotHere
                     }
+                    // A host too busy or unavailable to say asks for no more questions; one that
+                    // refuses to say about this session may still say about another.
+                    code if code.retry_category().permits_automatic_retry() => Holds::Unknown,
                     _ => Holds::Refused,
                 },
                 Ok(Err(_)) | Err(_) => Holds::Unknown,
