@@ -349,8 +349,10 @@ fn build_zsh(tree: &Path, prefix: &Path) {
 /// built elsewhere and placed in a release is not that package, so the build is made at the
 /// release's own path and the release is installed there from what is kept.
 fn zsh_built_for(host: &Host, tree: &Path, name: &ReleaseName) -> PathBuf {
-    let versions = host.store.versions();
-    let created = !versions.exists();
+    // The build makes the directories it needs, and the store has to make its own: private to its
+    // owner.
+    let root = host.store.root().to_path_buf();
+    let created = !root.exists();
     let place = host.store.release_directory(name);
     let prefix = place.join("shells");
     build_zsh(tree, &prefix);
@@ -358,8 +360,7 @@ fn zsh_built_for(host: &Host, tree: &Path, name: &ReleaseName) -> PathBuf {
     std::fs::remove_dir_all(prefix.join("sources")).expect("the build's sources go");
     let kept = host.scratch(&format!("zsh-for-{name}")).join("shells");
     std::fs::rename(&prefix, &kept).expect("the package is kept");
-    std::fs::remove_dir_all(if created { &versions } else { &place })
-        .expect("the place is free again");
+    std::fs::remove_dir_all(if created { &root } else { &place }).expect("the place is free again");
     kept
 }
 
