@@ -786,6 +786,16 @@ impl Controller {
                     )
                     .await;
             }
+            // The disclosed checks are started once per actor's action: what the start came to is
+            // kept in memory for this daemon's life and a retry is answered from it
+            // ([`Controller::retained`]), so a retry does not start another run.
+            Method::EnvironmentCapabilitiesCheck => {
+                return respond(
+                    mutation.request_id,
+                    self.start_capability_checks(actor_id, mutation, carried)
+                        .await,
+                );
+            }
             // Privacy mode and a session's pinned name are this daemon's own, each changed once per
             // actor's action: the action is claimed first, and what it came to is kept under the
             // claim before it is answered, so a retry is answered from that record.

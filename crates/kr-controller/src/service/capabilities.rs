@@ -1,6 +1,6 @@
 //! The desktop this host has, and the capability evidence taken on it.
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::desktop::{
@@ -87,7 +87,7 @@ impl Controller {
     }
 
     /// Returns the context this host's capability evidence is about, and its revision.
-    async fn desktop_evidence(&self) -> (DesktopContext, CapabilityRevision) {
+    pub(super) async fn desktop_evidence(&self) -> (DesktopContext, CapabilityRevision) {
         let _ = self.desktop().await;
         let reading = self.desktop.lock().await;
         (reading.evidence.clone(), reading.revision)
@@ -113,9 +113,59 @@ impl Controller {
     pub(super) async fn capability_report(
         &self,
     ) -> Result<kr_protocol::desktop::DesktopCapabilityReport> {
+        Ok(self.capability_report_with_checks().await?.0)
+    }
+
+    /// Builds the capability report as [`Self::capability_report`] does, with where the disclosed
+    /// checks stood at the moment it was built.
+    ///
+    /// The two are read in one hold of the checks, so a run that ends meanwhile is in both or in
+    /// neither: an answer never says the checks are current beside records that lack their
+    /// findings.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::capability_report`].
+    pub(super) async fn capability_report_with_checks(
+        &self,
+    ) -> Result<(
+        kr_protocol::desktop::DesktopCapabilityReport,
+        kr_protocol::desktop::CapabilityChecks,
+    )> {
         let (context, revision) = self.desktop_evidence().await;
         let mut report =
-            crate::desktop::capabilities(self.paths.environment_id(), context, revision);
+            crate::desktop::capabilities(self.paths.environment_id(), context.clone(), revision);
+        // What a person's disclosed checks found stands in the platform's place while nothing has
+        // ended it. The directory is read before the desktop's lock is taken, so a wait for one is
+        // never made under the other.
+        let checks = loop {
+            // What the desktop, the tools and the worker are now is read before the checks' lock
+            // is taken, because reading the tools opens their files, and only where findings are
+            // held to be compared with it. A run that ended in between has replaced the findings
+            // this was read against, and the reading is made again.
+            let workers = self.directory_workers().await;
+            let (held, generation) = self
+                .checks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .held_stamp();
+            let now = held.map(|session| {
+                let worker = workers.iter().find(|w| w.descriptor.session_id == session);
+                super::capability_checks::fingerprint_of(&context, worker)
+            });
+            let mut checks = self.checks.lock().unwrap_or_else(PoisonError::into_inner);
+            if checks.held_stamp() != (held, generation) {
+                continue;
+            }
+            let findings = match &now {
+                Some(now) => checks.standing(now),
+                None => Vec::new(),
+            };
+            let view = checks.view();
+            drop(checks);
+            super::capability_checks::merge(&mut report.records, &findings, &context);
+            break view;
+        };
         // The comparison and the revision it decides are one hold of this lock. Two reports
         // running at once would otherwise both see the old evidence, one would commit the new
         // revision, and the other would hand out records stamped with a revision that no longer
@@ -151,7 +201,7 @@ impl Controller {
             record.revision = revision;
         }
         drop(reading);
-        Ok(report)
+        Ok((report, checks))
     }
 
     /// Returns the execution profile this host creates sessions with when a request chooses none.
@@ -176,15 +226,17 @@ impl Controller {
                 self.paths.environment_id()
             )));
         }
+        let (desktop, checks) = self.capability_report_with_checks().await?;
         Ok(EnvironmentCapabilitiesResult {
             environment_id: self.paths.environment_id(),
             // The same answer `host.info` gives: what this host creates a session in when the
             // request chooses nothing, which is what the configuration resolves rather than what
             // the platform alone would say. Two reads of one question must not disagree.
             default_worker_profile: self.default_profile().await,
-            desktop: self.capability_report().await?,
+            desktop,
             persistence: crate::desktop::persistence(self.supervisor.describe()),
             power: self.power_state().await,
+            checks,
         })
     }
 }

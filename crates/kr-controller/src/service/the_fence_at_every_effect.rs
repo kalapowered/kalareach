@@ -1272,7 +1272,7 @@ async fn the_methods_that_take_no_admission_are_refused_while_a_fence_is_owed() 
 
 /// The local write methods this daemon performs itself that pass their admission on to the service
 /// that acts: every one of them asks the fence and the registration again inside that service.
-const TAKES_AN_ADMISSION: [Method; 24] = [
+const TAKES_AN_ADMISSION: [Method; 25] = [
     Method::SessionCreate,
     Method::SessionClose,
     Method::AgentPromptSubmit,
@@ -1294,6 +1294,7 @@ const TAKES_AN_ADMISSION: [Method; 24] = [
     Method::SessionRename,
     Method::DescriptionConfigure,
     Method::DescriptionDownload,
+    Method::EnvironmentCapabilitiesCheck,
     Method::MachineJoin,
     Method::MachineMerge,
     Method::MachineSplit,

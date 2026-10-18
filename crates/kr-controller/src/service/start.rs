@@ -1117,6 +1117,7 @@ impl Controller {
                 records: Vec::new(),
                 read_at: std::time::Instant::now(),
             }),
+            checks: std::sync::Mutex::new(super::capability_checks::Checks::new()),
             inhibitor: Mutex::new(Inhibitor::new()),
             demand_scan: Mutex::new(DemandScan::default()),
             finalising: Mutex::new(()),

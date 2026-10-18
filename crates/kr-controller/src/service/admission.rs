@@ -803,6 +803,34 @@ impl Controller {
                 }
                 let _: kr_protocol::backup_setup::BackupEnableParams = parse(&mutation.params)?;
             }
+            // The disclosed checks belong to the environment: they run in a session's worker that
+            // the daemon chooses, so the target names none. What is checked here is the request,
+            // before the run is started, so a path that is not one is refused and not kept.
+            Method::EnvironmentCapabilitiesCheck => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "the disclosed checks belong to this environment, not to one session"
+                            .to_owned(),
+                    ));
+                }
+                let params: kr_protocol::desktop::EnvironmentCapabilitiesCheckParams =
+                    parse(&mutation.params)?;
+                if params.environment_id != self.paths.environment_id() {
+                    return Err(ControllerError::InvalidArgument(format!(
+                        "this daemon owns environment {}",
+                        self.paths.environment_id()
+                    )));
+                }
+                if let Some(file) = params.authorised_file.as_ref()
+                    && (file.len() > kr_protocol::desktop::MAX_AUTHORISED_FILE_BYTES
+                        || !std::path::Path::new(file).is_absolute())
+                {
+                    return Err(ControllerError::InvalidArgument(
+                        "the file to read has to be an absolute path of at most 4096 bytes"
+                            .to_owned(),
+                    ));
+                }
+            }
             // Privacy mode belongs to the environment, not to a session.
             Method::PrivacySet => {
                 if mutation.target.session_id.as_ref().is_some() {

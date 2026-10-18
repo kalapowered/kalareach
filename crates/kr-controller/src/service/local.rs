@@ -342,6 +342,12 @@ impl Controller {
         if RETAINED_AUTHORITY_ANSWERS.contains(&method) {
             return self.retained_authority_answer(actor_id, mutation).await;
         }
+        // The request for the disclosed checks is answered the same way from what this daemon kept
+        // in memory of it, on a later connection and after its window has closed. What it kept is
+        // not in the registry: the run it started lives only as long as this daemon.
+        if method == Method::EnvironmentCapabilitiesCheck {
+            return self.kept_capability_checks(actor_id, mutation);
+        }
         // A machine group step is claimed in the same store and answered from it the same way, and
         // from the machine group record where an attempt ended without recording what it did.
         if RETAINED_MACHINE_ANSWERS.contains(&method) {

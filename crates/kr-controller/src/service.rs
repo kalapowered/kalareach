@@ -55,6 +55,7 @@ mod backup_actions;
 mod backup_production;
 mod barrier;
 mod capabilities;
+mod capability_checks;
 mod close;
 mod configuration;
 mod create;
@@ -726,6 +727,9 @@ pub struct Controller {
     /// The desktop this host has, as last read, and the capability revision that reading is
     /// evidence for.
     desktop: Mutex<DesktopReading>,
+    /// The disclosed checks a person asked for: whether a run is in progress, how the latest ended,
+    /// and the findings while nothing has ended them.
+    checks: std::sync::Mutex<capability_checks::Checks>,
     /// The sleep assertion this daemon holds, where it holds one, and whether a review of it is
     /// running.
     inhibitor: Mutex<Inhibitor>,
