@@ -1305,10 +1305,15 @@ fn paired_dial_by(host: &Host, device: &Device, record: &DeviceRecord) -> Paired
 /// client and no use at all to a suite that has to submit *the same* action twice. This connects
 /// the same authorised transport and puts the frames on it directly.
 pub struct RawDevice {
-    transport: NetworkTransport,
+    transport: Arc<NetworkTransport>,
     action_window_id: kr_protocol::ids::ActionWindowId,
     next_request: std::sync::atomic::AtomicU64,
+    /// What a task reading the control stream has found, once [`Self::next_frame`] has started it.
+    heard: tokio::sync::Mutex<Option<Heard>>,
 }
+
+/// The frames a task reading a control stream passes on, in the order they arrived.
+type Heard = tokio::sync::mpsc::UnboundedReceiver<kr_protocol::envelope::ControlFrame>;
 
 impl RawDevice {
     /// Connects a paired device and claims the receive side of its control stream.
@@ -1336,9 +1341,10 @@ impl RawDevice {
             transport.initial_action_window().action_window_id.clone()
         };
         Ok(Self {
-            transport,
+            transport: Arc::new(transport),
             action_window_id,
             next_request: std::sync::atomic::AtomicU64::new(1),
+            heard: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -1526,6 +1532,91 @@ impl RawDevice {
         }
     }
 
+    /// The frame that sends one read, and the request it is.
+    fn read_frame<P: serde::Serialize + ?Sized>(
+        &self,
+        method: Method,
+        params: &P,
+    ) -> (
+        kr_protocol::ids::RequestId,
+        kr_protocol::envelope::ControlFrame,
+    ) {
+        use kr_protocol::envelope::{ControlFrame, ParamsValue, Request};
+
+        let request_id = kr_protocol::ids::RequestId::new(
+            self.next_request
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        let frame = ControlFrame::Request(Request {
+            request_id,
+            method: method.into(),
+            method_version: method.entry().version,
+            params: ParamsValue::from_typed(params).expect("the parameters encode"),
+        });
+        (request_id, frame)
+    }
+
+    /// Sends one read and does not wait for the answer, and returns the request it is.
+    pub async fn submit_read<P: serde::Serialize + ?Sized>(
+        &self,
+        method: Method,
+        params: &P,
+    ) -> kr_protocol::ids::RequestId {
+        use kr_client::transport::ControlTransport as _;
+
+        let (request_id, frame) = self.read_frame(method, params);
+        self.transport
+            .send(&frame)
+            .await
+            .expect("the frame is sent");
+        request_id
+    }
+
+    /// The next frame the host sends, or `None` when `within` passes first or the control stream
+    /// ends.
+    ///
+    /// A task reads the stream from the first call on, so a call that gives up loses nothing: a
+    /// read of the stream that is dropped part way through a frame cannot be resumed. A device that
+    /// is read this way is not read by [`Self::read`] or [`Self::mutate`] afterwards.
+    pub async fn next_frame(
+        &self,
+        within: Duration,
+    ) -> Option<kr_protocol::envelope::ControlFrame> {
+        use kr_client::transport::ControlTransport as _;
+
+        let mut held = self.heard.lock().await;
+        let heard = held.get_or_insert_with(|| {
+            let (found, heard) = tokio::sync::mpsc::unbounded_channel();
+            let transport = Arc::clone(&self.transport);
+            tokio::spawn(async move {
+                while let Ok(Some(frame)) = transport.recv().await {
+                    if found.send(frame).is_err() {
+                        break;
+                    }
+                }
+            });
+            heard
+        });
+        tokio::time::timeout(within, heard.recv()).await.ok()?
+    }
+
+    /// The next answer the host sends, to whichever request, or `None` when `within` passes first
+    /// or the control stream ends. Anything else the host sends is passed over.
+    pub async fn next_answer(
+        &self,
+        within: Duration,
+    ) -> Option<(kr_protocol::ids::RequestId, kr_protocol::envelope::Outcome)> {
+        use kr_protocol::envelope::ControlFrame;
+
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if let ControlFrame::Response(response) = self.next_frame(remaining).await? {
+                return Some((response.request_id, response.outcome));
+            }
+        }
+    }
+
     /// Sends one read, and returns what the host answered.
     pub async fn read<P: serde::Serialize + ?Sized>(
         &self,
@@ -1546,18 +1637,9 @@ impl RawDevice {
         params: &P,
     ) -> Option<std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError>> {
         use kr_client::transport::ControlTransport as _;
-        use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Request};
+        use kr_protocol::envelope::{ControlFrame, Outcome};
 
-        let request_id = kr_protocol::ids::RequestId::new(
-            self.next_request
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        );
-        let frame = ControlFrame::Request(Request {
-            request_id,
-            method: method.into(),
-            method_version: method.entry().version,
-            params: ParamsValue::from_typed(params).expect("the parameters encode"),
-        });
+        let (request_id, frame) = self.read_frame(method, params);
         if self.transport.send(&frame).await.is_err() {
             return None;
         }

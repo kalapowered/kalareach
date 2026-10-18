@@ -65,17 +65,31 @@ impl Worker {
     /// registry row and a published descriptor. A daemon started afterwards reaches it at its
     /// start. No daemon may be running on the tree while this runs.
     pub async fn start(tree: &kr_ipc::testing::TempHost, display: u64) -> Self {
-        Self::start_as(tree, display, false).await
+        Self::start_as(tree, display, false, "exec cat").await
+    }
+
+    /// As [`Self::start`], for a session whose application is `script`, a POSIX shell script.
+    pub async fn start_running(
+        tree: &kr_ipc::testing::TempHost,
+        display: u64,
+        script: &str,
+    ) -> Self {
+        Self::start_as(tree, display, false, script).await
     }
 
     /// As [`Self::start`], for a session the registry also holds an open reservation of, as it does
     /// for every session a daemon creates. What a share or an offer of a session tells a device
     /// depends on that: a session with no reservation is not one the host can tell a device about.
     pub async fn start_reserved(tree: &kr_ipc::testing::TempHost, display: u64) -> Self {
-        Self::start_as(tree, display, true).await
+        Self::start_as(tree, display, true, "exec cat").await
     }
 
-    async fn start_as(tree: &kr_ipc::testing::TempHost, display: u64, reserved: bool) -> Self {
+    async fn start_as(
+        tree: &kr_ipc::testing::TempHost,
+        display: u64,
+        reserved: bool,
+        script: &str,
+    ) -> Self {
         let environment = tree.environment();
         let environment_id = tree.environment_id();
         let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
@@ -136,7 +150,7 @@ impl Worker {
             session_epoch: SessionEpoch::V1,
             environment_id,
             display_number,
-            shell: kr_worker::testing::posix_script("exec cat"),
+            shell: kr_worker::testing::posix_script(script),
             shell_mode: ShellMode::NativeCompat,
             worker_profile: WorkerProfile::HeadlessUser,
             desktop: DesktopBinding::none(),
@@ -218,6 +232,11 @@ impl Worker {
             session_id,
             _runtime: runtime,
         }
+    }
+
+    /// The session's runtime, for a suite that stops the journal's next commit.
+    pub fn runtime(&self) -> &Arc<SessionRuntime> {
+        &self._runtime
     }
 
     /// How many attachments the session holds now.

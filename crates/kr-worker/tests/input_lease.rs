@@ -4747,3 +4747,287 @@ async fn a_client_that_goes_after_a_key_sent_behind_its_mutation_leaves_nothing_
         .1
         .release();
 }
+
+/// A paired device's attachment on the control daemon's proxy link to the worker, holding the
+/// input lease, with an application that keeps what it reads.
+///
+/// The daemon forwards a device's frames over a link of its own that declares itself a proxy, so
+/// this is the connection a device's keys reach the worker on.
+struct Proxied {
+    _kept: tempfile::TempDir,
+    received: std::path::PathBuf,
+    wired: Wired,
+    link: BoundLink,
+    actor: kr_protocol::actor::ActorEnvelope,
+    attachment: AttachmentId,
+    epoch: kr_protocol::ids::InputLeaseEpoch,
+    sequence: u64,
+    typed: Vec<u8>,
+}
+
+impl Proxied {
+    async fn start() -> Self {
+        let kept = tempfile::tempdir().expect("a directory for what the application keeps");
+        let received = kept.path().join("received");
+        let wired = wired(&format!(
+            "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec tee '{}'",
+            received.display()
+        ))
+        .await;
+        retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+        let mut link = BoundLink::connect(&wired.endpoint, build())
+            .await
+            .expect("connects");
+        let role = kr_protocol::local::ControllerConnectionRole::Proxy;
+        link.send(&ControlFrame::ControllerRole(role))
+            .await
+            .expect("declares the role");
+        match link.recv().await.expect("the worker answers") {
+            ControlFrame::ControllerRole(declared) => assert_eq!(declared, role),
+            other => panic!("the worker answered {other:?}"),
+        }
+        let identity = Arc::clone(&wired.controller);
+        let boot = wired.boot.clone();
+        link.present_generation(move |nonce| {
+            identity
+                .generation_token(ControllerGeneration::new(1), &boot, nonce)
+                .map_err(kr_ipc::IpcError::from)
+        })
+        .await
+        .expect("the worker accepts the generation");
+        let actor = kr_protocol::actor::ActorEnvelope {
+            actor_id: kr_protocol::ids::ActorId::new("device:phone").expect("an actor"),
+            ingress: ActorIngress::PairedDevice,
+            device_id: Nullable::some(kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid())),
+            grant_id: Nullable::null(),
+            grant_revision: Nullable::null(),
+            controller_generation: ControllerGeneration::new(1),
+            connection_id: connection(),
+        };
+        let mut proxied = Self {
+            _kept: kept,
+            received,
+            wired,
+            link,
+            actor,
+            attachment: AttachmentId::new(kr_ipc::new_uuid()),
+            epoch: kr_protocol::ids::InputLeaseEpoch::new(0),
+            sequence: 0,
+            typed: Vec::new(),
+        };
+        let attached: kr_protocol::attachment::SessionAttachResult = proxied
+            .forward(
+                Method::SessionAttach,
+                &terminal(proxied.wired.session_id, Some("xterm-256color")),
+            )
+            .await
+            .expect("the device attaches")
+            .to_typed()
+            .expect("an attachment");
+        proxied.attachment = attached.attachment.attachment_id;
+        let lease: kr_protocol::input::InputAcquireResult = proxied
+            .forward(
+                Method::InputAcquire,
+                &InputAcquireParams {
+                    session_id: proxied.wired.session_id,
+                    attachment_id: proxied.attachment,
+                    expected_epoch: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the device takes the lease")
+            .to_typed()
+            .expect("a lease");
+        proxied.epoch = lease.lease.epoch;
+        proxied
+    }
+
+    /// The mutation `method`, as the daemon forwards it for the device, and its answer.
+    async fn forward<T: serde::Serialize>(
+        &mut self,
+        method: Method,
+        params: &T,
+    ) -> Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError> {
+        let mutation = self.mutation(method, params).await;
+        self.link
+            .forward(&mutation, &self.actor, &self.rights(), Self::deadline())
+            .await
+            .expect("reaches the worker")
+    }
+
+    async fn mutation<T: serde::Serialize>(
+        &mut self,
+        method: Method,
+        params: &T,
+    ) -> kr_protocol::envelope::MutationRequest {
+        self.link
+            .compose(
+                method,
+                ActionId::new(kr_ipc::new_uuid()),
+                self.wired.target(),
+                params,
+            )
+            .await
+            .expect("the mutation is composed")
+    }
+
+    fn rights(&self) -> CanonicalSet<kr_protocol::rights::ActionRight> {
+        [
+            kr_protocol::rights::ActionRight::SessionView,
+            kr_protocol::rights::ActionRight::TerminalInput,
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    fn deadline() -> kr_protocol::scalars::U64 {
+        kr_protocol::scalars::U64::new(kr_ipc::clock::boot_elapsed_ms() + 120_000)
+    }
+
+    /// Sends a forwarded mutation without waiting for its answer.
+    async fn send_forwarded<T: serde::Serialize>(
+        &mut self,
+        method: Method,
+        params: &T,
+    ) -> kr_protocol::ids::RequestId {
+        let mutation = self.mutation(method, params).await;
+        let id = mutation.request_id;
+        self.link
+            .send(&ControlFrame::Forwarded(Box::new(
+                kr_protocol::local::ForwardedMutation {
+                    mutation,
+                    actor: self.actor.clone(),
+                    grant_rights: self.rights(),
+                    accepted_deadline_boot_ms: Self::deadline(),
+                    history: None,
+                    screen_basis: None,
+                },
+            )))
+            .await
+            .expect("the mutation is written");
+        id
+    }
+
+    /// Sends a forwarded `input.write` without waiting for its answer.
+    async fn send_key(&mut self, bytes: &[u8]) -> (kr_protocol::ids::RequestId, Instant) {
+        let id = kr_protocol::ids::RequestId::new(OWN_REQUESTS + self.sequence);
+        let params = InputWriteParams {
+            session_id: self.wired.session_id,
+            attachment_id: self.attachment,
+            epoch: self.epoch,
+            sequence: kr_protocol::ids::InputSequence::new(self.sequence),
+            bytes: Bytes::new(bytes.to_vec()),
+        };
+        self.sequence += 1;
+        self.typed.extend_from_slice(bytes);
+        let began = Instant::now();
+        self.link
+            .send(&ControlFrame::ForwardedRead(Box::new(
+                kr_protocol::local::ForwardedRequest {
+                    request: kr_protocol::envelope::Request {
+                        request_id: id,
+                        method: Method::InputWrite.into(),
+                        method_version: MethodVersion::V1,
+                        params: kr_protocol::envelope::ParamsValue::from_typed(&params)
+                            .expect("encodes"),
+                    },
+                    actor: self.actor.clone(),
+                    authority_deadline_boot_ms: Nullable::null(),
+                    history: None,
+                },
+            )))
+            .await
+            .expect("the key is written");
+        (id, began)
+    }
+
+    fn received(&self) -> Vec<u8> {
+        std::fs::read(&self.received).unwrap_or_default()
+    }
+}
+
+/// KR-PERF-002: a key the control daemon forwards for a paired device reaches the application while
+/// the device's own mutation, forwarded on the same link before it, is stopped in its commit.
+///
+/// The daemon forwards a device's frames on one link of its own, which is a controller connection.
+/// The worker used to read nothing more from such a connection until the mutation ahead had
+/// returned, so a key the daemon forwarded behind it waited for the mutation's commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarded_key_sent_after_a_forwarded_mutation_reaches_the_application_while_the_mutation_is_stalled()
+ {
+    let mut proxied = Proxied::start().await;
+    let (reached, release) = {
+        let mut session = proxied.wired.runtime.session();
+        let journal = session.journal_mut().expect("this session keeps a journal");
+        journal.stall_next_marker()
+    };
+    let report = kr_protocol::attachment::AttachmentViewportParams {
+        attachment_id: proxied.attachment,
+        dimensions: Dimensions::new(80, 24),
+        position: Nullable::null(),
+        column: kr_protocol::scalars::U64::new(0),
+    };
+    let viewport = proxied
+        .send_forwarded(Method::AttachmentViewport, &report)
+        .await;
+    tokio::time::timeout(LIVENESS_DEADLINE, reached)
+        .await
+        .expect("the mutation reached its stall")
+        .expect("the stall was not dropped");
+
+    let letting_go = LetGo::after(release.clone(), Duration::from_secs(5));
+    let (escape, began) = proxied.send_key(b"\x1b").await;
+    let arrived = tokio::time::timeout(LIVENESS_DEADLINE, async {
+        loop {
+            if proxied.received() == proxied.typed {
+                return Instant::now();
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    let had_to_be_let_go = letting_go.finish();
+    eprintln!(
+        "a forwarded Escape behind a stalled forwarded viewport report: received {:?} after the write began",
+        arrived.as_ref().map(|at| at.duration_since(began))
+    );
+    assert!(
+        !had_to_be_let_go,
+        "the forwarded Escape was kept waiting until the mutation before it was let go"
+    );
+    assert!(arrived.is_ok(), "the application never received the Escape");
+
+    // The key is answered ahead of the mutation, which is still stopped.
+    let first = loop {
+        match tokio::time::timeout(LIVENESS_DEADLINE, proxied.link.recv()).await {
+            Ok(Ok(ControlFrame::Response(response))) => break response,
+            Ok(Ok(_)) => {}
+            other => panic!("the link ended before the key was answered: {other:?}"),
+        }
+    };
+    assert_eq!(first.request_id, escape, "the key was answered first");
+    assert!(matches!(
+        first.outcome,
+        kr_protocol::envelope::Outcome::Ok(_)
+    ));
+
+    release.send(()).expect("lets the stall go");
+    let second = loop {
+        match tokio::time::timeout(LIVENESS_DEADLINE, proxied.link.recv()).await {
+            Ok(Ok(ControlFrame::Response(response))) => break response,
+            Ok(Ok(_)) => {}
+            other => panic!("the link ended before the mutation was answered: {other:?}"),
+        }
+    };
+    assert_eq!(second.request_id, viewport);
+    assert!(matches!(
+        second.outcome,
+        kr_protocol::envelope::Outcome::Ok(_)
+    ));
+    proxied
+        .wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
