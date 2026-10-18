@@ -11,6 +11,7 @@
 //! refuses.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use kr_client::services::account::ACCOUNT_ORIGIN;
@@ -60,6 +61,10 @@ pub(crate) fn host_of(origin: &GatewayOrigin) -> String {
 pub struct SyncService {
     file: PathBuf,
     origin: Mutex<GatewayOrigin>,
+    /// Whether the file could not be read when it was last tried, so that the next use reads it
+    /// again: a phone started before its first unlock cannot read its files, and the managed
+    /// service that stands in for the setting meanwhile must not outlive the lock.
+    unread: AtomicBool,
     /// Held from the moment a choice is written to the moment it is the one in memory, so that two
     /// choices made together leave the file and this run saying the same thing.
     keeping: Mutex<()>,
@@ -71,30 +76,36 @@ impl SyncService {
     #[must_use]
     pub fn open(data: &Path) -> Self {
         let file = data.join(FILE);
-        // A setting this build will not follow (a link, another owner's file, one wider than
-        // owner-only, text that is not an origin) is not taken to a service the person chose: the
-        // managed service stands, and the log says why.
-        let origin = match read_owner_only_file(&file, ORIGIN_LIMIT) {
-            Ok(None) => managed(),
-            Ok(Some(bytes)) => kept_origin(bytes).unwrap_or_else(|why| {
-                tracing::warn!(%why, "the sync service setting is not an origin, so the managed service stands");
-                managed()
-            }),
-            Err(error) => {
-                tracing::warn!(%error, "the sync service setting could not be read, so the managed service stands");
-                managed()
-            }
-        };
+        let (origin, readable) = read(&file, true);
         Self {
             file,
             origin: Mutex::new(origin),
+            unread: AtomicBool::new(!readable),
             keeping: Mutex::new(()),
+        }
+    }
+
+    /// Reads the setting again when it could not be read the last time it was tried. A choice made
+    /// since is the newest word and is not read over.
+    fn read_again(&self) {
+        if !self.unread.load(Ordering::SeqCst) {
+            return;
+        }
+        let _keeping = self.keeping.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.unread.load(Ordering::SeqCst) {
+            return;
+        }
+        let (origin, readable) = read(&self.file, false);
+        if readable {
+            *self.origin.lock().unwrap_or_else(PoisonError::into_inner) = origin;
+            self.unread.store(false, Ordering::SeqCst);
         }
     }
 
     /// The origin this computer talks to for sync.
     #[must_use]
     pub fn origin(&self) -> GatewayOrigin {
+        self.read_again();
         self.origin
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -132,7 +143,33 @@ impl SyncService {
             ))
         })?;
         *self.origin.lock().unwrap_or_else(PoisonError::into_inner) = origin.clone();
+        self.unread.store(false, Ordering::SeqCst);
         Ok(SyncServiceView::of(&origin))
+    }
+}
+
+/// The origin the file in `file` keeps, and whether the file could be read at all.
+///
+/// A setting this build will not follow (a link, another owner's file, one wider than owner-only,
+/// text that is not an origin) is not taken to a service the person chose: the managed service
+/// stands, and the log says why when `say` is set. A file that cannot be read stands for the same
+/// service and is read again at the next use.
+fn read(file: &Path, say: bool) -> (GatewayOrigin, bool) {
+    match read_owner_only_file(file, ORIGIN_LIMIT) {
+        Ok(None) => (managed(), true),
+        Ok(Some(bytes)) => (
+            kept_origin(bytes).unwrap_or_else(|why| {
+                tracing::warn!(%why, "the sync service setting is not an origin, so the managed service stands");
+                managed()
+            }),
+            true,
+        ),
+        Err(error) => {
+            if say {
+                tracing::warn!(%error, "the sync service setting could not be read, so the managed service stands");
+            }
+            (managed(), false)
+        }
     }
 }
 
