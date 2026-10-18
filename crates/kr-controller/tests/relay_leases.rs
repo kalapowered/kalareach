@@ -997,6 +997,25 @@ impl Rig {
         );
     }
 
+    /// Lets the keeper look at the relays, with time passing for it, until the doctor no longer
+    /// warns: the endpoint connecting to a relay is seen by the doctor at the keeper's next look.
+    async fn until_the_doctor_is_ok(&self) {
+        use iroh::Watcher;
+        let mut report = self.endpoint().net_report();
+        let settled = tokio::time::timeout(Duration::from_secs(180), async {
+            loop {
+                if self.check().await.status == DoctorStatus::Ok {
+                    return;
+                }
+                self.timer.advance(Duration::from_secs(5));
+                self.pass().await;
+                let _ = tokio::time::timeout(Duration::from_secs(2), report.updated()).await;
+            }
+        })
+        .await;
+        assert!(settled.is_ok(), "the doctor never went back to Ok");
+    }
+
     /// Lets the keeper look at the relays, with time passing for it, until the doctor says the
     /// leased relay is not answering.
     async fn until_the_doctor_warns_of_the_relay(&self) {
@@ -1244,7 +1263,7 @@ async fn a_host_whose_leased_relay_stops_uses_its_configured_relays_and_goes_bac
     relays.leased.start_again().await;
     rig.until_held_to(&relays.leased.url).await;
     rig.until_homed_on(&relays.leased.url).await;
-    assert_eq!(rig.check().await.status, DoctorStatus::Ok);
+    rig.until_the_doctor_is_ok().await;
 }
 
 /// KR-REQ-17.34: a relay the leases are installed on that has never answered this host does not
@@ -1272,7 +1291,7 @@ async fn a_leased_relay_that_never_answered_does_not_cost_the_host_its_configure
     relays.leased.start_again().await;
     rig.until_held_to(&relays.leased.url).await;
     rig.until_homed_on(&relays.leased.url).await;
-    assert_eq!(rig.check().await.status, DoctorStatus::Ok);
+    rig.until_the_doctor_is_ok().await;
 }
 
 /// KR-REQ-17.34: the look at the endpoint's relays is the host's own and does not wait on the
