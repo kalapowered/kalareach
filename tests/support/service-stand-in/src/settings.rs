@@ -19,8 +19,9 @@
 //! receipt would have been swept. The receipt is read before membership, so an installation that
 //! was removed after it sent a request can still ask what became of it.
 //!
-//! A write spends the principal's settings-sync allowance; a test arranges for it to be spent with
-//! [`crate::ServiceWeb::refuse_settings_writes`].
+//! A write of an object spends the principal's settings-sync allowance; a test arranges for it to be
+//! spent with [`crate::ServiceWeb::refuse_settings_writes`]. A removal stores nothing and is not
+//! refused when the allowance is spent.
 //!
 //! A removal (an exchange that names no object) is a compared write like any other: it takes a place
 //! in the object's order, leaves a tombstone so the next write carries on from it, and frees the
@@ -1234,7 +1235,9 @@ impl Collection {
                 }
             }
         }
-        if !funded {
+        // A removal stores nothing, so the Worker takes no hold against the allowance for it and
+        // one that is spent does not refuse it.
+        if !funded && asked.object.is_some() {
             return quota_exhausted(
                 "This principal's settings-sync allowance has no room for that write.",
             );

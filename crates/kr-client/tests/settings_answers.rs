@@ -53,7 +53,9 @@ use kr_protocol::ids::{
 };
 use kr_protocol::scalars::{TimestampMs, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
-use kr_protocol::sync::{MAX_SYNC_CONFLICT_COPIES, SyncObjectKind};
+use kr_protocol::sync::{
+    MAX_SYNC_CONFLICT_COPIES, MAX_SYNC_OBJECT_PLAINTEXT_BYTES, SyncObjectKind,
+};
 use kr_service_stand_in::ServiceWeb;
 
 mod recording;
@@ -218,9 +220,72 @@ fn shown_comparison(found: &SyncComparison) -> String {
 /* The script                                                                  */
 /* -------------------------------------------------------------------------- */
 
+/// How the script's first device comes to hold no settings-sync allowance.
+///
+/// A local Worker counts bytes against its free tier, so the allowance is spent by writing: through
+/// a transport that keeps no record, because the writes are the arrangement and not what the
+/// recording is of. The stand-in counts nothing and is told it is spent.
+enum Spent<'a> {
+    /// Write until the Worker refuses, over this transport.
+    Written(&'a Arc<dyn ServiceHttp>),
+    /// Tell the stand-in.
+    Told(&'a ServiceWeb),
+}
+
+impl Spent<'_> {
+    /// Leaves `device` with no room for an object the size of `smallest` and no room for anything
+    /// larger.
+    async fn spend(&self, device: &Device, origin: &GatewayOrigin, smallest: &[u8]) {
+        let transport = match self {
+            Self::Told(web) => {
+                web.refuse_settings_writes(true);
+                return;
+            }
+            Self::Written(transport) => transport,
+        };
+        let service = ManagedSyncService::new(
+            origin.clone(),
+            Arc::clone(transport),
+            Arc::new(recording::Keyed {
+                key: device.keys.authorisation.clone(),
+                signer: ServiceRequestSigner::Installation,
+            }) as _,
+        );
+        // The largest object first, then the smallest, so that nothing is left over to write.
+        let largest = sealed(&vec![
+            0x61;
+            usize::try_from(MAX_SYNC_OBJECT_PLAINTEXT_BYTES - 1024)
+                .expect("a size")
+        ]);
+        for object in [largest.as_slice(), smallest] {
+            let mut written = 0_u32;
+            loop {
+                let collection =
+                    sync_collection(SyncObjectKind::Settings, SyncObjectId::new(identity()));
+                let answer = service
+                    .compare_exchange(&collection, identity(), now_ms(), None, object)
+                    .await;
+                if !matches!(answer, Ok(SyncExchanged::Applied { .. })) {
+                    break;
+                }
+                written += 1;
+                assert!(
+                    written < 4096,
+                    "the Worker's allowance did not run out in {written} writes"
+                );
+            }
+        }
+    }
+}
+
 /// Runs the script against one service through `http`.
 #[allow(clippy::too_many_lines)]
-async fn run_the_script(http: &Arc<dyn ServiceHttp>, origin: &GatewayOrigin, journal: &Journal) {
+async fn run_the_script(
+    http: &Arc<dyn ServiceHttp>,
+    origin: &GatewayOrigin,
+    journal: &Journal,
+    spent: Spent<'_>,
+) {
     let a = Device::on(http, origin);
     let b = Device::on(http, origin);
 
@@ -813,6 +878,66 @@ async fn run_the_script(http: &Arc<dyn ServiceHttp>, origin: &GatewayOrigin, jou
         .rekey_fence(&shared, identity(), now_ms(), now_ms())
         .await;
     journal.decoded(decoded(&answer, debug));
+
+    // A removal stores nothing, so it takes no hold against the allowance: a principal that can no
+    // longer write an object can still remove one.
+    let late_id = SyncObjectId::new(identity());
+    let late = draft_collection(DraftId::new(late_id.get()));
+    let small = sealed(b"to be removed late");
+
+    journal.step("write an object to be removed once the allowance is spent");
+    let answer = a
+        .service
+        .exchange_shared(
+            &shared,
+            &late,
+            epoch + 1,
+            identity(),
+            now_ms(),
+            None,
+            &small,
+        )
+        .await;
+    let late_at = match &answer {
+        Ok(Keyed::Answered {
+            answer: SyncExchanged::Applied { position },
+            ..
+        }) => Some(*position),
+        _ => None,
+    };
+    journal.decoded(decoded(&answer, |keyed| shown_keyed(keyed, shown)));
+
+    spent.spend(&a, origin, &small).await;
+
+    journal.step("write an object when the allowance is spent");
+    let answer = a
+        .service
+        .exchange_shared(
+            &shared,
+            &draft_collection(DraftId::new(identity())),
+            epoch + 1,
+            identity(),
+            now_ms(),
+            None,
+            &small,
+        )
+        .await;
+    journal.decoded(decoded(&answer, |keyed| shown_keyed(keyed, shown)));
+
+    journal.step("remove an object when the allowance is spent");
+    let removal = identity();
+    let answer = a
+        .service
+        .remove_shared(&shared, &late, epoch + 1, removal, now_ms(), late_at)
+        .await;
+    journal.decoded(decoded(&answer, |keyed| shown_keyed(keyed, shown)));
+
+    journal.step("remove it against a revision that is not its own when the allowance is spent");
+    let answer = a
+        .service
+        .remove_shared(&shared, &late, epoch + 1, identity(), now_ms(), late_at)
+        .await;
+    journal.decoded(decoded(&answer, |keyed| shown_keyed(keyed, shown)));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -831,7 +956,7 @@ async fn the_stand_in_answers_as_the_worker_did() {
         origin: web.origin().to_owned(),
         journal: Arc::clone(&journal),
     });
-    run_the_script(&http, &origin, &journal).await;
+    run_the_script(&http, &origin, &journal, Spent::Told(&web)).await;
     let ran = recorded(&journal, "");
 
     let mut differing = exchange_differences(&held, &ran);
@@ -868,11 +993,11 @@ async fn record_a_local_workers_answers() {
     );
     let journal = Arc::new(Journal::default());
     let http: Arc<dyn ServiceHttp> = Arc::new(Recording {
-        inner: transport,
+        inner: Arc::clone(&transport),
         origin,
         journal: Arc::clone(&journal),
     });
-    run_the_script(&http, &gateway, &journal).await;
+    run_the_script(&http, &gateway, &journal, Spent::Written(&transport)).await;
     let commit = std::env::var("KR_WEB_COMMIT").unwrap_or_else(|_| "not stated".to_owned());
     let mut text = serde_json::to_string_pretty(&recorded(&journal, &commit)).expect("a recording");
     text.push('\n');
