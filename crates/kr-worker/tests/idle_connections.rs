@@ -19,9 +19,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, LinkReader, LocalClient};
 use kr_ipc::endpoint::Listener;
-use kr_ipc::framed::{FrameReader, FrameWriter};
+use kr_ipc::framed::FrameReader;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::envelope::{ActionTarget, ControlEvent, ControlFrame};
@@ -148,9 +148,27 @@ async fn host() -> Host {
 /// A connection as its two ends are read and written raw, because the ordinary client absorbs a
 /// keepalive on its caller's behalf and this case is about whether the worker sends one.
 struct Raw {
-    reader: FrameReader,
+    reader: Reading,
     /// Held so the connection stays open: a writer that is dropped closes it.
-    _writer: FrameWriter,
+    _writer: Box<dyn Send>,
+}
+
+/// The reading half of a connection, as the kind of client that holds it reads.
+enum Reading {
+    /// A command line client's.
+    Local(FrameReader),
+    /// The control daemon's link to a worker, which reads at the level the worker states.
+    Link(LinkReader),
+}
+
+impl Reading {
+    async fn next(&mut self) -> ControlFrame {
+        match self {
+            Self::Local(reader) => reader.read_message().await,
+            Self::Link(reader) => reader.read().await,
+        }
+        .expect("the worker keeps the connection open")
+    }
 }
 
 impl Raw {
@@ -160,8 +178,18 @@ impl Raw {
         while client.take_held().is_some() {}
         let (reader, writer, _acknowledgement) = client.into_halves();
         Self {
-            reader,
-            _writer: writer,
+            reader: Reading::Local(reader),
+            _writer: Box::new(writer),
+        }
+    }
+
+    /// The same for the control daemon's link.
+    fn of_link(mut link: BoundLink) -> Self {
+        while link.take_held().is_some() {}
+        let (reader, writer, _acknowledgement) = link.into_halves();
+        Self {
+            reader: Reading::Link(reader),
+            _writer: Box::new(writer),
         }
     }
 
@@ -169,11 +197,7 @@ impl Raw {
     async fn keepalive(&mut self) {
         tokio::time::timeout(BEAT_BOUND, async {
             loop {
-                let frame: ControlFrame = self
-                    .reader
-                    .read_message()
-                    .await
-                    .expect("the worker keeps the connection open");
+                let frame = self.reader.next().await;
                 if matches!(frame, ControlFrame::Event(ControlEvent::Keepalive)) {
                     return;
                 }
@@ -187,11 +211,7 @@ impl Raw {
     async fn holds_a_keepalive(&mut self) -> bool {
         tokio::time::timeout(LOOK, async {
             loop {
-                let frame: ControlFrame = self
-                    .reader
-                    .read_message()
-                    .await
-                    .expect("the worker keeps the connection open");
+                let frame = self.reader.next().await;
                 if matches!(frame, ControlFrame::Event(ControlEvent::Keepalive)) {
                     return;
                 }
@@ -204,34 +224,26 @@ impl Raw {
 
 /// A connection of the daemon's, declared for `role` and speaking for generation one.
 async fn daemon(host: &Host, role: ControllerConnectionRole) -> Raw {
-    let mut client = LocalClient::connect_receiving(
-        &host.endpoint,
-        LocalClientKind::Controller,
-        build(),
-        ReceiveLimits::default(),
-    )
-    .await
-    .expect("connects");
-    client
-        .writer()
-        .write_message(&ControlFrame::ControllerRole(role))
+    let mut link = BoundLink::connect_receiving(&host.endpoint, build(), ReceiveLimits::default())
+        .await
+        .expect("connects");
+    link.send(&ControlFrame::ControllerRole(role))
         .await
         .expect("declares the role");
-    match client.recv().await.expect("the worker answers") {
+    match link.recv().await.expect("the worker answers") {
         ControlFrame::ControllerRole(declared) => assert_eq!(declared, role),
         other => panic!("the worker answered {other:?}"),
     }
     let identity = Arc::clone(&host.controller);
     let boot = host.boot.clone();
-    client
-        .present_generation(move |nonce| {
-            identity
-                .generation_token(ControllerGeneration::new(1), &boot, nonce)
-                .map_err(kr_ipc::IpcError::from)
-        })
-        .await
-        .expect("the worker accepts the generation");
-    Raw::of(client)
+    link.present_generation(move |nonce| {
+        identity
+            .generation_token(ControllerGeneration::new(1), &boot, nonce)
+            .map_err(kr_ipc::IpcError::from)
+    })
+    .await
+    .expect("the worker accepts the generation");
+    Raw::of_link(link)
 }
 
 async fn cli(host: &Host) -> LocalClient {
