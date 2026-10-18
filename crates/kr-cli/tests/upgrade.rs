@@ -236,66 +236,111 @@ impl Assembled {
     }
 }
 
+/// A host on the release before, with a live session, updated by that release's own `kr` to this
+/// build's release.
+struct Updated {
+    host: Host,
+    /// The release before.
+    one: Assembled,
+    /// This build's release, which names every level this build speaks at.
+    two: Assembled,
+    /// The session's display number and identifier.
+    display: String,
+    session_id: SessionId,
+    /// The process of the session's worker before the update.
+    worker: kr_protocol::identity::ProcessStartIdentity,
+}
+
+impl Updated {
+    async fn new() -> Self {
+        let before = previous();
+        let one = before.assembled(1);
+        let two =
+            Assembled::at_this_level("0.75.0+bbbbbbbbbbbb", 2).retaining_what_this_build_does();
+        let mut host = Host::bare();
+        host.install(&one);
+        let started_through_current = host.store.stable(Program::Controller);
+        host.start_daemon(&started_through_current).await;
+        let (display, session_id) = host.new_session(&host.program(one.name(), Program::Kr));
+        let worker = host.worker_process(session_id);
+        assert_eq!(
+            host.worker_build(session_id).await,
+            format!("kr-worker/{}", one.name()),
+            "the session's worker is the release before's"
+        );
+
+        let archive = host.scratch("archives").join("two.tar.gz");
+        two.archive(&archive);
+        let (output, said) = host.kr_json(&[
+            "host",
+            "update",
+            "--archive",
+            &archive.display().to_string(),
+            "--json",
+        ]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "the release before's kr host update goes on: {said} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            host.store.current().expect("reads"),
+            Some(two.name().clone())
+        );
+        assert_eq!(
+            host.daemon_build().await,
+            format!("kr-controller/{}", two.name()),
+            "the daemon is of the new release"
+        );
+        let updated = Self {
+            host,
+            one,
+            two,
+            display,
+            session_id,
+            worker,
+        };
+        updated.the_worker_is_as_it_was().await;
+        updated
+    }
+
+    /// The release before's `kr`, and this release's.
+    fn kr_before(&self) -> PathBuf {
+        self.host.program(self.one.name(), Program::Kr)
+    }
+
+    fn kr_now(&self) -> PathBuf {
+        self.host.program(self.two.name(), Program::Kr)
+    }
+
+    /// The worker still runs the release before, and is the process it was.
+    async fn the_worker_is_as_it_was(&self) {
+        assert_eq!(
+            self.host.worker_build(self.session_id).await,
+            format!("kr-worker/{}", self.one.name()),
+            "the worker still runs the release before"
+        );
+        assert_eq!(
+            self.host.worker_process(self.session_id),
+            self.worker,
+            "and it is the process it was"
+        );
+    }
+}
+
 /// KR-REQ-26.06, KR-REQ-26.08, KR-ACC-035: a host on the release before is updated, by that
 /// release's own `kr`, to this one while a session's worker still runs the release before: the
-/// update goes on and does not wait, the worker and its shell are the processes they were, the
-/// new control daemon lists the session and closes it with the answer of the worker's level, and
-/// the release the worker holds is kept until the session ends.
+/// update goes on and does not wait, the worker is the process it was, the new control daemon lists
+/// the session and closes it with the answer of the worker's level, and the release the worker holds
+/// is let go once the session ends.
 #[tokio::test(flavor = "multi_thread")]
 async fn kr_host_update_goes_on_beside_a_live_worker_of_the_release_before() {
-    let before = previous();
-    let one = before.assembled(1);
-    let two = Assembled::at_this_level("0.75.0+bbbbbbbbbbbb", 2).retaining_what_this_build_does();
-    let mut host = Host::bare();
-    host.install(&one);
-    let started_through_current = host.store.stable(Program::Controller);
-    host.start_daemon(&started_through_current).await;
-    let (display, session_id) = host.new_session(&host.program(one.name(), Program::Kr));
-    let worker = host.worker_process(session_id);
-    assert_eq!(
-        host.worker_build(session_id).await,
-        format!("kr-worker/{}", one.name()),
-        "the session's worker is the release before's"
-    );
-
-    let archive = host.scratch("archives").join("two.tar.gz");
-    two.archive(&archive);
-    let (output, said) = host.kr_json(&[
-        "host",
-        "update",
-        "--archive",
-        &archive.display().to_string(),
-        "--json",
-    ]);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "kr host update: {said} {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        host.store.current().expect("reads"),
-        Some(two.name().clone())
-    );
-    assert_eq!(
-        host.daemon_build().await,
-        format!("kr-controller/{}", two.name()),
-        "the daemon is of the new release"
-    );
-    assert_eq!(
-        host.worker_build(session_id).await,
-        format!("kr-worker/{}", one.name()),
-        "the worker still runs the release before"
-    );
-    assert_eq!(
-        host.worker_process(session_id),
-        worker,
-        "and it is the process it was"
-    );
+    let updated = Updated::new().await;
+    let host = &updated.host;
 
     // The new daemon lists the session it adopted.
-    let new_kr = host.program(two.name(), Program::Kr);
-    let listed = host.run(&new_kr, &["--json", "list"]);
+    let listed = host.run(&updated.kr_now(), &["--json", "list"]);
     assert!(
         listed.status.success(),
         "kr list: {}",
@@ -303,12 +348,92 @@ async fn kr_host_update_goes_on_beside_a_live_worker_of_the_release_before() {
     );
     let listed: Value = serde_json::from_slice(&listed.stdout).expect("a document");
     assert!(
-        listed.to_string().contains(&session_id.to_string()),
+        listed.to_string().contains(&updated.session_id.to_string()),
         "the session is listed: {listed}"
     );
 
     // The new daemon closes it, and the release the worker held is let go.
-    host.close(&new_kr, &display);
-    host.worker_ended(&worker).await;
-    host.released(one.name()).await;
+    host.close(&updated.kr_now(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+    host.released(updated.one.name()).await;
+}
+
+/// KR-REQ-26.06, KR-ACC-035: a control daemon of this release that starts again beside the worker
+/// of the release before finds it again from its descriptor and publishes the descriptor in the
+/// shape the release before reads, so that release's own `kr` still finds and reads the session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_start_of_the_daemon_leaves_the_session_readable_by_the_release_before() {
+    let mut updated = Updated::new().await;
+    assert!(updated.host.stop_the_daemon().await, "the daemon stops");
+    let controller = updated.host.store.stable(Program::Controller);
+    updated.host.start_daemon(&controller).await;
+
+    let host = &updated.host;
+    let read = host.run(
+        &updated.kr_before(),
+        &["--json", "status", &updated.display],
+    );
+    assert!(
+        read.status.success(),
+        "the release before's kr status: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let read: Value = serde_json::from_slice(&read.stdout).expect("a document");
+    assert_eq!(read["session_id"], updated.session_id.to_string(), "{read}");
+    updated.the_worker_is_as_it_was().await;
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+}
+
+/// KR-REQ-26.10, KR-REQ-26.08: a rollback to the release before goes on while only its session is
+/// live, and waits, exit 9, naming the session, while a session of this release is live.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_for_one_of_this_release()
+ {
+    let updated = Updated::new().await;
+    let host = &updated.host;
+
+    // A session of this release: the older release's daemon does not retain its level.
+    let (display, _) = host.new_session(&updated.kr_now());
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "a rollback waits for a session of this release: {said}"
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains(&format!(
+            "session {display} runs kr-worker/{}",
+            updated.two.name()
+        )),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(updated.two.name().clone()),
+        "nothing was switched"
+    );
+    host.close(&updated.kr_now(), &display);
+
+    // With only the release before's session live the rollback goes on.
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(updated.one.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", updated.one.name()),
+        "the daemon is the release before's again"
+    );
+    updated.the_worker_is_as_it_was().await;
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
 }
