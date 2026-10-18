@@ -209,8 +209,10 @@ struct ScriptedHosts {
     second: Mutex<Option<Vec<Listed>>>,
     /// Whether a host this computer owns does not answer.
     silent: Mutex<bool>,
-    /// Whether a host this computer owns refuses to list its devices to it.
+    /// Whether every host this computer owns refuses to list its devices to it.
     refusing_lists: Mutex<bool>,
+    /// Whether the host this computer can ask refuses, and a second host, if there is one, lists.
+    first_refusing: Mutex<bool>,
     /// How many times a host was asked whether it holds a session.
     asked: Mutex<u32>,
 }
@@ -228,6 +230,7 @@ impl ScriptedHosts {
             second: Mutex::default(),
             silent: Mutex::default(),
             refusing_lists: Mutex::default(),
+            first_refusing: Mutex::default(),
             asked: Mutex::default(),
         }
     }
@@ -289,6 +292,11 @@ impl ScriptedHosts {
         *self.refusing_lists.lock().expect("the record") = refusing;
     }
 
+    /// The host this computer can ask refuses to list its devices to it, or lists them again.
+    fn refuse_at_the_first_host(&self, refusing: bool) {
+        *self.first_refusing.lock().expect("the record") = refusing;
+    }
+
     fn times_asked_who_holds(&self) -> u32 {
         *self.asked.lock().expect("the record")
     }
@@ -321,17 +329,19 @@ impl Hosts for ScriptedHosts {
         };
         let devices = self.devices.lock().expect("the record").clone();
         let mut lists = Vec::new();
-        if !devices.is_empty() {
+        let first_refuses = *self.first_refusing.lock().expect("the record");
+        if !devices.is_empty() && !first_refuses {
             lists.push(list_of(&devices));
         }
         if let Some(second) = &*self.second.lock().expect("the record") {
             lists.push(list_of(second));
         }
         let silent = *self.silent.lock().expect("the record");
-        let refused = *self.refusing_lists.lock().expect("the record");
-        if refused {
+        let all_refuse = *self.refusing_lists.lock().expect("the record");
+        if all_refuse {
             lists.clear();
         }
+        let refused = all_refuse || first_refuses;
         Box::pin(std::future::ready(HostLists {
             lists,
             silent,
@@ -3447,7 +3457,7 @@ async fn hosts_that_all_refuse_to_list_their_devices_stop_this_computer_and_take
         .call("settings_sync_now", json!({}))
         .expect_err("this computer says it cannot check who may share");
     assert!(
-        stopped.to_string().contains("will list their devices"),
+        stopped.to_string().contains("will not list their devices"),
         "{stopped}"
     );
     assert_eq!(
@@ -3466,6 +3476,60 @@ async fn hosts_that_all_refuse_to_list_their_devices_stop_this_computer_and_take
     this.hosts.refuse_to_list(false);
     page.sync_now();
     assert_eq!(phone.sync_now()["colour_mode"], "light");
+}
+
+/// A host that refuses beside a host that does not answer, with none that lists, leaves this
+/// computer as unable to check as hosts that all refuse: it stops, and takes nobody out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_beside_a_silent_host_stops_this_computer_too() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    let phone = other.start();
+    page.share(&first_reference(&page.devices_refresh()["candidates"]))
+        .expect("shared");
+    phone
+        .join(&first_reference(&phone.devices_refresh()["offers"]))
+        .expect("joined");
+    page.sync_now();
+
+    this.hosts.refuse_to_list(true);
+    this.hosts.go_silent(true);
+    page.call("settings_sync_now", json!({}))
+        .expect_err("this computer says it cannot check who may share");
+    assert_eq!(
+        page.devices()["members"].as_array().expect("members").len(),
+        2,
+        "nobody was taken out"
+    );
+}
+
+/// A host that refuses to list its devices to this computer says nothing of the devices only it
+/// lists, as a host that does not answer says nothing: they stay, while the host that lists is
+/// believed about the devices it mentions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_refuses_beside_one_that_lists_leaves_the_devices_only_it_lists_in() {
+    let (this, other) = two_computers().await;
+    this.hosts
+        .list_at_a_second_host(vec![this.listed("this-mac")]);
+    let page = with_sync_on(&this).await;
+    let phone = other.start();
+    page.share(&first_reference(&page.devices_refresh()["candidates"]))
+        .expect("shared");
+    phone
+        .join(&first_reference(&phone.devices_refresh()["offers"]))
+        .expect("joined");
+    page.sync_now();
+
+    this.hosts.refuse_at_the_first_host(true);
+    let view = page.sync_now();
+    assert_eq!(
+        view["sync"]["devices"]["members"]
+            .as_array()
+            .expect("members")
+            .len(),
+        2,
+        "the phone, which only the host that refuses lists, is kept: {view}"
+    );
 }
 
 /// Two hosts that list one device under different stored-envelope keys leave it nothing to be
@@ -4156,6 +4220,33 @@ async fn a_choice_made_beside_a_change_that_went_over_a_write_still_asks_the_dev
     assert_eq!(view["colour_mode"], "system");
 
     // The phone held what was gone over, and it is asked.
+    let view = phone.sync_now();
+    assert_eq!(view["colour_mode"], "light", "{view}");
+    assert_eq!(view["sync"]["conflicts"], 1, "{view}");
+}
+
+/// A third computer that chooses what the change that went over says, so that the copy is let go
+/// and nothing is asked of its person, still carries what that change went over: the device that
+/// held the write is asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_choice_that_says_what_the_change_over_a_write_says_still_asks_the_device_that_held_it() {
+    let (_computers, pages) = computers_sharing(&["the-phone", "the-tablet", "the-laptop"]).await;
+    let [page, phone, tablet, _laptop] = &pages[..] else {
+        panic!("four computers");
+    };
+    phone.choose("light");
+    page.unshare(&reference_of(&page.devices()["members"], "the-laptop"))
+        .expect("the laptop is taken out");
+    page.sync_now();
+    page.choose("system");
+
+    tablet.choose("system");
+    let view = tablet.sync_now();
+    assert_eq!(
+        view["sync"]["conflicts"], 0,
+        "nothing is asked of the tablet: {view}"
+    );
+
     let view = phone.sync_now();
     assert_eq!(view["colour_mode"], "light", "{view}");
     assert_eq!(view["sync"]["conflicts"], 1, "{view}");

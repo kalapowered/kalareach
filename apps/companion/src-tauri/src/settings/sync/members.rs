@@ -219,11 +219,12 @@ impl DeviceDirectory for HostsDirectory {
             }
             let asked = self.hosts.device_lists().await;
             if asked.lists.is_empty() {
-                // Hosts that all refuse to list their devices to this computer have answered, and
-                // what they say is that this computer cannot vouch for anybody: it checks nobody,
-                // publishes nothing, and takes nobody out for it, which is for the person to
-                // decide. No host that answered at all leaves check 3 unable to run.
-                if asked.refused && !asked.silent {
+                // Hosts that refuse to list their devices to this computer, and no host that
+                // listed, have answered, and what they say is that this computer cannot vouch for
+                // anybody: it checks nobody, publishes nothing, and takes nobody out for it, which
+                // is for the person to decide. No host that answered at all leaves check 3 unable
+                // to run.
+                if asked.refused {
                     // What the hosts listed a minute ago is not believed any more.
                     *self
                         .listed
@@ -233,8 +234,8 @@ impl DeviceDirectory for HostsDirectory {
                     return Err(ClientError::refusal(
                         ErrorCode::PermissionDenied,
                         Shown::said(
-                            "none of your hosts will list their devices to this computer any \
-                             more, so who may share your settings cannot be checked here",
+                            "the hosts that answered will not list their devices to this computer \
+                             any more, so who may share your settings cannot be checked here",
                         ),
                     ));
                 }
@@ -293,9 +294,12 @@ impl DeviceDirectory for HostsDirectory {
                 .filter(|(_, keys)| keys.len() > 1)
                 .map(|(device, _)| device)
                 .collect();
+            // A host that refuses to list its devices to this computer says nothing of the devices
+            // only it lists, as a host that did not answer says nothing: they are kept, and
+            // nothing is accepted, opened or added on that host's word.
             let answers = HostAnswers {
                 reports,
-                silent: asked.silent,
+                silent: asked.silent || asked.refused,
             };
             *self
                 .listed

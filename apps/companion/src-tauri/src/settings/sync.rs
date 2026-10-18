@@ -1519,8 +1519,8 @@ fn member_failure(error: kr_client::sync::membership::MembershipError) -> Comman
             "none of your hosts answered, so who may share your settings could not be checked",
         ),
         MembershipError::HostSilent => CommandError::unavailable(
-            "one of your hosts did not answer, so the settings were not joined; try again when it \
-             does, or unpair a host that is gone",
+            "one of your hosts did not answer or will not list its devices to this computer, so the \
+             settings were not joined; try again when it does, or unpair a host that is gone",
         ),
         MembershipError::NotCommitted => {
             CommandError::refused("no host lists that device as one of yours any more")
