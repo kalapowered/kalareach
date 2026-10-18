@@ -195,8 +195,16 @@ async fn kr_req_12_18_a_relayed_approval_is_recorded_and_its_views_are_told() {
 /// KR-REQ-12.18: with the package bound as the installation's binder will bind it, a relayed
 /// approval is interpreted from the table's own decision destination and an answer through
 /// `agent.approval.respond` goes out on the channel as the application's own verdict, once.
+///
+/// The approval is the one the forwarder of the release before this one relayed, and the verdict
+/// is the one that release's worker wrote, both as recorded in `channel-frames-0.74.json`: the
+/// forwarder and the worker of two releases read each other's frames, so neither frame changes
+/// without a release that retains the older one.
 #[tokio::test]
 async fn kr_req_12_18_an_answer_goes_out_on_the_channel_as_the_applications_verdict() {
+    let recorded: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/channel-frames-0.74.json"))
+            .expect("the recorded frames are JSON");
     let broker = memory_broker();
     register(&broker, 2);
     let package = Package::laid_out();
@@ -207,7 +215,7 @@ async fn kr_req_12_18_an_answer_goes_out_on_the_channel_as_the_applications_verd
         launched(2),
     );
 
-    channel.relay("abcde").await;
+    channel.send(&recorded["permission_request"]).await;
     eventually("the approval is interpreted", || {
         relayed(&broker, 2, "abcde").is_some_and(|resource| resource.interpretation_verified)
     })
@@ -237,10 +245,7 @@ async fn kr_req_12_18_an_answer_goes_out_on_the_channel_as_the_applications_verd
     assert_eq!(answered.state, PendingState::Resolved);
     assert_eq!(
         channel.next().await,
-        Some(serde_json::json!({
-            "method": "notifications/claude/channel/permission",
-            "params": { "request_id": "abcde", "behavior": "allow" }
-        })),
+        Some(recorded["permission"].clone()),
         "the verdict Claude Code reads, and nothing else"
     );
     assert!(

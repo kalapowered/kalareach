@@ -1,0 +1,1 @@
+{"permission_request":{"jsonrpc":"2.0","method":"notifications/claude/channel/permission_request","params":{"description":"Run shell command","input_preview":"{\"command\":\"ls\"}","request_id":"abcde","tool_name":"Bash"}},"permission":{"method":"notifications/claude/channel/permission","params":{"behavior":"allow","request_id":"abcde"}}}

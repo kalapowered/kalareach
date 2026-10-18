@@ -84,6 +84,30 @@ fn exit_code(launch: &Launch) -> Option<i32> {
     code
 }
 
+/// Completes Claude Code's handshake with the channel, as Claude Code does, and returns the
+/// channel's answer to `initialize`.
+fn handshake(launch: &mut Launch, lines: &Receiver<serde_json::Value>) -> serde_json::Value {
+    to_channel(
+        launch,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "claude-code", "version": "2.1.278"},
+            },
+        }),
+    );
+    let answer = next(lines);
+    to_channel(
+        launch,
+        &serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+    answer
+}
+
 fn permission_request(request_id: &str, input_preview: &str) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -134,20 +158,7 @@ async fn kr_req_12_18_the_channel_negotiates_and_carries_frames_both_ways_and_no
     let mut admitted = launch.accept().await.expect("the channel is admitted");
     assert_eq!(admitted.surface, BridgeSurface::Channel);
 
-    to_channel(
-        &mut launch,
-        &serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": {"name": "claude-code", "version": "2.1.278"},
-            },
-        }),
-    );
-    let answer = next(&lines);
+    let answer = handshake(&mut launch, &lines);
     assert_eq!(answer["id"], 0);
     assert_eq!(answer["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(
@@ -163,10 +174,6 @@ async fn kr_req_12_18_the_channel_negotiates_and_carries_frames_both_ways_and_no
             .as_str()
             .is_some_and(|text| text.contains("<channel source=\"kalareach\">")),
         "{answer}"
-    );
-    to_channel(
-        &mut launch,
-        &serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
     );
 
     // A message into the session.
@@ -243,6 +250,52 @@ async fn kr_req_12_18_the_channel_negotiates_and_carries_frames_both_ways_and_no
         to_worker(&mut admitted).await,
         None,
         "the worker reads the end of the channel"
+    );
+}
+
+/// KR-REQ-12.18: the Channels frames cross as the worker of the release before this one wrote and
+/// read them, recorded in `channel-frames-0.74.json` (a file, not frames this build wrote): the
+/// approval this forwarder relays is the one that worker reads, and the verdict that worker wrote,
+/// which carries no `jsonrpc` member, reaches Claude Code as a notification of the same method and
+/// parameters. A worker of that release is reached by this forwarder directly, so these frames are
+/// the whole of what the two read of each other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_18_the_frames_of_a_worker_of_the_release_before_cross_as_it_wrote_and_read_them()
+{
+    let recorded: serde_json::Value = serde_json::from_str(include_str!(
+        "../../kr-worker/tests/fixtures/channel-frames-0.74.json"
+    ))
+    .expect("the recorded frames are JSON");
+    let placed = Placed::new();
+    let mut launch = Launch::channel(
+        &placed,
+        installed(&placed, &[BridgeSurface::Hook, BridgeSurface::Channel]),
+    );
+    let lines = read_lines(&mut launch);
+    let mut admitted = launch.accept().await.expect("the channel is admitted");
+    handshake(&mut launch, &lines);
+
+    let request = &recorded["permission_request"]["params"];
+    to_channel(
+        &mut launch,
+        &permission_request(
+            request["request_id"].as_str().expect("an identifier"),
+            request["input_preview"].as_str().expect("a preview"),
+        ),
+    );
+    assert_eq!(
+        to_worker(&mut admitted).await.as_ref(),
+        Some(&recorded["permission_request"]),
+        "the approval, as the worker of the release before reads it"
+    );
+
+    from_worker(&mut admitted, &recorded["permission"]).await;
+    let delivered = next(&lines);
+    assert_eq!(delivered["method"], recorded["permission"]["method"]);
+    assert_eq!(delivered["params"], recorded["permission"]["params"]);
+    assert_eq!(
+        delivered["jsonrpc"], "2.0",
+        "Claude Code reads a notification"
     );
 }
 
