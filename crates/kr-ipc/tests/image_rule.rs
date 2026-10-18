@@ -61,7 +61,13 @@ const LINK_FILES: [&str; 2] = [
 ];
 
 /// The names of the raw ways to a connection that [`LINK_FILES`] alone may use.
-const RAW_LINKS: [&str; 3] = ["LocalClient", "Connection::connect", "framed::split"];
+const RAW_LINKS: [&str; 5] = [
+    "LocalClient",
+    "ThisLevel",
+    "Connection::connect",
+    "framed::split",
+    "framed::*",
+];
 
 /// The features that exist for tests, in whichever crate they are: each compiles seams into its
 /// crate that only a test acts through, so a program built with one carries a way in that nothing
@@ -512,12 +518,20 @@ fn raw_link(tokens: &[Located], at: usize, end: usize) -> Option<&'static str> {
     if ident(at, "LocalClient") {
         return Some("LocalClient");
     }
+    // The raw client under its generic name.
+    if ident(at, "ThisLevel") {
+        return Some("ThisLevel");
+    }
     if ident(at, "Connection") && path_sep(at + 1) && ident(at + 3, "connect") {
         return Some("Connection::connect");
     }
     if ident(at, "framed") && path_sep(at + 1) {
         if ident(at + 3, "split") {
             return Some("framed::split");
+        }
+        // A glob brings `split` in without naming it.
+        if punct(at + 3, '*') {
+            return Some("framed::*");
         }
         if punct(at + 3, '{') {
             let close = closing_brace(tokens, at + 3, end);
@@ -1248,6 +1262,11 @@ fn the_reading_finds_a_raw_way_to_a_connection_however_it_is_written() {
             "Connection::connect",
         ),
         ("use kr_ipc::framed::split;", "framed::split"),
+        ("use kr_ipc::framed::*;", "framed::*"),
+        (
+            "fn f(client: kr_ipc::client::Client<ThisLevel>) {}",
+            "ThisLevel",
+        ),
         (
             "use kr_ipc::framed::{FrameReader, FrameWriter, split};",
             "framed::split",

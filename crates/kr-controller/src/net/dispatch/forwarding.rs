@@ -10,7 +10,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{AuthorityRevision, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::CanonicalSet;
+use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_transport::window::AcceptedDeadline;
 
 use super::super::proxy::{Vouched, WorkerProxy};
@@ -606,18 +606,24 @@ impl RemoteConnection {
             request_id: mutation.request_id,
             method: Method::ActionRead.into(),
             method_version: Method::ActionRead.entry().version,
-            params: ParamsValue::from_typed(&kr_protocol::receipt::ActionReadParams {
-                action_id: mutation.action_id,
-                // This request goes to the worker that owns the session, which serves the
-                // receipts of the one session it has. Naming it would say nothing more.
-                session_id: None,
-            })
-            .map_err(|error| {
-                RouteRefusal::Conflict(ProtocolError::new(
-                    ErrorCode::InvalidArgument,
-                    error.to_string(),
-                ))
-            })?,
+            // Written as the worker's level reads them: the daemon makes this request itself.
+            params: proxy
+                .level()
+                .encode_params(
+                    Method::ActionRead,
+                    &kr_protocol::receipt::ActionReadParams {
+                        action_id: mutation.action_id,
+                        // This request goes to the worker that owns the session, which serves the
+                        // receipts of the one session it has. Naming it would say nothing more.
+                        session_id: None,
+                    },
+                )
+                .map_err(|error| {
+                    RouteRefusal::Conflict(ProtocolError::new(
+                        ErrorCode::UnsupportedCapability,
+                        error.to_string(),
+                    ))
+                })?,
         };
         let envelope = self.envelope(asked.acting.grant.grant_id, validated);
         let authority = self
@@ -648,19 +654,31 @@ impl RemoteConnection {
         else {
             return Err(RouteRefusal::Conflict(unreadable_retained_answer()));
         };
-        // A close's result is settled as one given now is, and goes as it came: the daemon keeps
-        // the worker's whole description for its own use, and what a device is shown of it is
-        // decided where the answer is written.
+        // A close's result is read in the shape of the worker's level, like the answer around it,
+        // and settled as one given now is. What goes on is the result in this release's shape: the
+        // daemon keeps the worker's whole description for its own use, and what a device is shown
+        // of it is decided where the answer is written. One that does not read is refused.
+        let mut read_back = read_back;
         if mutation.method == Method::SessionClose.into()
-            && let Some(result) = read_back.result.as_ref()
-            && let Ok(answer) = proxy
-                .level()
-                .decode_value::<kr_protocol::session::SessionCloseResult>(result)
+            && let Some(result) = read_back.result.0.take()
         {
+            let Ok(answer) = proxy
+                .level()
+                .decode_value::<kr_protocol::session::SessionCloseResult>(&result)
+            else {
+                return Err(RouteRefusal::Conflict(unreadable_retained_answer()));
+            };
             let _ = self
                 .controller
                 .settle_close_answer(session_id, &answer)
                 .await;
+            let converted = ParamsValue::from_typed(&answer).map_err(|error| {
+                RouteRefusal::Conflict(ProtocolError::new(
+                    ErrorCode::InvalidArgument,
+                    error.to_string(),
+                ))
+            })?;
+            read_back.result = Nullable::some(converted);
         }
         // The result when the action produced one, and the receipt when it has not: a caller that
         // resubmitted is told what became of its action, and nothing is dispatched again.

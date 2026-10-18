@@ -284,6 +284,17 @@ async fn a_worker_whose_level_cannot_read_the_statement_is_sent_none_and_its_lin
             None
         );
     }
+    // The link was not given up: the next exchange on it is answered.
+    let notice = controller.revision_notice(
+        controller.leases.authority_revision(),
+        controller.leases.authority_revision(),
+        0,
+    );
+    let acknowledged = link
+        .announce_revision(notice)
+        .await
+        .expect("the link carries the next exchange");
+    assert_eq!(acknowledged.session_id, silent.session_id);
     assert!(
         !heard(&recorded)
             .iter()

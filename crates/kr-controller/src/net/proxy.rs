@@ -18,9 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use kr_ipc::client::BoundLink;
 use kr_protocol::actor::ActorEnvelope;
-use kr_protocol::envelope::{
-    ControlEvent, ControlFrame, MutationRequest, ParamsValue, Request, Response,
-};
+use kr_protocol::envelope::{ControlEvent, ControlFrame, MutationRequest, Request, Response};
 use kr_protocol::grant::HistoryScope;
 use kr_protocol::ids::{RequestId, SessionId};
 use kr_protocol::local::{
@@ -404,7 +402,9 @@ impl WorkerProxy {
         params: &T,
     ) -> Result<Response> {
         let request_id = self.next_request_id();
-        let params = ParamsValue::from_typed(params)
+        let params = self
+            .level
+            .encode_params(method, params)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         let frame = ControlFrame::Request(Request {
             request_id,

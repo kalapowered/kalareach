@@ -1734,10 +1734,7 @@ async fn a_replacement_daemon_settles_a_close_the_worker_answers_again_from_what
     )
     .await;
     assert!(
-        matches!(
-            closed.retained,
-            crate::service::net::Retained::Worker
-        ),
+        matches!(closed.retained, crate::service::net::Retained::Worker),
         "the worker answered from what it kept"
     );
     assert_eq!(
@@ -3605,7 +3602,8 @@ async fn kr_req_10_49_the_daemons_own_link_forwards_no_history_member() {
 
 /// KR-REQ-10.49: a device's retry of a close whose answer the worker kept is answered, and the
 /// daemon settles the kept answer first, as it settles one given now: the worker keeps the answer
-/// whole, which the daemon uses for its own record, and shows the device what its grant reaches.
+/// whole, which the daemon uses for its own record. What the device is shown of a kept answer is
+/// held to its grant by the worker; `kr_req_10_49_a_kept_result_is_not_shown_to_a_device` shows it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_10_49_a_retried_close_is_answered_and_the_kept_answer_is_settled() {
     use kr_protocol::envelope::{ControlFrame, Outcome, Response};
@@ -3657,6 +3655,54 @@ async fn kr_req_10_49_a_retried_close_is_answered_and_the_kept_answer_is_settled
     assert_eq!(
         scripted::list(&world, false).await,
         vec![(world.session_id, SessionState::Closing)]
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-10.49: the close result a worker kept inside its answer is read in the shape of the
+/// worker's level too. One that does not read there is refused by name and the close is not sent
+/// again; the daemon settles nothing from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_49_a_kept_close_result_that_does_not_read_is_refused_not_passed_on() {
+    use kr_protocol::envelope::ControlFrame;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let connection =
+        super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 37));
+    let close = fake::close_request(world.environment_id, world.session_id);
+    assert!(
+        connection
+            .claim_route(&close, Some(world.session_id))
+            .is_ok(),
+        "the route of the close is on record"
+    );
+    let unreadable = ParamsValue::new(kr_cbor::CanonicalValue::Map(
+        kr_cbor::CanonicalMap::from_entries([(
+            "a_member_no_level_has".to_owned(),
+            kr_cbor::CanonicalValue::integer(1).expect("an integer"),
+        )])
+        .expect("a map"),
+    ));
+    script.kept(close.action_id, unreadable);
+    let answered = connection
+        .answer(ControlFrame::Mutation(Box::new(close)))
+        .await
+        .expect("the retry is answered");
+    let error = error_of(answered.frame());
+    assert_eq!(
+        error.code,
+        kr_protocol::error::ErrorCode::UnsupportedSchema,
+        "{error}"
+    );
+    assert_eq!(
+        script.forwarded().len(),
+        0,
+        "the close was not sent again to get another answer"
     );
     world.serving.abort();
 }
