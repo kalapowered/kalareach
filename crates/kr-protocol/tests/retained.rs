@@ -650,3 +650,45 @@ fn a_kept_answer_reads_under_the_retained_level_as_it_reads_under_this_one() {
         assert_eq!(kept, answer);
     }
 }
+
+/// KR-REQ-26.06, KR-ACC-035: the exchange a control daemon had with a real worker of the release
+/// before (`retained/0.74/frames.json`: the payload of every frame either way, as they went over
+/// the wire in the upgrade suite) reads under the level that release stated, and reads the same
+/// under this build's own level while the two do not differ. What the daemon wrote reads back as
+/// the bytes it wrote.
+///
+/// The record is made by `KR_RECORD_FRAMES=1 cargo test -p kr-cli --features upgrade-suite --test
+/// upgrade the_frames_ -- --nocapture`, which prints it.
+#[test]
+fn the_exchange_recorded_with_a_real_worker_of_the_release_before_reads_under_its_level() {
+    let record: Vec<Value> = serde_json::from_str(include_str!("../retained/0.74/frames.json"))
+        .expect("the record is a list");
+    assert!(
+        !record.is_empty(),
+        "the retained level records no exchange with a worker of its release"
+    );
+    let level = Level::retained(&kr_protocol::retained::RETAINED[0]);
+    let mut both_ways = [false; 2];
+    for entry in &record {
+        let payload = hex::decode(entry["payload"].as_str().expect("a payload")).expect("hex");
+        let written = entry["direction"] == "controller_to_worker";
+        both_ways[usize::from(written)] = true;
+        let frame = level
+            .decode(&payload, &limits())
+            .unwrap_or_else(|error| panic!("{entry} reads under the level: {error:?}"));
+        assert_eq!(
+            Level::this()
+                .decode(&payload, &limits())
+                .expect("it reads under this build's level too"),
+            frame
+        );
+        if written {
+            assert_eq!(
+                level.encode(&frame, &limits()).expect("it writes again"),
+                payload,
+                "{entry}"
+            );
+        }
+    }
+    assert_eq!(both_ways, [true, true], "frames went both ways");
+}
