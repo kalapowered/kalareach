@@ -81,6 +81,17 @@ impl<R: Runtime> ConnectedHosts<R> {
     }
 }
 
+/// Whether a refusal says the host will answer no question now, and not only this one.
+fn refuses_everything(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::RateLimited
+            | ErrorCode::EnvironmentUnavailable
+            | ErrorCode::UpstreamUnavailable
+            | ErrorCode::StorageUnavailable
+    )
+}
+
 /// Whether `link` is the connection `over` makes to the host of `environment`.
 fn is_link(link: Option<&Link>, environment: EnvironmentId, over: &Arc<Session>) -> bool {
     link.is_some_and(|(held, session)| {
@@ -144,8 +155,9 @@ impl<R: Runtime> DraftHosts for ConnectedHosts<R> {
                         Holds::NotHere
                     }
                     // A host too busy or unavailable to say asks for no more questions; one that
-                    // refuses to say about this session may still say about another.
-                    code if code.retry_category().permits_automatic_retry() => Holds::Unknown,
+                    // refuses to say about this session, or cannot reach that session's worker,
+                    // may still say about another.
+                    code if refuses_everything(code) => Holds::Unknown,
                     _ => Holds::Refused,
                 },
                 Ok(Err(_)) | Err(_) => Holds::Unknown,
@@ -196,5 +208,20 @@ impl<R: Runtime> DraftHosts for ConnectedHosts<R> {
                 },
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A session whose worker cannot be reached is refused as unavailable, and that says nothing of
+    /// the host's other sessions; a host that is rate limited answers none.
+    #[test]
+    fn a_session_that_cannot_be_reached_does_not_end_the_questions_about_the_others() {
+        assert!(!refuses_everything(ErrorCode::ResourceUnavailable));
+        assert!(!refuses_everything(ErrorCode::PermissionDenied));
+        assert!(refuses_everything(ErrorCode::RateLimited));
+        assert!(refuses_everything(ErrorCode::EnvironmentUnavailable));
     }
 }

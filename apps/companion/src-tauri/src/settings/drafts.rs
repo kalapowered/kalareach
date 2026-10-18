@@ -268,7 +268,7 @@ struct HostStore {
 }
 
 /// The failure an answer is held back with when the store cannot be made to hold the boundary.
-fn cannot_hold(_why: &CommandError) -> kr_client::ClientError {
+fn cannot_hold() -> kr_client::ClientError {
     kr_client::ClientError::refusal(
         kr_protocol::error::ErrorCode::StorageUnavailable,
         kr_client::Shown::said("the privacy boundary of this host's drafts could not be kept"),
@@ -278,10 +278,14 @@ fn cannot_hold(_why: &CommandError) -> kr_client::ClientError {
 /// A host's service as its drafts reach it. An answer is not handed on until the host's privacy
 /// mode has been read again and the host's store moved to it, so the generation an answer is
 /// settled against is the one in force when the answer arrives, and not the one in force when
-/// the request left. A store that is already fenced is not read for again: a read cannot make it
-/// more closed. A store that cannot be moved to what the host reports, as one whose generation is
-/// ahead of a reset host's, is fenced at the generation it holds, and an answer is not handed on
-/// when even that cannot be recorded.
+/// the request left. A store that is already fenced is not read for again: what an answer brings
+/// down is withheld from a fenced store whatever the host says next. A store that cannot be moved
+/// to what the host reports, as one whose generation is ahead of a reset host's, is fenced at the
+/// generation it holds, and an answer is not handed on when even that cannot be recorded. The
+/// fence at the held generation keeps the account of a write the service applied before then, so
+/// a write in flight when such a host turns private is noted and not discarded; the generation
+/// the host reports is not one the store can take, and one made up would shut the host out until
+/// its own passed it.
 struct Gate {
     inner: Arc<dyn SyncBackupService>,
     hosts: Arc<dyn DraftHosts>,
@@ -304,10 +308,7 @@ impl Gate {
     /// Returns why the store could not be made to hold the boundary: nothing may be settled then,
     /// and the request stays outstanding for a reconciliation.
     async fn read_again(&self) -> kr_client::Result<()> {
-        let closed = self
-            .client
-            .is_fenced()
-            .map_err(|error| cannot_hold(&super::sync::sync_failure(error)))?;
+        let closed = self.client.is_fenced().map_err(|_| cannot_hold())?;
         if closed {
             return Ok(());
         }
@@ -318,14 +319,10 @@ impl Gate {
             // cannot. It is fenced at the generation it holds, as for a host that cannot be read,
             // so nothing an answer brings down is kept.
             Err(error) => {
-                let held = self
-                    .client
-                    .store()
-                    .privacy()
-                    .map_err(|error| cannot_hold(&super::sync::sync_failure(error)))?;
+                let held = self.client.store().privacy().map_err(|_| cannot_hold())?;
                 self.client
                     .fence(held.generation.get())
-                    .map_err(|error| cannot_hold(&super::sync::sync_failure(error)))?;
+                    .map_err(|_| cannot_hold())?;
                 HostPrivacy::Unreadable {
                     reason: error.message,
                 }

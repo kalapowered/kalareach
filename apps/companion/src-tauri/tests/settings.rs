@@ -2109,12 +2109,17 @@ async fn a_refusal_that_arrives_while_the_host_cannot_be_read_brings_nothing_dow
         "nothing the service answered with was kept: {:?}",
         page.kept_drafts()
     );
+    assert_eq!(
+        kept_here(&page.view()),
+        vec![("studio".to_owned(), "unreadable".to_owned(), 1)],
+        "and the card says why the draft waits"
+    );
 }
 
 /// A host whose state was reset reports a generation below the one this computer holds for it. Its
 /// word that privacy mode is off is believed, and a store cannot follow it down when it turns on
-/// again: an answer that arrives then is still withheld, since the store is fenced at the
-/// generation it holds.
+/// again: it is fenced at the generation it holds, so what an answer brings down is withheld. A
+/// write the service applied before then is noted all the same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_host_that_goes_private_below_the_generation_held_has_what_the_answer_brings_withheld() {
     let computer = Computer::new().await;
@@ -2145,12 +2150,24 @@ async fn a_host_that_goes_private_below_the_generation_held_has_what_the_answer_
     computer
         .hosts
         .turn_after(environment, 2, HostPrivacy::On { generation: 2 });
-    page.sync_now();
+    let view = page.sync_now();
     assert_eq!(
         page.kept_drafts().len(),
         2,
         "nothing the service answered with was kept: {:?}",
         page.kept_drafts()
+    );
+    let kept = &view["sync"]["drafts"]["kept_here"];
+    assert_eq!(
+        kept_here(&view),
+        vec![("studio".to_owned(), "unreadable".to_owned(), 1)],
+        "and the card says why the draft waits: {kept}"
+    );
+    assert!(
+        kept[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("ahead")),
+        "and that the store is ahead of the host: {kept}"
     );
 }
 
