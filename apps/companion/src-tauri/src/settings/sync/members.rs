@@ -185,8 +185,9 @@ impl DeviceDirectory for HostsDirectory {
             for list in &lists {
                 let mut devices = Vec::new();
                 for summary in &list.devices {
-                    // A device a host holds only two of the keys of is not one another device
-                    // seals to: the pairing the owner approved is what binds a key to a device.
+                    // A device whose four keys the host does not report yet is not one another
+                    // device seals to: the pairing the owner approved is what binds a key to a
+                    // device.
                     let Some(keys) = summary.keys.0 else { continue };
                     names.insert(keys.authorisation, summary.display_name.clone());
                     devices.push(HostDevice {

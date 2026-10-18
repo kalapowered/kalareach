@@ -163,7 +163,8 @@ impl Ceremony for ScriptedCeremony {
 #[derive(Clone)]
 struct Listed {
     name: String,
-    keys: DevicePublicKeys,
+    /// What the host reports of its four keys: none until the device declares them.
+    keys: Option<DevicePublicKeys>,
     manages_host: bool,
     revoked: bool,
 }
@@ -358,7 +359,7 @@ fn listed_device(number: usize, device: &Listed) -> kr_protocol::sharing::Device
         grant_id: kr_protocol::ids::GrantId::new(Uuid::from_bytes([0x90; 16])),
         paired_at_ms: TimestampMs::new(1),
         revoked: device.revoked,
-        keys: Nullable::some(device.keys),
+        keys: device.keys.map_or_else(Nullable::null, Nullable::some),
         manages_host: device.manages_host,
         platform: kr_protocol::pairing::DevicePlatform::Macos,
         grant_expires_at_ms: Nullable::null(),
@@ -394,12 +395,12 @@ impl Computer {
         let keys = self.identity().keys;
         Listed {
             name: name.to_owned(),
-            keys: DevicePublicKeys {
+            keys: Some(DevicePublicKeys {
                 transport: *keys.transport.public(),
                 authorisation: *keys.authorisation.public(),
                 stored_envelope: *keys.stored_envelope.public(),
                 notification_preview: *keys.notification_preview.public(),
-            },
+            }),
             manages_host: true,
             revoked: false,
         }
@@ -3134,4 +3135,79 @@ async fn a_device_a_host_reports_revoked_is_taken_out_at_the_next_step() {
     let view = phone.sync_now();
     assert_eq!(view["colour_mode"], "dark", "{view}");
     assert_eq!(view["sync"]["devices"]["out"], true, "{view}");
+}
+
+/// A computer the person does not confirm on joins nothing: the offer stays, and the settings the
+/// first computer holds are not read there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_computer_the_person_does_not_confirm_on_does_not_join() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    page.choose("dark");
+    let phone = other.start();
+    let shown = page.devices_refresh();
+    page.share(&first_reference(&shown["candidates"]))
+        .expect("shared");
+    let offers = phone.devices_refresh();
+    let reference = first_reference(&offers["offers"]);
+
+    other.ceremony.will_answer(CeremonyOutcome::NotConfirmed);
+    assert!(phone.join(&reference).is_err(), "it was not confirmed");
+    other.ceremony.will_answer(CeremonyOutcome::Unavailable);
+    assert!(phone.join(&reference).is_err(), "there was no way to ask");
+
+    page.sync_now();
+    let view = phone.sync_now();
+    assert_eq!(view["colour_mode"], "system", "nothing was read: {view}");
+    assert_eq!(
+        phone.devices_refresh()["offers"]
+            .as_array()
+            .expect("offers")
+            .len(),
+        1,
+        "the offer stands"
+    );
+}
+
+/// A device is offered the settings only when a host lists all four of its keys and says it holds the
+/// right to manage the host: the pairing the owner approved is what binds a key to a device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_a_host_lists_without_its_keys_or_the_right_to_manage_is_not_offered_the_key() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+
+    let mut without_keys = other.listed("the-phone");
+    without_keys.keys = None;
+    this.hosts
+        .list(vec![this.listed("this-mac"), without_keys.clone()]);
+    assert_eq!(page.devices_refresh()["candidates"], json!([]));
+
+    let mut without_the_right = other.listed("the-phone");
+    without_the_right.manages_host = false;
+    this.hosts
+        .list(vec![this.listed("this-mac"), without_the_right]);
+    assert_eq!(page.devices_refresh()["candidates"], json!([]));
+
+    this.hosts
+        .list(vec![this.listed("this-mac"), other.listed("the-phone")]);
+    assert_eq!(
+        page.devices_refresh()["candidates"]
+            .as_array()
+            .expect("candidates")
+            .len(),
+        1
+    );
+}
+
+/// A reference the page was never shown names no device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reference_the_page_was_not_shown_names_no_device() {
+    let (this, _other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    page.devices_refresh();
+
+    assert!(page.share("00000000000000000000000000000000").is_err());
+    assert!(page.unshare("00000000000000000000000000000000").is_err());
+    assert!(page.join("00000000-0000-0000-0000-000000000000").is_err());
+    assert!(this.ceremony.reasons().is_empty(), "nobody was asked");
 }
