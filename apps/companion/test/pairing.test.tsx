@@ -365,6 +365,36 @@ describe('pairing with a host', () => {
     expect((await screen.findByTestId('pairing-status')).textContent).toBe('Checking the code')
   })
 
+  it('keeps the words of a later try over a read of the records that answers after them', async () => {
+    // The records are not open because the device is locked when the page reads them.
+    window.history.replaceState(null, '', '/?pairing_records=locked')
+    try {
+      const { port, controls } = fakeHost()
+      const answer = controls.holdPairingView()
+      render(
+        <AppProvider port={port} initialPlace={{ view: 'pairing' }}>
+          <App />
+        </AppProvider>
+      )
+      await act(async () => {
+        await Promise.resolve()
+      })
+      // A try after the unlock fails for another cause, and the page hears the words for it first.
+      act(() => {
+        controls.failPairingRecords()
+      })
+      await act(async () => {
+        answer()
+        await Promise.resolve()
+      })
+      const words = (await screen.findByTestId('records-failure')).textContent ?? ''
+      expect(words).toContain('could not be opened')
+      expect(words).not.toContain('locked')
+    } finally {
+      window.history.replaceState(null, '', '/')
+    }
+  })
+
   // KR-REQ-10.18: the code entry's change action changes the rendezvous origin it names, before
   // an attempt starts.
   it('changes the service codes go through', async () => {

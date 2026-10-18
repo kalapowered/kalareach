@@ -227,10 +227,15 @@ fn checks<R: tauri::Runtime>(
             return found;
         }
     };
+    let available = companion_platform::protection::is_available(app);
     found.push(check(
         "the system says protected data is available",
-        companion_platform::protection::is_available(app),
-        "available",
+        available,
+        if available {
+            "available"
+        } else {
+            "not available"
+        },
     ));
     found.push(secret_item(app, request));
 

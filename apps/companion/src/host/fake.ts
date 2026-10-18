@@ -424,6 +424,11 @@ export interface FakeHostControls {
    */
   failPairingRecords(): void
   /**
+   * Holds the answer to each read of the pairing view until the returned function is called. What
+   * a read answers is what was true when it was asked.
+   */
+  holdPairingView(): () => void
+  /**
    * Marks the host as unreachable, or reachable again, and says so as native code does. `reason`
    * is native code's words for the loss, which can be blank; without it, the host cannot be
    * contacted right now.
@@ -827,6 +832,8 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
         return null
     }
   })()
+  /** While set, the pairing view's answers wait for it. */
+  let pairingViewGate: Promise<void> | null = null
   const pairingListeners = new Set<(view: PairingView | PairingUnavailable) => void>()
   const publishPairing = (change: Partial<PairingView>) => {
     pairing = { ...pairing, ...change }
@@ -1933,8 +1940,15 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       return terminalOpensAnswer.then(() => view.handle)
     },
     pairingView: () => {
-      if (recordsNotOpen !== null) refuse('RESOURCE_UNAVAILABLE', recordsNotOpen)
-      return Promise.resolve(pairing)
+      if (pairingViewGate === null) {
+        if (recordsNotOpen !== null) refuse('RESOURCE_UNAVAILABLE', recordsNotOpen)
+        return Promise.resolve(pairing)
+      }
+      const [words, view] = [recordsNotOpen, pairing]
+      return pairingViewGate.then(() => {
+        if (words !== null) refuse('RESOURCE_UNAVAILABLE', words)
+        return view
+      })
     },
     pairingSetOrigin: (origin) => {
       const trimmed = origin.trim().replace(/\/$/, '')
@@ -2601,6 +2615,16 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     openPairingRecords() {
       recordsNotOpen = null
       publishPairing({})
+    },
+    holdPairingView() {
+      let open!: () => void
+      pairingViewGate = new Promise<void>((resolve) => {
+        open = resolve
+      })
+      return () => {
+        pairingViewGate = null
+        open()
+      }
     },
     failPairingRecords() {
       recordsNotOpen = RECORDS_UNAVAILABLE_WORDS

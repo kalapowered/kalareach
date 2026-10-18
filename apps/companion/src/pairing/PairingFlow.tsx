@@ -146,7 +146,9 @@ export function PairingFlow({
         if (watching && !heard) shown(current)
       })
       .catch((error: unknown) => {
-        if (watching) setFailure(failureMessage(error))
+        // The read's failure is let go as its answer is when an event was heard: the event is at
+        // least as new, and its words are the ones that stand.
+        if (watching && !heard) setFailure(failureMessage(error))
       })
     return () => {
       watching = false

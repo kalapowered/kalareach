@@ -358,13 +358,14 @@ impl AppState {
     /// Records this computer as a device that pairs, once it has been opened, and where it pastes
     /// invitations from.
     pub fn opened(&self, device: Arc<Device>, owner: Arc<Owner>, paste: Arc<dyn PastePlatform>) {
+        let _ = self.device.set(device);
+        let _ = self.owner.set(owner);
+        let _ = self.paste.set(paste);
+        // Once they are open, so that nothing that asks in between hears of a failure that is over.
         *self
             .records_failure
             .write()
             .expect("the state lock is not poisoned") = None;
-        let _ = self.device.set(device);
-        let _ = self.owner.set(owner);
-        let _ = self.paste.set(paste);
     }
 
     /// Takes the turn to try opening this computer's pairing records, which is held until the try
