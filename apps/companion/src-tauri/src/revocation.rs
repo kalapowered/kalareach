@@ -3,9 +3,11 @@
 //! A person who owns a host can take a device's pairing away from here. Two routes lead to the host,
 //! and the host a request is for decides which:
 //!
-//! * **The host on this computer** takes `device.revoke` over the connection this application holds
-//!   to it. The method is the local owner's alone, so a paired device never sends it, and the
-//!   host's answer, with the state of its dispatch barrier, is the acknowledgement.
+//! * **The host on this computer** takes `device.revoke` over a connection it admits now: it
+//!   withdraws the ones it admitted before each revocation, so this computer opens another and sends
+//!   over the one it already holds only when no other opens. The method is the local owner's alone,
+//!   so a paired device never sends it, and the host's answer, with the state of its dispatch
+//!   barrier, is the acknowledgement.
 //! * **A host this computer is paired with as an owner** is reached through its authority feed. This
 //!   computer signs a revocation request with its authorisation key, publishes it at the sync service
 //!   it is set to use, and the host reads it at its next poll, carries it out and acknowledges it in
@@ -217,13 +219,18 @@ pub enum DeviceStanding {
         /// Whether the host already lists the device as revoked.
         host_lists_revoked: bool,
     },
-    /// The host acknowledged, and some of its session workers have not confirmed the fence yet.
+    /// The host acknowledged, and either some of its session workers have not confirmed the fence
+    /// yet or its own list does not show the device as revoked.
     Acknowledged {
         /// When the host acknowledged, in UTC milliseconds.
         at_ms: u64,
         /// How many workers have not, when the host said. Null when the host has not yet said that every
         /// worker confirmed, and did not say how many have not.
         pending_workers: Option<u64>,
+        /// Whether the host's own list shows the device as revoked. A host that acknowledged and
+        /// does not list the device as revoked contradicts what the feed says, and the device is
+        /// revoked at the host itself.
+        host_lists_revoked: bool,
     },
     /// The host acknowledged, and every session worker confirmed the fence.
     Done {
@@ -874,6 +881,7 @@ fn standing(
                 DeviceStanding::Acknowledged {
                     at_ms,
                     pending_workers: workers,
+                    host_lists_revoked: true,
                 }
             }
             _ if device.revoked => DeviceStanding::Revoked,
@@ -901,6 +909,7 @@ fn standing(
                             DeviceStanding::Acknowledged {
                                 at_ms,
                                 pending_workers: None,
+                                host_lists_revoked: false,
                             },
                         ),
                         RevocationCompletion::Complete => (4, DeviceStanding::Done { at_ms }),
@@ -909,6 +918,7 @@ fn standing(
                             DeviceStanding::Acknowledged {
                                 at_ms,
                                 pending_workers: Some(pending_workers.get()),
+                                host_lists_revoked: device.revoked,
                             },
                         ),
                     }
@@ -1181,7 +1191,8 @@ mod tests {
             standing_of(true, std::slice::from_ref(&pending)),
             DeviceStanding::Acknowledged {
                 at_ms: 200,
-                pending_workers: Some(3)
+                pending_workers: Some(3),
+                host_lists_revoked: true
             }
         );
         assert_eq!(
@@ -1195,12 +1206,23 @@ mod tests {
             standing_of(false, std::slice::from_ref(&complete)),
             DeviceStanding::Acknowledged {
                 at_ms: 200,
-                pending_workers: None
+                pending_workers: None,
+                host_lists_revoked: false
             }
         );
         assert_eq!(
             standing_when(false, false, std::slice::from_ref(&complete)),
             DeviceStanding::Done { at_ms: 200 }
+        );
+        assert_eq!(
+            standing_of(false, std::slice::from_ref(&pending)),
+            DeviceStanding::Acknowledged {
+                at_ms: 200,
+                pending_workers: Some(3),
+                host_lists_revoked: false
+            },
+            "a host that has not confirmed every worker and does not list the device as revoked \
+             is told apart from one that does"
         );
         assert_eq!(
             standing_of(false, std::slice::from_ref(&refused)),
@@ -1218,7 +1240,8 @@ mod tests {
             standing_of(true, &[refused.clone(), sent.clone(), pending.clone()]),
             DeviceStanding::Acknowledged {
                 at_ms: 200,
-                pending_workers: Some(3)
+                pending_workers: Some(3),
+                host_lists_revoked: true
             }
         );
         assert_eq!(
@@ -1270,8 +1293,8 @@ mod tests {
         let elsewhere = signed(&mine, me, other_host, 22);
         // Issued as another device on this host.
         let borrowed = signed(&mine, DeviceId::new(id(6)), host, 23);
-        // Published by another key altogether.
-        let mut stranger = signed(&theirs, me, host, 24);
+        // Signed by this computer, and published by another key.
+        let mut stranger = signed(&mine, me, host, 24);
         stranger.published_by = *theirs.public();
         let records = [genuine, forged, elsewhere, borrowed, stranger];
 
