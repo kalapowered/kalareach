@@ -18,7 +18,7 @@
 //! | [`cli`] | The accepted invocations and the exit codes |
 //! | [`registration`] | Finding and reading the launch's registration, and the hello |
 //! | [`exchange`] | The private exchange with the worker: admission and bounded JSON lines |
-//! | [`helper`] | Handing a launch whose worker runs another release to that release's own forwarder |
+//! | `helper` (Unix only) | Handing a launch whose worker runs another release to that release's own forwarder |
 //! | [`hook`] | One observing hook, whichever application started it: prompt, neutral, and never a decision |
 //! | [`claude_code`] | Claude Code's bridge: its Channels server and what its hooks report |
 //! | [`gemini_cli`] | Gemini CLI's bridge: what its hooks report |
