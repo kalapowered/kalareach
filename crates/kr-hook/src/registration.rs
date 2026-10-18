@@ -400,6 +400,36 @@ impl Registration {
     }
 }
 
+/// The release a launch's worker runs, as its registration names it, where the registration is a
+/// whole record and names one: a worker of an installed release says which.
+///
+/// This reads the registration alone, waiting up to `within` for the worker to finish writing it,
+/// and never the credential beside it.
+///
+/// # Errors
+///
+/// Returns [`RegistrationError`] when the registration does not appear, cannot be read, or names
+/// something that is not a release.
+pub fn release_of(
+    paths: &Paths,
+    within: Duration,
+) -> Result<Option<kr_protocol::update::ReleaseName>, RegistrationError> {
+    let deadline = Instant::now() + within;
+    let (directory, name) = open_directory(&paths.registration)?;
+    let text = wait_for_whole(&directory, &paths.registration, &name, deadline, within)?;
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .find(|(name, _)| name.trim() == "release")
+        .map(|(_, value)| {
+            kr_protocol::update::ReleaseName::new(value.trim()).map_err(|_| {
+                RegistrationError::Malformed {
+                    detail: "names a release that is not named as one".to_owned(),
+                }
+            })
+        })
+        .transpose()
+}
+
 /// Opens the directory a registration is in, once, so that it and the credential beside it are
 /// read through one handle: a directory swapped for another in between cannot change which files
 /// are read.

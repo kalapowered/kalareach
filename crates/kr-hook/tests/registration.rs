@@ -391,3 +391,84 @@ fn wait(relay: &mut std::process::Child) -> std::process::ExitStatus {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+/// The registration a worker of the release before this one wrote, as it wrote it: the forwarder of
+/// this release reads it whole, and reads the release it names. It is a recorded file, not one this
+/// build wrote, so a change to what the forwarder reads of a registration has to meet it.
+#[cfg(unix)]
+#[test]
+fn the_registration_a_worker_of_the_release_before_wrote_is_read_whole_and_names_its_release() {
+    const RECORDED: &str = include_str!("fixtures/registration-0.74.txt");
+
+    assert!(
+        kr_hook::registration::whole(RECORDED),
+        "the recorded registration is a whole one"
+    );
+    let directory = kr_ipc::testing::TempHost::create();
+    let registration = directory.root().join("registration");
+    std::fs::write(&registration, RECORDED).expect("the recorded file");
+    let paths = kr_hook::registration::Paths {
+        registration: registration.clone(),
+    };
+    let release = kr_hook::registration::release_of(&paths, Duration::from_millis(250))
+        .expect("read")
+        .expect("it names a release");
+    assert_eq!(release.as_str(), "0.74.0+d59b70150cd2");
+
+    // A registration of a worker outside a store names none.
+    let outside: String = RECORDED
+        .lines()
+        .filter(|line| !line.starts_with("release="))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    std::fs::write(&registration, outside).expect("a file");
+    assert_eq!(
+        kr_hook::registration::release_of(&paths, Duration::from_millis(250)).expect("read"),
+        None
+    );
+}
+
+/// The hello this forwarder writes has the members the recorded one of the release before it had,
+/// and no other: the worker of either release reads the forwarder of the other, so what a hello
+/// carries is the same set. The process this test runs as stands in for the forwarder, and the
+/// values of the recorded frame are replaced by this process's own.
+#[cfg(unix)]
+#[test]
+fn the_hello_this_forwarder_writes_has_the_members_of_the_one_the_release_before_wrote() {
+    const RECORDED: &str = include_str!("../../kr-worker/tests/fixtures/bridge-hello-0.74.json");
+
+    let launch = Launch::new();
+    launch.publish(&launch.whole("/run/kr/e/p.sock"));
+    let read = kr_hook::registration::Registration::read(
+        &kr_hook::registration::Paths {
+            registration: launch.registration(),
+        },
+        Duration::from_secs(5),
+    )
+    .expect("a whole registration");
+    let written = read
+        .hello(Some(kr_hook::registration::Bridge {
+            application: "claude-code",
+            surface: "hook",
+        }))
+        .expect("a hello");
+    let written: serde_json::Value = serde_json::from_slice(written.expose()).expect("JSON");
+    let recorded: serde_json::Value = serde_json::from_str(RECORDED).expect("JSON");
+    let members = |value: &serde_json::Value| -> Vec<String> {
+        value["kr_hello"]
+            .as_object()
+            .expect("a hello")
+            .keys()
+            .cloned()
+            .collect()
+    };
+    assert_eq!(members(&written), members(&recorded));
+    assert_eq!(
+        written["kr_hello"]["bridge"],
+        recorded["kr_hello"]["bridge"]
+    );
+    assert_eq!(
+        written["kr_hello"]["headers"],
+        recorded["kr_hello"]["headers"]
+    );
+}

@@ -122,6 +122,16 @@ impl InstalledBridge {
     ///
     /// Returns [`BrokerError::PermissionDenied`] naming what did not match.
     pub fn validate(&self, declared: &BridgeDeclaration, running: Option<&Path>) -> Result<()> {
+        self.validate_as(declared, running, kr_ipc::install::this_process().ok())
+    }
+
+    /// [`Self::validate`] for the worker `this`, which is the process that runs it.
+    fn validate_as(
+        &self,
+        declared: &BridgeDeclaration,
+        running: Option<&Path>,
+        this: Option<&kr_ipc::install::Running>,
+    ) -> Result<()> {
         if declared.application != self.application {
             return Err(BrokerError::denied(format!(
                 "this connection declares a bridge for {:?}, and the bridge installed for this \
@@ -154,15 +164,31 @@ impl InstalledBridge {
                 running.display()
             ))
         })?;
-        if running != installed {
-            return Err(BrokerError::denied(format!(
-                "this connection runs {}, and the installed forwarder is {}",
-                running.display(),
-                installed.display()
-            )));
+        if running == installed || running_is_the_own_forwarder_of(this, &running) {
+            return Ok(());
         }
-        Ok(())
+        Err(BrokerError::denied(format!(
+            "this connection runs {}, and the installed forwarder is {}",
+            running.display(),
+            installed.display()
+        )))
     }
+}
+
+/// Whether `running` is the `kr-hook` of the release the worker `this` runs.
+///
+/// A forwarder an update has made current can speak to this worker in a shape it does not read,
+/// and then starts the forwarder of the worker's own release in its place. That one is admitted
+/// beside the installed forwarder, and only for a worker of a release in a store: a build outside
+/// one has no release of its own.
+fn running_is_the_own_forwarder_of(
+    this: Option<&kr_ipc::install::Running>,
+    running: &Path,
+) -> bool {
+    let Some(this) = this.filter(|this| this.release().is_some()) else {
+        return false;
+    };
+    std::fs::canonicalize(this.own(kr_ipc::install::Program::Hook)).is_ok_and(|own| own == running)
 }
 
 /// A bridge this host admitted.
@@ -1157,6 +1183,93 @@ mod tests {
                 .validate(&declared("claude-code", BridgeSurface::Hook), Some(&this))
                 .is_err()
         );
+    }
+
+    /// A worker of a release in a store admits the `kr-hook` of its own release beside the one an
+    /// update keeps current, and no other: not one of another release, and not one for a worker
+    /// that runs outside a store.
+    #[cfg(unix)]
+    #[test]
+    fn a_worker_admits_the_forwarder_of_its_own_release_beside_the_installed_one() {
+        use kr_ipc::install::{Program, Running, Store};
+        use kr_protocol::update::ReleaseName;
+
+        let host = kr_ipc::testing::TempHost::create();
+        let store = Store::at(host.root().join("store"));
+        store.create_directories().expect("the store's directories");
+        std::fs::write(store.record(), b"{}\n").expect("the store's record");
+        let this_exe = std::env::current_exe().expect("this test's executable");
+        let mut programs = Vec::new();
+        for name in ["0.1.0+aaaaaaaaaaaa", "0.2.0+bbbbbbbbbbbb"] {
+            let release = ReleaseName::new(name).expect("a release");
+            std::fs::create_dir_all(store.release_directory(&release).join("bin"))
+                .expect("the release's bin");
+            std::fs::write(store.manifest(&release), manifest_of(&release)).expect("a manifest");
+            let bin = store.release_directory(&release).join("bin");
+            let worker = bin.join(Program::Worker.file_name());
+            let hook = bin.join(Program::Hook.file_name());
+            kr_ipc::testing::place_program(&this_exe, &worker);
+            kr_ipc::testing::place_program(&this_exe, &hook);
+            programs.push((worker, hook));
+        }
+        let (worker, hook) = programs[0].clone();
+        let (_, other_hook) = programs[1].clone();
+        let running = Running::of_image(&worker).expect("a worker of the first release");
+        // The installed forwarder is the one an update has made current: the other release's.
+        let bridge = installed(other_hook.clone());
+        let declaration = declared("claude-code", BridgeSurface::Hook);
+
+        bridge
+            .validate_as(&declaration, Some(&other_hook), Some(&running))
+            .expect("the forwarder an update made current");
+        bridge
+            .validate_as(&declaration, Some(&hook), Some(&running))
+            .expect("the forwarder of the worker's own release");
+        assert!(
+            bridge.validate_as(&declaration, Some(&hook), None).is_err(),
+            "a worker outside a store has no release of its own"
+        );
+        // A program of the worker's own release that is not its forwarder is refused.
+        let stranger = store
+            .release_directory(&ReleaseName::new("0.1.0+aaaaaaaaaaaa").expect("a release"))
+            .join("bin")
+            .join(Program::Kr.file_name());
+        kr_ipc::testing::place_program(&this_exe, &stranger);
+        assert!(
+            bridge
+                .validate_as(&declaration, Some(&stranger), Some(&running))
+                .is_err(),
+            "another program of the worker's own release"
+        );
+    }
+
+    #[cfg(unix)]
+    fn manifest_of(release: &kr_protocol::update::ReleaseName) -> String {
+        serde_json::json!({
+            "signed": {
+                "_type": "kalareach-release",
+                "release": release,
+                "sequence": "1",
+                "commit": "4254aa6e62e585478ff8dcff5518f23c7263f4ce",
+                "target": "aarch64-apple-darwin",
+                "os_floor": { "system": "macos", "version": "14.0" },
+                "protocol_version": { "major": 0, "minor": 48, "patch": 0 },
+                "public_majors": [1],
+                "retained_levels": ["0.48"],
+                "shells": [],
+                "stores": [{
+                    "store": "registry",
+                    "scope": "environment",
+                    "path": "registry.sqlite",
+                    "recording": { "kind": "sqlite_table", "table": "schema_version" },
+                    "version": 7,
+                    "migrates_from": 1,
+                }],
+                "files": [],
+            },
+            "signatures": [],
+        })
+        .to_string()
     }
 
     #[test]

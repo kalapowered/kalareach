@@ -137,6 +137,16 @@ pub fn run(
     application: &'static Application,
     started: std::time::Instant,
 ) -> std::process::ExitCode {
+    // A hook started in place of another has the rest of the deadline the application gave that
+    // one, which may have ended before it began.
+    #[cfg(unix)]
+    let started = match resumed(started) {
+        Resumed::Passed => {
+            answer();
+            return std::process::ExitCode::SUCCESS;
+        }
+        Resumed::At(started) => started,
+    };
     run_with(
         started,
         move |started| observe(application, started),
@@ -147,6 +157,49 @@ pub fn run(
         },
     );
     std::process::ExitCode::SUCCESS
+}
+
+/// Where a hook stands when it was started in place of another.
+#[cfg(unix)]
+enum Resumed {
+    /// The deadline of the hook it replaced ended before it began.
+    Passed,
+    /// The hook began at this moment, as far as its deadline goes.
+    At(std::time::Instant),
+}
+
+/// The moment this hook began as far as its deadline goes: `started`, or the moment the hook it
+/// replaced began when it was started in place of one.
+#[cfg(unix)]
+fn resumed(started: std::time::Instant) -> Resumed {
+    resumed_at(
+        started,
+        crate::helper::Marker::of_this_process(),
+        kr_ipc::clock::boot_elapsed_ms(),
+    )
+}
+
+/// [`resumed`] given the marker and what the continuous clock says.
+#[cfg(unix)]
+fn resumed_at(
+    started: std::time::Instant,
+    marker: Option<crate::helper::Marker>,
+    now_ms: u64,
+) -> Resumed {
+    use crate::helper::Standing;
+
+    match marker.and_then(|marker| marker.standing(now_ms)) {
+        None => Resumed::At(started),
+        Some(Standing::Passed) => Resumed::Passed,
+        Some(Standing::Left(left)) => {
+            let spent = HOOK_DEADLINE.saturating_sub(left);
+            Resumed::At(
+                std::time::Instant::now()
+                    .checked_sub(spent)
+                    .unwrap_or(started),
+            )
+        }
+    }
 }
 
 /// One run: the work, the answer, and the diagnostic, with what writes each given.
@@ -266,6 +319,10 @@ pub fn answered_after(diagnostic: &str) -> Option<Duration> {
 /// [`THREAD_REPORT_LINGER`] after `started`.
 fn observe(application: &Application, started: std::time::Instant) -> Result<(), String> {
     kr_ipc::install::this_process().map_err(|error| error.to_string())?;
+    // Before the input is read: the forwarder of the worker's own release is given it. It is a
+    // reason to go on directly when that one cannot be started.
+    #[cfg(unix)]
+    let _ = crate::helper::hand_over(REGISTRATION_WAIT, Some((started, HOOK_DEADLINE)));
     let input = read_input(std::io::stdin().lock())?;
     // Outside a launch there is nobody to tell, and the answer is the same neutral one.
     let Some(paths) = Paths::from_environment() else {
@@ -567,6 +624,57 @@ fn answer() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hook started in place of another has the deadline the application gave the first, counted
+    /// on the continuous clock the marker names: what is left of it when it begins is what its own
+    /// run is given, a deadline that has ended is passed, and a hook started on its own has all of
+    /// it. The clock reading is supplied, so nothing here waits.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_started_in_place_of_another_has_what_is_left_of_the_deadline() {
+        use crate::helper::Marker;
+
+        let started = std::time::Instant::now();
+        let marker = |deadline_ms| {
+            Some(Marker {
+                from: "0.1.0+aaaaaaaaaaaa".to_owned(),
+                deadline_ms: Some(deadline_ms),
+            })
+        };
+        // On its own: the whole deadline, from its own start.
+        let Resumed::At(own) = resumed_at(started, None, 10_000) else {
+            panic!("a hook on its own is given its deadline");
+        };
+        assert_eq!(own, started);
+        // A hundred and fifty milliseconds left of five hundred: three hundred and fifty spent.
+        let Resumed::At(began) = resumed_at(started, marker(10_150), 10_000) else {
+            panic!("a hook with time left is given it");
+        };
+        let spent = std::time::Instant::now().saturating_duration_since(began);
+        assert!(
+            spent >= HOOK_DEADLINE - Duration::from_millis(150),
+            "{spent:?} of the deadline counts as spent"
+        );
+        assert!(HOOK_DEADLINE.saturating_sub(spent) <= Duration::from_millis(150));
+        // The deadline ended, exactly and before.
+        assert!(matches!(
+            resumed_at(started, marker(10_000), 10_000),
+            Resumed::Passed
+        ));
+        assert!(matches!(
+            resumed_at(started, marker(9_000), 10_000),
+            Resumed::Passed
+        ));
+        // A marker with no deadline, as a channel's, leaves the hook's own start.
+        let channel = Some(Marker {
+            from: "0.1.0+aaaaaaaaaaaa".to_owned(),
+            deadline_ms: None,
+        });
+        assert!(matches!(
+            resumed_at(started, channel, 10_000),
+            Resumed::At(at) if at == started
+        ));
+    }
 
     /// A run waits for its diagnostic no later than its deadline, or the allowance after an answer
     /// that came later, and in either case no later than the deadline and the allowance after the
