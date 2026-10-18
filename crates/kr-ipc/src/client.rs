@@ -402,6 +402,14 @@ impl BoundLink {
 }
 
 impl<C: Codec> Client<C> {
+    /// Keeps every frame this link reads and writes from now on in `tap`, so that a test can record
+    /// a real exchange.
+    #[cfg(feature = "testing")]
+    pub fn record_into(&mut self, tap: &crate::framed::Tap) {
+        self.reader.tap_into(tap.clone());
+        self.writer.tap_into(tap.clone());
+    }
+
     /// Returns what the host said about this connection.
     #[must_use]
     pub const fn acknowledgement(&self) -> &LocalHelloAck {

@@ -24,6 +24,46 @@ use tokio::io::{AsyncReadExt as _, ReadHalf, WriteHalf};
 use crate::endpoint::Connection;
 use crate::error::{IpcError, Result};
 
+/// The frames a link read and wrote, kept in order for a test that records a real exchange.
+///
+/// Each is the payload of one frame, the canonical bytes of one message, with the direction it went.
+/// It is a way into a link that only a test takes, so it exists only with the `testing` feature.
+#[cfg(feature = "testing")]
+#[derive(Clone, Debug, Default)]
+pub struct Tap(Arc<std::sync::Mutex<Vec<Tapped>>>);
+
+/// One frame a [`Tap`] kept.
+#[cfg(feature = "testing")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tapped {
+    /// Whether this end wrote it (and did not read it).
+    pub written: bool,
+    /// The frame's payload.
+    pub payload: Vec<u8>,
+}
+
+#[cfg(feature = "testing")]
+impl Tap {
+    fn keep(&self, written: bool, payload: &[u8]) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Tapped {
+                written,
+                payload: payload.to_vec(),
+            });
+    }
+
+    /// The frames kept so far, in order.
+    #[must_use]
+    pub fn frames(&self) -> Vec<Tapped> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 /// Splits a connection into a frame reader and a frame writer.
 #[must_use]
 pub fn split(connection: Connection, kind: StreamKind) -> (FrameReader, FrameWriter) {
@@ -47,6 +87,8 @@ pub fn split(connection: Connection, kind: StreamKind) -> (FrameReader, FrameWri
             payload: Vec::new(),
             payload_filled: 0,
             declared: None,
+            #[cfg(feature = "testing")]
+            tap: None,
         },
         FrameWriter {
             half: writer,
@@ -54,6 +96,8 @@ pub fn split(connection: Connection, kind: StreamKind) -> (FrameReader, FrameWri
             pending: Vec::new(),
             sent: 0,
             writable,
+            #[cfg(feature = "testing")]
+            tap: None,
             #[cfg(unix)]
             descriptor,
             #[cfg(windows)]
@@ -212,9 +256,17 @@ pub struct FrameReader {
     payload: Vec<u8>,
     payload_filled: usize,
     declared: Option<usize>,
+    #[cfg(feature = "testing")]
+    tap: Option<Tap>,
 }
 
 impl FrameReader {
+    /// Keeps every frame this reader reads from now on in `tap`.
+    #[cfg(feature = "testing")]
+    pub fn tap_into(&mut self, tap: Tap) {
+        self.tap = Some(tap);
+    }
+
     /// Reads one frame's payload.
     ///
     /// # Errors
@@ -299,6 +351,10 @@ impl FrameReader {
         self.prefix_filled = 0;
         self.payload_filled = 0;
         self.declared = None;
+        #[cfg(feature = "testing")]
+        if let Some(tap) = &self.tap {
+            tap.keep(false, &self.payload);
+        }
         Ok(Some(std::mem::take(&mut self.payload)))
     }
 
@@ -399,6 +455,8 @@ pub struct FrameWriter {
     pending: Vec<u8>,
     sent: usize,
     writable: Writable,
+    #[cfg(feature = "testing")]
+    tap: Option<Tap>,
     /// This connection's own descriptor, which is what the attempt writes through.
     #[cfg(unix)]
     descriptor: Option<std::os::fd::OwnedFd>,
@@ -575,10 +633,23 @@ impl FrameWriter {
                 std::io::Error::other("a frame is already part way to the peer"),
             ));
         }
+        #[cfg(feature = "testing")]
+        if let Some(tap) = &self.tap {
+            tap.keep(
+                true,
+                frame.get(FRAME_LENGTH_PREFIX_LEN..).unwrap_or_default(),
+            );
+        }
         self.pending.clear();
         self.pending.extend_from_slice(frame);
         self.sent = 0;
         self.attempt()
+    }
+
+    /// Keeps every frame this writer writes from now on in `tap`.
+    #[cfg(feature = "testing")]
+    pub fn tap_into(&mut self, tap: Tap) {
+        self.tap = Some(tap);
     }
 
     /// Offers the rest of a retained frame to the peer without waiting for it.

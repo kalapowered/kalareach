@@ -498,6 +498,160 @@ async fn the_kr_of_this_release_hands_the_worker_of_the_release_before_to_the_kr
     host.worker_ended(&updated.worker).await;
 }
 
+/// The lowercase hexadecimal text of `bytes`.
+fn hexadecimal(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// KR-REQ-26.06, KR-ACC-035: the frames a control daemon sends a worker on its own, and the worker's
+/// answers, are read by the real worker of the release before, and the exchange, recorded as it
+/// went over the wire, reads under the level that release stated.
+///
+/// A link of the test process speaks for the host with the host's own keys, once the host's daemon
+/// has stopped (a generation there takes authority from the daemon's link), and is bound to the
+/// level the worker states. It proves the worker, presents a generation, and tells it what the
+/// daemon tells a worker: what the local owner may do, two authority revisions (the second
+/// withdrawing a grant and a device), the privacy generation, and reads the session. Every frame
+/// either way is kept as its payload. Run with `KR_RECORD_FRAMES` set, the exchange is printed as
+/// the record `retained/<level>/frames.json` holds, which `kr-protocol`'s retained cases decode.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_frames_the_controller_sends_on_its_own_are_read_by_the_worker_of_the_release_before() {
+    use kr_ipc::client::BoundLink;
+    use kr_ipc::framed::Tap;
+    use kr_ipc::verify::{CONTROLLER_SECRET_SERVICE, ControllerIdentity};
+    use kr_protocol::ids::{AuthorityRevision, ControllerGeneration, DeviceId, GrantId};
+    use kr_protocol::privacy::PrivacyGenerationNotice;
+    use kr_protocol::retained::Level;
+    use kr_protocol::session::{SessionReadParams, SessionReadResult};
+    use kr_protocol::worker::{AuthorityRevisionNotice, LocalAccess, LocalBound, RevisionReach};
+
+    let updated = Updated::new().await;
+    let host = &updated.host;
+    assert!(host.stop_the_daemon().await, "the daemon stops");
+
+    let environment = host.tree.environment();
+    let descriptor = kr_ipc::descriptor::read(&environment, updated.session_id)
+        .expect("reads the descriptor")
+        .expect("the session is published");
+    let endpoint = kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint).expect("an endpoint");
+    let opened = kr_crypto::store::StoreSelection::File
+        .open(CONTROLLER_SECRET_SERVICE, &environment.secrets_dir())
+        .expect("the host's secrets");
+    let identity = ControllerIdentity::load(opened.store.as_ref(), environment.environment_id())
+        .expect("the host's own identity");
+
+    let tap = Tap::default();
+    let mut link = BoundLink::connect(&endpoint, build())
+        .await
+        .expect("the worker of the release before is met at its own level");
+    link.record_into(&tap);
+    link.verify_worker(&descriptor)
+        .await
+        .expect("the worker proves it is the one the descriptor names");
+    let boot = link.acknowledgement().boot_identity.clone();
+    link.present_generation(|nonce| {
+        identity
+            .generation_token(ControllerGeneration::new(1_000), &boot, nonce)
+            .map_err(kr_ipc::IpcError::from)
+    })
+    .await
+    .expect("the worker accepts the generation");
+
+    let environment_id = environment.environment_id();
+    let local = link
+        .announce_local_access(LocalAccess {
+            sequence: kr_protocol::scalars::U64::new(1),
+            bound: LocalBound::Open,
+        })
+        .await
+        .expect("the worker holds what the local owner may do");
+    assert_eq!(local.sequence.get(), 1);
+    for (revision, reach) in [
+        (2, RevisionReach::Host),
+        (
+            3,
+            RevisionReach::Within {
+                since: AuthorityRevision::new(2),
+                grants: [GrantId::new(kr_protocol::scalars::Uuid::from_bytes(
+                    [7; 16],
+                ))]
+                .into_iter()
+                .collect(),
+                devices: [DeviceId::new(kr_protocol::scalars::Uuid::from_bytes(
+                    [8; 16],
+                ))]
+                .into_iter()
+                .collect(),
+            },
+        ),
+    ] {
+        let acknowledged = link
+            .announce_revision(AuthorityRevisionNotice {
+                environment_id,
+                revision: AuthorityRevision::new(revision),
+                reach,
+                evidence_from: 0,
+            })
+            .await
+            .expect("the worker installs the revision");
+        assert_eq!(acknowledged.revision.get(), revision);
+    }
+    link.announce_privacy(PrivacyGenerationNotice {
+        environment_id,
+        generation: kr_protocol::scalars::U64::new(1),
+        enabled: false,
+    })
+    .await
+    .expect("the worker takes the privacy generation");
+    let read = link
+        .request(
+            kr_protocol::method::Method::SessionRead,
+            &SessionReadParams {
+                session_id: updated.session_id,
+            },
+        )
+        .await
+        .expect("the read goes over")
+        .expect("the worker answers the read");
+    let read: SessionReadResult = link.decode(&read).expect("the answer reads at the level");
+    assert_eq!(read.session.session_id, updated.session_id);
+
+    // Every frame of the exchange reads under the level the worker stated; what this side wrote
+    // reads back the same under it.
+    let frames = tap.frames();
+    assert!(frames.len() >= 12, "{} frames", frames.len());
+    let level = Level::retained(&kr_protocol::retained::RETAINED[0]);
+    for frame in &frames {
+        let decoded = level
+            .decode(&frame.payload, &kr_cbor::Limits::DEFAULT)
+            .unwrap_or_else(|error| panic!("a frame reads under the level: {error:?}"));
+        if frame.written {
+            assert_eq!(
+                level
+                    .encode(&decoded, &kr_cbor::Limits::DEFAULT)
+                    .expect("it writes again"),
+                frame.payload,
+                "a frame this side wrote is the one the level writes"
+            );
+        }
+    }
+    if std::env::var_os("KR_RECORD_FRAMES").is_some() {
+        let record: Vec<Value> = frames
+            .iter()
+            .map(|frame| {
+                serde_json::json!({
+                    "direction": if frame.written { "controller_to_worker" } else { "worker_to_controller" },
+                    "payload": hexadecimal(&frame.payload),
+                })
+            })
+            .collect();
+        println!(
+            "FRAMES-JSON-BEGIN\n{}\nFRAMES-JSON-END",
+            serde_json::to_string_pretty(&record).expect("a record")
+        );
+    }
+}
+
 /// KR-REQ-26.10, KR-REQ-26.08: a rollback to the release before goes on while only its session is
 /// live, and waits, exit 9, naming the session, while a session of this release is live.
 #[tokio::test(flavor = "multi_thread")]
