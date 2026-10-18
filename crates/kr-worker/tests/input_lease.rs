@@ -4271,3 +4271,480 @@ async fn a_keystroke_after_a_close_is_refused_without_waiting_for_the_session() 
     );
     rig.close().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// KR-PERF-002: a keystroke waits for no mutation and no read on its own connection.
+// ---------------------------------------------------------------------------------------------
+
+/// Where the raw requests of these cases begin numbering, apart from the identifiers a client
+/// gives the calls it makes itself.
+const OWN_REQUESTS: u64 = 1_000_000;
+
+/// What a connection has been answered, by request identifier, and in which order.
+#[derive(Default)]
+struct Answers {
+    outcomes:
+        std::collections::BTreeMap<kr_protocol::ids::RequestId, kr_protocol::envelope::Outcome>,
+    order: Vec<kr_protocol::ids::RequestId>,
+}
+
+impl Answers {
+    /// Reads `client` until `id` has been answered, or until `within` has passed.
+    async fn until(
+        &mut self,
+        client: &mut LocalClient,
+        id: kr_protocol::ids::RequestId,
+        within: Duration,
+    ) -> Option<kr_protocol::envelope::Outcome> {
+        let deadline = tokio::time::Instant::now() + within;
+        while !self.outcomes.contains_key(&id) {
+            let frame = tokio::time::timeout_at(deadline, client.recv())
+                .await
+                .ok()?
+                .expect("the connection is read");
+            if let ControlFrame::Response(response) = frame {
+                self.order.push(response.request_id);
+                self.outcomes.insert(response.request_id, response.outcome);
+            }
+        }
+        self.outcomes.get(&id).cloned()
+    }
+}
+
+/// Sends one `input.write` on the rig's own connection without waiting for its answer.
+///
+/// Returns the request and the instant before the frame was written, which is no later than its
+/// arrival on the socket.
+async fn send_key(rig: &mut Rig, bytes: &[u8]) -> (kr_protocol::ids::RequestId, Instant) {
+    let id = kr_protocol::ids::RequestId::new(OWN_REQUESTS + rig.sequence);
+    let frame = key_frame(rig, id, bytes);
+    rig.sequence += 1;
+    rig.typed.extend_from_slice(bytes);
+    let began = Instant::now();
+    rig.client
+        .writer()
+        .write_message(&frame)
+        .await
+        .expect("the key is written");
+    (id, began)
+}
+
+/// The `input.write` frame for the rig's next sequence number.
+fn key_frame(rig: &Rig, id: kr_protocol::ids::RequestId, bytes: &[u8]) -> ControlFrame {
+    ControlFrame::Request(kr_protocol::envelope::Request {
+        request_id: id,
+        method: Method::InputWrite.into(),
+        method_version: MethodVersion::V1,
+        params: kr_protocol::envelope::ParamsValue::from_typed(&InputWriteParams {
+            session_id: rig.wired.session_id,
+            attachment_id: rig.attachment,
+            epoch: rig.epoch,
+            sequence: kr_protocol::ids::InputSequence::new(rig.sequence),
+            bytes: Bytes::new(bytes.to_vec()),
+        })
+        .expect("encodes"),
+    })
+}
+
+/// Sends one mutation on the rig's own connection without waiting for its answer.
+async fn send_mutation<T: serde::Serialize>(
+    rig: &mut Rig,
+    method: Method,
+    params: &T,
+) -> kr_protocol::ids::RequestId {
+    let mutation = rig
+        .client
+        .compose(
+            method,
+            ActionId::new(kr_ipc::new_uuid()),
+            rig.wired.target(),
+            params,
+        )
+        .await
+        .expect("the mutation is composed");
+    let id = mutation.request_id;
+    rig.client
+        .writer()
+        .write_message(&ControlFrame::Mutation(Box::new(mutation)))
+        .await
+        .expect("the mutation is written");
+    id
+}
+
+/// A viewport report at the size the typist attached with, which changes nothing and is journalled
+/// like any mutation.
+fn viewport_report(rig: &Rig) -> kr_protocol::attachment::AttachmentViewportParams {
+    kr_protocol::attachment::AttachmentViewportParams {
+        attachment_id: rig.attachment,
+        dimensions: Dimensions::new(80, 24),
+        position: Nullable::null(),
+        column: kr_protocol::scalars::U64::new(0),
+    }
+}
+
+/// Stops the commit of the next dispatch marker, sends the mutation `method` on the rig's own
+/// connection, and returns once the mutation is stopped in that commit.
+async fn stall_own<T: serde::Serialize>(
+    rig: &mut Rig,
+    method: Method,
+    params: &T,
+) -> (Standing, kr_protocol::ids::RequestId) {
+    let (reached, release) = {
+        let mut session = rig.wired.runtime.session();
+        let journal = session.journal_mut().expect("this session keeps a journal");
+        journal.stall_next_marker()
+    };
+    let id = send_mutation(rig, method, params).await;
+    tokio::time::timeout(LIVENESS_DEADLINE, reached)
+        .await
+        .unwrap_or_else(|_| panic!("{method:?}: the mutation did not reach its stall"))
+        .unwrap_or_else(|_| panic!("{method:?}: the stall was dropped before it was reached"));
+    (
+        Standing {
+            release,
+            stopped: None,
+        },
+        id,
+    )
+}
+
+/// What a lone Escape that follows work on its own connection comes to: the hold, once the
+/// application has it and its answer has been read, with the work still stopped.
+///
+/// The watchdog lets the stall go after five seconds at the latest, as the other cases do, so a
+/// regression fails naming the wait and not by hanging.
+async fn an_escape_meets(
+    rig: &mut Rig,
+    standing: &Standing,
+    answers: &mut Answers,
+    what: &str,
+) -> (kr_protocol::ids::RequestId, Duration) {
+    let letting_go = LetGo::after(standing.release.clone(), Duration::from_secs(5));
+    let (escape, began) = send_key(rig, b"\x1b").await;
+    let arrived = rig.until_everything_typed_arrived().await;
+    let answer = answers
+        .until(&mut rig.client, escape, LIVENESS_DEADLINE)
+        .await;
+    let had_to_be_let_go = letting_go.finish();
+    let arrived = arrived.unwrap_or_else(|| {
+        panic!(
+            "{what}: the application never received the Escape: {:?}",
+            rig.received()
+        )
+    });
+    let hold = arrived.duration_since(began);
+    eprintln!("{what}: the Escape was received {hold:?} after the write began");
+    assert!(
+        !had_to_be_let_go,
+        "{what}: the Escape was kept waiting until the work on its own connection was let go \
+         ({hold:?})"
+    );
+    assert!(
+        matches!(answer, Some(kr_protocol::envelope::Outcome::Ok(_))),
+        "{what}: the Escape was answered {answer:?}"
+    );
+    (escape, hold)
+}
+
+/// KR-PERF-002: a lone Escape that follows a journalled mutation on the same connection reaches
+/// the application while that mutation is stopped in its commit, with a disk writer beside.
+///
+/// A client sends its keys and its mutations (a resize, a viewport report) on one connection. The
+/// worker used to read no frame from a connection until that connection's mutation had returned,
+/// so the Escape waited for the mutation's commits and then for the recogniser's deadline. The
+/// clock starts before the Escape is written, which is no later than its arrival on the socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lone_escape_sent_after_a_mutation_on_its_own_connection_reaches_the_application_while_the_mutation_is_stalled()
+ {
+    let mut rig = Rig::start(HOST_EVENT_OUTPUT).await;
+    let disk = DiskWriter::beside(rig._kept.path());
+    let report = viewport_report(&rig);
+    let (standing, viewport) = stall_own(&mut rig, Method::AttachmentViewport, &report).await;
+    let mut answers = Answers::default();
+    let (escape, _) = an_escape_meets(
+        &mut rig,
+        &standing,
+        &mut answers,
+        "a stalled viewport report",
+    )
+    .await;
+    assert!(
+        !answers.outcomes.contains_key(&viewport),
+        "the stalled mutation was answered before its stall was let go"
+    );
+
+    standing.release.send(()).expect("lets the stall go");
+    let answer = answers
+        .until(&mut rig.client, viewport, LIVENESS_DEADLINE)
+        .await;
+    assert!(
+        matches!(answer, Some(kr_protocol::envelope::Outcome::Ok(_))),
+        "the viewport report was answered {answer:?}"
+    );
+    assert_eq!(
+        answers.order,
+        vec![escape, viewport],
+        "the Escape was answered ahead of the mutation it followed"
+    );
+    disk.stop();
+    rig.close().await;
+}
+
+/// KR-PERF-002: a lone Escape that follows a read on the same connection reaches the application
+/// while that read waits for a session another connection's mutation is holding.
+///
+/// A read takes the session, and a mutation on another connection holds it across its commits. The
+/// connection used to read nothing more until its read was answered, so the Escape behind it waited
+/// as long.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lone_escape_sent_after_a_read_waiting_for_the_session_reaches_the_application_while_it_is_held()
+ {
+    let mut rig = Rig::start(HOST_EVENT_OUTPUT).await;
+    let standing = stall(&mut rig, Stalled::Marker).await;
+    let read = kr_protocol::ids::RequestId::new(OWN_REQUESTS / 2);
+    rig.client
+        .writer()
+        .write_message(&ControlFrame::Request(kr_protocol::envelope::Request {
+            request_id: read,
+            method: Method::SessionRead.into(),
+            method_version: MethodVersion::V1,
+            params: kr_protocol::envelope::ParamsValue::from_typed(
+                &kr_protocol::session::SessionReadParams {
+                    session_id: rig.wired.session_id,
+                },
+            )
+            .expect("encodes"),
+        }))
+        .await
+        .expect("the read is written");
+    let mut answers = Answers::default();
+    let (escape, _) = an_escape_meets(
+        &mut rig,
+        &standing,
+        &mut answers,
+        "a read waiting for the session",
+    )
+    .await;
+    assert!(
+        !answers.outcomes.contains_key(&read),
+        "the read was answered while the session was held"
+    );
+
+    standing.release.send(()).expect("lets the stall go");
+    if let Some(stopped) = standing.stopped {
+        let _ = stopped.await;
+    }
+    let answer = answers
+        .until(&mut rig.client, read, LIVENESS_DEADLINE)
+        .await;
+    assert!(
+        matches!(answer, Some(kr_protocol::envelope::Outcome::Ok(_))),
+        "the read was answered {answer:?}"
+    );
+    assert_eq!(
+        answers.order,
+        vec![escape, read],
+        "the Escape was answered ahead of the read it followed"
+    );
+    rig.close().await;
+}
+
+/// KR-PERF-002: a key that follows a mutation which can change what the key meets still waits for
+/// it.
+///
+/// A client that sends `session.detach` and then a key for the attachment has the key refused,
+/// because the detach is applied first. The key is not answered while the detach is stopped in its
+/// commit, and nothing reaches the application.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_sent_after_a_detach_on_its_own_connection_waits_for_it_and_is_refused() {
+    let mut rig = Rig::start(HOST_EVENT_OUTPUT).await;
+    let detach = kr_protocol::attachment::SessionDetachParams {
+        attachment_id: Nullable::some(rig.attachment),
+        line_token: Nullable::null(),
+    };
+    let (standing, detach_id) = stall_own(&mut rig, Method::SessionDetach, &detach).await;
+    let (key, _) = send_key(&mut rig, b"x").await;
+    let mut answers = Answers::default();
+    assert!(
+        answers
+            .until(&mut rig.client, key, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "the key was answered while the detach it follows was stopped in its commit"
+    );
+
+    standing.release.send(()).expect("lets the stall go");
+    let detached = answers
+        .until(&mut rig.client, detach_id, LIVENESS_DEADLINE)
+        .await;
+    assert!(
+        matches!(detached, Some(kr_protocol::envelope::Outcome::Ok(_))),
+        "the detach was answered {detached:?}"
+    );
+    let refused = answers.until(&mut rig.client, key, LIVENESS_DEADLINE).await;
+    match refused {
+        Some(kr_protocol::envelope::Outcome::Error(error)) => {
+            assert_eq!(error.code, ErrorCode::AmbiguousAttachment);
+        }
+        other => panic!("the key after the detach was answered {other:?}"),
+    }
+    assert_eq!(answers.order, vec![detach_id, key]);
+    assert!(
+        rig.received().is_empty(),
+        "the key reached the application: {:?}",
+        rig.received()
+    );
+    rig.close().await;
+}
+
+/// KR-PERF-002: every frame sent around a mutation is answered once and the keys arrive in order.
+///
+/// Keys and viewport reports are interleaved while a viewport report is stopped in its commit,
+/// more of the reports than the worker reads ahead of a key, and more keys follow once the stall is
+/// let go. Each request identifier is answered once, every key is accepted, and the application
+/// has the keys in the order they were sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_frames_sent_around_a_mutation_on_its_own_connection_are_each_answered_once_and_the_keys_stay_in_order()
+ {
+    let mut rig = Rig::start(HOST_EVENT_OUTPUT).await;
+    let report = viewport_report(&rig);
+    let (standing, first) = stall_own(&mut rig, Method::AttachmentViewport, &report).await;
+    // A watchdog: while the worker reads nothing, as it did before, the frames below fill the
+    // socket and the stall has to be let go for them to be written.
+    let letting_go = LetGo::after(standing.release.clone(), Duration::from_secs(5));
+    let mut keys = Vec::new();
+    let mut reports = vec![first];
+    keys.push(send_key(&mut rig, b"a").await.0);
+    for _ in 0..10 {
+        reports.push(send_mutation(&mut rig, Method::AttachmentViewport, &report).await);
+    }
+    keys.push(send_key(&mut rig, b"b").await.0);
+    for _ in 0..10 {
+        reports.push(send_mutation(&mut rig, Method::AttachmentViewport, &report).await);
+    }
+    keys.push(send_key(&mut rig, b"c").await.0);
+    // The keys sent before the reports past the read-ahead are answered while the stall holds. A
+    // worker that reads nothing meanwhile answers nothing, and this gives up with the watchdog.
+    let mut answers = Answers::default();
+    let _ = answers
+        .until(&mut rig.client, keys[1], Duration::from_secs(5))
+        .await;
+    let _ = letting_go.finish();
+    // Whatever the stall still held is let go; a stall already let go has nothing to send to.
+    let _ = standing.release.send(());
+
+    for id in keys.iter().chain(&reports) {
+        let answer = answers.until(&mut rig.client, *id, LIVENESS_DEADLINE).await;
+        assert!(
+            matches!(answer, Some(kr_protocol::envelope::Outcome::Ok(_))),
+            "request {id:?} was answered {answer:?}"
+        );
+    }
+    let mut seen = answers.order.clone();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        answers.order.len(),
+        "a request was answered twice: {:?}",
+        answers.order
+    );
+    assert_eq!(answers.order.len(), keys.len() + reports.len());
+    assert!(
+        rig.until_everything_typed_arrived().await.is_some(),
+        "the application did not receive the keys in the order they were sent: {:?}",
+        rig.received()
+    );
+    rig.close().await;
+}
+
+/// KR-PERF-002: a key frame cut part way when the mutation it follows ends is read whole.
+///
+/// The worker reads ahead of the mutation, and the mutation ends while the key is part read. The
+/// rest of the key arrives afterwards and the key is answered once, accepted and delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_frame_cut_part_way_when_the_mutation_before_it_ends_is_read_whole() {
+    let mut rig = Rig::start(HOST_EVENT_OUTPUT).await;
+    let report = viewport_report(&rig);
+    let (standing, viewport) = stall_own(&mut rig, Method::AttachmentViewport, &report).await;
+    let id = kr_protocol::ids::RequestId::new(OWN_REQUESTS + rig.sequence);
+    let frame = key_frame(&rig, id, b"k");
+    rig.sequence += 1;
+    rig.typed.extend_from_slice(b"k");
+    let bytes =
+        kr_ipc::framed::FrameWriter::encode(kr_protocol::frame::StreamKind::Control, &frame)
+            .expect("encodes");
+    let cut = 4 + (bytes.len() - 4) / 2;
+    rig.client
+        .writer()
+        .write_frame(&bytes[..cut])
+        .await
+        .expect("the first part is written");
+    // Time for the worker to take the first part. The case does not depend on it having: a worker
+    // that has not taken it yet reads the whole frame afterwards, and both are right.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    standing.release.send(()).expect("lets the stall go");
+    let mut answers = Answers::default();
+    let answer = answers
+        .until(&mut rig.client, viewport, LIVENESS_DEADLINE)
+        .await;
+    assert!(matches!(
+        answer,
+        Some(kr_protocol::envelope::Outcome::Ok(_))
+    ));
+    rig.client
+        .writer()
+        .write_frame(&bytes[cut..])
+        .await
+        .expect("the rest is written");
+    let answer = answers.until(&mut rig.client, id, LIVENESS_DEADLINE).await;
+    assert!(
+        matches!(answer, Some(kr_protocol::envelope::Outcome::Ok(_))),
+        "the key was answered {answer:?}"
+    );
+    assert_eq!(answers.order, vec![viewport, id]);
+    assert!(
+        rig.until_everything_typed_arrived().await.is_some(),
+        "the application did not receive the key: {:?}",
+        rig.received()
+    );
+    rig.close().await;
+}
+
+/// KR-PERF-002: a client that goes away after a key sent behind a mutation leaves nothing behind.
+///
+/// The peer is gone when the worker answers the key, and when the mutation ends. Neither writes to
+/// a stream that cannot take it, and the connection's attachment is given up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_goes_after_a_key_sent_behind_its_mutation_leaves_nothing_held() {
+    let mut rig = Rig::start(HOST_EVENT_OUTPUT).await;
+    let report = viewport_report(&rig);
+    let (standing, _) = stall_own(&mut rig, Method::AttachmentViewport, &report).await;
+    let _ = send_key(&mut rig, b"x").await;
+    let Rig {
+        client,
+        wired,
+        attachment,
+        ..
+    } = rig;
+    drop(client);
+    standing.release.send(()).expect("lets the stall go");
+    tokio::time::timeout(LIVENESS_DEADLINE, async {
+        while wired
+            .runtime
+            .session()
+            .attachment_capabilities(attachment)
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the connection's attachment was given up");
+    wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
