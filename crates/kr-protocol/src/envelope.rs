@@ -581,4 +581,9 @@ pub enum ControlFrame {
     /// The worker's answer: the session's facts, or none, with the privacy state they were
     /// captured under.
     DescriptionFactsPage(Box<crate::describe::DescriptionFactsPage>),
+    /// The control daemon's request that a worker perform the disclosed desktop checks, on its
+    /// checks connection to the worker.
+    DesktopChecks(crate::desktop::DesktopChecksRequest),
+    /// The worker's findings: one record for each check it performed.
+    DesktopChecksAnswer(Box<crate::desktop::DesktopChecksAnswer>),
 }

@@ -105,7 +105,9 @@ use crate::describe::{
     SessionDescribeResult, SessionRenameParams, SessionRenameResult,
 };
 use crate::desktop::{
-    CapabilityRecord, DesktopCapabilityReport, DesktopContext, EnvironmentCapabilitiesParams,
+    CapabilityChecks, CapabilityChecksFailure, CapabilityChecksState, CapabilityRecord,
+    DesktopCapabilityReport, DesktopChecksAnswer, DesktopChecksRequest, DesktopContext,
+    EnvironmentCapabilitiesCheckParams, EnvironmentCapabilitiesParams,
     EnvironmentCapabilitiesResult, SleepInhibitionState,
 };
 use crate::envelope::{ControlFrame, MutationRequest, Notification, Request, Response};
@@ -375,6 +377,9 @@ pub fn protocol_schema() -> Value {
         "authority_revision_notice" => AuthorityRevisionNotice,
         "authority_revision_record" => AuthorityRevisionRecord,
         "capability_map" => CapabilityMap,
+        "capability_checks" => CapabilityChecks,
+        "capability_checks_failure" => CapabilityChecksFailure,
+        "capability_checks_state" => CapabilityChecksState,
         "capability_record" => CapabilityRecord,
         "catalogue_add_params" => CatalogueAddParams,
         "catalogue_add_result" => CatalogueAddResult,
@@ -399,10 +404,13 @@ pub fn protocol_schema() -> Value {
         "decoder_ledger_entry" => DecoderLedgerEntry,
         "decoding_trust" => DecodingTrust,
         "desktop_capability_report" => DesktopCapabilityReport,
+        "desktop_checks_answer" => DesktopChecksAnswer,
+        "desktop_checks_request" => DesktopChecksRequest,
         "desktop_context" => DesktopContext,
         "direct_challenge" => DirectChallenge,
         "direct_redeem_proof" => DirectRedeemProof,
         "envelope_plaintext" => EnvelopePlaintext,
+        "environment_capabilities_check_params" => EnvironmentCapabilitiesCheckParams,
         "environment_capabilities_params" => EnvironmentCapabilitiesParams,
         "environment_capabilities_result" => EnvironmentCapabilitiesResult,
         "environment_enrol_params" => EnvironmentEnrolParams,

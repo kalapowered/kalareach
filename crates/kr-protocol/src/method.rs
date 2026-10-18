@@ -369,6 +369,16 @@ methods! {
     confirmation: None, idempotency: READ,
     doc: "What one environment can currently do. Capability evidence, never authority.";
 
+    EnvironmentCapabilitiesCheck = "environment.capabilities.check", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Perform the disclosed desktop checks in a session's own worker, at the host itself: \
+          read a file the person authorised, take a screen image, find an accessible element \
+          and start an application. They run once, after the person has been shown what each \
+          one does, and the answer says that they are running. Their findings reach \
+          `environment.capabilities`, which never performs them.";
+
     HostDoctor = "host.doctor", HostAndEnvironment,
     effect: Read, ingress: [LocalIpc, PairedDevice], rights: [], selectors: [Host, Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,

@@ -271,7 +271,25 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
     include_str!("../retained/0.75/RELEASE"),
     include_str!("../retained/0.75/PLUGIN_HOST"),
     &[],
-    &[],
+    &[
+        Compatible {
+            at: "ControllerConnectionRole#const:checks",
+            reason: "the control daemon declares this role only to a worker at its own level, which \
+                     it chooses by level for the disclosed checks, so a worker of the retained \
+                     level is never asked for one",
+        },
+        Compatible {
+            at: "ControlFrame#key:desktop_checks",
+            reason: "the control daemon writes this request only on a checks connection to a \
+                     worker at its own level, and a worker of the retained level never receives \
+                     it",
+        },
+        Compatible {
+            at: "ControlFrame#key:desktop_checks_answer",
+            reason: "only a worker at the daemon's own level answers the request, so a worker of \
+                     the retained level never writes this frame",
+        },
+    ],
 )
 .with_public_majors(include_str!("../retained/0.75/PUBLIC_MAJORS"))];
 

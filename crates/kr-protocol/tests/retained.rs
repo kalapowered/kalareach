@@ -1,10 +1,12 @@
 //! What a release keeps of the release before it, tried on the surfaces of two real releases.
 //!
-//! The product keeps one retained level, and between it and this build nothing differs, so the
-//! tables of entries are empty. The difference these tests work from is a real one: the surface of
-//! the 0.73.0 release (`tests/retained/0.73`, cut from its tag) and of this build differ by one
-//! variant of the attention source, which a record of the attention text request carries. The
-//! other differences are made by editing that real surface: a required member dropped, a variant
+//! The product keeps one retained level. The difference these tests work from is a real one: the
+//! surface of the 0.73.0 release (`tests/retained/0.73`, cut from its tag) and of the retained
+//! level, the release after it, differ by one variant of the attention source, which a record of
+//! the attention text request carries. The retained level is what they compare with, and not this
+//! build, because this build's surface moves with every change to a frame and these cases are
+//! about how differences are found and covered, not about what this build differs by. The other
+//! differences are made by editing that real surface: a required member dropped, a variant
 //! removed, a definition renamed, something frozen changed.
 
 use kr_cbor::{CanonicalMap, CanonicalValue, Limits};
@@ -26,6 +28,11 @@ const SURFACE_073: &str = include_str!("retained/0.73/surface.schema.json");
 
 fn old_surface() -> Surface {
     Surface::parse(SURFACE_073).expect("the 0.73 surface")
+}
+
+/// The surface of the retained level, which is the release after 0.73.0.
+fn newer_surface() -> &'static Surface {
+    kr_protocol::retained::RETAINED[0].surface()
 }
 
 fn limits() -> Limits {
@@ -104,7 +111,7 @@ fn the_surface_kept_for_the_previous_release_is_the_one_this_build_has() {
 /// Two real releases: one variant, found at the place that carries it.
 #[test]
 fn two_real_releases_differ_by_the_attention_source_authority() {
-    let found = differences(&old_surface(), current());
+    let found = differences(&old_surface(), newer_surface());
     assert_eq!(
         found,
         vec![Difference {
@@ -119,13 +126,13 @@ fn two_real_releases_differ_by_the_attention_source_authority() {
 #[test]
 fn every_difference_needs_an_entry_and_every_entry_needs_a_difference() {
     let old = old_surface();
-    let bare = assess(&old, current(), &[], &[]);
+    let bare = assess(&old, newer_surface(), &[], &[]);
     assert_eq!(bare.uncovered.len(), 1, "{bare}");
     assert!(!bare.is_clean());
 
     let covered = assess(
         &old,
-        current(),
+        newer_surface(),
         &[],
         &[Compatible {
             at: "AttentionSource#const:authority",
@@ -136,7 +143,7 @@ fn every_difference_needs_an_entry_and_every_entry_needs_a_difference() {
 
     let stale = assess(
         &old,
-        current(),
+        newer_surface(),
         &[],
         &[
             Compatible {
@@ -527,7 +534,7 @@ fn rewrites_are_applied_to_each_instance_both_ways() {
     // The member's absence is two differences at one place (it is not a member, and it is not
     // required), which one entry covers.
     assert_eq!(
-        differences(&without, current())
+        differences(&without, newer_surface())
             .iter()
             .map(|found| found.at.as_str())
             .collect::<std::collections::BTreeSet<_>>(),

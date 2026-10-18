@@ -111,7 +111,9 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         | Method::EnvironmentForget
         | Method::EnvironmentInventory
         | Method::EnvironmentRefresh => None,
-        Method::EnvironmentCapabilities => at(PLATFORMS, "What may be done on a desktop"),
+        Method::EnvironmentCapabilities | Method::EnvironmentCapabilitiesCheck => {
+            at(PLATFORMS, "What may be done on a desktop")
+        }
         Method::DeliveryDestinationConfigure
         | Method::DeliveryDestinationRemove
         | Method::DeliveryDestinationList => at(DELIVERY, "Configuring and removing a destination"),

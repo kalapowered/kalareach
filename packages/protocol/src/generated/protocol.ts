@@ -968,6 +968,12 @@ export type ControlFrame =
   | {
       description_facts_page: DescriptionFactsPage
     }
+  | {
+      desktop_checks: DesktopChecksRequest
+    }
+  | {
+      desktop_checks_answer: DesktopChecksAnswer
+    }
 /**
  * A versioned capability name. Capabilities describe feasibility, never authority.
  */
@@ -1030,7 +1036,8 @@ export type DesktopSessionId = string
  * It confers nothing on its own. Every one of these connections still proves which generation it
  * speaks for, and only the holder of the environment's signing key can produce that proof.
  */
-export type ControllerConnectionRole = 'authority' | 'proxy' | 'attention' | 'descriptions'
+export type ControllerConnectionRole =
+  'authority' | 'proxy' | 'attention' | 'descriptions' | 'checks'
 /**
  * The control daemon's answer to a [`PluginRuntimeWanted`].
  */
@@ -1124,6 +1131,15 @@ export type CapabilityInvalidation =
   | 'os_permission'
   | 'desktop_generation'
   | 'worker_profile'
+/**
+ * Why a run of the disclosed checks established nothing.
+ */
+export type CapabilityChecksFailure =
+  'no_session' | 'worker_refused' | 'worker_unreachable' | 'worker_failed'
+/**
+ * Where the disclosed checks stand.
+ */
+export type CapabilityChecksState = 'not_run' | 'running' | 'current' | 'stale' | 'failed'
 /**
  * The catalogue generation a plugin package was resolved against.
  */
@@ -2668,6 +2684,9 @@ export interface KalaReachProtocol {
   bridge_frame?: BridgeFrame
   bridge_hello?: BridgeHello
   bridge_hello_ack?: BridgeHelloAck
+  capability_checks?: CapabilityChecks
+  capability_checks_failure?: CapabilityChecksFailure
+  capability_checks_state?: CapabilityChecksState
   capability_map?: CapabilityMap1
   capability_record?: CapabilityRecord
   capture_count?: CaptureCount
@@ -2730,6 +2749,8 @@ export interface KalaReachProtocol {
   description_repository?: DescriptionRepository
   description_setup_params?: DescriptionSetupParams
   desktop_capability_report?: DesktopCapabilityReport
+  desktop_checks_answer?: DesktopChecksAnswer
+  desktop_checks_request?: DesktopChecksRequest
   desktop_context?: DesktopContext1
   destination_secret?: DestinationSecret
   destination_secret_kind?: DestinationSecretKind
@@ -2764,6 +2785,7 @@ export interface KalaReachProtocol {
   edge_condition?: EdgeCondition
   effective_configuration?: EffectiveConfiguration
   envelope_plaintext?: EnvelopePlaintext
+  environment_capabilities_check_params?: EnvironmentCapabilitiesCheckParams
   environment_capabilities_params?: EnvironmentCapabilitiesParams
   environment_capabilities_result?: EnvironmentCapabilitiesResult
   environment_enrol_params?: EnvironmentEnrolParams
@@ -9970,17 +9992,40 @@ export interface DescriptionRepository {
   name: string
 }
 /**
- * Everything one installation of one application can currently do.
- *
- * Section 12: "The feature set is a per-installation capability map, not a single label assigned
- * to an agent name." Two installations of the same agent, at different versions or with different
- * permissions, have different maps.
+ * The control daemon's request that a worker perform the disclosed checks, made over the
+ * connection it holds for them.
  */
-export interface CapabilityMap1 {
+export interface DesktopChecksRequest {
   /**
-   * The records, ordered by capability so the map encodes deterministically.
+   * The file the read check reads, or null for none.
    */
-  records: InstanceCapabilityRecord[]
+  authorised_file: string | null
+  /**
+   * The environment the findings are about.
+   */
+  environment_id: string
+  /**
+   * Correlates the answer with this request.
+   */
+  request_id: string
+}
+/**
+ * The worker's findings for a [`DesktopChecksRequest`].
+ */
+export interface DesktopChecksAnswer {
+  /**
+   * One record for each check that was performed. A check that was not performed, because the
+   * platform's operation is not this build's or the context refuses it, has none.
+   */
+  records: CapabilityRecord[]
+  /**
+   * The request this answers.
+   */
+  request_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
 }
 /**
  * One capability, one subject, one answer.
@@ -10083,6 +10128,49 @@ export interface CapabilitySubject {
    * The terminal the record is about, where it is one.
    */
   terminal: string | null
+}
+/**
+ * Where the disclosed checks stand on this host.
+ *
+ * The checks take a screen image and start an application, so a read never performs them: a
+ * person asks, after being shown what each one does, with `environment.capabilities.check`. Their
+ * findings are held by the control daemon and reach the records of `environment.capabilities`
+ * for as long as nothing has ended them.
+ */
+export interface CapabilityChecks {
+  /**
+   * Why the latest run established nothing, where it did not.
+   */
+  failure: CapabilityChecksFailure | null
+  /**
+   * When the latest run ended, where it has.
+   */
+  finished_at_ms: TimestampMs | null
+  /**
+   * The session whose worker performed them, where one did.
+   */
+  session_id: SessionId | null
+  /**
+   * When the latest run began, where there has been one since this daemon started.
+   */
+  started_at_ms: TimestampMs | null
+  /**
+   * Where they stand.
+   */
+  state: 'not_run' | 'running' | 'current' | 'stale' | 'failed'
+}
+/**
+ * Everything one installation of one application can currently do.
+ *
+ * Section 12: "The feature set is a per-installation capability map, not a single label assigned
+ * to an agent name." Two installations of the same agent, at different versions or with different
+ * permissions, have different maps.
+ */
+export interface CapabilityMap1 {
+  /**
+   * The records, ordered by capability so the map encodes deterministically.
+   */
+  records: InstanceCapabilityRecord[]
 }
 /**
  * One class's counts in a captured tree or a diff read.
@@ -14739,6 +14827,20 @@ export interface EnvelopePlaintext {
   version: 'kr-mailbox/1'
 }
 /**
+ * Parameters of `environment.capabilities.check`.
+ */
+export interface EnvironmentCapabilitiesCheckParams {
+  /**
+   * The file the person authorised the read check to read, as an absolute path, or null for
+   * none. Without one the read check says that none was nominated.
+   */
+  authorised_file: string | null
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+}
+/**
  * Parameters of `environment.capabilities`.
  */
 export interface EnvironmentCapabilitiesParams {
@@ -14755,6 +14857,7 @@ export interface EnvironmentCapabilitiesParams {
  * profile, and the host's sleep-inhibition state.
  */
 export interface EnvironmentCapabilitiesResult {
+  checks: CapabilityChecks1
   /**
    * How long a worker's execution context lasts.
    *
@@ -14773,6 +14876,31 @@ export interface EnvironmentCapabilitiesResult {
    */
   persistence: ProfilePersistence[]
   power: SleepInhibitionState
+}
+/**
+ * Where the disclosed checks stand: whether the records above include their findings.
+ */
+export interface CapabilityChecks1 {
+  /**
+   * Why the latest run established nothing, where it did not.
+   */
+  failure: CapabilityChecksFailure | null
+  /**
+   * When the latest run ended, where it has.
+   */
+  finished_at_ms: TimestampMs | null
+  /**
+   * The session whose worker performed them, where one did.
+   */
+  session_id: SessionId | null
+  /**
+   * When the latest run began, where there has been one since this daemon started.
+   */
+  started_at_ms: TimestampMs | null
+  /**
+   * Where they stand.
+   */
+  state: 'not_run' | 'running' | 'current' | 'stale' | 'failed'
 }
 /**
  * The desktop and its capability records.
@@ -18449,6 +18577,7 @@ export interface MethodEntry {
     | 'host.info'
     | 'environment.list'
     | 'environment.capabilities'
+    | 'environment.capabilities.check'
     | 'host.doctor'
     | 'environment.enrol'
     | 'environment.forget'
@@ -27324,6 +27453,7 @@ export interface ServiceRequestPayload {
     | 'host.info'
     | 'environment.list'
     | 'environment.capabilities'
+    | 'environment.capabilities.check'
     | 'host.doctor'
     | 'environment.enrol'
     | 'environment.forget'

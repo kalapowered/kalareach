@@ -252,7 +252,8 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::AccountSignIn
         | Method::AccountSignOut
         | Method::DescriptionConfigure
-        | Method::DescriptionDownload => Environment,
+        | Method::DescriptionDownload
+        | Method::EnvironmentCapabilitiesCheck => Environment,
         _ => Unclassified,
     }
 }

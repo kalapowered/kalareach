@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 183,
+  "method_count": 184,
   "methods": [
     {
       "capability": "none",
@@ -63,6 +63,35 @@
         "environment"
       ],
       "summary": "What one environment can currently do. Capability evidence, never authority.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "environment.capabilities.check",
+      "name": "environment.capabilities.check",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "Perform the disclosed desktop checks in a session's own worker, at the host itself: read a file the person authorised, take a screen image, find an accessible element and start an application. They run once, after the person has been shown what each one does, and the answer says that they are running. Their findings reach `environment.capabilities`, which never performs them.",
       "version": 1
     },
     {

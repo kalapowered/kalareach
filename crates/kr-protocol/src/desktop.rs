@@ -54,7 +54,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{BootIdentity, WorkerProfile};
-use crate::ids::{CapabilityId, CapabilityRevision, DesktopSessionId, EnvironmentId, SessionId};
+use crate::ids::{
+    CapabilityId, CapabilityRevision, DesktopSessionId, EnvironmentId, RequestId, SessionId,
+};
 use crate::scalars::{Nullable, TimestampMs, U64};
 
 /// Which platform facility named a login session.
@@ -537,15 +539,21 @@ pub mod capabilities {
     pub const APPLICATION_LAUNCH: &str = "desktop.application_launch";
     /// The display server the desktop presents.
     pub const DISPLAY_SERVER: &str = "desktop.display_server";
+    /// Reading a file the person authorised this context to read.
+    ///
+    /// No platform query answers it: the only evidence for it is the read itself, so it has a
+    /// record only after the disclosed checks have been performed.
+    pub const AUTHORISED_FILE_READ: &str = "desktop.authorised_file_read";
 }
 
 /// Every desktop capability this build names, in the order they are declared.
-pub const CAPABILITIES: [&str; 5] = [
+pub const CAPABILITIES: [&str; 6] = [
     capabilities::SCREEN_CAPTURE,
     capabilities::INPUT_INJECTION,
     capabilities::ACCESSIBILITY,
     capabilities::APPLICATION_LAUNCH,
     capabilities::DISPLAY_SERVER,
+    capabilities::AUTHORISED_FILE_READ,
 ];
 
 /// The owner's sleep-inhibition choice.
@@ -935,6 +943,121 @@ pub struct EnvironmentCapabilitiesResult {
     pub persistence: Vec<ProfilePersistence>,
     /// The host's sleep-inhibition state.
     pub power: SleepInhibitionState,
+    /// Where the disclosed checks stand: whether the records above include their findings.
+    pub checks: CapabilityChecks,
+}
+
+/// Where the disclosed checks stand on this host.
+///
+/// The checks take a screen image and start an application, so a read never performs them: a
+/// person asks, after being shown what each one does, with `environment.capabilities.check`. Their
+/// findings are held by the control daemon and reach the records of `environment.capabilities`
+/// for as long as nothing has ended them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityChecks {
+    /// Where they stand.
+    pub state: CapabilityChecksState,
+    /// When the latest run began, where there has been one since this daemon started.
+    pub started_at_ms: Nullable<TimestampMs>,
+    /// When the latest run ended, where it has.
+    pub finished_at_ms: Nullable<TimestampMs>,
+    /// The session whose worker performed them, where one did.
+    pub session_id: Nullable<SessionId>,
+    /// Why the latest run established nothing, where it did not.
+    pub failure: Nullable<CapabilityChecksFailure>,
+}
+
+impl CapabilityChecks {
+    /// The state of a host on which nothing has been asked.
+    #[must_use]
+    pub const fn not_run() -> Self {
+        Self {
+            state: CapabilityChecksState::NotRun,
+            started_at_ms: Nullable::null(),
+            finished_at_ms: Nullable::null(),
+            session_id: Nullable::null(),
+            failure: Nullable::null(),
+        }
+    }
+}
+
+/// Where the disclosed checks stand.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityChecksState {
+    /// Nobody has asked since this daemon started.
+    NotRun,
+    /// A session's worker is performing them.
+    Running,
+    /// They were performed, and nothing since has ended what they found.
+    Current,
+    /// They were performed, and something since has ended what they found: a new login, a
+    /// replaced worker or a changed profile. They have to be performed again to be current.
+    Stale,
+    /// The latest run established nothing.
+    Failed,
+}
+
+/// Why a run of the disclosed checks established nothing.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityChecksFailure {
+    /// No session of the profile the host creates sessions with is running, and the checks run in
+    /// a session's own worker, which is the context an agent has.
+    NoSession,
+    /// The worker answered the request with an error: it was already performing a run, its
+    /// authority had moved on, it could not make a directory for the run, or the run did not
+    /// finish.
+    WorkerRefused,
+    /// The worker did not answer in time, or the connection to it could not be made or ended.
+    WorkerUnreachable,
+    /// The worker answered with something this daemon does not hold as the findings.
+    WorkerFailed,
+}
+
+/// Parameters of `environment.capabilities.check`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentCapabilitiesCheckParams {
+    /// The environment whose checks to perform.
+    pub environment_id: EnvironmentId,
+    /// The file the person authorised the read check to read, as an absolute path, or null for
+    /// none. Without one the read check says that none was nominated.
+    pub authorised_file: Nullable<String>,
+}
+
+/// The longest path the read check is nominated a file by.
+pub const MAX_AUTHORISED_FILE_BYTES: usize = 4_096;
+
+/// The control daemon's request that a worker perform the disclosed checks, made over the
+/// connection it holds for them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopChecksRequest {
+    /// Correlates the answer with this request.
+    pub request_id: RequestId,
+    /// The environment the findings are about.
+    pub environment_id: EnvironmentId,
+    /// The file the read check reads, or null for none.
+    pub authorised_file: Nullable<String>,
+}
+
+/// The worker's findings for a [`DesktopChecksRequest`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopChecksAnswer {
+    /// The request this answers.
+    pub request_id: RequestId,
+    /// The session whose worker performed them.
+    pub session_id: SessionId,
+    /// One record for each check that was performed. A check that was not performed, because the
+    /// platform's operation is not this build's or the context refuses it, has none.
+    pub records: Vec<CapabilityRecord>,
 }
 
 /// Parameters of `environment.capabilities`.

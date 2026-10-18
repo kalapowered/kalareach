@@ -508,6 +508,32 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             "{name} asks for host management and nothing else"
         );
     }
+    // The disclosed desktop checks take a screen image and start an application, so a read never
+    // performs them. One write in the host-and-environment group asks for them, made at the host
+    // itself by the owner and never over a paired device.
+    let checks = ["environment.capabilities.check"];
+    for name in checks {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(
+            entry.effect,
+            EffectClass::Write,
+            "{name} performs the checks"
+        );
+        assert_eq!(entry.group, MethodGroup::HostAndEnvironment);
+        assert_eq!(entry.ingress, &[ActorIngress::LocalIpc]);
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::right(ActionRight::HostManage)],
+            "{name} asks for host management and nothing else"
+        );
+        assert_eq!(
+            decide(name, MethodVersion::V1, ActorIngress::PairedDevice),
+            AuthorityDecision::Denied(DenialReason::ForbiddenIngress {
+                ingress: ActorIngress::PairedDevice
+            }),
+            "{name} is not served to a paired device"
+        );
+    }
     // A paired device is refused the two that change the host, by the registry itself.
     for name in ["description.configure", "description.download"] {
         assert_eq!(
@@ -1032,6 +1058,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + backup.len()
             + updates.len()
             + descriptions.len()
+            + checks.len()
             + machines.len()
             + redemptions.len()
             + held.len()

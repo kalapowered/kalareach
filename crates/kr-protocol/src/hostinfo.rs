@@ -5887,6 +5887,18 @@ pub mod export {
             ContentClass::Structure,
         ),
         field(
+            "EnvironmentCapabilitiesResult",
+            "checks",
+            ContentClass::Structure,
+        ),
+        // Where the disclosed checks stand: closed words and numbers this build produced, and the
+        // session whose worker performed them, which this host named.
+        field("CapabilityChecks", "state", ContentClass::Term),
+        field("CapabilityChecks", "started_at_ms", ContentClass::Number),
+        field("CapabilityChecks", "finished_at_ms", ContentClass::Number),
+        field("CapabilityChecks", "session_id", ContentClass::Identifier),
+        field("CapabilityChecks", "failure", ContentClass::Term),
+        field(
             "DesktopCapabilityReport",
             "desktop",
             ContentClass::Structure,
@@ -7918,6 +7930,7 @@ mod tests {
                     crate::desktop::PowerSource::Unknown,
                 )
             },
+            checks: crate::desktop::CapabilityChecks::not_run(),
         };
         let (planted, count) =
             plant_everywhere::<_, crate::desktop::EnvironmentCapabilitiesResult>(&answer);
@@ -8089,6 +8102,7 @@ mod tests {
                 crate::desktop::InhibitionMechanism::None,
                 crate::desktop::PowerSource::Unknown,
             ),
+            checks: crate::desktop::CapabilityChecks::not_run(),
         };
         let read: crate::desktop::EnvironmentCapabilitiesResult =
             serde_json::from_value(serde_json::to_value(&answer).expect("the answer serialises"))

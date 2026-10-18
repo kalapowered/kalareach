@@ -19,6 +19,7 @@ links to its document.
 | `host.info` | read | `local_ipc`, `paired_device` | Host build identity, protocol limits and configured services. |  |
 | `environment.list` | read | `local_ipc`, `paired_device` | The environments this actor's grant admits. |  |
 | `environment.capabilities` | read | `local_ipc`, `paired_device` | What one environment can currently do. Capability evidence, never authority. | [Platforms: What may be done on a desktop](../host/platforms.md) |
+| `environment.capabilities.check` | write | `local_ipc` | Perform the disclosed desktop checks in a session's own worker, at the host itself: read a file the person authorised, take a screen image, find an accessible element and start an application. They run once, after the person has been shown what each one does, and the answer says that they are running. Their findings reach `environment.capabilities`, which never performs them. | [Platforms: What may be done on a desktop](../host/platforms.md) |
 | `host.doctor` | read | `local_ipc`, `paired_device` | Host diagnostics with credentials redacted. |  |
 | `environment.enrol` | write | `local_ipc` | Record an enrolled WSL, container, SSH or paired environment: its platform identity, its operating-system user and the absolute path of the helper installed there. |  |
 | `environment.forget` | write | `local_ipc` | Remove one enrolled environment and its cached inventory row. |  |

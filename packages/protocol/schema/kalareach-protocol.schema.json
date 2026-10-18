@@ -6264,6 +6264,123 @@
       "$ref": "#/$defs/Bytes",
       "description": "The opaque token that lets one verified source poll or cancel its own question.\n\nIt is not authority over a session and it is not an answer: it permits exactly the two reads\nand the one cancellation that belong to the question it was issued for, and only from the same\nverified application. Section 11 keeps it out of events, push payloads, backups and logs, so\nthis type prints as a redaction and carries no `Display`."
     },
+    "CapabilityChecks": {
+      "additionalProperties": false,
+      "description": "Where the disclosed checks stand on this host.\n\nThe checks take a screen image and start an application, so a read never performs them: a\nperson asks, after being shown what each one does, with `environment.capabilities.check`. Their\nfindings are held by the control daemon and reach the records of `environment.capabilities`\nfor as long as nothing has ended them.",
+      "properties": {
+        "failure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CapabilityChecksFailure"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the latest run established nothing, where it did not."
+        },
+        "finished_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the latest run ended, where it has."
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session whose worker performed them, where one did."
+        },
+        "started_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the latest run began, where there has been one since this daemon started."
+        },
+        "state": {
+          "$ref": "#/$defs/CapabilityChecksState",
+          "description": "Where they stand."
+        }
+      },
+      "required": [
+        "state",
+        "started_at_ms",
+        "finished_at_ms",
+        "session_id",
+        "failure"
+      ],
+      "type": "object"
+    },
+    "CapabilityChecksFailure": {
+      "description": "Why a run of the disclosed checks established nothing.",
+      "oneOf": [
+        {
+          "const": "no_session",
+          "description": "No session of the profile the host creates sessions with is running, and the checks run in\na session's own worker, which is the context an agent has.",
+          "type": "string"
+        },
+        {
+          "const": "worker_refused",
+          "description": "The worker answered the request with an error: it was already performing a run, its\nauthority had moved on, it could not make a directory for the run, or the run did not\nfinish.",
+          "type": "string"
+        },
+        {
+          "const": "worker_unreachable",
+          "description": "The worker did not answer in time, or the connection to it could not be made or ended.",
+          "type": "string"
+        },
+        {
+          "const": "worker_failed",
+          "description": "The worker answered with something this daemon does not hold as the findings.",
+          "type": "string"
+        }
+      ]
+    },
+    "CapabilityChecksState": {
+      "description": "Where the disclosed checks stand.",
+      "oneOf": [
+        {
+          "const": "not_run",
+          "description": "Nobody has asked since this daemon started.",
+          "type": "string"
+        },
+        {
+          "const": "running",
+          "description": "A session's worker is performing them.",
+          "type": "string"
+        },
+        {
+          "const": "current",
+          "description": "They were performed, and nothing since has ended what they found.",
+          "type": "string"
+        },
+        {
+          "const": "stale",
+          "description": "They were performed, and something since has ended what they found: a new login, a\nreplaced worker or a changed profile. They have to be performed again to be current.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "The latest run established nothing.",
+          "type": "string"
+        }
+      ]
+    },
     "CapabilityEvidenceSource": {
       "description": "What produced a capability answer.",
       "oneOf": [
@@ -10825,6 +10942,32 @@
             "description_facts_page"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The control daemon's request that a worker perform the disclosed desktop checks, on its\nchecks connection to the worker.",
+          "properties": {
+            "desktop_checks": {
+              "$ref": "#/$defs/DesktopChecksRequest"
+            }
+          },
+          "required": [
+            "desktop_checks"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The worker's findings: one record for each check it performed.",
+          "properties": {
+            "desktop_checks_answer": {
+              "$ref": "#/$defs/DesktopChecksAnswer"
+            }
+          },
+          "required": [
+            "desktop_checks_answer"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -10849,6 +10992,11 @@
         {
           "const": "descriptions",
           "description": "The connection the daemon reads this session's description facts over.\n\nIt carries the description facts request and nothing else, and holds one of them at a\ntime. A newer one replaces it, and a replacement generation fences it along with the\nauthority itself.",
+          "type": "string"
+        },
+        {
+          "const": "checks",
+          "description": "The connection the daemon asks a worker to perform the disclosed desktop checks over.\n\nIt carries the checks request and nothing else, and the worker performs one run at a time\nwhatever connections ask. The run takes a screen image and starts an application, so it can\nlast about two minutes; a connection of its own keeps the authority connection free for the\nwork that has a deadline. A newer one replaces it, and a replacement generation fences it\nalong with the authority itself.",
           "type": "string"
         }
       ]
@@ -12284,6 +12432,64 @@
       "required": [
         "desktop",
         "records"
+      ],
+      "type": "object"
+    },
+    "DesktopChecksAnswer": {
+      "additionalProperties": false,
+      "description": "The worker's findings for a [`DesktopChecksRequest`].",
+      "properties": {
+        "records": {
+          "description": "One record for each check that was performed. A check that was not performed, because the\nplatform's operation is not this build's or the context refuses it, has none.",
+          "items": {
+            "$ref": "#/$defs/CapabilityRecord"
+          },
+          "type": "array"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId",
+          "description": "The request this answers."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session whose worker performed them."
+        }
+      },
+      "required": [
+        "request_id",
+        "session_id",
+        "records"
+      ],
+      "type": "object"
+    },
+    "DesktopChecksRequest": {
+      "additionalProperties": false,
+      "description": "The control daemon's request that a worker perform the disclosed checks, made over the\nconnection it holds for them.",
+      "properties": {
+        "authorised_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The file the read check reads, or null for none."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment the findings are about."
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId",
+          "description": "Correlates the answer with this request."
+        }
+      },
+      "required": [
+        "request_id",
+        "environment_id",
+        "authorised_file"
       ],
       "type": "object"
     },
@@ -15226,6 +15432,32 @@
       "description": "The variables an owner has configured to add to a session, each with its value.",
       "type": "object"
     },
+    "EnvironmentCapabilitiesCheckParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `environment.capabilities.check`.",
+      "properties": {
+        "authorised_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The file the person authorised the read check to read, as an absolute path, or null for\nnone. Without one the read check says that none was nominated."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment whose checks to perform."
+        }
+      },
+      "required": [
+        "environment_id",
+        "authorised_file"
+      ],
+      "type": "object"
+    },
     "EnvironmentCapabilitiesParams": {
       "additionalProperties": false,
       "description": "Parameters of `environment.capabilities`.",
@@ -15244,6 +15476,10 @@
       "additionalProperties": false,
       "description": "The result of `environment.capabilities`.\n\nOne document: the desktop this environment currently has, what may actually be done on it, the\nexecution profile a session gets when the request does not choose one, what logout does to each\nprofile, and the host's sleep-inhibition state.",
       "properties": {
+        "checks": {
+          "$ref": "#/$defs/CapabilityChecks",
+          "description": "Where the disclosed checks stand: whether the records above include their findings."
+        },
         "default_worker_profile": {
           "$ref": "#/$defs/WorkerProfile",
           "description": "The profile a create request gets when it does not choose one."
@@ -15273,7 +15509,8 @@
         "desktop",
         "default_worker_profile",
         "persistence",
-        "power"
+        "power",
+        "checks"
       ],
       "type": "object"
     },
@@ -21438,6 +21675,11 @@
         {
           "const": "environment.capabilities",
           "description": "What one environment can currently do. Capability evidence, never authority.",
+          "type": "string"
+        },
+        {
+          "const": "environment.capabilities.check",
+          "description": "Perform the disclosed desktop checks in a session's own worker, at the host itself: read a file the person authorised, take a screen image, find an accessible element and start an application. They run once, after the person has been shown what each one does, and the answer says that they are running. Their findings reach `environment.capabilities`, which never performs them.",
           "type": "string"
         },
         {
@@ -41983,6 +42225,15 @@
     "bridge_hello_ack": {
       "$ref": "#/$defs/BridgeHelloAck"
     },
+    "capability_checks": {
+      "$ref": "#/$defs/CapabilityChecks"
+    },
+    "capability_checks_failure": {
+      "$ref": "#/$defs/CapabilityChecksFailure"
+    },
+    "capability_checks_state": {
+      "$ref": "#/$defs/CapabilityChecksState"
+    },
     "capability_map": {
       "$ref": "#/$defs/CapabilityMap"
     },
@@ -42169,6 +42420,12 @@
     "desktop_capability_report": {
       "$ref": "#/$defs/DesktopCapabilityReport"
     },
+    "desktop_checks_answer": {
+      "$ref": "#/$defs/DesktopChecksAnswer"
+    },
+    "desktop_checks_request": {
+      "$ref": "#/$defs/DesktopChecksRequest"
+    },
     "desktop_context": {
       "$ref": "#/$defs/DesktopContext"
     },
@@ -42270,6 +42527,9 @@
     },
     "envelope_plaintext": {
       "$ref": "#/$defs/EnvelopePlaintext"
+    },
+    "environment_capabilities_check_params": {
+      "$ref": "#/$defs/EnvironmentCapabilitiesCheckParams"
     },
     "environment_capabilities_params": {
       "$ref": "#/$defs/EnvironmentCapabilitiesParams"

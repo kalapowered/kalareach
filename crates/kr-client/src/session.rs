@@ -1555,7 +1555,11 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
         | ControlFrame::PrivacyGenerationAck(_)
         // The control daemon's request for a session's description facts, and the worker's page.
         | ControlFrame::DescriptionFacts(_)
-        | ControlFrame::DescriptionFactsPage(_) => return false,
+        | ControlFrame::DescriptionFactsPage(_)
+        // The control daemon's request that a worker perform the disclosed checks, and the
+        // worker's findings.
+        | ControlFrame::DesktopChecks(_)
+        | ControlFrame::DesktopChecksAnswer(_) => return false,
     }
     true
 }

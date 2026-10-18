@@ -66,8 +66,9 @@ fn root(label: &str, krate: &'static str, names: &[&str], depth: Depth) -> Root 
 }
 
 /// The wrappers that carry a rule and that types of the surface hold in their fields, which are no
-/// definitions of the schema themselves.
-const WRAPPERS: &[&str] = &["Nullable", "CanonicalSet"];
+/// definitions of the schema themselves. `Sentence` is the text of a capability record's reason,
+/// which the disclosed checks' answer carries.
+const WRAPPERS: &[&str] = &["Nullable", "CanonicalSet", "Sentence"];
 
 /// Types with a rule of their own that are held by a type of the surface and that no root covers,
 /// with why.

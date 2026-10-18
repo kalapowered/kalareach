@@ -491,6 +491,14 @@ pub enum ControllerConnectionRole {
     /// time. A newer one replaces it, and a replacement generation fences it along with the
     /// authority itself.
     Descriptions,
+    /// The connection the daemon asks a worker to perform the disclosed desktop checks over.
+    ///
+    /// It carries the checks request and nothing else, and the worker performs one run at a time
+    /// whatever connections ask. The run takes a screen image and starts an application, so it can
+    /// last about two minutes; a connection of its own keeps the authority connection free for the
+    /// work that has a deadline. A newer one replaces it, and a replacement generation fences it
+    /// along with the authority itself.
+    Checks,
 }
 
 impl ControllerConnectionRole {
@@ -502,6 +510,7 @@ impl ControllerConnectionRole {
             Self::Proxy => "proxy",
             Self::Attention => "attention",
             Self::Descriptions => "descriptions",
+            Self::Checks => "checks",
         }
     }
 }
