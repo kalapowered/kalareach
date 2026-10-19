@@ -2,8 +2,10 @@
  * Revoking a device, in the words the page uses for it.
  *
  * A revocation is done only when the host's acknowledgement has been read. Everything before that is
- * said as what it is: sent, with nobody having answered it, or acknowledged with some of the host's
- * sessions still running. Nothing here calls a request that has not been acknowledged revoked.
+ * said as what it is: sent, with nobody having answered it, or acknowledged while some of the host's
+ * sessions have yet to confirm it. Nothing here calls a request that has not been acknowledged
+ * revoked, and nothing here says a session stopped: a revocation ends what the device may do, and
+ * the sessions stay on the host.
  */
 
 import type {
@@ -44,8 +46,8 @@ export const CANNOT_CONFIRM =
 export const REVOCATION_HELP =
   'Revoking a device ends its pairing with a host. Each revocation asks you to confirm on this computer first.'
 
-/** A moment, said short for today and with its day for another. */
-export function momentOf(ms: number, now: number = Date.now()): string {
+/** A moment as a phrase: "at 11:40 AM" for today, "on 18 Oct at 11:40 AM" for another day. */
+export function whenOf(ms: number, now: number = Date.now()): string {
   const at = new Date(ms)
   const time = at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
   const today = new Date(now)
@@ -54,8 +56,17 @@ export function momentOf(ms: number, now: number = Date.now()): string {
     at.getMonth() === today.getMonth() &&
     at.getDate() === today.getDate()
   return sameDay
-    ? time
-    : `${at.toLocaleDateString([], { day: 'numeric', month: 'short' })}, ${time}`
+    ? `at ${time}`
+    : `on ${at.toLocaleDateString([], { day: 'numeric', month: 'short' })} at ${time}`
+}
+
+/**
+ * What a host is called inside a sentence. The host on this computer is shown under the name "This
+ * computer", which as the subject of a sentence reads as the computer and not as its host.
+ */
+export function hostCalled(host: RevocationHost, startsSentence = false): string {
+  if (host.route !== 'direct') return host.name
+  return startsSentence ? 'The host on this computer' : 'the host on this computer'
 }
 
 /** How many sessions, counted: "1 session", "3 sessions". */
@@ -67,12 +78,17 @@ function sessions(count: number): string {
 export function describeRefusal(reason: RevocationRefusal, host: string): string {
   switch (reason) {
     case 'no_owner_authority':
-      return `${host} does not take this computer as one of its owners, so it refused the request.`
+      return `${host} does not take this computer as one of its owners, so it refused the request. Revoke the device at the host.`
     case 'unknown_target':
       return `${host} does not know this device, so it refused the request.`
     case 'superseded':
       return `${host} refused the request because an earlier revocation covers it.`
   }
+}
+
+/** Whether a refused request is one a second request can succeed after: only a superseded one. */
+export function canAskAgainAfter(standing: RevocationStanding): boolean {
+  return standing.state === 'refused' && standing.reason === 'superseded'
 }
 
 /** The short name of a standing, for its badge. Null where there is nothing to name. */
@@ -97,81 +113,96 @@ export function standingBadge(
 
 /**
  * What a standing says in a sentence, where there is one to say. A request that has not been
- * acknowledged is not described as anything more than sent.
+ * acknowledged is not described as anything more than sent. A standing kept from an earlier read of
+ * the feed (`staleSince`) says when it was read and that the feed has not been read since.
  */
 export function describeStanding(
   standing: RevocationStanding,
   host: RevocationHost,
+  staleSince: number | null = null,
   now: number = Date.now()
 ): string | null {
+  const said = standingWords(standing, host, now)
+  if (said === null || staleSince === null) return said
+  return `${said} This is what the feed showed ${whenOf(staleSince, now)}: this computer has not been able to read it since.`
+}
+
+function standingWords(standing: RevocationStanding, host: RevocationHost, now: number): string | null {
+  const name = hostCalled(host, true)
   switch (standing.state) {
     case 'active':
       return null
     case 'revoked':
-      return `${host.name} lists this device as revoked.`
+      return `${name} lists this device as revoked.`
     case 'sent': {
-      const sent = `Sent ${momentOf(standing.at_ms, now)}. ${host.name} has not acknowledged it yet.`
+      const sent = `Sent ${whenOf(standing.at_ms, now)}. ${name} has not acknowledged it yet.`
       return standing.host_lists_revoked ? `${sent} It already lists the device as revoked.` : sent
     }
     case 'acknowledged': {
-      const who = host.route === 'direct' ? "This computer's host recorded it" : `${host.name} acknowledged it`
-      const at = `${who} ${momentOf(standing.at_ms, now)}`
+      const at = `${name} ${host.route === 'direct' ? 'recorded' : 'acknowledged'} it ${whenOf(standing.at_ms, now)}`
       // A host that has not said how many sessions are left has not said that none are.
-      const stopped =
+      const confirmed =
         standing.pending_workers !== null
-          ? `, and ${sessions(standing.pending_workers)} had not stopped yet`
+          ? `, and ${sessions(standing.pending_workers)} had not confirmed it yet`
           : standing.host_lists_revoked
-            ? ', and has not said that every session stopped'
+            ? ', and has not said that every session confirmed it'
             : ''
       return standing.host_lists_revoked
-        ? `${at}${stopped}.`
-        : `${at}${stopped}. Its own list does not show the device as revoked. Revoke it at the host.`
+        ? `${at}${confirmed}.`
+        : `${at}${confirmed}. Its own list does not show the device as revoked. Revoke it at the host.`
     }
     case 'done':
-      return host.route === 'direct'
-        ? `This computer's host revoked it ${momentOf(standing.at_ms, now)}, with every session stopped.`
-        : `${host.name} acknowledged it ${momentOf(standing.at_ms, now)}, with every session stopped.`
+      return `${name} ${host.route === 'direct' ? 'revoked' : 'acknowledged'} it ${whenOf(standing.at_ms, now)}, and every session confirmed it.`
     case 'refused':
-      return describeRefusal(standing.reason, host.name)
+      return describeRefusal(standing.reason, name)
   }
 }
 
-/** Whether a standing is one the host has yet to finish, so the screen asks again while it waits. */
-export function isWaiting(standing: RevocationStanding): boolean {
-  return standing.state === 'sent' || standing.state === 'acknowledged'
+/**
+ * Whether a standing is one the host has yet to finish, so the screen asks again while it waits. The
+ * host on this computer answers each revocation as it is asked, so nothing a look finds can change
+ * what it said: its control is "Check again".
+ */
+export function isWaiting(standing: RevocationStanding, host: RevocationHost): boolean {
+  return (
+    standing.state === 'sent' || (standing.state === 'acknowledged' && host.route !== 'direct')
+  )
 }
 
 /** Whether any device of any host is waiting for its host. */
 export function anyWaiting(view: RevocationView): boolean {
-  return view.hosts.some((host) => host.devices.some((device) => isWaiting(device.standing)))
+  return view.hosts.some((host) => host.devices.some((device) => isWaiting(device.standing, host)))
 }
 
 /** How a host is reached, said under its name. */
 export function describeRoute(host: RevocationHost, origin: string | null): string {
   if (host.route === 'direct') {
-    return 'The host on this computer. A revocation takes effect here at once.'
+    return 'The host on this computer. Revocations go to it directly.'
   }
   const every = host.feed?.poll_interval_seconds
   const reads =
-    typeof every === 'number'
-      ? `The host reads its feed every ${every} seconds while it is online.`
-      : 'The host reads its feed while it is online.'
+    host.feed?.removed === true
+      ? ''
+      : typeof every === 'number'
+        ? ` The host reads its feed every ${every} seconds while it is online.`
+        : ' The host reads its feed while it is online.'
   return origin === null
-    ? `Reached through its feed. ${reads}`
-    : `Reached through its feed at ${origin}. ${reads}`
+    ? `Reached through its feed.${reads}`
+    : `Reached through its feed at ${origin}.${reads}`
 }
 
 /** What is known of whether the host answered, in a line. Null when it listed its devices. */
 export function describeContact(host: RevocationHost, now: number = Date.now()): string | null {
+  const name = hostCalled(host, true)
   switch (host.contact) {
     case 'answered':
       return null
     case 'refused':
-      return `${host.name} will not list its devices to this computer.`
+      return `${name} will not list its devices to this computer.`
     case 'silent':
       return host.listed_at_ms === null
-        ? `${host.name} is not answering, and this computer has no list of its devices yet.`
-        : `${host.name} is not answering. These are the devices it listed at ${momentOf(host.listed_at_ms, now)}.`
+        ? `${name} is not answering, and this computer has no list of its devices yet.`
+        : `${name} is not answering. These are the devices it listed ${whenOf(host.listed_at_ms, now)}.`
   }
 }
 
@@ -196,8 +227,8 @@ export function describeFeed(
     const last = feed.last_acknowledgement
     lines.push(
       last === null
-        ? `${host.name} has written nothing in this feed yet.`
-        : `${host.name} last acknowledged a request at ${momentOf(last.at_ms, now)} (revision ${last.revision}).`
+        ? `${host.name} has acknowledged no request in this feed yet.`
+        : `${host.name} last acknowledged a request ${whenOf(last.at_ms, now)} (revision ${last.revision}).`
     )
     if (feed.outstanding > 0) {
       lines.push(
@@ -206,6 +237,9 @@ export function describeFeed(
           : `${feed.outstanding} requests are waiting for the host.`
       )
     }
+  }
+  if (host.host_synchronised_at_ms !== null) {
+    lines.push(`${host.name} last read its feed ${whenOf(host.host_synchronised_at_ms, now)}.`)
   }
   if (host.host_feed_stale) {
     lines.push(`${host.name} says it could not reach its feed at its last check.`)
@@ -226,23 +260,30 @@ export function describeDevice(device: RevocationDevice): string {
   return device.this_computer ? `${platform}${owner}. This computer.` : `${platform}${owner}.`
 }
 
-/** The label of a revoke control, for a screen reader: which device, on which host, how. */
+/**
+ * The name of a revoke control, for a screen reader: its visible label first, then which device, on
+ * which host. Null where this computer offers no ceremony.
+ */
 export function revokeName(
   device: RevocationDevice,
   host: RevocationHost,
   ceremony: CeremonyKind,
   again = false
 ): string | null {
-  const how = by(ceremony)
-  return how === null
-    ? null
-    : `${again ? 'Revoke again' : 'Revoke'} ${device.name} on ${host.name} ${how}`
+  const label = revokeLabel(ceremony, again)
+  return label === null ? null : `${label}: ${device.name} on ${host.name}`
+}
+
+/** The name of the control that asks the host on this computer again, visible label first. */
+export function checkAgainName(device: RevocationDevice, host: RevocationHost): string {
+  return `Check again: has ${hostCalled(host)} finished revoking ${device.name}?`
 }
 
 /**
  * What changed between two views that a person should hear, as sentences: a request a host
- * acknowledged, finished or refused since the last view. Nothing is said for a request that is only
- * still waiting.
+ * acknowledged, finished or refused since the last view, and an acknowledgement whose host list
+ * came to agree with it or to contradict it. Nothing is said for a request that is only still
+ * waiting.
  */
 export function announcements(before: RevocationView | null, after: RevocationView): readonly string[] {
   if (before === null) return []
@@ -250,22 +291,23 @@ export function announcements(before: RevocationView | null, after: RevocationVi
   for (const host of after.hosts) {
     const earlier = before.hosts.find((each) => each.reference === host.reference)
     if (earlier === undefined) continue
+    const name = hostCalled(host, true)
     for (const device of host.devices) {
       const was = earlier.devices.find((each) => each.reference === device.reference)
-      if (was === undefined || was.standing.state === device.standing.state) continue
+      if (was === undefined || !changedWhatIsDone(was.standing, device.standing)) continue
       switch (device.standing.state) {
         case 'done':
-          said.push(`${device.name} is revoked: ${host.name} acknowledged it.`)
+          said.push(`${name} acknowledged the revocation of ${device.name}, and every session confirmed it.`)
           break
         case 'acknowledged':
           said.push(
             device.standing.host_lists_revoked
-              ? `${host.name} acknowledged the revocation of ${device.name}, and some sessions have not stopped.`
-              : `${host.name} acknowledged the revocation of ${device.name}, but its own list does not show it revoked.`
+              ? `${name} acknowledged the revocation of ${device.name}, and has not said that every session confirmed it.`
+              : `${name} acknowledged the revocation of ${device.name}, but its own list does not show it revoked.`
           )
           break
         case 'refused':
-          said.push(`${host.name} refused the request to revoke ${device.name}.`)
+          said.push(`${name} refused the request to revoke ${device.name}.`)
           break
         default:
           break
@@ -273,4 +315,14 @@ export function announcements(before: RevocationView | null, after: RevocationVi
     }
   }
   return said
+}
+
+/** Whether a device's standing moved to another state, or an acknowledgement's host list changed. */
+function changedWhatIsDone(was: RevocationStanding, now: RevocationStanding): boolean {
+  if (was.state !== now.state) return true
+  return (
+    was.state === 'acknowledged' &&
+    now.state === 'acknowledged' &&
+    was.host_lists_revoked !== now.host_lists_revoked
+  )
 }

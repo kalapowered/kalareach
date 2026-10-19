@@ -1184,25 +1184,26 @@ textarea::placeholder {
 }
 
 /*
- * What a row says of its request, in words. A change of standing puts new words in, and they fade
- * in over the state duration without travelling, so reduced motion changes nothing about them and
- * the keyboard rule makes them instant.
+ * What a row says of its request, in words, and a refusal of the person's last attempt. The words
+ * take focus once a request is sent, so they show it; nothing about them moves or fades.
  */
-.revocation-state {
-  opacity: 1;
-  transition: opacity var(--state) var(--ease-out);
-}
-
-@starting-style {
-  .revocation-state {
-    opacity: 0;
-  }
-}
-
 .revocation-state:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 4px;
   border-radius: 6px;
+}
+
+.revocation-failure {
+  color: var(--danger);
+}
+
+/*
+ * A host's name and where its requests go. Neither has a place a line can break when it is long, and
+ * at the largest text size either is wider than the card.
+ */
+.card-title {
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
 }
 
 /* The two answers to a question about one device: side by side while they fit, wrapped if not. */

@@ -380,8 +380,13 @@ export interface FakeRevocation {
   change(view: RevocationView): void
   /** Sets where one device's revocation stands, as the host's acknowledgement would. */
   stand(host: string, device: string, standing: RevocationStanding): void
-  /** Makes every revocation fail as one does that was not confirmed, with these words, or stops that. */
-  refuseWith(message: string | null): void
+  /** Makes every revocation fail with this code and these words, or stops that. */
+  failWith(message: string | null, code?: string): void
+  /**
+   * Makes the next look at the hosts wait, answering with the view as it is when the look is made
+   * and only once `release` is called: a host that is slow to answer.
+   */
+  holdNextView(): { release(): void }
 }
 
 /** The sync service setting, as the backend reports it. */
@@ -865,7 +870,8 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   let owner: OwnerView = { ceremony: 'touch_id', requests: [] }
   let revocation: RevocationView = { ceremony: 'touch_id', feed_origin: 'reach.kala.to', hosts: [] }
   const revocationAsked: string[] = []
-  let revocationRefusal: string | null = null
+  let revocationFailure: { readonly code: string; readonly message: string } | null = null
+  let revocationHold: ((release: () => void) => void) | null = null
   const ownerListeners = new Set<(view: OwnerView) => void>()
   const publishOwner = (next: OwnerView) => {
     owner = next
@@ -2027,10 +2033,22 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       return Promise.resolve(connectionNow())
     },
     onPairing: (listener) => register(pairingListeners, listener),
-    revocationView: () => Promise.resolve(revocation),
+    revocationView: () => {
+      const snapshot = revocation
+      const hold = revocationHold
+      if (hold === null) return Promise.resolve(snapshot)
+      revocationHold = null
+      return new Promise((resolve) => {
+        hold(() => {
+          resolve(snapshot)
+        })
+      })
+    },
     revocationRevoke: (host, device) => {
       revocationAsked.push(`${host} ${device}`)
-      if (revocationRefusal !== null) return refused('PERMISSION_DENIED', revocationRefusal)
+      if (revocationFailure !== null) {
+        return refused(revocationFailure.code, revocationFailure.message)
+      }
       const found = revocation.hosts.find((each) => each.reference === host)
       const row = found?.devices.find((each) => each.reference === device)
       if (found === undefined || row === undefined) {
@@ -2611,8 +2629,19 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
           )
         }
       },
-      refuseWith(message) {
-        revocationRefusal = message
+      failWith(message, code = 'PERMISSION_DENIED') {
+        revocationFailure = message === null ? null : { code, message }
+      },
+      holdNextView() {
+        let release = () => {}
+        revocationHold = (answer) => {
+          release = answer
+        }
+        return {
+          release: () => {
+            release()
+          }
+        }
       }
     },
     syncService: {

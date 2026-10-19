@@ -8,10 +8,14 @@
  *
  * Revoking asks the person once, with the platform's own ceremony, so the control is named for it
  * ("Revoke with Touch ID") and there is no question in the row beside the dialog's. The row's words
- * wrap and no row has a fixed width, so no text size pushes a control out of its card. While a
- * request waits for its host the screen asks again every few seconds; a row that changes fades its
- * new words in and nothing travels, so reduced motion keeps it as it is. What changes is said in a
- * polite live region, and focus goes to the row whose request has just been sent.
+ * wrap and no row has a fixed width, so no text size pushes a control out of its card. A refusal is
+ * said in the row it is about, and focus returns to the control that was pressed. A request that
+ * was sent leaves its row without a control, so focus goes to the words that now say where it
+ * stands; those words are one element for as long as the row lives, so a later change of standing
+ * keeps the person's place. Nothing here moves: what changes is said in a polite live region.
+ *
+ * While a request waits for its host the screen asks again, ten seconds after the last answer: one
+ * look at a time, so a slow host is waited for and its answer is shown, never dropped for the next.
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
@@ -26,6 +30,8 @@ import {
   REVOCATION_HELP,
   announcements,
   anyWaiting,
+  canAskAgainAfter,
+  checkAgainName,
   describeContact,
   describeDevice,
   describeFeed,
@@ -36,8 +42,20 @@ import {
   standingBadge
 } from '../model/revocation'
 
-/** How long the screen waits between two looks while some request waits for its host. */
-const LOOK_EVERY_MS = 10_000
+/** How long after one look has been answered the screen waits to look again, while a request waits. */
+const LOOK_AFTER_MS = 10_000
+
+/** A revocation that did not go through, said in the row of the device it was for. */
+interface Failure {
+  readonly key: string
+  readonly message: string
+}
+
+/** Where focus goes once the screen has settled: the words of a row, or the control of one. */
+interface FocusTarget {
+  readonly key: string
+  readonly on: 'words' | 'control'
+}
 
 /** The screen. */
 export function Devices(): ReactNode {
@@ -45,15 +63,17 @@ export function Devices(): ReactNode {
   const target = minimumTarget('desktop')
   const [view, setView] = useState<RevocationView | null>(null)
   const [problem, setProblem] = useState<string | null>(null)
-  const [refused, setRefused] = useState<string | null>(null)
+  const [failure, setFailure] = useState<Failure | null>(null)
   const [looking, setLooking] = useState(false)
   // The device a revocation is being confirmed or sent for, by host and device reference.
   const [revoking, setRevoking] = useState<string | null>(null)
   const [heard, setHeard] = useState('')
   const reads = useRef<Watch | null>(null)
   const shown = useRef<RevocationView | null>(null)
-  const states = useRef(new Map<string, HTMLElement>())
-  const toFocus = useRef<string | null>(null)
+  const looks = useRef(0)
+  const words = useRef(new Map<string, HTMLElement>())
+  const controls = useRef(new Map<string, HTMLElement>())
+  const toFocus = useRef<FocusTarget | null>(null)
 
   /** Shows a view the host answered, and says what changed in it since the last one. */
   const show = useCallback((next: RevocationView) => {
@@ -63,9 +83,11 @@ export function Devices(): ReactNode {
     if (said.length > 0) setHeard(said.join(' '))
   }, [])
 
+  /** Asks every host and feed. Only the newest answer is shown, and a look in flight is waited for. */
   const look = useCallback(() => {
     const current = reads.current?.read() ?? null
     if (current === null) return
+    looks.current += 1
     setLooking(true)
     ask(() => port.revocationView())
       .then((next) => {
@@ -78,7 +100,8 @@ export function Devices(): ReactNode {
         setProblem(failureMessage(error))
       })
       .finally(() => {
-        if (current()) setLooking(false)
+        looks.current -= 1
+        if (looks.current === 0) setLooking(false)
       })
   }, [port, show])
 
@@ -91,40 +114,57 @@ export function Devices(): ReactNode {
     }
   }, [look])
 
-  // While a request waits for its host, the host's answer is looked for. A screen no one can see
-  // asks nothing.
+  // While a request waits for its host, the host's answer is looked for: once the last look has
+  // been answered and ten seconds have passed. A screen no one can see asks nothing, and asks as
+  // soon as it can be seen.
   const waiting = view !== null && anyWaiting(view)
   useEffect(() => {
-    if (!waiting) return
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === 'visible') look()
-    }, LOOK_EVERY_MS)
-    return () => {
-      window.clearInterval(timer)
+    if (!waiting || looking) return
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return
+      document.removeEventListener('visibilitychange', onVisible)
+      look()
     }
-  }, [waiting, look])
+    const timer = window.setTimeout(() => {
+      if (document.visibilityState === 'visible') look()
+      else document.addEventListener('visibilitychange', onVisible)
+    }, LOOK_AFTER_MS)
+    return () => {
+      window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [waiting, looking, look])
 
-  // A request that was just sent leaves its row without a control, so focus goes to the words that
-  // now say where it stands.
+  // Once nothing is being asked, focus goes where the last revocation left it.
   useEffect(() => {
-    const reference = toFocus.current
-    if (reference === null) return
+    const next = toFocus.current
+    if (next === null || revoking !== null) return
     toFocus.current = null
-    states.current.get(reference)?.focus()
-  }, [view])
+    // A row with no words and no control, one whose host cannot be reached, has nothing to take it.
+    const held = next.on === 'words' ? words : controls
+    held.current.get(next.key)?.focus()
+  }, [view, failure, revoking])
 
   const revoke = (host: RevocationHost, device: RevocationDevice) => {
     const key = `${host.reference}/${device.reference}`
     setRevoking(key)
-    setRefused(null)
+    setFailure(null)
     ask(() => port.revocationRevoke(host.reference, device.reference))
       .then((next) => {
-        toFocus.current = key
+        // This answer is newer than any look that began before it: none of them may replace it.
+        if (reads.current?.read() == null) return
+        toFocus.current = { key, on: 'words' }
         show(next)
         setProblem(null)
       })
       .catch((error: unknown) => {
-        setRefused(failureMessage(error))
+        const message = failureMessage(error)
+        toFocus.current = { key, on: 'control' }
+        setFailure({ key, message })
+        setHeard(`Could not revoke ${device.name}. ${message}`)
+        // A refusal after the request left says so in its own words; the screen looks, so that
+        // what it shows is what the host and its feed say now.
+        look()
       })
       .finally(() => {
         setRevoking(null)
@@ -151,11 +191,12 @@ export function Devices(): ReactNode {
           tone="warning"
           title="Could not read your hosts"
           detail={problem}
-          action={<Button onClick={look}>Try again</Button>}
+          action={
+            <Button disabled={looking} onClick={look}>
+              Try again
+            </Button>
+          }
         />
-      ) : null}
-      {refused !== null ? (
-        <Banner tone="warning" title="Nothing was changed" detail={refused} />
       ) : null}
       {view !== null && view.ceremony === 'none' ? (
         <Banner tone="accent" title="This computer cannot confirm" detail={CANNOT_CONFIRM} />
@@ -187,7 +228,9 @@ export function Devices(): ReactNode {
               view={view}
               target={target}
               revoking={revoking}
-              states={states}
+              failure={failure}
+              words={words}
+              controls={controls}
               onRevoke={revoke}
             />
           ))}
@@ -203,24 +246,32 @@ function HostCard({
   view,
   target,
   revoking,
-  states,
+  failure,
+  words,
+  controls,
   onRevoke
 }: {
   readonly host: RevocationHost
   readonly view: RevocationView
   readonly target: number
   readonly revoking: string | null
-  readonly states: RefObject<Map<string, HTMLElement>>
+  readonly failure: Failure | null
+  readonly words: RefObject<Map<string, HTMLElement>>
+  readonly controls: RefObject<Map<string, HTMLElement>>
   readonly onRevoke: (host: RevocationHost, device: RevocationDevice) => void
 }): ReactNode {
   const contact = describeContact(host)
   const feedLines = host.feed === null ? [] : describeFeed(host.feed, host)
-  // A request for a host reached through its feed needs a feed that was read and still has the host.
-  const reachable = host.feed === null || (host.feed.read && !host.feed.removed)
+  // A request needs the host to be asked, and for a host reached through its feed, a feed that was
+  // read and still has the host. The host on this computer that does not answer is sent nothing.
+  const reachable =
+    host.route === 'direct'
+      ? host.contact === 'answered'
+      : host.feed === null || (host.feed.read && !host.feed.removed)
   return (
     <Card data-testid="devices-host">
       <div className="card-header">
-        <div className="spacer">
+        <div className="spacer card-title">
           <h2>{host.name}</h2>
           <p className="muted small">{describeRoute(host, view.feed_origin)}</p>
         </div>
@@ -254,7 +305,9 @@ function HostCard({
                 target={target}
                 reachable={reachable}
                 revoking={revoking}
-                states={states}
+                failure={failure}
+                words={words}
+                controls={controls}
                 onRevoke={onRevoke}
               />
             ))}
@@ -275,7 +328,9 @@ function DeviceRow({
   target,
   reachable,
   revoking,
-  states,
+  failure,
+  words,
+  controls,
   onRevoke
 }: {
   readonly host: RevocationHost
@@ -284,18 +339,20 @@ function DeviceRow({
   readonly target: number
   readonly reachable: boolean
   readonly revoking: string | null
-  readonly states: RefObject<Map<string, HTMLElement>>
+  readonly failure: Failure | null
+  readonly words: RefObject<Map<string, HTMLElement>>
+  readonly controls: RefObject<Map<string, HTMLElement>>
   readonly onRevoke: (host: RevocationHost, device: RevocationDevice) => void
 }): ReactNode {
   const key = `${host.reference}/${device.reference}`
   const standing = device.standing
   const badge = standingBadge(standing)
-  const sentence = describeStanding(standing, host)
+  const sentence = describeStanding(standing, host, device.stale_since_ms)
   const mine = revoking === key
-  // Revoking is offered for a device nothing has been asked of, and again for one the host
-  // refused. The host on this computer that has not finished is asked about again, which asks
-  // nothing new of the person.
-  const again = standing.state === 'refused'
+  // Revoking is offered for a device nothing has been asked of, and again for one the host refused
+  // in a way a second request can get past. The host on this computer that has not finished is
+  // asked about again, which asks nothing new of the person.
+  const again = canAskAgainAfter(standing)
   const askAgain = host.route === 'direct' && standing.state === 'acknowledged'
   const offered =
     !device.this_computer &&
@@ -304,7 +361,8 @@ function DeviceRow({
       (again && ceremony !== 'none') ||
       askAgain)
   const label = askAgain ? 'Check again' : revokeLabel(ceremony, again)
-  const name = askAgain ? `Check again whether ${host.name} finished revoking ${device.name}` : revokeName(device, host, ceremony, again)
+  const name = askAgain ? checkAgainName(device, host) : revokeName(device, host, ceremony, again)
+  const failed = failure !== null && failure.key === key ? failure.message : null
   return (
     <li className="device-row" data-testid="devices-device" data-state={standing.state}>
       <div className="device-words">
@@ -315,15 +373,19 @@ function DeviceRow({
         {sentence !== null ? (
           <p
             className="account-note revocation-state"
-            key={standing.state}
             tabIndex={-1}
             ref={(element) => {
-              if (element === null) states.current.delete(key)
-              else states.current.set(key, element)
+              if (element === null) words.current.delete(key)
+              else words.current.set(key, element)
             }}
             data-testid="devices-standing"
           >
             {sentence}
+          </p>
+        ) : null}
+        {failed !== null ? (
+          <p className="account-note revocation-failure" data-testid="devices-failure">
+            Could not revoke {device.name}. {failed}
           </p>
         ) : null}
         <p className="account-help">{describeDevice(device)}</p>
@@ -333,14 +395,17 @@ function DeviceRow({
           tone={askAgain ? 'default' : 'danger'}
           data-wraps
           disabled={revoking !== null}
-          aria-busy={mine}
           aria-label={name}
           style={{ minBlockSize: target }}
+          ref={(element) => {
+            if (element === null) controls.current.delete(key)
+            else controls.current.set(key, element)
+          }}
           onClick={() => {
             onRevoke(host, device)
           }}
         >
-          {mine ? 'Waiting for you to confirm…' : label}
+          {mine ? (askAgain ? 'Checking…' : 'Revoking…') : label}
         </Button>
       ) : null}
     </li>

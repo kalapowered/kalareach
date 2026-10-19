@@ -670,7 +670,10 @@ export type RevocationContact = 'answered' | 'refused' | 'silent'
 /** Why a host refused a request. */
 export type RevocationRefusal = 'no_owner_authority' | 'unknown_target' | 'superseded'
 
-/** Where one device's revocation stands. Only `done` is a revocation carried out. */
+/**
+ * Where one device's revocation stands. Only `done` is a revocation carried out: the host
+ * acknowledged it and every session confirmed it.
+ */
 export type RevocationStanding =
   | { readonly state: 'active' }
   | { readonly state: 'revoked' }
@@ -716,6 +719,11 @@ export interface RevocationDevice {
   /** Whether it is this computer, which does not revoke itself. */
   readonly this_computer: boolean
   readonly standing: RevocationStanding
+  /**
+   * When the feed last said the standing, in UTC milliseconds, for a standing native code keeps
+   * from an earlier read because it could not read the feed this time. Null for one read now.
+   */
+  readonly stale_since_ms: number | null
 }
 
 /** One host this computer can revoke devices on. */

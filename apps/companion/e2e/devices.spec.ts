@@ -2,11 +2,12 @@
  * The devices of the hosts this computer owns, in a real browser engine.
  *
  * A component test cannot hold layout, the keyboard or motion. This holds what the screen does when
- * it is full: every host and every standing a request can have, a name with no short place to break
- * a line, a text size twice the default, and the face the Linux runner draws, which sets about a
- * tenth more text across a line. The words and the controls stay inside their cards and no control is
- * smaller than a pointer needs. A device is revoked from the keyboard alone, focus follows the
- * request to the words that say where it stands, and under reduced motion those words do not fade.
+ * it is full: every host and every standing a request can have, names with no place to break a line
+ * (one with hyphens and one with none), a text size twice the default, and the face the Linux runner
+ * draws, which sets about a tenth more text across a line. The words and the controls stay inside
+ * their cards and no control is smaller than a pointer needs. A device is revoked from the keyboard
+ * alone, focus follows the request to the words that say where it stands, and a refusal returns
+ * focus to the control that was pressed.
  *
  * Every screenshot goes under `/tmp`, named for the engine and the case.
  */
@@ -21,6 +22,9 @@ const WIDE_FACE = ':root { --font-ui: Verdana, "DejaVu Sans", sans-serif !import
 /** A name with no short place to break a line, as a person's own might be. */
 const LONG_NAME = 'studio-workstation-in-the-converted-garage'
 
+/** A name with no place to break a line at all. */
+const UNBROKEN_NAME = 'northwesternstoragecontainerworkstationbox'
+
 const AT = Date.UTC(2026, 9, 18, 9, 40)
 
 const device = (reference: string, name: string, standing: object, over: object = {}) => ({
@@ -30,6 +34,7 @@ const device = (reference: string, name: string, standing: object, over: object 
   manages_host: false,
   this_computer: false,
   standing,
+  stale_since_ms: null,
   ...over
 })
 
@@ -91,6 +96,32 @@ const EVERYTHING = {
       devices: [device('h', 'the-kindle', { state: 'active' })]
     },
     {
+      reference: 'unread',
+      name: UNBROKEN_NAME,
+      route: 'feed',
+      contact: 'answered',
+      listed_at_ms: AT,
+      host_synchronised_at_ms: null,
+      host_feed_stale: false,
+      feed: {
+        read: false,
+        problem: 'it did not answer in time',
+        removed: false,
+        host_wrote_here: false,
+        last_acknowledgement: null,
+        outstanding: 0,
+        poll_interval_seconds: null
+      },
+      devices: [
+        device(
+          'k',
+          'kitchenwindowsillraspberrypicamera',
+          { state: 'sent', at_ms: AT, host_lists_revoked: false },
+          { stale_since_ms: AT + 60_000 }
+        )
+      ]
+    },
+    {
       reference: 'here',
       name: 'This computer',
       route: 'direct',
@@ -126,8 +157,7 @@ async function photograph(page: Page, element: Locator, path: string): Promise<v
   const view = page.viewportSize()
   const height = await element.evaluate((each) => each.getBoundingClientRect().height)
   if (view !== null) await page.setViewportSize({ width: view.width, height: Math.ceil(height) + view.height })
-  // A fade that has not ended is taken at its end, so the photograph shows the words as they settle.
-  await page.screenshot({ path, fullPage: true, animations: 'disabled' })
+  await page.screenshot({ path, fullPage: true })
 }
 
 // KR-REQ-10.46: the screen stays whole at the default text size and the largest, in the system's face
@@ -148,8 +178,11 @@ for (const [size, face] of [
     await openTheScreen(page)
     if (face === 'wide') await page.addStyleTag({ content: WIDE_FACE })
     const hosts = page.getByTestId('devices-host')
-    await expect(hosts).toHaveCount(3)
+    await expect(hosts).toHaveCount(4)
     // Every standing is said in its row, and none is called revoked but the one the host acknowledged.
+    await expect(page.getByTestId('devices-device').filter({ hasText: 'kitchenwindowsill' })).toContainText(
+      'has not been able to read it since'
+    )
     await expect(page.getByTestId('devices-device').filter({ hasText: 'the-tablet' })).toContainText('Sent')
     await expect(page.getByTestId('devices-device').filter({ hasText: 'the-watch' })).toContainText('Acknowledged')
     await expect(page.getByTestId('devices-device').filter({ hasText: 'the-pad' })).toContainText('Revoke it at the host')
@@ -188,7 +221,9 @@ test('offers nothing for a host the feed removed, and nothing for this computer'
 test('revokes a device from the keyboard alone, and focus goes to where the request stands', async ({ page }) => {
   await openTheScreen(page)
   const row = page.getByTestId('devices-device').filter({ hasText: `${LONG_NAME}-phone` })
-  const button = row.getByRole('button', { name: new RegExp(`^Revoke ${LONG_NAME}-phone on ${LONG_NAME} with Touch ID$`) })
+  const button = row.getByRole('button', {
+    name: new RegExp(`^Revoke with Touch ID: ${LONG_NAME}-phone on ${LONG_NAME}$`)
+  })
   // WebKit on macOS passes over buttons unless the system's keyboard setting asks for them, so the
   // button is focused directly and the key that presses it is what the case holds to.
   await button.focus()
@@ -209,13 +244,17 @@ test('revokes a device from the keyboard alone, and focus goes to where the requ
   await expect(page.getByTestId('devices-heard')).toContainText('is revoked')
 })
 
-test('changes its words by fading and never by travelling, with or without reduced motion', async ({ page }) => {
-  for (const reducedMotion of ['no-preference', 'reduce'] as const) {
-    await page.emulateMedia({ reducedMotion })
-    await openTheScreen(page)
-    const standing = page.getByTestId('devices-standing').first()
-    await expect(standing).toBeVisible()
-    const moved = await standing.evaluate((each) => getComputedStyle(each).transitionProperty)
-    expect(moved, `${reducedMotion}: only the opacity of the words changes over time`).toBe('opacity')
-  }
+test('says a refusal in the row and returns focus to the control that was pressed', async ({ page }) => {
+  await openTheScreen(page)
+  await page.evaluate(() => {
+    window.krTestHost?.revocation.failWith('It was not confirmed, so nothing was changed.')
+  })
+  const row = page.getByTestId('devices-device').filter({ hasText: `${LONG_NAME}-phone` })
+  const button = row.getByRole('button', { name: /^Revoke with Touch ID/ })
+  await button.focus()
+  await page.keyboard.press('Enter')
+  await expect(row.getByTestId('devices-failure')).toContainText('was not confirmed')
+  // The control is back, enabled and focused, so a second attempt is one key away.
+  await expect(button).toBeEnabled()
+  await expect(button).toBeFocused()
 })
