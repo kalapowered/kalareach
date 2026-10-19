@@ -365,21 +365,130 @@ fn until_the_journal_is_healthy(host: &Host) {
 /// maintenance is such a connection, on its first pass or when a pass of its own meets this one,
 /// so this asks again, as the next pass does, until the recovery has finished.
 async fn until_rich_work_is_back(host: &Host) {
-    let broker = host.service.broker();
     let started = std::time::Instant::now();
     loop {
-        host.service.recover_storage_now();
-        if broker.mode() == kr_protocol::gateway::GatewayMode::Normal {
+        // On a thread of its own, so that the wait can end at the deadline even when the pass is
+        // held on a lock; a thread that is held that way is left to the end of the process. The
+        // mode is read on that thread too, for it takes the broker's lock.
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let service = Arc::clone(&host.service);
+        std::thread::spawn(move || {
+            service.recover_storage_now();
+            let _ = done.send(service.broker().mode());
+        });
+        let mode = tokio::time::timeout(
+            common::LIVENESS_DEADLINE.saturating_sub(started.elapsed()),
+            finished,
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the recovery pass did not return in {:?}",
+                started.elapsed()
+            )
+        })
+        .expect("the recovery pass ended without finishing");
+        if mode == kr_protocol::gateway::GatewayMode::Normal {
             return;
         }
         assert!(
             started.elapsed() < common::LIVENESS_DEADLINE,
-            "with nothing owed, rich work is back: the gateway is still {} after {:?}",
-            broker.mode(),
+            "with nothing owed, rich work is back: the gateway is still {mode} after {:?}",
             started.elapsed()
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+/// Whether the store refused a request.
+fn refused_by_the_store(outcome: &Outcome) -> bool {
+    matches!(outcome, Outcome::Error(error) if error.code == ErrorCode::StorageUnavailable)
+}
+
+/// The receipt an action has, or none when the host never admitted it.
+///
+/// A read the store refuses is asked again once the host has recovered, inside the caller's
+/// deadline ([`send_until_decided`]).
+async fn receipt_if_admitted<C: Codec>(
+    client: &mut Client<C>,
+    host: &Host,
+    action_id: ActionId,
+) -> Option<kr_protocol::receipt::Receipt> {
+    loop {
+        client
+            .send(&ControlFrame::Request(Request {
+                request_id: RequestId::new(901),
+                method: Method::ActionRead.into(),
+                method_version: MethodVersion::V1,
+                params: ParamsValue::from_typed(&kr_protocol::receipt::ActionReadParams {
+                    action_id,
+                    session_id: None,
+                })
+                .expect("encodes"),
+            }))
+            .await
+            .expect("writes the request");
+        let outcome = loop {
+            match client.recv().await.expect("the worker answers") {
+                ControlFrame::Response(response) => break response.outcome,
+                ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
+                other => panic!("the worker answered {other:?}"),
+            }
+        };
+        match outcome {
+            Outcome::Ok(value) => {
+                let result: kr_protocol::receipt::ActionReadResult =
+                    value.to_typed().expect("the result decodes");
+                return Some(result.receipt);
+            }
+            Outcome::Error(error)
+                if error.code == ErrorCode::InvalidArgument
+                    && error.message.starts_with("no receipt for action") =>
+            {
+                return None;
+            }
+            other if refused_by_the_store(&other) => until_rich_work_is_back(host).await,
+            other => panic!("the receipt is readable or absent: {other:?}"),
+        }
+    }
+}
+
+/// Sends the request `build` makes, and returns what the host answered and the action it was.
+///
+/// A store can refuse a write on a loaded machine. The journal is then faulted until the host's own
+/// maintenance writes the gap that explains it, and a request is refused for that before the host
+/// admits it, with no receipt. That says nothing of what a case asks the host to decide, so the
+/// host recovers and the request is sent again under a new action, as a client sends it again. An
+/// action the host admitted before the store refused it is a result and is returned as it is.
+///
+/// One deadline, the suite's hung-test bound, covers the sends, the reads of receipts and the
+/// recoveries together; a store that refuses every request fails the case at it with the last
+/// outcome.
+async fn send_until_decided<C: Codec>(
+    client: &mut Client<C>,
+    host: &Host,
+    mut build: impl FnMut(&Client<C>) -> MutationRequest,
+) -> (Outcome, ActionId) {
+    let mut last = None;
+    let decided = tokio::time::timeout(LIVENESS_DEADLINE, async {
+        loop {
+            let mutation = build(client);
+            let action_id = mutation.action_id;
+            let outcome = send(client, mutation).await;
+            if !refused_by_the_store(&outcome) {
+                return (outcome, action_id);
+            }
+            last = Some(outcome.clone());
+            if receipt_if_admitted(client, host, action_id).await.is_some() {
+                return (outcome, action_id);
+            }
+            until_rich_work_is_back(host).await;
+        }
+    })
+    .await;
+    decided.unwrap_or_else(|_| {
+        panic!("the host decided nothing in {LIVENESS_DEADLINE:?}: the last answer was {last:?}")
+    })
 }
 
 /// Registers the instance every test here acts on, with the capability a prompt needs.
@@ -2167,14 +2276,31 @@ async fn plugin_answer(
 }
 
 /// Sends one `plugin.action.invoke` naming a pending resource, or none, and returns its refusal
-/// and the action it was.
+/// and the action it was ([`send_until_decided`]).
 async fn plugin_refusal(
     client: &mut Client<impl Codec>,
     host: &Host,
     request_id: u64,
     resource_id: Nullable<kr_protocol::ids::PendingResourceId>,
 ) -> (kr_protocol::error::ProtocolError, ActionId) {
-    let mutation = MutationRequest {
+    let (outcome, action_id) = send_until_decided(client, host, |client| {
+        plugin_answer_request(client, host, request_id, resource_id)
+    })
+    .await;
+    let Outcome::Error(error) = outcome else {
+        panic!("this host transmits no plugin action: {outcome:?}");
+    };
+    (error, action_id)
+}
+
+/// One `plugin.action.invoke` that answers the pending resource `resource_id`, or none.
+fn plugin_answer_request(
+    client: &Client<impl Codec>,
+    host: &Host,
+    request_id: u64,
+    resource_id: Nullable<kr_protocol::ids::PendingResourceId>,
+) -> MutationRequest {
+    MutationRequest {
         request_id: RequestId::new(request_id),
         method: Method::PluginActionInvoke.into(),
         method_version: MethodVersion::V1,
@@ -2202,13 +2328,7 @@ async fn plugin_refusal(
             parameters: kr_protocol::scalars::Bytes::from(br#"{"decision":"allow"}"#.to_vec()),
         })
         .expect("encodes"),
-    };
-    let action_id = mutation.action_id;
-    let outcome = send(client, mutation).await;
-    let Outcome::Error(error) = outcome else {
-        panic!("this host transmits no plugin action: {outcome:?}");
-    };
-    (error, action_id)
+    }
 }
 
 /// Section 5: an action the package's component prepares is admitted as any other, and refused
@@ -2346,9 +2466,10 @@ async fn kr_req_12_18_an_answer_to_an_approval_whose_run_ended_is_rejected_as_en
         plugin_answer(&mut client, &host, 50, Nullable::some(resource_id)).await,
         (ErrorCode::QuestionResolved, ReceiptState::Rejected)
     );
-    let mutation = approval_mutation(&client, &host, 51, resource_id);
-    let action_id = mutation.action_id;
-    let outcome = send(&mut client, mutation).await;
+    let (outcome, action_id) = send_until_decided(&mut client, &host, |client| {
+        approval_mutation(client, &host, 51, resource_id)
+    })
+    .await;
     let Outcome::Error(error) = outcome else {
         panic!("an ended approval takes no answer: {outcome:?}");
     };
