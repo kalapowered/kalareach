@@ -277,6 +277,34 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
             reason: "only a worker at the daemon's own level answers the request, so a worker of \
                      the retained level never writes this frame",
         },
+        Compatible {
+            at: "WorkerLaunchSpec.root_command",
+            reason: "A member that is absent from the wire unless the daemon starts a session to run \
+                     a command. The specification of an ordinary session is byte for byte what a \
+                     worker of the retained level reads, and a worker of that level that is sent \
+                     one with a command refuses the specification as a frame it cannot read, so \
+                     it starts no shell in place of the command.",
+        },
+        Compatible {
+            at: "WorkerLaunchSpec.workflow",
+            reason: "A member that is absent from the wire unless a workflow started the session, \
+                     and sent only together with a root command, so a worker of the retained \
+                     level never meets it without also refusing the specification for the command.",
+        },
+        Compatible {
+            at: "ForwardedMutation.workflow_run_id",
+            reason: "A member that is absent from the wire except in a workflow's close of a session \
+                     it started, which the daemon sends only to the worker it started that \
+                     session's command on, never to a worker of the retained level. Every other \
+                     forwarded mutation is byte for byte what that level reads.",
+        },
+        Compatible {
+            at: "SessionSummary.root",
+            reason: "A member that is absent from the wire for the interactive shell every other \
+                     session has, so a summary of such a session is what the retained level \
+                     reads. A session whose root is a command is described by the worker that \
+                     runs it, which is not of the retained level.",
+        },
     ],
 )
 .with_public_majors(include_str!("../retained/0.75/PUBLIC_MAJORS"))];

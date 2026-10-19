@@ -180,12 +180,60 @@ fn beside_this_test(name: &str) -> PathBuf {
 /// on the internal disk and started by the platform's own supervisor, and the daemon serves the
 /// rendezvous its workers connect to.
 async fn working_host() -> Host {
+    working_host_through(|supervisor| supervisor).await
+}
+
+/// A supervisor that waits at the door of a launch until the test lets it through, and counts the
+/// launches that have reached the door.
+#[derive(Debug)]
+struct AtTheDoor {
+    inner: Box<dyn WorkerSupervisor>,
+    open: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    arrived: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl WorkerSupervisor for AtTheDoor {
+    fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
+        self.arrived
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (lock, wake) = &*self.open;
+        let mut open = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*open {
+            open = wake
+                .wait(open)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        drop(open);
+        self.inner.start(launch)
+    }
+
+    fn describe(&self) -> &'static str {
+        self.inner.describe()
+    }
+}
+
+/// [`working_host`] with the supervisor wrapped by `wrap`, which sits between the daemon and the
+/// tree's own.
+async fn working_host_through(
+    wrap: impl FnOnce(Box<dyn WorkerSupervisor>) -> Box<dyn WorkerSupervisor>,
+) -> Host {
     let temp = teardown::Tree::create();
+    let worker = temp.root().join("kr-worker");
+    kr_ipc::testing::place_and_start_once(&beside_this_test("kr-worker"), &worker, &["--version"]);
+    working_host_on(temp, wrap).await
+}
+
+/// A daemon with real sessions on a tree that already holds its worker program.
+async fn working_host_on(
+    temp: teardown::Tree,
+    wrap: impl FnOnce(Box<dyn WorkerSupervisor>) -> Box<dyn WorkerSupervisor>,
+) -> Host {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let worker = temp.root().join("kr-worker");
-    kr_ipc::testing::place_and_start_once(&beside_this_test("kr-worker"), &worker, &["--version"]);
-    let supervisor = temp.supervisor(kr_controller::supervision::detect());
+    let supervisor = wrap(temp.supervisor(kr_controller::supervision::detect()));
     let controller = start_daemon_with(
         &environment,
         environment_id,
@@ -210,6 +258,29 @@ async fn working_host() -> Host {
         rendezvous: Some(rendezvous),
         work: tempfile::TempDir::new().expect("a working directory on the internal disk"),
     }
+}
+
+/// Stops a daemon and starts another on the same tree, as a restart does: the workers it started
+/// go on running, and the new daemon finds them.
+async fn restarted(host: Host) -> Host {
+    let Host {
+        _temp,
+        controller,
+        clients,
+        rendezvous,
+        ..
+    } = host;
+    clients.abort();
+    if let Some(rendezvous) = rendezvous {
+        rendezvous.abort();
+    }
+    let service = Arc::downgrade(controller.automation().service());
+    drop(controller);
+    until("the first daemon to let go of its service", || {
+        service.strong_count() == 0
+    })
+    .await;
+    working_host_on(_temp, |supervisor| supervisor).await
 }
 
 /// Starts a daemon on an environment and on `clocks`, waiting out one that is still letting go of
@@ -4113,6 +4184,269 @@ async fn a_command_that_outlives_its_wait_is_stopped_and_a_created_session_is_no
         owed_rows(&host),
         0,
         "once the closure was recorded what the dispatch owned was released"
+    );
+    host.clients.abort();
+}
+
+/// Runs `document` from another task, so the test can act while the node is between its checks and
+/// its effect, and answers what the run came to.
+fn run_from_another_task(
+    host: &Host,
+    document: &WorkflowDefinition,
+    event: &str,
+) -> tokio::task::JoinHandle<std::result::Result<ParamsValue, ProtocolError>> {
+    let environment_id = host.environment_id;
+    let endpoint = host.endpoint.clone();
+    let document = document.clone();
+    let event = event.to_owned();
+    tokio::spawn(async move {
+        let mut control = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects to the control endpoint");
+        control
+            .mutate(
+                Method::WorkflowRun,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &WorkflowRunParams {
+                    workflow_id: document.workflow_id,
+                    revision: document.revision,
+                    event_id: event,
+                    event_type: "manual".to_owned(),
+                    event_payload: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+    })
+}
+
+/// Holds the registry's write lock, as another writer would, so that a create that has passed
+/// every check the engine and the runner make waits for it.
+fn hold_the_registry(host: &Host) -> rusqlite::Connection {
+    let registry = rusqlite::Connection::open(host._temp.environment().registry_database())
+        .expect("opens the registry");
+    registry
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("another writer holds the registry");
+    registry
+}
+
+/// KR-REQ-19.04 and KR-REQ-25.14: the node's grant is asked where the session comes into being,
+/// and not only before the runner is called. A node of each kind has passed every check the engine
+/// and the runner make when the grant is withdrawn; the create then waits for the registry, and
+/// when it reaches its launch it is refused: no session is made, the command never runs, and the
+/// node pauses on the refusal as it would have a moment earlier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_grant_withdrawn_before_the_session_comes_into_being_makes_no_session() {
+    let host = working_host().await;
+    let mut control = client(&host).await;
+    let marker = host.work().join("a-command-ran");
+    for (number, grant, node) in [
+        (
+            30_u8,
+            vec![ActionRight::SessionCreate],
+            create_session_node(&host),
+        ),
+        (
+            31,
+            COMMAND_RIGHTS.to_vec(),
+            command_node(&host, "command", &format!("touch {}", marker.display())),
+        ),
+    ] {
+        host.issue(grant_id(number), &grant);
+        let document = definition(workflow_id(number), grant_id(number), "a node", node);
+        install(&mut control, &host, &document).await;
+        enable(&mut control, &host, &document).await;
+
+        let registry = hold_the_registry(&host);
+        let running = run_from_another_task(&host, &document, "evt-withdrawn");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        host.controller
+            .sharing()
+            .grants()
+            .revoke(grant_id(number), kr_ipc::now_ms().get(), || Ok(()))
+            .expect("the grant is withdrawn");
+        registry
+            .execute_batch("COMMIT")
+            .expect("the other writer finishes");
+
+        let refused = running
+            .await
+            .expect("the run answers")
+            .expect_err("the withdrawn grant stops the create");
+        assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+        assert!(refused.message.contains("revoked"), "{refused:?}");
+    }
+    assert!(
+        all_sessions(&mut control).await.is_empty(),
+        "no session was made for either node"
+    );
+    assert!(!marker.exists(), "the command never ran");
+    host.clients.abort();
+}
+
+/// KR-REQ-19.04 and KR-REQ-25.14: the command is released to start at the worker's claim, which
+/// comes after the launch transition, so the grant is asked there as well. The grant is withdrawn
+/// while the launch waits at the supervisor's door; the worker is started, connects and is
+/// refused its claim, and the command never runs. The node pauses on the refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_grant_withdrawn_before_the_worker_claims_its_launch_runs_no_command() {
+    let open = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let arrived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let host = working_host_through({
+        let (open, arrived) = (Arc::clone(&open), Arc::clone(&arrived));
+        move |inner| {
+            Box::new(AtTheDoor {
+                inner,
+                open,
+                arrived,
+            })
+        }
+    })
+    .await;
+    let mut control = client(&host).await;
+    let marker = host.work().join("a-command-ran");
+    host.issue(grant_id(32), &COMMAND_RIGHTS);
+    let document = definition(
+        workflow_id(32),
+        grant_id(32),
+        "a command",
+        command_node(&host, "command", &format!("touch {}", marker.display())),
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+
+    let running = run_from_another_task(&host, &document, "evt-at-the-door");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while arrived.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < until,
+            "the launch reached the door"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    host.controller
+        .sharing()
+        .grants()
+        .revoke(grant_id(32), kr_ipc::now_ms().get(), || Ok(()))
+        .expect("the grant is withdrawn");
+    {
+        let (lock, wake) = &*open;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        wake.notify_all();
+    }
+
+    let refused = running
+        .await
+        .expect("the run answers")
+        .expect_err("the withdrawn grant stops the command");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(!marker.exists(), "the command never ran");
+    assert!(
+        all_sessions(&mut control)
+            .await
+            .iter()
+            .all(|session| session.closure.0.is_some() || session.root.is_none()),
+        "no session whose root is a command is live"
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-25.14, KR-REQ-25.15 and KR-REQ-24.10: a command that is running when the daemon stops is
+/// not forgotten. The node it belonged to settles unknown, nothing runs it again, and the new
+/// daemon's sweep finds what the dispatch wrote down, closes the session, removes the directory the
+/// command ran in and releases the row, without waiting for the run to end. A `create_session`
+/// node's session, which no sweep owns, is there after the restart as it was before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_command_a_stopped_daemon_left_running_is_closed_and_released_by_the_next_one() {
+    let host = working_host().await;
+    let mut control = client(&host).await;
+    host.issue(grant_id(26), &COMMAND_RIGHTS);
+    host.issue(grant_id(27), &[ActionRight::SessionCreate]);
+
+    // A session a node created and left running.
+    let created = definition(
+        workflow_id(27),
+        grant_id(27),
+        "a session",
+        create_session_node(&host),
+    );
+    install(&mut control, &host, &created).await;
+    enable(&mut control, &host, &created).await;
+    let made: WorkflowRunResult = typed(
+        &start(&mut control, &host, &created, "evt-session")
+            .await
+            .expect("the run is admitted"),
+    );
+    let Some(kr_protocol::automation::NodeOutput::CreateSession { session_id: kept }) =
+        receipts_of(&mut control, &created, made.run_id).await[0]
+            .output
+            .0
+            .clone()
+    else {
+        panic!("the node names its session");
+    };
+
+    // A command that runs far longer than this test.
+    let long = definition(
+        workflow_id(26),
+        grant_id(26),
+        "a long command",
+        command_node(&host, "long", "sleep 600"),
+    );
+    install(&mut control, &host, &long).await;
+    enable(&mut control, &host, &long).await;
+    let running = run_from_another_task(&host, &long, "evt-long");
+    let command_session = {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let live = all_sessions(&mut control).await;
+            if let Some(session) = live.into_iter().find(|session| {
+                session.root == Some(kr_protocol::session::SessionRoot::Command)
+                    && session.closure.0.is_none()
+            }) {
+                break session.session_id;
+            }
+            assert!(std::time::Instant::now() < until, "the command's session");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    };
+    assert_eq!(owed_rows(&host), 1, "the dispatch wrote down what it owns");
+    drop(control);
+
+    let host = restarted(host).await;
+    running.abort();
+    let mut control = client(&host).await;
+    let closed = closed_session(&mut control, command_session).await;
+    assert_eq!(
+        closed.closure.0.expect("closed").reason,
+        kr_protocol::session::ClosureReason::CloseRequested,
+        "the sweep of the next daemon closed it"
+    );
+    until("the sweep to release what the command owned", || {
+        owed_rows(&host) == 0
+    })
+    .await;
+    let scratch = host
+        ._temp
+        .environment()
+        .state_dir()
+        .join("workflow-scratch");
+    assert!(
+        std::fs::read_dir(&scratch).map_or(true, |mut entries| entries.next().is_none()),
+        "the directory the command ran in is gone"
+    );
+    let sessions = all_sessions(&mut control).await;
+    let still = sessions
+        .iter()
+        .find(|session| session.session_id == kept)
+        .expect("the created session is listed");
+    assert!(
+        still.closure.0.is_none(),
+        "a session a create_session node made is not any sweep's to close: {still:?}"
     );
     host.clients.abort();
 }

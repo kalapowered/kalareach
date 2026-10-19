@@ -746,7 +746,9 @@ async fn command_node(
     context: NodeContext,
     held: Arc<HeldGrant>,
 ) -> kr_automation::Result<ActionOutcome> {
-    let controller = context.daemon.get()?;
+    // The daemon is looked up for each call and never held across the command, which can run for
+    // as long as the node's wait: a task that kept it would keep a daemon that is being let go.
+    context.daemon.get()?;
     let params: kr_protocol::automation::ShellCommandParams =
         serde_json::from_str(&held.node.action_params)?;
     // Where it runs: the workspace the definition names, which may be a shared checkout because
@@ -808,7 +810,6 @@ async fn command_node(
         let outcome = drive_command(
             &context,
             &held,
-            &controller,
             &task,
             Command {
                 text: params.command,
@@ -842,11 +843,11 @@ struct Command {
 async fn drive_command(
     context: &NodeContext,
     held: &Arc<HeldGrant>,
-    controller: &Arc<Controller>,
     task: &Arc<NodeTask>,
     command: Command,
 ) -> kr_automation::Result<ActionOutcome> {
     let actor_id = workflow_principal(held.definition.grant_reference)?;
+    let controller = context.daemon.get()?;
     // The place it runs in exists before the session is asked for.
     if let Some(scratch) = command.scratch.clone() {
         let root = context.scratch_root.clone();
@@ -871,7 +872,7 @@ async fn drive_command(
                 ))
             })?;
     }
-    let admit = node_admission(controller, held, context.wait_until_ms);
+    let admit = node_admission(&controller, held, context.wait_until_ms);
     // The command may start no later than the moment the engine stops waiting for the node,
     // expressed on the clock the worker reads too.
     let remaining = context
@@ -918,6 +919,7 @@ async fn drive_command(
             return creation_failed(held, error);
         }
     };
+    drop(controller);
     let session_id = created.session.session_id;
     // The session is written down at once and bound to the workspace it runs in: a live session
     // is a writer there, which a capture that wants the workspace held still has to count.
@@ -949,7 +951,7 @@ async fn drive_command(
             );
         }
     }
-    let closure = wait_for_closure(context, controller, task, &actor_id, session_id).await;
+    let closure = wait_for_closure(context, task, &actor_id, session_id).await;
     let outcome = match &closure {
         Some(closure) => command_outcome(closure),
         None => ActionOutcome::Unknown {
@@ -991,13 +993,14 @@ fn left_unaccounted(closure: &kr_protocol::session::ClosureRecord) -> bool {
 /// closure; one that is not recorded in that time is left to the sweep.
 async fn wait_for_closure(
     context: &NodeContext,
-    controller: &Arc<Controller>,
     task: &Arc<NodeTask>,
     actor_id: &ActorId,
     session_id: kr_protocol::ids::SessionId,
 ) -> Option<kr_protocol::session::ClosureRecord> {
     let mut stop_by: Option<tokio::time::Instant> = None;
     loop {
+        // A daemon that is gone has nobody to ask; the next daemon's sweep finds the session.
+        let controller = context.daemon.get().ok()?;
         if stop_by.is_none() && task.cancelled.load(Ordering::SeqCst) {
             stop_by = Some(tokio::time::Instant::now() + STOP_WAIT);
             let closed = controller
@@ -1027,6 +1030,7 @@ async fn wait_for_closure(
                 );
             }
         }
+        drop(controller);
         if stop_by.is_some_and(|by| tokio::time::Instant::now() >= by) {
             return None;
         }
