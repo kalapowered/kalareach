@@ -235,9 +235,13 @@ impl Controller {
     /// The closure of a session, after asking whether its worker has gone.
     ///
     /// A command that ends takes its worker with it, and nothing records that on its own: this
-    /// asks the kernel about the worker the registry holds, closes the session if it is gone (a
-    /// worker that handed over its own account has that account recorded as it stands), and reads
-    /// the record. `None` says the session has not closed, not that it is open.
+    /// asks the kernel about the worker the registry holds, and only a worker the kernel says has
+    /// ended is reconciled. Reconciling closes the session and fences what it owned, which is for
+    /// a worker that is gone; a worker that is still running, or that the kernel will not speak
+    /// for, is left alone and the session has no closure yet. A worker that handed over its own
+    /// account has that account recorded as it stands.
+    ///
+    /// `None` says the session has not closed, not that it is open.
     ///
     /// # Errors
     ///
@@ -246,8 +250,24 @@ impl Controller {
         self: &Arc<Self>,
         session_id: SessionId,
     ) -> Result<Option<ClosureRecord>> {
-        if let Some(closure) = self.registry.lock().await.closure(session_id)? {
-            return Ok(Some(closure));
+        let worker = {
+            let registry = self.registry.lock().await;
+            if let Some(closure) = registry.closure(session_id)? {
+                return Ok(Some(closure));
+            }
+            registry
+                .workers()?
+                .into_iter()
+                .find(|record| record.session_id == session_id)
+        };
+        let Some(worker) = worker else {
+            return Ok(None);
+        };
+        if !matches!(
+            kr_ipc::identity::process_state(&worker.process_identity),
+            kr_ipc::identity::ProcessState::Ended
+        ) {
+            return Ok(None);
         }
         self.reconcile(session_id).await
     }
