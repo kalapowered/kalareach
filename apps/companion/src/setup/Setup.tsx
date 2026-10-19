@@ -855,11 +855,11 @@ function CapabilitiesStep({
           </p>
           <ChecksLine checks={capabilities.checks} />
         </div>
-        <footer className="card-footer setup-route">
-          <Button onClick={onRead} disabled={reading} data-testid="setup-recheck">
+        <footer className="card-footer setup-route setup-route-pair">
+          <Button onClick={onRead} disabled={reading} data-testid="setup-recheck" data-wraps>
             {reading ? 'Reading…' : 'Read again'}
           </Button>
-          <Button tone="primary" onClick={onRunChecks} data-testid="setup-run-checks">
+          <Button tone="primary" onClick={onRunChecks} data-testid="setup-run-checks" data-wraps>
             Run the checks…
           </Button>
         </footer>

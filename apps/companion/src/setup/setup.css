@@ -45,6 +45,15 @@
 }
 
 /*
+ * A title and the badge that says where it stands sit side by side where there is room. At a large
+ * text size on a narrow window there is not, and the badge goes under the title instead of past
+ * the card's edge, where the card clips it.
+ */
+.setup .card-header {
+  flex-wrap: wrap;
+}
+
+/*
  * A card in this flow is one thing among many, so its heading sits a step below the group heading
  * above it rather than level with it.
  */
@@ -291,6 +300,16 @@
   .setup-route {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  /*
+   * The footer's own rule for the card comes later in the bundle and has the same weight, so it
+   * keeps its centring over the one above. Two controls that decide are stacked here, each as wide
+   * as the card, so a label that is long at the text size the person chose wraps inside its
+   * button where there is room for the lines and is not cut off at the card's edge.
+   */
+  .setup-route.setup-route-pair {
+    align-items: stretch;
   }
 
   .setup-governs > li {
