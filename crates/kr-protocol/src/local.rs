@@ -13,7 +13,11 @@ use crate::actor::ActorIngress;
 use crate::envelope::{MutationRequest, Request};
 use crate::hello::{ActionWindow, PACKAGE_VERSION, PackageVersion, ProtocolVersion, ReceiveLimits};
 use crate::identity::BootIdentity;
-use crate::ids::{BuildId, CapabilityId, ConnectionId, EnvironmentId};
+use crate::ids::{
+    AuthorityRevision, BuildId, CapabilityId, ConnectionId, ControllerGeneration, EnvironmentId,
+    RemoteDispatchLeaseId,
+};
+use crate::method::Method;
 use crate::scalars::{CanonicalSet, Nullable, U64};
 
 /// Which host process a local endpoint belongs to.
@@ -339,6 +343,40 @@ pub fn may_travel_to_a_worker(
     !rights.contains(&crate::rights::ActionRight::VoiceUse)
 }
 
+/// The remote dispatch lease the control daemon holds for a worker, as it travels beside a mutation
+/// it forwards for a paired device.
+///
+/// Remote dispatch needs a live authority lease from the current controller generation and
+/// revision, valid for at most five seconds, and the worker is where the dispatch is. The daemon
+/// takes the lease at the moment it forwards, so what arrives is a renewal made for this
+/// dispatch; the worker holds it to what it has itself acknowledged and installed, and to its own
+/// clock, in the serial path immediately before the dispatch marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardedLease {
+    /// The lease's identity, which a refusal names to the daemon.
+    pub lease_id: RemoteDispatchLeaseId,
+    /// The controller generation that issued it. A replacement controller advances this, and a
+    /// lease of an earlier generation is no lease.
+    pub controller_generation: ControllerGeneration,
+    /// The authority revision the lease is bound to: the one the worker acknowledged.
+    pub authority_revision: AuthorityRevision,
+    /// When the lease ends, on the machine's own continuous clock, as
+    /// [`ForwardedMutation::accepted_deadline_boot_ms`] is. A worker holds a lease to five seconds
+    /// whatever this says.
+    pub deadline_boot_ms: U64,
+}
+
+/// Whether a mutation forwarded for a paired device needs the remote dispatch lease.
+///
+/// Every method does but `session.close`: stopping owned execution does not depend on the lease, as
+/// local terminal input and native local forwarding do not, and a device may always stop what it is
+/// authorised to stop. The daemon forwards a close without one and the worker admits it without.
+#[must_use]
+pub const fn needs_a_dispatch_lease(method: Method) -> bool {
+    !matches!(method, Method::SessionClose)
+}
+
 /// A mutation the host admitted for a caller, passed to the component that owns its subject.
 ///
 /// The control daemon owns admission: it authenticates the caller, stamps the freshness window,
@@ -419,6 +457,18 @@ pub struct ForwardedMutation {
     /// what a worker built before workflows closed their own sessions reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_run_id: Option<crate::ids::WorkflowRunId>,
+    /// The remote dispatch lease the daemon took for this mutation, for a paired device's.
+    ///
+    /// Absent for a local caller, whose actions do not depend on the lease, for `session.close`
+    /// ([`needs_a_dispatch_lease`]), and on a link to a worker of an earlier release, which cannot
+    /// read it.
+    ///
+    /// It is absent from the wire when it is absent, so a mutation without one is byte for byte
+    /// what a worker built before the lease travelled reads, and a daemon sends one only to a
+    /// worker at its own level. A worker at this level admits a paired device's mutation that
+    /// needs a lease only with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<ForwardedLease>,
 }
 
 /// The rights beside a forwarded mutation, as they are encoded and decoded: a set that holds
@@ -685,6 +735,7 @@ mod tests {
                 history: None,
                 screen_basis: None,
                 workflow_run_id: None,
+                lease: None,
             }))
         };
 
@@ -854,6 +905,7 @@ mod tests {
             history,
             screen_basis: None,
             workflow_run_id: None,
+            lease: None,
         };
         let limits = kr_cbor::Limits::DEFAULT;
 

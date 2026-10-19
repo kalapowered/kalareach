@@ -90,11 +90,13 @@ const SAME: &[Same] = &[
     Same {
         root: "ForwardedMutation",
         digest: "815a9cb51701f6f459514684e2c818c6d59640522d10ab55100bbe2bbc18c3c6",
-        reason: "A member that is absent from the wire except in a workflow's close of a session \
-                 it started, which the daemon sends only to the worker it started that session's \
-                 command on, never to a worker of the retained level. Every other forwarded \
-                 mutation is byte for byte what that level reads, and what that level accepts is \
-                 unchanged.",
+        reason: "Two members that are absent from the wire. One is sent only in a workflow's close \
+                 of a session it started, to the worker the daemon started that session's command \
+                 on, never to a worker of the retained level. The other is sent only when the \
+                 daemon forwards a paired device's mutation to a worker at this release's own \
+                 level, which holds the dispatch to the lease; the daemon omits it on a link to a \
+                 worker of the retained level. Every other forwarded mutation is byte for byte \
+                 what that level reads, and what that level accepts is unchanged.",
     },
     Same {
         root: "SessionSummary",

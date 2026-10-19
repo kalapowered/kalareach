@@ -162,7 +162,10 @@ impl Controller {
                 // Remote dispatch additionally needs a live lease, taken at the moment the
                 // dispatch runs rather than one that was valid when the request arrived. Its own
                 // remaining time then bounds the deadline the worker is given.
-                Ok(self.dispatch_lease(params.session_id, actor).await?)
+                Ok(self
+                    .dispatch_lease(params.session_id, actor)
+                    .await?
+                    .map(|lease| lease.deadline))
             }
             .await;
             let lease_deadline = match checked {
@@ -197,6 +200,8 @@ impl Controller {
                     // what it asked for.
                     &CanonicalSet::new(),
                     accepted_deadline_boot_ms,
+                    // A local caller's close does not depend on the remote lease.
+                    None,
                 ),
             )
             .await

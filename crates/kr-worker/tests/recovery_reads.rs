@@ -541,6 +541,7 @@ async fn forwarded_mutation<T: serde::Serialize>(
         history: None,
         screen_basis: None,
         workflow_run_id: None,
+        lease: None,
     }));
     within("the worker's answer", async {
         daemon.send(&mutation).await.expect("writes the mutation");

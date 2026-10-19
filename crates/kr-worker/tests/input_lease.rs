@@ -899,6 +899,7 @@ async fn a_forwarded_caller_claiming_a_network_ingress_is_refused_the_lease() {
                 .into_iter()
                 .collect(),
             kr_protocol::scalars::U64::new(kr_ipc::clock::boot_elapsed_ms() + 5_000),
+            None,
         )
         .await
         .expect("reaches the worker")
@@ -4984,7 +4985,13 @@ impl Proxied {
     ) -> Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError> {
         let mutation = self.mutation(method, params).await;
         self.link
-            .forward(&mutation, &self.actor, &self.rights(), Self::deadline())
+            .forward(
+                &mutation,
+                &self.actor,
+                &self.rights(),
+                Self::deadline(),
+                None,
+            )
             .await
             .expect("reaches the worker")
     }
@@ -5036,6 +5043,7 @@ impl Proxied {
                     history: None,
                     screen_basis: None,
                     workflow_run_id: None,
+                    lease: None,
                 },
             )))
             .await

@@ -22,7 +22,8 @@ use kr_protocol::envelope::{ControlEvent, ControlFrame, MutationRequest, Request
 use kr_protocol::grant::HistoryScope;
 use kr_protocol::ids::{RequestId, SessionId};
 use kr_protocol::local::{
-    ControllerConnectionRole, ForwardedMutation, ForwardedRequest, ScreenBasis,
+    ControllerConnectionRole, ForwardedLease, ForwardedMutation, ForwardedRequest, ScreenBasis,
+    needs_a_dispatch_lease,
 };
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
@@ -53,6 +54,11 @@ pub struct Vouched<'a> {
     /// whose issuer was shown the session's screen as text and is drawn that and no more, or the
     /// device's pairing grant.
     pub screen_basis: Option<ScreenBasis>,
+    /// The remote dispatch lease the daemon took for this mutation, for a paired device's.
+    ///
+    /// It is sent only to a worker at this release's own level, and only with a method that needs
+    /// one ([`kr_protocol::local::needs_a_dispatch_lease`]).
+    pub lease: Option<ForwardedLease>,
 }
 use crate::service::Controller;
 
@@ -354,6 +360,13 @@ impl WorkerProxy {
             history: vouched.history.cloned(),
             screen_basis,
             workflow_run_id: None,
+            // A worker of the retained level refuses a frame that carries the member, and it holds
+            // no lease of its own to compare it with: the daemon alone holds the lease for it.
+            // Remove this condition with the retained level.
+            lease: vouched
+                .lease
+                .filter(|_| self.level.is_this())
+                .filter(|_| mutation.method.method().is_none_or(needs_a_dispatch_lease)),
         }));
         self.call(request_id, &frame).await
     }

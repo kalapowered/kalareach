@@ -287,6 +287,7 @@ async fn no_frame_a_worker_receives_carries_a_voice_right() {
             &world.actor,
             &with_voice,
             kr_protocol::scalars::U64::new(u64::MAX),
+            None,
         )
         .await;
     assert!(
@@ -310,6 +311,7 @@ async fn no_frame_a_worker_receives_carries_a_voice_right() {
                 history: None,
                 screen_basis: None,
                 workflow_run_id: None,
+                lease: None,
             })))
             .await;
         assert!(
@@ -1502,6 +1504,7 @@ async fn close_for_a_device_of(
                 grant_rights: &rights,
                 history: Some(&connection.device.grant.history),
                 screen_basis: None,
+                lease: None,
             },
             accepted,
             Some(&connection.expiry_observer()),
@@ -1886,6 +1889,98 @@ async fn kr_req_10_49_a_mutation_carries_the_devices_scope_to_the_worker() {
         vec![true],
         "and the bytes the proxy wrote carry it"
     );
+    world.serving.abort();
+}
+
+/// KR-REQ-09.10, KR-REQ-09.11: a mutation a device sends is forwarded with the lease the daemon
+/// took for it, naming the generation it holds and the revision the worker acknowledged, with an
+/// end within five seconds; a close, which stops owned execution and does not depend on the lease,
+/// is forwarded with none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mutation_a_device_sends_is_forwarded_with_the_lease_the_daemon_took_and_a_close_with_none()
+ {
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::rights::ActionRight;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    script.accepts_prompts(true);
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let connection = super::RemoteConnection::for_test(
+        controller,
+        paired(controller, 51, |grant| {
+            grant.actions = [
+                ActionRight::SessionView,
+                ActionRight::AgentPrompt,
+                ActionRight::SessionClose,
+            ]
+            .into_iter()
+            .collect();
+        }),
+    );
+    let actor = connection.device.principal();
+    let draft =
+        a_draft_holding_an_attachment(controller, world.environment_id, &actor, "lease.bin");
+    let boot_before = kr_ipc::clock::boot_elapsed_ms();
+    let answer = connection
+        .answer(ControlFrame::Mutation(Box::new(a_prompt_naming(
+            &world,
+            &connection,
+            Method::AgentPromptSubmit,
+            1,
+            draft,
+        ))))
+        .await
+        .expect("the prompt is answered");
+    assert!(
+        matches!(
+            answer.frame(),
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Ok(_),
+                ..
+            })
+        ),
+        "{:?}",
+        answer.frame()
+    );
+    let forwarded = prompts_the_worker_was_asked_to_take(&script);
+    assert_eq!(forwarded.len(), 1);
+    let lease = forwarded[0]
+        .lease
+        .expect("the daemon sends the worker the lease it took for this dispatch");
+    assert_eq!(lease.controller_generation, controller.generation);
+    assert_eq!(
+        Some(lease.authority_revision),
+        script.installed_revision(),
+        "the lease names the revision the worker acknowledged"
+    );
+    let boot_after = kr_ipc::clock::boot_elapsed_ms();
+    assert!(
+        lease.deadline_boot_ms.get() > boot_before
+            && lease.deadline_boot_ms.get()
+                <= boot_after + kr_transport::lease::MAX_LEASE.as_millis() as u64,
+        "the lease ends within five seconds of its being taken"
+    );
+    assert!(
+        forwarded[0].accepted_deadline_boot_ms.get() <= lease.deadline_boot_ms.get(),
+        "the deadline the worker is given is bounded by the lease"
+    );
+
+    let closed = close_for_a_device(
+        &world,
+        &connection,
+        &fake::close_request(world.environment_id, world.session_id),
+        &[ActionRight::SessionView, ActionRight::SessionClose],
+    )
+    .await;
+    assert_eq!(closed.retained, crate::service::net::Retained::Not);
+    let all = script.forwarded();
+    let close = all.last().expect("the close was forwarded");
+    assert_eq!(close.mutation.method, Method::SessionClose.into());
+    assert_eq!(close.lease, None, "a close does not depend on the lease");
     world.serving.abort();
 }
 
@@ -3587,6 +3682,7 @@ async fn kr_req_10_49_the_daemons_own_link_forwards_no_history_member() {
             &world.actor,
             &rights,
             kr_protocol::scalars::U64::new(u64::MAX),
+            None,
         )
         .await
         .expect("the worker answers the daemon's own close");

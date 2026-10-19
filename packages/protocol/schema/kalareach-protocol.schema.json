@@ -17171,6 +17171,35 @@
         }
       ]
     },
+    "ForwardedLease": {
+      "additionalProperties": false,
+      "description": "The remote dispatch lease the control daemon holds for a worker, as it travels beside a mutation\nit forwards for a paired device.\n\nRemote dispatch needs a live authority lease from the current controller generation and\nrevision, valid for at most five seconds, and the worker is where the dispatch is. The daemon\ntakes the lease at the moment it forwards, so what arrives is a renewal made for this\ndispatch; the worker holds it to what it has itself acknowledged and installed, and to its own\nclock, in the serial path immediately before the dispatch marker.",
+      "properties": {
+        "authority_revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The authority revision the lease is bound to: the one the worker acknowledged."
+        },
+        "controller_generation": {
+          "$ref": "#/$defs/ControllerGeneration",
+          "description": "The controller generation that issued it. A replacement controller advances this, and a\nlease of an earlier generation is no lease."
+        },
+        "deadline_boot_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "When the lease ends, on the machine's own continuous clock, as\n[`ForwardedMutation::accepted_deadline_boot_ms`] is. A worker holds a lease to five seconds\nwhatever this says."
+        },
+        "lease_id": {
+          "$ref": "#/$defs/RemoteDispatchLeaseId",
+          "description": "The lease's identity, which a refusal names to the daemon."
+        }
+      },
+      "required": [
+        "lease_id",
+        "controller_generation",
+        "authority_revision",
+        "deadline_boot_ms"
+      ],
+      "type": "object"
+    },
     "ForwardedMutation": {
       "additionalProperties": false,
       "description": "A mutation the host admitted for a caller, passed to the component that owns its subject.\n\nThe control daemon owns admission: it authenticates the caller, stamps the freshness window,\nchecks the envelope and derives the accepted deadline. The worker owns the subject. Forwarding\ncarries the caller's mutation to the worker **unchanged**, because the mutation is what the\npayload digest covers and what the caller will retry with: rewriting any of it would give the\nworker a different action from the one the caller asked for.\n\nWhat travels beside it is what the worker cannot establish for itself: which principal the host\nverified, the rights the grant it was checked against carries, and the deadline the host\naccepted. The worker performs the action under all three.",
@@ -17201,6 +17230,17 @@
             }
           ],
           "description": "The history scope of the grant the host decided this mutation under.\n\nSection 10 narrows a grant's history in one place, the shared host-side filter, and the\nworker applies it to the answer it gives the caller: the first answer to a question, and\nthe retained answer to a duplicate. The worker holds no grants, so the scope travels with\nthe mutation. It is absent for a caller acting under no grant. Absence never widens what a\ncaller is shown: a worker shows retained content without a scope only to a caller it can\nsee is the local owner.\n\nIt is absent from the wire when it is absent, so a mutation without one is byte for byte\nwhat a worker built before scopes travelled with mutations reads, and the daemon's own link\nfor a local caller's action never writes one. A daemon sends one only to a worker that states\n[`FORWARDED_RESULT_SCOPE`]."
+        },
+        "lease": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ForwardedLease"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The remote dispatch lease the daemon took for this mutation, for a paired device's.\n\nAbsent for a local caller, whose actions do not depend on the lease, for `session.close`\n([`needs_a_dispatch_lease`]), and on a link to a worker of an earlier release, which cannot\nread it.\n\nIt is absent from the wire when it is absent, so a mutation without one is byte for byte\nwhat a worker built before the lease travelled reads, and a daemon sends one only to a\nworker at its own level. A worker at this level admits a paired device's mutation that\nneeds a lease only with one."
         },
         "mutation": {
           "$ref": "#/$defs/MutationRequest",

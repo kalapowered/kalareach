@@ -793,6 +793,7 @@ impl Viewer {
                     history: None,
                     screen_basis: None,
                     workflow_run_id: None,
+                    lease: None,
                 }));
                 self.call(frame, request_id)
                     .await

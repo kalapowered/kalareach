@@ -1086,6 +1086,7 @@ async fn a_forwarded_close_sent_again_is_marked_retained_only_on_a_link_that_dec
             history: None,
             screen_basis: None,
             workflow_run_id: None,
+            lease: None,
         }))
     };
 
@@ -1550,6 +1551,7 @@ async fn the_host_authorises_against_current_state_and_a_relayed_envelope_grants
         history: None,
         screen_basis: None,
         workflow_run_id: None,
+        lease: None,
     }));
     client.send(&forwarded).await.expect("writes the frame");
     let answer = loop {
@@ -3278,6 +3280,7 @@ async fn a_forwarded_retry_is_answered_after_its_deadline_and_never_first_admitt
             history: None,
             screen_basis: None,
             workflow_run_id: None,
+            lease: None,
         }))
     };
 

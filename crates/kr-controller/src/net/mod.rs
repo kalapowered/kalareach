@@ -1179,6 +1179,16 @@ fn shown_value(
     }
 }
 
+/// What a forwarded mutation is sent beside the mutation itself: the deadline it carries and the
+/// lease that bounded it ([`Controller::forwarded_deadline`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ForwardedDeadline {
+    /// The accepted deadline, bounded by the lease, on the machine's own continuous clock.
+    pub deadline_boot_ms: kr_protocol::scalars::U64,
+    /// The lease the daemon took for this dispatch, for a paired device's mutation.
+    pub lease: Option<kr_protocol::local::ForwardedLease>,
+}
+
 /// What a remote close settled as.
 #[derive(Debug)]
 pub(crate) struct ClosedRemotely {
@@ -1813,13 +1823,15 @@ impl Controller {
         }
     }
 
-    /// Returns the deadline a forwarded mutation carries, bounded by the dispatch lease.
+    /// Returns the deadline a forwarded mutation carries, bounded by the dispatch lease, and the
+    /// lease it was bounded by.
     ///
     /// Section 9 requires a live worker-held authority lease from the current controller generation
     /// and revision for remote dispatch, taken at the moment the dispatch runs rather than one that
     /// was valid when the request arrived. The lease's own remaining time then bounds the deadline
     /// the worker is given, and the result is on the machine's own continuous clock, which is the
-    /// clock the worker reads.
+    /// clock the worker reads. The lease goes to the worker as well, with its own end on that
+    /// clock, because the worker holds the dispatch to it in its serial path.
     ///
     /// This is the last thing this host decides before the mutation is forwarded, so the admission
     /// it was accepted under is asked here: before the lease is taken, so a mutation whose
@@ -1836,7 +1848,7 @@ impl Controller {
         session_id: kr_protocol::ids::SessionId,
         actor: &kr_protocol::actor::ActorEnvelope,
         accepted: AcceptedDeadline,
-    ) -> Result<kr_protocol::scalars::U64> {
+    ) -> Result<ForwardedDeadline> {
         let admitted_revision =
             actor
                 .grant_revision
@@ -1856,20 +1868,21 @@ impl Controller {
         self.check_registration(&admitted)?;
         #[cfg(feature = "testing")]
         self.before_the_lease.wait().await;
-        let lease: Option<ContinuousInstant> = match self.dispatch_lease(session_id, actor).await {
-            Ok(lease) => lease,
-            // A worker that has not installed the revision in force has no lease to renew. Asking
-            // it once, here, is what lets a dispatch to a worker this daemon has not spoken to
-            // about authority succeed rather than fail on a condition the daemon itself can meet.
-            // Only that: a fence this host owes, or a generation it no longer holds, is not
-            // something an announcement changes, and starting one for it would have the worker
-            // told a revision the barrier has not finished.
-            Err(LeaseDenied::NotAcknowledged(_)) => {
-                self.acknowledge_worker_revision(session_id).await?;
-                self.dispatch_lease(session_id, actor).await?
-            }
-            Err(stopped @ LeaseDenied::Stopped(_)) => return Err(stopped.into()),
-        };
+        let lease: Option<kr_transport::lease::DispatchLease> =
+            match self.dispatch_lease(session_id, actor).await {
+                Ok(lease) => lease,
+                // A worker that has not installed the revision in force has no lease to renew. Asking
+                // it once, here, is what lets a dispatch to a worker this daemon has not spoken to
+                // about authority succeed rather than fail on a condition the daemon itself can meet.
+                // Only that: a fence this host owes, or a generation it no longer holds, is not
+                // something an announcement changes, and starting one for it would have the worker
+                // told a revision the barrier has not finished.
+                Err(LeaseDenied::NotAcknowledged(_)) => {
+                    self.acknowledge_worker_revision(session_id).await?;
+                    self.dispatch_lease(session_id, actor).await?
+                }
+                Err(stopped @ LeaseDenied::Stopped(_)) => return Err(stopped.into()),
+            };
         // Taking the lease can wait for the worker to acknowledge the revision, and the mutation
         // waited for its link before that. The check every service asks from inside its work is
         // asked after those waits: a fence this host owes and could not raise leaves the revision
@@ -1877,14 +1890,38 @@ impl Controller {
         // registration withdrawn or replaced meanwhile, and a deadline that has passed, refuse it
         // as well. A worker already holding a forwarded mutation decides it under its own lease.
         self.check_registration(&admitted)?;
-        crate::service::remaining_deadline(
+        let spent = || ControllerError::WindowExpired {
+            detail: "the deadline this action was admitted under has passed".to_owned(),
+        };
+        let deadline_boot_ms = crate::service::remaining_deadline(
             &*self.shared_clock,
             &*self.clock,
             accepted.deadline,
-            lease,
+            lease.map(|lease| lease.deadline),
         )
-        .ok_or_else(|| ControllerError::WindowExpired {
-            detail: "the deadline this action was admitted under has passed".to_owned(),
+        .ok_or_else(spent)?;
+        let lease = lease
+            .map(|lease| {
+                // The lease's own end, on the machine's clock, which is the bound above when the
+                // lease is what ran out first.
+                crate::service::remaining_deadline(
+                    &*self.shared_clock,
+                    &*self.clock,
+                    lease.deadline,
+                    None,
+                )
+                .map(|deadline_boot_ms| kr_protocol::local::ForwardedLease {
+                    lease_id: lease.lease_id,
+                    controller_generation: lease.generation,
+                    authority_revision: lease.authority_revision,
+                    deadline_boot_ms,
+                })
+                .ok_or_else(spent)
+            })
+            .transpose()?;
+        Ok(ForwardedDeadline {
+            deadline_boot_ms,
+            lease,
         })
     }
 

@@ -435,7 +435,7 @@ impl Controller {
         }
     }
 
-    /// Takes the dispatch lease a remote-origin mutation needs, and returns its deadline.
+    /// Takes the dispatch lease a remote-origin mutation needs, and returns it.
     ///
     /// Section 9 requires a live worker-held authority lease from the current controller generation
     /// and revision for remote dispatch. A locally authenticated caller is not remote dispatch and
@@ -463,7 +463,7 @@ impl Controller {
         &self,
         session_id: SessionId,
         actor: &kr_protocol::actor::ActorEnvelope,
-    ) -> std::result::Result<Option<kr_transport::clock::ContinuousInstant>, LeaseDenied> {
+    ) -> std::result::Result<Option<kr_transport::lease::DispatchLease>, LeaseDenied> {
         if actor.ingress != kr_protocol::actor::ActorIngress::PairedDevice {
             return Ok(None);
         }
@@ -499,7 +499,7 @@ impl Controller {
         if lease.authority_revision != self.leases.authority_revision() {
             return Err(not_acknowledged());
         }
-        Ok(Some(lease.deadline))
+        Ok(Some(lease))
     }
 
     /// Issues an action window for one authenticated connection.

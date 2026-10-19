@@ -42,6 +42,7 @@ use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
 
+use crate::service::net::ForwardedDeadline;
 use crate::service::{Clocks, Controller, WallClock};
 
 /// How long a test waits for something it waits for by condition, and fails after. Nothing is
@@ -393,7 +394,7 @@ impl World {
     /// receiving it and its answering. The task ends with the link and the worker's answer.
     fn forward_in_the_background(
         &mut self,
-        deadline: U64,
+        bound: ForwardedDeadline,
     ) -> tokio::task::JoinHandle<(BoundLink, Result<ParamsValue, ProtocolError>)> {
         let mut link = self.link.take().expect("the link is free");
         let mutation = self.attach();
@@ -401,7 +402,13 @@ impl World {
         let rights: CanonicalSet<ActionRight> = [ActionRight::SessionView].into_iter().collect();
         tokio::spawn(async move {
             let answer = link
-                .forward(&mutation, &actor, &rights, deadline)
+                .forward(
+                    &mutation,
+                    &actor,
+                    &rights,
+                    bound.deadline_boot_ms,
+                    bound.lease,
+                )
                 .await
                 .expect("the forward reaches the worker");
             (link, answer)
@@ -422,7 +429,7 @@ impl World {
     }
 
     /// Takes the lease an action for this device needs, the way a forward does.
-    async fn lease(&self) -> Result<U64, crate::error::ControllerError> {
+    async fn lease(&self) -> Result<ForwardedDeadline, crate::error::ControllerError> {
         self.controller
             .forwarded_deadline(self.session_id, &self.actor, self.accepted())
             .await
@@ -498,10 +505,10 @@ async fn the_lease_runs_out_and_is_not_renewed(steps: &Steps) {
     // The control. An action holds its lease at the worker's shut serial boundary, the clock passes
     // the lease, and the worker refuses the action as expired: that much the lapse does by itself.
     steps.at("the control: taking the action's lease");
-    let deadline = world.lease().await.expect("the action is given its lease");
+    let bound = world.lease().await.expect("the action is given its lease");
     steps.at("the control: shutting the worker's serial boundary");
     let shut = Shut::hold(&world.runtime).await;
-    let waiting = world.forward_in_the_background(deadline);
+    let waiting = world.forward_in_the_background(bound);
     steps.at("the control: waiting for the worker to hold the action");
     world.until_the_worker_holds(1).await;
     world.clock.advance(Duration::from_secs(6));
@@ -521,11 +528,11 @@ async fn the_lease_runs_out_and_is_not_renewed(steps: &Steps) {
 
     // With no debt owed the next action is given a fresh lease, and the worker runs it.
     steps.at("the control: taking the next action's lease");
-    let deadline = world
+    let bound = world
         .lease()
         .await
         .expect("with no fence owed the next action is given a new lease");
-    let waiting = world.forward_in_the_background(deadline);
+    let waiting = world.forward_in_the_background(bound);
     steps.at("the control: waiting for the worker to run the next action");
     let (link, answer) = ended(waiting).await;
     world.link = Some(link);
@@ -533,10 +540,10 @@ async fn the_lease_runs_out_and_is_not_renewed(steps: &Steps) {
 
     // The revocation. An action holds a fresh lease at the shut serial boundary.
     steps.at("the revocation: taking the action's lease");
-    let deadline = world.lease().await.expect("the action is given its lease");
+    let bound = world.lease().await.expect("the action is given its lease");
     steps.at("the revocation: shutting the worker's serial boundary");
     let shut = Shut::hold(&world.runtime).await;
-    let waiting = world.forward_in_the_background(deadline);
+    let waiting = world.forward_in_the_background(bound);
     steps.at("the revocation: waiting for the worker to hold the action");
     world.until_the_worker_holds(3).await;
     let held_at = world.controller.leases.authority_revision();

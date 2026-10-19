@@ -232,12 +232,12 @@ impl RemoteConnection {
             return failure(mutation.request_id, refusal.into_error());
         }
         let envelope = self.envelope(acting.grant.grant_id, validated);
-        let deadline = match self
+        let bound = match self
             .controller
             .forwarded_deadline(session_id, &envelope, accepted)
             .await
         {
-            Ok(deadline) => deadline,
+            Ok(bound) => bound,
             Err(error) => {
                 // The grant may have run out while this waited, and wherever that is observed it
                 // is written down. What decides is the grant's own deadline: everything else this
@@ -311,8 +311,9 @@ impl RemoteConnection {
                         grant_rights: &grant_rights,
                         history: Some(&history),
                         screen_basis,
+                        lease: bound.lease,
                     },
-                    deadline,
+                    bound.deadline_boot_ms,
                 )
                 .await
         });

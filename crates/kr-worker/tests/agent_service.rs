@@ -761,6 +761,7 @@ async fn kr_req_14_11_a_prompt_with_no_lifetime_is_answered_only_from_a_receipt(
                 &owner,
                 &kr_protocol::scalars::CanonicalSet::new(),
                 kr_protocol::scalars::U64::new(deadline),
+                None,
             )
             .await
             .expect("the forward reaches the worker")
@@ -3010,6 +3011,7 @@ async fn forward_as_device(
             &envelope,
             &grant_rights.iter().copied().collect(),
             kr_protocol::scalars::U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000),
+            None,
         )
         .await
         .expect("the forward reaches the worker")

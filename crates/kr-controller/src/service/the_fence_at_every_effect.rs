@@ -835,7 +835,7 @@ async fn a_lease_taken_before_a_debt_is_published_lapses_and_is_not_renewed() {
         .current_lease(session_id)
         .expect("the forward took a lease");
     assert!(
-        forwarded.get() > 0
+        forwarded.deadline_boot_ms.get() > 0
             && lease.remaining(controller.clock.now()) <= kr_transport::lease::MAX_LEASE,
         "the deadline the worker is given is bounded by the lease: {forwarded:?}"
     );

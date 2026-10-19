@@ -522,6 +522,7 @@ impl Wired {
                 actor,
                 &rights.iter().copied().collect(),
                 U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000),
+                None,
             ),
         )
         .await

@@ -835,6 +835,11 @@ impl<C: Codec> Client<C> {
     /// and a worker of any build reads it. A scope goes only over a proxy link, to a worker that
     /// states it holds results to one.
     ///
+    /// `lease` is the remote dispatch lease the host took for a paired device's mutation, and a
+    /// local caller's action, which does not depend on the lease, passes none. A link to a worker of
+    /// an earlier release refuses a frame that carries one, so the lease is passed only on a link
+    /// whose worker is at this build's own level.
+    ///
     /// # Errors
     ///
     /// Returns the host's error, or a transport failure.
@@ -844,12 +849,14 @@ impl<C: Codec> Client<C> {
         actor: &kr_protocol::actor::ActorEnvelope,
         grant_rights: &kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>,
         accepted_deadline_boot_ms: kr_protocol::scalars::U64,
+        lease: Option<kr_protocol::local::ForwardedLease>,
     ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
         self.forward_for(
             mutation,
             actor,
             grant_rights,
             accepted_deadline_boot_ms,
+            lease,
             None,
         )
         .await
@@ -877,6 +884,7 @@ impl<C: Codec> Client<C> {
             actor,
             &kr_protocol::scalars::CanonicalSet::new(),
             accepted_deadline_boot_ms,
+            None,
             Some(workflow_run_id),
         )
         .await
@@ -888,6 +896,7 @@ impl<C: Codec> Client<C> {
         actor: &kr_protocol::actor::ActorEnvelope,
         grant_rights: &kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>,
         accepted_deadline_boot_ms: kr_protocol::scalars::U64,
+        lease: Option<kr_protocol::local::ForwardedLease>,
         workflow_run_id: Option<kr_protocol::ids::WorkflowRunId>,
     ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
         if !kr_protocol::local::may_travel_to_a_worker(grant_rights) {
@@ -905,6 +914,7 @@ impl<C: Codec> Client<C> {
                 history: None,
                 screen_basis: None,
                 workflow_run_id,
+                lease,
             },
         )))
         .await?;

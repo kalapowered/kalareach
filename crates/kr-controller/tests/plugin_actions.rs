@@ -439,6 +439,7 @@ async fn kr_req_23_30_a_forwarded_action_revoked_while_the_component_prepared_is
                 history: None,
                 screen_basis: None,
                 workflow_run_id: None,
+                lease: None,
             },
         )))
         .await

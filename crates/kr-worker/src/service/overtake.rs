@@ -305,6 +305,7 @@ mod tests {
             history: None,
             screen_basis: None,
             workflow_run_id: None,
+            lease: None,
         }))
     }
 

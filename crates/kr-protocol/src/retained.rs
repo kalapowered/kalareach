@@ -316,6 +316,17 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
                      the member is written only by a worker of this build, for a session it was \
                      started to run a command in.",
         },
+        Compatible {
+            at: "ForwardedMutation.lease",
+            reason: "A member that is absent from the wire unless the daemon forwards a paired \
+                     device's mutation to a worker at this release's own level, which holds the \
+                     dispatch to the lease. The daemon omits it on a link to a worker of the \
+                     retained level, which refuses the frame that carries it, so every forwarded \
+                     mutation that level reads is byte for byte what it read before. Such a worker \
+                     enforces the generation fence, the authority revision the grant was validated \
+                     at and the deadline the lease bounds, and the daemon alone holds the lease for \
+                     it.",
+        },
     ],
 )
 .with_public_majors(include_str!("../retained/0.75/PUBLIC_MAJORS"))];

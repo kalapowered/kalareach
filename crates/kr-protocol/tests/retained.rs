@@ -795,3 +795,87 @@ fn the_recordings_beside_the_tests_are_of_the_release_before() {
         "the recorded registration names the release level {level} was cut from"
     );
 }
+
+/// KR-REQ-09.10, KR-REQ-26.06: a paired device's mutation forwarded without a lease is the frame
+/// the release before reads, byte for byte, and is read back as it was; one that carries a lease is
+/// refused by name for that level and not written, which is why the daemon sends it only to a
+/// worker at its own level.
+#[test]
+fn a_forwarded_mutation_without_a_lease_is_what_the_release_before_reads_and_one_with_it_is_refused()
+ {
+    use kr_protocol::actor::{ActorEnvelope, ActorIngress};
+    use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
+    use kr_protocol::ids::{
+        ActionId, ActionWindowId, ActorId, AuthorityRevision, ConnectionId, ControllerGeneration,
+        DeviceId, EnvironmentId, RemoteDispatchLeaseId, RequestId,
+    };
+    use kr_protocol::local::{ForwardedLease, ForwardedMutation};
+    use kr_protocol::method::{Method, MethodVersion};
+    use kr_protocol::scalars::{DurationMs, Uuid};
+
+    let frame = |lease: Option<ForwardedLease>| {
+        ControlFrame::Forwarded(Box::new(ForwardedMutation {
+            mutation: MutationRequest {
+                request_id: RequestId::new(1),
+                method: Method::SessionAttach.into(),
+                method_version: MethodVersion::V1,
+                action_id: ActionId::new(Uuid::from_bytes([1; 16])),
+                grant_id: Nullable::null(),
+                target: ActionTarget {
+                    environment_id: EnvironmentId::new(Uuid::from_bytes([2; 16])),
+                    session_id: Nullable::null(),
+                    session_epoch: Nullable::null(),
+                    application_instance_id: Nullable::null(),
+                    agent_binding_revision: Nullable::null(),
+                },
+                expected: ParamsValue::empty(),
+                action_window_id: ActionWindowId::new("device:test").expect("a window"),
+                requested_ttl_ms: DurationMs::new(30_000),
+                params: ParamsValue::empty(),
+            },
+            actor: ActorEnvelope {
+                actor_id: ActorId::new("device:test").expect("a principal"),
+                ingress: ActorIngress::PairedDevice,
+                device_id: Nullable::some(DeviceId::new(Uuid::from_bytes([4; 16]))),
+                grant_id: Nullable::null(),
+                grant_revision: Nullable::some(AuthorityRevision::new(3)),
+                controller_generation: ControllerGeneration::new(1),
+                connection_id: ConnectionId::new(Uuid::from_bytes([3; 16])),
+            },
+            grant_rights: kr_protocol::scalars::CanonicalSet::new(),
+            accepted_deadline_boot_ms: U64::new(5),
+            history: None,
+            screen_basis: None,
+            lease,
+        }))
+    };
+    let level = Level::retained(&kr_protocol::retained::RETAINED[0]);
+
+    let without = frame(None);
+    let written = level
+        .encode(&without, &limits())
+        .expect("written for the level");
+    assert_eq!(
+        written,
+        Level::this().encode(&without, &limits()).expect("written"),
+        "no lease, no member"
+    );
+    assert_eq!(level.decode(&written, &limits()).expect("read"), without);
+
+    let leased = frame(Some(ForwardedLease {
+        lease_id: RemoteDispatchLeaseId::new(Uuid::from_bytes([5; 16])),
+        controller_generation: ControllerGeneration::new(1),
+        authority_revision: AuthorityRevision::new(3),
+        deadline_boot_ms: U64::new(5),
+    }));
+    let own = Level::this()
+        .encode(&leased, &limits())
+        .expect("this build writes it");
+    assert_eq!(Level::this().decode(&own, &limits()).expect("read"), leased);
+    match level.encode(&leased, &limits()) {
+        Err(CodecError::NotInLevel { refusal, .. }) => {
+            assert!(refusal.to_string().contains("lease"), "{refusal}");
+        }
+        other => panic!("expected a refusal by name, got {other:?}"),
+    }
+}

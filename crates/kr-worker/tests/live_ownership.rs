@@ -620,6 +620,7 @@ async fn forward<T: serde::Serialize>(
         history: None,
         screen_basis: None,
         workflow_run_id: None,
+        lease: None,
     }));
     exchange(daemon, frame, request_id).await
 }

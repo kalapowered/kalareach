@@ -784,6 +784,8 @@ impl RemoteConnection {
                                 grant_rights: &grant_rights,
                                 history: Some(&history),
                                 screen_basis: None,
+                                // Stopping owned execution does not depend on the remote lease.
+                                lease: None,
                             },
                             accepted,
                             Some(&observer),

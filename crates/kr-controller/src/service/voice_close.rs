@@ -142,6 +142,8 @@ impl Controller {
                         history: Some(&narrowed.history),
                         // A close is not an attach: no screen is drawn from it.
                         screen_basis: None,
+                        // Stopping owned execution does not depend on the remote lease.
+                        lease: None,
                     },
                     accepted,
                     None,

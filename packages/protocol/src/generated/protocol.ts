@@ -9598,6 +9598,19 @@ export interface ForwardedMutation {
    * [`FORWARDED_RESULT_SCOPE`].
    */
   history?: HistoryScope | null
+  /**
+   * The remote dispatch lease the daemon took for this mutation, for a paired device's.
+   *
+   * Absent for a local caller, whose actions do not depend on the lease, for `session.close`
+   * ([`needs_a_dispatch_lease`]), and on a link to a worker of an earlier release, which cannot
+   * read it.
+   *
+   * It is absent from the wire when it is absent, so a mutation without one is byte for byte
+   * what a worker built before the lease travelled reads, and a daemon sends one only to a
+   * worker at its own level. A worker at this level admits a paired device's mutation that
+   * needs a lease only with one.
+   */
+  lease?: ForwardedLease | null
   mutation: MutationRequest1
   /**
    * The kind of grant the host decided this mutation under, for a `session.attach` only.
@@ -9697,6 +9710,35 @@ export interface HistoryScope {
    * Current questions named explicitly, even when they were created before the lower bound.
    */
   named_questions: QuestionId[]
+}
+/**
+ * The remote dispatch lease the control daemon holds for a worker, as it travels beside a mutation
+ * it forwards for a paired device.
+ *
+ * Remote dispatch needs a live authority lease from the current controller generation and
+ * revision, valid for at most five seconds, and the worker is where the dispatch is. The daemon
+ * takes the lease at the moment it forwards, so what arrives is a renewal made for this
+ * dispatch; the worker holds it to what it has itself acknowledged and installed, and to its own
+ * clock, in the serial path immediately before the dispatch marker.
+ */
+export interface ForwardedLease {
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  /**
+   * The controller generation that issued it. A replacement controller advances this, and a
+   * lease of an earlier generation is no lease.
+   */
+  controller_generation: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  deadline_boot_ms: string
+  /**
+   * The lease's identity, which a refusal names to the daemon.
+   */
+  lease_id: string
 }
 /**
  * A mutation request.
