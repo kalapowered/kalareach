@@ -219,7 +219,7 @@ describe('pairing with a host', () => {
     expect((await screen.findByTestId('failure-action')).textContent).toBe('Paste again')
   })
 
-  // KR-REQ-10.54: a managed relay that has no free capacity to admit a device is not a host that
+  // KR-REQ-17.40: a managed relay that has no free capacity to admit a device is not a host that
   // cannot be reached, and the page says which it is, on both ways of pairing.
   it('tells a relay without free capacity from a host that is not there, for a code and for an invitation', async () => {
     const { controls } = start()

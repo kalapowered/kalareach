@@ -125,10 +125,9 @@ function codeWords(
     case 'relay_capacity':
       return {
         // The managed relay is the product's own, so the failure is not the host's, and it is said
-        // to be neither. The alternatives are the ones the service names: this device on the host's
-        // own network, or a direct invitation.
+        // to be neither. The way round it that fits both ways of pairing is the host's own network.
         sentence:
-          "The managed relay could not take this pairing now. Try again shortly, or bring this device onto the host's network and use a direct invitation.",
+          "The managed relay could not take this pairing now. Try again shortly, or bring this device onto the host's network.",
         action: 'try_again'
       }
     case 'host_mismatch':
