@@ -86,7 +86,34 @@ struct Same {
     reason: &'static str,
 }
 
-const SAME: &[Same] = &[];
+const SAME: &[Same] = &[
+    Same {
+        root: "ForwardedMutation",
+        digest: "815a9cb51701f6f459514684e2c818c6d59640522d10ab55100bbe2bbc18c3c6",
+        reason: "A member that is absent from the wire except in a workflow's close of a session \
+                 it started, which the daemon sends only to the worker it started that session's \
+                 command on, never to a worker of the retained level. Every other forwarded \
+                 mutation is byte for byte what that level reads, and what that level accepts is \
+                 unchanged.",
+    },
+    Same {
+        root: "SessionSummary",
+        digest: "7fe58d83a5989335c94b5e105f5cbce3a42cda57d60510c18ba096a3e6bb6c19",
+        reason: "A member that is absent from the wire for the interactive shell every other \
+                 session has. A worker of the retained level never writes it, and this build \
+                 reads a summary without it as a session whose root is a shell, so what that \
+                 level writes is read as before.",
+    },
+    Same {
+        root: "WorkerLaunchSpec",
+        digest: "1dbe88292acb0c5093405c88fd4b6de5b953318737d9466ff8a23c569a8db469",
+        reason: "Three members that are absent from the wire unless a workflow started the \
+                 session. The specification of an ordinary session is byte for byte what a \
+                 worker of the retained level reads, and a launch specification goes only to a \
+                 worker the daemon of this release started, so what that level accepts is \
+                 unchanged.",
+    },
+];
 
 /// The rules of the surface, as the roots the walker follows them from:
 ///
