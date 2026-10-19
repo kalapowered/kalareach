@@ -821,8 +821,9 @@ impl<E: Environment> Reconciler<E> {
         Ok(Ended::Done)
     }
 
-    /// A revocation this device verified from an authority feed, recorded when it arrives with
-    /// the removals it requires, without waiting for a host.
+    /// A revocation this device knows of, one verified from an authority feed or one its caller was
+    /// told to take out, recorded when it arrives with the removals it requires, without waiting
+    /// for a host.
     pub(crate) fn feed_revocation(
         &mut self,
         revocation: <E::Kinds as Kinds>::Revocation,

@@ -470,10 +470,12 @@ way included: nothing written after the revocation is sealed under a key the dev
 was held back is sent once the device is out, under the key that follows its removal. The record is
 kept across a restart, and the next step of any companion over the same data takes the device out.
 Nothing takes the record back. A request that fails may have reached its host all the same, with
-only the reply lost, so the device stays out of the shared settings, the person is told so, and
-revoking it again finishes the job. A device that a view finds revoked by this computer's own
-signature in a host's feed, or that the host on this computer lists as revoked, whoever revoked it,
-is taken out the same way. A send already on its way cannot be called back.
+only the reply lost, so the device is taken out of the shared settings whatever became of the
+request, and the person is told so where settings are shared. That exclusion is for good on this
+computer and covers every device that shares the settings; pairing the device again does not undo
+it, and revoking it again finishes the job. A device that a view finds revoked by this computer's
+own signature in a host's feed, or that the host on this computer lists as revoked, whoever revoked
+it, is taken out the same way. A send already on its way cannot be called back.
 
 ## Sharing a session
 

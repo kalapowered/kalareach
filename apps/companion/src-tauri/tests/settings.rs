@@ -544,7 +544,6 @@ impl Computer {
         companion_tauri::start_sync_service(app.handle(), self.data.path());
         companion_tauri::start_settings_sync(
             app.handle(),
-            self.data.path(),
             &self.identity(),
             Arc::clone(&self.hosts) as Arc<dyn Hosts>,
             Arc::clone(&self.ceremony) as Arc<dyn Ceremony>,

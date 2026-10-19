@@ -1,5 +1,6 @@
-//! The record of revocations this computer sent that the membership has not taken in yet, and the
-//! gate it makes for everything settings sync sends.
+//! The record of revocations that the membership has not taken in yet, and the gate it makes for
+//! everything settings sync sends: revocations this computer sent, whatever became of the request,
+//! and devices a host lists as revoked.
 //!
 //! A revocation this computer sends is written down before the request leaves, and a request whose
 //! record cannot be written is not sent. A step may be in hand, waiting on the network, when the
@@ -10,9 +11,16 @@
 //!
 //! **A record is only ever taken in, never taken back.** What becomes of a request after the record
 //! is written is not always known here: a reply can be lost after a host acted, and two requests
-//! can name one device. So a failed request does not lift its record: the device stays out of the
-//! shared settings, and the person revokes it again or shares with it again by pairing it anew.
-//! Nothing lets go of a record but the step that has taken it into the membership.
+//! can name one device. So a failed request does not lift its record. Only a step that has taken
+//! the record into the membership lets go of it, or a step that finds no collection to take it
+//! out of.
+//!
+//! The cost is stated, not hidden: a device taken in is out of the shared settings for good on this
+//! computer. The membership keeps a revoked device's key for as long as it keeps its own records,
+//! the exclusion covers the whole collection and every device that shares it, and the device's
+//! keys are the same when it is paired again, so pairing it anew does not undo it. A person who
+//! revoked a device and was told the request failed can revoke it again to finish the job; nothing
+//! here brings it back into the shared settings.
 //!
 //! The record is a file beside the other records of settings sync, so it is kept across a restart
 //! and seen by a second companion over the same data directory: each step takes in what it finds
@@ -28,7 +36,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use kr_client::sync::PublishGate;
-use kr_ipc::paths::{create_private_directory, read_owner_only_file, write_owner_only_file};
+use kr_ipc::paths::{
+    create_private_directory, flush_path_names, read_owner_only_file, write_owner_only_file,
+};
 use kr_protocol::scalars::AuthorisationKey;
 
 use crate::error::{CommandError, Result};
@@ -42,7 +52,8 @@ const LOCK: &str = "revoking.lock";
 /// The most bytes of [`FILE`] that are read: far more than this computer's devices come to.
 const LIMIT: u64 = 1 << 20;
 
-/// The devices whose revocation this computer sent and the membership has not recorded yet.
+/// The devices whose revocation is known here and the membership has not recorded yet: those this
+/// computer sent a request for, whatever became of it, and those a host lists as revoked.
 #[derive(Debug)]
 pub struct Fence {
     directory: PathBuf,
@@ -86,12 +97,17 @@ impl Fence {
 
     /// Changes the file under its lock.
     fn change(&self, change: impl FnOnce(&mut BTreeSet<AuthorisationKey>)) -> Result<()> {
-        create_private_directory(&self.directory).map_err(|error| {
-            CommandError::local_failure(format!(
-                "this computer's record of revocations not yet taken in could not be made: \
-                 {error}"
-            ))
-        })?;
+        // The directory and its name are made durable before anything is written in it, as
+        // settings sync does its own: a hold that a crash could lose is not one.
+        create_private_directory(&self.directory)
+            .map_err(|error| error.to_string())
+            .and_then(|()| flush_path_names(&self.directory).map_err(|error| error.to_string()))
+            .map_err(|error| {
+                CommandError::local_failure(format!(
+                    "this computer's record of revocations not yet taken in could not be made: \
+                     {error}"
+                ))
+            })?;
         let _lock = crate::settings::locked_file(&self.directory.join(LOCK)).map_err(|error| {
             CommandError::local_failure(format!(
                 "this computer's record of revocations not yet taken in could not be locked: \
@@ -121,24 +137,38 @@ impl Fence {
     /// this computer is about to send. All or nothing: a record that cannot be written holds
     /// nothing, and the revocation is not sent.
     ///
+    /// A write can fail after it has done its work: the file is renamed into place and then the
+    /// directory is flushed. When the record names the devices all the same, it is a hold, for
+    /// every reader, and it stands: the request goes, and the flush that did not finish is the
+    /// risk of any write.
+    ///
     /// # Errors
     ///
-    /// Returns why the record could not be written.
+    /// Returns why the record could not be written, when it does not name the devices.
     pub(in crate::settings) fn raise(&self, devices: &[AuthorisationKey]) -> Result<()> {
-        self.change(|kept| kept.extend(devices.iter().copied()))?;
+        if let Err(error) = self.change(|kept| kept.extend(devices.iter().copied())) {
+            let named = self
+                .on_disk()
+                .is_ok_and(|kept| devices.iter().all(|device| kept.contains(device)));
+            if !named {
+                return Err(error);
+            }
+        }
         self.held().extend(devices.iter().copied());
         Ok(())
     }
 
-    /// Holds everything sent until `devices` are taken out of the shared settings, for devices a
-    /// host has revoked already: the revocation has happened, so this process holds them from
-    /// memory when the record cannot be written, and writes them down when it can.
+    /// Holds everything sent until `devices` are taken out of the shared settings, for devices
+    /// whose revocation has happened or may have: a host lists them as revoked, or the request for
+    /// one was sent and failed. This process holds them from memory when the record cannot be
+    /// written, and writes them down when it can.
     pub(super) fn raise_regardless(&self, devices: &[AuthorisationKey]) {
         self.held().extend(devices.iter().copied());
         let _ = self.change(|kept| kept.extend(devices.iter().copied()));
     }
 
-    /// Lets go of `devices`, which the membership has taken in.
+    /// Lets go of `devices`, which the membership has taken in or which have no collection to be
+    /// taken out of.
     ///
     /// # Errors
     ///

@@ -327,9 +327,11 @@ pub struct Settings {
     local: Arc<LocalSettings>,
     sync: OnceLock<SettingsSync>,
     told: Arc<Told>,
-    /// The revocations this computer sent that settings sync has not taken in. It is here and not
-    /// in settings sync, so that a revocation is held back even where settings sync did not start.
+    /// The revocations that settings sync has not taken in. It is here and not in settings sync,
+    /// so that settings are held back for a revocation even where settings sync did not start.
     fence: Arc<sync::Fence>,
+    /// Where the settings and settings sync keep their records.
+    data: PathBuf,
 }
 
 impl Settings {
@@ -341,6 +343,7 @@ impl Settings {
             sync: OnceLock::new(),
             told: Arc::new(Told::default()),
             fence: Arc::new(sync::Fence::in_directory(&data.join(sync::DIRECTORY))),
+            data: data.to_path_buf(),
         }
     }
 
@@ -363,14 +366,13 @@ impl Settings {
     /// Returns a local failure when sync's directory cannot be made.
     pub fn take_part(
         &self,
-        data: &Path,
         parts: SyncParts,
         desk: Arc<crate::drafts::DraftDesk>,
         hosts: Arc<dyn Hosts>,
         ceremony: Arc<dyn kr_client::pairing::owner::Ceremony>,
     ) -> Result<()> {
         let sync = SettingsSync::open(
-            data,
+            &self.data,
             Arc::clone(&self.local),
             parts,
             Arc::clone(&self.told),
@@ -575,6 +577,12 @@ impl Settings {
             sync.dismiss_outcomes().await?;
         }
         Ok(self.view())
+    }
+
+    /// Whether this computer shares its settings with other devices: settings sync is on.
+    #[must_use]
+    pub fn shares_settings(&self) -> bool {
+        self.sync.get().is_some_and(SettingsSync::shares)
     }
 
     /// Holds everything settings sync sends until `devices` are taken out of the shared settings.

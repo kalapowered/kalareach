@@ -41,10 +41,10 @@
 //!
 //! Before a revocation leaves, settings sync is told to hold everything it sends until the device
 //! is out of the shared settings, and a revocation whose hold cannot be written down is not sent.
-//! Once the request has left, settings sync takes the device out in a step of its own, without
-//! waiting for any host to acknowledge it. What settings sync was sending is held too, a step
-//! already under way included, so nothing written after the revocation is sealed under a key the
-//! device holds. A device that a view finds revoked by this computer's own signature in a host's
+//! Once the request has been sent, whatever becomes of it, settings sync takes the device out in a
+//! step of its own, without waiting for any host to acknowledge it: a request that failed may have
+//! reached its host all the same. What settings sync was sending is held too, a step already under
+//! way included, so nothing written after the revocation is sealed under a key the device holds. A device that a view finds revoked by this computer's own signature in a host's
 //! feed, or listed as revoked by the host on this computer, whoever revoked it, is passed to
 //! settings sync the same way. A send already on its way cannot be called back.
 
@@ -511,8 +511,8 @@ impl Revocations {
 
     /// Passes the devices of revocations to settings sync, which holds what it sends at once and
     /// takes the devices out of the shared settings in a step of its own, without waiting for a
-    /// host to confirm: the devices a request just sent names, and those a view finds this computer
-    /// sent or a host on this computer lists as revoked. All the devices of one view go in one
+    /// host to confirm: the devices a request just sent names, whether it succeeded or not, and
+    /// those a view finds this computer sent or a host on this computer lists as revoked. All the devices of one view go in one
     /// call. It runs on its own, so that a service that is slow to answer does not hold the
     /// screen.
     fn tell(&self, context: &Context, told: Vec<AuthorisationKey>) {
@@ -759,6 +759,8 @@ impl Revocations {
                 ))
             })?;
         }
+        // Whether there are settings the device is taken out of, to say so truthfully.
+        let shared = settings.is_some_and(|settings| settings.shares_settings());
         let sent = self.dispatch(prepared, &summary).await;
         // Told at once, and not at the end of the view that follows, which waits for every host and
         // every feed. A request that failed may have reached its host all the same, a reply being
@@ -768,7 +770,10 @@ impl Revocations {
         }
         match sent {
             Ok(()) => Ok(self.view(context).await),
-            Err(mut error) if settings.is_some() => {
+            Err(mut error) if shared => {
+                if !error.message.ends_with('.') {
+                    error.message.push('.');
+                }
                 error.message.push_str(
                     " This computer no longer shares its settings with that device, because the \
                      request may have reached the host.",

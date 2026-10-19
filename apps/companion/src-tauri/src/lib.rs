@@ -649,7 +649,7 @@ fn open_recovery(app: &tauri::AppHandle) {
     }
     let hosts = std::sync::Arc::new(settings::connected::ConnectedHosts::new(app.clone()));
     let ceremony = verify::platform_ceremony(app.get_webview_window("main"));
-    match start_settings_sync(app, &data, device.identity(), hosts, ceremony) {
+    match start_settings_sync(app, device.identity(), hosts, ceremony) {
         Ok(()) => keep_settings_in_step(app),
         Err(error) => {
             tracing::warn!(%error, "this computer cannot take part in settings sync");
@@ -684,7 +684,6 @@ pub fn watch_settings<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 /// sync's directory cannot be made.
 pub fn start_settings_sync<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-    data: &std::path::Path,
     identity: &device::DeviceIdentity,
     hosts: std::sync::Arc<dyn settings::Hosts>,
     ceremony: std::sync::Arc<dyn kr_client::pairing::owner::Ceremony>,
@@ -695,7 +694,6 @@ pub fn start_settings_sync<R: tauri::Runtime>(
 
     let state = app.state::<AppState>();
     state.settings()?.take_part(
-        data,
         settings::SyncParts {
             keys: identity.keys.clone(),
             secrets: Arc::clone(&identity.secrets),

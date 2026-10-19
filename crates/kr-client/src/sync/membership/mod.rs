@@ -245,8 +245,9 @@ pub struct HostAnswers {
 pub struct RecordedAnswers {
     /// The hosts' answers at the last refresh.
     pub hosts: HostAnswers,
-    /// The devices a verified authority feed revoked, by authorisation key. A refresh keeps
-    /// them: a host that has not received a revocation yet does not undo it.
+    /// The devices a revocation was recorded for, by authorisation key: those a verified authority
+    /// feed revoked, and those a caller was told to take out. A refresh keeps them: a host that has
+    /// not received a revocation yet does not undo it.
     pub verified: BTreeSet<AuthorisationKey>,
     /// The devices that passed check 3 at an answer this device recorded, and have not failed it
     /// since: the ones a host that does not answer may be the one to list.
@@ -1141,8 +1142,8 @@ impl SyncMembership {
         self.reconciler.remove(listed)
     }
 
-    /// Records a revocation this device verified from an authority feed, with the removals it
-    /// requires, before any host answers.
+    /// Records a revocation this device knows of before any host lists it: one it verified from an
+    /// authority feed, or one its caller was told to take out, with the removals it requires.
     ///
     /// # Errors
     ///

@@ -250,17 +250,21 @@ impl Rig {
             .expect("an origin");
     }
 
-    /// This computer takes part in settings sync, over a collection of its own.
-    async fn with_settings_sync(&self) {
+    /// Settings sync starts on this computer and is not turned on: no settings are shared.
+    fn start_settings_sync(&self) {
         let device = self.app.device();
         companion_tauri::start_settings_sync(
             self.app.app.handle(),
-            self.data.path(),
             device.identity(),
             Arc::new(NoHosts),
             Arc::clone(&self.ceremony) as Arc<dyn Ceremony>,
         )
         .expect("settings sync opens");
+    }
+
+    /// This computer takes part in settings sync, over a collection of its own.
+    async fn with_settings_sync(&self) {
+        self.start_settings_sync();
         self.app
             .app
             .state::<AppState>()
@@ -807,13 +811,9 @@ async fn a_revocation_whose_hold_on_settings_sync_cannot_be_written_down_is_not_
     assert_eq!(record.len(), 1, "the device is held: {record:?}");
 }
 
-/// A request the service stored and answered that it cannot say whether it took effect may have
-/// reached the host, so the device is out of the shared settings all the same, and the person is
-/// told so.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_revocation_whose_outcome_is_not_known_still_takes_the_device_out_of_the_settings() {
-    let rig = Rig::start().await;
-    rig.with_settings_sync().await;
+/// Revokes the phone on the feed host with the service answering the publication "stored, and I
+/// cannot say whether it took effect", and says what the call answered.
+async fn revoke_with_the_outcome_unknown(rig: &Rig) -> Value {
     let view = rig.view().await;
     let host = host_by(&view, "feed");
     let phone = the_phone(&host);
@@ -834,6 +834,17 @@ async fn a_revocation_whose_outcome_is_not_known_still_takes_the_device_out_of_t
         .expect("the call ends")
         .expect_err("the service could not say whether it took effect");
     assert_eq!(rig.publications(), 1, "the service stored the request");
+    lost
+}
+
+/// A request the service stored and answered that it cannot say whether it took effect may have
+/// reached the host, so the device is out of the shared settings all the same, and the person is
+/// told so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_whose_outcome_is_not_known_still_takes_the_device_out_of_the_settings() {
+    let rig = Rig::start().await;
+    rig.with_settings_sync().await;
+    let lost = revoke_with_the_outcome_unknown(&rig).await;
     assert!(
         lost["message"]
             .as_str()
@@ -841,6 +852,36 @@ async fn a_revocation_whose_outcome_is_not_known_still_takes_the_device_out_of_t
         "the person is told what became of the settings: {lost}"
     );
     rig.settings_sync_hears_of(&rig.phone).await;
+}
+
+/// Where no settings are shared there is nothing to take the device out of: the person is told
+/// nothing of settings, and the hold is let go of.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_revocation_says_nothing_of_settings_where_none_are_shared() {
+    let rig = Rig::start().await;
+    rig.start_settings_sync();
+    let lost = revoke_with_the_outcome_unknown(&rig).await;
+    assert!(
+        lost["message"]
+            .as_str()
+            .is_some_and(|words| !words.contains("settings")),
+        "nothing is said of settings: {lost}"
+    );
+    let record = rig.data.path().join("settings-sync").join("revoking.json");
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let held: Vec<String> = std::fs::read(&record)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+            if held.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the hold is let go of: there is no collection to take the device out of");
 }
 
 /// The host on this computer takes a revocation and answers, and the view that follows cannot list

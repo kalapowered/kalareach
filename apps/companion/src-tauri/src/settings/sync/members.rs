@@ -648,6 +648,12 @@ impl SettingsSync {
             .map(|_| ())
     }
 
+    /// Whether settings sync is on, so that there are settings shared with other devices.
+    #[must_use]
+    pub fn shares(&self) -> bool {
+        matches!(self.record(), Ok(Some(_)))
+    }
+
     /// Takes devices whose revocation is known here out of the shared settings, as far as the hosts
     /// and the service allow.
     ///
