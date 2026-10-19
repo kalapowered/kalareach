@@ -354,7 +354,7 @@ pub fn may_travel_to_a_worker(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardedLease {
-    /// The lease's identity, which a refusal names to the daemon.
+    /// The lease's identity, as the daemon's issuer names it. The worker decides nothing by it.
     pub lease_id: RemoteDispatchLeaseId,
     /// The controller generation that issued it. A replacement controller advances this, and a
     /// lease of an earlier generation is no lease.

@@ -325,7 +325,8 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
                      mutation that level reads is byte for byte what it read before. Such a worker \
                      enforces the generation fence, the authority revision the grant was validated \
                      at and the deadline the lease bounds, and the daemon alone holds the lease for \
-                     it.",
+                     it. No release at the next level exists without the member: were one tagged, \
+                     the member would belong to the level after it and this cut would move.",
         },
     ],
 )

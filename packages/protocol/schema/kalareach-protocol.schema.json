@@ -17189,7 +17189,7 @@
         },
         "lease_id": {
           "$ref": "#/$defs/RemoteDispatchLeaseId",
-          "description": "The lease's identity, which a refusal names to the daemon."
+          "description": "The lease's identity, as the daemon's issuer names it. The worker decides nothing by it."
         }
       },
       "required": [

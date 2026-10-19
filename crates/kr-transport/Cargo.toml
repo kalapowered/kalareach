@@ -36,8 +36,10 @@ url.workspace = true
 
 [features]
 # The entry points that bind an endpoint asking one name server of the caller's choosing and no
-# other, for this crate's own tests, which stand a name server of their own on loopback. They are
-# compiled only with this feature, and no shipped build enables it.
+# other, for this crate's own tests, which stand a name server of their own on loopback, and the
+# constructors and counts of a control channel that the control daemon's tests read a frame at a
+# moment of their own with. They are compiled only with this feature, and no shipped build enables
+# it.
 testing = []
 
 [dev-dependencies]

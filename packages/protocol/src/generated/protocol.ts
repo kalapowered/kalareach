@@ -9736,7 +9736,7 @@ export interface ForwardedLease {
    */
   deadline_boot_ms: string
   /**
-   * The lease's identity, which a refusal names to the daemon.
+   * The lease's identity, as the daemon's issuer names it. The worker decides nothing by it.
    */
   lease_id: string
 }
