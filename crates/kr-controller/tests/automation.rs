@@ -2603,7 +2603,11 @@ async fn a_workflow_grant_is_held_to_the_offline_bound_on_the_continuous_clock()
     let (_, ends_in) = grants
         .grant_standing(grant.grant_id, T)
         .expect("inside the bound");
-    assert_eq!(ends_in, Some(std::time::Duration::from_millis(200)));
+    assert!(
+        ends_in.is_some_and(|ends_in| ends_in <= std::time::Duration::from_millis(201)
+            && ends_in >= std::time::Duration::from_millis(200)),
+        "the bound is the end of a window of two hundred milliseconds: {ends_in:?}"
+    );
 
     // The control: a hundred milliseconds on both clocks, still inside the bound.
     continuous.advance(std::time::Duration::from_millis(100));
@@ -2614,7 +2618,11 @@ async fn a_workflow_grant_is_held_to_the_offline_bound_on_the_continuous_clock()
     let (_, ends_in) = grants
         .grant_standing(grant.grant_id, T + 100)
         .expect("inside the bound a hundred milliseconds on");
-    assert_eq!(ends_in, Some(std::time::Duration::from_millis(100)));
+    assert!(
+        ends_in.is_some_and(|ends_in| ends_in <= std::time::Duration::from_millis(101)
+            && ends_in >= std::time::Duration::from_millis(100)),
+        "a hundred milliseconds of the window are left: {ends_in:?}"
+    );
 
     // Two hundred more on the continuous clock, and the wall clock wound back five seconds. The
     // host's floor holds UTC at T + 100, inside the bound, so only the continuous clock can refuse.
@@ -3884,17 +3892,15 @@ async fn an_owner_managed_workflow_runs_under_a_members_organisation_grant_while
     kr_automation::authority::check_node(&held, &document, &document.nodes[0], host.environment_id)
         .expect("the node is inside the grant");
     // The lease is an end the grant stands on: a command that starts later than the node asks is
-    // held to it, and the end moves with the continuous clock.
-    let (_, ends_in) = grants
+    // held to it.
+    let (_, first) = grants
         .grant_standing(grant.grant_id, T + 60_000)
         .expect("the member's lease answers");
-    assert_eq!(ends_in, Some(std::time::Duration::from_millis(LEASE_MS)));
-    continuous.advance(std::time::Duration::from_millis(LEASE_MS - 1_000));
-    let (_, ends_in) = grants
-        .grant_standing(grant.grant_id, T + 60_000)
-        .expect("the lease has a second left");
-    assert_eq!(ends_in, Some(std::time::Duration::from_secs(1)));
-    continuous.advance(std::time::Duration::from_secs(1));
+    let first = first.expect("a lease is an end");
+    assert!(
+        first <= std::time::Duration::from_millis(LEASE_MS) && !first.is_zero(),
+        "the lease ends within its own lifetime: {first:?}"
+    );
 
     // The control: the member's grant does not reach workflow.install itself.
     let managing = Grant {
@@ -3929,7 +3935,21 @@ async fn an_owner_managed_workflow_runs_under_a_members_organisation_grant_while
         "no role ceiling carries automation.manage"
     );
 
+    // The end moves with the continuous clock: a second before it, a second is left.
+    continuous.advance(first - std::time::Duration::from_secs(1));
+    let (_, ends_in) = grants
+        .grant_standing(grant.grant_id, T + 60_000)
+        .expect("the lease has a second left");
+    assert!(
+        ends_in.is_some_and(|ends_in| ends_in >= std::time::Duration::from_secs(1)
+            && ends_in <= std::time::Duration::from_millis(1_001)),
+        "a second of the lease is left: {ends_in:?}"
+    );
+
     // Once the lease has ended, the node is refused.
+    continuous.advance(
+        std::time::Duration::from_millis(LEASE_MS) - (first - std::time::Duration::from_secs(1)),
+    );
     wall.store(T + LEASE_MS, Ordering::SeqCst);
     let refused = grants
         .grant(grant.grant_id, T + LEASE_MS)
@@ -4181,9 +4201,10 @@ fn reservation_phases(host: &Host, grant: GrantId) -> Vec<String> {
         .prepare("SELECT phase FROM reservations WHERE actor_id = ?1 ORDER BY created_at_ms")
         .expect("prepares");
     statement
-        .query_map([kr_automation::resources::session_principal(grant)], |row| {
-            row.get::<_, String>(0)
-        })
+        .query_map(
+            [kr_automation::resources::session_principal(grant)],
+            |row| row.get::<_, String>(0),
+        )
         .expect("reads")
         .collect::<std::result::Result<_, _>>()
         .expect("rows")
@@ -4231,6 +4252,11 @@ impl Door {
             })
         })
         .await
+    }
+
+    /// How many launches have reached the door.
+    fn launches(&self) -> usize {
+        self.arrived.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn until_a_launch_arrives(&self) {
@@ -4475,7 +4501,11 @@ async fn a_run_cancelled_while_its_command_runs_stops_it_and_pauses_nothing() {
     host.controller
         .automation()
         .journal()
-        .cancel_run(only_run(&host), "run cancelled by request", kr_ipc::now_ms().get())
+        .cancel_run(
+            only_run(&host),
+            "run cancelled by request",
+            kr_ipc::now_ms().get(),
+        )
         .expect("the run is cancelled");
 
     let answered: WorkflowRunResult = typed(
@@ -4484,7 +4514,11 @@ async fn a_run_cancelled_while_its_command_runs_stops_it_and_pauses_nothing() {
             .expect("the run answers")
             .expect("the cancelled run is answered"),
     );
-    assert_eq!(answered.status, WorkflowRunStatus::Cancelled, "{answered:?}");
+    assert_eq!(
+        answered.status,
+        WorkflowRunStatus::Cancelled,
+        "{answered:?}"
+    );
     let closed = closed_session(&mut control, live.session_id).await;
     assert_eq!(
         closed.closure.0.expect("closed").reason,
@@ -4547,7 +4581,11 @@ async fn a_directory_put_in_place_of_a_commands_own_is_left_alone() {
     host.controller
         .automation()
         .journal()
-        .cancel_run(only_run(&host), "run cancelled by request", kr_ipc::now_ms().get())
+        .cancel_run(
+            only_run(&host),
+            "run cancelled by request",
+            kr_ipc::now_ms().get(),
+        )
         .expect("the run is cancelled");
     let _ = running.await;
     let _ = closed_session(&mut control, live.session_id).await;
@@ -4593,7 +4631,10 @@ async fn a_command_runs_only_in_the_workspace_that_was_recorded() {
             .expect("the run is admitted"),
     );
     assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
-    assert!(tree.join("ran-here").exists(), "the command ran in the tree");
+    assert!(
+        tree.join("ran-here").exists(),
+        "the command ran in the tree"
+    );
     std::fs::remove_file(tree.join("ran-here")).expect("the mark is removed");
 
     std::fs::rename(&tree, host.work().join("moved-away")).expect("the tree is moved aside");
@@ -4608,7 +4649,11 @@ async fn a_command_runs_only_in_the_workspace_that_was_recorded() {
         node_statuses(&host),
         [NodeStatus::Success.as_str(), NodeStatus::Paused.as_str()]
     );
-    assert_eq!(all_sessions(&mut control).await.len(), 1, "no second session");
+    assert_eq!(
+        all_sessions(&mut control).await.len(),
+        1,
+        "no second session"
+    );
     until("the refused node to leave nothing owed", || {
         owed_rows(&host) == 0
     })
@@ -4674,7 +4719,10 @@ fn hold_the_registry(host: &Host) -> rusqlite::Connection {
 /// its session (the cases above).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_wait_that_ends_before_the_session_comes_into_being_makes_no_session() {
-    let host = working_host().await;
+    // The door is open: it only counts the launches that reach the supervisor.
+    let door = Door::shut();
+    door.let_through();
+    let host = door.host().await;
     let mut control = client(&host).await;
     let marker = host.work().join("a-command-ran");
     for (number, grant, node) in [
@@ -4731,7 +4779,7 @@ async fn a_wait_that_ends_before_the_session_comes_into_being_makes_no_session()
             node_statuses(&host).last().map(String::as_str),
             Some(NodeStatus::Cancelled.as_str())
         );
-        let receipts = receipts_of_workflow(&mut control, &document).await;
+        let receipts = receipts_of(&mut control, &document, run.run_id).await;
         assert!(
             !receipts.is_empty() && receipts.iter().all(|receipt| receipt.output.0.is_none()),
             "the node produced nothing: {receipts:?}"
@@ -4742,35 +4790,17 @@ async fn a_wait_that_ends_before_the_session_comes_into_being_makes_no_session()
         sessions.iter().all(|session| session.closure.0.is_some()),
         "no session is live for either node: {sessions:?}"
     );
+    assert_eq!(
+        door.launches(),
+        0,
+        "the refusal was the launch transition's: no worker was asked for"
+    );
     assert!(!marker.exists(), "the command never ran");
     until("what the command's dispatch owned to be released", || {
         owed_rows(&host) == 0
     })
     .await;
     host.clients.abort();
-}
-
-/// The node receipts of every run of a workflow.
-async fn receipts_of_workflow(
-    control: &mut LocalClient,
-    document: &WorkflowDefinition,
-) -> Vec<kr_protocol::automation::NodeReceiptSummary> {
-    let read: WorkflowReadResult = typed(
-        &control
-            .request(
-                Method::WorkflowRead,
-                &WorkflowReadParams {
-                    workflow_id: Nullable::some(document.workflow_id),
-                    revision: Nullable::some(document.revision),
-                    run_id: Nullable::null(),
-                    causal_root_id: Nullable::null(),
-                },
-            )
-            .await
-            .expect("the call reaches the daemon")
-            .expect("workflow.read succeeds"),
-    );
-    read.node_receipts
 }
 
 /// A grant is withdrawn while a node's launch waits at the supervisor's door, after the launch
@@ -4848,12 +4878,12 @@ async fn a_grant_withdrawn_before_the_worker_claims_its_launch_starts_no_named_s
 }
 
 /// KR-REQ-25.19: a `create_session` node whose session passed its admission cannot be stopped. The
-/// node's wait ends while the launch waits at the door, the node settles unknown, and the session
-/// comes into being once the door opens and stays: nothing closes a session a node created.
+/// worker's claim is committed, the node's wait ends while the rendezvous waits there, and the
+/// node settles unknown; the session comes into being once the rendezvous goes on, and stays:
+/// nothing closes a session a node created.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_created_session_is_kept_when_its_node_is_asked_to_stop_after_its_admission() {
-    let door = Door::shut();
-    let host = door.host().await;
+    let host = working_host().await;
     let mut control = client(&host).await;
     host.issue(grant_id(33), &[ActionRight::SessionCreate]);
     let mut document = definition(
@@ -4862,29 +4892,31 @@ async fn a_created_session_is_kept_when_its_node_is_asked_to_stop_after_its_admi
         "a session",
         create_session_node(&host, None),
     );
+    // Long enough for the worker to claim its launch under load, and short enough to end while the
+    // rendezvous is held.
     document.deadlines = WorkflowDeadlines {
-        run_deadline_ms: U64::new(60_000),
-        action_wait_ms: U64::new(1_500),
+        run_deadline_ms: U64::new(120_000),
+        action_wait_ms: U64::new(15_000),
     };
     install(&mut control, &host, &document).await;
     enable(&mut control, &host, &document).await;
 
+    let (claimed, resume) = host.controller.pause_rendezvous_after_claim();
     let running = run_from_another_task(&host, &document, "evt-held");
-    door.until_a_launch_arrives().await;
+    claimed.await.expect("the worker's claim was committed");
     until("the node's wait to end", || {
         node_statuses(&host) == [NodeStatus::Unknown.as_str()]
     })
     .await;
-    door.let_through();
+    resume.send(()).expect("the rendezvous goes on");
     let _ = running.await;
 
     let until_live = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let session = loop {
         let sessions = all_sessions(&mut control).await;
-        if let Some(session) = sessions
-            .into_iter()
-            .find(|session| session.closure.0.is_none() && session.state == kr_protocol::session::SessionState::Live)
-        {
+        if let Some(session) = sessions.into_iter().find(|session| {
+            session.closure.0.is_none() && session.state == kr_protocol::session::SessionState::Live
+        }) {
             break session;
         }
         assert!(

@@ -786,11 +786,8 @@ async fn a_cancellation_committed_as_the_wait_lapses_pauses_nothing() {
     *clock
         .armed
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((
-        Arc::clone(service.store()),
-        run_id,
-        1_000 + 600_001,
-    ));
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((Arc::clone(service.store()), run_id, 1_000 + 600_001));
 
     let answered = tokio::time::timeout(std::time::Duration::from_secs(10), running)
         .await

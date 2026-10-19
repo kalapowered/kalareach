@@ -1077,7 +1077,10 @@ fn start_window(
 ///
 /// The directory is made here and nowhere else: one that is already there is the leftover of this
 /// node's own earlier attempt only if it is private and empty, and is refused otherwise.
-fn make_scratch(root: &std::path::Path, scratch: &std::path::Path) -> kr_automation::Result<String> {
+fn make_scratch(
+    root: &std::path::Path,
+    scratch: &std::path::Path,
+) -> kr_automation::Result<String> {
     let refused = |what: &str, error: &dyn std::fmt::Display| {
         kr_automation::AutomationError::InvalidArgument(format!(
             "the directory this command runs in {what}: {error}"
@@ -3155,7 +3158,11 @@ mod tests {
         use std::time::Duration;
 
         let wait = Duration::from_secs(600);
-        assert_eq!(start_window(wait, None), wait, "a grant with no end holds nothing back");
+        assert_eq!(
+            start_window(wait, None),
+            wait,
+            "a grant with no end holds nothing back"
+        );
         assert_eq!(
             start_window(wait, Some(Duration::from_secs(3_600))),
             wait,
@@ -3183,7 +3190,10 @@ mod tests {
         let identity = made();
         std::fs::write(scratch.join("output"), b"x").expect("a file in it");
         remove_scratch(root.path(), &scratch, Some(&identity)).expect("it is removed");
-        assert!(!scratch.exists(), "the directory that was made goes with its contents");
+        assert!(
+            !scratch.exists(),
+            "the directory that was made goes with its contents"
+        );
 
         // Moved aside, not removed: a removed directory's inode can be handed to the next one.
         let identity = made();
@@ -3191,7 +3201,10 @@ mod tests {
         std::fs::create_dir(&scratch).expect("another directory is put at its path");
         std::fs::write(scratch.join("precious"), b"y").expect("a file in it");
         remove_scratch(root.path(), &scratch, Some(&identity)).expect("nothing to remove");
-        assert!(scratch.join("precious").exists(), "another directory is left alone");
+        assert!(
+            scratch.join("precious").exists(),
+            "another directory is left alone"
+        );
         std::fs::remove_dir_all(&scratch).expect("cleared");
 
         std::fs::create_dir(&scratch).expect("an unidentified directory");
@@ -3200,7 +3213,10 @@ mod tests {
         std::fs::create_dir(&scratch).expect("an unidentified directory");
         std::fs::write(scratch.join("precious"), b"z").expect("a file in it");
         remove_scratch(root.path(), &scratch, None).expect("a full one is left");
-        assert!(scratch.join("precious").exists(), "an unidentified directory with contents stays");
+        assert!(
+            scratch.join("precious").exists(),
+            "an unidentified directory with contents stays"
+        );
 
         let elsewhere = tempfile::tempdir().expect("another root");
         let outside = elsewhere.path().join("node");
