@@ -1091,6 +1091,8 @@ fn an_application_notice_is_untrusted_and_is_never_a_pending_approval() {
     );
 }
 
+/// KR-REQ-25.02: an application notice with no input-lease holder is routed by the owner's
+/// notification policy, and Attention retains it.
 #[test]
 fn a_notice_with_no_lease_holder_goes_to_the_owner_policy_and_stays_in_attention() {
     let mut attention = engine();
@@ -1118,6 +1120,8 @@ fn a_notice_with_no_lease_holder_goes_to_the_owner_policy_and_stays_in_attention
     );
 }
 
+/// KR-REQ-25.02: an OSC notification stays an untrusted notice: no wait raises it above
+/// informational, and no rule repeats it.
 #[test]
 fn an_untrusted_notice_never_reaches_an_urgent_level_however_long_it_waits() {
     let mut attention = engine();
@@ -1127,10 +1131,9 @@ fn an_untrusted_notice_never_reaches_an_urgent_level_however_long_it_waits() {
     attention
         .tick_all(reading(IDLE_REMINDER_MS * 12))
         .expect("the store records the decision");
-    assert_eq!(
-        whole_inbox(&attention).remove(0).level,
-        AttentionLevel::Informational
-    );
+    let item = whole_inbox(&attention).remove(0);
+    assert!(!item.trusted, "any process can print one");
+    assert_eq!(item.level, AttentionLevel::Informational);
     assert_eq!(rule(AttentionRule::ApplicationNotice).repeat_ms, None);
 }
 

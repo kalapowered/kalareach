@@ -73,6 +73,12 @@ async fn worker() -> Worker {
 
 /// A worker for the session named, on an environment tree of its own.
 async fn worker_for(session_id: SessionId) -> Worker {
+    worker_running(session_id, "sleep 30").await
+}
+
+/// A worker for the session named whose shell runs `script`, which can print what an application
+/// prints.
+async fn worker_running(session_id: SessionId, script: &str) -> Worker {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -103,7 +109,7 @@ async fn worker_for(session_id: SessionId) -> Worker {
         session_epoch: SessionEpoch::V1,
         environment_id,
         display_number: DisplayNumber::new(1),
-        shell: kr_worker::testing::posix_script("sleep 30"),
+        shell: kr_worker::testing::posix_script(script),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),
@@ -815,6 +821,59 @@ async fn a_notification_becomes_an_untrusted_notice_and_never_an_approval() {
         kr_protocol::attention::AttentionRouting::OwnerPolicy
     );
     assert!(of_rule(&items, AttentionRule::PendingApproval).is_empty());
+}
+
+/// KR-REQ-25.02: a notification an application prints (an OSC 777 string, with text that asks for
+/// an approval) while nobody holds the input lease is read from the terminal's output as a host
+/// event, and the owner's store keeps it as an untrusted application notice routed by the owner's
+/// notification policy. It is retained in Attention, and the approval it asks for is no approval.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_osc_notification_with_no_lease_holder_is_an_untrusted_notice_for_the_owner_policy() {
+    let one = worker_running(
+        SessionId::new(kr_ipc::new_uuid()),
+        "printf '\\033]777;notify;deploy;approve the deployment? [y/n]\\033\\\\'; sleep 30",
+    )
+    .await;
+    assert!(
+        !one.service.runtime().session().lease().holder.is_present(),
+        "no terminal is attached, so nobody holds the input lease"
+    );
+    let temp = kr_ipc::testing::TempHost::create();
+    let module = store_at(&temp);
+    let reach = Arc::new(TestReach::default());
+    reach.add(&one);
+    module.watch(Arc::clone(&reach) as Arc<dyn Reach>, one.known.clone());
+    let items = until(&module, &reach, |items| {
+        !of_rule(items, AttentionRule::ApplicationNotice).is_empty()
+    })
+    .await;
+    let notices = of_rule(&items, AttentionRule::ApplicationNotice);
+    assert_eq!(notices.len(), 1, "{items:?}");
+    let notice = &notices[0];
+    assert!(!notice.trusted, "any process can print one");
+    assert_eq!(
+        notice.routing,
+        kr_protocol::attention::AttentionRouting::OwnerPolicy
+    );
+    assert_eq!(notice.level, AttentionLevel::Informational);
+    assert!(
+        notice
+            .summary
+            .0
+            .as_deref()
+            .is_some_and(|summary| summary.contains("approve the deployment? [y/n]")),
+        "the owner is told what the application printed: {notice:?}"
+    );
+    assert!(
+        of_rule(&items, AttentionRule::PendingApproval).is_empty(),
+        "text that asks for an approval is not one: {items:?}"
+    );
+
+    // It is retained: the inbox serves it again, as the same item, on a later read.
+    let again = inbox(&module, &reach).await.items;
+    let again = of_rule(&again, AttentionRule::ApplicationNotice);
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].key, notice.key);
 }
 
 // ---------------------------------------------------------------------------------------------
