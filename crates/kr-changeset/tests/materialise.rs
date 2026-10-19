@@ -815,9 +815,9 @@ fn declared(
 
 /// KR-REQ-25.20: a run that wrote only where its suite declares output attests the version it ran
 /// against. The directory it wrote is recorded as one reference that names its listing, and
-/// nothing beneath it is read into the content store. A link inside it, and a file the listing
-/// cannot read, are entries and not failures. The control is the same run without the declaration,
-/// which cannot attest the version.
+/// nothing beneath it is read into the content store. A link inside it is an entry and not a
+/// failure. The control is the same run without the declaration, which cannot attest the
+/// version.
 #[test]
 fn a_run_that_wrote_only_its_declared_output_attests_the_version() {
     let fixture = Fixture::create();
@@ -853,6 +853,19 @@ fn a_run_that_wrote_only_its_declared_output_attests_the_version() {
         result.outputs.iter().any(|output| output.kind == "log"),
         "the outputs the report names are kept beside it"
     );
+    assert!(
+        !fixture
+            .service()
+            .objects()
+            .holds(kr_changeset::objects::digest_of(b"built things\n"))
+            .expect("the store is asked"),
+        "nothing an output holds enters the content store"
+    );
+    assert!(
+        result.attestation.contains("build/output"),
+        "the result names the path it left out of the comparison: {}",
+        result.attestation
+    );
 
     // The control: the same directory without the declaration is source the run added.
     let (_, undeclared) = a_copy_to_run_in(&fixture, "built-undeclared");
@@ -866,8 +879,8 @@ fn a_run_that_wrote_only_its_declared_output_attests_the_version() {
 
 /// KR-REQ-25.20: only the declared path is left out. A path the run added beside it makes the
 /// source indeterminate, as it would without any declaration, and the reading is recorded as a
-/// derived version. A declared output that is a file over the byte bound, or a link, is a
-/// reference of its own kind and not a failure.
+/// derived version. A declared output that is a link is a reference of its own kind and not a
+/// failure.
 #[test]
 fn a_path_beside_a_declared_output_still_changes_the_source() {
     let fixture = Fixture::create();
@@ -910,6 +923,233 @@ fn a_path_beside_a_declared_output_still_changes_the_source() {
         "a link as an output is recorded as one: {:?}",
         result.outputs
     );
+}
+
+/// KR-REQ-25.20: a declared output over a bound is a reference and never a reason to doubt the
+/// source. A file over the byte bound is digested up to it and recorded with its whole length, and
+/// a directory with more entries than a listing holds is a truncated listing.
+#[test]
+fn an_output_over_a_bound_is_a_reference_and_never_a_reason_to_doubt_the_source() {
+    let fixture = Fixture::create();
+    let (record, made) = a_copy_to_run_in(&fixture, "bounds");
+    let directory = Path::new(&made.directory_path);
+    std::fs::File::create(directory.join("big.bin"))
+        .expect("a file")
+        .set_len(materialise::MAX_OUTPUT_FILE_BYTES + 1)
+        .expect("a sparse file one byte over the bound");
+    std::fs::create_dir(directory.join("many")).expect("a directory");
+    for number in 0..=materialise::MAX_OUTPUT_ENTRIES {
+        std::fs::File::create(directory.join("many").join(format!("f{number}"))).expect("an entry");
+    }
+
+    let outputs =
+        declared(&fixture, &record, &["big.bin", "many"]).expect("the declaration is fine");
+    let result = materialise::record_result_with(
+        fixture.service(),
+        made.materialisation_id,
+        &report(),
+        &outputs,
+    )
+    .expect("the result is recorded");
+    assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
+    let big = result
+        .outputs
+        .iter()
+        .find(|output| output.label == "big.bin")
+        .expect("the file is recorded");
+    assert_eq!(big.kind, "file over the byte bound");
+    assert_eq!(big.byte_len.get(), materialise::MAX_OUTPUT_FILE_BYTES + 1);
+    assert_eq!(
+        big.digest,
+        kr_changeset::objects::digest_of(&vec![0_u8; materialise::MAX_OUTPUT_FILE_BYTES as usize]),
+        "the digest is of the first bytes up to the bound and no more"
+    );
+    let many = result
+        .outputs
+        .iter()
+        .find(|output| output.label == "many")
+        .expect("the directory is recorded");
+    assert_eq!(many.kind, "truncated directory listing");
+}
+
+/// KR-REQ-25.20: two directory names that read alike as text are two directories. A name that is
+/// not text and one that is text with the replacement character are listed once each, the second
+/// is entered and the first is not, and neither is opened as the other, so what one holds is never
+/// counted for the other.
+#[cfg(target_os = "linux")]
+#[test]
+fn names_that_read_alike_as_text_are_listed_as_the_directories_they_are() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let fixture = Fixture::create();
+    let (record, made) = a_copy_to_run_in(&fixture, "alike");
+    let directory = Path::new(&made.directory_path);
+    let not_text = directory
+        .join("output")
+        .join(std::ffi::OsStr::from_bytes(b"\xff"));
+    std::fs::create_dir_all(&not_text).expect("a directory whose name is not text");
+    std::fs::write(not_text.join("a"), b"a").expect("one byte in it");
+    let replacement = directory.join("output").join("\u{FFFD}");
+    std::fs::create_dir_all(&replacement).expect("a directory whose name is the replacement");
+    std::fs::write(replacement.join("bb"), b"bb").expect("two bytes in it");
+
+    let outputs = declared(&fixture, &record, &["output"]).expect("the declaration is fine");
+    let result = materialise::record_result_with(
+        fixture.service(),
+        made.materialisation_id,
+        &report(),
+        &outputs,
+    )
+    .expect("the result is recorded");
+    let listing = result
+        .outputs
+        .iter()
+        .find(|output| output.label == "output")
+        .expect("the output is recorded");
+    assert_eq!(
+        listing.byte_len.get(),
+        2,
+        "the directory named in text holds two bytes and is counted once, and the one whose name \
+         is not text is listed and not entered"
+    );
+}
+
+/// KR-REQ-25.20: the bound on a listing holds at an entry that could not be read as well. One
+/// directory holds twenty-five thousand directories its owner cannot read; each is an entry and
+/// so is the failure to read it, which is one entry more than a listing holds, and the last of
+/// them is where the bound is met. The listing is a truncated one and the source is still attested.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_entry_at_the_bound_makes_a_truncated_listing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if rustix::process::geteuid().is_root() {
+        println!("not exercised: this process reads a directory whatever its mode says");
+        return;
+    }
+    let fixture = Fixture::create();
+    let (record, made) = a_copy_to_run_in(&fixture, "unreadable");
+    let directory = Path::new(&made.directory_path);
+    let output = directory.join("out").join("inner");
+    std::fs::create_dir_all(&output).expect("a directory in the output");
+    for number in 0..materialise::MAX_OUTPUT_ENTRIES / 2 {
+        let unreadable = output.join(format!("d{number}"));
+        std::fs::create_dir(&unreadable).expect("a directory");
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+            .expect("its owner cannot read it");
+    }
+
+    let outputs = declared(&fixture, &record, &["out"]).expect("the declaration is fine");
+    let result = materialise::record_result_with(
+        fixture.service(),
+        made.materialisation_id,
+        &report(),
+        &outputs,
+    )
+    .expect("the result is recorded");
+    assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
+    let listing = result
+        .outputs
+        .iter()
+        .find(|output| output.label == "out")
+        .expect("the output is recorded");
+    assert_eq!(listing.kind, "truncated directory listing");
+}
+
+/// KR-REQ-25.20: a declared output below a directory the capture's grant keeps out is reached
+/// through that directory and nothing else of it is: what a run puts beside the output, in a
+/// directory the grant keeps out, is still an input this host cannot account for.
+#[test]
+fn an_output_below_a_directory_the_grant_keeps_out_is_reached_and_its_neighbours_are_not() {
+    let fixture = Fixture::create();
+    ordinary_repository(fixture.work(), "granted");
+    let workspace = fixture.workspace("granted");
+    let grant = kr_protocol::changeset::FileGrant {
+        included_paths: vec!["src".to_owned()],
+        excluded_paths: Vec::new(),
+        secret_rules_applied: true,
+    };
+    let record = fixture
+        .capture_with(workspace, &include_everything(), &grant, None, None)
+        .expect("the capture succeeds");
+    let copy = |label: &str| {
+        materialise::materialise(
+            fixture.service(),
+            reference(&record),
+            MaterialisationPurpose::Test,
+            label,
+            None,
+        )
+        .expect("the version is materialised")
+    };
+    let outputs = declared(&fixture, &record, &["target/debug"]).expect("the declaration is fine");
+
+    let made = copy("only the output");
+    write(
+        Path::new(&made.directory_path),
+        "target/debug/artefact",
+        "built\n",
+    );
+    let result = materialise::record_result_with(
+        fixture.service(),
+        made.materialisation_id,
+        &report(),
+        &outputs,
+    )
+    .expect("the result is recorded");
+    assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
+
+    let made = copy("a neighbour of the output");
+    write(
+        Path::new(&made.directory_path),
+        "target/debug/artefact",
+        "built\n",
+    );
+    write(
+        Path::new(&made.directory_path),
+        "target/other/file",
+        "not an output\n",
+    );
+    let result = materialise::record_result_with(
+        fixture.service(),
+        made.materialisation_id,
+        &report(),
+        &outputs,
+    )
+    .expect("the result is recorded");
+    assert_eq!(result.tested_source, TestedSource::Indeterminate);
+}
+
+/// A materialisation a run left read-only, in a name this host does not accept as input, with a
+/// root its owner cannot search, is taken away: the owner's right to change each directory is given
+/// back first and each level is removed through its own handle. Without this a copy would hold its
+/// version for ever.
+#[test]
+fn a_materialisation_a_run_left_read_only_is_released() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::create();
+    let (_, made) = a_copy_to_run_in(&fixture, "read-only");
+    let directory = Path::new(&made.directory_path);
+    write(directory, "vendor/module/file.go", "package module\n");
+    write(
+        directory,
+        "vendor/nul/file",
+        "a name a Windows device has\n",
+    );
+    for tree in ["vendor/nul", "vendor/module", "vendor"] {
+        std::fs::set_permissions(directory.join(tree), std::fs::Permissions::from_mode(0o555))
+            .expect("the tree is read-only");
+    }
+
+    // And the root itself can be one its owner cannot search.
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o400))
+        .expect("the root cannot be searched");
+
+    let released = materialise::release(fixture.service(), made.materialisation_id)
+        .expect("a read-only tree is released");
+    assert!(released.released_at_ms.0.is_some());
+    assert!(!directory.exists(), "the directory is gone");
 }
 
 /// KR-REQ-25.20: declarations that contradict each other or the version are refused before a run

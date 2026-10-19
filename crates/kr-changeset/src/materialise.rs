@@ -380,7 +380,12 @@ pub fn reread_with(
     let parent = service
         .root()
         .subdirectory(&RelativeName::parse(MATERIALISATIONS_DIRECTORY)?)?;
-    let directory = match parent.subdirectory(&RelativeName::parse(&row.directory_name)?) {
+    // Confined to the mount the directory is on: a mount a run grafted into its copy is content
+    // the version never held, and this reading refuses to follow it.
+    let directory = match parent
+        .subdirectory(&RelativeName::parse(&row.directory_name)?)
+        .and_then(AuthorisedDirectory::confined_to_one_mount)
+    {
         Ok(directory) => directory,
         Err(error) => {
             return Ok((
@@ -479,6 +484,10 @@ pub const MAX_OUTPUT_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// truncated listing, which is never a reason to call the source indeterminate.
 pub const MAX_OUTPUT_ENTRIES: usize = 50_000;
 
+/// The most bytes of paths an output directory's listing holds, so that entries with long names
+/// fill it before they fill memory; a listing that reaches it is a truncated listing.
+pub const MAX_OUTPUT_LISTING_PATH_BYTES: usize = 16 * 1024 * 1024;
+
 impl Outputs {
     /// No declared output: every path is source.
     #[must_use]
@@ -490,9 +499,10 @@ impl Outputs {
     ///
     /// A declaration is a relative path of names this host can carry, with no `.` or `..`, no
     /// empty name and no trailing separator, spelled as the version spells it (the comparison is
-    /// exact, with case). No declaration holds another, and none holds, or is held by, a path the
-    /// version has: an output the version already contains is source, and a run that writes it
-    /// has changed the source.
+    /// exact, with case). No declaration holds another, and no path of the version is a declared
+    /// path or lies inside one: an output the version already contains is source, and a run that
+    /// writes it has changed the source. A declaration beneath a file of the version is not
+    /// refused, because writing there takes the file away first, which reads as a change.
     ///
     /// # Errors
     ///
@@ -941,12 +951,12 @@ fn describe_output(
         },
         Ok(ObjectKind::Directory) => match directory.subdirectory(name) {
             Ok(child) => {
-                let mut listed = Vec::new();
-                let complete = list_output(child.handle(), "", &mut listed, 0);
-                listed.sort();
+                let mut listing = OutputListing::default();
+                let complete = list_output(&child, "", &mut listing, 0);
+                listing.entries.sort();
                 let mut text = String::new();
                 let mut total = 0_u64;
-                for entry in &listed {
+                for entry in &listing.entries {
                     total = total.saturating_add(entry.length);
                     text.push_str(&format!(
                         "{}\t{}\t{}\t{}\n",
@@ -982,53 +992,74 @@ struct Listed {
     written_at_nanos: Option<u64>,
 }
 
-/// Lists every entry beneath `directory` into `listed`, recursing into real directories only.
-/// Answers false when the listing stopped at a bound.
+/// What a directory output's listing holds so far.
+#[derive(Default)]
+struct OutputListing {
+    entries: Vec<Listed>,
+    /// The bytes of the paths in `entries`.
+    path_bytes: usize,
+}
+
+/// Adds one entry to a listing unless the listing is full, by entries or by the bytes of its
+/// paths. The bound holds before every append, an entry that could not be read included.
+fn push_listed(listing: &mut OutputListing, entry: Listed) -> bool {
+    let bytes = listing.path_bytes.saturating_add(entry.path.len());
+    if listing.entries.len() >= MAX_OUTPUT_ENTRIES || bytes > MAX_OUTPUT_LISTING_PATH_BYTES {
+        return false;
+    }
+    listing.path_bytes = bytes;
+    listing.entries.push(entry);
+    true
+}
+
+/// A listing entry for something this host could not read.
+fn unreadable(path: String) -> Listed {
+    Listed {
+        path,
+        kind: "unreadable",
+        length: 0,
+        written_at_nanos: None,
+    }
+}
+
+/// Lists every entry beneath `directory` into `listed`, descending into real directories only:
+/// each is opened without following a link and on the mount `directory` is confined to, so a
+/// directory replaced by a link, or mounted over, is an entry and never a way out. Answers false
+/// when the listing stopped at a bound.
 fn list_output(
-    directory: &cap_std::fs::Dir,
+    directory: &AuthorisedDirectory,
     prefix: &str,
-    listed: &mut Vec<Listed>,
+    listed: &mut OutputListing,
     depth: usize,
 ) -> bool {
     if depth >= crate::capture::MAX_WALK_DEPTH {
         return false;
     }
-    let Ok(entries) = directory.entries() else {
-        listed.push(Listed {
-            path: prefix.to_owned(),
-            kind: "unreadable",
-            length: 0,
-            written_at_nanos: None,
-        });
-        return true;
+    let Ok(entries) = directory.handle().entries() else {
+        return push_listed(listed, unreadable(prefix.to_owned()));
     };
     let mut complete = true;
     for entry in entries {
         let Ok(entry) = entry else {
-            listed.push(Listed {
-                path: format!("{prefix}/?"),
-                kind: "unreadable",
-                length: 0,
-                written_at_nanos: None,
-            });
+            if !push_listed(listed, unreadable(format!("{prefix}/?"))) {
+                return false;
+            }
             continue;
         };
-        if listed.len() >= MAX_OUTPUT_ENTRIES {
-            return false;
-        }
+        // The text of the path is for the listing; a directory is opened by the name it has, so a
+        // name that is not text is an entry that is not entered, and two names that read alike
+        // are never opened as one.
         let name = entry.file_name().to_string_lossy().into_owned();
+        let exact_name = entry.file_name().into_string().ok();
         let path = if prefix.is_empty() {
             name.clone()
         } else {
             format!("{prefix}/{name}")
         };
-        let Ok(metadata) = directory.symlink_metadata(entry.file_name()) else {
-            listed.push(Listed {
-                path,
-                kind: "unreadable",
-                length: 0,
-                written_at_nanos: None,
-            });
+        let Ok(metadata) = directory.handle().symlink_metadata(entry.file_name()) else {
+            if !push_listed(listed, unreadable(path)) {
+                return false;
+            }
             continue;
         };
         let written = metadata
@@ -1038,27 +1069,35 @@ fn list_output(
             .and_then(|since| u64::try_from(since.as_nanos()).ok());
         let file_type = metadata.file_type();
         if file_type.is_dir() {
-            listed.push(Listed {
+            let directory_entry = Listed {
                 path: path.clone(),
                 kind: "directory",
                 length: 0,
                 written_at_nanos: written,
-            });
-            match directory.open_dir(entry.file_name()) {
-                Ok(child) => {
+            };
+            if !push_listed(listed, directory_entry) {
+                return false;
+            }
+            // A name this host does not carry (or that is not text), a link put in the directory's
+            // place, and a mount are each an entry that is not entered.
+            let child = exact_name
+                .as_deref()
+                .and_then(|name| RelativeName::parse(name).ok())
+                .and_then(|name| directory.subdirectory(&name).ok());
+            match child {
+                Some(child) => {
                     if !list_output(&child, &path, listed, depth + 1) {
                         complete = false;
                     }
                 }
-                Err(_) => listed.push(Listed {
-                    path: format!("{path}/?"),
-                    kind: "unreadable",
-                    length: 0,
-                    written_at_nanos: None,
-                }),
+                None => {
+                    if !push_listed(listed, unreadable(format!("{path}/?"))) {
+                        return false;
+                    }
+                }
             }
         } else {
-            listed.push(Listed {
+            let other = Listed {
                 path,
                 kind: if file_type.is_symlink() {
                     "link"
@@ -1073,7 +1112,10 @@ fn list_output(
                     0
                 },
                 written_at_nanos: written,
-            });
+            };
+            if !push_listed(listed, other) {
+                return false;
+            }
         }
     }
     complete
@@ -1203,6 +1245,19 @@ pub fn record_result_with(
                  version: {detail}"
             ),
         ),
+    };
+    let attestation = if found.is_empty() {
+        attestation
+    } else {
+        format!(
+            "{attestation}. The declared output paths {} were left out of that comparison and are \
+             recorded as references",
+            found
+                .iter()
+                .map(|reference| reference.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     };
     let result = MaterialisationResult {
         materialisation_id,
@@ -1400,15 +1455,15 @@ pub fn release(
             // was **empty**. Everything beneath it is therefore this host's own writing and
             // whatever the run it served put there. Nothing is asked about the content, because a
             // run that rewrote, replaced or removed a file this host wrote is the ordinary case a
-            // materialisation exists for.
-            empty(&directory, 0)?;
-            // The name goes last, and only as an empty-directory removal, which takes nothing that
-            // holds anything. What is left is the limit every removal by name has: an empty
-            // directory somebody put there in the instant after the check.
-            parent
-                .handle()
-                .remove_dir(name.as_str())
-                .map_err(ChangeSetError::storage)?;
+            // materialisation exists for. A run can have taken the owner's right to change a
+            // directory away (a read-only tree is what some toolchains leave), and that is given
+            // back to this host's own directories before they are emptied.
+            let directory = directory.confined_to_one_mount()?;
+            make_removable(&directory);
+            // The project's removal for a directory it made: it stays on the directory's own
+            // mount, enters each level without following a link, takes names this host would not
+            // accept as input, and removes the name only once what it holds is gone.
+            parent.remove_tree(&name, directory)?;
             parent.sync(kr_flush::NameKind::Directory)?;
         }
         // A plain absence is a release that already happened. Anything else is a failure: this
@@ -1425,56 +1480,103 @@ pub fn release(
     Ok(record)
 }
 
-/// Empties one directory through its own open handle.
+/// Gives the owner back the right to change every directory of a materialisation, through
+/// descriptors this host opens beneath it: a run can leave a tree read-only, and a removal cannot
+/// take a name out of a directory its owner cannot write.
 ///
-/// Nothing here resolves a name a second time: each level is opened from the level above, and each
-/// entry is removed by the handle that holds it.
-fn empty(directory: &AuthorisedDirectory, depth: usize) -> Result<()> {
-    if depth >= crate::capture::MAX_WALK_DEPTH {
-        return Err(ChangeSetError::StorageUnavailable {
-            detail: format!(
-                "this materialisation is more than {} levels deep, which is deeper than this host \
-                 removes",
-                crate::capture::MAX_WALK_DEPTH
-            )
-            .into(),
-        });
+/// Every name the tree holds is reached, whatever it is called: each directory is opened without
+/// following a link, from the descriptor of the directory above it, and is entered only when it is
+/// on the mount of the copy's root, compared as the project's authority compares one (a mount of
+/// the same filesystem is another mount, and nothing in it is touched). The root's own mode is
+/// given back through the library's handle, which needs no right to search the directory. Only
+/// this host's own directories change. A directory whose owner cannot read it, or that another
+/// account owns, cannot be changed, so it is left and the removal that follows fails and says why.
+#[cfg(unix)]
+fn make_removable(directory: &AuthorisedDirectory) {
+    use cap_std::fs::Dir;
+    use kr_protocol::ids::EnvironmentId;
+    use kr_transfer::authority::MountId;
+    use rustix::fd::OwnedFd;
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, fchmod, openat, statat};
+
+    /// The mount a directory was resolved through, as the project's authority names it.
+    fn mount_of(environment: EnvironmentId, descriptor: &OwnedFd) -> Option<MountId> {
+        let held = Dir::from_std_file(std::fs::File::from(descriptor.try_clone().ok()?));
+        AuthorisedDirectory::from_handle(environment, held, std::path::PathBuf::new())
+            .ok()?
+            .confined_to_one_mount()
+            .ok()?
+            .mount()
     }
-    let names: Vec<String> = directory
-        .handle()
-        .entries()
-        .map_err(ChangeSetError::storage)?
-        .map(|entry| {
-            entry
-                .map_err(ChangeSetError::storage)?
-                .file_name()
-                .into_string()
-                .map_err(|_| ChangeSetError::StorageUnavailable {
-                    detail: "this materialisation holds a name this host cannot read as text"
-                        .into(),
+
+    fn repair(environment: EnvironmentId, directory: &OwnedFd, mount: MountId, depth: usize) {
+        let _ = fchmod(directory, Mode::RWXU);
+        if depth >= kr_transfer::authority::MAX_REMOVAL_DEPTH {
+            return;
+        }
+        // The names are read and the listing is let go before any descent, so a deep tree holds
+        // one descriptor for each level and not two.
+        let names: Vec<std::ffi::CString> = {
+            let Ok(listing) = rustix::fs::Dir::read_from(directory) else {
+                return;
+            };
+            listing
+                .flatten()
+                .filter_map(|entry| {
+                    let name = entry.file_name();
+                    if name == c"." || name == c".." {
+                        return None;
+                    }
+                    let is_directory = match entry.file_type() {
+                        FileType::Directory => true,
+                        FileType::Unknown => statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+                            .is_ok_and(|about| {
+                                FileType::from_raw_mode(about.st_mode) == FileType::Directory
+                            }),
+                        _ => false,
+                    };
+                    is_directory.then(|| name.to_owned())
                 })
-        })
-        .collect::<Result<Vec<String>>>()?;
-    for component in names {
-        let name = RelativeName::parse(&component)?;
-        match directory.probe(&name) {
-            Ok(ObjectKind::Directory) => {
-                let child = directory.subdirectory(&name)?;
-                empty(&child, depth + 1)?;
-                directory
-                    .handle()
-                    .remove_dir(name.as_str())
-                    .map_err(ChangeSetError::storage)?;
+                .collect()
+        };
+        let opened = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        for name in names {
+            if let Ok(child) = openat(directory, name.as_c_str(), opened, Mode::empty())
+                && mount_of(environment, &child) == Some(mount)
+            {
+                repair(environment, &child, mount, depth + 1);
             }
-            // A file, a link or anything else that is not a directory is one entry of the
-            // directory this host holds open, removed by the handle that holds it.
-            Ok(_) => directory.remove(&name)?,
-            Err(kr_transfer::Escape::NotFound { .. }) => {}
-            Err(error) => return Err(error.into()),
         }
     }
-    Ok(())
+
+    // The root first, through the library's own handle, so that a root the owner cannot search
+    // can be opened below. Where the handle is a descriptor `fchmod` takes (macOS) that changes the
+    // directory it holds; where it is a path descriptor (Linux) it is changed through the kernel's
+    // name for the descriptor, which needs no right to search the directory.
+    if fchmod(directory.handle(), Mode::RWXU).is_err() {
+        use std::os::fd::AsRawFd as _;
+
+        let _ = rustix::fs::chmod(
+            format!("/proc/self/fd/{}", directory.handle().as_raw_fd()),
+            Mode::RWXU,
+        );
+    }
+    let Some(mount) = directory.mount() else {
+        return;
+    };
+    if let Ok(root) = openat(
+        directory.handle(),
+        c".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        repair(directory.environment_id(), &root, mount, 0);
+    }
 }
+
+/// Nothing to give back where a directory has no owner's right to lose.
+#[cfg(not(unix))]
+fn make_removable(_directory: &AuthorisedDirectory) {}
 
 /// Returns every materialisation of one version that still holds it.
 ///

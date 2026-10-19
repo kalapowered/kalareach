@@ -530,8 +530,8 @@ A test result is what this host observed, and nothing a caller reports.
 * **Declared outputs.** A suite may declare the paths it writes besides the source, such as a
   build directory. Those paths are left out of the comparison and recorded as one reference each:
   a directory is a digest of its sorted listing (path, length and instant written of every entry,
-  links listed and not followed) with the sum of the lengths it lists, up to 50,000 entries, after
-  which it is a truncated listing; a file is a digest of its first 64 MiB with its whole length; a
+  links listed and not followed) with the sum of the lengths it lists, up to 50,000 entries, 64
+  levels and 16 MiB of path text, after which it is a truncated listing; a file is a digest of its first 64 MiB with its whole length; a
   link, or an object that is neither, is recorded as what it is. A directory in an output that is
   a link, or a mount, or has a name this host does not carry, is an entry of the listing and is not
   entered. Nothing in an output enters the content store, and a result that attests the version
@@ -548,10 +548,13 @@ A test result is what this host observed, and nothing a caller reports.
   that did not release it. The owner's right to change each of the copy's directories is given
   back first, so a tree a run left read-only does not hold the version, and each level is removed
   through its own handle, without following a link and without leaving the mount the copy is on.
-  A copy that has a mount in it, a tree deeper than 128 levels, a directory its owner cannot read,
-  or an entry with an immutable flag set (on macOS) is not removed: the copy goes on holding its
-  version, the sweep keeps trying and its log names why, and a person removes what the suite
-  left.
+  Only this host's own directories change, and only those on the copy's own mount. A copy is not
+  removed, and goes on holding its version, when it has anything this account cannot take away: a
+  mount (of another filesystem, a bind mount of the same one, or a volume on another device such as
+  a subvolume), a tree deeper than 128 levels, a directory its owner cannot read, a directory
+  another account owns that holds entries (a container that ran as root leaves these), or on
+  macOS an entry with the immutable or append-only flag set or an access-control entry that denies
+  deletion. The sweep keeps trying, its log names why, and a person removes what the suite left.
 * **Reviews.** A reviewer session and the attention items for review results are refused by name
   (`request_review`, `attention_notice`); no caller can register a test or review result.
 

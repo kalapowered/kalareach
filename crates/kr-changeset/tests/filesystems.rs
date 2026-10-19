@@ -307,8 +307,6 @@ fn a_materialisation_under_another_device_number_is_still_the_version_it_was_wri
 #[cfg(unix)]
 #[test]
 fn a_release_that_stops_leaves_the_record_naming_the_filesystem_the_directory_was_found_on() {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
     let fixture = Fixture::create();
     let path = ordinary_repository(fixture.work(), "work");
     write(&path, "README.md", "the version under test\n");
@@ -323,23 +321,20 @@ fn a_release_that_stops_leaves_the_record_naming_the_filesystem_the_directory_wa
     )
     .expect("the version is materialised");
     let directory = std::path::Path::new(&made.directory_path);
-    let locked = directory.join("src");
-    if std::fs::metadata(&locked).is_ok_and(|metadata| metadata.uid() == 0) {
-        println!("not exercised: this process removes entries whatever a directory's mode says");
-        return;
-    }
     // The record as a build that recorded no filesystem wrote it.
     let journal = changeset_journal(&fixture);
     journal
         .execute("UPDATE materialisations SET identity_fs = NULL", [])
         .expect("the record is rewritten");
 
-    // A directory inside it that its entries cannot be removed from stops the release.
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
-        .expect("its entries cannot be removed");
+    // A chain of directories deeper than a removal holds handles for stops the release.
+    let chain = directory.join("deep");
+    let mut deepest = chain.clone();
+    for _ in 0..kr_transfer::authority::MAX_REMOVAL_DEPTH + 2 {
+        deepest.push("d");
+    }
+    std::fs::create_dir_all(&deepest).expect("a chain of directories");
     let stopped = materialise::release(fixture.service(), made.materialisation_id);
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
-        .expect("the directory is writable again");
     stopped.expect_err("a release that cannot empty the directory is not one");
     let filesystem: Option<Vec<u8>> = journal
         .query_row("SELECT identity_fs FROM materialisations", [], |row| {
@@ -351,6 +346,7 @@ fn a_release_that_stops_leaves_the_record_naming_the_filesystem_the_directory_wa
         Some(kr_transfer::FilesystemId::LEN),
         "the record took the filesystem the directory was found on before anything was removed"
     );
+    std::fs::remove_dir_all(&chain).expect("the chain goes by hand");
     materialise::release(fixture.service(), made.materialisation_id)
         .expect("the directory goes once its entries can");
 }
