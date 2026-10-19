@@ -203,7 +203,9 @@ written twice: `'it’’s'`.
 PowerShell puts the call operator before the line, since a quoted word at the start of a line is a
 string and not a program. A command the caller has already quoted for its target shell is
 installed exactly as given. The host quotes one thing itself: the path of a package in a startup
-entry, by the same single-quote rule.
+entry. It writes a path unquoted when every character is an ASCII letter, an ASCII digit or one of
+`.,_+:@%/-`, except that PowerShell quotes a path holding `@` or `,`; any other path takes the same
+single-quote rule.
 
 ## Launching the root shell
 

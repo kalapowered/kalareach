@@ -2,7 +2,7 @@
 //!
 //! The product keeps one retained level. The difference these tests work from is a real one: the
 //! surface of the 0.73.0 release (`tests/retained/0.73`, cut from its tag) and of the retained
-//! level, the release after it, differ by one variant of the attention source, which a record of
+//! level, a later release, differ by one variant of the attention source, which a record of
 //! the attention text request carries. The retained level is what they compare with, and not this
 //! build, because this build's surface moves with every change to a frame and these cases are
 //! about how differences are found and covered, not about what this build differs by. The other
@@ -30,7 +30,7 @@ fn old_surface() -> Surface {
     Surface::parse(SURFACE_073).expect("the 0.73 surface")
 }
 
-/// The surface of the retained level, which is the release after 0.73.0.
+/// The surface of the retained level, a later release than 0.73.0.
 fn newer_surface() -> &'static Surface {
     kr_protocol::retained::RETAINED[0].surface()
 }
