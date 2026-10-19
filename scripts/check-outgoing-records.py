@@ -123,12 +123,14 @@ PEM_HEADER = re.compile(rb"-----BEGIN ((?:[A-Z0-9]+ )*)PRIVATE KEY( BLOCK)?-----
 # to check (ciphertext, or a kind of block this does not know, unless its body is a DER structure)
 # the body has to look like random bytes, in one of two ways. Where the block's end marker follows
 # the body, only base64 and what source text puts between its pieces (of any size) may lie between
-# the header and the marker, and the characters of the whole body have to be as many and as
-# different as those of random bytes. Where it does not (a body cut off, or a marker elsewhere), the
-# first 32 characters have no words (the pieces that source text breaks apart, by quotes, joiners,
-# comment markers or line breaks, are one word; a comma, a semicolon, or spaces alone, ends a word,
-# which is what separates the pieces of a body from a list of short strings; every word is at least
-# 8 characters), hold 17 or more different characters, and the text after them goes on as a body
+# the header and the marker, the words (the pieces that spaces, tabs, semicolons, table bars, and
+# commas outside quotes separate) have to be at least 8 characters except the last, and the
+# characters of the whole body have to be as many and as different as those of random bytes. Where
+# it does not (a body cut off, or a marker elsewhere), the first 32 characters have no words (the
+# pieces that source text breaks apart, by quotes, joiners, comment markers or line breaks, are one
+# word; a comma, a semicolon, a table bar or spaces alone end a word, which is what separates the
+# pieces of a body from a list of short strings; every word is at least 8 characters), hold 17 or
+# more different characters, and the text after them goes on as a body
 # goes on (a line break, a quote, an escape, padding, the end, or a space and another long run of
 # base64, or a last short one that padding, a quote or the end follows), not into a short word, a
 # call or code.
@@ -145,8 +147,8 @@ ENCRYPTED_LINE = re.compile(rb"(?:Proc-Type|DEK-Info): ")
 BASE64 = re.compile(rb"(?:[A-Za-z0-9+/]|\\+/)+")
 MINIMUM_RUN = 8
 PADDING = re.compile(rb"=+")
-WORD_GAP_WITH_COMMAS = re.compile(rb"[ \t,;]+")
-WORD_GAP = re.compile(rb"[ \t;]+")
+WORD_GAP = re.compile(rb"[ \t;|]+")
+QUOTING = re.compile(rb"[\"'`\\]")
 SPACED_RUN = re.compile(rb"[ \t]+((?:[A-Za-z0-9+/]|\\+/)*)")
 BODY_CHARACTERS = 32
 END_MARKER = b"-----END "
@@ -225,13 +227,23 @@ def body_ends_cleanly(window, position):
     return len(spaced.group(1)) >= MINIMUM_RUN or after in LAST_PIECE_ENDS
 
 
-def completes_block(window, position):
+def breaks_word(gap, joined_by_quotes):
+    """Whether the text between two runs of base64 ends a word: spaces, tabs, semicolons and table bars
+    alone do, and so does a comma, except where a body is known to end in its end marker and the comma
+    sits between quoted pieces (`"abcd", "efgh"`)."""
+    if WORD_GAP.fullmatch(gap):
+        return True
+    return b"," in gap and not (joined_by_quotes and QUOTING.search(gap))
+
+
+def completes_block(window, position, dropped):
     """Whether the body that starts at `position` runs up to the block's end marker as only base64
     and what source text puts between pieces of it, in words of at least 8 characters (the last may
-    be shorter) that only spaces, tabs, commas and semicolons separate, and has as many different characters as random
-    bytes do. The end marker is the evidence that makes pieces of any size safe; the words and the
-    characters are what tell a body from a sentence, a heading or a list of names between the
-    markers."""
+    be shorter; the first may have lost a `+` or `/` that the layout reader took for a joiner, which
+    `dropped` says) that spaces, tabs, semicolons, bars and commas outside quotes separate, and has
+    as many different characters as random bytes do. The end marker is the evidence that makes pieces
+    of any size safe; the words and the characters are what tell a body from a sentence, a heading, a
+    table row or a list of names between the markers."""
     body = bytearray()
     words = []
     last = position
@@ -242,7 +254,7 @@ def completes_block(window, position):
             if run is not None:
                 characters = run.group().replace(b"\\", b"")
                 if characters.strip(b"+/"):
-                    if words and WORD_GAP_WITH_COMMAS.fullmatch(window, last, run.start()) is None:
+                    if words and not breaks_word(window[last : run.start()], True):
                         words[-1] += len(characters)
                     else:
                         words.append(len(characters))
@@ -254,6 +266,7 @@ def completes_block(window, position):
         position = item.end()
     if not window.startswith(END_MARKER, position):
         return False
+    words[0] += dropped
     if any(word < MINIMUM_RUN for word in words[:-1]):
         return False
     # 17 different characters in 32, and one more for each three after that, up to 40; random
@@ -265,6 +278,7 @@ def key_body_follows(window, kind):
     """Whether the text after a private key's header is the body of a key of that kind."""
     position = 0
     encrypted = False
+    dropped = 0
     while True:
         item = NAME_LINE.match(window, position)
         if item is not None:
@@ -273,6 +287,8 @@ def key_body_follows(window, kind):
             item = LAYOUT.match(window, position)
         if item is None:
             break
+        # A body may begin with a `+` or a `/`, which this takes for a joiner or a comment marker.
+        dropped = int(item.group()[-1:] in (b"+", b"/"))
         position = item.end()
     start = position
     taken = bytearray()
@@ -291,7 +307,7 @@ def key_body_follows(window, kind):
             if characters.strip(b"+/"):
                 taken += characters
                 gap = window[last : run.start()]
-                if words and b"," not in gap and WORD_GAP.fullmatch(gap) is None:
+                if words and not breaks_word(gap, False):
                     words[-1] += len(characters)
                 else:
                     words.append(len(characters))
@@ -314,7 +330,7 @@ def key_body_follows(window, kind):
             len(set(taken[:BODY_CHARACTERS])) >= DISTINCT_CHARACTERS
             and min(words) >= MINIMUM_RUN
             and body_ends_cleanly(window, position)
-        ) or completes_block(window, start)
+        ) or completes_block(window, start, dropped)
     if kind == b"PGP":
         return pgp_private_key(raw)
     return der_private_key(raw) or raw[:12] == b"openssh-key-"
@@ -896,6 +912,15 @@ def cases(scratch, expect):
     cipher = base64.b64encode(hashlib.sha256(b"ciphertext").digest()).decode().rstrip("=")
     slashed = cipher[:3] + "/" + cipher[4:]
     wide = base64.b64encode(hashlib.sha512(b"ciphertext").digest()).decode().rstrip("=")
+    # A body of 32 bytes that begins with a `/` or a `+`, which the layout reader takes for a joiner.
+    leading = {
+        first: next(
+            body
+            for body in (base64.b64encode(hashlib.sha256(f"leading{n}".encode()).digest()).decode() for n in range(4096))
+            if body[0] == first
+        )
+        for first in "/+"
+    }
 
     def pieces(text, size):
         return [text[i : i + size] for i in range(0, len(text), size)]
@@ -959,6 +984,7 @@ def cases(scratch, expect):
         "src/nebula-eights.txt": f"{nebula_header}\n" + " ".join(pieces(cipher[:40], 8)) + "\n",
         "src/nebula-array.js": 'const key = ["' + nebula_header + '", "' + '", "'.join(pieces(cipher + "=", 4)) + '", "' + nebula_end + '"].join("\\n");\n',
         "src/nebula-array-long.js": 'const key = ["' + nebula_header + '", "' + '", "'.join(pieces(cipher + wide + wide[::-1], 4)) + '", "' + nebula_end + '"].join("\\n");\n',
+        "src/nebula-backticks.js": "const key = [`" + nebula_header + "`, `" + "`, `".join(pieces(cipher + "=", 4)) + "`, `" + nebula_end + "`].join(\"\\n\");\n",
         "src/nebula-array.go": f"var key = []string{{\n\t\"{nebula_header}\",\n" + "".join(f'\t"{piece}",\n' for piece in pieces(cipher + "=", 7)) + f'\t"{nebula_end}",\n}}\n',
         "src/nebula-unpadded.sh": f"KEY='{nebula_header} {wide[:64]} {wide[64:68]} {nebula_end}'\n",
         "src/nebula-unpadded-lines.txt": f"{nebula_header} {wide[:64]} {wide[64:68]}\n{nebula_end}\n",
@@ -971,6 +997,8 @@ def cases(scratch, expect):
         "src/last-xml.xml": f"<key>{nebula_header} {wide[:64]} abcd</key>\n",
         "src/last-padding.txt": f"{nebula_header} {wide[:64]} ab==\n",
         "src/last-eof.txt": f"{nebula_header} {wide[:64]} abcd",
+        "src/nebula-lead-slash.txt": f"{nebula_header}\n{' '.join(pieces(leading['/'][:-1], 8))}=\n{nebula_end}\n",
+        "src/nebula-lead-plus.txt": f"{nebula_header}\n{' '.join(pieces(leading['+'][:-1], 8))}=\n{nebula_end}\n",
         "src/nebula-spaces.sh": f'KEY="{nebula_header} {cipher[:16]} {cipher[16:32]} {cipher[32:]}"\n',
         "src/nebula-pieces.rs": f"// {nebula_header}\n" + "".join(f"// {piece}\n" for piece in pieces(cipher, 5)),
         "src/openssh.txt": planted("-----", "BEGIN OPENSSH PRIVATE KEY", "-----") + "\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB\n",
@@ -1036,7 +1064,9 @@ def cases(scratch, expect):
     for name, text in {
         "docs/placeholder-sentence.md": f"{nebula_header}\npaste your base64 encoded private key here\n{nebula_end}\n",
         "docs/placeholder-insert.md": f"{tendermint_header}\nInsert the 32 byte X25519 private key in base64\n{tendermint_end}\n",
-        "docs/placeholder-table.md": f"| {nebula_header} | the private key in base64 | {nebula_end} |\n",
+        "docs/placeholder-table.md": f"| {nebula_header} | the base64 encoded private key goes in this cell | {nebula_end} |\n",
+        "docs/names-table.md": f"| {nebula_header} | Alice | Bob | Charlie | Daniel | Eve | Frank | George | Helen | {nebula_end} |\n",
+        "docs/names-lines.md": f"{nebula_header}\nuseRef,\nuseState,\ntype ButtonHTMLAttributes,\n{nebula_end}\n",
         "docs/long-words.md": f"{nebula_header}\nSynchronization Administration Configuration Interoperability\n{nebula_end}\n",
         "docs/comma-words.md": f"{nebula_header}\nBoxed, Browser, Carrier, Ending, Loopback, Plan, Reply, Unavailable,\n{nebula_end}\n",
         "src/array-no-marker.js": f"{nebula_header}\n" + ", ".join(f'"{piece}"' for piece in pieces(cipher, 4)) + "\n- item\n",
