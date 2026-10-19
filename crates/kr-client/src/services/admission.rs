@@ -24,7 +24,8 @@
 //! leaves it doubtful without anything running when it is cut, and a later dial asks again after
 //! twenty seconds. No entry is asked about more than three times between connections, and the
 //! count starts again ten minutes after the last request, which is when what that request got has
-//! ended.
+//! ended. Until then a refusal from the service goes on explaining a failed dial, though the minute
+//! it is kept for has passed, because nothing asks again to renew it.
 //!
 //! A service that answers that it does not serve the request (it has no such route) or that this
 //! device is not allowed to ask stops every request for ten minutes. Nothing here ever turns that
@@ -32,7 +33,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use kr_cbor::signing_value;
@@ -201,12 +202,12 @@ pub enum AdmissionAnswer {
 impl std::fmt::Debug for AdmissionAnswer {
     /// Which answer, and nothing the service wrote.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Admitted { .. } => "AdmissionAnswer::Admitted",
-            Self::NotNeeded => "AdmissionAnswer::NotNeeded",
-            Self::NotManaged => "AdmissionAnswer::NotManaged",
-            Self::Unavailable { .. } => "AdmissionAnswer::Unavailable",
-        })
+        match self {
+            Self::Admitted { .. } => formatter.write_str("AdmissionAnswer::Admitted"),
+            Self::NotNeeded => formatter.write_str("AdmissionAnswer::NotNeeded"),
+            Self::NotManaged => formatter.write_str("AdmissionAnswer::NotManaged"),
+            Self::Unavailable { .. } => formatter.write_str("AdmissionAnswer::Unavailable"),
+        }
     }
 }
 
@@ -313,7 +314,7 @@ impl AdmissionClock {
 }
 
 /// One relay at which one host is reached.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct Key {
     relay: String,
     host: EndpointKey,
@@ -390,7 +391,7 @@ impl Entry {
 }
 
 /// The cache's state.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct State {
     entries: HashMap<Key, Entry>,
     /// Until when no request is made, because the service said it does not serve them.
@@ -413,7 +414,6 @@ impl std::fmt::Debug for PairingAdmissions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PairingAdmissions")
-            .field("origin", &self.origin.as_str())
             .finish_non_exhaustive()
     }
 }
@@ -520,7 +520,7 @@ impl PairingAdmissions {
                 host: *host,
             };
             let asks = {
-                let mut state = self.state.lock().expect("the admission cache");
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
                 let suspended = state.suspended_until.is_some_and(|until| now < until);
                 let entry = state.entries.entry(key.clone()).or_insert_with(Entry::new);
                 let ask = !suspended && entry.asks_again(now);
@@ -561,7 +561,7 @@ impl PairingAdmissions {
     async fn ask(&self, key: Key, request: AdmissionRequest) {
         let answer = self.service.admit(&request).await;
         let now = self.clock.now();
-        let mut state = self.state.lock().expect("the admission cache");
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         match &answer {
             Err(error)
                 if matches!(
@@ -612,7 +612,7 @@ impl PairingAdmissions {
         let Some(key) = self.dialled_key(network, host) else {
             return;
         };
-        let mut state = self.state.lock().expect("the admission cache");
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = state.entries.get_mut(&key) {
             entry.in_doubt = false;
             entry.asks = 0;
@@ -630,7 +630,7 @@ impl PairingAdmissions {
             return false;
         };
         let now = self.clock.now();
-        let state = self.state.lock().expect("the admission cache");
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         // An answer that the service is unable stands for as long as it explains a failed dial, and
         // for as long as the cache will not ask again (three requests with no connection, until the
         // ten minutes after the last), because nothing renews it while no request is made.

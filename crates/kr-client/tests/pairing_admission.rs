@@ -683,7 +683,10 @@ async fn a_dial_that_its_route_ends_while_it_waits_leaves_its_request_to_finish(
         alternatives: vec!["a direct connection".to_owned()],
         retry_after_seconds: None,
     });
-    let admissions = scripted_admissions(Arc::clone(&service), &clock);
+    // The wait for the answer is far longer than the test will give the dial, so that only the
+    // route's own cut can end it.
+    let admissions =
+        scripted_admissions(Arc::clone(&service), &clock).waiting(Duration::from_secs(600));
     let (host, relays) = (key(0x11), network(&[MANAGED]));
 
     // The route's own deadline ends the dial long before the wait for the answer would.
