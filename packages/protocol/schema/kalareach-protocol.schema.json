@@ -17216,6 +17216,17 @@
             }
           ],
           "description": "The kind of grant the host decided this mutation under, for a `session.attach` only.\n\nAn attachment decided under a share is drawn the screen the share's issuer was shown: the\ntext and how it is drawn, and no window title, no title stack and no link target, which the\npreview did not show. One decided under a device's pairing grant is drawn the live screen.\nA frame that says nothing is drawn as a share's is, because the worker cannot tell which it\nis and the narrower reading discloses nothing the other does not.\n\nIt is absent from the wire when it is absent, so a frame without one is byte for byte what a\nworker built before it read, and a daemon sends it only to a worker that states\n[`FORWARDED_SCREEN_BASIS`]."
+        },
+        "workflow_run_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowRunId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The workflow run a `session.close` from a workflow acts for.\n\nA worker admits a close under the workflow ingress only for a session whose launch\nprovenance names this run, and admits the field under no other method or ingress.\n\nIt is absent from the wire when it is absent, so a mutation without one is byte for byte\nwhat a worker built before workflows closed their own sessions reads."
         }
       },
       "required": [
@@ -34409,6 +34420,30 @@
       ],
       "type": "object"
     },
+    "RootCommand": {
+      "additionalProperties": false,
+      "description": "The command a session's root runs in place of an interactive shell.\n\nThe worker runs `interpreter -c command` with no interactive arguments, in the working\ndirectory the create request named, and the session ends with the command: its exit status or\nits signal is the closure's. `SHELL` names the interpreter, which is the program the worker\nlaunches.",
+      "properties": {
+        "command": {
+          "description": "The command line.",
+          "type": "string"
+        },
+        "interpreter": {
+          "description": "The absolute path of the POSIX shell that runs the command line, resolved by the daemon.",
+          "type": "string"
+        },
+        "not_after_boot_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "The last moment, on the machine's continuous clock since boot, at which the daemon accepted\nthat the command may start. A worker that reaches it first starts nothing and ends the\nsession without a root."
+        }
+      },
+      "required": [
+        "interpreter",
+        "command",
+        "not_after_boot_ms"
+      ],
+      "type": "object"
+    },
     "RootCommandAcceptedParams": {
       "additionalProperties": false,
       "description": "Parameters of `root.command.accepted`.\n\nSent from the reader at acceptance, inside the fenced context, before the reader leaves. The\norder matters: a record sent after the leave would arrive with the fence already invalidated and\ncould only ever say `unverifiable`.",
@@ -36254,6 +36289,16 @@
         }
       ]
     },
+    "SessionRoot": {
+      "description": "What a session's root process is, where it is not an interactive shell.",
+      "oneOf": [
+        {
+          "const": "command",
+          "description": "A command line the host started in a shell run non-interactively. The session closes when\nthe command ends, and its closure record carries the command's own exit status.",
+          "type": "string"
+        }
+      ]
+    },
     "SessionScreenPreviewParams": {
       "additionalProperties": false,
       "description": "Parameters of `session.screen.preview`.",
@@ -36425,6 +36470,17 @@
             }
           ],
           "description": "Where the variables its root shell was started with came from, when its worker said.\n\nAbsent from the wire when absent, as [`SessionCloseResult::session`] is. It is absent for\na summary this host composes from its own records without its worker's description (a\nclosure with no worker record to read, a worker whose end could not be established, or a\nsession the registry lists from its rows alone) because those records do not hold it, and\nfor one a worker of an earlier release described, which wrote no such member. Only that\nsecond reason ends: it goes when no worker of a release that wrote none can still be\nrunning and no journal row of one is still read."
+        },
+        "root": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionRoot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the session's root process is, when it is not an interactive shell.\n\nAbsent from the wire for the shell every ordinary session starts, so a summary of one is\nbyte for byte what a release that wrote no such member reads. A workflow node that runs a\ncommand makes its session's root that command."
         },
         "root_process": {
           "anyOf": [
@@ -40390,6 +40446,17 @@
           "description": "The release string the session reports as its terminal program version.",
           "type": "string"
         },
+        "root_command": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RootCommand"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The command this session's root runs, when the host started the session to run one.\n\nAbsent from the wire when absent, so a specification for an ordinary session is byte for\nbyte what a worker of an earlier release reads, and a worker of an earlier release that is\nsent one refuses the specification instead of starting a shell the command was meant to\nreplace. The command travels only in the specification, from the daemon's memory to the\nworker's claim: it is in no registry row and in no create request."
+        },
         "session_epoch": {
           "$ref": "#/$defs/SessionEpoch",
           "description": "The session epoch."
@@ -40408,6 +40475,17 @@
             }
           ],
           "description": "The qualified shell package the controller resolved, as an absolute directory.\n\nNull for a create that launches no managed package. Where it is present the worker launches\nthat package and no other: the daemon and the worker can be configured with different\npackage roots, and a session must run the package its create was admitted against rather\nthan whichever one the worker's own environment would have found."
+        },
+        "workflow": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowSession"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The workflow run and node this session was started for, when a workflow started it.\n\nAbsent from the wire when absent. A worker admits a close from a workflow only for a\nsession whose provenance names the run that closes it."
         }
       },
       "required": [
@@ -41440,6 +41518,25 @@
         "trigger_event_id",
         "started_at_ms",
         "ended_at_ms"
+      ],
+      "type": "object"
+    },
+    "WorkflowSession": {
+      "additionalProperties": false,
+      "description": "The workflow a session was started for.",
+      "properties": {
+        "node_id": {
+          "description": "The node of that run the session belongs to.",
+          "type": "string"
+        },
+        "workflow_run_id": {
+          "$ref": "#/$defs/WorkflowRunId",
+          "description": "The run that started the session."
+        }
+      },
+      "required": [
+        "workflow_run_id",
+        "node_id"
       ],
       "type": "object"
     },

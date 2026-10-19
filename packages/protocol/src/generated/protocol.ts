@@ -1025,6 +1025,10 @@ export type ApplicationState = 'shell_ready' | 'agent_busy' | 'awaiting_input' |
  */
 export type DesktopSessionId = string
 /**
+ * What a session's root process is, where it is not an interactive shell.
+ */
+export type SessionRoot = 'command'
+/**
  * What one of the control daemon's connections to a worker is for.
  *
  * A daemon needs more than one connection to a worker, because a worker's attachments,
@@ -1106,6 +1110,10 @@ export type QuestionId = string
  */
 export type ScreenBasis = 'pairing' | 'share'
 /**
+ * One automation run.
+ */
+export type WorkflowRunId = string
+/**
  * One submitted intent and its receipt, generated as a UUIDv4.
  */
 export type ActionId = string
@@ -1152,10 +1160,6 @@ export type RepositoryGeneration = string
  * section 14 means by never advertising a point-in-time snapshot without one.
  */
 export type SourceConsistency = 'atomic_snapshot' | 'quiesced_capture' | 'per_file_capture'
-/**
- * One automation run.
- */
-export type WorkflowRunId = string
 /**
  * One immutable captured change set.
  */
@@ -8130,6 +8134,16 @@ export interface WorkerLaunchSpec {
    */
   release: string
   /**
+   * The command this session's root runs, when the host started the session to run one.
+   *
+   * Absent from the wire when absent, so a specification for an ordinary session is byte for
+   * byte what a worker of an earlier release reads, and a worker of an earlier release that is
+   * sent one refuses the specification instead of starting a shell the command was meant to
+   * replace. The command travels only in the specification, from the daemon's memory to the
+   * worker's claim: it is in no registry row and in no create request.
+   */
+  root_command?: RootCommand | null
+  /**
    * The session epoch, fixed at 1 in protocol version 1.
    */
   session_epoch: string
@@ -8146,6 +8160,13 @@ export interface WorkerLaunchSpec {
    * than whichever one the worker's own environment would have found.
    */
   shell_package: string | null
+  /**
+   * The workflow run and node this session was started for, when a workflow started it.
+   *
+   * Absent from the wire when absent. A worker admits a close from a workflow only for a
+   * session whose provenance names the run that closes it.
+   */
+  workflow?: WorkflowSession | null
 }
 /**
  * The create request the controller admitted.
@@ -8346,6 +8367,41 @@ export interface PrivacyLaunch {
   generation: string
 }
 /**
+ * The command a session's root runs in place of an interactive shell.
+ *
+ * The worker runs `interpreter -c command` with no interactive arguments, in the working
+ * directory the create request named, and the session ends with the command: its exit status or
+ * its signal is the closure's. `SHELL` names the interpreter, which is the program the worker
+ * launches.
+ */
+export interface RootCommand {
+  /**
+   * The command line.
+   */
+  command: string
+  /**
+   * The absolute path of the POSIX shell that runs the command line, resolved by the daemon.
+   */
+  interpreter: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  not_after_boot_ms: string
+}
+/**
+ * The workflow a session was started for.
+ */
+export interface WorkflowSession {
+  /**
+   * The node of that run the session belongs to.
+   */
+  node_id: string
+  /**
+   * The run that started the session.
+   */
+  workflow_run_id: string
+}
+/**
  * What a worker reports once its root shell is running.
  */
 export interface WorkerReady {
@@ -8452,6 +8508,14 @@ export interface SessionSummary {
    * running and no journal row of one is still read.
    */
   environment_sources?: SessionEnvironmentSources | null
+  /**
+   * What the session's root process is, when it is not an interactive shell.
+   *
+   * Absent from the wire for the shell every ordinary session starts, so a summary of one is
+   * byte for byte what a release that wrote no such member reads. A workflow node that runs a
+   * command makes its session's root that command.
+   */
+  root?: SessionRoot | null
   /**
    * The root shell's process identity while the session is running.
    */
@@ -9544,6 +9608,16 @@ export interface ForwardedMutation {
    * [`FORWARDED_SCREEN_BASIS`].
    */
   screen_basis?: ScreenBasis | null
+  /**
+   * The workflow run a `session.close` from a workflow acts for.
+   *
+   * A worker admits a close under the workflow ingress only for a session whose launch
+   * provenance names this run, and admits the field under no other method or ingress.
+   *
+   * It is absent from the wire when it is absent, so a mutation without one is byte for byte
+   * what a worker built before workflows closed their own sessions reads.
+   */
+  workflow_run_id?: WorkflowRunId | null
 }
 /**
  * The actor the host verified, with the ingress it arrived on.
@@ -15599,6 +15673,14 @@ export interface SessionSummary1 {
    * running and no journal row of one is still read.
    */
   environment_sources?: SessionEnvironmentSources | null
+  /**
+   * What the session's root process is, when it is not an interactive shell.
+   *
+   * Absent from the wire for the shell every ordinary session starts, so a summary of one is
+   * byte for byte what a release that wrote no such member reads. A workflow node that runs a
+   * command makes its session's root that command.
+   */
+  root?: SessionRoot | null
   /**
    * The root shell's process identity while the session is running.
    */
@@ -27847,6 +27929,14 @@ export interface SessionSummary2 {
    */
   environment_sources?: SessionEnvironmentSources | null
   /**
+   * What the session's root process is, when it is not an interactive shell.
+   *
+   * Absent from the wire for the shell every ordinary session starts, so a summary of one is
+   * byte for byte what a release that wrote no such member reads. A workflow node that runs a
+   * command makes its session's root that command.
+   */
+  root?: SessionRoot | null
+  /**
    * The root shell's process identity while the session is running.
    */
   root_process: ProcessStartIdentity4 | null
@@ -27998,6 +28088,14 @@ export interface SessionSummary3 {
    * running and no journal row of one is still read.
    */
   environment_sources?: SessionEnvironmentSources | null
+  /**
+   * What the session's root process is, when it is not an interactive shell.
+   *
+   * Absent from the wire for the shell every ordinary session starts, so a summary of one is
+   * byte for byte what a release that wrote no such member reads. A workflow node that runs a
+   * command makes its session's root that command.
+   */
+  root?: SessionRoot | null
   /**
    * The root shell's process identity while the session is running.
    */
@@ -28409,6 +28507,14 @@ export interface SessionSummary4 {
    * running and no journal row of one is still read.
    */
   environment_sources?: SessionEnvironmentSources | null
+  /**
+   * What the session's root process is, when it is not an interactive shell.
+   *
+   * Absent from the wire for the shell every ordinary session starts, so a summary of one is
+   * byte for byte what a release that wrote no such member reads. A workflow node that runs a
+   * command makes its session's root that command.
+   */
+  root?: SessionRoot | null
   /**
    * The root shell's process identity while the session is running.
    */
