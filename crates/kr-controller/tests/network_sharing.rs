@@ -256,6 +256,44 @@ async fn kr_req_25_10_an_expired_invitation_activates_nothing() {
     host.stop().await;
 }
 
+/// KR-REQ-25.10: an invitation of a session that has ended activates nothing, and says so. The
+/// host does not offer such an invitation (`grant.held` leaves it out), so a device that asks for it
+/// anyway is refused in the host's words and not given a grant over a session nobody can reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_an_invitation_of_a_session_that_has_ended_activates_nothing() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (device, record) = recipient(&host, &owner).await;
+    let (session_id, _) = net_support::an_open_session(&host);
+    let issued = shared(&host, session_id, record.device_id).await;
+    net_support::end_session(&host, session_id);
+
+    let connection = RawDevice::connect(&host, &device, &record).await;
+    let refused = connection
+        .mutate(
+            Method::GrantRedeem,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(&host),
+            &GrantRedeemParams {
+                invitation_id: issued.preview.invitation_id,
+            },
+        )
+        .await
+        .expect_err("an invitation of an ended session activates nothing");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(refused.message.contains("no longer open"), "{refused:?}");
+    assert!(!is_active(&host, issued.grant.grant_id));
+    let invitation = host
+        .controller()
+        .sharing()
+        .invitation(issued.preview.invitation_id)
+        .expect("readable")
+        .expect("present");
+    assert_eq!(invitation.state, InvitationState::Open);
+    connection.close();
+    host.stop().await;
+}
+
 /// KR-REQ-25.10: a connection is ended at the end of the share it acts under though a request of
 /// its is still waiting to be served. The device read under a share, and then sent a redemption
 /// that is held at the store; the share ends, and the host closes the connection without waiting
