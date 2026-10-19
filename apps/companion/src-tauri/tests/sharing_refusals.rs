@@ -10,6 +10,10 @@
 //! | KR-REQ-18.13 | `an_invitation_withdrawn_after_the_device_read_its_list_is_refused_in_the_hosts_words` |
 //! | KR-REQ-18.13 | `an_invitation_that_ran_out_after_the_device_read_its_list_is_refused_in_the_hosts_words` |
 //! | KR-REQ-18.13 | `an_invitation_used_after_the_device_read_its_list_is_refused_in_the_hosts_words` |
+//! | KR-REQ-18.13 | `an_invitation_withdrawn_before_the_person_accepts_is_refused_in_the_hosts_words` |
+//! | KR-REQ-18.13 | `an_invitation_that_ran_out_before_the_person_accepts_is_refused_in_the_hosts_words` |
+//! | KR-REQ-18.13 | `an_invitation_used_before_the_person_accepts_is_refused_in_the_hosts_words` |
+//! | KR-REQ-18.13 | `an_invitation_the_application_never_listed_is_refused_without_asking_the_host` |
 
 #![cfg(unix)]
 // The scene is the sharing suite's, and this suite uses the part of it that holds an acceptance back.
@@ -213,5 +217,204 @@ async fn an_invitation_used_after_the_device_read_its_list_is_refused_in_the_hos
         is_active(&scene, created.grant.grant_id),
         "the other connection's acceptance stands"
     );
+    scene.stop().await;
+}
+
+/// The page lists what the device is offered and is shown the invitation; the invitation then stops
+/// being open on the host; the person accepts it. Returns what the page was answered, and what the
+/// host itself says to a device that asks for the same invitation afterwards.
+async fn accepted_after_it_left_the_list(
+    scene: &Scene,
+    created: &GrantCreateResult,
+    change: Change<'_>,
+) -> (Value, String) {
+    let invitation_id = created.preview.invitation_id;
+    let redeem = GrantRedeemParams { invitation_id };
+    let elsewhere = RawDevice::connect(&scene.host, &scene.device, &scene.record).await;
+    let shown = held_of(
+        &scene
+            .phone
+            .call("grant_held", json!({}))
+            .await
+            .expect("the page lists what the device is offered"),
+    );
+    assert!(
+        shown
+            .offers
+            .iter()
+            .any(|offer| offer.invitation_id == invitation_id),
+        "the page was shown the invitation"
+    );
+    match change {
+        Change::Withdrawn => {
+            scene
+                .issuer
+                .call(
+                    "grant_revoke",
+                    json!({ "params": serde_json::to_value(&GrantRevokeParams {
+                        grant_id: created.grant.grant_id,
+                    }).expect("encodes") }),
+                )
+                .await
+                .expect("the invitation is withdrawn");
+        }
+        Change::RunOut(wall) => wall.advance(Duration::from_secs(5 * 60)),
+        Change::UsedElsewhere => {
+            elsewhere
+                .mutate(
+                    Method::GrantRedeem,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    on_the_host(&scene.host),
+                    &redeem,
+                )
+                .await
+                .expect("the invitation is accepted from the device's other connection");
+        }
+    }
+    let now = held_of(
+        &scene
+            .phone
+            .call("grant_held", json!({}))
+            .await
+            .expect("the host answers the list"),
+    );
+    assert!(
+        now.offers
+            .iter()
+            .all(|offer| offer.invitation_id != invitation_id),
+        "the host no longer offers the invitation"
+    );
+    let answered = scene
+        .phone
+        .call(
+            "grant_redeem",
+            json!({ "params": serde_json::to_value(&redeem).expect("encodes") }),
+        )
+        .await
+        .expect("the person is answered with the attempt, not refused");
+    let hosts_own = elsewhere
+        .mutate(
+            Method::GrantRedeem,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(&scene.host),
+            &redeem,
+        )
+        .await
+        .expect_err("the host refuses a device that asks for the invitation now");
+    elsewhere.close();
+    (answered, hosts_own.message)
+}
+
+/// KR-REQ-18.13: the issuer withdraws an invitation after the page showed it. The person who then
+/// accepts it is told what the host says, that it was withdrawn, and nothing is accepted. The host
+/// is asked: the application does not answer for it when the invitation has left the list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invitation_withdrawn_before_the_person_accepts_is_refused_in_the_hosts_words() {
+    let scene = Scene::start().await;
+    let made = scene
+        .issuer
+        .call("grant_create", scene.invitation(SessionRole::Viewer))
+        .await
+        .expect("the invitation is issued");
+    let created: GrantCreateResult = typed(&made["value"]);
+
+    let (answered, hosts_words) =
+        accepted_after_it_left_the_list(&scene, &created, Change::Withdrawn).await;
+
+    assert_eq!(answered["value"], Value::Null, "{answered}");
+    let told = answered["attempt"]["refusal"].as_str().unwrap_or_default();
+    assert!(told.contains("withdrawn"), "{answered}");
+    assert_eq!(told, hosts_words, "the host's own words: {answered}");
+    assert!(!is_active(&scene, created.grant.grant_id));
+    scene.stop().await;
+}
+
+/// KR-REQ-18.13: an invitation's time runs out on the host's clock after the page showed it. The
+/// person who then accepts it is told what the host says, that it expired, and nothing is accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invitation_that_ran_out_before_the_person_accepts_is_refused_in_the_hosts_words() {
+    let wall = MovedWall::new();
+    let scene = Scene::start_on(&wall).await;
+    let made = scene
+        .issuer
+        .call(
+            "grant_create",
+            scene.invitation_lasting(SessionRole::Viewer, Some(60_000)),
+        )
+        .await
+        .expect("the invitation is issued");
+    let created: GrantCreateResult = typed(&made["value"]);
+
+    let (answered, hosts_words) =
+        accepted_after_it_left_the_list(&scene, &created, Change::RunOut(&wall)).await;
+
+    assert_eq!(answered["value"], Value::Null, "{answered}");
+    let told = answered["attempt"]["refusal"].as_str().unwrap_or_default();
+    assert!(told.contains("expired"), "{answered}");
+    assert_eq!(told, hosts_words, "the host's own words: {answered}");
+    assert!(!is_active(&scene, created.grant.grant_id));
+    scene.stop().await;
+}
+
+/// KR-REQ-18.13: the device accepts an invitation from another connection of its own after the page
+/// showed it. The person who then accepts it here is told what the host says, that it was already
+/// used; the grant is active because of the other connection's acceptance alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invitation_used_before_the_person_accepts_is_refused_in_the_hosts_words() {
+    let scene = Scene::start().await;
+    let made = scene
+        .issuer
+        .call("grant_create", scene.invitation(SessionRole::Viewer))
+        .await
+        .expect("the invitation is issued");
+    let created: GrantCreateResult = typed(&made["value"]);
+
+    let (answered, hosts_words) =
+        accepted_after_it_left_the_list(&scene, &created, Change::UsedElsewhere).await;
+
+    assert_eq!(answered["value"], Value::Null, "{answered}");
+    let told = answered["attempt"]["refusal"].as_str().unwrap_or_default();
+    assert!(told.contains("already been redeemed"), "{answered}");
+    assert_eq!(told, hosts_words, "the host's own words: {answered}");
+    assert!(is_active(&scene, created.grant.grant_id));
+    scene.stop().await;
+}
+
+/// KR-REQ-18.13: an invitation the host does not list and this application never listed is not one
+/// it was offered, so it is refused without a question to the host and leaves no attempt behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invitation_the_application_never_listed_is_refused_without_asking_the_host() {
+    let scene = Scene::start().await;
+    let made = scene
+        .issuer
+        .call("grant_create", scene.invitation(SessionRole::Viewer))
+        .await
+        .expect("the invitation is issued");
+    let created: GrantCreateResult = typed(&made["value"]);
+    scene
+        .issuer
+        .call(
+            "grant_revoke",
+            json!({ "params": serde_json::to_value(&GrantRevokeParams {
+                grant_id: created.grant.grant_id,
+            }).expect("encodes") }),
+        )
+        .await
+        .expect("the invitation is withdrawn before the device ever listed it");
+
+    let refused = scene
+        .phone
+        .call(
+            "grant_redeem",
+            json!({ "params": serde_json::to_value(&GrantRedeemParams {
+                invitation_id: created.preview.invitation_id,
+            }).expect("encodes") }),
+        )
+        .await
+        .expect_err("an invitation the application never listed is refused");
+
+    assert_eq!(code_of(&refused), "RESOURCE_UNAVAILABLE", "{refused}");
+    assert!(scene.phone.attempts().await.is_empty());
+    assert!(!is_active(&scene, created.grant.grant_id));
     scene.stop().await;
 }

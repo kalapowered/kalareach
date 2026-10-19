@@ -693,6 +693,14 @@ fn typed<T: serde::de::DeserializeOwned>(value: &Value) -> T {
     serde_json::from_value(value.clone()).expect("the answer is the method's own result")
 }
 
+/// What `grant_held` answered, as the protocol's own result.
+fn held_of(answer: &Value) -> GrantHeldResult {
+    typed(&json!({
+        "offers": answer["offers"], "offers_more": false,
+        "shares": answer["shares"], "shares_more": false,
+    }))
+}
+
 /// What the person at the machine is told by the host's own words when the attempt was refused.
 fn code_of(refusal: &Value) -> &str {
     refusal["code"].as_str().unwrap_or_default()

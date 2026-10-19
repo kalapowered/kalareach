@@ -1366,14 +1366,6 @@ fn well_formed_inbox_read() -> Value {
     })
 }
 
-/// What `grant_held` answered, as the protocol's own result.
-fn held_of(answer: &Value) -> GrantHeldResult {
-    typed(&json!({
-        "offers": answer["offers"], "offers_more": false,
-        "shares": answer["shares"], "shares_more": false,
-    }))
-}
-
 /// KR-REQ-18.13: a device with more invitations, and then more shares, than one page holds is told
 /// every one of them by one command, each once, however many pages the host answered it in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
