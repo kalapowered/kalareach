@@ -480,9 +480,26 @@ fn text_of<T: Serialize>(value: &T) -> String {
         .to_owned()
 }
 
-/// A relay's URL as the Worker's registry compares it: no trailing slash, in lower case.
+/// A relay's URL as the Worker's registry compares it (`normalisedRelayUrl` in
+/// `workers/api/src/relay/instances.ts`): the scheme and host in lower case, the default port left
+/// out, a path with its case and no trailing slash. A text that is not an http or https URL names
+/// no relay, and is kept as written so that it matches nothing but itself.
 fn same_relay(url: &str) -> String {
-    url.trim_end_matches('/').to_ascii_lowercase()
+    let Ok(parsed) = url::Url::parse(url) else {
+        return url.to_owned();
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return url.to_owned();
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    let port = parsed
+        .port()
+        .map_or_else(String::new, |port| format!(":{port}"));
+    format!(
+        "{}://{host}{port}{}",
+        parsed.scheme(),
+        parsed.path().trim_end_matches('/')
+    )
 }
 
 fn key_of(text: &str) -> EndpointKey {

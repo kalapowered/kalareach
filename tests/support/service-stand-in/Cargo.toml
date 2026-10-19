@@ -25,6 +25,8 @@ serde.workspace = true
 serde_json.workspace = true
 # The loopback listener, and the pause a held request waits in.
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync"] }
+# A relay's URL as the Worker's registry reads it, the way the Worker's own URL parser does.
+url.workspace = true
 
 [lints]
 workspace = true
