@@ -1286,27 +1286,28 @@ pub fn hello_frame(
 mod tests {
     use super::*;
 
-    /// The first frame the forwarder of the release before this one writes, as it wrote it: a
-    /// forwarder of that release is reached directly by workers of this one that do not admit their
-    /// own release's, and a forwarder of this release is reached by theirs, so the exchange has to
-    /// read the same in both directions. This is the recorded frame, and a change to what the
-    /// worker reads of a hello has to meet it.
+    /// The first frame the forwarder of the release before this one writes, as it wrote it: that
+    /// forwarder still reaches workers of this release, and a forwarder of this release reaches a
+    /// worker of that one directly when it cannot hand over to that release's own forwarder, so the
+    /// exchange has to read the same in both directions. This is the recorded frame, and a change
+    /// to what the worker reads of a hello has to meet it. Its process, start value and credential
+    /// are the recording's own, so the case holds what each has to be and not its value.
     #[test]
     fn the_hello_a_forwarder_of_the_release_before_wrote_is_read_as_it_always_was() {
-        const RECORDED: &[u8] = include_bytes!("../../tests/fixtures/bridge-hello-0.74.json");
+        const RECORDED: &[u8] = include_bytes!("../../tests/fixtures/bridge-hello-0.75.json");
 
         let frame: FirstFrameWire = serde_json::from_slice(RECORDED.trim_ascii_end())
             .expect("the recorded hello is a first frame");
         let FirstFrameWire::Hello { kr_hello } = frame else {
             panic!("the recorded frame is a bridge's hello");
         };
-        assert_eq!(kr_hello.pid, 41);
-        assert_eq!(kr_hello.start, 900);
         assert_eq!(kr_hello.session, None);
         assert!(kr_hello.headers.is_empty());
         assert_eq!(
-            decode_credential(&kr_hello.credential).expect("a credential"),
-            vec![9_u8; 32]
+            decode_credential(&kr_hello.credential)
+                .expect("a credential")
+                .len(),
+            crate::broker::process::CREDENTIAL_BYTES
         );
         let bridge = kr_hello.bridge.expect("it declares its bridge");
         assert_eq!(bridge.application, "claude-code");

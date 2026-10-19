@@ -493,3 +493,57 @@ async fn exchange(answer: &str, credential: &str, reached: Reached) -> Result<Ra
     }
     Ok(ran)
 }
+
+/// Writes the first frame the forwarder presents, as the release's cut keeps it
+/// (`bridge-hello.json` in `KR_RECORD_DIR`).
+///
+/// The registration and the listener are the case's own: the credential is one the worker
+/// generates and publishes the way a launch does, and the endpoint is bound as the worker binds
+/// one. The forwarder is the hook of this tree, started with the registration's path alone. Run it
+/// in the release's own tree:
+/// `KR_RECORD_DIR=<directory> cargo test -p kr-hook --test listener -- --ignored record_the_hello`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "records a release's hello for its cut; run by hand with KR_RECORD_DIR"]
+async fn record_the_hello_the_forwarder_presents() {
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("KR_RECORD_DIR").expect("KR_RECORD_DIR names where the record goes"),
+    );
+    let placed = Placed::new();
+    let files = placed.host.root().join("files");
+    kr_ipc::paths::create_private_directory(&files).expect("a private directory");
+    let credential_file = files.join("credential");
+    kr_worker::broker::Credential::generate()
+        .expect("a credential")
+        .write_file(&credential_file)
+        .expect("the credential is published");
+    let mut reached = hook_reaching(
+        &files,
+        "record",
+        "record",
+        |stand_in| {
+            let registration = files.join("registration");
+            std::fs::write(
+                &registration,
+                format!(
+                    "endpoint={}\nprofile=lp-1\n\
+                     instance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
+                     credential={}\nframing=json_lines\n",
+                    stand_in.address,
+                    credential_file.display()
+                ),
+            )
+            .expect("the registration is written");
+            let mut command = placed.command(&["claude-code", "hook"]);
+            command.env("KR_REGISTRATION", &registration);
+            tokio::task::spawn_blocking(move || run_with_input(command, SESSION_START))
+        },
+        |_| {},
+    )
+    .await;
+    let mut hello = read_line(&mut reached.stream).await;
+    assert!(!hello.is_empty(), "the forwarder presented itself");
+    hello.push(b'\n');
+    std::fs::write(directory.join("bridge-hello.json"), hello).expect("the record is written");
+    drop(reached.stream);
+    reached.running.await.expect("the forwarder ran");
+}

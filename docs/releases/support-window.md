@@ -41,3 +41,36 @@ Two kinds of edit escape the checks of the table, and a review has to catch them
 A release retains the compatibility level of the newest release at the highest level below its own, and the release tags are the only record of which release that is, so `scripts/check-retained-release.sh` reads them. Nothing runs it by itself: run that script on a clean checkout of the commit to release, with the tags fetched.
 
 The script takes the newest tag in the form `packages/v<version>+<commit>` in the history of that commit at the highest level below its own, and fails unless that level is the newest the build retains. It then compares the schema of every release tagged at that level, and the table of public majors and the plugin host protocol of the newest, with those the level kept. If the level's record refers to an earlier release of the same level, it moves the record to the newest one, and the level's row in the table above with it. It runs the `retained_surface` test against the source tree of that release, to hold the rules and limits the level kept to the release they came from, the `public_majors` tests against the record as it now stands, and `kr-protocol-gen --check`. If the record moved, the script fails after it lists the two files it changed: commit them, run the upgrade suite, which builds the release the record now names, and run the script again on that commit.
+
+### Retaining a level
+
+A release that raises the compatibility level retains the level of the release before it, and the cut is one commit on the branch that raises it. The release before is the one `kr-protocol-gen --predecessor` prints. Extract its commit with `git archive` into a directory of its own: the steps that read the release read that tree.
+
+1. Run `kr-protocol-gen --retain <level> --commit <full commit>`. It creates the directory `crates/kr-protocol/retained/<level>/` with the surface, release record, plugin host protocol, and the table of public majors, and an empty list of frames.
+2. Add that level to the list of retained levels, and then replace the level you're dropping. In `crates/kr-protocol/src/retained.rs` add to `RETAINED_WORKER_LEVELS` and add `include_str!` paths to `RETAINED`. Remove the directory of the level this release stops retaining, replace that level's row in the table above, and update the tests that hardcode the level number.
+3. Then record the rules the surface reads from the release's tree: `KR_RELEASE_TREE=<tree> cargo test -p kr-cli --test retained_surface -- --ignored record_the_rules_of_the_surface`. That writes `sources.json`, `limits.json`, and `vectors.json`.
+4. Also record the exchange with a worker of that release, with `TMPDIR` set to a neutral directory, by running `KR_RECORD_FRAMES=1 cargo test -p kr-cli --features upgrade-suite --test upgrade the_frames_ -- --nocapture` and extracting the text between the `FRAMES-JSON-BEGIN` and `FRAMES-JSON-END` lines as `frames.json`.
+5. Search the tree for code that says it goes once no retained level is below some level, and remove what this cut makes unneeded, in a commit of its own.
+6. In the commit after the cut, record the files that are not kept within `retained/`, as described in the next section.
+
+### Recordings beside the tests
+
+Outside the `retained/` directory, three recordings of the release before are kept near the tests that read them, not near the other recordings from the same release. `registration-<level>.txt` is the file a worker of that release publishes for a launch, `bridge-hello-<level>.json` is the first frame its forwarder writes, and `channel-frames-<level>.json` holds the approval its forwarder relays and the verdict its worker writes back. `<level>` is, of course, the release's compatibility level. The test `the_recordings_beside_the_tests_are_of_the_release_before` in the `kr-protocol` crate will fail while any of the recordings is named for an older level or while the registration refers to a release other than the one the newest retained level was cut from. When `scripts/check-retained-release.sh` moves the level's record to a later release of the level, make the recordings again from that release's tree.
+
+The recordings are the bytes the release's code writes, and must be created by that code in that release's tree, never by hand. They include values that vary between runs, like a process number, a start value, a credential, and the paths of the launch's directory, and those values belong to the recording. The tests that read it check what each value has to be and never the value itself.
+
+There are four ignored test cases, each beside the tests that read its recording or the writer it records, that run in the release's tree against its forwarder and worker and record what they write to a directory named by the `KR_RECORD_DIR` environment variable. Run them in the order below, in the tree you extracted when cutting the release, with the environment variable `KR_RECORD_RELEASE` set to the name of the release you cut, taken from the `RELEASE` file in the `retained/<level>/` directory you generated above, and `TMPDIR` set to a neutral directory, since the registration records the launch's directory under it:
+
+```text
+export KR_RECORD_DIR=<an empty directory> KR_RECORD_RELEASE=<release name> TMPDIR=<a neutral directory>
+cargo test --locked -p kr-hook --test listener -- --ignored record_the_hello
+cargo test --locked -p kr-hook --test channel -- --ignored record_the_approval
+cargo test --locked -p kr-worker --test channels -- --ignored record_the_frames
+cargo test --locked -p kr-worker --lib -- --ignored record_the_registration
+```
+
+The first runs the release's hook against a listener the case owns, through a registration the case wrote with a credential the worker's own code generated, and keeps the first line it writes as `bridge-hello.json`. The second has the release's channel relay a tool approval to a worker's listener. The third reads that approval, has the release's worker answer it through `agent.approval.respond`, and writes both frames as `channel-frames.json`. The fourth writes `registration.txt`, the registration of a launch as the release's worker renders it, with the release line that a worker run from a store adds.
+
+Move `bridge-hello.json` and `channel-frames.json` into `crates/kr-worker/tests/fixtures/` with the names given above, and move `registration.txt` into `crates/kr-hook/tests/fixtures/` with its name above. Remove the corresponding files for the previous level and change the file names the tests include.
+
+A release from before the recorders has none in its tree. Keep a second extract of that release, and take the four recorder functions from the same four files of the branch that raises the level, adding them alone to the release's own files. Compare each of the four with its copy by `git diff --no-index --numstat <release file> <changed file>`: the second column must be 0, and the added lines must be read. Remove this paragraph once the release of the retained level has the recorders.

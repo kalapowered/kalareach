@@ -197,13 +197,13 @@ async fn kr_req_12_18_a_relayed_approval_is_recorded_and_its_views_are_told() {
 /// `agent.approval.respond` goes out on the channel as the application's own verdict, once.
 ///
 /// The approval is the one the forwarder of the release before this one relayed, and the verdict
-/// is the one that release's worker wrote, both as recorded in `channel-frames-0.74.json`: the
+/// is the one that release's worker wrote, both as recorded in `channel-frames-0.75.json`: the
 /// forwarder and the worker of two releases read each other's frames, so neither frame changes
 /// without a release that retains the older one.
 #[tokio::test]
 async fn kr_req_12_18_an_answer_goes_out_on_the_channel_as_the_applications_verdict() {
     let recorded: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/channel-frames-0.74.json"))
+        serde_json::from_str(include_str!("fixtures/channel-frames-0.75.json"))
             .expect("the recorded frames are JSON");
     let broker = memory_broker();
     register(&broker, 2);
@@ -1601,6 +1601,68 @@ async fn kr_req_12_18_a_channels_identifier_is_not_restored_as_another_connectio
         relayed(&broker, 2, "fghij").is_some()
     })
     .await;
+    channel.close().await;
+    assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
+}
+
+/// Writes the Channels frames a release's cut keeps (`channel-frames.json` in `KR_RECORD_DIR`): the
+/// approval the forwarder relayed, which `channel-request.json` there holds, and the verdict this
+/// worker writes on the channel when an answer goes out through `agent.approval.respond`.
+///
+/// The worker is the one under test, bound to the connector's package as the installation's binder
+/// binds it. Run it in the release's own tree, after the forwarder's frame is recorded:
+/// `KR_RECORD_DIR=<directory> cargo test -p kr-worker --test channels -- --ignored
+/// record_the_frames`.
+#[tokio::test]
+#[ignore = "records a release's channel frames for its cut; run by hand with KR_RECORD_DIR"]
+async fn record_the_frames_of_an_approval_and_its_verdict() {
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("KR_RECORD_DIR").expect("KR_RECORD_DIR names where the record goes"),
+    );
+    let requested: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(directory.join("channel-request.json"))
+            .expect("the forwarder's frame is recorded first"),
+    )
+    .expect("the recorded frame is JSON");
+    let broker = memory_broker();
+    register(&broker, 2);
+    let package = Package::laid_out();
+    package.bind(&broker, 2);
+    let mut channel = Channel::open(
+        package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
+        2,
+        launched(2),
+    );
+
+    channel.send(&requested["permission_request"]).await;
+    let request_id = requested["permission_request"]["params"]["request_id"]
+        .as_str()
+        .expect("an identifier");
+    eventually("the approval is interpreted", || {
+        relayed(&broker, 2, request_id).is_some_and(|resource| resource.interpretation_verified)
+    })
+    .await;
+    let resource = relayed(&broker, 2, request_id).expect("recorded");
+    broker
+        .agent_approval_respond(
+            &caller(),
+            &respond(2, &resource, "allow"),
+            TimestampMs::new(5),
+        )
+        .await
+        .expect("the answer is admitted and carried");
+    let verdict = channel.next().await.expect("the verdict goes out");
+    std::fs::write(
+        directory.join("channel-frames.json"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "permission_request": requested["permission_request"],
+                "permission": verdict,
+            })
+        ),
+    )
+    .expect("the record is written");
     channel.close().await;
     assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
 }

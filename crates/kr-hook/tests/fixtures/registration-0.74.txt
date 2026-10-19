@@ -1,8 +1,0 @@
-endpoint=/run/kr/e/p.sock
-profile=00000000-0000-0000-0000-0000000000aa
-instance=00000000-0000-0000-0000-0000000000bb
-pid=41
-start=900
-credential=/run/kr/a/credential
-release=0.74.0+d59b70150cd2
-framing=json_lines

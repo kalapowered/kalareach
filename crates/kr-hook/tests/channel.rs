@@ -254,17 +254,18 @@ async fn kr_req_12_18_the_channel_negotiates_and_carries_frames_both_ways_and_no
 }
 
 /// KR-REQ-12.18: the Channels frames cross as the worker of the release before this one wrote and
-/// read them, recorded in `channel-frames-0.74.json` (a file, not frames this build wrote): the
+/// read them, recorded in `channel-frames-0.75.json` (a file, not frames this build wrote): the
 /// approval this forwarder relays is the one that worker reads, and the verdict that worker wrote,
 /// which carries no `jsonrpc` member, reaches Claude Code as a notification of the same method and
-/// parameters. A worker of that release is reached by this forwarder directly. That worker carries
-/// no message into the session (it refuses to), so no such frame was recorded; the case above
-/// checks the message this forwarder reads.
+/// parameters. This forwarder reaches a worker of that release directly only when it cannot hand
+/// over to that release's own forwarder. That worker carries no message into the session (it
+/// refuses to), so no such frame was recorded; the case above checks the message this forwarder
+/// reads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_12_18_the_frames_of_a_worker_of_the_release_before_cross_as_it_wrote_and_read_them()
 {
     let recorded: serde_json::Value = serde_json::from_str(include_str!(
-        "../../kr-worker/tests/fixtures/channel-frames-0.74.json"
+        "../../kr-worker/tests/fixtures/channel-frames-0.75.json"
     ))
     .expect("the recorded frames are JSON");
     let placed = Placed::new();
@@ -806,4 +807,38 @@ async fn kr_req_12_18_every_refusal_is_reported_in_order_while_standard_error_is
             "refusal {index} in its place: {said}"
         );
     }
+}
+
+/// Writes the approval the channel relays to the worker, as the release's cut keeps it
+/// (`channel-request.json` in `KR_RECORD_DIR`).
+///
+/// The worker's own listener admits the channel and the frame is the one the forwarder of this
+/// tree writes on that connection for a tool approval Claude Code sends it. Run it in the release's
+/// own tree: `KR_RECORD_DIR=<directory> cargo test -p kr-hook --test channel -- --ignored
+/// record_the_approval`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "records a release's channel frame for its cut; run by hand with KR_RECORD_DIR"]
+async fn record_the_approval_the_channel_relays() {
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("KR_RECORD_DIR").expect("KR_RECORD_DIR names where the record goes"),
+    );
+    let placed = Placed::new();
+    let mut launch = Launch::channel(&placed, installed(&placed, &[BridgeSurface::Channel]));
+    let lines = read_lines(&mut launch);
+    let mut admitted = launch.accept().await.expect("the channel is admitted");
+    handshake(&mut launch, &lines);
+    to_channel(
+        &mut launch,
+        &permission_request("abcde", "{\"command\":\"ls\"}"),
+    );
+    let relayed = to_worker(&mut admitted)
+        .await
+        .expect("the approval is relayed");
+    std::fs::write(
+        directory.join("channel-request.json"),
+        format!("{}\n", serde_json::json!({ "permission_request": relayed })),
+    )
+    .expect("the record is written");
+    launch.close_input();
+    assert_eq!(exit_code(&launch), Some(0));
 }

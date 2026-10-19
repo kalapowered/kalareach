@@ -743,3 +743,54 @@ fn the_exchange_recorded_with_a_real_worker_of_the_release_before_reads_under_it
         ]
     );
 }
+
+/// The recordings of the release before that sit beside the tests that read them, outside
+/// `retained/` (the registration a worker of that release publishes for a launch, the first frame
+/// its forwarder writes, and the Channels frames of its forwarder and its worker), are of the
+/// newest retained level: each file is named for that level, and the registration names the
+/// release the level was cut from. A cut that retains a newer level and leaves a recording of the
+/// older one in place fails here, naming the file.
+#[test]
+fn the_recordings_beside_the_tests_are_of_the_release_before() {
+    let before = kr_protocol::retained::RETAINED
+        .iter()
+        .max_by_key(|level| level.level)
+        .expect("a level is retained");
+    let level = before.level.to_string();
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    for (directory, stem, extension) in [
+        ("kr-worker/tests/fixtures", "channel-frames", "json"),
+        ("kr-worker/tests/fixtures", "bridge-hello", "json"),
+        ("kr-hook/tests/fixtures", "registration", "txt"),
+    ] {
+        let mut recordings: Vec<String> = std::fs::read_dir(crates.join(directory))
+            .expect("the fixtures directory")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with(&format!("{stem}-")))
+            .collect();
+        recordings.sort();
+        assert_eq!(
+            recordings,
+            [format!("{stem}-{level}.{extension}")],
+            "{directory} holds the recording of the release before, named for its level {level}, \
+             and no other"
+        );
+    }
+    let registration = std::fs::read_to_string(
+        crates.join(format!("kr-hook/tests/fixtures/registration-{level}.txt")),
+    )
+    .expect("the recorded registration");
+    assert_eq!(
+        registration
+            .lines()
+            .find_map(|line| line.strip_prefix("release=")),
+        before.record("release"),
+        "the recorded registration names the release level {level} was cut from"
+    );
+}

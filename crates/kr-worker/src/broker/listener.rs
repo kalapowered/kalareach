@@ -676,6 +676,55 @@ mod tests {
         assert!(!registration().to_file().contains("release="));
     }
 
+    /// Writes the registration a worker of an installed release publishes for a launch, as the
+    /// release's cut keeps it (`registration.txt` in `KR_RECORD_DIR`).
+    ///
+    /// The launch is made as the broker makes one: a private directory, an address chosen in it, a
+    /// fresh credential published beside the registration, and this process as the launched one.
+    /// The test binary runs outside every store, so `KR_RECORD_RELEASE` names the release the
+    /// worker runs. Run it in the release's own tree:
+    /// `KR_RECORD_DIR=<directory> KR_RECORD_RELEASE=<release> cargo test -p kr-worker --lib --
+    /// --ignored record_the_registration`.
+    #[test]
+    #[ignore = "records a release's registration for its cut; needs KR_RECORD_DIR and the release"]
+    fn record_the_registration_a_worker_of_an_installed_release_publishes() {
+        let directory = std::path::PathBuf::from(
+            std::env::var_os("KR_RECORD_DIR").expect("KR_RECORD_DIR names where the record goes"),
+        );
+        let release = kr_protocol::update::ReleaseName::new(
+            std::env::var("KR_RECORD_RELEASE").expect("KR_RECORD_RELEASE names the release"),
+        )
+        .expect("a release name");
+        let host = kr_ipc::testing::TempHost::create();
+        let launch = host.root().join("launch");
+        kr_ipc::paths::create_private_directory(&launch).expect("a private directory is made");
+        let credential = launch.join("credential");
+        Credential::generate()
+            .expect("a credential")
+            .write_file(&credential)
+            .expect("the credential is published");
+        let registration = Registration::new(
+            ListenerAddress::for_launch(&launch).expect("an address is chosen"),
+            crate::broker::profiles::new_profile_id(kr_ipc::now_ms())
+                .expect("a profile identifier"),
+            ApplicationInstanceId::new(kr_ipc::new_uuid()),
+            kr_ipc::identity::current_process_start_identity().expect("this process"),
+            credential,
+        );
+        // The launch listener appends the framing line to the file `to_file_of` renders.
+        let framing =
+            crate::broker::framing::Framing::new(kr_protocol::gateway::NativeFraming::JsonLines);
+        std::fs::write(
+            directory.join("registration.txt"),
+            format!(
+                "{}framing={}\n",
+                registration.to_file_of(Some(&release)),
+                framing.name()
+            ),
+        )
+        .expect("the record is written");
+    }
+
     #[test]
     fn a_registration_carries_no_credential() {
         let file = registration().to_file();

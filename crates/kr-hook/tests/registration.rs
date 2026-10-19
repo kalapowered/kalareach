@@ -398,7 +398,7 @@ fn wait(relay: &mut std::process::Child) -> std::process::ExitStatus {
 #[cfg(unix)]
 #[test]
 fn the_registration_a_worker_of_the_release_before_wrote_is_read_whole_and_names_its_release() {
-    const RECORDED: &str = include_str!("fixtures/registration-0.74.txt");
+    const RECORDED: &str = include_str!("fixtures/registration-0.75.txt");
 
     assert!(
         kr_hook::registration::whole(RECORDED),
@@ -413,7 +413,15 @@ fn the_registration_a_worker_of_the_release_before_wrote_is_read_whole_and_names
     let release = kr_hook::registration::release_of(&paths, Duration::from_millis(250))
         .expect("read")
         .expect("it names a release");
-    assert_eq!(release.as_str(), "0.74.0+d59b70150cd2");
+    let before = kr_protocol::retained::RETAINED
+        .iter()
+        .max_by_key(|level| level.level)
+        .expect("a level is retained");
+    assert_eq!(
+        Some(release.as_str()),
+        before.record("release"),
+        "the recorded registration names the release the newest retained level was cut from"
+    );
 
     // A registration of a worker outside a store names none.
     let outside: String = RECORDED
@@ -435,7 +443,7 @@ fn the_registration_a_worker_of_the_release_before_wrote_is_read_whole_and_names
 #[cfg(unix)]
 #[test]
 fn the_hello_this_forwarder_writes_has_the_members_of_the_one_the_release_before_wrote() {
-    const RECORDED: &str = include_str!("../../kr-worker/tests/fixtures/bridge-hello-0.74.json");
+    const RECORDED: &str = include_str!("../../kr-worker/tests/fixtures/bridge-hello-0.75.json");
 
     let launch = Launch::new();
     launch.publish(&launch.whole("/run/kr/e/p.sock"));
