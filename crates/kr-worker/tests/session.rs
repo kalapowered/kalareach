@@ -2323,45 +2323,63 @@ async fn the_palette_a_create_request_names_reaches_the_launched_session() {
     }
 }
 
-/// A session started to run a command creates its process only at the last moment, in a directory
-/// that is there. A moment the daemon accepted the command for that has passed by then starts
-/// nothing, and a directory that is not there starts nothing (the terminal library would run it in
-/// the account's home directory instead). The control is the same command in a directory that is
-/// there, before its moment: it runs, and the session says its root is a command.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_command_starts_only_in_time_and_in_a_directory_that_is_there() {
-    let host = kr_ipc::testing::TempHost::create();
+/// A session whose root is a command, opened and about to launch in `cwd` with `not_after_boot_ms`
+/// as the moment after which the command does not start. The command leaves a mark if it runs.
+fn command_session(
+    host: &kr_ipc::testing::TempHost,
+    cwd: &std::path::Path,
+    not_after_boot_ms: u64,
+) -> (Session, std::path::PathBuf) {
     let marker = host.root().join("the-command-ran");
-    let in_the_directory = host.root().to_path_buf();
-    let script = format!("touch {}", marker.display());
+    let mut config = configuration(host, &format!("touch {}", marker.display()));
+    config.shell.cwd = cwd.display().to_string();
+    let mut session = Session::open(config).expect("opens");
+    session.start_as_command(not_after_boot_ms);
+    (session, marker)
+}
 
-    let refused = |not_after_boot_ms: u64, cwd: std::path::PathBuf| {
-        let mut config = configuration(&host, &script);
-        config.shell.cwd = cwd.display().to_string();
-        let mut session = Session::open(config).expect("opens");
-        session.start_as_command(not_after_boot_ms);
-        let error = session.launch().expect_err("the command does not start");
-        (error, session.closure().cloned())
-    };
-
-    let (late, closure) = refused(0, in_the_directory.clone());
-    assert_eq!(late.code(), kr_protocol::error::ErrorCode::PermissionDenied);
+/// A command whose moment has passed by the time its process would be created does not start: the
+/// session closes with the record of a launch that failed, and the command leaves no mark.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_does_not_start_after_the_moment_it_was_accepted_for() {
+    let host = kr_ipc::testing::TempHost::create();
+    let (mut session, marker) = command_session(&host, host.root(), 0);
+    let error = session.launch().expect_err("the command does not start");
     assert_eq!(
-        closure.expect("a refused start leaves its record").reason,
+        error.code(),
+        kr_protocol::error::ErrorCode::PermissionDenied
+    );
+    assert_eq!(
+        session
+            .closure()
+            .expect("a refused start leaves its record")
+            .reason,
         ClosureReason::RootLaunchFailed
     );
-    let (absent, closure) = refused(u64::MAX, host.root().join("not-there"));
-    assert_eq!(
-        absent.code(),
-        kr_protocol::error::ErrorCode::InvalidArgument
-    );
-    assert!(closure.is_some());
-    assert!(!marker.exists(), "neither refusal ran the command");
+    assert!(!marker.exists(), "the command did not run");
+}
 
-    let mut config = configuration(&host, &script);
-    config.shell.cwd = in_the_directory.display().to_string();
-    let mut session = Session::open(config).expect("opens");
-    session.start_as_command(u64::MAX);
+/// A command whose directory is not there does not start: the terminal library would run it in the
+/// account's home directory instead, which nobody chose.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_does_not_start_in_a_directory_that_is_not_there() {
+    let host = kr_ipc::testing::TempHost::create();
+    let (mut session, marker) = command_session(&host, &host.root().join("not-there"), u64::MAX);
+    let error = session.launch().expect_err("the command does not start");
+    assert_eq!(error.code(), kr_protocol::error::ErrorCode::InvalidArgument);
+    assert!(
+        session.closure().is_some(),
+        "a refused start leaves its record"
+    );
+    assert!(!marker.exists(), "the command did not run");
+}
+
+/// The control of the two above: the same command, before its moment and in a directory that is
+/// there, runs, and its session says from the first summary on that its root is a command.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_starts_in_time_in_a_directory_that_is_there() {
+    let host = kr_ipc::testing::TempHost::create();
+    let (mut session, marker) = command_session(&host, host.root(), u64::MAX);
     session.launch().expect("the command starts");
     assert_eq!(
         session.summary().root,

@@ -1117,56 +1117,64 @@ async fn a_forwarded_close_sent_again_is_marked_retained_only_on_a_link_that_dec
     .expect("the closure finishes");
 }
 
+/// A workflow's close as the daemon forwards it: a mutation under the workflow ingress, naming the
+/// run that asks, from the connection the caller picks.
+fn workflow_close(
+    mutation: &MutationRequest,
+    ingress: kr_protocol::actor::ActorIngress,
+    named: Option<kr_protocol::ids::WorkflowRunId>,
+    grant: Option<kr_protocol::ids::GrantId>,
+) -> ControlFrame {
+    ControlFrame::Forwarded(Box::new(kr_protocol::local::ForwardedMutation {
+        mutation: mutation.clone(),
+        actor: kr_protocol::actor::ActorEnvelope {
+            actor_id: actor("workflow:grant"),
+            ingress,
+            device_id: Nullable::null(),
+            grant_id: Nullable(grant),
+            grant_revision: Nullable::null(),
+            controller_generation: ControllerGeneration::new(1),
+            connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([8; 16])),
+        },
+        grant_rights: kr_protocol::scalars::CanonicalSet::new(),
+        accepted_deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms() + 120_000),
+        history: None,
+        screen_basis: None,
+        workflow_run_id: named,
+    }))
+}
+
+/// The code a refused response carries.
+fn refused_with(frame: ControlFrame) -> ErrorCode {
+    match frame {
+        ControlFrame::Response(response) => match response.outcome {
+            Outcome::Error(error) => error.code,
+            Outcome::Ok(_) => panic!("the close must be refused"),
+        },
+        other => panic!("a refusal is a plain response, not {other:?}"),
+    }
+}
+
 /// A workflow closes the session its run started, and nothing else.
 ///
 /// The worker serves the local and paired-device ingresses, and the workflow ingress for one
-/// method, `session.close`, for the run named in the session's launch provenance. The controls come
-/// first, each a close the worker must not do: another run's, one that names no run, one under
-/// another method, one that carries a grant, one from a link that declared itself a proxy, and a
-/// run named by an ingress that is not a workflow's. None of them closes the session; the close of
-/// the right run does.
+/// method, `session.close`, for the run named in the session's launch provenance. The controls
+/// come first, each a close the worker must not do: another run's, one that names no run, one
+/// under another method, one that carries a grant, and a run named by an ingress that is not a
+/// workflow's. None of them closes the session; the close of the right run does, and the same
+/// close sent again before its delivery is confirmed is answered from the first one's receipt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_workflow_closes_the_session_its_run_started_and_nothing_else() {
     let host = host().await;
     let run = kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([0x21; 16]));
     host.service.started_for_workflow(run);
     let mut authority = controller_client(&host).await;
-    let mut proxy = controller_client_declaring(&host, Some(ControllerConnectionRole::Proxy)).await;
     let mutation = close_mutation(
         &authority,
         &host,
         DEFAULT_MUTATION_TTL.get(),
         ParamsValue::empty(),
     );
-    let forwarded = |ingress: kr_protocol::actor::ActorIngress,
-                     named: Option<kr_protocol::ids::WorkflowRunId>,
-                     grant: Option<kr_protocol::ids::GrantId>,
-                     mutation: &MutationRequest| {
-        ControlFrame::Forwarded(Box::new(kr_protocol::local::ForwardedMutation {
-            mutation: mutation.clone(),
-            actor: kr_protocol::actor::ActorEnvelope {
-                actor_id: actor("workflow:grant"),
-                ingress,
-                device_id: Nullable::null(),
-                grant_id: Nullable(grant),
-                grant_revision: Nullable::null(),
-                controller_generation: ControllerGeneration::new(1),
-                connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([8; 16])),
-            },
-            grant_rights: kr_protocol::scalars::CanonicalSet::new(),
-            accepted_deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms() + 120_000),
-            history: None,
-            screen_basis: None,
-            workflow_run_id: named,
-        }))
-    };
-    let refused = |frame: ControlFrame| match frame {
-        ControlFrame::Response(response) => match response.outcome {
-            Outcome::Error(error) => error.code,
-            Outcome::Ok(_) => panic!("the close must be refused"),
-        },
-        other => panic!("a refusal is a plain response, not {other:?}"),
-    };
     let workflow = kr_protocol::actor::ActorIngress::Workflow;
     let other_run = kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([0x22; 16]));
     let mut other_method = mutation.clone();
@@ -1176,84 +1184,53 @@ async fn a_workflow_closes_the_session_its_run_started_and_nothing_else() {
     for (what, frame) in [
         (
             "another run's close",
-            forwarded(workflow, Some(other_run), None, &mutation),
+            workflow_close(&mutation, workflow, Some(other_run), None),
         ),
         (
             "a close that names no run",
-            forwarded(workflow, None, None, &mutation),
+            workflow_close(&mutation, workflow, None, None),
         ),
         (
             "another method",
-            forwarded(workflow, Some(run), None, &other_method),
+            workflow_close(&other_method, workflow, Some(run), None),
         ),
         (
             "a close that carries a grant",
-            forwarded(workflow, Some(run), grant, &mutation),
+            workflow_close(&mutation, workflow, Some(run), grant),
         ),
         (
             "a run named by the local owner",
-            forwarded(
+            workflow_close(
+                &mutation,
                 kr_protocol::actor::ActorIngress::LocalIpc,
                 Some(run),
                 None,
-                &mutation,
             ),
         ),
         (
             "a run named by a paired device",
-            forwarded(
+            workflow_close(
+                &mutation,
                 kr_protocol::actor::ActorIngress::PairedDevice,
                 Some(run),
                 None,
-                &mutation,
             ),
         ),
     ] {
         assert_eq!(
-            refused(answer_to(&mut authority, frame).await),
+            refused_with(answer_to(&mut authority, frame).await),
             ErrorCode::PermissionDenied,
             "{what}"
         );
     }
-    assert_eq!(
-        refused(answer_to(&mut proxy, forwarded(workflow, Some(run), None, &mutation)).await),
-        ErrorCode::PermissionDenied,
-        "a close over a proxy link"
-    );
     assert!(
         host.service.runtime().session().closure().is_none(),
         "no refused close closed the session"
     );
 
-    // A session that was not started for any run is closed by none: a close that names one is
-    // refused all the same.
-    let unstarted = self::host().await;
-    let mut unstarted_authority = controller_client(&unstarted).await;
-    let unstarted_close = close_mutation(
-        &unstarted_authority,
-        &unstarted,
-        DEFAULT_MUTATION_TTL.get(),
-        ParamsValue::empty(),
-    );
-    assert_eq!(
-        refused(
-            answer_to(
-                &mut unstarted_authority,
-                forwarded(workflow, Some(run), None, &unstarted_close)
-            )
-            .await
-        ),
-        ErrorCode::PermissionDenied,
-        "a session with no launch provenance"
-    );
-    assert!(
-        unstarted.service.runtime().session().closure().is_none(),
-        "the refused close closed nothing"
-    );
-
     let ControlFrame::Response(accepted) = answer_to(
         &mut authority,
-        forwarded(workflow, Some(run), None, &mutation),
+        workflow_close(&mutation, workflow, Some(run), None),
     )
     .await
     else {
@@ -1268,7 +1245,7 @@ async fn a_workflow_closes_the_session_its_run_started_and_nothing_else() {
     // answered from what the first one produced.
     let ControlFrame::Response(again) = answer_to(
         &mut authority,
-        forwarded(workflow, Some(run), None, &mutation),
+        workflow_close(&mutation, workflow, Some(run), None),
     )
     .await
     else {
@@ -1289,6 +1266,78 @@ async fn a_workflow_closes_the_session_its_run_started_and_nothing_else() {
     )
     .await
     .expect("the closure finishes");
+}
+
+/// A workflow's close does not travel over a proxy link, whatever run it names. The
+/// link declared itself a proxy, and the session is closed by no one over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workflow_close_over_a_proxy_link_is_refused() {
+    let host = host().await;
+    let run = kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([0x21; 16]));
+    host.service.started_for_workflow(run);
+    let authority = controller_client(&host).await;
+    let mut proxy = controller_client_declaring(&host, Some(ControllerConnectionRole::Proxy)).await;
+    let mutation = close_mutation(
+        &authority,
+        &host,
+        DEFAULT_MUTATION_TTL.get(),
+        ParamsValue::empty(),
+    );
+    assert_eq!(
+        refused_with(
+            answer_to(
+                &mut proxy,
+                workflow_close(
+                    &mutation,
+                    kr_protocol::actor::ActorIngress::Workflow,
+                    Some(run),
+                    None
+                )
+            )
+            .await
+        ),
+        ErrorCode::PermissionDenied,
+        "a close over a proxy link"
+    );
+    assert!(
+        host.service.runtime().session().closure().is_none(),
+        "the refused close closed nothing"
+    );
+}
+
+/// A session that was not started for any run is closed by no workflow, whichever run
+/// asks: its launch carried no provenance for the worker to compare the run with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_started_for_no_run_is_closed_by_no_workflow() {
+    let host = host().await;
+    let mut authority = controller_client(&host).await;
+    let mutation = close_mutation(
+        &authority,
+        &host,
+        DEFAULT_MUTATION_TTL.get(),
+        ParamsValue::empty(),
+    );
+    let run = kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([0x21; 16]));
+    assert_eq!(
+        refused_with(
+            answer_to(
+                &mut authority,
+                workflow_close(
+                    &mutation,
+                    kr_protocol::actor::ActorIngress::Workflow,
+                    Some(run),
+                    None
+                )
+            )
+            .await
+        ),
+        ErrorCode::PermissionDenied,
+        "a session with no launch provenance"
+    );
+    assert!(
+        host.service.runtime().session().closure().is_none(),
+        "the refused close closed nothing"
+    );
 }
 
 /// The member `name` of a map-shaped answer, where it has one.
