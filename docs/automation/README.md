@@ -194,8 +194,8 @@ closed for any other reason, by a request, a crash or the host's shutdown, says 
 about the command and leaves the node unknown. The session is a session like any other while it
 lives (it is listed, and a person can attach to it), and says in its summary that its root is a
 command. The session's journal keeps that word in a row of its own and its summary in the form
-every earlier release reads, so a release rolled back to reads a command's session as it reads any
-other. An update that closes sessions closes a running command too. Commands are offered where
+the release before reads, so a host rolled back to that release reads a command's session as it
+reads any other. An update that closes sessions closes a running command too. Commands are offered where
 the host has a POSIX shell: a definition that holds one is refused at install on Windows.
 
 When the node's wait or its run's deadline passes, or its run is cancelled, the command's session

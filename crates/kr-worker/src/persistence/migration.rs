@@ -132,7 +132,8 @@ pub const IMPORTER: &str =
 /// schema, because one build writes it, except for the `session_root` table: it was added without
 /// raising the version, so that a release that reads this version reads the journals of this one,
 /// and a journal an earlier build of the version wrote does not have it. It is created when
-/// absent and never required.
+/// absent and never required, which costs this: a journal of this build that loses the table is
+/// not reported as having lost something, and reads its command session as a shell session.
 #[must_use]
 pub fn tables_at(version: i64) -> &'static [&'static str] {
     match version {

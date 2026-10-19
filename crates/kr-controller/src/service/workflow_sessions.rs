@@ -146,15 +146,13 @@ impl Controller {
     /// after a restart, finds the first one's receipt. Its deadline is fresh: the node's own wait
     /// has usually ended by the time anyone closes. After the worker's acceptance the daemon
     /// confirms delivery, which is what lets the worker stop the group, and watches for the
-    /// worker to end. A session with no worker left in the directory is closed already or was
-    /// never launched, and its record, if there is one, is what [`Self::workflow_session_closure`]
-    /// reads.
-    ///
-    /// # Errors
+    /// worker to end. A session with no worker in the directory is closed already, was never
+    /// launched, or has a worker that has not yet reported; its record, if there is one, is what
+    /// [`Self::workflow_session_closure`] reads.
     ///
     /// Answers whether a worker was asked: `false` says the directory holds no worker for the
-    /// session, because it has closed or because its worker has not yet reported, and nothing was
-    /// sent. A caller that must see a session closed asks again until it is.
+    /// session and nothing was sent. A caller that must see a session closed asks again until it
+    /// is.
     ///
     /// # Errors
     ///
