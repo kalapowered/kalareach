@@ -474,6 +474,14 @@ impl Controller {
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         let begun = self.under_registration(&carried, || {
             let mut checks = self.checks.lock().unwrap_or_else(PoisonError::into_inner);
+            // The lookup before admission and this are two looks: a request of the same actor and
+            // action that was answered between them is answered here again, or refused as a reused
+            // identifier, under the one hold that also starts a run.
+            if let Some(kept) = checks.kept_for(actor_id, mutation.action_id, &digest) {
+                return kept.map_err(|()| ControllerError::IdConflict {
+                    token: mutation.action_id.to_string(),
+                });
+            }
             let asked = checks.ask(
                 now_ms,
                 worker.as_ref().map(|worker| worker.descriptor.session_id),
@@ -490,8 +498,8 @@ impl Controller {
                 };
                 tokio::spawn(perform(self.me.clone(), worker, request));
             }
-            view
-        })?;
+            Ok(view)
+        })??;
         ParamsValue::from_typed(&begun)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
