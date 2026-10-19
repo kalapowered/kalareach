@@ -315,7 +315,14 @@ export function Segmented<T extends string>({
   )
 }
 
-/** A banner that says what is happening, without claiming more than it knows. */
+/**
+ * A banner that says what is happening, without claiming more than it knows.
+ *
+ * A screen reader says what a live region changes to, and not what one arrives holding. The
+ * banner appears with its words, so its live region is in the page first and empty, and the words
+ * go into it once the page has drawn it, as the standing banner's do. The region is for a screen
+ * reader alone: the words a person reads are the banner's own.
+ */
 export function Banner({
   tone,
   title,
@@ -327,13 +334,25 @@ export function Banner({
   readonly detail: string
   readonly action?: ReactNode
 }): ReactNode {
+  const announcement = `${title}${/[.!?]$/.test(title) ? '' : '.'} ${detail}`
+  const region = useRef<HTMLSpanElement | null>(null)
+  useEffect(() => {
+    if (region.current !== null) region.current.textContent = announcement
+  }, [announcement])
   return (
-    <div className={`banner ${tone}`} role="status">
+    <div className={`banner ${tone}`}>
       <div className="spacer">
         <strong>{title}</strong>
         {detail}
       </div>
       {action}
+      <span
+        className="visually-hidden"
+        role="status"
+        aria-live="polite"
+        data-announcement=""
+        ref={region}
+      />
     </div>
   )
 }
