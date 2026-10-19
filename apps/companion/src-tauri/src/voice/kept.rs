@@ -208,13 +208,14 @@ fn staged_name(file: &Path, count: u64) -> PathBuf {
     file.with_extension(format!("staged-{}-{count}", std::process::id()))
 }
 
-#[cfg(test)]
+// A link that leads back to itself is how a test makes a file the system refuses to read, which
+// only Unix has.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     /// A file the system refuses to read is not a file that is not there: the first is read again,
     /// the second holds nothing, and so does one that is not this layout.
-    #[cfg(unix)]
     #[test]
     fn a_file_the_system_refuses_to_read_is_told_apart_from_one_that_is_not_there() {
         let directory = tempfile::tempdir().expect("a directory");
