@@ -260,6 +260,28 @@ describe('revoking a device', () => {
     })
   })
 
+  it('says for the host on this computer that it recorded a revocation, and how many sessions have yet to confirm it', async () => {
+    const person = userEvent.setup()
+    const { controls } = screenOf(
+      view([
+        host({
+          reference: 'here',
+          name: 'This computer',
+          route: 'direct',
+          feed: null,
+          devices: [device('the-phone', { state: 'active' })]
+        })
+      ])
+    )
+    await rowOf('the-phone')
+    controls.revocation.stand('here', 'the-phone', ACKNOWLEDGED({ pending_workers: 2 }))
+    await person.click(screen.getByTestId('devices-refresh'))
+    await waitFor(() => {
+      expect(screen.getByTestId('devices-heard')).toHaveTextContent('recorded the revocation of the-phone')
+    })
+    expect(screen.getByTestId('devices-heard')).toHaveTextContent('2 sessions')
+  })
+
   it('names the control for the host on this computer in words, not by the name its card has', async () => {
     screenOf(
       view([

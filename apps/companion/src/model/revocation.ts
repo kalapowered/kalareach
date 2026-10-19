@@ -303,13 +303,16 @@ export function announcements(before: RevocationView | null, after: RevocationVi
               : `${name} acknowledged the revocation of ${device.name}, and every session confirmed it.`
           )
           break
-        case 'acknowledged':
+        case 'acknowledged': {
+          const heard = `${name} ${host.route === 'direct' ? 'recorded' : 'acknowledged'} the revocation of ${device.name}`
+          const workers = device.standing.pending_workers
           said.push(
             device.standing.host_lists_revoked
-              ? `${name} acknowledged the revocation of ${device.name}, and has not said that every session confirmed it.`
-              : `${name} acknowledged the revocation of ${device.name}, but its own list does not show it revoked.`
+              ? `${heard}, and ${workers !== null ? `${sessions(workers)} had not confirmed it yet` : 'has not said that every session confirmed it'}.`
+              : `${heard}, but its own list does not show it revoked.`
           )
           break
+        }
         case 'refused':
           said.push(`${name} refused the request to revoke ${device.name}.`)
           break
