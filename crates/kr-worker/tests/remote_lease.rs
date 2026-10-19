@@ -329,6 +329,7 @@ fn forwarded(
         accepted_deadline_boot_ms: U64::new(boot_now_ms() + TWO_MINUTES_MS),
         history: None,
         screen_basis: None,
+        workflow_run_id: None,
         lease,
     }))
 }

@@ -1163,6 +1163,8 @@ fn workflow_close(
         history: None,
         screen_basis: None,
         workflow_run_id: named,
+        // A close needs no lease, a paired device's included.
+        lease: None,
     }))
 }
 

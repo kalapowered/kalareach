@@ -846,6 +846,7 @@ fn a_forwarded_mutation_without_a_lease_is_what_the_release_before_reads_and_one
             accepted_deadline_boot_ms: U64::new(5),
             history: None,
             screen_basis: None,
+            workflow_run_id: None,
             lease,
         }))
     };
