@@ -2273,6 +2273,74 @@ async fn a_later_attempt_at_a_draft_publication_presents_its_identity_and_its_by
 }
 
 #[tokio::test]
+async fn bytes_sealed_under_a_retired_epoch_are_not_sent_under_the_next_one() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, first, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+
+    // The first attempt never arrives. Its bytes are held, sealed under the first epoch's key.
+    service.drop_the_next_request().await;
+    first
+        .publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW),
+        )
+        .await
+        .expect_err("it never arrived");
+
+    // The collection moves to a newer epoch, and the client is built again over the same records,
+    // under the newer key.
+    let next: Arc<dyn DraftSealer> = Arc::new(DeviceSealer::new(0x5b));
+    let second = DraftSync::new(
+        Arc::clone(&service) as Arc<_>,
+        Arc::clone(&next),
+        SyncStore::open(directory.path().join("sync")).expect("the same store"),
+    );
+    second
+        .publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW + 30),
+        )
+        .await
+        .expect("published");
+
+    // What travels under the second epoch is sealed under it, as work of its own: neither the first
+    // attempt's bytes nor its identity.
+    let sent = service.exchanges().await;
+    assert_eq!(sent.len(), 2);
+    assert!(
+        next.open(&sent[1].ciphertext).is_ok(),
+        "the bytes are sealed under the epoch they travel under"
+    );
+    assert_ne!(sent[1].request_id, sent[0].request_id);
+
+    // The first request is not attempted again, and a reconciliation ends it at the service, where
+    // it ran nothing.
+    let first_request = sent[0].request_id;
+    let reconciled = second
+        .reconcile_unsettled(&drafts, TimestampMs::new(NOW + 40))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.fenced, 1);
+    assert!(
+        service
+            .fence_requests()
+            .await
+            .iter()
+            .any(|fence| fence.request_id == first_request),
+        "the request sealed under the retired epoch was fenced"
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+}
+
+#[tokio::test]
 async fn every_attempt_at_a_draft_publication_lies_between_the_two_instants_its_fence_carries() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(Service::default());
