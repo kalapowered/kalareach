@@ -567,19 +567,28 @@ pub async fn forward_events<R: Runtime>(
 ) {
     let host = host.to_string();
     let mut events = session.events();
+    // The question of whether the host withdrew this connection, while one is out: one at a time.
+    let mut asking: Option<tauri::async_runtime::JoinHandle<()>> = None;
     loop {
         let heard = tokio::select! {
             heard = events.recv() => heard,
             // The host refused a request on this connection as not permitted. A host that
             // withdrew what the connection was admitted under refuses everything on it and does
             // not close it, so whether this is that is asked of the host, over another connection,
-            // and nothing waits on the answer: events go on being forwarded meanwhile.
-            () = session.denied() => {
+            // and nothing waits on the answer: events go on being forwarded meanwhile. The
+            // question is asked of one connection at a time, and what it is refused itself, and
+            // what is refused while it is out, is the same answer to it and not a new question.
+            () = session.denied(), if asking.is_none() => {
                 let app = app.clone();
                 let session = Arc::clone(&session);
-                tauri::async_runtime::spawn(async move {
+                asking = Some(tauri::async_runtime::spawn(async move {
                     app.state::<AppState>().replace_if_withdrawn(&session).await;
-                });
+                }));
+                continue;
+            }
+            _ = async { if let Some(asking) = asking.as_mut() { let _ = asking.await; } }, if asking.is_some() => {
+                asking = None;
+                let _ = tokio::time::timeout(std::time::Duration::ZERO, session.denied()).await;
                 continue;
             }
             () = session.closed() => {

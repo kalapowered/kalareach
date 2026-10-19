@@ -257,7 +257,11 @@ impl AppState {
         let Some(connection) = held else {
             return;
         };
-        if Arc::ptr_eq(&connection.session(), session) {
+        // Only the connection to the host on this machine is replaced: nothing replaces a paired
+        // device's, and asking a host it holds no right to manage only draws another refusal.
+        if Arc::ptr_eq(&connection.session(), session)
+            && matches!(connection.standing(), Standing::Owner)
+        {
             crate::settings::connected::listed_replacing(&connection, &self.replacer()).await;
         }
     }
