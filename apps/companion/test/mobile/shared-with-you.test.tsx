@@ -728,11 +728,20 @@ describe('an invitation that arrives while the inbox is open (KR-REQ-18.13)', ()
   it('is told once to a screen reader and takes its place at the head', async () => {
     const { controls, port } = start()
     await screen.findByText('Nothing needs you right now.')
+    // An invitation the first read of what is held already lists was there before the inbox was
+    // open, so it is not one that arrives: the first read is taken in before this one is offered.
+    await waitFor(() => {
+      expect(bookOf(port).snapshot().status).toBe('ready')
+    })
     controls.sharing.offer({ session: '4' })
     await readAgain(port)
 
     expect(await screen.findByText('Studio shared session 4 with you.')).toBeInTheDocument()
-    expect(screen.getByTestId('offers-said')).toHaveTextContent('New invitation. Studio shared session 4 with you.')
+    await waitFor(() => {
+      expect(screen.getByTestId('offers-said')).toHaveTextContent(
+        'New invitation. Studio shared session 4 with you.'
+      )
+    })
 
     // A read that finds nothing new says nothing more.
     const said = screen.getByTestId('offers-said').textContent
