@@ -1199,6 +1199,15 @@ async fn a_workflow_closes_the_session_its_run_started_and_nothing_else() {
                 &mutation,
             ),
         ),
+        (
+            "a run named by a paired device",
+            forwarded(
+                kr_protocol::actor::ActorIngress::PairedDevice,
+                Some(run),
+                None,
+                &mutation,
+            ),
+        ),
     ] {
         assert_eq!(
             refused(answer_to(&mut authority, frame).await),
@@ -1216,6 +1225,32 @@ async fn a_workflow_closes_the_session_its_run_started_and_nothing_else() {
         "no refused close closed the session"
     );
 
+    // A session that was not started for any run is closed by none: a close that names one is
+    // refused all the same.
+    let unstarted = self::host().await;
+    let mut unstarted_authority = controller_client(&unstarted).await;
+    let unstarted_close = close_mutation(
+        &unstarted_authority,
+        &unstarted,
+        DEFAULT_MUTATION_TTL.get(),
+        ParamsValue::empty(),
+    );
+    assert_eq!(
+        refused(
+            answer_to(
+                &mut unstarted_authority,
+                forwarded(workflow, Some(run), None, &unstarted_close)
+            )
+            .await
+        ),
+        ErrorCode::PermissionDenied,
+        "a session with no launch provenance"
+    );
+    assert!(
+        unstarted.service.runtime().session().closure().is_none(),
+        "the refused close closed nothing"
+    );
+
     let ControlFrame::Response(accepted) = answer_to(
         &mut authority,
         forwarded(workflow, Some(run), None, &mutation),
@@ -1228,6 +1263,21 @@ async fn a_workflow_closes_the_session_its_run_started_and_nothing_else() {
         matches!(accepted.outcome, Outcome::Ok(_)),
         "{:?}",
         accepted.outcome
+    );
+    // The same close sent again before its delivery is confirmed is the same action, and is
+    // answered from what the first one produced.
+    let ControlFrame::Response(again) = answer_to(
+        &mut authority,
+        forwarded(workflow, Some(run), None, &mutation),
+    )
+    .await
+    else {
+        panic!("a retry of the close is answered");
+    };
+    assert!(
+        matches!(again.outcome, Outcome::Ok(_)),
+        "{:?}",
+        again.outcome
     );
     authority
         .confirm_delivery(mutation.action_id)

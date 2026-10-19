@@ -110,6 +110,35 @@ pub struct SessionConfig {
     pub time: crate::action::time::TimeSources,
 }
 
+/// What a session started to run a command is held to when its process starts.
+#[derive(Clone, Copy, Debug)]
+struct CommandStart {
+    /// The moment on the machine's continuous clock after which the command does not start.
+    not_after_boot_ms: u64,
+}
+
+impl CommandStart {
+    /// Whether `command` may start now, at `now_boot_ms` on the continuous clock.
+    fn admits(self, command: &ShellCommand, now_boot_ms: u64) -> Result<()> {
+        if now_boot_ms >= self.not_after_boot_ms {
+            return Err(WorkerError::PermissionDenied {
+                detail: "the moment the daemon accepted this command for passed before it could \
+                         start"
+                    .to_owned(),
+            });
+        }
+        // The terminal library starts a process in the account's home directory when the
+        // directory it was given is not there, which would run the command somewhere nobody
+        // chose.
+        if !std::path::Path::new(&command.cwd).is_dir() {
+            return Err(WorkerError::InvalidArgument(
+                "the directory this command runs in is not there".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// What a close request produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CloseAcceptance {
@@ -350,6 +379,8 @@ pub struct Session {
     /// What the root process is, where it is not an interactive shell: a command the host
     /// started the session to run.
     root: Option<kr_protocol::session::SessionRoot>,
+    /// What a session started to run a command is held to at the moment its process starts.
+    command_start: Option<CommandStart>,
     owned: Option<OwnedProcesses>,
     /// Writes what the session owns to the journal, off this session's lock, where the journal is
     /// a file.
@@ -633,6 +664,7 @@ impl Session {
             created_at_ms: kr_ipc::now_ms(),
             environment_sources: None,
             root: None,
+            command_start: None,
             owned: None,
             owned_writer: None,
             root_exit: None,
@@ -700,6 +732,15 @@ impl Session {
             ));
         }
         let command = self.config.shell.clone();
+        // A command is held to what the daemon accepted it for at the last moment before it
+        // exists, after everything this worker prepared first, so a delay in any of that cannot
+        // carry it past its moment.
+        if let Some(start) = self.command_start
+            && let Err(error) = start.admits(&command, kr_ipc::clock::boot_elapsed_ms())
+        {
+            self.record_closure(ClosureReason::RootLaunchFailed, None);
+            return Err(error);
+        }
         // Before the shell exists, so that whatever it leaves behind stays this worker's.
         crate::ownership::adopt_orphans();
         match self.pty.launch(&command) {
@@ -1931,10 +1972,15 @@ impl Session {
         self.environment_sources = Some(sources);
     }
 
-    /// Says that the root process is a command the host started the session to run, which a
-    /// summary of the session then carries.
-    pub const fn set_root(&mut self, root: kr_protocol::session::SessionRoot) {
-        self.root = Some(root);
+    /// Says that the root process is a command the host started the session to run, which every
+    /// summary of the session then carries, the first one written at launch among them.
+    ///
+    /// The command starts only if the machine's continuous clock has not reached
+    /// `not_after_boot_ms` and the directory it runs in exists, both read immediately before the
+    /// process is created.
+    pub const fn start_as_command(&mut self, not_after_boot_ms: u64) {
+        self.root = Some(kr_protocol::session::SessionRoot::Command);
+        self.command_start = Some(CommandStart { not_after_boot_ms });
     }
 
     /// Where the session's palette came from.

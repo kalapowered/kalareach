@@ -228,11 +228,11 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     admissions.apply(&first, &sources);
     // A session whose root is a command starts nothing the daemon did not accept: it is refused
     // here, before anything is bound or spawned, when the command may not run on this platform or
-    // under this mode, or when the moment the daemon accepted it for has passed.
+    // under this mode. The moment the daemon accepted it for is held again when the process is
+    // about to be created, after everything this worker still prepares.
     if let Some(refusal) = root_command_refusal(
         specification.root_command.as_ref(),
         specification.create.shell_mode,
-        kr_ipc::clock::boot_elapsed_ms(),
     ) {
         writer
             .write_message(&ControlFrame::WorkerFailed(refusal.clone()))
@@ -293,6 +293,10 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         environment_sources,
         palette,
         specification.privacy,
+        specification
+            .root_command
+            .as_ref()
+            .map(|root| root.not_after_boot_ms.get()),
         std::sync::Arc::clone(&shared_clock),
     ) {
         Ok(runtime) => runtime,
@@ -305,12 +309,6 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // A session started to run a command says so from its first summary on.
-    if specification.root_command.is_some() {
-        runtime
-            .session()
-            .set_root(kr_protocol::session::SessionRoot::Command);
-    }
     // The driver and the endpoint go in together, before the ready report: the first thing the
     // reader says about itself must have somewhere to go.
     let bridge_server = bridge.map(|(package, endpoint)| {
@@ -753,12 +751,11 @@ fn session_config(
 ///
 /// The command runs through a POSIX shell given the command line, and that is offered on the
 /// platforms that have one. It runs in `native_compat`, because a managed session is the
-/// interactive shell its package qualifies, and it starts only before the moment the daemon
-/// accepted it for: a worker that reaches that moment first starts nothing.
+/// interactive shell its package qualifies. The moment the daemon accepted it for, and the
+/// directory it runs in, are held where its process is created.
 fn root_command_refusal(
     root: Option<&kr_protocol::worker::RootCommand>,
     shell_mode: ShellMode,
-    now_boot_ms: u64,
 ) -> Option<ProtocolError> {
     let root = root?;
     let refuse = |code: ErrorCode, message: &str| Some(ProtocolError::new(code, message));
@@ -778,12 +775,6 @@ fn root_command_refusal(
         return refuse(
             ErrorCode::InvalidArgument,
             "the interpreter of a command is named by an absolute path",
-        );
-    }
-    if now_boot_ms >= root.not_after_boot_ms.get() {
-        return refuse(
-            ErrorCode::PermissionDenied,
-            "the moment the daemon accepted this command for passed before it could start",
         );
     }
     None
@@ -813,6 +804,11 @@ const fn startup_mode(profile: &kr_protocol::session::LaunchProfile) -> StartupM
 /// A `native_compat` session runs the selected stock shell as an interactive shell. It is never a
 /// non-interactive script invocation turned interactive, and it is never a silently substituted
 /// binary: this is the executable the create request named, run the way an interactive login does.
+///
+/// The one session that is not an interactive shell is a session the host started to run a
+/// command: its root is the command's interpreter given the command line ([`command_arguments`]),
+/// with no login and no interactive mode, and its summary says so. That departs on purpose from a
+/// session whose root is always the account's interactive shell, and it is the only departure.
 ///
 /// The arguments belong to the shell, not to the platform. A PowerShell given `-l -i` would treat
 /// them as a script path and a parameter and fail; a Bourne-family shell given `-NoLogo` would do
@@ -981,8 +977,8 @@ mod tests {
         );
     }
 
-    /// A command the daemon did not accept for this moment, this mode or this platform starts
-    /// nothing; one it did, starts, and a session that is not a command's is none of this.
+    /// A command the daemon did not accept for this mode or this platform starts nothing; one it
+    /// did, starts, and a session that is not a command's is none of this.
     #[cfg(unix)]
     #[test]
     fn a_session_whose_root_is_a_command_starts_only_what_the_daemon_accepted() {
@@ -991,22 +987,19 @@ mod tests {
         use kr_protocol::session::ShellMode;
         use kr_protocol::worker::RootCommand;
 
-        let command = |interpreter: &str, not_after: u64| RootCommand {
+        let command = |interpreter: &str| RootCommand {
             interpreter: interpreter.to_owned(),
             command: "exit 3".to_owned(),
-            not_after_boot_ms: kr_protocol::scalars::U64::new(not_after),
+            not_after_boot_ms: kr_protocol::scalars::U64::new(100),
         };
-        let accepted = command("/bin/sh", 100);
-        assert!(root_command_refusal(Some(&accepted), ShellMode::NativeCompat, 99).is_none());
-        assert!(root_command_refusal(None, ShellMode::Managed, 99).is_none());
+        let accepted = command("/bin/sh");
+        assert!(root_command_refusal(Some(&accepted), ShellMode::NativeCompat).is_none());
+        assert!(root_command_refusal(None, ShellMode::Managed).is_none());
 
-        let late = root_command_refusal(Some(&accepted), ShellMode::NativeCompat, 100)
-            .expect("the moment passed");
-        assert_eq!(late.code, ErrorCode::PermissionDenied);
-        let managed = root_command_refusal(Some(&accepted), ShellMode::Managed, 1)
+        let managed = root_command_refusal(Some(&accepted), ShellMode::Managed)
             .expect("a managed session is the interactive shell");
         assert_eq!(managed.code, ErrorCode::InvalidArgument);
-        let relative = root_command_refusal(Some(&command("sh", 100)), ShellMode::NativeCompat, 1)
+        let relative = root_command_refusal(Some(&command("sh")), ShellMode::NativeCompat)
             .expect("an interpreter is named by an absolute path");
         assert_eq!(relative.code, ErrorCode::InvalidArgument);
     }

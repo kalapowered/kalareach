@@ -1030,6 +1030,7 @@ fn start_printing(
         },
         kr_worker::snapshot::PaletteChoice::from_request(None),
         privacy,
+        None,
         std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
     )
 }

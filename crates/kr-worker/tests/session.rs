@@ -2308,6 +2308,7 @@ async fn the_palette_a_create_request_names_reaches_the_launched_session() {
                 generation: kr_protocol::scalars::U64::ZERO,
                 enabled: false,
             },
+            None,
             std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
         )
         .expect("the session launches");
@@ -2320,6 +2321,62 @@ async fn the_palette_a_create_request_names_reaches_the_launched_session() {
         gate.release();
         let _ = closure_record(&runtime, "the session closes").await;
     }
+}
+
+/// A session started to run a command creates its process only at the last moment, in a directory
+/// that is there. A moment the daemon accepted the command for that has passed by then starts
+/// nothing, and a directory that is not there starts nothing (the terminal library would run it in
+/// the account's home directory instead). The control is the same command in a directory that is
+/// there, before its moment: it runs, and the session says its root is a command.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_starts_only_in_time_and_in_a_directory_that_is_there() {
+    let host = kr_ipc::testing::TempHost::create();
+    let marker = host.root().join("the-command-ran");
+    let in_the_directory = host.root().to_path_buf();
+    let script = format!("touch {}", marker.display());
+
+    let refused = |not_after_boot_ms: u64, cwd: std::path::PathBuf| {
+        let mut config = configuration(&host, &script);
+        config.shell.cwd = cwd.display().to_string();
+        let mut session = Session::open(config).expect("opens");
+        session.start_as_command(not_after_boot_ms);
+        let error = session.launch().expect_err("the command does not start");
+        (error, session.closure().cloned())
+    };
+
+    let (late, closure) = refused(0, in_the_directory.clone());
+    assert_eq!(late.code(), kr_protocol::error::ErrorCode::PermissionDenied);
+    assert_eq!(
+        closure.expect("a refused start leaves its record").reason,
+        ClosureReason::RootLaunchFailed
+    );
+    let (absent, closure) = refused(u64::MAX, host.root().join("not-there"));
+    assert_eq!(
+        absent.code(),
+        kr_protocol::error::ErrorCode::InvalidArgument
+    );
+    assert!(closure.is_some());
+    assert!(!marker.exists(), "neither refusal ran the command");
+
+    let mut config = configuration(&host, &script);
+    config.shell.cwd = in_the_directory.display().to_string();
+    let mut session = Session::open(config).expect("opens");
+    session.start_as_command(u64::MAX);
+    session.launch().expect("the command starts");
+    assert_eq!(
+        session.summary().root,
+        Some(kr_protocol::session::SessionRoot::Command)
+    );
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
+    let record = closure_record(&runtime, "the command ends with its session").await;
+    assert_eq!(record.reason, ClosureReason::RootExit);
+    assert!(marker.exists(), "the command ran");
 }
 
 /// KR-REQ-07.15: silence is not a reason to close a session. A live session with no attachment, no
