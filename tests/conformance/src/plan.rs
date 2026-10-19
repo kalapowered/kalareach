@@ -1581,36 +1581,35 @@ pub struct IgnoredRun {
 /// Where tests that an ordinary run leaves out are run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Runs {
-    /// A command in a file of the repository, given as every word of it up to the test names (the
-    /// words of the file's line, its continuations joined and split at white space, compared as
-    /// written). The file has to hold exactly these words as a run, and nothing after them but, if
-    /// they include `--exact`, each test the entry covers, and then the end of the command: a
-    /// redirection, a pipe or another command. No word is added, changed or taken out unseen, so no
-    /// flag, filter or option can narrow the run. The word before them has to be one that leaves the
-    /// command running as written (the start of the line, `run:`, `then`, `!`, `&&` and the like).
+    /// A command in a file of the repository, given as the whole of its line: the file has to hold
+    /// a line with exactly these words (the continuations of a line joined, the white space made
+    /// single, a comment at its end left out), so a word added to the line, changed in it or taken
+    /// out of it, a flag, a filter, a redirection, what stands before or after the command, is a
+    /// line the entry does not give, and the map refuses it until the entry is changed to the line
+    /// as it now is. If the line selects with `--exact`, it names each test the entry covers.
     Command {
         /// The file, relative to the repository.
         file: &'static str,
-        /// The words of the command.
-        command: &'static [&'static str],
+        /// The line.
+        line: &'static str,
     },
-    /// A command as for [`Runs::Command`] whose test names are not after it, because a call or a
-    /// list passes them: each test the entry covers is named on a line that begins with the first
-    /// of `names_with` (after an opening quote) and holds the rest, such as the call that hands the
-    /// name to the command.
+    /// A command as for [`Runs::Command`] whose test names are not on its own line, because a call
+    /// or a list passes them: each test the entry covers is named on a line that begins with the
+    /// first of `names_with` (after an opening quote) and holds the rest, such as the call that
+    /// hands the name to the command.
     Supplied {
         /// The file, relative to the repository.
         file: &'static str,
-        /// The words of the command.
-        command: &'static [&'static str],
+        /// The line.
+        line: &'static str,
         /// The words each line that names a test holds, the first of them at its start.
         names_with: &'static [&'static str],
     },
-    /// A step of this report's own plan on Linux, given as every word of it; a step has to have
-    /// exactly these words, and, if they include `--exact`, name each test the entry covers.
+    /// A step of this report's own plan on Linux, given as the whole of its command: some step has
+    /// exactly these words and, if they include `--exact`, names each test the entry covers.
     Plan {
-        /// The words of the step.
-        command: &'static [&'static str],
+        /// The words of the step, joined with single spaces.
+        line: &'static str,
     },
     /// A process the target's own tests start: the file names each helper test in its code, within
     /// a few lines of the flags that ask for an ignored test by name.
@@ -1632,32 +1631,6 @@ pub enum Runs {
     },
 }
 
-/// The workflow step that drives the built shell packages through the contract.
-const SHELL_PACKAGE_STEP: &[&str] = &[
-    "cargo",
-    "test",
-    "--locked",
-    "-p",
-    "kr-shell-integration",
-    "--test",
-    "zsh",
-    "--test",
-    "bash",
-    "--test",
-    "fish",
-    "--test",
-    "pwsh",
-    "--test",
-    "module_abi",
-    "--test",
-    "relocation",
-    "--test",
-    "fish_sources",
-    "--",
-    "--test-threads=1",
-    "--include-ignored",
-];
-
 /// The steps that run the keyed tests an ordinary run leaves out.
 pub const IGNORED_RUNS: &[IgnoredRun] = &[
     IgnoredRun {
@@ -1666,7 +1639,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
-            command: SHELL_PACKAGE_STEP,
+            line: "cargo test --locked -p kr-shell-integration --test zsh --test bash --test fish --test pwsh --test module_abi --test relocation --test fish_sources -- --test-threads=1 --include-ignored",
         },
     },
     IgnoredRun {
@@ -1675,7 +1648,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
-            command: SHELL_PACKAGE_STEP,
+            line: "cargo test --locked -p kr-shell-integration --test zsh --test bash --test fish --test pwsh --test module_abi --test relocation --test fish_sources -- --test-threads=1 --include-ignored",
         },
     },
     IgnoredRun {
@@ -1684,7 +1657,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
-            command: SHELL_PACKAGE_STEP,
+            line: "cargo test --locked -p kr-shell-integration --test zsh --test bash --test fish --test pwsh --test module_abi --test relocation --test fish_sources -- --test-threads=1 --include-ignored",
         },
     },
     IgnoredRun {
@@ -1693,7 +1666,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
-            command: SHELL_PACKAGE_STEP,
+            line: "cargo test --locked -p kr-shell-integration --test zsh --test bash --test fish --test pwsh --test module_abi --test relocation --test fish_sources -- --test-threads=1 --include-ignored",
         },
     },
     IgnoredRun {
@@ -1702,7 +1675,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
-            command: SHELL_PACKAGE_STEP,
+            line: "cargo test --locked -p kr-shell-integration --test zsh --test bash --test fish --test pwsh --test module_abi --test relocation --test fish_sources -- --test-threads=1 --include-ignored",
         },
     },
     IgnoredRun {
@@ -1711,7 +1684,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
-            command: SHELL_PACKAGE_STEP,
+            line: "cargo test --locked -p kr-shell-integration --test zsh --test bash --test fish --test pwsh --test module_abi --test relocation --test fish_sources -- --test-threads=1 --include-ignored",
         },
     },
     IgnoredRun {
@@ -1720,18 +1693,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
-            command: &[
-                "cargo",
-                "test",
-                "--locked",
-                "-p",
-                "kr-shell-integration",
-                "--test",
-                "install_homes",
-                "--",
-                "--test-threads=1",
-                "--include-ignored",
-            ],
+            line: "cargo test --locked -p kr-shell-integration --test install_homes -- --test-threads=1 --include-ignored",
         },
     },
     IgnoredRun {
@@ -1740,18 +1702,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
-            command: &[
-                "cargo",
-                "test",
-                "--locked",
-                "-p",
-                "kr-shell-integration",
-                "--test",
-                "qualification",
-                "--",
-                "--test-threads=1",
-                "--include-ignored",
-            ],
+            line: "cargo test --locked -p kr-shell-integration --test qualification -- --test-threads=1 --include-ignored",
         },
     },
     IgnoredRun {
@@ -1760,17 +1711,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &["host::startup::"],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
-            command: &[
-                "cargo",
-                "test",
-                "--locked",
-                "-p",
-                "kr-shell-integration",
-                "--lib",
-                "host::startup::",
-                "--",
-                "--include-ignored",
-            ],
+            line: "cargo test --locked -p kr-shell-integration --lib host::startup:: -- --include-ignored",
         },
     },
     IgnoredRun {
@@ -1789,18 +1730,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         ],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
-            command: &[
-                "cargo",
-                "test",
-                "--locked",
-                "-p",
-                "kr-client",
-                "--lib",
-                "--",
-                "--nocapture",
-                "--ignored",
-                "--exact",
-            ],
+            line: "run: cargo test --locked -p kr-client --lib -- --nocapture --ignored --exact sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again",
         },
     },
     IgnoredRun {
@@ -1809,20 +1739,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Supplied {
             file: ".github/workflows/core-ci.yml",
-            command: &[
-                "cargo",
-                "test",
-                "--locked",
-                "-p",
-                "\"$package\"",
-                "\"${selector[@]}\"",
-                "--",
-                "--ignored",
-                "--exact",
-                "--color",
-                "never",
-                "\"$check\"",
-            ],
+            line: "cargo test --locked -p \"$package\" \"${selector[@]}\" -- --ignored --exact --color never \"$check\" 2>&1 | tee \"$log\" || ran=1",
             names_with: &["kr-changeset capture"],
         },
     },
@@ -1832,20 +1749,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Supplied {
             file: ".github/workflows/core-ci.yml",
-            command: &[
-                "cargo",
-                "test",
-                "--locked",
-                "-p",
-                "\"$package\"",
-                "\"${selector[@]}\"",
-                "--",
-                "--ignored",
-                "--exact",
-                "--color",
-                "never",
-                "\"$check\"",
-            ],
+            line: "cargo test --locked -p \"$package\" \"${selector[@]}\" -- --ignored --exact --color never \"$check\" 2>&1 | tee \"$log\" || ran=1",
             names_with: &["kr-transfer authority"],
         },
     },
@@ -1855,20 +1759,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Supplied {
             file: ".github/workflows/core-ci.yml",
-            command: &[
-                "cargo",
-                "test",
-                "--locked",
-                "-p",
-                "\"$package\"",
-                "\"${selector[@]}\"",
-                "--",
-                "--ignored",
-                "--exact",
-                "--color",
-                "never",
-                "\"$check\"",
-            ],
+            line: "cargo test --locked -p \"$package\" \"${selector[@]}\" -- --ignored --exact --color never \"$check\" 2>&1 | tee \"$log\" || ran=1",
             names_with: &["kr-project workspaces"],
         },
     },
@@ -1890,19 +1781,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         ],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
-            command: &[
-                "cargo",
-                "test",
-                "--locked",
-                "-p",
-                "kr-cli",
-                "--test",
-                "startup_windows",
-                "--",
-                "--ignored",
-                "--skip",
-                "a_task_the_task_scheduler_does_not_start",
-            ],
+            line: "run: cargo test --locked -p kr-cli --test startup_windows -- --ignored --skip a_task_the_task_scheduler_does_not_start",
         },
     },
     IgnoredRun {
@@ -1926,19 +1805,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         target: "--test applications",
         cases: &[],
         runs: Runs::Plan {
-            command: &[
-                "cargo",
-                "test",
-                "--locked",
-                "-p",
-                "kr-conformance",
-                "--test",
-                "applications",
-                "--",
-                "--ignored",
-                "--test-threads=1",
-                "--show-output",
-            ],
+            line: "cargo test --locked -p kr-conformance --test applications -- --ignored --test-threads=1 --show-output",
         },
     },
     IgnoredRun {
@@ -1946,20 +1813,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         target: "--test report",
         cases: &["typescript_comment_forms_and_titles_key_their_tests"],
         runs: Runs::Plan {
-            command: &[
-                "cargo",
-                "test",
-                "--locked",
-                "-p",
-                "kr-conformance",
-                "--test",
-                "report",
-                "--",
-                "--ignored",
-                "--exact",
-                "typescript_comment_forms_and_titles_key_their_tests",
-                "--show-output",
-            ],
+            line: "cargo test --locked -p kr-conformance --test report -- --ignored --exact typescript_comment_forms_and_titles_key_their_tests --show-output",
         },
     },
     IgnoredRun {
@@ -1967,19 +1821,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         target: "--test network",
         cases: &[],
         runs: Runs::Plan {
-            command: &[
-                "cargo",
-                "test",
-                "--locked",
-                "-p",
-                "kr-controller",
-                "--test",
-                "network",
-                "--",
-                "--test-threads=1",
-                "--include-ignored",
-                "--show-output",
-            ],
+            line: "cargo test --locked -p kr-controller --test network -- --test-threads=1 --include-ignored --show-output",
         },
     },
     IgnoredRun {
@@ -1988,17 +1830,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: "scripts/real-package-cases.sh",
-            command: &[
-                "step",
-                "cargo",
-                "test",
-                "-p",
-                "kr-controller",
-                "--test",
-                "shell",
-                "--",
-                "--ignored",
-            ],
+            line: "step cargo test -p kr-controller --test shell -- --ignored",
         },
     },
     IgnoredRun {
@@ -2007,18 +1839,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: "scripts/real-package-cases.sh",
-            command: &[
-                "step",
-                "cargo",
-                "test",
-                "-p",
-                "kr-worker",
-                "--test",
-                "fence",
-                "--",
-                "--ignored",
-                "--exact",
-            ],
+            line: "step cargo test -p kr-worker --test fence -- --ignored --exact a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint a_startup_prompt_takes_its_answer_through_the_worker_and_the_session_is_ready_after_the_profile a_startup_prompt_nobody_answers_leaves_the_session_not_ready_and_it_still_closes a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypass_as_typed a_real_shell_that_ran_cd_is_described_by_its_new_directory_at_the_next_prompt a_real_shell_names_the_program_it_resolved_and_not_a_word_it_found_no_file_for a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_again",
         },
     },
     IgnoredRun {
@@ -2027,24 +1848,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &["a_viewer_reaches_only_the_distribution_it_was_paired_with"],
         runs: Runs::Supplied {
             file: "scripts/e2e-wsl.sh",
-            command: &[
-                "wsl.exe",
-                "-d",
-                "\"$distribution\"",
-                "-u",
-                "\"$linux_user\"",
-                "--exec",
-                "/bin/sh",
-                "-lc",
-                "\"KR_ACC_OTHER='$other'",
-                "'$pairing_suite_path'",
-                "--ignored",
-                "--exact",
-                "--nocapture",
-                "--test-threads",
-                "1",
-                "$name\"",
-            ],
+            line: "wsl.exe -d \"$distribution\" -u \"$linux_user\" --exec /bin/sh -lc \"KR_ACC_OTHER='$other' '$pairing_suite_path' --ignored --exact --nocapture --test-threads 1 $name\" >\"$pairing_log\" 2>&1 ||",
             names_with: &["pairing_case"],
         },
     },
@@ -2065,21 +1869,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         ],
         runs: Runs::Supplied {
             file: "scripts/performance.sh",
-            command: &[
-                "output=\"$(CARGO_BUILD_JOBS=\"${CARGO_BUILD_JOBS:-4}\"",
-                "cargo",
-                "test",
-                "--release",
-                "-p",
-                "kr-worker",
-                "\"$target_flag\"",
-                "\"$target\"",
-                "--",
-                "--ignored",
-                "--exact",
-                "--nocapture",
-                "\"$name\"",
-            ],
+            line: "if ! output=\"$(CARGO_BUILD_JOBS=\"${CARGO_BUILD_JOBS:-4}\" cargo test --release -p kr-worker \"$target_flag\" \"$target\" -- --ignored --exact --nocapture \"$name\" 2>&1)\"; then",
             names_with: &["measurement_in --test performance"],
         },
     },
@@ -2097,21 +1887,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Supplied {
             file: "scripts/performance.sh",
-            command: &[
-                "output=\"$(CARGO_BUILD_JOBS=\"${CARGO_BUILD_JOBS:-4}\"",
-                "cargo",
-                "test",
-                "--release",
-                "-p",
-                "kr-worker",
-                "\"$target_flag\"",
-                "\"$target\"",
-                "--",
-                "--ignored",
-                "--exact",
-                "--nocapture",
-                "\"$name\"",
-            ],
+            line: "if ! output=\"$(CARGO_BUILD_JOBS=\"${CARGO_BUILD_JOBS:-4}\" cargo test --release -p kr-worker \"$target_flag\" \"$target\" -- --ignored --exact --nocapture \"$name\" 2>&1)\"; then",
             names_with: &["measurement_in --bench input_latency"],
         },
     },

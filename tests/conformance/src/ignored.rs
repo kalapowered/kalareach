@@ -2,21 +2,23 @@
 //!
 //! A test with `#[ignore]` is skipped by `cargo test` until a command asks for it, with
 //! `--ignored` or `--include-ignored`. One that names an acceptance row is that row's evidence, so
-//! some step of this repository has to ask for it. This module holds [`plan::IGNORED_RUNS`] to the
-//! sources in both directions. Every keyed ignored test has an entry that runs it, and every
-//! entry's command is still where the entry says, so a test cannot become ignored, or lose the
-//! command that runs it, without the map saying so.
+//! some step of this repository has to ask for it. This module holds
+//! [`crate::plan::IGNORED_RUNS`] to the sources in both directions. Every keyed ignored test has an
+//! entry that runs it, and every entry's command is still where the entry says, so a test cannot
+//! become ignored, or lose the command that runs it, without the map saying so.
 //!
-//! The commands are not read for what they mean. An entry gives every word of one command, up to the
-//! test names, and the check is that the file still has a line with exactly those words as a run
-//! (the continuations of a line joined, what a comment holds left out, a line that only says
-//! something, such as one that begins with `echo`, not a command), followed by nothing but the tests
-//! the entry covers, when the words select by name with `--exact`, and the end of the command. A
-//! word added, changed or taken out of the command, a flag, a filter, an option or a second
-//! separator, is a command the entry does not name, so none can narrow a run unseen. An entry whose
-//! test names a call passes finds them on lines that begin with the call's words. A step of the
-//! report's own plan is found in the plan, not in text. Whether control reaches a command, and what
-//! the script does with its result, are not read.
+//! The commands are not read for what they mean. An entry gives the whole of one line of a script
+//! or a workflow, and the check is that the file still has a line with exactly those words (the
+//! continuations of a line joined, the white space made single, a comment at its end left out). A
+//! word added to the line, changed in it or taken out of it, whether a flag, a filter, a redirection
+//! or what stands before or after the command, is a line the entry does not give, so none can
+//! narrow a run unseen: the map refuses it, and says which line of the file is nearest, until the
+//! entry is changed to the line as it now is. A line that selects tests with `--exact` has to name
+//! each test the entry covers; an entry whose tests a call passes finds them on lines that begin
+//! with the call's words. A step of the report's own plan is found in the plan, not in text.
+//! Whether control reaches a line, what the script does with its result, the environment a step
+//! sets, and what other syntax (a here-document, a quoted block over several lines, a folded
+//! scalar) makes of a line are not read.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -93,13 +95,13 @@ pub fn check(map: &Map, root: &Path, runs: &[IgnoredRun]) -> Findings {
             }
         }
         let problem = match run.runs {
-            Runs::Command { file, command } => missing_command(root, file, command, None, matched),
+            Runs::Command { file, line } => missing_command(root, file, line, None, matched),
             Runs::Supplied {
                 file,
-                command,
+                line,
                 names_with,
-            } => missing_command(root, file, command, Some(names_with), matched),
-            Runs::Plan { command } => missing_step(&plan, command, matched),
+            } => missing_command(root, file, line, Some(names_with), matched),
+            Runs::Plan { line } => missing_step(&plan, line, matched),
             Runs::Helper { file } => missing_helper(root, file, matched),
             Runs::ByHand { why } => {
                 unrun_notes.push(format!("{name} is run by hand: {why}"));
@@ -168,22 +170,16 @@ fn case_matches(case: &str, name: &str) -> bool {
     case == name || (case.ends_with("::") && name.starts_with(case))
 }
 
-/// The words that may stand before a command and leave it running as written.
-const BEFORE: [&str; 11] = [
-    "run:", "-", "!", "if", "then", "do", "else", "&&", "||", ";", "{",
-];
-
-/// Why `file` holds no command with exactly the words `command` that names `covered` and nothing
-/// else, or `None` when it holds one.
+/// Why `file` holds no line with exactly the words of `line` that names `covered`, or `None` when it
+/// holds one.
 ///
-/// A command whose words include `--exact` is followed by each of `covered`, in any order, and by
-/// nothing but the end of the command; when `names_with` is given, the tests are named instead on
-/// lines that begin with the first of those words and hold the rest (the call that passes the name
-/// to the command).
+/// A line that selects with `--exact` names each of `covered` among its own words; when
+/// `names_with` is given, the tests are named instead on lines that begin with the first of those
+/// words and hold the rest (the call that passes the name to the command).
 fn missing_command(
     root: &Path,
     file: &str,
-    command: &[&str],
+    line: &str,
     names_with: Option<&[&str]>,
     covered: &BTreeSet<String>,
 ) -> Option<String> {
@@ -191,149 +187,67 @@ fn missing_command(
         Ok(text) => text,
         Err(error) => return Some(format!("{file} cannot be read: {error}")),
     };
-    if let Some(wrong) = leaves_out(command, covered) {
-        return Some(format!("its command {wrong}"));
+    if let Some(wrong) = leaves_out(line, covered) {
+        return Some(format!("its line {wrong}"));
     }
+    let wanted = words_of(line);
     let lines: Vec<String> = commands(&text).collect();
-    let names_after = names_with.is_none() && command.contains(&"--exact");
-    let found: Vec<Option<String>> = lines
-        .iter()
-        .flat_map(|line| {
-            let words: Vec<&str> = line.split_whitespace().collect();
-            starts(&words, command)
-                .into_iter()
-                .map(|start| run_problem(&words, start, command.len(), names_after, covered))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    if found.is_empty() {
-        return Some(format!("{file} holds no command with {}", quoted(command)));
-    }
-    if found.iter().any(Option::is_none) {
-        return names_with.and_then(|with| {
-            covered
-                .iter()
-                .find(|name| {
-                    !lines.iter().any(|other| {
-                        begins_with(other, with)
-                            && holds_all(other, with)
-                            && contains_token(other, name)
-                    })
-                })
-                .map(|name| format!("{file} does not name {name}"))
-        });
-    }
-    found
-        .into_iter()
-        .next()
-        .flatten()
-        .map(|wrong| format!("{file} {wrong}"))
-}
-
-/// Where in `words` the run `command` starts.
-fn starts(words: &[&str], command: &[&str]) -> Vec<usize> {
-    (0..words.len())
-        .filter(|&at| words[at..].starts_with(command))
-        .collect()
-}
-
-/// Why the command that starts at `start` in `words` is not the command as written, or `None`:
-/// something that changes how it runs stands before it, a test it should name is missing, or a
-/// word follows that the entry does not name.
-fn run_problem(
-    words: &[&str],
-    start: usize,
-    length: usize,
-    names_after: bool,
-    covered: &BTreeSet<String>,
-) -> Option<String> {
-    if let Some(before) = start.checked_sub(1).map(|at| words[at])
-        && !BEFORE.contains(&before)
-    {
+    if !lines.contains(&wanted) {
         return Some(format!(
-            "has `{before}` before the command, which may change how it runs"
+            "{file} holds no line `{wanted}`{}",
+            nearest(&lines, &wanted)
         ));
     }
-    let mut rest = &words[start + length..];
-    if names_after {
-        let mut named = BTreeSet::new();
-        while let Some(name) = rest.first().filter(|word| covered.contains(**word)) {
-            named.insert(*name);
-            rest = &rest[1..];
-        }
-        if let Some(name) = covered.iter().find(|name| !named.contains(name.as_str())) {
-            return Some(format!("does not name {name}"));
-        }
-    }
-    after_command(rest)
-}
-
-/// Why `rest`, the words after a command, is more than its end, or `None`: a redirection (with its
-/// target) goes on to the end, and a pipe, a list operator or the end of a substitution ends it.
-fn after_command(rest: &[&str]) -> Option<String> {
-    let mut at = 0;
-    while let Some(word) = rest.get(at) {
-        match redirection(word) {
-            Some(Redirection::Whole) => {}
-            Some(Redirection::NeedsTarget) => at += 1,
-            Some(Redirection::Ends) => return None,
-            None if word.starts_with(['|', '&', ';', ')', '}']) => return None,
-            None => {
-                return Some(format!(
-                    "has `{word}` after the command that the entry does not name"
-                ));
-            }
-        }
-        at += 1;
+    let words: Vec<&str> = wanted.split_whitespace().collect();
+    if words.contains(&"--exact") {
+        let named = |name: &String| match names_with {
+            None => words.contains(&name.as_str()),
+            Some(with) => lines.iter().any(|other| {
+                begins_with(other, with) && holds_all(other, with) && contains_token(other, name)
+            }),
+        };
+        return covered
+            .iter()
+            .find(|name| !named(name))
+            .map(|name| format!("{file} does not name {name}"));
     }
     None
 }
 
-/// What a word is when it is a redirection.
-enum Redirection {
-    /// All of the word: `2>&1`, `>file`.
-    Whole,
-    /// The operator alone: its target is the next word.
-    NeedsTarget,
-    /// A redirection that the end of the command follows in the same word: `2>&1)";`.
-    Ends,
+/// The words of `line` with single spaces between them.
+fn words_of(line: &str) -> String {
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Reads `word` as a redirection, or `None`.
-fn redirection(word: &str) -> Option<Redirection> {
-    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
-    let rest = rest.strip_prefix(['>', '<'])?;
-    let rest = rest.trim_start_matches(['>', '<']);
-    if rest.is_empty() {
-        return Some(Redirection::NeedsTarget);
-    }
-    let target_end = rest.strip_prefix('&').map_or(rest, |duplicate| {
-        duplicate.trim_start_matches(|c: char| c.is_ascii_digit() || c == '-')
-    });
-    let target = target_end
-        .find(['|', '&', ';', ')'])
-        .map_or(target_end.len(), |at| at);
-    if target < target_end.len() {
-        Some(Redirection::Ends)
-    } else {
-        Some(Redirection::Whole)
+/// A hint to put after a missing line: the line of the file that shares most leading words with it.
+fn nearest(lines: &[String], wanted: &str) -> String {
+    let shared = |line: &String| {
+        line.split_whitespace()
+            .zip(wanted.split_whitespace())
+            .take_while(|(a, b)| a == b)
+            .count()
+    };
+    match lines.iter().max_by_key(|line| shared(line)) {
+        Some(line) if shared(line) >= 3 => format!("; the nearest line is `{line}`"),
+        _ => String::new(),
     }
 }
 
-/// Why `command` leaves a test of `covered` out, or `None`: it only lists them or builds them, or a
-/// `--skip` filter in it selects one of them. The words are the entry's own, so this holds the table
-/// to the tests it says it covers.
-fn leaves_out(command: &[&str], covered: &BTreeSet<String>) -> Option<String> {
-    if let Some(word) = command
+/// Why the line `command` leaves a test of `covered` out, or `None`: it only lists them or builds
+/// them, or a `--skip` filter in it selects one of them. The words are the entry's own, so this
+/// holds the table to the tests it says it covers.
+fn leaves_out(command: &str, covered: &BTreeSet<String>) -> Option<String> {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    if let Some(word) = words
         .iter()
         .find(|word| matches!(**word, "--list" | "--no-run"))
     {
         return Some(format!("does not run the tests, with `{word}`"));
     }
-    command.iter().enumerate().find_map(|(at, word)| {
+    words.iter().enumerate().find_map(|(at, word)| {
         let skip = word.strip_prefix("--skip=").or_else(|| {
             (*word == "--skip")
-                .then(|| command.get(at + 1).copied())
+                .then(|| words.get(at + 1).copied())
                 .flatten()
         })?;
         covered
@@ -343,25 +257,23 @@ fn leaves_out(command: &[&str], covered: &BTreeSet<String>) -> Option<String> {
     })
 }
 
-/// Why no step of the report's own plan has exactly the words `command`, or does not name a test
-/// the step selects with `--exact`, or `None` when it does both.
-fn missing_step(plan: &[String], command: &[&str], covered: &BTreeSet<String>) -> Option<String> {
-    if let Some(wrong) = leaves_out(command, covered) {
+/// Why no step of the report's own plan has exactly the words `line`, or does not name a test the
+/// step selects with `--exact`, or `None` when it does both.
+fn missing_step(plan: &[String], line: &str, covered: &BTreeSet<String>) -> Option<String> {
+    if let Some(wrong) = leaves_out(line, covered) {
         return Some(format!("its step {wrong}"));
     }
-    if !plan
-        .iter()
-        .any(|step| step.split_whitespace().eq(command.iter().copied()))
-    {
+    let wanted = words_of(line);
+    if !plan.contains(&wanted) {
         return Some(format!(
-            "the report's plan has no step with the words {}",
-            quoted(command)
+            "the report's plan has no step with the words `{wanted}`"
         ));
     }
-    if command.contains(&"--exact") {
+    let words: Vec<&str> = wanted.split_whitespace().collect();
+    if words.contains(&"--exact") {
         return covered
             .iter()
-            .find(|name| !command.contains(&name.as_str()))
+            .find(|name| !words.contains(&name.as_str()))
             .map(|name| format!("its step does not name {name}"));
     }
     None
@@ -468,10 +380,6 @@ fn contains_token(text: &str, word: &str) -> bool {
     })
 }
 
-fn quoted(words: &[&str]) -> String {
-    format!("`{}`", words.join(" "))
-}
-
 /// Every step of the report's plan on Linux, each as the words of its command.
 fn plan_commands() -> Vec<String> {
     crate::plan::steps(
@@ -489,7 +397,7 @@ fn plan_commands() -> Vec<String> {
 
 /// The commands of a script or a workflow, one to a line: the continuations joined, the white space
 /// made single, and what a comment holds left out. A comment on a line that continues another ends
-/// the command there, as it does for the shell. A line that only says something is not a command.
+/// the command there, as it does for the shell.
 fn commands(text: &str) -> impl Iterator<Item = String> + '_ {
     text.replace("\\\n", " ")
         .lines()
@@ -499,22 +407,9 @@ fn commands(text: &str) -> impl Iterator<Item = String> + '_ {
                 .collect::<Vec<_>>()
                 .join(" ")
         })
-        .filter(|line| !line.is_empty() && !says(line))
+        .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .into_iter()
-}
-
-/// Whether a line only says something: it begins (after a workflow's `run:`) with `echo`, `printf`
-/// or `:`, so words that look like a command after them are text.
-fn says(line: &str) -> bool {
-    let command = line
-        .trim_start_matches("- ")
-        .trim_start_matches("run:")
-        .trim_start();
-    matches!(
-        command.split_whitespace().next(),
-        Some("echo" | "printf" | ":")
-    )
 }
 
 /// `line` up to the `#` that begins a comment: one at the start of the line or after white space,

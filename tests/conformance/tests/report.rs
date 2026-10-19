@@ -717,13 +717,13 @@ fn held_to(runs: &[IgnoredRun]) -> Map {
 }
 
 /// The one step that runs the ignored tests of `outcomes`, which the tree's own manifest stands in
-/// for: a file with a line that holds the words `command`.
-fn outcomes_run(command: &'static [&'static str]) -> IgnoredRun {
+/// for: a file with a line `line`.
+fn outcomes_run(line: &'static str) -> IgnoredRun {
     outcomes_entry(
         &[],
         Runs::Command {
             file: "Cargo.toml",
-            command,
+            line,
         },
     )
 }
@@ -758,27 +758,27 @@ fn a_keyed_test_an_ordinary_run_leaves_out_and_no_step_runs_stops_the_map() {
         unrun.problems
     );
 
-    let run = held_to(&[outcomes_run(&["harness", "=", "false"])]);
+    let run = held_to(&[outcomes_run("harness = false")]);
     assert!(run.problems.is_empty(), "{:?}", run.problems);
 }
 
 #[test]
 fn a_step_that_lost_its_command_or_has_nothing_left_to_run_stops_the_map() {
-    let gone = held_to(&[outcomes_run(&["--ignored"])]);
+    let gone = held_to(&[outcomes_run("--ignored")]);
     assert_eq!(gone.problems.len(), 1, "{:?}", gone.problems);
     assert!(
-        gone.problems[0].contains("Cargo.toml holds no command with `--ignored`"),
+        gone.problems[0].contains("Cargo.toml holds no line `--ignored`"),
         "{:?}",
         gone.problems
     );
 
     let stale = held_to(&[
-        outcomes_run(&["harness", "=", "false"]),
+        outcomes_run("harness = false"),
         outcomes_entry(
             &["tests::passes"],
             Runs::Command {
                 file: "Cargo.toml",
-                command: &["harness", "=", "false"],
+                line: "harness = false",
             },
         ),
     ]);
@@ -791,12 +791,12 @@ fn a_step_that_lost_its_command_or_has_nothing_left_to_run_stops_the_map() {
     );
 }
 
-/// What `ignored::check` finds in a file `ci.sh` that holds `script`, for an entry whose command is
-/// `command`, covering the three ignored tests of `outcomes` (or the ones named by a call, when
-/// `names_with` is given).
+/// What `ignored::check` finds in a file `ci.sh` that holds `script`, for an entry whose line is
+/// `line` (and whose tests a call passes, when `names_with` is given), covering the three ignored
+/// tests of `outcomes`.
 fn found_in(
     script: &str,
-    command: &'static [&'static str],
+    line: &'static str,
     names_with: Option<&'static [&'static str]>,
 ) -> Vec<String> {
     let map = held_to(&[]);
@@ -807,11 +807,11 @@ fn found_in(
         match names_with {
             None => Runs::Command {
                 file: "ci.sh",
-                command,
+                line,
             },
             Some(names_with) => Runs::Supplied {
                 file: "ci.sh",
-                command,
+                line,
                 names_with,
             },
         },
@@ -821,10 +821,10 @@ fn found_in(
 
 const NAMES: &str =
     "tests::is_ignored tests::is_ignored_too tests::is_ignored_for_a_reason_over_two_lines";
-const COMMAND: &[&str] = &["cargo", "test", "--lib", "--", "--ignored", "--exact"];
+const COMMAND: &str = "cargo test --lib -- --ignored --exact tests::is_ignored tests::is_ignored_too tests::is_ignored_for_a_reason_over_two_lines";
 
 #[test]
-fn a_command_is_the_words_the_entry_gives_and_the_tests_it_covers() {
+fn a_command_is_the_line_the_entry_gives_and_nothing_else() {
     let ok = |script: String| {
         let found = found_in(&script, COMMAND, None);
         assert!(found.is_empty(), "{script}: {found:?}");
@@ -834,23 +834,22 @@ fn a_command_is_the_words_the_entry_gives_and_the_tests_it_covers() {
         assert_eq!(found.len(), 1, "{script}: {found:?}");
         assert!(found[0].contains(said), "{script}: {found:?}");
     };
-    let command = format!("cargo test --lib -- --ignored --exact {NAMES}");
 
-    // The command as the entry gives it passes, with a pipe and a redirection after it, on a
-    // continued line, in a workflow's `run:`, in any order of the names.
-    ok(command.clone());
+    // The line as the entry gives it passes: alone, among other lines, continued over several
+    // lines, with white space of another width, with a comment at its end.
+    ok(COMMAND.to_owned());
+    ok(format!("true\n{COMMAND}\ntrue"));
     ok(format!(
-        "cargo test --lib -- --ignored --exact \\\n  {NAMES} 2>&1 | tee log || true"
+        "cargo test --lib -- --ignored --exact \\\n  {NAMES}"
     ));
-    ok(format!("  run: {command} >out 2>&1"));
-    ok(
-        "cargo test --lib -- --ignored --exact tests::is_ignored_too \
-        tests::is_ignored_for_a_reason_over_two_lines tests::is_ignored"
-            .to_owned(),
-    );
+    ok(format!(
+        "cargo  test --lib   -- --ignored --exact\t{NAMES} # why"
+    ));
 
-    // A word added after the names is a command the entry does not name: a skip in either form, a
-    // listing, a filter, a second separator, a quoted flag, a variable, whatever it may be.
+    // A word added anywhere in the line, whatever it is, is a line the entry does not give: after
+    // the names (a skip in either form, a listing, a build only, a filter, a second separator, a
+    // quoted flag, a variable, a redirection that goes on, a brace, a process substitution) or
+    // before or inside the command.
     for added in [
         "--skip tests::is_ignored_too",
         "--skip=tests::is_ignored_too",
@@ -865,74 +864,94 @@ fn a_command_is_the_words_the_entry_gives_and_the_tests_it_covers() {
         "$extra",
         "--nocapture",
         "2>&1 --list",
-        "2>/dev/null --skip tests::is_ignored_too",
+        "&>/dev/null --skip tests::is_ignored_too",
+        ">|out --list",
+        "2>'x;y' --list",
+        "} --list",
+        ">(:) --list",
+        "&& true",
+        "| cat",
     ] {
-        refused(format!("{command} {added}"), "has `");
+        refused(format!("{COMMAND} {added}"), "holds no line");
     }
-
-    // A word put into the command, where the words of the entry no longer stand as a run, or a
-    // spelling of the command the entry does not give, is no command of the entry's.
     for changed in [
-        format!("cargo test --lib --config 'x' -- --ignored --exact {NAMES}"),
-        format!("cargo t --lib -- --ignored --exact {NAMES}"),
-        format!("cargo +stable test --lib -- --ignored --exact {NAMES}"),
-        format!("cargo test --lib -- --skip --ignored --exact {NAMES}"),
-        format!("cargo test --lib --ignored --exact {NAMES}"),
-        format!("cargo test --lib -- --ignored {NAMES}"),
+        "cargo test --lib --config 'x' -- --ignored --exact",
+        "cargo t --lib -- --ignored --exact",
+        "cargo +stable test --lib -- --ignored --exact",
+        "cargo test --lib -- --skip --ignored --exact",
+        "cargo test --lib --ignored --exact",
+        "cargo test --lib -- --ignored",
+        "RUSTFLAGS=x cargo test --lib -- --ignored --exact",
+        "timeout 1 cargo test --lib -- --ignored --exact",
+        "true ! cargo test --lib -- --ignored --exact",
+        "true if cargo test --lib -- --ignored --exact",
+        "echo cargo test --lib -- --ignored --exact",
+        "run: : cargo test --lib -- --ignored --exact",
+        "{ cargo test --lib -- --ignored --exact }",
     ] {
-        refused(changed, "holds no command with");
+        refused(format!("{changed} {NAMES}"), "holds no line");
     }
 
-    // What stands before the command may change how it runs, or may only say it.
-    refused(format!("RUSTFLAGS=x {command}"), "before the command");
-    refused(format!("timeout 1 {command}"), "before the command");
-    refused(format!("true; echo {command}"), "before the command");
-    ok(format!("true && {command}"));
-    ok(format!("if ! out=1; then {command}"));
-    refused(format!("echo {command}"), "holds no command with");
-    refused(format!("# {command}"), "holds no command with");
-    refused(format!("run: : {command}"), "holds no command with");
-
-    // A test left unnamed, or named only in a comment or in another command, is not run.
+    // A comment, and the words of two lines, are not the line.
+    refused(format!("# {COMMAND}"), "holds no line");
     refused(
-        "cargo test --lib -- --ignored --exact tests::is_ignored".to_owned(),
-        "does not name tests::is_ignored_for_a_reason_over_two_lines",
+        format!("cargo test --lib \\\n  # -- --ignored --exact {NAMES}"),
+        "holds no line",
     );
     refused(
-        "cargo test --lib -- --ignored --exact tests::is_ignored tests::is_ignored_too \\\n  \
-         # tests::is_ignored_for_a_reason_over_two_lines"
-            .to_owned(),
-        "does not name tests::is_ignored_for_a_reason_over_two_lines",
+        format!("cargo test --lib\n-- --ignored --exact {NAMES}"),
+        "holds no line",
     );
+    // The line it is nearest to is shown.
     refused(
-        "cargo test --lib -- --ignored --exact tests::is_ignored tests::is_ignored_too\n\
-         cargo test --lib tests::is_ignored_for_a_reason_over_two_lines"
-            .to_owned(),
-        "does not name tests::is_ignored_for_a_reason_over_two_lines",
-    );
-
-    // The words of two lines are not one command.
-    refused(
-        "cargo test --lib\n-- --ignored --exact tests::is_ignored tests::is_ignored_too tests::is_ignored_for_a_reason_over_two_lines".to_owned(),
-        "holds no command with",
+        format!("{COMMAND} --list"),
+        "the nearest line is `cargo test --lib -- --ignored --exact",
     );
 }
 
 #[test]
+fn a_command_that_selects_by_name_names_every_test_the_entry_covers() {
+    // The entry's own line leaves a test out: the table is wrong, and the map says so.
+    let found = |line: &'static str| found_in(line, line, None);
+    let one = found("cargo test --lib -- --ignored --exact tests::is_ignored");
+    assert_eq!(one.len(), 1, "{one:?}");
+    assert!(
+        one[0].contains("does not name tests::is_ignored_for_a_reason_over_two_lines"),
+        "{one:?}"
+    );
+    assert!(found(COMMAND).is_empty());
+
+    // A line of the entry that skips a covered test, or only lists or builds, is the table's error.
+    for (line, said) in [
+        (
+            "cargo test --lib -- --ignored --exact tests::is_ignored tests::is_ignored_too tests::is_ignored_for_a_reason_over_two_lines --skip tests::is_ignored_too",
+            "skips tests::is_ignored_too",
+        ),
+        (
+            "cargo test --lib -- --ignored --exact tests::is_ignored tests::is_ignored_too tests::is_ignored_for_a_reason_over_two_lines --skip=tests::is_ignored_too",
+            "skips tests::is_ignored_too",
+        ),
+        (
+            "cargo test --lib -- --ignored --list",
+            "does not run the tests",
+        ),
+        (
+            "cargo test --lib --no-run -- --ignored",
+            "does not run the tests",
+        ),
+    ] {
+        let wrong = found(line);
+        assert_eq!(wrong.len(), 1, "{line}: {wrong:?}");
+        assert!(wrong[0].contains(said), "{line}: {wrong:?}");
+    }
+}
+
+#[test]
 fn a_command_whose_names_a_call_passes_finds_them_on_the_calls() {
-    const PASSING: &[&str] = &[
-        "cargo",
-        "test",
-        "--lib",
-        "--",
-        "--ignored",
-        "--exact",
-        "\"$1\"",
-    ];
+    const PASSING: &str = "cargo test --lib -- --ignored --exact \"$1\"";
     let found = |script: &str| found_in(script, PASSING, Some(&["call"]));
-    let run = "cargo test --lib -- --ignored --exact \"$1\"";
     let calls = format!(
-        "{run}\ncall tests::is_ignored\ncall tests::is_ignored_too\ncall tests::is_ignored_for_a_reason_over_two_lines"
+        "{PASSING}\ncall tests::is_ignored\ncall tests::is_ignored_too\ncall tests::is_ignored_for_a_reason_over_two_lines"
     );
     assert!(found(&calls).is_empty(), "{:?}", found(&calls));
 
@@ -943,7 +962,7 @@ fn a_command_whose_names_a_call_passes_finds_them_on_the_calls() {
         "# call tests::is_ignored_too",
     ] {
         let script = format!(
-            "{run}\ncall tests::is_ignored\n{line}\ncall tests::is_ignored_for_a_reason_over_two_lines"
+            "{PASSING}\ncall tests::is_ignored\n{line}\ncall tests::is_ignored_for_a_reason_over_two_lines"
         );
         let wrong = found(&script);
         assert_eq!(wrong.len(), 1, "{line}: {wrong:?}");
@@ -953,47 +972,23 @@ fn a_command_whose_names_a_call_passes_finds_them_on_the_calls() {
         );
     }
 
-    // The command itself is still the entry's words and nothing else.
-    let narrowed = calls.replace(run, &format!("{run} --skip x"));
+    // The command itself is still the line the entry gives and nothing else.
+    let narrowed = calls.replace(PASSING, &format!("{PASSING} --skip x"));
     assert_eq!(found(&narrowed).len(), 1, "{:?}", found(&narrowed));
 }
 
 #[test]
 fn a_step_of_the_report_is_found_in_the_plan_and_a_step_nothing_runs_is_shown() {
     // A step of the report's own plan is found in the plan, with exactly its words.
-    let plan = |command| outcomes_entry(&[], Runs::Plan { command });
-    let applications: &[&str] = &[
-        "cargo",
-        "test",
-        "--locked",
-        "-p",
-        "kr-conformance",
-        "--test",
-        "applications",
-        "--",
-        "--ignored",
-        "--test-threads=1",
-        "--show-output",
-    ];
-    assert!(
-        held_to(&[plan(applications)]).problems.is_empty(),
-        "{:?}",
-        held_to(&[plan(applications)]).problems
-    );
-    let absent = held_to(&[plan(&["cargo", "test", "--test", "no_such_target"])]);
+    let plan = |line| outcomes_entry(&[], Runs::Plan { line });
+    let applications = "cargo test --locked -p kr-conformance --test applications -- --ignored --test-threads=1 --show-output";
+    let found = held_to(&[plan(applications)]);
+    assert!(found.problems.is_empty(), "{:?}", found.problems);
+    let absent = held_to(&[plan("cargo test --test no_such_target")]);
     assert_eq!(absent.problems.len(), 1, "{:?}", absent.problems);
-    let narrower: &[&str] = &[
-        "cargo",
-        "test",
-        "--locked",
-        "-p",
-        "kr-conformance",
-        "--test",
-        "applications",
-        "--",
-        "--ignored",
-    ];
-    let shorter = held_to(&[plan(narrower)]);
+    let shorter = held_to(&[plan(
+        "cargo test --locked -p kr-conformance --test applications -- --ignored",
+    )]);
     assert_eq!(shorter.problems.len(), 1, "{:?}", shorter.problems);
 
     // Tests run by hand and tests nothing runs are shown, and are not problems.
