@@ -1447,7 +1447,7 @@ pub fn named() -> Vec<Named> {
             children: &[],
             opaque: true,
             databases: true,
-            reason: "the directories a workflow's commands run in, one for each node and removed when its row in the resource ledger is released; what a command writes there is its own",
+            reason: "the directories a workflow's commands run in, one for each node and removed when its row in the resource ledger is released unless the removal refuses the tree, which then stays and is named in the daemon's log; what a command writes there is its own",
         },
         content(
             StoreScope::Environment,

@@ -204,11 +204,15 @@ what the command did. Everything a command node owns outside the journal (its se
 directory, the run's hold on its workspace) is written down in a ledger of its own before any of
 it is made, and released once the session's closure accounts for its worker. A node's private
 directory is made for it alone, its identity is written down before the command can start, and it
-is removed only while it still has that identity: the directory is opened once, its identity is
-read from that handle and everything in it is removed through the handle, a tree the command left
-without write access included, so what is removed is the directory that was checked and never one
-put at its path afterwards. A directory that was never identified is removed only when it is
-empty. A dispatch owns its row while it runs; after a restart, or when a dispatch
+is removed only while it still has that identity, by the removal the project uses for a directory it
+recorded: the directory is opened beneath the scratch root without following a link, it has to be
+the recorded object and one only this account can change, and what is in it goes through handles
+the removal holds, staying on the directory's own mount and holding no more than 128 levels. A
+tree the removal will not take (a mount inside it, one nested deeper than that, a mode the command
+loosened, entries still being written) stays where it is: the row is released and the daemon's log
+names the directory. One limit stays: in the moment between the last look at the directory's name
+and its removal, a process of the same account can put an empty directory there, which then goes
+in its place. A directory that was never identified is removed only when it is empty. A dispatch owns its row while it runs; after a restart, or when a dispatch
 ends without releasing, a sweep closes the session, removes the directory, ends the hold and
 releases the row, without waiting for the run to end. A run holds a workspace once, however many of
 its nodes ran there, and the hold ends with the last of them; a paused run does not keep a

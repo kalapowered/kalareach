@@ -1187,130 +1187,106 @@ fn directory_identity(_path: &std::path::Path) -> std::io::Result<String> {
     ))
 }
 
-/// Removes the directory a command ran in, when it is still the one that was made.
+/// Removes the directory a command ran in, when it is still the one that was made, and answers
+/// what it left, if anything.
 ///
-/// A directory with the identity written down is removed with what is in it. One that was never
-/// identified was never used, and is removed only if it is empty. Another directory at the path,
-/// or none, is not this host's to remove.
+/// The removal is the project's own one for a directory it recorded
+/// ([`AuthorisedDirectory::remove_tree`]), asked the way a staging directory's is: the directory
+/// is opened beneath the scratch root without following a link, it has to be the recorded object
+/// on the recorded filesystem and one only this account can change, and the contents go through
+/// handles the removal holds, staying on the directory's own mount and refusing a tree nested
+/// deeper than the descent holds handles for. A directory the removal cannot or may not take
+/// (a mount inside it, a tree too deep, a mode the command loosened, entries still being written)
+/// stays where it is, and the answer names why, so the row that owns it is released and the
+/// leftover is named rather than the row being owed for ever. Another directory at the path, or
+/// none, is not this host's to remove and is not named.
 ///
-/// The directory is opened once, through its parent, and its identity is read from the open
-/// handle. Everything is removed through that handle, so what is removed is the directory that was
-/// checked and never whatever the path names a moment later.
+/// A directory that was never identified was never used, and is removed only if it is empty.
+///
+/// What this cannot promise is what [`AuthorisedDirectory::remove_tree`] states: between the last
+/// look at the entry and its removal, a process of this same account can put an empty directory
+/// there, which then goes in its place.
 #[cfg(unix)]
 fn remove_scratch(
+    environment_id: EnvironmentId,
     root: &std::path::Path,
     path: &std::path::Path,
     identity: Option<&str>,
-) -> std::io::Result<()> {
-    remove_scratch_after(root, path, identity, || {})
-}
+) -> Option<String> {
+    use kr_transfer::{AuthorisedDirectory, Escape, Privacy, RelativeName};
 
-/// [`remove_scratch`], calling `verified` once the open directory has been found to be the one
-/// that was made and before anything in it is removed.
-#[cfg(unix)]
-fn remove_scratch_after(
-    root: &std::path::Path,
-    path: &std::path::Path,
-    identity: Option<&str>,
-    verified: impl FnOnce(),
-) -> std::io::Result<()> {
-    use rustix::fs::{AtFlags, CWD, Mode, OFlags, openat, unlinkat};
-    use rustix::io::Errno;
-    use std::os::fd::AsFd;
-    use std::os::unix::fs::MetadataExt;
-
-    if !path.starts_with(root) {
-        return Ok(());
+    if path.parent() != Some(root) {
+        return None;
     }
-    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-        return Ok(());
+    // Gone, or a file or a link in its place: not the directory that was made.
+    match std::fs::symlink_metadata(path) {
+        Ok(about) if about.is_dir() => {}
+        Ok(_) => return None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => return Some(format!("it could not be looked at: {error}")),
+    }
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|name| RelativeName::parse(name).ok())?;
+    let Some(recorded) = identity else {
+        // Never identified, so never used: whatever is in it was not put there by this host, and
+        // only an empty directory goes.
+        return match std::fs::remove_dir(path) {
+            Ok(()) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => Some("it holds entries this host did not put there".to_owned()),
+        };
     };
-    let opened = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let parent = match openat(CWD, parent, opened, Mode::empty()) {
-        Ok(parent) => parent,
-        Err(Errno::NOENT) => return Ok(()),
-        Err(error) => return Err(error.into()),
+    let Some(expected) = parse_directory_identity(recorded) else {
+        return Some("the identity recorded for it cannot be read".to_owned());
     };
-    let directory = match openat(&parent, name, opened, Mode::empty()) {
-        Ok(directory) => std::fs::File::from(directory),
-        // Gone, or a file or a link in its place: not the directory that was made.
-        Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP) => return Ok(()),
-        Err(error) => return Err(error.into()),
+    let held = match AuthorisedDirectory::open_root(environment_id, root) {
+        Ok(held) => held,
+        Err(refusal) => return Some(refusal.to_string()),
     };
-    let found = {
-        let about = directory.metadata()?;
-        format!("{}:{}", about.dev(), about.ino())
-    };
-    match identity {
-        Some(recorded) if recorded == found => {
-            verified();
-            remove_contents(directory.as_fd(), 0)?;
+    let opened = match held.subdirectory(&name) {
+        Ok(opened) => opened,
+        Err(Escape::NotFound { .. } | Escape::Link { .. } | Escape::WrongKind { .. }) => {
+            return None;
         }
-        Some(_) => return Ok(()),
-        // Never identified, so never used: whatever is in it was not put there by this host.
-        None => {}
+        Err(refusal) => return Some(refusal.to_string()),
+    };
+    // The recorded directory is the recorded one under whatever device number its filesystem has
+    // now; any other directory at the path is not this host's.
+    if opened.check_recorded(expected).is_err() {
+        return None;
     }
-    match unlinkat(&parent, name, AtFlags::REMOVEDIR) {
-        // Gone already, or not empty: another directory was put at the path, or this one holds
-        // something this host did not put there.
-        Ok(()) | Err(Errno::NOENT | Errno::NOTEMPTY) => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// How deep a tree of a command's making is removed. Nothing a command is given to do makes a
-/// tree this deep, and a tree that is stays, with the row that owns it.
-#[cfg(unix)]
-const SCRATCH_DEPTH: u32 = 256;
-
-/// Removes everything in an open directory, through the handle, and leaves the directory itself.
-///
-/// A directory the command made without write access to it is made the owner's again first, so a
-/// tree a build left read-only goes like any other.
-#[cfg(unix)]
-fn remove_contents(directory: std::os::fd::BorrowedFd<'_>, depth: u32) -> std::io::Result<()> {
-    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, fchmod, openat, statat, unlinkat};
-
-    if depth > SCRATCH_DEPTH {
-        return Err(std::io::Error::other(
-            "the tree a command left is nested deeper than this host removes",
+    if let Err(refusal) = opened.check_privacy(Privacy::Exclusive) {
+        return Some(format!(
+            "it is not a directory only this account can change: {refusal}"
         ));
     }
-    // Not the owner's to change when it is not the owner's: the removal below then says so.
-    let _ = fchmod(directory, Mode::RWXU);
-    // The names are read first: what a directory lists while its entries are being removed is not
-    // specified, and an entry that is skipped would be left behind.
-    let mut names = Vec::new();
-    for entry in Dir::read_from(directory)? {
-        let name = entry?.file_name().to_owned();
-        if name.as_bytes() != b"." && name.as_bytes() != b".." {
-            names.push(name);
-        }
-    }
-    for name in names {
-        let about = statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW)?;
-        if FileType::from_raw_mode(about.st_mode) == FileType::Directory {
-            let opened = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-            let child = openat(directory, &name, opened, Mode::empty())?;
-            remove_contents(std::os::fd::AsFd::as_fd(&child), depth + 1)?;
-            unlinkat(directory, &name, AtFlags::REMOVEDIR)?;
-        } else {
-            unlinkat(directory, &name, AtFlags::empty())?;
-        }
-    }
-    Ok(())
+    held.remove_tree(&name, opened)
+        .err()
+        .map(|refusal| refusal.to_string())
+}
+
+/// The identity a directory was recorded under, from its text form ([`directory_identity`]).
+#[cfg(unix)]
+fn parse_directory_identity(text: &str) -> Option<kr_transfer::RecordedIdentity> {
+    let (device, file_id) = text.split_once(':')?;
+    Some(kr_transfer::RecordedIdentity::without_filesystem(
+        kr_transfer::ObjectIdentity {
+            device: device.parse().ok()?,
+            file_id: file_id.parse().ok()?,
+        },
+    ))
 }
 
 #[cfg(not(unix))]
 fn remove_scratch(
+    _environment_id: EnvironmentId,
     _root: &std::path::Path,
     _path: &std::path::Path,
     _identity: Option<&str>,
-) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "a directory a command ran in is removed on POSIX hosts",
-    ))
+) -> Option<String> {
+    Some("a directory a command ran in is removed on POSIX hosts".to_owned())
 }
 
 /// Makes the session a command runs as the root of, waits for it to close, and says whether what
@@ -1596,17 +1572,18 @@ async fn release(
         if row.state == OwnedState::Released {
             return Ok(());
         }
-        if let Some(scratch) = row.scratch.as_ref() {
-            remove_scratch(
+        if let Some(scratch) = row.scratch.as_ref()
+            && let Some(reason) = remove_scratch(
+                changesets.environment_id(),
                 &scratch_root,
                 std::path::Path::new(scratch),
                 row.scratch_identity.as_deref(),
             )
-            .map_err(|error| {
-                kr_automation::AutomationError::InvalidArgument(format!(
-                    "the directory a command ran in was not removed: {error}"
-                ))
-            })?;
+        {
+            eprintln!(
+                "kr-controller: the directory a workflow command ran in was left where it is \
+                 ({reason}): {scratch}"
+            );
         }
         if let (Some(workspace_id), Some(session_id)) = (row.workspace_id, row.session_id)
             && let Err(error) = changesets
@@ -3310,19 +3287,32 @@ mod tests {
 
     /// The directory a command ran in is removed with what is in it only while it still has the
     /// identity written down for it. Another directory at its path is left alone, and one that
-    /// was never identified is removed only when it is empty.
+    /// was never identified is removed only when it is empty. The control is the directory that
+    /// was made, which goes with its contents.
+    #[cfg(unix)]
     #[test]
     fn a_directory_is_removed_only_while_it_is_the_one_that_was_made() {
+        let environment = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16]));
         let root = tempfile::tempdir().expect("a root");
         let scratch = root.path().join("node");
         let made = || {
             std::fs::create_dir(&scratch).expect("the directory is made");
+            std::fs::set_permissions(
+                &scratch,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .expect("it is private");
             directory_identity(&scratch).expect("it has an identity")
         };
 
         let identity = made();
-        std::fs::write(scratch.join("output"), b"x").expect("a file in it");
-        remove_scratch(root.path(), &scratch, Some(&identity)).expect("it is removed");
+        std::fs::create_dir(scratch.join("inner")).expect("a directory in it");
+        std::fs::write(scratch.join("inner").join("output"), b"x").expect("a file in it");
+        assert_eq!(
+            remove_scratch(environment, root.path(), &scratch, Some(&identity)),
+            None,
+            "the directory that was made goes without a leftover"
+        );
         assert!(
             !scratch.exists(),
             "the directory that was made goes with its contents"
@@ -3333,7 +3323,10 @@ mod tests {
         std::fs::rename(&scratch, root.path().join("moved")).expect("it is moved aside");
         std::fs::create_dir(&scratch).expect("another directory is put at its path");
         std::fs::write(scratch.join("precious"), b"y").expect("a file in it");
-        remove_scratch(root.path(), &scratch, Some(&identity)).expect("nothing to remove");
+        assert_eq!(
+            remove_scratch(environment, root.path(), &scratch, Some(&identity)),
+            None
+        );
         assert!(
             scratch.join("precious").exists(),
             "another directory is left alone"
@@ -3341,11 +3334,18 @@ mod tests {
         std::fs::remove_dir_all(&scratch).expect("cleared");
 
         std::fs::create_dir(&scratch).expect("an unidentified directory");
-        remove_scratch(root.path(), &scratch, None).expect("an empty one is removed");
+        assert_eq!(
+            remove_scratch(environment, root.path(), &scratch, None),
+            None,
+            "an empty one is removed"
+        );
         assert!(!scratch.exists());
         std::fs::create_dir(&scratch).expect("an unidentified directory");
         std::fs::write(scratch.join("precious"), b"z").expect("a file in it");
-        remove_scratch(root.path(), &scratch, None).expect("a full one is left");
+        assert!(
+            remove_scratch(environment, root.path(), &scratch, None).is_some(),
+            "a full one is left, and named"
+        );
         assert!(
             scratch.join("precious").exists(),
             "an unidentified directory with contents stays"
@@ -3355,66 +3355,125 @@ mod tests {
         let outside = elsewhere.path().join("node");
         std::fs::create_dir(&outside).expect("a directory outside the root");
         let identity = directory_identity(&outside).expect("it has an identity");
-        remove_scratch(root.path(), &outside, Some(&identity)).expect("not this host's");
+        assert_eq!(
+            remove_scratch(environment, root.path(), &outside, Some(&identity)),
+            None
+        );
         assert!(outside.exists(), "a path outside the root is never removed");
     }
 
-    /// What is removed is the directory that was checked, whatever is put at its path after the
-    /// check: the replacement is left as it is, with what is in it, and the directory that was
-    /// checked is emptied through its own handle.
+    /// A tree the removal will not take is left where it is and named, and the answer is not an
+    /// error: the row that owns it is released and the leftover is for a person to look at. A
+    /// chain deeper than the removal holds handles for and a directory whose mode the command
+    /// loosened are such trees; the control is the same directory as the host made it, which goes.
+    #[cfg(unix)]
     #[test]
-    fn a_directory_put_at_the_path_after_the_check_is_not_removed() {
+    fn a_tree_the_removal_will_not_take_is_left_and_named() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let environment = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16]));
+        let root = tempfile::tempdir().expect("a root");
+        let scratch = root.path().join("node");
+        let private = || {
+            std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))
+                .expect("it is private");
+        };
+
+        std::fs::create_dir(&scratch).expect("the directory is made");
+        private();
+        let mut deep = scratch.clone();
+        for _ in 0..=kr_transfer::authority::MAX_REMOVAL_DEPTH + 4 {
+            deep.push("a");
+        }
+        std::fs::create_dir_all(&deep).expect("a deep chain is made");
+        let identity = directory_identity(&scratch).expect("it has an identity");
+        assert!(
+            remove_scratch(environment, root.path(), &scratch, Some(&identity)).is_some(),
+            "the deep chain is left and named"
+        );
+        assert!(scratch.is_dir(), "and it is left where it is");
+        std::fs::remove_dir_all(&scratch).expect("the chain is taken apart");
+
+        std::fs::create_dir(&scratch).expect("the directory is made");
+        private();
+        std::fs::write(scratch.join("file"), b"x").expect("a file in it");
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o755))
+            .expect("the command loosened its mode");
+        let identity = directory_identity(&scratch).expect("it has an identity");
+        assert!(
+            remove_scratch(environment, root.path(), &scratch, Some(&identity)).is_some(),
+            "a directory others may change is left and named"
+        );
+        assert!(scratch.join("file").exists());
+        private();
+        assert_eq!(
+            remove_scratch(environment, root.path(), &scratch, Some(&identity)),
+            None,
+            "the same directory, private again, is removed"
+        );
+        assert!(!scratch.exists());
+    }
+
+    /// A directory the host may not take out of its parent is left and named like any other tree
+    /// the removal will not take: the last step fails and the row is not owed for ever. The
+    /// control is the parent as the host made it. Run as the superuser, a mode stops nothing, and
+    /// the case then has nothing to show.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_the_host_may_not_take_out_of_its_parent_is_left_and_named() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let environment = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16]));
         let root = tempfile::tempdir().expect("a root");
         let scratch = root.path().join("node");
         std::fs::create_dir(&scratch).expect("the directory is made");
-        std::fs::write(scratch.join("output"), b"x").expect("a file in it");
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))
+            .expect("it is private");
         let identity = directory_identity(&scratch).expect("it has an identity");
-        let moved = root.path().join("moved");
 
-        remove_scratch_after(root.path(), &scratch, Some(&identity), || {
-            std::fs::rename(&scratch, &moved).expect("the checked directory is moved aside");
-            std::fs::create_dir(&scratch).expect("another is put at its path");
-            std::fs::write(scratch.join("precious"), b"y").expect("a file in it");
-        })
-        .expect("the removal goes on");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o500))
+            .expect("the parent is closed to writing");
+        let left = remove_scratch(environment, root.path(), &scratch, Some(&identity));
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("the parent is opened again");
+        assert!(left.is_some(), "the empty directory is left and named");
+        assert!(scratch.is_dir());
 
-        assert!(
-            scratch.join("precious").exists(),
-            "what was put at the path after the check is not removed"
+        assert_eq!(
+            remove_scratch(environment, root.path(), &scratch, Some(&identity)),
+            None,
+            "the control: the parent as the host made it lets it go"
         );
-        assert!(
-            !moved.join("output").exists(),
-            "the directory that was checked is the one that was emptied"
-        );
+        assert!(!scratch.exists());
     }
 
-    /// A tree a command left without write access, as a build's cache is, is removed like any other.
+    /// The moment a grant stands until is measured from a reading taken before the grant was
+    /// decided: a decision that takes five seconds shortens the moment by five seconds and never
+    /// lengthens it. The time left is credited as continuous time is.
     #[test]
-    fn a_tree_a_command_left_read_only_is_removed() {
-        use std::os::unix::fs::PermissionsExt;
+    fn a_slow_decision_shortens_the_moment_a_grant_stands_until() {
+        use std::time::Duration;
 
-        let root = tempfile::tempdir().expect("a root");
-        let scratch = root.path().join("node");
-        let cache = scratch.join("cache").join("deep");
-        std::fs::create_dir_all(&cache).expect("the tree is made");
-        std::fs::write(cache.join("module"), b"x").expect("a file in it");
-        let outside = tempfile::tempdir().expect("a directory outside the tree");
-        std::fs::write(outside.path().join("kept"), b"z").expect("a file in it");
-        std::os::unix::fs::symlink(outside.path(), scratch.join("link")).expect("a link in it");
-        for path in [cache.join("module"), cache.clone(), cache.parent().expect("a parent").to_path_buf()] {
-            let mode = if path.is_dir() { 0o555 } else { 0o444 };
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
-                .expect("the tree is made read-only");
-        }
-        let identity = directory_identity(&scratch).expect("it has an identity");
-
-        remove_scratch(root.path(), &scratch, Some(&identity)).expect("it is removed");
-
-        assert!(!scratch.exists(), "the whole tree goes");
-        assert!(
-            outside.path().join("kept").exists(),
-            "a link in the tree is removed and never followed"
+        let clock = std::cell::Cell::new(1_000_u64);
+        let ends_at = grant_end_on_the_boot_clock(
+            || clock.get(),
+            || {
+                // The decision takes five seconds and finds ten seconds left.
+                clock.set(6_000);
+                Ok(Some(Duration::from_secs(10)))
+            },
+        )
+        .expect("decided");
+        assert_eq!(
+            ends_at,
+            Some(1_000 + kr_ipc::clock::credited(10_000)),
+            "the reading before the decision, not the one after it"
         );
+        let unbounded = grant_end_on_the_boot_clock(|| 1_000, || Ok(None)).expect("decided");
+        assert_eq!(unbounded, None, "a grant with no end has no moment");
     }
 
     /// A worker a closure could not account for is gone when the boot it ran in has ended, or when
