@@ -828,7 +828,13 @@ async fn the_host_on_this_computer_takes_the_revocation_itself_and_its_answer_is
         .expect("the host on this computer revokes the device");
     assert_eq!(phone_state(&done, "direct"), "done", "{done}");
     assert_eq!(rig.publications(), 0, "no feed was involved");
-    assert_eq!(rig.ceremony.reasons().len(), 1);
+    let reasons = rig.ceremony.reasons();
+    assert_eq!(reasons.len(), 1, "the person is asked once: {reasons:?}");
+    assert!(
+        reasons[0].contains(phone["name"].as_str().expect("a name"))
+            && reasons[0].ends_with("on this computer"),
+        "the dialog reads as a sentence about this computer: {reasons:?}"
+    );
     // Settings sync is told, and takes the device out of the settings it shares: the connection it
     // would ask the host over is the one the revocation withdrew.
     rig.settings_sync_hears_of(&rig.phone).await;
@@ -1596,6 +1602,7 @@ async fn a_connection_the_host_withdrew_is_replaced_whichever_way_the_applicatio
         .read(Method::HostInfo, &json!({}))
         .await
         .expect("the host answers on the connection it admitted");
+    assert_eq!(state.connection_state().replaced, 0);
 
     the_owner_at_the_machine_revokes_the_paired_device(&rig).await;
 
@@ -1617,6 +1624,9 @@ async fn a_connection_the_host_withdrew_is_replaced_whichever_way_the_applicatio
             .filter(|session| !Arc::ptr_eq(session, &first))
     })
     .await;
+    // The page is told the connection was replaced, once, by the count the state carries: the
+    // request refused on the withdrawn connection was answered with a failure just before.
+    assert_eq!(state.connection_state().replaced, 1);
     let _: HostInfoResult = second
         .read(Method::HostInfo, &json!({}))
         .await
@@ -1624,6 +1634,11 @@ async fn a_connection_the_host_withdrew_is_replaced_whichever_way_the_applicatio
     rig.app
         .call("host_info", json!({}))
         .expect("a command goes through on it");
+    assert_eq!(
+        state.connection_state().replaced,
+        1,
+        "once for one withdrawal"
+    );
     // One withdrawal asked the host one question, over one other connection: what the question was
     // itself refused, over the connection it asked about, was not another.
     assert_eq!(

@@ -3356,6 +3356,71 @@ async fn a_revocation_in_a_hosts_feed_takes_a_member_out_before_any_host_says_so
     assert_eq!(view["sync"]["devices"]["out"], true, "{view}");
 }
 
+/// A revoke that did not go through takes a device out all the same, and the hosts go on listing it
+/// as it was. It is named apart from the devices that were never shared with, and the person who
+/// shares with it again gets it back: it joins again and reads what was written while it was out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_taken_out_by_a_revoke_that_did_not_go_through_is_given_the_settings_again_when_the_person_says_so()
+ {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    page.choose("dark");
+    let phone = other.start();
+    let shown = page.devices_refresh();
+    page.share(&first_reference(&shown["candidates"]))
+        .expect("shared");
+    let offers = phone.devices_refresh();
+    phone
+        .join(&first_reference(&offers["offers"]))
+        .expect("joined");
+    page.sync_now();
+    assert_eq!(phone.sync_now()["colour_mode"], "dark");
+
+    // The request was sent and failed: this computer recorded it, and both computers' hosts still
+    // list the phone as it was.
+    let recorded = page
+        .app
+        .state::<AppState>()
+        .settings()
+        .expect("settings are open")
+        .revocations_sent(&[*other.identity().keys.authorisation.public()])
+        .await
+        .expect("the revocation is recorded");
+    assert!(recorded, "the membership recorded it");
+    page.choose("light");
+    let view = page.sync_now();
+    let devices = &view["sync"]["devices"];
+    assert_eq!(
+        devices["members"].as_array().expect("members").len(),
+        1,
+        "the phone was taken out: {view}"
+    );
+    assert_eq!(
+        devices["candidates"],
+        json!([]),
+        "it is not offered as a device never shared with: {view}"
+    );
+    assert_eq!(
+        devices["held_out"].as_array().expect("held out").len(),
+        1,
+        "it is named as taken out by a revoke: {view}"
+    );
+
+    page.share(&first_reference(&devices["held_out"]))
+        .expect("the person shares with it again");
+    assert_eq!(
+        page.devices_refresh()["held_out"],
+        json!([]),
+        "it is held out no longer"
+    );
+    let offers = phone.devices_refresh();
+    phone
+        .join(&first_reference(&offers["offers"]))
+        .expect("the phone joins again");
+    page.sync_now();
+    assert_eq!(phone.sync_now()["colour_mode"], "light");
+}
+
 /// The person's two computers share settings: the second has joined and both are in step.
 async fn two_computers_sharing(this: &Computer, other: &Computer) -> (Page, Page) {
     let page = with_sync_on(this).await;
