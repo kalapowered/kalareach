@@ -766,9 +766,11 @@ async fn a_request_that_was_sent_keeps_its_standing_while_its_feed_cannot_be_rea
     let unread = rig.view().await;
     assert_eq!(host_by(&unread, "feed")["feed"]["read"], false);
     let kept = standing_of(&unread, &asked);
+    // The host's own list may say meanwhile that it has revoked the device; the request is the
+    // standing, and it is not forgotten because its feed cannot be read.
     assert_eq!(
-        kept["standing"], read["standing"],
-        "a request that was sent is not forgotten because its feed cannot be read"
+        kept["standing"]["state"], read["standing"]["state"],
+        "a request that was sent is not forgotten because its feed cannot be read: {kept}"
     );
     assert!(
         kept["stale_since_ms"].is_u64(),

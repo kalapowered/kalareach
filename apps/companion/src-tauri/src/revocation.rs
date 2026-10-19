@@ -689,6 +689,33 @@ impl Revocations {
     /// The requests in a host's feed that are this computer's own.
     fn verified<'a>(&self, reading: &'a Reading) -> Vec<Verified<'a>> {
         match (&reading.host, &reading.feed) {
+            // The host's own list, read just now, says the device is revoked: the standing kept
+            // from the feed is the request's, and now says the host lists it so.
+            (DeviceStanding::Revoked, Some(known)) => match known.standing {
+                DeviceStanding::Sent { at_ms, .. } => (
+                    DeviceStanding::Sent {
+                        at_ms,
+                        host_lists_revoked: true,
+                    },
+                    Some(known.at_ms),
+                ),
+                DeviceStanding::Acknowledged {
+                    at_ms,
+                    pending_workers,
+                    ..
+                } => (
+                    DeviceStanding::Acknowledged {
+                        at_ms,
+                        pending_workers,
+                        host_lists_revoked: true,
+                    },
+                    Some(known.at_ms),
+                ),
+                DeviceStanding::Done { at_ms } => {
+                    (DeviceStanding::Done { at_ms }, Some(known.at_ms))
+                }
+                _ => (read, None),
+            },
             (Host::Paired(host), Some(Ok(feed))) => own_requests(
                 &feed.records,
                 host.device_id,
