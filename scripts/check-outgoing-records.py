@@ -41,6 +41,7 @@ every one and pass the near misses.
 """
 
 import argparse
+import base64
 import binascii
 import glob
 import json
@@ -117,7 +118,7 @@ PEM_HEADER = re.compile(rb"-----BEGIN ((?:[A-Z0-9]+ )*)PRIVATE KEY( BLOCK)?-----
 # line breaks of any depth, a backslash that continues a string, a PowerShell `n, quotes and string
 # prefixes, joiners, commas, margins, comment markers including `///` and `//!`), and the first 32
 # characters of base64, taken wherever the source text breaks them, have to begin with that
-# structure, so a placeholder that keeps only the first line of a key is not one.
+# structure, so a placeholder shorter than 32 characters is not a key.
 # A quoted header followed by code or prose does not decode to one. The read goes forward one item
 # at a time and never back, so its time is in proportion to the window; keep it so.
 STRING_PREFIX = rb"(?:u8|[bBrRuUfFL]{1,2})(?=[\"'])"
@@ -156,22 +157,37 @@ def der_private_key(raw):
     return False
 
 
+# The public-key algorithms an OpenPGP key packet names: RSA, ElGamal, DSA, ECDH, ECDSA, EdDSA, X25519,
+# X448, Ed25519 and Ed448.
+PGP_ALGORITHMS = (1, 2, 3, 16, 17, 18, 19, 22, 25, 26, 27, 28)
+
+
 def pgp_private_key(raw):
+    """A secret key packet, or the public key packet that a block of secret subkeys starts with, in
+    either header format, with a version, a creation time and an algorithm that a key has."""
     tag = raw[0]
     if not tag & 0x80:
         return False
     if tag & 0x40:
         kind = tag & 0x3F
-        first = raw[1] if len(raw) > 1 else 0
-        version = 2 if first < 192 else 3 if first < 224 else 6 if first == 255 else None
+        first = raw[1]
+        at = 2 if first < 192 else 3 if first < 224 else 6 if first == 255 else None
     else:
         kind = (tag >> 2) & 0x0F
-        version = (2, 3, 5)[tag & 3] if tag & 3 < 3 else None
-    return kind in (5, 7) and version is not None and raw[version : version + 1] in (b"\x03", b"\x04", b"\x05", b"\x06")
+        at = (2, 3, 5)[tag & 3] if tag & 3 < 3 else None
+    if kind not in (5, 6) or at is None or raw[at] not in (3, 4, 5, 6):
+        return False
+    return raw[at + (7 if raw[at] == 3 else 5)] in PGP_ALGORITHMS
 
 
-def key_body_follows(window, pgp):
-    """Whether the text after a private key's header is the body of a key."""
+# The kinds of block whose body has a structure to check. Any other kind (`NEBULA X25519`, the
+# Cosmos `TENDERMINT`, whatever a tool invents) holds a private key in a format this does not know,
+# so a body of base64 is all it is asked for.
+STRUCTURED_KINDS = (b"", b"RSA", b"DSA", b"EC", b"ENCRYPTED", b"OPENSSH", b"PGP")
+
+
+def key_body_follows(window, kind):
+    """Whether the text after a private key's header is the body of a key of that kind."""
     position = 0
     encrypted = False
     while True:
@@ -191,8 +207,10 @@ def key_body_follows(window, pgp):
             continue
         run = BASE64.match(window, position)
         if run is not None:
-            taken += run.group()[: BODY_CHARACTERS - len(taken)]
             position = run.end()
+            # A `+` or a `/` by itself is a joiner or a comment marker, not part of the body.
+            if run.group().strip(b"+/"):
+                taken += run.group()[: BODY_CHARACTERS - len(taken)]
             continue
         item = LAYOUT.match(window, position)
         if item is None:
@@ -200,10 +218,12 @@ def key_body_follows(window, pgp):
         position = item.end()
     if len(taken) < BODY_CHARACTERS:
         return False
-    if encrypted:
+    if encrypted or kind not in STRUCTURED_KINDS:
         return True
     raw = binascii.a2b_base64(bytes(taken))
-    return pgp_private_key(raw) if pgp else der_private_key(raw) or raw[:12] == b"openssh-key-"
+    if kind == b"PGP":
+        return pgp_private_key(raw)
+    return der_private_key(raw) or raw[:12] == b"openssh-key-"
 
 
 LIVE_KEY = re.compile(rb"\bsk_live_[0-9A-Za-z]{20,}")
@@ -246,13 +266,9 @@ def refused_name(path):
 def refused_contents(data):
     """What a file holds that is a credential, one description each."""
     found = []
-    headers = list(PEM_HEADER.finditer(data))
-    for index, header in enumerate(headers):
-        # A window ends where the next header starts: no key body holds a header, and a file of
-        # headers would otherwise be read once for each.
-        end = headers[index + 1].start() if index + 1 < len(headers) else len(data)
-        window = data[header.end() : min(end, header.end() + KEY_WINDOW)]
-        if key_body_follows(window, b"PGP" in (header.group(1) or b"")):
+    for header in PEM_HEADER.finditer(data):
+        kind = (header.group(1) or b"").strip()
+        if key_body_follows(data[header.end() : header.end() + KEY_WINDOW], kind):
             found.append("a private key")
             break
     if LIVE_KEY.search(data):
@@ -776,6 +792,13 @@ def cases(scratch, expect):
     # A key written out as source text is still a key. A header quoted in source text, or in prose,
     # is not one: the tests that refuse keys quote one.
     header = planted("-----", "BEGIN PRIVATE KEY", "-----")
+    pgp_header = planted("-----", "BEGIN PGP PRIVATE KEY BLOCK", "-----")
+
+    def pgp_body(*packet):
+        """The base64 of a key packet's start, as an armoured block carries it."""
+        return base64.b64encode(bytes(packet) + b"the-secret-material-of-the-key-0123456789").decode().rstrip("=")
+
+    fragments = [f"b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB"[i : i + 12] for i in range(0, 52, 12)]
     shapes = {
         "src/joined.rs": f'const K: &str = "{header}\\n" + "{key_body[:32]}" + "{key_body[32:]}";\n',
         "src/lines.js": f'const K = ["{header}", "{key_body[:32]}", "{key_body[32:]}"].join("\\n");\n',
@@ -795,7 +818,6 @@ def cases(scratch, expect):
         + "\n",
         "src/encrypted.pem.txt": f"{header}\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123456789ABCDEF\n\n{key_body}\n",
         "src/eight.js": f'const K = "{header}\\n" + "{key_body[:8]}" + "{key_body[8:]}";\n',
-        "src/newpgp.asc": planted("-----", "BEGIN PGP PRIVATE KEY BLOCK", "-----") + "\n\nxVsEZexampleexampleexampleexample\n",
         "src/powershell.ps1": f'$k = "{header}`n{key_body}`n"\n',
         "src/ed25519.rs": f'const K: &str = "{header}\\n" + "MC4CAQAwBQYDK2VwBCIEIGexampleexampleexampleexample";\n',
         "src/sec1.rs": f'const K: &str = "{header}\\n" + "MHcCAQEEIexampleexampleexampleexampleexample";\n',
@@ -809,8 +831,25 @@ def cases(scratch, expect):
         "src/commented-short.rs": f"// {header}\n" + "".join(f"// {key_body[i : i + 24]}\n" for i in range(0, len(key_body), 24)),
         "src/php.json": '{"k":"' + header + "\\n" + key_body[:10] + "\\/" + key_body[10:] + '\\n"}\n',
         "src/openssh.txt": planted("-----", "BEGIN OPENSSH PRIVATE KEY", "-----") + "\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB\n",
-        "src/pgp.asc": planted("-----", "BEGIN PGP PRIVATE KEY BLOCK", "-----") + "\n\nlQOYBGPexampleexampleexampleexampleexample\n",
-        "src/pgp-version.asc": planted("-----", "BEGIN PGP PRIVATE KEY BLOCK", "-----") + "\nVersion: Example 1.0\n\nlQOYBGPexampleexampleexampleexampleexample\n",
+        "src/pgp.asc": f"{pgp_header}\n\n{pgp_body(0x95, 0x03, 0x98, 4, 0x5F, 0, 0, 1, 1)}\n",
+        "src/pgp-version.asc": f"{pgp_header}\nVersion: Example 1.0\n\n{pgp_body(0x95, 0x03, 0x98, 4, 0x5F, 0, 0, 1, 1)}\n",
+        "src/pgp-short.asc": f"{pgp_header}\n\n{pgp_body(0x94, 0x58, 4, 0x5F, 0, 0, 1, 22)}\n",
+        "src/pgp-new.asc": f"{pgp_header}\n\n{pgp_body(0xC5, 0x5B, 4, 0x5F, 0, 0, 1, 27)}\n",
+        "src/pgp-new-long.asc": f"{pgp_header}\n\n{pgp_body(0xC5, 0xC2, 0xD8, 4, 0x5F, 0, 0, 1, 1)}\n",
+        "src/pgp-public-first.asc": f"{pgp_header}\n\n{pgp_body(0xC6, 0x33, 4, 0x5F, 0, 0, 1, 19)}\n",
+        "src/pgp-v6.asc": f"{pgp_header}\n\n{pgp_body(0xC5, 0x40, 6, 0x5F, 0, 0, 1, 27)}\n",
+        "src/pgp-comment.asc": f"{pgp_header}\nComment: Convert to {header} for OpenSSL\n\n{pgp_body(0xC5, 0x5B, 4, 0x5F, 0, 0, 1, 27)}\n",
+        "src/nebula.yml": "key: |\n  " + planted("-----", "BEGIN NEBULA X25519 PRIVATE KEY", "-----") + "\n  dGhpcy1pcy1hLWZha2Uta2V5LWZvci10ZXN0cw\n",
+        "src/cosmos.txt": planted("-----", "BEGIN TENDERMINT PRIVATE KEY", "-----") + "\nkdf: bcrypt\nsalt: 0123456789ABCDEF0123456789ABCDEF\ntype: secp256k1\n\nq83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJ\n",
+        "src/joiners.js": f'const key = "{header}\\n" +\n  "MC4C" +\n  "AQAwBQYDK2VwBCIEIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f\\n";\n',
+        "src/openssh-joined.js": 'const key = "' + planted("-----", "BEGIN OPENSSH PRIVATE KEY", "-----") + '\\n" +\n  ' + " +\n  ".join(f'"{piece}"' for piece in fragments) + ";\n",
+        "src/openssh-comments.rs": "// " + planted("-----", "BEGIN OPENSSH PRIVATE KEY", "-----") + "\n" + "".join(f"// {piece}\n" for piece in fragments),
+        "src/at.m": f'NSString *k = @"{header}\\n" @"{key_body}";\n',
+        "src/u8.cpp": f'auto k = u8"{header}\\n" u8"{key_body[:4]}" u8"{key_body[4:]}";\n',
+        "src/rb.py": f'K = (rb"{header}\\n"\n     rb"{key_body[:4]}"\n     rb"{key_body[4:]}")\n',
+        "src/tab.ps1": f'$k = "{header}`t{key_body}"\n',
+        "src/ps-encrypted-crlf.ps1": f'$k = "{header}`r`nProc-Type: 4,ENCRYPTED`r`nDEK-Info: AES-128-CBC,0123456789ABCDEF`r`n`r`nq83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJ"\n',
+        "src/python-encrypted.py": f'K = (b"{header}\\n"\n     b"Proc-Type: 4,ENCRYPTED\\n"\n     b"DEK-Info: AES-128-CBC,0123456789ABCDEF\\n\\n"\n     b"q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJ")\n',
     }
     fx = Fixture(scratch)
     for path, text in shapes.items():
@@ -839,9 +878,12 @@ def cases(scratch, expect):
     fx.write("src/words.md", f"{header} MAKE SURE THE HEADER IS PRESENT, MAY be followed by lines, MIME types and MCPServerConfiguration.load(H).\n")
     fx.write("src/length.js", f'const marker = "{header}";\nMAXPASSWORDLENGTH.toString();\n')
     fx.write("docs/placeholder.md", f"{header}\nMIIEpAIBAAKCAQEA...\n-----END\n")
-    pgp_header = planted("-----", "BEGIN PGP PRIVATE KEY BLOCK", "-----")
     fx.write("src/armour.js", f'const ARMOR = "{pgp_header}";\nlet armoredSecretKey = await readKey(ARMOR);\n')
     fx.write("docs/lines.md", f"{pgp_header} lines up the armour headers first, then the packets.\n")
+    fx.write("src/lanes.js", f'const A = "{pgp_header}";\nnextBaseLanes, renderLanes, remainingChildLanes;\n')
+    fx.write("docs/list.md", f"{pgp_header}\nlist README files before checking signatures\n")
+    fx.write("src/names.js", f'const A = "{pgp_header}";\nlet armoredSecretKey, armoredPublicKey, revocationCertificate;\n')
+    fx.write("src/limits.js", f'const marker = "{header}";\nMAXPASSWORDLENGTH, MINPASSWORDLENGTH, PASSWORDHISTORY;\n')
     fx.write("src/table.rs", f'let x = "{header}"; MAPPINGTABLE.get(1);\n')
     head = fx.commit("Quote a header")
     status, output = fx.run("--range", f"{fx.base}..{head}")
