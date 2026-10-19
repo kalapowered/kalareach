@@ -2000,3 +2000,74 @@ async fn a_share_with_the_live_screen_of_the_session_of_the_release_before_is_is
     host.worker_ended(&updated.worker).await;
     drop(owner);
 }
+
+/// KR-REQ-26.10, KR-REQ-26.08: a rollback to the release before reads every session archived under
+/// this release. The journal of a closed session whose root was a command holds the session's
+/// summary in the form the release before reads, so the shell, the directory and the start time it
+/// recorded are what that release shows; the word that says the root was a command is kept in a
+/// row of its own, which that release does not read.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_release_before_reads_the_journal_of_a_command_session_this_release_wrote() {
+    let updated = Updated::new().await;
+    let host = &updated.host;
+
+    // A session of this release, closed, whose journal is then written as a command session's is:
+    // by this release's own writer, from the summary the worker recorded with the marker set.
+    let (display, session_now) = host.new_session(&updated.kr_now());
+    let worker_now = host.worker_process(session_now);
+    host.close(&updated.kr_now(), &display);
+    host.worker_ended(&worker_now).await;
+    let path = host.tree.environment().journal_database(session_now);
+    let recorded = {
+        let mut journal = kr_worker::journal::Journal::open(&path).expect("opens the journal");
+        let mut summary = journal
+            .read_session(session_now)
+            .expect("reads the summary")
+            .expect("the worker recorded the session");
+        summary.root = Some(kr_protocol::session::SessionRoot::Command);
+        journal
+            .record_session(&summary)
+            .expect("records the command session");
+        assert_eq!(
+            journal
+                .read_session(session_now)
+                .expect("reads it back")
+                .expect("the summary")
+                .root,
+            Some(kr_protocol::session::SessionRoot::Command),
+            "this release reads the marker back"
+        );
+        summary
+    };
+
+    // The rollback goes on beside the release before's own session, and that release's `kr` reads
+    // the closed session whole.
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", updated.one.name()),
+        "the daemon is the release before's again"
+    );
+    let read = host.run(&updated.kr_before(), &["--json", "status", &display]);
+    assert!(
+        read.status.success(),
+        "the release before's kr status: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let read: Value = serde_json::from_slice(&read.stdout).expect("a document");
+    assert_eq!(read["session_id"], session_now.to_string(), "{read}");
+    assert_eq!(
+        read["cwd"], recorded.cwd,
+        "the directory the journal recorded is shown, not a summary rebuilt from the closure: {read}"
+    );
+    assert_eq!(read["shell_path"], recorded.shell_path, "{read}");
+
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+}
