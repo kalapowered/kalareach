@@ -172,9 +172,7 @@ describe('revoking a device', () => {
     controls.revocation.stand('studio', 'the-phone', ACKNOWLEDGED({ host_lists_revoked: false }))
     await person.click(screen.getByTestId('devices-refresh'))
     await waitFor(() => {
-      expect(within(row).getByTestId('devices-standing')).toHaveTextContent(
-        'Its own list does not show the device as revoked. Revoke it at the host.'
-      )
+      expect(within(row).getByTestId('devices-standing')).toHaveTextContent('Revoke it at the host')
     })
     expect(within(row).getByText('Acknowledged')).toBeInTheDocument()
     expect(within(row).queryByText('Revoked')).not.toBeInTheDocument()
@@ -223,7 +221,7 @@ describe('revoking a device', () => {
     await waitFor(() => {
       expect(control).toBeEnabled()
     })
-    expect(screen.getByTestId('devices-heard')).toHaveTextContent('Could not revoke the-phone')
+    expect(screen.getByTestId('devices-heard')).toHaveTextContent('Revoking the-phone did not finish')
   })
 
   it('does not claim that nothing changed when the request may have reached its host, and looks again', async () => {
@@ -244,6 +242,40 @@ describe('revoking a device', () => {
     await waitFor(() => {
       expect(asked).toHaveBeenCalled()
     })
+  })
+
+  it('moves focus to the words of the row when a lost reply leaves a sent request and no control', async () => {
+    const person = userEvent.setup()
+    const { controls } = screenOf(view([host()]))
+    controls.revocation.loseTheReply('The host did not answer in time. The request may have reached the host.')
+    const row = await rowOf('the-phone')
+    await person.click(within(row).getByRole('button', { name: /^Revoke with Touch ID/ }))
+    // The failure says the request may have reached the host, and the look that follows finds it sent.
+    await waitFor(() => {
+      expect(within(row).getByText('Sent')).toBeInTheDocument()
+    })
+    expect(within(row).getByTestId('devices-failure')).toHaveTextContent('may have reached the host')
+    await waitFor(() => {
+      expect(within(row).getByTestId('devices-standing')).toHaveFocus()
+    })
+  })
+
+  it('names the control for the host on this computer in words, not by the name its card has', async () => {
+    screenOf(
+      view([
+        host({
+          reference: 'here',
+          name: 'This computer',
+          route: 'direct',
+          feed: null,
+          devices: [device('the-phone', { state: 'active' })]
+        })
+      ])
+    )
+    const row = await rowOf('the-phone')
+    expect(
+      within(row).getByRole('button', { name: 'Revoke with Touch ID: the-phone on the host on this computer' })
+    ).toBeEnabled()
   })
 
   it('offers nothing for a host the feed removed or this computer could not read the feed of', async () => {
@@ -331,7 +363,7 @@ describe('revoking a device', () => {
     expect(within(third).getByTestId('devices-standing')).toHaveTextContent('Revoke the device at the host')
   })
 
-  it('says where requests are published, and that a host must read that service', async () => {
+  it('says where requests are published', async () => {
     screenOf(view([host()]))
     await rowOf('the-phone')
     expect(screen.getByText(/Reached through its feed at reach\.kala\.to/)).toBeVisible()
@@ -450,6 +482,30 @@ describe('looking again while a request waits', () => {
     expect(within(row).queryByRole('button')).not.toBeInTheDocument()
     await waitFor(() => {
       expect(screen.getByTestId('devices-refresh')).toBeEnabled()
+    })
+  })
+
+  it('makes the look that a failure asks for after the one that is out, not beside it', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = screenOf(view([host()]))
+    const row = await rowOf('the-phone')
+    const asked = vi.spyOn(port, 'revocationView')
+    controls.revocation.failWith('It was not confirmed, so nothing was changed.')
+    const slow = controls.revocation.holdNextView()
+    await person.click(screen.getByTestId('devices-refresh'))
+    expect(asked).toHaveBeenCalledTimes(1)
+    await person.click(within(row).getByRole('button', { name: /^Revoke with Touch ID/ }))
+    await waitFor(() => {
+      expect(within(row).getByTestId('devices-failure')).toBeInTheDocument()
+    })
+    // The failure wants a look, and one is out: none begins beside it.
+    expect(asked).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      slow.release()
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(asked).toHaveBeenCalledTimes(2)
     })
   })
 

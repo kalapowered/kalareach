@@ -383,6 +383,11 @@ export interface FakeRevocation {
   /** Makes every revocation fail with this code and these words, or stops that. */
   failWith(message: string | null, code?: string): void
   /**
+   * Makes every revocation reach its host and then lose the reply, so that it fails with these
+   * words though the request was sent, or stops that.
+   */
+  loseTheReply(message: string | null): void
+  /**
    * Makes the next look at the hosts wait, answering with the view as it is when the look is made
    * and only once `release` is called: a host that is slow to answer.
    */
@@ -874,6 +879,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   const revocationAsked: string[] = []
   let revocationFailure: { readonly code: string; readonly message: string } | null = null
   let revocationHold: ((release: () => void) => void) | null = null
+  let revocationReplyLost: string | null = null
   let revocationRevokeHold: ((release: () => void) => void) | null = null
   const ownerListeners = new Set<(view: OwnerView) => void>()
   const publishOwner = (next: OwnerView) => {
@@ -2087,6 +2093,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
             : each
         )
       }
+      if (revocationReplyLost !== null) return refused('OUTCOME_UNKNOWN', revocationReplyLost)
       return Promise.resolve(revocation)
     },
     ownerConfirmations: () => Promise.resolve(owner),
@@ -2641,6 +2648,9 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       },
       failWith(message, code = 'PERMISSION_DENIED') {
         revocationFailure = message === null ? null : { code, message }
+      },
+      loseTheReply(message) {
+        revocationReplyLost = message
       },
       holdNextRevocation() {
         let release = () => {}

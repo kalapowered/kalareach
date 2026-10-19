@@ -271,7 +271,7 @@ export function revokeName(
   again = false
 ): string | null {
   const label = revokeLabel(ceremony, again)
-  return label === null ? null : `${label}: ${device.name} on ${host.name}`
+  return label === null ? null : `${label}: ${device.name} on ${hostCalled(host)}`
 }
 
 /** The name of the control that asks the host on this computer again, visible label first. */
@@ -297,7 +297,11 @@ export function announcements(before: RevocationView | null, after: RevocationVi
       if (was === undefined || !changedWhatIsDone(was.standing, device.standing)) continue
       switch (device.standing.state) {
         case 'done':
-          said.push(`${name} acknowledged the revocation of ${device.name}, and every session confirmed it.`)
+          said.push(
+            host.route === 'direct'
+              ? `${name} revoked ${device.name}, and every session confirmed it.`
+              : `${name} acknowledged the revocation of ${device.name}, and every session confirmed it.`
+          )
           break
         case 'acknowledged':
           said.push(

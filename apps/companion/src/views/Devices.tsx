@@ -8,14 +8,17 @@
  *
  * Revoking asks the person once, with the platform's own ceremony, so the control is named for it
  * ("Revoke with Touch ID") and there is no question in the row beside the dialog's. The row's words
- * wrap and no row has a fixed width, so no text size pushes a control out of its card. A refusal is
- * said in the row it is about, and focus returns to the control that was pressed. A request that
+ * wrap and no row has a fixed width, so no text size pushes a control out of its card. A failure is
+ * said in the row it is about, in words that claim nothing of the outcome, and focus returns to the
+ * control that was pressed, or to the words of the row when that control is gone. A request that
  * was sent leaves its row without a control, so focus goes to the words that now say where it
  * stands; those words are one element for as long as the row lives, so a later change of standing
- * keeps the person's place. Nothing here moves: what changes is said in a polite live region.
+ * keeps the person's place. Focus moves only from where a press left it: a person who has gone
+ * elsewhere is not followed. Nothing here moves: what changes is said in a polite live region.
  *
  * While a request waits for its host the screen asks again, ten seconds after the last answer: one
  * look at a time, so a slow host is waited for and its answer is shown, never dropped for the next.
+ * A look asked for while another is out waits for it.
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
@@ -71,6 +74,8 @@ export function Devices(): ReactNode {
   const reads = useRef<Watch | null>(null)
   const shown = useRef<RevocationView | null>(null)
   const looks = useRef(0)
+  // A look was asked for while another was out, and is made once that one is answered.
+  const queued = useRef(false)
   const words = useRef(new Map<string, HTMLElement>())
   const controls = useRef(new Map<string, HTMLElement>())
   const toFocus = useRef<FocusTarget | null>(null)
@@ -84,8 +89,13 @@ export function Devices(): ReactNode {
   }, [])
 
   /** Asks every host and feed. Only the newest answer is shown, and a look in flight is waited for. */
-  const look = useCallback(() => {
-    const current = reads.current?.read() ?? null
+  const look = useCallback(function look() {
+    if (reads.current === null) return
+    if (looks.current > 0) {
+      queued.current = true
+      return
+    }
+    const current = reads.current.read()
     if (current === null) return
     looks.current += 1
     setLooking(true)
@@ -101,7 +111,12 @@ export function Devices(): ReactNode {
       })
       .finally(() => {
         looks.current -= 1
-        if (looks.current === 0) setLooking(false)
+        if (looks.current > 0) return
+        setLooking(false)
+        if (queued.current) {
+          queued.current = false
+          look()
+        }
       })
   }, [port, show])
 
@@ -135,20 +150,29 @@ export function Devices(): ReactNode {
     }
   }, [waiting, looking, look])
 
-  // Once nothing is being asked, focus goes where the last revocation left it.
+  // Once nothing is being asked, focus goes where the last revocation left it: to its control, or to
+  // the words of its row when the answer took the control away. A person who has moved on is not
+  // followed: only focus that a press left on nothing, or on a control now disabled, is moved.
   useEffect(() => {
     const next = toFocus.current
-    if (next === null || revoking !== null) return
+    if (next === null || revoking !== null || looking) return
     toFocus.current = null
+    const control = controls.current.get(next.key)
+    const row = words.current.get(next.key)
+    const active = document.activeElement
+    const left = active === null || active === document.body || active === control || (active as HTMLButtonElement).disabled
+    if (!left) return
     // A row with no words and no control, one whose host cannot be reached, has nothing to take it.
-    const held = next.on === 'words' ? words : controls
-    held.current.get(next.key)?.focus()
-  }, [view, failure, revoking])
+    const target = next.on === 'words' ? (row ?? control) : (control ?? row)
+    target?.focus()
+  }, [view, failure, revoking, looking])
 
   const revoke = (host: RevocationHost, device: RevocationDevice) => {
     const key = `${host.reference}/${device.reference}`
     setRevoking(key)
     setFailure(null)
+    // A later failure is said again, even in the same words.
+    setHeard('')
     ask(() => port.revocationRevoke(host.reference, device.reference))
       .then((next) => {
         // This answer is newer than any look that began before it: none of them may replace it.
@@ -161,8 +185,8 @@ export function Devices(): ReactNode {
         const message = failureMessage(error)
         toFocus.current = { key, on: 'control' }
         setFailure({ key, message })
-        setHeard(`Could not revoke ${device.name}. ${message}`)
-        // A refusal after the request left says so in its own words; the screen looks, so that
+        setHeard(`Revoking ${device.name} did not finish. ${message}`)
+        // A failure after the request left says so in its own words; the screen looks, so that
         // what it shows is what the host and its feed say now.
         look()
       })
@@ -385,7 +409,7 @@ function DeviceRow({
         ) : null}
         {failed !== null ? (
           <p className="account-note revocation-failure" data-testid="devices-failure">
-            Could not revoke {device.name}. {failed}
+            Revoking {device.name} did not finish. {failed}
           </p>
         ) : null}
         <p className="account-help">{describeDevice(device)}</p>
