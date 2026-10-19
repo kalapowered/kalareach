@@ -303,7 +303,128 @@ enum Direct {
 #[derive(Clone, Copy)]
 struct Known {
     standing: DeviceStanding,
+    /// When the feed said so, which is what the screen shows as the time of that read.
     at_ms: u64,
+    /// When what said it began: a read of the feed that began after this can know better, and one
+    /// that began before it cannot, however late it finishes.
+    written_ms: u64,
+}
+
+/// What one visit to a host made of a device's standing, and what it knew of it.
+#[derive(Clone, Copy)]
+struct Seen {
+    /// The standing the visit's reads give.
+    read: DeviceStanding,
+    /// Whether the feed was read.
+    feed_read: bool,
+    /// Whether the host answered with its list, so that the list is read just now.
+    host_answered: bool,
+    /// When the visit began.
+    started_ms: u64,
+}
+
+/// Where a device's revocation stands for a host reached through its feed, given what a visit
+/// made of it, and what the feed last said of it before.
+///
+/// A feed that was read is the truth, unless a request is known that was written after the visit
+/// began: a view that waited for a slow host while a revocation was sent must not take that request
+/// back. A feed that could not be read says nothing of this computer's requests, so a device it
+/// would show as not asked about keeps the standing the feed last gave it, with the time of that
+/// read, corrected by what the host's own list says now: the screen shows a stale standing and says
+/// so, not a device nobody asked anything of.
+fn keep(
+    known: &mut BTreeMap<(String, DeviceId), Known>,
+    key: (String, DeviceId),
+    seen: Seen,
+    now_ms: u64,
+) -> (DeviceStanding, Option<u64>) {
+    if seen.feed_read {
+        if known
+            .get(&key)
+            .is_none_or(|held| held.written_ms < seen.started_ms)
+        {
+            match seen.read {
+                DeviceStanding::Active | DeviceStanding::Revoked => {
+                    known.remove(&key);
+                }
+                _ => {
+                    known.insert(
+                        key,
+                        Known {
+                            standing: seen.read,
+                            at_ms: now_ms,
+                            written_ms: seen.started_ms,
+                        },
+                    );
+                }
+            }
+        }
+        return (seen.read, None);
+    }
+    match known
+        .get(&key)
+        .and_then(|held| kept(held.standing, seen).map(|standing| (standing, held.at_ms)))
+    {
+        Some((standing, at_ms)) => (standing, Some(at_ms)),
+        None => (seen.read, None),
+    }
+}
+
+/// The standing the feed last gave, as the host's list now corrects it: the host that answers just
+/// now and does not list the device as revoked contradicts a feed that said it finished, and the
+/// host that lists it revoked bears out a request that was only sent. Null where the list gives
+/// more than the feed did.
+fn kept(held: DeviceStanding, seen: Seen) -> Option<DeviceStanding> {
+    match (seen.read, held) {
+        (DeviceStanding::Active, DeviceStanding::Done { at_ms }) => Some(if seen.host_answered {
+            DeviceStanding::Acknowledged {
+                at_ms,
+                pending_workers: None,
+                host_lists_revoked: false,
+            }
+        } else {
+            DeviceStanding::Done { at_ms }
+        }),
+        (
+            DeviceStanding::Active,
+            DeviceStanding::Acknowledged {
+                at_ms,
+                pending_workers,
+                ..
+            },
+        ) => Some(DeviceStanding::Acknowledged {
+            at_ms,
+            pending_workers,
+            host_lists_revoked: !seen.host_answered,
+        }),
+        (DeviceStanding::Active, DeviceStanding::Sent { at_ms, .. }) => {
+            Some(DeviceStanding::Sent {
+                at_ms,
+                host_lists_revoked: false,
+            })
+        }
+        (DeviceStanding::Active, refused @ DeviceStanding::Refused { .. }) => Some(refused),
+        (DeviceStanding::Revoked, DeviceStanding::Sent { at_ms, .. }) => {
+            Some(DeviceStanding::Sent {
+                at_ms,
+                host_lists_revoked: true,
+            })
+        }
+        (
+            DeviceStanding::Revoked,
+            DeviceStanding::Acknowledged {
+                at_ms,
+                pending_workers,
+                ..
+            },
+        ) => Some(DeviceStanding::Acknowledged {
+            at_ms,
+            pending_workers,
+            host_lists_revoked: true,
+        }),
+        (DeviceStanding::Revoked, done @ DeviceStanding::Done { .. }) => Some(done),
+        _ => None,
+    }
 }
 
 /// What a view and a command are told of this application beyond this computer's records.
@@ -395,6 +516,8 @@ fn device_name(summary: &DeviceSummary) -> String {
 /// What a visit to one host found.
 struct Reading {
     host: Host,
+    /// When the visit began, which is before the host and its feed were asked.
+    started_ms: u64,
     contact: Contact,
     list: Option<DeviceListResult>,
     /// The feed, for a host reached through one.
@@ -623,9 +746,14 @@ impl Revocations {
                     reading.contact == Contact::Answered,
                 );
                 let (standing, stale_since_ms) = match &reading.feed {
-                    Some(feed) => {
-                        self.standing_by_the_feed(&reference, summary.device_id, read, feed.is_ok())
-                    }
+                    Some(feed) => self.standing_by_the_feed(
+                        &reference,
+                        summary.device_id,
+                        read,
+                        feed.is_ok(),
+                        reading.contact == Contact::Answered,
+                        reading.started_ms,
+                    ),
                     None => (read, None),
                 };
                 DeviceView {
@@ -657,67 +785,27 @@ impl Revocations {
     }
 
     /// Where a device's revocation stands for a host reached through its feed, given what this
-    /// read of the feed made of it. A feed that was read is the truth and is kept. A feed that
-    /// could not be read says nothing of this computer's requests, so a device it would show as
-    /// not asked about keeps the standing the feed last gave it, with the time of that read: the
-    /// screen shows a stale standing and says so, not a device nobody asked anything of.
+    /// visit made of it and what the feed last said of it before ([`keep`]).
     fn standing_by_the_feed(
         &self,
         host: &str,
         device: DeviceId,
         read: DeviceStanding,
         feed_read: bool,
+        host_answered: bool,
+        started_ms: u64,
     ) -> (DeviceStanding, Option<u64>) {
-        let mut memory = self.memory();
-        let key = (host.to_owned(), device);
-        if feed_read {
-            match read {
-                DeviceStanding::Active | DeviceStanding::Revoked => {
-                    memory.known.remove(&key);
-                }
-                _ => {
-                    memory.known.insert(
-                        key,
-                        Known {
-                            standing: read,
-                            at_ms: now().get(),
-                        },
-                    );
-                }
-            }
-            return (read, None);
-        }
-        match (read, memory.known.get(&key)) {
-            (DeviceStanding::Active, Some(known)) => (known.standing, Some(known.at_ms)),
-            // The host's own list, read just now, says the device is revoked: the standing kept
-            // from the feed is the request's, and now says the host lists it so.
-            (DeviceStanding::Revoked, Some(known)) => match known.standing {
-                DeviceStanding::Sent { at_ms, .. } => (
-                    DeviceStanding::Sent {
-                        at_ms,
-                        host_lists_revoked: true,
-                    },
-                    Some(known.at_ms),
-                ),
-                DeviceStanding::Acknowledged {
-                    at_ms,
-                    pending_workers,
-                    ..
-                } => (
-                    DeviceStanding::Acknowledged {
-                        at_ms,
-                        pending_workers,
-                        host_lists_revoked: true,
-                    },
-                    Some(known.at_ms),
-                ),
-                DeviceStanding::Done { at_ms } => {
-                    (DeviceStanding::Done { at_ms }, Some(known.at_ms))
-                }
-                _ => (read, None),
+        keep(
+            &mut self.memory().known,
+            (host.to_owned(), device),
+            Seen {
+                read,
+                feed_read,
+                host_answered,
+                started_ms,
             },
-            _ => (read, None),
-        }
+            now().get(),
+        )
     }
 
     /// The requests in a host's feed that are this computer's own.
@@ -875,6 +963,7 @@ impl Revocations {
                                 host_lists_revoked: false,
                             },
                             at_ms,
+                            written_ms: at_ms,
                         },
                     );
                 }
@@ -1172,6 +1261,7 @@ async fn visit(
     client: Option<std::result::Result<AuthorityFeedClient, String>>,
     replace: crate::connection::Replacer,
 ) -> Reading {
+    let started_ms = now().get();
     let (listing, feed) = match &host {
         Host::Local(connection) => (listed_replacing(connection, &replace).await, None),
         Host::Paired(paired) => {
@@ -1206,6 +1296,7 @@ async fn visit(
     };
     Reading {
         host,
+        started_ms,
         contact,
         list,
         feed,
@@ -1484,5 +1575,106 @@ mod tests {
             .map(|request| request.record.request.request_id)
             .collect();
         assert_eq!(ids, [RevocationRequestId::new(id(20))]);
+    }
+
+    fn seen(read: DeviceStanding, feed_read: bool, host_answered: bool, started_ms: u64) -> Seen {
+        Seen {
+            read,
+            feed_read,
+            host_answered,
+            started_ms,
+        }
+    }
+
+    /// A feed that says a request finished, and a host that answers now and does not list the
+    /// device as revoked, are two facts: the screen shows the second as the first's contradiction,
+    /// as it does where the feed is read.
+    #[test]
+    fn a_standing_kept_from_the_feed_is_corrected_by_what_the_host_says_now() {
+        let done = DeviceStanding::Done { at_ms: 10 };
+        let not_revoked = |host_answered| seen(DeviceStanding::Active, false, host_answered, 50);
+        assert_eq!(
+            kept(done, not_revoked(true)),
+            Some(DeviceStanding::Acknowledged {
+                at_ms: 10,
+                pending_workers: None,
+                host_lists_revoked: false,
+            }),
+            "the host answers and does not list it revoked"
+        );
+        assert_eq!(
+            kept(done, not_revoked(false)),
+            Some(done),
+            "a host that did not answer contradicts nothing"
+        );
+        let sent = DeviceStanding::Sent {
+            at_ms: 10,
+            host_lists_revoked: true,
+        };
+        assert_eq!(
+            kept(sent, not_revoked(true)),
+            Some(DeviceStanding::Sent {
+                at_ms: 10,
+                host_lists_revoked: false,
+            })
+        );
+        assert_eq!(
+            kept(
+                DeviceStanding::Sent {
+                    at_ms: 10,
+                    host_lists_revoked: false,
+                },
+                seen(DeviceStanding::Revoked, false, true, 50)
+            ),
+            Some(DeviceStanding::Sent {
+                at_ms: 10,
+                host_lists_revoked: true,
+            }),
+            "the host lists it revoked"
+        );
+    }
+
+    /// A view that read the feed before a request was sent, and waited for a slow host while it
+    /// was, finishes after the request is known: what it read must not take the request back.
+    #[test]
+    fn a_visit_that_began_before_a_request_was_sent_does_not_take_it_back() {
+        let key = ("host".to_owned(), DeviceId::new(id(1)));
+        let sent = DeviceStanding::Sent {
+            at_ms: 200,
+            host_lists_revoked: false,
+        };
+        let mut known = BTreeMap::new();
+        known.insert(
+            key.clone(),
+            Known {
+                standing: sent,
+                at_ms: 200,
+                written_ms: 200,
+            },
+        );
+
+        // It began at 100, read no request, and is answered now.
+        let (shown, stale) = keep(
+            &mut known,
+            key.clone(),
+            seen(DeviceStanding::Active, true, true, 100),
+            400,
+        );
+        assert_eq!((shown, stale), (DeviceStanding::Active, None));
+        assert!(known.contains_key(&key), "the request is still known");
+
+        // The next visit began after the request was sent and found it in the feed.
+        let (shown, _) = keep(&mut known, key.clone(), seen(sent, true, true, 300), 400);
+        assert_eq!(shown, sent);
+        assert_eq!(known[&key].written_ms, 300);
+
+        // A visit that began after it and found nothing there has the last word.
+        keep(
+            &mut known,
+            key.clone(),
+            seen(DeviceStanding::Active, true, true, 500),
+            600,
+        );
+        assert!(!known.contains_key(&key));
     }
 }
