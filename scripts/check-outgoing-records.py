@@ -44,6 +44,7 @@ import argparse
 import base64
 import binascii
 import glob
+import hashlib
 import json
 import os
 import re
@@ -118,7 +119,10 @@ PEM_HEADER = re.compile(rb"-----BEGIN ((?:[A-Z0-9]+ )*)PRIVATE KEY( BLOCK)?-----
 # line breaks of any depth, a backslash that continues a string, a PowerShell `n, quotes and string
 # prefixes, joiners, commas, margins, comment markers including `///` and `//!`), and the first 32
 # characters of base64, taken wherever the source text breaks them, have to begin with that
-# structure, so a placeholder shorter than 32 characters is not a key.
+# structure, so a placeholder shorter than 32 characters is not a key. Where there is no structure
+# to check (ciphertext, or a kind of block this does not know) the 32 characters have to look like
+# random bytes: no word-sized pieces (every run of base64 in them is at least 8 characters) and 17
+# or more different characters.
 # A quoted header followed by code or prose does not decode to one. The read goes forward one item
 # at a time and never back, so its time is in proportion to the window; keep it so.
 STRING_PREFIX = rb"(?:u8|[bBrRuUfFL]{1,2})(?=[\"'])"
@@ -129,7 +133,10 @@ STRING_PREFIX = re.compile(STRING_PREFIX)
 NAME_LINE = re.compile(rb"[A-Za-z-]+: [^\r\n\\`]*(?:\r?\n|\\r|\\n|`[rn])")
 ENCRYPTED_LINE = re.compile(rb"(?:Proc-Type|DEK-Info): ")
 BASE64 = re.compile(rb"[A-Za-z0-9+/]+")
+ESCAPED_SLASH = re.compile(rb"\\+/")
 BODY_CHARACTERS = 32
+DISTINCT_CHARACTERS = 17
+MINIMUM_RUN = 8
 KEY_WINDOW = 8192
 
 
@@ -200,6 +207,7 @@ def key_body_follows(window, kind):
             break
         position = item.end()
     taken = bytearray()
+    runs = []
     while len(taken) < BODY_CHARACTERS:
         item = STRING_PREFIX.match(window, position)
         if item is not None:
@@ -211,6 +219,13 @@ def key_body_follows(window, kind):
             # A `+` or a `/` by itself is a joiner or a comment marker, not part of the body.
             if run.group().strip(b"+/"):
                 taken += run.group()[: BODY_CHARACTERS - len(taken)]
+                runs.append(len(run.group()))
+            continue
+        # JSON may write the `/` of base64 as `\/`, and it is a character of the body there.
+        item = ESCAPED_SLASH.match(window, position)
+        if item is not None:
+            taken += b"/"
+            position = item.end()
             continue
         item = LAYOUT.match(window, position)
         if item is None:
@@ -219,7 +234,10 @@ def key_body_follows(window, kind):
     if len(taken) < BODY_CHARACTERS:
         return False
     if encrypted or kind not in STRUCTURED_KINDS:
-        return True
+        # Ciphertext and key material in a format this does not know are random bytes, and 32
+        # characters of random base64 hold at least 17 different ones (one draw in 200,000 holds
+        # as few as 17); words and identifiers hold fewer.
+        return len(set(taken)) >= DISTINCT_CHARACTERS and min(runs) >= MINIMUM_RUN
     raw = binascii.a2b_base64(bytes(taken))
     if kind == b"PGP":
         return pgp_private_key(raw)
@@ -798,6 +816,10 @@ def cases(scratch, expect):
         """The base64 of a key packet's start, as an armoured block carries it."""
         return base64.b64encode(bytes(packet) + b"the-secret-material-of-the-key-0123456789").decode().rstrip("=")
 
+    # Ciphertext and key material in a format the check does not know are random bytes.
+    cipher = base64.b64encode(hashlib.sha256(b"ciphertext").digest()).decode().rstrip("=")
+    nebula_header = planted("-----", "BEGIN NEBULA X25519 PRIVATE KEY", "-----")
+    tendermint_header = planted("-----", "BEGIN TENDERMINT PRIVATE KEY", "-----")
     fragments = [f"b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB"[i : i + 12] for i in range(0, 52, 12)]
     shapes = {
         "src/joined.rs": f'const K: &str = "{header}\\n" + "{key_body[:32]}" + "{key_body[32:]}";\n',
@@ -822,25 +844,27 @@ def cases(scratch, expect):
         "src/ed25519.rs": f'const K: &str = "{header}\\n" + "MC4CAQAwBQYDK2VwBCIEIGexampleexampleexampleexample";\n',
         "src/sec1.rs": f'const K: &str = "{header}\\n" + "MHcCAQEEIexampleexampleexampleexampleexample";\n',
         "src/python.py": f'K = (b"{header}\\n"\n     b"{key_body[:4]}"\n     b"{key_body[4:8]}"\n     b"{key_body[8:32]}"\n     b"{key_body[32:]}")\n',
-        "src/ps-encrypted.ps1": f'$k = "{header}`nProc-Type: 4,ENCRYPTED`nDEK-Info: AES-128-CBC,0123456789ABCDEF`n`nq83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJ"\n',
+        "src/ps-encrypted.ps1": f'$k = "{header}`nProc-Type: 4,ENCRYPTED`nDEK-Info: AES-128-CBC,0123456789ABCDEF`n`n{cipher}"\n',
         "src/margin.kt": f'val k = """\n    |{header}\n    |{key_body}\n""".trimMargin()\n',
         "src/wide.cc": f'const wchar_t* k = L"{header}\\n" L"{key_body}";\n',
         "src/enc-pkcs8.pem.txt": planted("-----", "BEGIN ENCRYPTED PRIVATE KEY", "-----") + "\nMIIFHDBOBgkqhkiG9w0BBQ0wQTApBgkqhkiG9w0BBQwwHAQIexampleexampleexample\n",
-        "src/encrypted-ciphertext.pem.txt": f"{header}\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123456789ABCDEF\n\nq83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJ\n",
+        "src/encrypted-ciphertext.pem.txt": f"{header}\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123456789ABCDEF\n\n{cipher}\n",
         "src/uneven.js": f'const K = "{header}\\n" +\n  "{key_body[:24]}" +\n  "{key_body[24:32]}" +\n  "{key_body[32:]}\\n";\n',
         "src/commented-short.rs": f"// {header}\n" + "".join(f"// {key_body[i : i + 24]}\n" for i in range(0, len(key_body), 24)),
         "src/php.json": '{"k":"' + header + "\\n" + key_body[:10] + "\\/" + key_body[10:] + '\\n"}\n',
         "src/openssh.txt": planted("-----", "BEGIN OPENSSH PRIVATE KEY", "-----") + "\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB\n",
         "src/pgp.asc": f"{pgp_header}\n\n{pgp_body(0x95, 0x03, 0x98, 4, 0x5F, 0, 0, 1, 1)}\n",
         "src/pgp-version.asc": f"{pgp_header}\nVersion: Example 1.0\n\n{pgp_body(0x95, 0x03, 0x98, 4, 0x5F, 0, 0, 1, 1)}\n",
+        "src/pgp-v3.asc": f"{pgp_header}\n\n{pgp_body(0x95, 0x01, 0x8F, 3, 0x5F, 0, 0, 1, 0, 0, 1)}\n",
+        "src/pgp-slash.json": json.dumps({"k": f"{pgp_header}\n\n{pgp_body(0x94, 0x57, 4, *(1700003663).to_bytes(4, 'big'), 22)}\n"}).replace("/", "\\/"),
         "src/pgp-short.asc": f"{pgp_header}\n\n{pgp_body(0x94, 0x58, 4, 0x5F, 0, 0, 1, 22)}\n",
         "src/pgp-new.asc": f"{pgp_header}\n\n{pgp_body(0xC5, 0x5B, 4, 0x5F, 0, 0, 1, 27)}\n",
         "src/pgp-new-long.asc": f"{pgp_header}\n\n{pgp_body(0xC5, 0xC2, 0xD8, 4, 0x5F, 0, 0, 1, 1)}\n",
         "src/pgp-public-first.asc": f"{pgp_header}\n\n{pgp_body(0xC6, 0x33, 4, 0x5F, 0, 0, 1, 19)}\n",
         "src/pgp-v6.asc": f"{pgp_header}\n\n{pgp_body(0xC5, 0x40, 6, 0x5F, 0, 0, 1, 27)}\n",
         "src/pgp-comment.asc": f"{pgp_header}\nComment: Convert to {header} for OpenSSL\n\n{pgp_body(0xC5, 0x5B, 4, 0x5F, 0, 0, 1, 27)}\n",
-        "src/nebula.yml": "key: |\n  " + planted("-----", "BEGIN NEBULA X25519 PRIVATE KEY", "-----") + "\n  dGhpcy1pcy1hLWZha2Uta2V5LWZvci10ZXN0cw\n",
-        "src/cosmos.txt": planted("-----", "BEGIN TENDERMINT PRIVATE KEY", "-----") + "\nkdf: bcrypt\nsalt: 0123456789ABCDEF0123456789ABCDEF\ntype: secp256k1\n\nq83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJ\n",
+        "src/nebula.yml": f"key: |\n  {nebula_header}\n  {cipher}\n",
+        "src/cosmos.txt": f"{tendermint_header}\nkdf: bcrypt\nsalt: 0123456789ABCDEF0123456789ABCDEF\ntype: secp256k1\n\n{cipher}\n",
         "src/joiners.js": f'const key = "{header}\\n" +\n  "MC4C" +\n  "AQAwBQYDK2VwBCIEIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f\\n";\n',
         "src/openssh-joined.js": 'const key = "' + planted("-----", "BEGIN OPENSSH PRIVATE KEY", "-----") + '\\n" +\n  ' + " +\n  ".join(f'"{piece}"' for piece in fragments) + ";\n",
         "src/openssh-comments.rs": "// " + planted("-----", "BEGIN OPENSSH PRIVATE KEY", "-----") + "\n" + "".join(f"// {piece}\n" for piece in fragments),
@@ -848,8 +872,8 @@ def cases(scratch, expect):
         "src/u8.cpp": f'auto k = u8"{header}\\n" u8"{key_body[:4]}" u8"{key_body[4:]}";\n',
         "src/rb.py": f'K = (rb"{header}\\n"\n     rb"{key_body[:4]}"\n     rb"{key_body[4:]}")\n',
         "src/tab.ps1": f'$k = "{header}`t{key_body}"\n',
-        "src/ps-encrypted-crlf.ps1": f'$k = "{header}`r`nProc-Type: 4,ENCRYPTED`r`nDEK-Info: AES-128-CBC,0123456789ABCDEF`r`n`r`nq83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJ"\n',
-        "src/python-encrypted.py": f'K = (b"{header}\\n"\n     b"Proc-Type: 4,ENCRYPTED\\n"\n     b"DEK-Info: AES-128-CBC,0123456789ABCDEF\\n\\n"\n     b"q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJ")\n',
+        "src/ps-encrypted-crlf.ps1": f'$k = "{header}`r`nProc-Type: 4,ENCRYPTED`r`nDEK-Info: AES-128-CBC,0123456789ABCDEF`r`n`r`n{cipher}"\n',
+        "src/python-encrypted.py": f'K = (b"{header}\\n"\n     b"Proc-Type: 4,ENCRYPTED\\n"\n     b"DEK-Info: AES-128-CBC,0123456789ABCDEF\\n\\n"\n     b"{cipher}")\n',
     }
     fx = Fixture(scratch)
     for path, text in shapes.items():
@@ -880,6 +904,11 @@ def cases(scratch, expect):
     fx.write("docs/placeholder.md", f"{header}\nMIIEpAIBAAKCAQEA...\n-----END\n")
     fx.write("src/armour.js", f'const ARMOR = "{pgp_header}";\nlet armoredSecretKey = await readKey(ARMOR);\n')
     fx.write("docs/lines.md", f"{pgp_header} lines up the armour headers first, then the packets.\n")
+    fx.write("docs/wrap.md", f"{nebula_header}\n# wrap up last segment yield section, content\n")
+    fx.write("docs/digest-note.md", f"{header}\nNote: the digest follows\n{cipher}\n")
+    for name, unknown in (("nebula", nebula_header), ("tendermint", tendermint_header)):
+        fx.write(f"src/{name}.js", f'const marker = "{unknown}";\nvalidatePrivateKeyAndCertificateChain(marker);\n')
+        fx.write(f"docs/{name}.md", f"{unknown} This header identifies a private key in the configuration file.\n")
     fx.write("src/lanes.js", f'const A = "{pgp_header}";\nnextBaseLanes, renderLanes, remainingChildLanes;\n')
     fx.write("docs/list.md", f"{pgp_header}\nlist README files before checking signatures\n")
     fx.write("src/names.js", f'const A = "{pgp_header}";\nlet armoredSecretKey, armoredPublicKey, revocationCertificate;\n')
