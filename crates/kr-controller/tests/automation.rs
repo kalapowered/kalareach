@@ -3674,7 +3674,7 @@ async fn an_owner_managed_workflow_runs_under_a_members_organisation_grant_while
         authority_revision: revision,
         environment_selector: EnvironmentSelector::Any,
         session_selector: SessionSelector::Any,
-        actions: COMMAND_RIGHTS.into_iter().collect(),
+        actions: [ActionRight::SessionView].into_iter().collect(),
         history: HistoryScope {
             lower_bound_ms: Nullable::null(),
             include_live_screen: false,
@@ -3705,9 +3705,12 @@ async fn an_owner_managed_workflow_runs_under_a_members_organisation_grant_while
         grant.grant_id,
         "under a member's organisation grant",
         WorkflowNode {
-            node_id: "tests".to_owned(),
-            action_kind: WorkflowActionKind::RunTests,
-            action_params: tests_params(),
+            node_id: "notice".to_owned(),
+            action_kind: WorkflowActionKind::AttentionNotice,
+            action_params: serde_json::to_string(&kr_protocol::automation::AttentionNoticeParams {
+                summary: "a notice".to_owned(),
+            })
+            .expect("a notice node's typed parameters"),
             declared_environment: Nullable::null(),
         },
     );
@@ -3734,7 +3737,13 @@ async fn an_owner_managed_workflow_runs_under_a_members_organisation_grant_while
 
     // The device binds on a live lease, and the owner installs the workflow.
     let key = organisation_support::device();
-    let lease = organisation.lease(2, &member("ada"), *key.public(), T, &COMMAND_RIGHTS);
+    let lease = organisation.lease(
+        2,
+        &member("ada"),
+        *key.public(),
+        T,
+        &[ActionRight::SessionView],
+    );
     host.controller
         .update_policy(|policy| {
             policy.install_lease(LeasePresentation {
@@ -3750,6 +3759,33 @@ async fn an_owner_managed_workflow_runs_under_a_members_organisation_grant_while
         .expect("the lease installs and binds the device");
     install(&mut control, &host, &document).await;
 
+    // The role ceiling carries no right to create a session, and a node that runs a command needs
+    // that right beside the right to type, so no node of that kind is installed under the member's
+    // grant, whatever the grant says.
+    let command = definition(
+        workflow_id(28),
+        grant.grant_id,
+        "a command under a member's grant",
+        command_node(&host, "command", "true"),
+    );
+    let refused = failure(
+        control
+            .mutate(
+                Method::WorkflowInstall,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &WorkflowInstallParams {
+                    workflow_id: command.workflow_id,
+                    revision: command.revision,
+                    definition: command.clone(),
+                    grant_reference: command.grant_reference,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+
     // Its node is decided while the lease lasts.
     let grants = HostGrants::for_daemon(&host.controller);
     let held = grants
@@ -3760,7 +3796,7 @@ async fn an_owner_managed_workflow_runs_under_a_members_organisation_grant_while
 
     // The control: the member's grant does not reach workflow.install itself.
     let managing = Grant {
-        actions: [ActionRight::AutomationManage, ActionRight::TerminalInput]
+        actions: [ActionRight::AutomationManage, ActionRight::SessionView]
             .into_iter()
             .collect(),
         ..grant.clone()
@@ -4132,9 +4168,10 @@ async fn a_command_that_outlives_its_wait_is_stopped_and_a_created_session_is_no
         "a long command",
         command_node(&host, "long", "sleep 120"),
     );
+    // Long enough for the worker to start under load, and far shorter than the command.
     document.deadlines = WorkflowDeadlines {
-        run_deadline_ms: U64::new(60_000),
-        action_wait_ms: U64::new(2_000),
+        run_deadline_ms: U64::new(120_000),
+        action_wait_ms: U64::new(15_000),
     };
     install(&mut control, &host, &document).await;
     enable(&mut control, &host, &document).await;
@@ -4149,8 +4186,10 @@ async fn a_command_that_outlives_its_wait_is_stopped_and_a_created_session_is_no
             let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
                 let live = all_sessions(&mut other).await;
-                if let Some(session) = live.into_iter().find(|session| session.closure.0.is_none())
-                {
+                if let Some(session) = live.into_iter().find(|session| {
+                    session.closure.0.is_none()
+                        && session.root == Some(kr_protocol::session::SessionRoot::Command)
+                }) {
                     return session;
                 }
                 assert!(std::time::Instant::now() < until, "the command's session");

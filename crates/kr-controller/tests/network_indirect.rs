@@ -130,9 +130,19 @@ async fn viewer_with(
     owner: &DeviceKeys,
     actions: &[ActionRight],
 ) -> (Device, RawDevice, GrantId, GrantId) {
+    viewer_selecting(host, owner, actions, SessionSelector::None).await
+}
+
+/// [`viewer_with`], whose pairing grant selects the sessions `selector` says.
+async fn viewer_selecting(
+    host: &Host,
+    owner: &DeviceKeys,
+    actions: &[ActionRight],
+    selector: SessionSelector,
+) -> (Device, RawDevice, GrantId, GrantId) {
     let device = Device::create().await;
     let mut grant = proposal(actions);
-    grant.session_selector = SessionSelector::None;
+    grant.session_selector = selector;
     let record = pair_with(host, &device, owner, grant).await;
     let session_id = SessionId::new(kr_ipc::new_uuid());
     let selection = RoleSelection::plain(SessionRole::Viewer);
@@ -233,26 +243,37 @@ async fn kr_req_19_01_a_view_only_recipient_installs_no_workflow_that_types_for_
     )
     .await
     .expect("a node that needs only what the pairing grant holds is installed");
-    let (_typist_device, typist, _, typist_pairing) = viewer_with(
+    let typing = [
+        ActionRight::AutomationManage,
+        ActionRight::SessionView,
+        ActionRight::TerminalInput,
+        ActionRight::SessionCreate,
+        ActionRight::SessionClose,
+        ActionRight::WorkspaceManage,
+    ];
+    // A node that types does it in a session it creates, so a grant that holds every right it needs
+    // but selects no session, or one, is not a broad shell grant and installs it nowhere.
+    let (_narrow_device, narrow, _, narrow_pairing) =
+        viewer_selecting(&host, &owner, &typing, SessionSelector::None).await;
+    let refused = install(
         &host,
-        &owner,
-        &[
-            ActionRight::AutomationManage,
-            ActionRight::SessionView,
-            ActionRight::TerminalInput,
-            ActionRight::SessionCreate,
-            ActionRight::SessionClose,
-            ActionRight::WorkspaceManage,
-        ],
+        &narrow,
+        &workflow(6, narrow_pairing, node(&host, WorkflowActionKind::RunTests)),
     )
-    .await;
+    .await
+    .expect_err("a grant that selects no session is not a broad shell grant");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(refused.message.contains("every session"), "{refused:?}");
+    let (_typist_device, typist, _, typist_pairing) =
+        viewer_selecting(&host, &owner, &typing, SessionSelector::Any).await;
     install(
         &host,
         &typist,
         &workflow(5, typist_pairing, node(&host, WorkflowActionKind::RunTests)),
     )
     .await
-    .expect("a grant that holds the right to type installs the node that types");
+    .expect("a broad grant that holds every right the node needs installs the node that types");
+    narrow.close();
 
     viewer.close();
     typist.close();
