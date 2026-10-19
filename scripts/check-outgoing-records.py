@@ -132,8 +132,8 @@ LAYOUT = re.compile(
 STRING_PREFIX = re.compile(STRING_PREFIX)
 NAME_LINE = re.compile(rb"[A-Za-z-]+: [^\r\n\\`]*(?:\r?\n|\\r|\\n|`[rn])")
 ENCRYPTED_LINE = re.compile(rb"(?:Proc-Type|DEK-Info): ")
-BASE64 = re.compile(rb"[A-Za-z0-9+/]+")
-ESCAPED_SLASH = re.compile(rb"\\+/")
+# JSON may write the `/` of base64 as `\/`, and it is a character of the body there.
+BASE64 = re.compile(rb"(?:[A-Za-z0-9+/]|\\+/)+")
 BODY_CHARACTERS = 32
 DISTINCT_CHARACTERS = 17
 MINIMUM_RUN = 8
@@ -216,16 +216,11 @@ def key_body_follows(window, kind):
         run = BASE64.match(window, position)
         if run is not None:
             position = run.end()
+            characters = run.group().replace(b"\\", b"")
             # A `+` or a `/` by itself is a joiner or a comment marker, not part of the body.
-            if run.group().strip(b"+/"):
-                taken += run.group()[: BODY_CHARACTERS - len(taken)]
-                runs.append(len(run.group()))
-            continue
-        # JSON may write the `/` of base64 as `\/`, and it is a character of the body there.
-        item = ESCAPED_SLASH.match(window, position)
-        if item is not None:
-            taken += b"/"
-            position = item.end()
+            if characters.strip(b"+/"):
+                taken += characters[: BODY_CHARACTERS - len(taken)]
+                runs.append(len(characters))
             continue
         item = LAYOUT.match(window, position)
         if item is None:
@@ -818,6 +813,7 @@ def cases(scratch, expect):
 
     # Ciphertext and key material in a format the check does not know are random bytes.
     cipher = base64.b64encode(hashlib.sha256(b"ciphertext").digest()).decode().rstrip("=")
+    slashed = cipher[:3] + "/" + cipher[4:]
     nebula_header = planted("-----", "BEGIN NEBULA X25519 PRIVATE KEY", "-----")
     tendermint_header = planted("-----", "BEGIN TENDERMINT PRIVATE KEY", "-----")
     fragments = [f"b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB"[i : i + 12] for i in range(0, 52, 12)]
@@ -852,6 +848,8 @@ def cases(scratch, expect):
         "src/uneven.js": f'const K = "{header}\\n" +\n  "{key_body[:24]}" +\n  "{key_body[24:32]}" +\n  "{key_body[32:]}\\n";\n',
         "src/commented-short.rs": f"// {header}\n" + "".join(f"// {key_body[i : i + 24]}\n" for i in range(0, len(key_body), 24)),
         "src/php.json": '{"k":"' + header + "\\n" + key_body[:10] + "\\/" + key_body[10:] + '\\n"}\n',
+        "src/php-encrypted.json": json.dumps({"k": f"{header}\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123456789ABCDEF\n\n{slashed}\n"}).replace("/", "\\/"),
+        "src/php-nebula.json": json.dumps({"k": f"{nebula_header}\n{slashed}\n"}).replace("/", "\\/"),
         "src/openssh.txt": planted("-----", "BEGIN OPENSSH PRIVATE KEY", "-----") + "\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB\n",
         "src/pgp.asc": f"{pgp_header}\n\n{pgp_body(0x95, 0x03, 0x98, 4, 0x5F, 0, 0, 1, 1)}\n",
         "src/pgp-version.asc": f"{pgp_header}\nVersion: Example 1.0\n\n{pgp_body(0x95, 0x03, 0x98, 4, 0x5F, 0, 0, 1, 1)}\n",
