@@ -481,23 +481,31 @@ is taken out the same way. A send already on its way cannot be called back.
 The Devices screen sits after Hosts in the desktop navigation and shows one card for each host, the
 one on this computer first. A card says how requests reach its host. For a host reached through its
 feed it also says what the feed holds: when the host last acknowledged a request, how many requests
-wait for it, and whether the feed removed it. Each device has a row that says in words where its
-revocation stands, with a badge for sent, acknowledged, revoked or refused. A request that has not
-been acknowledged is never called revoked. An acknowledgement that the host's own list does not bear
-out is shown as acknowledged, and the row tells the person to revoke the device at the host.
+wait for it, when it last read its feed, and whether the feed removed it. Each device has a row that
+says in words where its revocation stands, with a badge for sent, acknowledged, revoked or refused.
+A request that has not been acknowledged is never called revoked, and a revocation counts as done
+only when the host has acknowledged it and every session has confirmed it. An acknowledgement that
+the host's own list does not bear out is shown as acknowledged, and the row tells the person to
+revoke the device at the host. When this computer cannot read a host's feed, a row keeps the
+standing the feed last gave it and says when that was read.
 
 The control is named for this computer's ceremony: "Revoke with Touch ID", "Revoke with your
 password" or "Revoke with Windows Hello". The row asks no second question, because the system's
 dialog names the device and the host and is the confirmation. A computer with no ceremony shows no
-control and says so. A host the feed removed, and a host whose feed this computer could not read,
-show no control either, and the card says why. A device whose request the host refused can be
-revoked again.
+control and says so. A host the feed removed, a host whose feed this computer could not read, and
+the host on this computer while it does not answer show no control either, and the card says why. A
+request the host refused can be revoked again only when it was refused because an earlier revocation
+covers it; a refusal for lack of owner authority tells the person to revoke the device at the host.
+When a revocation does not go through, the row says why and focus returns to the control. The screen
+then looks again, because a request that failed may still have reached its host.
 
-While a request waits for its host, the screen looks again every ten seconds, and each look connects
-to the hosts it lists, which read their feeds when a device connects. What changes is said in a live
-region, and once a request is sent, focus goes to the words that say where it stands. Those words
-fade in over the state duration and nothing travels, so reduced motion changes nothing about them.
-This screen is the desktop's: a phone has no ceremony to confirm with, so it revokes nothing.
+While a request waits for its host, the screen looks again ten seconds after the last answer. It
+makes one look at a time, so a slow host is waited for and its answer is shown. Each look connects
+to the hosts it lists, which read their feeds when a device connects. A hidden screen waits until it
+is shown. The host on this computer answers each revocation as it is asked, so the screen does not
+look for it, and its row offers "Check again". What changes is said in a live region, and once a
+request is sent, focus goes to the words that say where it stands. Nothing on the screen moves. This
+screen is the desktop's: a phone has no ceremony to confirm with, so it revokes nothing.
 
 ## Sharing a session
 
