@@ -617,7 +617,7 @@ impl Revocations {
                 );
                 let (standing, stale_since_ms) = match &reading.feed {
                     Some(feed) => {
-                        self.from_the_feed(&reference, summary.device_id, read, feed.is_ok())
+                        self.standing_by_the_feed(&reference, summary.device_id, read, feed.is_ok())
                     }
                     None => (read, None),
                 };
@@ -654,7 +654,7 @@ impl Revocations {
     /// could not be read says nothing of this computer's requests, so a device it would show as
     /// not asked about keeps the standing the feed last gave it, with the time of that read: the
     /// screen shows a stale standing and says so, not a device nobody asked anything of.
-    fn from_the_feed(
+    fn standing_by_the_feed(
         &self,
         host: &str,
         device: DeviceId,
