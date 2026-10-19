@@ -987,6 +987,8 @@ mod tests {
     #[test]
     fn a_session_whose_root_is_a_command_starts_only_what_the_daemon_accepted() {
         use super::root_command_refusal;
+        use kr_protocol::error::ErrorCode;
+        use kr_protocol::session::ShellMode;
         use kr_protocol::worker::RootCommand;
 
         let command = |interpreter: &str, not_after: u64| RootCommand {

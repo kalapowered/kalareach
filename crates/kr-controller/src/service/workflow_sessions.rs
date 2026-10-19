@@ -157,7 +157,7 @@ impl Controller {
             target: ActionTarget {
                 environment_id: self.paths.environment_id(),
                 session_id: Nullable::some(order.session_id),
-                session_epoch: Nullable::null(),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
                 application_instance_id: Nullable::null(),
                 agent_binding_revision: Nullable::null(),
             },

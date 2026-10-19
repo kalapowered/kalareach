@@ -428,7 +428,12 @@ mod tests {
             check_definition(&view_only, &definition, here()).expect_err("a shell node is refused");
         assert!(refusal.to_string().contains("terminal.input"), "{refusal}");
 
-        let with_terminal = grant_with(&[ActionRight::SessionView, ActionRight::TerminalInput]);
+        let with_terminal = grant_with(&[
+            ActionRight::SessionView,
+            ActionRight::TerminalInput,
+            ActionRight::SessionCreate,
+            ActionRight::SessionClose,
+        ]);
         check_definition(&with_terminal, &definition, here())
             .expect("a broad shell grant admits it");
     }
@@ -451,7 +456,11 @@ mod tests {
     #[test]
     fn a_shell_node_names_an_environment_the_grant_must_admit() {
         let environment_id = EnvironmentId::new(Uuid::from_bytes([4; 16]));
-        let mut grant = grant_with(&[ActionRight::TerminalInput]);
+        let mut grant = grant_with(&[
+            ActionRight::TerminalInput,
+            ActionRight::SessionCreate,
+            ActionRight::SessionClose,
+        ]);
         grant.environment_selector = EnvironmentSelector::These {
             environment_ids: [EnvironmentId::new(Uuid::from_bytes([5; 16]))]
                 .into_iter()

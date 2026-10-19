@@ -768,7 +768,7 @@ async fn a_revoked_grant_runs_no_workflow() {
     let host = host().await;
     let mut control = client(&host).await;
 
-    host.issue(grant_id(2), &[ActionRight::TerminalInput]);
+    host.issue(grant_id(2), &COMMAND_RIGHTS);
     let document = definition(
         workflow_id(2),
         grant_id(2),
@@ -878,7 +878,7 @@ async fn a_replayed_mutation_is_answered_from_its_record() {
     let host = host().await;
     let mut control = client(&host).await;
 
-    host.issue(grant_id(4), &[ActionRight::TerminalInput]);
+    host.issue(grant_id(4), &COMMAND_RIGHTS);
     let document = definition(
         workflow_id(4),
         grant_id(4),
@@ -978,7 +978,7 @@ async fn a_repeat_over_a_new_connection_is_answered_from_its_record() {
     let host = host().await;
     let mut control = client(&host).await;
 
-    host.issue(grant_id(5), &[ActionRight::TerminalInput]);
+    host.issue(grant_id(5), &COMMAND_RIGHTS);
     let document = definition(
         workflow_id(5),
         grant_id(5),
@@ -1055,7 +1055,7 @@ async fn a_grant_the_host_policy_refuses_installs_no_workflow() {
     let host = host().await;
     let mut control = client(&host).await;
 
-    let mut grant = host.issue(grant_id(6), &[ActionRight::TerminalInput]);
+    let mut grant = host.issue(grant_id(6), &COMMAND_RIGHTS);
     grant.authority_revision = AuthorityRevision::new(1_000_000);
     let unissued = grant_id(7);
     host.controller
@@ -1169,7 +1169,7 @@ async fn a_triggered_workflow_descends_from_the_node_that_triggered_it() {
         "capture-on-demand",
         capture_node(workspace),
     );
-    host.issue(grant_id(9), &[ActionRight::TerminalInput]);
+    host.issue(grant_id(9), &COMMAND_RIGHTS);
     let mut tests = definition(
         workflow_id(9),
         grant_id(9),
@@ -1266,7 +1266,7 @@ fn a_clock_wound_back_does_not_revive_a_grant_a_dispatch_refused() {
             authority_revision: AuthorityRevision::new(1),
             environment_selector: EnvironmentSelector::Any,
             session_selector: SessionSelector::Any,
-            actions: [ActionRight::TerminalInput].into_iter().collect(),
+            actions: COMMAND_RIGHTS.into_iter().collect(),
             history: HistoryScope {
                 lower_bound_ms: Nullable::null(),
                 include_live_screen: false,
@@ -1890,7 +1890,13 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
         &host,
         &device,
         &owner,
-        net_support::proposal(&[ActionRight::AutomationManage, ActionRight::TerminalInput]),
+        net_support::proposal(&[
+            ActionRight::AutomationManage,
+            ActionRight::TerminalInput,
+            ActionRight::SessionCreate,
+            ActionRight::SessionClose,
+            ActionRight::WorkspaceManage,
+        ]),
     )
     .await;
     let session = net_support::connect(&host, &device, &record).await;
@@ -2000,7 +2006,7 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
                     authority_revision: host.controller().policy().authority_revision(),
                     environment_selector: EnvironmentSelector::Any,
                     session_selector: SessionSelector::Any,
-                    actions: [ActionRight::TerminalInput].into_iter().collect(),
+                    actions: COMMAND_RIGHTS.into_iter().collect(),
                     history: HistoryScope {
                         lower_bound_ms: Nullable::null(),
                         include_live_screen: false,
@@ -3597,7 +3603,7 @@ async fn an_owner_managed_workflow_runs_under_a_members_organisation_grant_while
         authority_revision: revision,
         environment_selector: EnvironmentSelector::Any,
         session_selector: SessionSelector::Any,
-        actions: [ActionRight::TerminalInput].into_iter().collect(),
+        actions: COMMAND_RIGHTS.into_iter().collect(),
         history: HistoryScope {
             lower_bound_ms: Nullable::null(),
             include_live_screen: false,
@@ -3657,13 +3663,7 @@ async fn an_owner_managed_workflow_runs_under_a_members_organisation_grant_while
 
     // The device binds on a live lease, and the owner installs the workflow.
     let key = organisation_support::device();
-    let lease = organisation.lease(
-        2,
-        &member("ada"),
-        *key.public(),
-        T,
-        &[ActionRight::TerminalInput],
-    );
+    let lease = organisation.lease(2, &member("ada"), *key.public(), T, &COMMAND_RIGHTS);
     host.controller
         .update_policy(|policy| {
             policy.install_lease(LeasePresentation {
@@ -3974,11 +3974,6 @@ async fn a_shell_command_node_reports_how_its_command_ended() {
         kr_protocol::session::ClosureReason::RootExit
     );
     assert_eq!(closure.root_exit_code.0, Some(U64::new(0)));
-    assert_eq!(
-        session.root,
-        Some(kr_protocol::session::SessionRoot::Command),
-        "a session whose root is a command says so"
-    );
 
     let (status, receipts) = &ended[1];
     assert_eq!(*status, WorkflowRunStatus::Failed);
@@ -4072,10 +4067,36 @@ async fn a_command_that_outlives_its_wait_is_stopped_and_a_created_session_is_no
     };
     install(&mut control, &host, &document).await;
     enable(&mut control, &host, &document).await;
+    // The run blocks until the node's wait ends, so the live session is read from another
+    // connection while the command runs.
+    let watcher = {
+        let endpoint = host.endpoint.clone();
+        tokio::spawn(async move {
+            let mut other = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+                .await
+                .expect("connects to the control endpoint");
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let live = all_sessions(&mut other).await;
+                if let Some(session) = live.into_iter().find(|session| session.closure.0.is_none())
+                {
+                    return session;
+                }
+                assert!(std::time::Instant::now() < until, "the command's session");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+    };
     let run: WorkflowRunResult = typed(
         &start(&mut control, &host, &document, "evt-1")
             .await
             .expect("the run is admitted"),
+    );
+    let live = watcher.await.expect("the watcher answers");
+    assert_eq!(
+        live.root,
+        Some(kr_protocol::session::SessionRoot::Command),
+        "a live session whose root is a command says so"
     );
     let receipts = receipts_of(&mut control, &document, run.run_id).await;
     assert_eq!(receipts[0].status, NodeStatus::Cancelled, "{receipts:?}");

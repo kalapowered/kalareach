@@ -240,6 +240,9 @@ async fn kr_req_19_01_a_view_only_recipient_installs_no_workflow_that_types_for_
             ActionRight::AutomationManage,
             ActionRight::SessionView,
             ActionRight::TerminalInput,
+            ActionRight::SessionCreate,
+            ActionRight::SessionClose,
+            ActionRight::WorkspaceManage,
         ],
     )
     .await;
