@@ -41,6 +41,24 @@ pub trait AuthoritySource: Send + Sync + std::fmt::Debug {
     /// Returns [`AutomationError::PermissionDenied`] when the grant is unknown to this host, has
     /// expired, has been revoked, or has never been redeemed.
     fn grant(&self, grant_id: GrantId, now_ms: u64) -> Result<Grant>;
+
+    /// Returns the grant like [`Self::grant`], and how long it stands from now on every clock its
+    /// source holds it to: the earliest of its own expiry, an organisation lease and a bounded
+    /// offline validity. `None` says the source knows of no end.
+    ///
+    /// A source that reads one clock only leaves this as it is: no end is known then, and a caller
+    /// that needs the bound of a moment it acts at holds only the wait it was given.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::grant`].
+    fn grant_standing(
+        &self,
+        grant_id: GrantId,
+        now_ms: u64,
+    ) -> Result<(Grant, Option<std::time::Duration>)> {
+        self.grant(grant_id, now_ms).map(|grant| (grant, None))
+    }
 }
 
 /// The rights one action kind needs before a node of that kind may be dispatched.

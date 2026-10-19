@@ -708,6 +708,142 @@ async fn a_run_cancelled_while_its_action_runs_asks_it_to_stop_and_pauses_nothin
     );
 }
 
+/// A clock that, once armed, cancels a run on its next reading and reads a moment past the wait:
+/// the cancellation is committed just before the engine finds the wait lapsed.
+#[derive(Debug)]
+struct CancelsBeforeItsNextReading {
+    inner: ManualClock,
+    armed: std::sync::Mutex<
+        Option<(
+            Arc<kr_automation::store::WorkflowStore>,
+            kr_protocol::ids::WorkflowRunId,
+            u64,
+        )>,
+    >,
+}
+
+impl kr_automation::HostClock for CancelsBeforeItsNextReading {
+    fn now_ms(&self) -> u64 {
+        let armed = self
+            .armed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((store, run_id, past)) = armed {
+            store
+                .cancel_run(run_id, "run cancelled by request", past)
+                .expect("the run is cancelled");
+            self.inner.set(past);
+        }
+        self.inner.now_ms()
+    }
+}
+
+/// KR-REQ-25.19: a run cancelled by request exceeded no limit, even when the action's wait lapses
+/// as the cancellation is committed. The engine reads the cancellation before it answers a lapsed
+/// wait, and the breach transaction leaves a cancelled run as it was: the workflow is not paused
+/// and no attention item is owed. The control is the same lapse with no cancellation, which pauses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancellation_committed_as_the_wait_lapses_pauses_nothing() {
+    let stoppable = Arc::new(Stoppable::default());
+    let clock = Arc::new(CancelsBeforeItsNextReading {
+        inner: ManualClock::new(1_000),
+        armed: std::sync::Mutex::new(None),
+    });
+    let service = Arc::new(
+        AutomationService::in_memory(common::host(
+            Arc::clone(&stoppable) as Arc<dyn ActionRunner>,
+            common::every_right(&[grant_id(43)]),
+            Arc::clone(&clock) as Arc<dyn kr_automation::HostClock>,
+        ))
+        .expect("a service"),
+    );
+    let definition = three_steps(workflow_id(43), grant_id(43), 1_800_000, 600_000);
+    installed(&service, &definition);
+
+    let running = {
+        let service = Arc::clone(&service);
+        let params = run_params(&definition, "evt-cancelled-at-the-lapse");
+        tokio::spawn(async move { service.submit_run(&params, 1_000).await })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while stoppable.entered.load(Ordering::SeqCst) < 1 {
+        assert!(std::time::Instant::now() < deadline, "the action began");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let run_id = service
+        .read(
+            &WorkflowReadParams {
+                workflow_id: Nullable::some(definition.workflow_id),
+                ..WorkflowReadParams::default()
+            },
+            None,
+            1_000,
+        )
+        .expect("reads")
+        .runs[0]
+        .run_id;
+    *clock
+        .armed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((
+        Arc::clone(service.store()),
+        run_id,
+        1_000 + 600_001,
+    ));
+
+    let answered = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+        .await
+        .expect("the run stops waiting")
+        .expect("the task ends")
+        .expect("the run answers");
+    assert_eq!(
+        answered.status,
+        WorkflowRunStatus::Cancelled,
+        "{answered:?}"
+    );
+    assert!(
+        !service
+            .store()
+            .is_paused(definition.workflow_id, 1)
+            .expect("reads"),
+        "a cancellation is no limit exceeded, so the workflow is not paused"
+    );
+    assert!(
+        service
+            .read(
+                &WorkflowReadParams {
+                    workflow_id: Nullable::some(definition.workflow_id),
+                    ..WorkflowReadParams::default()
+                },
+                None,
+                1_000,
+            )
+            .expect("reads")
+            .alerts
+            .is_empty(),
+        "and no attention item is owed"
+    );
+
+    // A breach found for a run that was cancelled first leaves it as it was, whatever asks.
+    service
+        .store()
+        .stop_run_on_breach(&kr_automation::store::Breach {
+            run_id,
+            reason: "the run's deadline passed",
+            outlived: None,
+            at_ms: 1_000 + 600_002,
+        })
+        .expect("the breach is found");
+    assert!(
+        !service
+            .store()
+            .is_paused(definition.workflow_id, 1)
+            .expect("reads"),
+        "the breach transaction pauses no workflow for a run cancelled by request"
+    );
+}
+
 /// A host whose session limit can change while chains run.
 #[derive(Debug)]
 struct Moving(AtomicUsize);

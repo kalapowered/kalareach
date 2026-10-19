@@ -678,12 +678,14 @@ impl WorkflowEngine {
         Ok(run_status)
     }
 
-    /// Waits for `action` until the host's clock reaches `until`, and answers `None` when it
-    /// outlived that moment, including when its report is read only after that moment.
+    /// Waits for `action` until the host's clock reaches `until`, and answers
+    /// [`Waited::Outlived`] when it outlived that moment, including when its report is read only
+    /// after that moment, and [`Waited::Cancelled`] when the run was cancelled first.
     ///
     /// The clock is read at least every [`DEADLINE_POLL_MS`], so a deadline that passes while the
     /// host sleeps or while nothing else happens is found soon after it passes rather than when
-    /// the action ends.
+    /// the action ends. A cancellation is read before a lapsed wait is answered: a run that was
+    /// cancelled exceeded no limit, whatever the clock says by the time anyone looks.
     async fn wait_for<T>(
         &self,
         run_id: WorkflowRunId,
@@ -694,7 +696,7 @@ impl WorkflowEngine {
         loop {
             let now = self.clock.now_ms();
             if now >= until {
-                return Waited::Outlived;
+                return self.lapsed(run_id);
             }
             let left = std::time::Duration::from_millis((until - now).min(DEADLINE_POLL_MS));
             tokio::select! {
@@ -706,19 +708,34 @@ impl WorkflowEngine {
                     return if self.clock.now_ms() < until {
                         Waited::Done(outcome)
                     } else {
-                        Waited::Outlived
+                        self.lapsed(run_id)
                     };
                 }
                 () = tokio::time::sleep(left) => {}
             }
             // A run cancelled while its action runs is looked for with the clock, so a
             // cancellation is found within the same interval a passed deadline is.
-            if matches!(
-                self.store.run_status(run_id),
-                Ok(Some(WorkflowRunStatus::Cancelled))
-            ) {
+            if self.cancelled(run_id) {
                 return Waited::Cancelled;
             }
+        }
+    }
+
+    /// Whether the run was cancelled, as the journal records it now.
+    fn cancelled(&self, run_id: WorkflowRunId) -> bool {
+        matches!(
+            self.store.run_status(run_id),
+            Ok(Some(WorkflowRunStatus::Cancelled))
+        )
+    }
+
+    /// What a wait whose moment has passed comes to: cancelled when the run was cancelled before
+    /// anyone looked, and outlived otherwise.
+    fn lapsed<T>(&self, run_id: WorkflowRunId) -> Waited<T> {
+        if self.cancelled(run_id) {
+            Waited::Cancelled
+        } else {
+            Waited::Outlived
         }
     }
 

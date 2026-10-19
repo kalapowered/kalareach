@@ -17,6 +17,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use kr_protocol::automation::WorkflowActionKind;
+use kr_protocol::identity::{BootIdentity, ProcessStartIdentity};
 use kr_protocol::ids::{
     ActionId, GrantId, MaterialisationId, SessionId, WorkflowRunId, WorkspaceId,
 };
@@ -82,11 +83,20 @@ pub struct Owned {
     pub materialisation_id: Option<MaterialisationId>,
     /// The scratch directory the node's command runs in, when it declared no workspace.
     pub scratch: Option<String>,
+    /// The identity of that directory (device and inode, as text), written down once it exists
+    /// and before the command can start. A directory is removed only when it still has this
+    /// identity; one that was never identified is removed only when it is empty.
+    pub scratch_identity: Option<String>,
     /// The workspace the run is bound to for this node, when the definition names one.
     pub workspace_id: Option<WorkspaceId>,
     /// The session the dispatch made, once it has made it. A session is also found through the
     /// registry by the dispatch's action identifier; this is what the workspace binding ends by.
     pub session_id: Option<SessionId>,
+    /// The process of the session's worker, once the session exists. A closure that could not
+    /// account for the worker leaves the row open until the kernel says this process has ended.
+    pub worker: Option<ProcessStartIdentity>,
+    /// The boot the session was made in. A worker of an earlier boot is gone with that boot.
+    pub boot: Option<BootIdentity>,
     /// Where the resources stand.
     pub state: OwnedState,
 }
@@ -146,11 +156,16 @@ impl ResourceLedger {
                 owns_session INTEGER NOT NULL,
                 materialisation_id TEXT,
                 scratch TEXT,
+                scratch_identity TEXT,
                 workspace_id TEXT,
                 session_id TEXT,
+                worker_process TEXT,
+                boot TEXT,
                 state TEXT NOT NULL,
-                began_at_ms INTEGER NOT NULL
+                began_at_ms INTEGER NOT NULL,
+                released_at_ms INTEGER
             );
+            CREATE INDEX IF NOT EXISTS owned_state ON owned (state);
             ",
         )?;
         transaction.pragma_update(None, "user_version", RESOURCES_SCHEMA_VERSION)?;
@@ -198,15 +213,43 @@ impl ResourceLedger {
         Ok(())
     }
 
-    /// Records the session a dispatch made.
+    /// Records the identity of the scratch directory a dispatch made, once it exists and before
+    /// the command that runs in it can start.
     ///
     /// # Errors
     ///
     /// Returns a storage error when the row cannot be written.
-    pub fn note_session(&self, action_id: ActionId, session_id: SessionId) -> Result<()> {
+    pub fn note_scratch_identity(&self, action_id: ActionId, identity: &str) -> Result<()> {
         self.lock().execute(
-            "UPDATE owned SET session_id = ?2 WHERE action_id = ?1",
-            params![action_id.get().to_string(), session_id.to_string()],
+            "UPDATE owned SET scratch_identity = ?2 WHERE action_id = ?1",
+            params![action_id.get().to_string(), identity],
+        )?;
+        Ok(())
+    }
+
+    /// Records the session a dispatch made, the process of its worker when the registry still
+    /// holds one, and the boot it was made in.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be written.
+    pub fn note_session(
+        &self,
+        action_id: ActionId,
+        session_id: SessionId,
+        worker: Option<&ProcessStartIdentity>,
+        boot: &BootIdentity,
+    ) -> Result<()> {
+        let worker = worker.map(encoded).transpose()?;
+        self.lock().execute(
+            "UPDATE owned SET session_id = ?2, worker_process = ?3, boot = ?4
+              WHERE action_id = ?1",
+            params![
+                action_id.get().to_string(),
+                session_id.to_string(),
+                worker,
+                encoded(boot)?,
+            ],
         )?;
         Ok(())
     }
@@ -216,12 +259,59 @@ impl ResourceLedger {
     /// # Errors
     ///
     /// Returns a storage error when the row cannot be written.
-    pub fn release(&self, action_id: ActionId) -> Result<()> {
+    pub fn release(&self, action_id: ActionId, now_ms: u64) -> Result<()> {
         self.lock().execute(
-            "UPDATE owned SET state = ?2 WHERE action_id = ?1",
-            params![action_id.get().to_string(), OwnedState::Released.as_str()],
+            "UPDATE owned SET state = ?2, released_at_ms = ?3 WHERE action_id = ?1",
+            params![
+                action_id.get().to_string(),
+                OwnedState::Released.as_str(),
+                i64::try_from(now_ms).unwrap_or(i64::MAX),
+            ],
         )?;
         Ok(())
+    }
+
+    /// Whether another dispatch of the same run still owes the release of the same workspace.
+    ///
+    /// The run's hold on a workspace is one hold however many of its nodes ran there, so the hold
+    /// ends with the last of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be read.
+    pub fn another_holds(
+        &self,
+        run_id: WorkflowRunId,
+        workspace_id: WorkspaceId,
+        except: ActionId,
+    ) -> Result<bool> {
+        Ok(self.lock().query_row(
+            "SELECT EXISTS (SELECT 1 FROM owned
+                             WHERE run_id = ?1 AND workspace_id = ?2 AND state = ?3
+                               AND action_id <> ?4)",
+            params![
+                run_id.to_string(),
+                workspace_id.to_string(),
+                OwnedState::Open.as_str(),
+                except.get().to_string(),
+            ],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Forgets the rows that were released before `before_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be removed.
+    pub fn forget_released_before(&self, before_ms: u64) -> Result<usize> {
+        Ok(self.lock().execute(
+            "DELETE FROM owned WHERE state = ?1 AND released_at_ms < ?2",
+            params![
+                OwnedState::Released.as_str(),
+                i64::try_from(before_ms).unwrap_or(i64::MAX),
+            ],
+        )?)
     }
 
     /// Reads one dispatch's row.
@@ -259,7 +349,8 @@ impl ResourceLedger {
 }
 
 const COLUMNS: &str = "action_id, run_id, node_id, kind, grant_id, owns_session, \
-                       materialisation_id, scratch, workspace_id, session_id, state";
+                       materialisation_id, scratch, scratch_identity, workspace_id, session_id, \
+                       worker_process, boot, state";
 
 /// A row as the database holds it, before its text is read as identifiers.
 struct RawRow {
@@ -271,8 +362,11 @@ struct RawRow {
     owns_session: bool,
     materialisation_id: Option<String>,
     scratch: Option<String>,
+    scratch_identity: Option<String>,
     workspace_id: Option<String>,
     session_id: Option<String>,
+    worker_process: Option<String>,
+    boot: Option<String>,
     state: String,
 }
 
@@ -286,9 +380,12 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
         owns_session: row.get(5)?,
         materialisation_id: row.get(6)?,
         scratch: row.get(7)?,
-        workspace_id: row.get(8)?,
-        session_id: row.get(9)?,
-        state: row.get(10)?,
+        scratch_identity: row.get(8)?,
+        workspace_id: row.get(9)?,
+        session_id: row.get(10)?,
+        worker_process: row.get(11)?,
+        boot: row.get(12)?,
+        state: row.get(13)?,
     })
 }
 
@@ -318,6 +415,7 @@ impl TryFrom<RawRow> for Owned {
                 .map(|text| uuid(text, "materialisation identifier").map(MaterialisationId::new))
                 .transpose()?,
             scratch: raw.scratch,
+            scratch_identity: raw.scratch_identity,
             workspace_id: raw
                 .workspace_id
                 .as_deref()
@@ -328,9 +426,33 @@ impl TryFrom<RawRow> for Owned {
                 .as_deref()
                 .map(|text| uuid(text, "session identifier").map(SessionId::new))
                 .transpose()?,
+            worker: raw
+                .worker_process
+                .as_deref()
+                .map(|text| decoded(text).ok_or_else(|| unreadable("worker process")))
+                .transpose()?,
+            boot: raw
+                .boot
+                .as_deref()
+                .map(|text| decoded(text).ok_or_else(|| unreadable("boot")))
+                .transpose()?,
             state: OwnedState::from_text(&raw.state).ok_or_else(|| unreadable("state"))?,
         })
     }
+}
+
+/// A value as the text the ledger keeps it as.
+fn encoded<T: serde::Serialize>(value: &T) -> Result<String> {
+    serde_json::to_string(value).map_err(|error| {
+        AutomationError::InvalidArgument(format!(
+            "a value for the workflow resource ledger could not be written: {error}"
+        ))
+    })
+}
+
+/// A value read back from the text [`encoded`] made.
+fn decoded<T: serde::de::DeserializeOwned>(text: &str) -> Option<T> {
+    serde_json::from_str(text).ok()
 }
 
 /// The session a dispatch owns is found through the registry from its action identifier and the
@@ -356,8 +478,11 @@ mod tests {
             owns_session,
             materialisation_id: Some(MaterialisationId::new(uuid(3))),
             scratch: Some("/scratch".to_owned()),
+            scratch_identity: None,
             workspace_id: Some(WorkspaceId::new(uuid(4))),
             session_id: None,
+            worker: None,
+            boot: None,
             state: OwnedState::Open,
         }
     }
@@ -376,7 +501,7 @@ mod tests {
             ledger.open_rows().expect("rows"),
             vec![first.clone(), second.clone()]
         );
-        ledger.release(first.action_id).expect("it releases");
+        ledger.release(first.action_id, 40).expect("it releases");
         assert_eq!(ledger.open_rows().expect("rows"), vec![second]);
         assert_eq!(
             ledger
@@ -385,6 +510,63 @@ mod tests {
                 .map(|row| row.state),
             Some(OwnedState::Released)
         );
+    }
+
+    #[test]
+    fn what_a_dispatch_made_is_found_again_from_the_row() {
+        let ledger = ResourceLedger::in_memory().expect("a ledger");
+        let row = owned(3, WorkflowActionKind::ShellCommand, true);
+        ledger.begin(&row, 10).expect("it begins");
+        ledger
+            .note_scratch_identity(row.action_id, "12:34")
+            .expect("the directory is identified");
+        let worker = ProcessStartIdentity::new(
+            77,
+            kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+            1_234,
+        );
+        let boot = BootIdentity {
+            source: kr_protocol::identity::BootIdentitySource::LinuxBootId,
+            value: kr_protocol::scalars::Bytes::new(vec![1, 2, 3]),
+        };
+        let session = SessionId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
+        ledger
+            .note_session(row.action_id, session, Some(&worker), &boot)
+            .expect("the session is written down");
+        let found = ledger.get(row.action_id).expect("reads").expect("a row");
+        assert_eq!(found.scratch_identity.as_deref(), Some("12:34"));
+        assert_eq!(found.session_id, Some(session));
+        assert_eq!(found.worker, Some(worker));
+        assert_eq!(found.boot, Some(boot));
+    }
+
+    #[test]
+    fn a_runs_hold_on_a_workspace_ends_with_the_last_row_that_holds_it() {
+        let ledger = ResourceLedger::in_memory().expect("a ledger");
+        let first = owned(5, WorkflowActionKind::ShellCommand, true);
+        let mut second = owned(6, WorkflowActionKind::ShellCommand, true);
+        second.run_id = first.run_id;
+        second.workspace_id = first.workspace_id;
+        ledger.begin(&first, 10).expect("it begins");
+        ledger.begin(&second, 20).expect("it begins");
+        let (run, workspace) = (first.run_id, first.workspace_id.expect("a workspace"));
+
+        assert!(
+            ledger
+                .another_holds(run, workspace, first.action_id)
+                .expect("reads"),
+            "the second row still holds it"
+        );
+        ledger.release(second.action_id, 30).expect("it releases");
+        assert!(
+            !ledger
+                .another_holds(run, workspace, first.action_id)
+                .expect("reads"),
+            "nothing else holds it, so the first row's release ends the hold"
+        );
+        assert_eq!(ledger.forget_released_before(31).expect("forgets"), 1);
+        assert!(ledger.get(second.action_id).expect("reads").is_none());
+        assert!(ledger.get(first.action_id).expect("reads").is_some());
     }
 
     #[test]

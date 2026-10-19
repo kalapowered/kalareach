@@ -3054,7 +3054,8 @@ impl WorkflowStore {
     /// known pauses for review; every other node still waiting is cancelled; the run is cancelled;
     /// and the revision pauses with the attention item the pause owes. A crash therefore finds
     /// either none of this or all of it, and never a settled node whose run dispatches on. A node
-    /// or a run that already settled keeps what it settled with.
+    /// or a run that already settled keeps what it settled with. A run that was cancelled by
+    /// request before the breach was found is left as it was: it exceeded no limit.
     ///
     /// # Errors
     ///
@@ -3064,6 +3065,19 @@ impl WorkflowStore {
             let Some(run) = journal.run_record(breach.run_id)? else {
                 return Ok(());
             };
+            // A run cancelled by request before this transaction exceeded no limit, whatever its
+            // clock said when the breach was found: nothing is paused and no notice is raised.
+            let cancelled: i64 = journal.conn.query_row(
+                "SELECT COUNT(*) FROM workflow_runs WHERE run_id = ?1 AND status = ?2",
+                params![
+                    breach.run_id.to_string(),
+                    WorkflowRunStatus::Cancelled.as_str()
+                ],
+                |row| row.get(0),
+            )?;
+            if cancelled > 0 {
+                return Ok(());
+            }
             if let Some(outlived) = &breach.outlived {
                 journal.settle_node(&NodeSettlement {
                     run_id: breach.run_id,
