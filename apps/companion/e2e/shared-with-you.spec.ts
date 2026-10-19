@@ -502,6 +502,8 @@ test.describe('a message in passing over the card an invitation opens', () => {
       at: string
       reduced?: boolean
       inset?: number
+      /** An inset that comes while the card is open, as the platform's does when the device turns. */
+      insetLater?: number
       shot: string
     }
   ): Promise<void> {
@@ -529,6 +531,11 @@ test.describe('a message in passing over the card an invitation opens', () => {
     await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here')
     await expect(accept).toBeVisible()
     await expect(toast).toBeVisible()
+    if (how.insetLater !== undefined) {
+      await page.evaluate((inset) => {
+        document.documentElement.style.setProperty('--safe-bottom', `${String(inset)}px`)
+      }, how.insetLater)
+    }
 
     // The message does not overlap the footer or either action, and is inside the screen.
     const overlaps = () =>
@@ -605,6 +612,19 @@ test.describe('a message in passing over the card an invitation opens', () => {
       at: CLOCKS[0].at,
       inset: 34,
       shot: 'inset'
+    })
+  })
+
+  // The inset under the footer changes while the card is open (the device turns): the message goes
+  // on resting above the footer, whatever the inset has become.
+  test('rests above the card’s footer when the inset under it grows while it is open', async ({ page }) => {
+    await messageOverCard(page, {
+      surface: 'ios',
+      ratio: 1,
+      face: FACES[0],
+      at: CLOCKS[0].at,
+      insetLater: 34,
+      shot: 'inset-later'
     })
   })
 

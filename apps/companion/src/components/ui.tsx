@@ -372,7 +372,7 @@ export interface ToastMessage {
 const TOAST_MS = 4200
 const TOAST_WITH_ACTION_MS = 8000
 
-/** The custom property on the root that says how far an open surface's footer lifts the toast. */
+/** The custom property on the root that says how far an open surface lifts the toast: its footer and the room under it. */
 const TOAST_LIFT = '--toast-lift'
 
 /** Shows the newest message, and takes it away. */
@@ -613,7 +613,11 @@ export function Sheet({
     }
     measure()
     const watching = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure)
+    // The sheet's content box changes when its padding does under its height cap, and its border box
+    // when its padding does below it: the inset under the footer is padding, and it changes with the
+    // orientation, or when a keyboard or a bar comes or goes.
     watching?.observe(sheet)
+    watching?.observe(sheet, { box: 'border-box' })
     watching?.observe(footer)
     return () => {
       watching?.disconnect()

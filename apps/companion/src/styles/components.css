@@ -902,10 +902,10 @@ textarea::placeholder {
    inside its own box, and the controls below it are never pushed off the screen. The 80px floor
    keeps the words usable on a screen too short for half of it to hold them: the toast is then more
    than half of that screen. Over an open surface the toast rests above its footer, by `--toast-lift`,
-   and its words give up the room that lifts it. At the largest size that leaves the words a few
-   lines, so a message of any length then scrolls inside its box, and a message that scrolls stays
-   until it is dismissed: over a surface that is open a message that would have gone by itself stays,
-   and its Dismiss is clear of the surface's actions. */
+   and its words give up the room that lifts it. At the largest size that leaves the words a line or
+   two: a longer message then scrolls inside its box, and a message that scrolls stays until it is
+   dismissed. Over a surface that is open, a message that would have gone by itself stays, over the
+   surface's body, and its Dismiss and the surface's actions are both clear. */
 .toast {
   /* The height of the tallest control: Dismiss is a target high, and a button that names an action
      is one line of its own text, its padding and its border. */
