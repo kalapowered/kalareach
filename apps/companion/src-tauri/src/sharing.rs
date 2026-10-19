@@ -129,8 +129,8 @@ pub struct ShareDesk {
     skew: Mutex<Duration>,
     running: Mutex<HashMap<ActionId, Running>>,
     /// The hand-overs being asked about, by the reference the page holds. A hand-over leaves this
-    /// table once, either abandoned or committed to a send ([`ShareDesk::commit`]); whoever takes it
-    /// owns its record, and the lock these two share is what orders them.
+    /// table once, either abandoned or committed to a send ([`ShareDesk::commit`]); whoever takes
+    /// it owns its record, and the lock these two share is what orders them.
     handovers: Mutex<HashMap<String, Handover>>,
     /// Held while a record is read and written back, so that what a person did to an attempt and
     /// what a task carrying it on learned are never written over one another.
@@ -139,7 +139,21 @@ pub struct ShareDesk {
     /// returned, kept until the page has read it and removed the attempt. A restart loses it, and
     /// the host's record of the action still has it ([`ask_the_host`]).
     results: Mutex<HashMap<ActionId, Value>>,
+    /// The invitations this application has listed, oldest first, so that an acceptance can still
+    /// be sent for one the host has stopped listing ([`redeem`]).
+    offered: Mutex<Vec<((EnvironmentId, InvitationId), Seen)>>,
 }
+
+/// What the host told this device of an invitation it listed: what an acceptance of it is kept
+/// under.
+#[derive(Clone, Copy)]
+struct Seen {
+    grant_id: GrantId,
+    display_number: u64,
+}
+
+/// The most invitations the application remembers having listed. The oldest are let go first.
+const MAX_REMEMBERED_OFFERS: usize = 512;
 
 impl std::fmt::Debug for ShareDesk {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -311,6 +325,34 @@ impl ShareDesk {
             .get(&attempt.action_id)
             .cloned();
         view
+    }
+
+    /// Remembers the invitations a complete list of the host's offers held.
+    fn remember_offers(&self, environment_id: EnvironmentId, offers: &[ShareOffer]) {
+        let mut offered = self.offered.lock().unwrap_or_else(PoisonError::into_inner);
+        for offer in offers {
+            let key = (environment_id, offer.invitation_id);
+            offered.retain(|(held, _)| *held != key);
+            offered.push((
+                key,
+                Seen {
+                    grant_id: offer.grant_id,
+                    display_number: offer.display_number.get(),
+                },
+            ));
+        }
+        let excess = offered.len().saturating_sub(MAX_REMEMBERED_OFFERS);
+        offered.drain(..excess);
+    }
+
+    /// What the host told of an invitation this application listed, when it did.
+    fn seen(&self, environment_id: EnvironmentId, invitation_id: InvitationId) -> Option<Seen> {
+        self.offered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(key, _)| *key == (environment_id, invitation_id))
+            .map(|(_, seen)| *seen)
     }
 
     fn keep_result(&self, action_id: ActionId, result: Value) {
@@ -1132,6 +1174,9 @@ pub struct Held {
 pub async fn held(state: &AppState) -> Result<Held> {
     let connection = holding(state)?;
     let (offers, shares) = held_all(&connection).await?;
+    state
+        .shares()
+        .remember_offers(connection.environment_id(), &offers);
     Ok(Held { offers, shares })
 }
 
@@ -1323,21 +1368,29 @@ pub async fn revoke(state: &AppState, params: GrantRevokeParams) -> Result<Attem
 
 /// Accepts an invitation that names this device.
 ///
+/// An invitation the host has stopped listing is still sent to the host when this application
+/// listed it before: the host knows whether it was withdrawn, ran out or was used, and its refusal
+/// is what the person is told.
+///
 /// # Errors
 ///
-/// Returns the host's refusal, and refuses when the host no longer offers the invitation to this
-/// device.
+/// Returns the host's refusal, and refuses when this application never listed the invitation.
 pub async fn redeem(state: &AppState, params: GrantRedeemParams) -> Result<Attempted> {
     let connection = holding(state)?;
     let environment_id = connection.environment_id();
     let (offers, _) = held_all(&connection).await?;
-    let Some(offer) = offers
+    let listed = offers
         .iter()
         .find(|offer| offer.invitation_id == params.invitation_id)
+        .map(|offer| Seen {
+            grant_id: offer.grant_id,
+            display_number: offer.display_number.get(),
+        });
+    let Some(offer) = listed.or_else(|| state.shares().seen(environment_id, params.invitation_id))
     else {
         return Err(CommandError::new(
             ErrorCode::ResourceUnavailable,
-            "that invitation is no longer offered to this device",
+            "this device was not offered that invitation",
         ));
     };
     let action_id = ActionId::new(kr_ipc::new_uuid());
@@ -1358,7 +1411,7 @@ pub async fn redeem(state: &AppState, params: GrantRedeemParams) -> Result<Attem
         &composed,
         Some(offer.grant_id),
         kr_ipc::now_ms().get(),
-        format!("Accepting session {}", offer.display_number.get()),
+        format!("Accepting session {}", offer.display_number),
     );
     let carry = carry(state, connection)?;
     carry.keep(&attempt)?;
@@ -1418,8 +1471,8 @@ pub struct PlanView {
 /// # Errors
 ///
 /// Refuses when no owner device is paired with the host, when the grant is not an active share of
-/// the session, when the receiver cannot take it, and when a hand-over of the session is still under
-/// way.
+/// the session, when the receiver cannot take it, and when a hand-over of the session is still
+/// under way.
 pub async fn transfer_ask(
     state: &AppState,
     subject: Subject,
@@ -2134,12 +2187,12 @@ mod tests {
         )
     }
 
-    /// KR-REQ-23.49: an attempt owes the person what the host's result carries that its end does not
-    /// say: the screen kept with a live invitation, and how far the workers have got with a
-    /// revocation or a hand-over. An invitation without the live view and an acceptance owe nothing,
-    /// so their records go with their end. A live invitation cannot be made by the product's own
-    /// harness, which has no session worker behind its sessions, so the rule is read off the
-    /// request a record holds.
+    /// KR-REQ-23.49: an attempt owes the person what the host's result carries that its end does
+    /// not say: the screen kept with a live invitation, and how far the workers have got with a
+    /// revocation or a hand-over. An invitation without the live view and an acceptance owe
+    /// nothing, so their records go with their end. A live invitation cannot be made by the
+    /// product's own harness, which has no session worker behind its sessions, so the rule is read
+    /// off the request a record holds.
     #[test]
     fn an_attempt_owes_the_screen_of_a_live_invitation_and_the_workers_of_a_revocation() {
         assert!(owes(&an_invitation(true)));
