@@ -149,6 +149,11 @@ struct HostScript {
     /// A host that took the frame and said nothing is what leaves an action whose outcome nobody
     /// knows, which is the state section 9 forbids forgetting.
     swallow_mutations: Mutex<u32>,
+    /// Answer nothing at all to this many of the next reads, and remember the request identity of
+    /// each, so that a test can send the answer later, as a host that was slow does.
+    swallow_reads: Mutex<u32>,
+    /// The identities of the reads that were swallowed, in order.
+    swallowed: Mutex<Vec<kr_protocol::ids::RequestId>>,
 }
 
 /// Serves one connection: handshake, then control frames until the client goes away.
@@ -220,6 +225,14 @@ fn spawn_host(
                     let answer = match frame {
                         ControlFrame::Request(request) => {
                             script.reads.fetch_add(1, Ordering::AcqRel);
+                            {
+                                let mut swallow = script.swallow_reads.lock().await;
+                                if *swallow > 0 {
+                                    *swallow -= 1;
+                                    script.swallowed.lock().await.push(request.request_id);
+                                    continue;
+                                }
+                            }
                             let refusal = {
                                 let mut held = script.refuse_reads_with.lock().await;
                                 match held.as_mut() {
@@ -1129,6 +1142,98 @@ async fn a_refusal_as_not_permitted_reaches_the_holder_unless_the_read_was_the_q
             .is_err(),
         "nothing was raised for the question's own refusal"
     );
+
+    session.close();
+    serving.abort();
+}
+
+/// A refusal as not permitted that arrives after the holder gave up on the question it answers is
+/// still that question's own refusal: it raises nothing. The control is a read of any other kind,
+/// whose refusal raises the signal however late it arrives.
+#[tokio::test]
+async fn a_refusal_that_arrives_after_the_question_was_given_up_raises_nothing() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let (pushes, receiver) = tokio::sync::mpsc::channel(8);
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), Some(receiver));
+    let session = Arc::new(connect(&client, &host).await);
+
+    for (question, raises) in [(true, false), (false, true)] {
+        *script.swallow_reads.lock().await = 1;
+        let swallowed_before = script.swallowed.lock().await.len();
+        let asking = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move {
+                if question {
+                    session
+                        .read_unsignalled::<_, SessionList>(Method::SessionList, &Empty {})
+                        .await
+                } else {
+                    session
+                        .read::<_, SessionList>(Method::SessionList, &Empty {})
+                        .await
+                }
+            })
+        };
+        // The host has the read and says nothing; the holder gives up on it.
+        let request_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(id) = script.swallowed.lock().await.get(swallowed_before) {
+                    return *id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the host received the read");
+        asking.abort();
+        let _ = asking.await;
+
+        // The host's refusal arrives after that. A window renewal follows it on the same stream, so
+        // once the window shows it the refusal has been read.
+        pushes
+            .send(ControlFrame::Response(Response {
+                request_id,
+                outcome: Outcome::Error(ProtocolError::new(ErrorCode::PermissionDenied, "refused")),
+            }))
+            .await
+            .expect("the host accepted the refusal");
+        let first = session.action_window().await;
+        let name = if question {
+            "after-question"
+        } else {
+            "after-read"
+        };
+        pushes
+            .send(ControlFrame::Event(ControlEvent::ActionWindowRenewed(
+                kr_protocol::hello::ActionWindow {
+                    action_window_id: kr_protocol::ids::ActionWindowId::new(name)
+                        .expect("an identifier"),
+                    connection_id: first.connection_id,
+                    boot_epoch: first.boot_epoch,
+                    issued_at_ms: TimestampMs::new(1),
+                    valid_for_ms: DurationMs::new(300_000),
+                },
+            )))
+            .await
+            .expect("the host accepted the renewal");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while session.action_window().await.action_window_id.as_str() != name {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the renewal was applied, so the refusal before it was read");
+
+        let raised = tokio::time::timeout(Duration::ZERO, session.denied())
+            .await
+            .is_ok();
+        assert_eq!(
+            raised, raises,
+            "a late refusal of the question raises nothing, and one of any other read does"
+        );
+    }
 
     session.close();
     serving.abort();

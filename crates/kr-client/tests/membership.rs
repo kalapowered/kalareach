@@ -2642,6 +2642,80 @@ async fn a_verified_feed_revocation_fences_publication_before_any_host_answers()
     assert!(owner.publishes());
 }
 
+/// A revocation recorded here keeps a device out for good: the hosts may still list it, paired and
+/// unrevoked, because the request that was to revoke it did not go through, and it is never offered
+/// again. Held out, it is named, and the owner who confirms sharing with it again gets it back; a
+/// device a host reports revoked is not held out, and cannot be given back.
+#[tokio::test]
+async fn a_device_a_recorded_revocation_keeps_out_is_given_the_settings_again_when_the_owner_confirms()
+ {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut revoked = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut revoked]).await;
+
+    owner
+        .membership
+        .feed_revocation(&revoked.auth())
+        .expect("recorded");
+    owner.refresh().await;
+    run(&mut owner).await;
+    assert!(!lists(&world.newest(&collection), &revoked), "taken out");
+    assert!(
+        owner
+            .membership
+            .candidates()
+            .expect("candidates")
+            .is_empty(),
+        "the hosts list it as it was, and it is not offered as a new device"
+    );
+
+    assert_eq!(
+        owner.membership.held_out().expect("the devices held out"),
+        vec![revoked.device()],
+        "it is named as held out by what this computer recorded"
+    );
+    let plan = owner
+        .membership
+        .plan_share_again(&revoked.auth(), now())
+        .expect("a plan to share with it again");
+    assert_eq!(
+        owner.membership.authorise(&plan, now()).expect("confirmed"),
+        Ended::Done
+    );
+    run(&mut owner).await;
+    assert!(
+        lists(&world.newest(&collection), &revoked),
+        "it holds the settings' key again"
+    );
+    assert!(owner.membership.held_out().expect("held out").is_empty());
+    assert!(owner.publishes());
+}
+
+/// A device a host reports revoked is not held out by what was recorded here, and is not given back:
+/// the hosts' word stands whatever this computer recorded.
+#[tokio::test]
+async fn a_device_a_host_reports_revoked_is_not_held_out_and_cannot_be_given_back() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut revoked = Node::new(&world);
+    collection_of(&world, &mut owner, &mut [&mut revoked]).await;
+
+    owner
+        .membership
+        .feed_revocation(&revoked.auth())
+        .expect("recorded");
+    world.hosts.revoke(revoked.device());
+    owner.refresh().await;
+    run(&mut owner).await;
+
+    assert!(owner.membership.held_out().expect("held out").is_empty());
+    assert!(matches!(
+        owner.membership.plan_share_again(&revoked.auth(), now()),
+        Err(MembershipError::NotHeldOut)
+    ));
+}
+
 /// The record read to settle a candidate whose receipt expired becomes the head, with
 /// the host answers applied to it in the same write.
 #[tokio::test]
