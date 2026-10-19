@@ -19,13 +19,15 @@
 //! Words are separated by a space or a tab and by nothing else, a comment begins at a `#` after a
 //! space or a tab, and a backslash and the new line after it are taken out and nothing is put in
 //! their place. Those are the shell's rules for the plain text of a command; a quote, an operator
-//! or a redirection is only a word of the line, so changing one changes the line. In a workflow (a
-//! `.yml` or `.yaml` file) a `run:` field is the exception: it is a plain scalar, where a
-//! backslash does not continue the line. Whether control reaches a line, what the script does with
-//! its result, the environment a step sets, what other syntax (a here-document, a quoted block
-//! over several lines, a folded scalar) makes of a line, and a filter in the line an entry itself
-//! gives are not read: the entry is taken as written, held only to the tests it covers by name, by
-//! `--skip`, `--list` and `--no-run`.
+//! or a redirection is only a word of the line, so changing one changes the line. A line that holds
+//! a carriage return or another Unicode line break, which some readers of a script or a workflow
+//! take as the end of a line, is joined to the next, so it never stands alone. One exception: an
+//! entry whose own line is a workflow's `run:` field (it begins `run:` or `- run:`, in a `.yml` or
+//! `.yaml` file) is a plain scalar, where a backslash does not continue the line. Whether control
+//! reaches a line, what the script does with its result, the environment a step sets, what other
+//! syntax (a here-document, a quoted block over several lines, a folded scalar) makes of a line,
+//! and a filter in the line an entry itself gives are not read: the entry is taken as written, held
+//! only to the tests it covers by name, by `--skip`, `--list` and `--no-run`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -198,8 +200,8 @@ fn missing_command(
         return Some(format!("its line {wrong}"));
     }
     let wanted = words_of(line);
-    let workflow = file.ends_with(".yml") || file.ends_with(".yaml");
-    let lines: Vec<String> = commands(&text, workflow);
+    let fields = (file.ends_with(".yml") || file.ends_with(".yaml")) && is_run_field(line);
+    let lines: Vec<String> = commands(&text, fields);
     if !lines.contains(&wanted) {
         return Some(format!(
             "{file} holds no line `{wanted}`{}",
@@ -413,16 +415,18 @@ fn plan_commands() -> Vec<String> {
 /// taken out (nothing put in their place, as the shell does, so a continuation that has no white
 /// space beside it joins two words into one), the white space made single, and what a comment holds
 /// left out. A comment on a line that continues another ends the command there, as it does for the
-/// shell. In a workflow, a `run:` field is a plain scalar, where a backslash is not a continuation:
-/// a line that begins `run:` or `- run:` is not joined to the next. Every other line that ends in a
-/// backslash is, in every file.
-fn commands(text: &str, workflow: bool) -> Vec<String> {
+/// shell. Every line that ends in a backslash continues, in every file, with one exception: when
+/// `fields` is set, the entry's own line is a workflow's `run:` field, a plain scalar where a
+/// backslash is not a continuation, and a line that begins `run:` or `- run:` and does not itself
+/// continue another line is not joined to the next. A line that holds a character in [`BREAKS`] is
+/// joined to the next as well.
+fn commands(text: &str, fields: bool) -> Vec<String> {
     let mut joined: Vec<String> = Vec::new();
     let mut continuing = false;
     for physical in text.split('\n') {
         let (body, goes_on) = match physical.strip_suffix('\\') {
-            Some(body) if !(workflow && is_run_field(physical)) => (body, true),
-            _ => (physical, false),
+            Some(body) if !(fields && !continuing && is_run_field(physical)) => (body, true),
+            _ => (physical, physical.contains(BREAKS)),
         };
         match joined.last_mut() {
             Some(last) if continuing => last.push_str(body),
@@ -436,6 +440,13 @@ fn commands(text: &str, workflow: bool) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .collect()
 }
+
+/// The characters, other than the line feed the text is split at, that some reader of a script or a
+/// workflow takes as the end of a line: the rest of the Unicode newline characters. A reader that
+/// breaks a line at one hands the shell different lines from the ones the map splits, so a line
+/// that holds one is never taken alone. It joins the next line, and the line that results holds the
+/// character, which no entry's line does.
+const BREAKS: [char; 6] = ['\u{b}', '\u{c}', '\r', '\u{85}', '\u{2028}', '\u{2029}'];
 
 /// Whether `line` starts a workflow's `run:` field: its first word is `run:`, or its first two are
 /// `-` and `run:`.

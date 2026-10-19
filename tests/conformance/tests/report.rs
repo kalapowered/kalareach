@@ -922,8 +922,9 @@ fn a_command_is_the_line_the_entry_gives_and_nothing_else() {
         tests::is_ignored_for_a_reason_over_two_lines"
         .to_owned());
 
-    // In a workflow, a `run:` field (`run:` or `- run:`) is a plain scalar, where a backslash is
-    // not a continuation.
+    // In a workflow, an entry whose own line is a `run:` field (`run:` or `- run:`) is a plain
+    // scalar, where a backslash is not a continuation. A `run:` line that continues another line
+    // is not a field.
     for prefix in ["run:", "- run:"] {
         let entry: &'static str = Box::leak(format!("{prefix} {COMMAND}").into_boxed_str());
         let found = found_in_file("ci.yml", &format!("{entry}\n"), entry, None);
@@ -931,24 +932,45 @@ fn a_command_is_the_line_the_entry_gives_and_nothing_else() {
         let split = format!("{prefix} cargo test --lib -- --ignored \\\n  --exact {NAMES}");
         let found = found_in_file("ci.yml", &split, entry, None);
         assert_eq!(found.len(), 1, "{found:?}");
-    }
-    // The word `run:` anywhere else is an ordinary word: in a script, whatever precedes it, and in
-    // a workflow past the key, a backslash at the end of the line joins the command that follows.
-    for (file, before) in [
-        ("ci.sh", "echo run: \\"),
-        ("ci.sh", ": run: \\"),
-        ("ci.sh", "run: \\"),
-        ("ci.sh", "- run: \\"),
-        ("ci.yml", "echo run: \\"),
-        ("ci.yml", ": run: \\"),
-        ("ci.yml", "echo - run: \\"),
-    ] {
-        let found = found_in_file(file, &format!("{before}\n{COMMAND}\n"), COMMAND, None);
-        assert_eq!(found.len(), 1, "{file} {before}: {found:?}");
-        assert!(
-            found[0].contains("holds no line"),
-            "{file} {before}: {found:?}"
+        let continued = format!("echo \\\n{entry}\n");
+        let found = found_in_file("ci.yml", &continued, entry, None);
+        assert_eq!(
+            found.len(),
+            1,
+            "{prefix} after a continuing line: {found:?}"
         );
+    }
+    // Any other entry's line follows the shell, in a script and in a workflow alike: a line that
+    // ends in a backslash joins the next one, whatever words it holds, `run:` among them.
+    for file in ["ci.sh", "ci.yml"] {
+        for before in [
+            "echo run: \\",
+            ": run: \\",
+            "echo - run: \\",
+            "run: \\",
+            "- run: \\",
+            "echo \\\nrun: \\",
+            "echo \\\n- run: \\",
+            ": \\\nrun: \\",
+        ] {
+            let found = found_in_file(file, &format!("{before}\n{COMMAND}\n"), COMMAND, None);
+            assert_eq!(found.len(), 1, "{file} {before}: {found:?}");
+            assert!(
+                found[0].contains("holds no line"),
+                "{file} {before}: {found:?}"
+            );
+        }
+    }
+    // A reader may take a carriage return, a next line, a line or paragraph separator, a vertical
+    // tab or a form feed as the end of a line (YAML does, and so does a CR LF file), where the shell
+    // does not. A line that holds one is never taken alone: it joins the next.
+    for file in ["ci.sh", "ci.yml"] {
+        for end in ['\r', '\u{85}', '\u{2028}', '\u{2029}', '\u{b}', '\u{c}'] {
+            let found = found_in_file(file, &format!("echo \\{end}\n{COMMAND}\n"), COMMAND, None);
+            assert_eq!(found.len(), 1, "{file} {end:?}: {found:?}");
+        }
+        let found = found_in_file(file, &format!("echo \\\r\n{COMMAND}\r\n"), COMMAND, None);
+        assert_eq!(found.len(), 1, "{file} CR LF: {found:?}");
     }
 
     // A comment, and the words of two lines, are not the line.
