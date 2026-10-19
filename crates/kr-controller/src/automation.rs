@@ -365,6 +365,8 @@ pub struct HostActions {
     holds: Arc<std::sync::Mutex<()>>,
     /// The nodes whose session the sweep of this daemon has already asked to close.
     closing: std::sync::Mutex<HashSet<kr_protocol::ids::ActionId>>,
+    /// How many looks the sweep has finished, for this host's own tests.
+    sweeps: PassCount,
 }
 
 /// The node dispatches this daemon is running, each with the state its cancellation sets.
@@ -626,23 +628,28 @@ impl HeldGrant {
     /// earliest of its own expiry, an organisation lease and a bounded offline validity, `None`
     /// when it has no end.
     ///
-    /// The clock is read before the decision, and the decision's own duration is added to that
-    /// reading, so the moment is never later than the grant's end: whatever the decision took
-    /// comes off the grant and is never added to it.
+    /// The clock is read before the decision, and the time the grant has left once the decision is
+    /// made, credited as continuous time is, is added to that reading, so the moment is never
+    /// later than the grant's end: whatever the decision took comes off the grant and is never
+    /// added to it.
     fn standing(&self) -> kr_automation::Result<Option<u64>> {
-        let read_at = self.daemon.get()?.boot_elapsed_ms();
-        let (grant, ends_in) = self
-            .authority
-            .grant_standing(self.definition.grant_reference, self.daemon.now_ms())?;
-        kr_automation::authority::check_node(
-            &grant,
-            &self.definition,
-            &self.node,
-            self.environment_id,
+        let daemon = self.daemon.get()?;
+        let ends_at = grant_end_on_the_boot_clock(
+            || daemon.boot_elapsed_ms(),
+            || {
+                let (grant, ends_in) = self
+                    .authority
+                    .grant_standing(self.definition.grant_reference, self.daemon.now_ms())?;
+                kr_automation::authority::check_node(
+                    &grant,
+                    &self.definition,
+                    &self.node,
+                    self.environment_id,
+                )?;
+                Ok(ends_in)
+            },
         )?;
-        Ok(ends_in.map(|ends_in| {
-            read_at.saturating_add(u64::try_from(ends_in.as_millis()).unwrap_or(u64::MAX))
-        }))
+        Ok(ends_at)
     }
 
     /// The refusal a hold recorded, in the engine's terms, when the change-set service reports
@@ -754,6 +761,25 @@ struct NodeContext {
     wait_until_ms: u64,
 }
 
+/// The moment a grant stands until, on the machine's continuous clock, from a reading taken before
+/// it was decided and the time the decision says it has left.
+///
+/// The reading comes first and the left-over time is added to it, never to a reading taken
+/// afterwards, so a decision that is slow shortens the moment and never lengthens it. The time is
+/// credited as continuous time is credited everywhere a duration is turned into a moment (the
+/// platform's time service can slow the clock the worker reads, and a bound must not outlast the
+/// grant because of it).
+fn grant_end_on_the_boot_clock(
+    read_boot_ms: impl FnOnce() -> u64,
+    decide: impl FnOnce() -> kr_automation::Result<Option<std::time::Duration>>,
+) -> kr_automation::Result<Option<u64>> {
+    let read_at = read_boot_ms();
+    Ok(decide()?.map(|ends_in| {
+        let ends_in_ms = u64::try_from(ends_in.as_millis()).unwrap_or(u64::MAX);
+        read_at.saturating_add(kr_ipc::clock::credited(ends_in_ms))
+    }))
+}
+
 /// The principal a workflow's sessions are created under: stable, scoped to the definition's
 /// grant, and the same for every run of it.
 fn workflow_principal(grant: GrantId) -> kr_automation::Result<ActorId> {
@@ -827,11 +853,9 @@ fn node_admission(
                 )),
             );
         }
-        let wait_ends = bounded_by_the_wait.then(|| boot_ms.saturating_add(wait_until_ms - now_ms));
-        Ok(grant_ends
-            .into_iter()
-            .chain(wait_ends)
-            .min())
+        let wait_ends = bounded_by_the_wait
+            .then(|| boot_ms.saturating_add(kr_ipc::clock::credited(wait_until_ms - now_ms)));
+        Ok(grant_ends.into_iter().chain(wait_ends).min())
     })
 }
 
@@ -885,7 +909,13 @@ async fn create_session_node(
         digest: node_digest(&held.definition, &held.node),
         create,
         command: None,
-        admit: node_admission(&controller, &held, context.wait_until_ms, &entry.task, false),
+        admit: node_admission(
+            &controller,
+            &held,
+            context.wait_until_ms,
+            &entry.task,
+            false,
+        ),
     };
     let (sender, receiver) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -2108,6 +2138,7 @@ async fn sweep_loop(actions: Arc<HostActions>, service: Arc<AutomationService>) 
     let mut wait = SWEEP_INTERVAL;
     loop {
         let owed = actions.sweep(&service).await;
+        actions.sweeps.finished();
         if owed == 0 {
             wait = SWEEP_INTERVAL;
             actions.live.changed.notified().await;
@@ -2303,6 +2334,7 @@ impl AutomationModule {
             live: Arc::new(LiveNodes::default()),
             holds: Arc::new(std::sync::Mutex::new(())),
             closing: std::sync::Mutex::new(HashSet::new()),
+            sweeps: PassCount::default(),
         });
         let host = Host {
             environment_id,
@@ -2391,6 +2423,14 @@ impl AutomationModule {
     #[must_use]
     pub fn dispatch_passes(&self) -> u64 {
         self.passes.get()
+    }
+
+    /// How many looks the sweep of what node dispatches left behind has finished, kept for this
+    /// host's own tests.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn sweep_passes(&self) -> u64 {
+        self.actions.sweeps.get()
     }
 
     /// Returns the service itself.
