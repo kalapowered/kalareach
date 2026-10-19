@@ -370,10 +370,10 @@ export interface ToastMessage {
  * something to do, which takes a decision as well as a reading.
  */
 const TOAST_MS = 4200
+const TOAST_WITH_ACTION_MS = 8000
 
 /** The custom property on the root that says how far an open surface's footer lifts the toast. */
 const TOAST_LIFT = '--toast-lift'
-const TOAST_WITH_ACTION_MS = 8000
 
 /** Shows the newest message, and takes it away. */
 export function Toast({
@@ -537,7 +537,8 @@ export function Sheet({
   closeLabel,
   onClose,
   children,
-  footer
+  footer,
+  liftsMessage = true
 }: {
   readonly open: boolean
   readonly title: string
@@ -547,6 +548,13 @@ export function Sheet({
   readonly onClose: () => void
   readonly children: ReactNode
   readonly footer?: ReactNode
+  /**
+   * Whether a message in passing rests above this surface's footer while it is open, as it does by
+   * default: a footer holds what the surface asks of the person, and a message over it takes the
+   * touch. A surface whose decisions are at the foot of its body, above a footer that only leads
+   * elsewhere, turns it off, since the lifted message would lie over the decisions.
+   */
+  readonly liftsMessage?: boolean
 }): ReactNode {
   const sheetRef = useRef<HTMLDivElement | null>(null)
   const footerRef = useRef<HTMLElement | null>(null)
@@ -590,24 +598,28 @@ export function Sheet({
   }, [onClose])
 
   // A message in passing rests above the footer of an open surface, where its actions are, and not
-  // over them: the footer's height is measured, as it changes with the text size, and handed to the
-  // toast as `--toast-lift`. It goes as the surface starts to leave, so the message settles back as
-  // the surface goes.
+  // over them. The room under the footer's top edge is measured from the surface's own box, since
+  // the surface pads its foot by the platform's inset, and it changes with the text size and the
+  // inset: it is handed to the toast as `--toast-lift`. It goes as the surface starts to leave, so
+  // the message settles back as the surface goes.
+  const lifts = liftsMessage && hasFooter
   useLayoutEffect(() => {
+    const sheet = sheetRef.current
     const footer = footerRef.current
-    if (!open || footer === null) return
+    if (!open || !lifts || sheet === null || footer === null) return
     const root = document.documentElement
     const measure = () => {
-      root.style.setProperty(TOAST_LIFT, `${String(footer.offsetHeight)}px`)
+      root.style.setProperty(TOAST_LIFT, `${String(sheet.clientHeight - footer.offsetTop)}px`)
     }
     measure()
     const watching = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure)
+    watching?.observe(sheet)
     watching?.observe(footer)
     return () => {
       watching?.disconnect()
       root.style.removeProperty(TOAST_LIFT)
     }
-  }, [open, hasFooter])
+  }, [open, lifts])
 
   useEffect(() => {
     if (!mounted) {

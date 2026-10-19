@@ -229,6 +229,9 @@ export function Inbox({
         title={open?.title ?? ''}
         description={open ? whereOf(open) : undefined}
         closeLabel="Close item"
+        // The decisions are at the foot of the body, above a footer that only opens the session: a
+        // message lifted over the footer would lie over the next request's decisions.
+        liftsMessage={false}
         onClose={() => {
           setOpen(null)
         }}

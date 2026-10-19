@@ -24,8 +24,9 @@ const SIZES = [
 
 /**
  * Two moments for the page's clock, in UTC (the pages that use them say so): by day, and in the hour
- * before midnight, when a share that lasts an hour ends on the next day and its end is told with the
- * day's name, which makes the words of a message about it longer.
+ * before midnight, when a share that lasts an hour ends on the next day. The end of a share is told
+ * with the day's name when it falls on another day, which makes the words of a message about it
+ * longer.
  */
 const CLOCKS = [
   { name: 'by day', at: '2026-10-18T14:00:00Z' },
@@ -229,7 +230,7 @@ for (const surface of ['ios', 'android'] as const) {
             await page.getByRole('button', { name: new RegExp(`shared session ${session} with you`) }).click()
             await page.getByTestId('accept-offer').click()
             await expect(page.getByTestId('sheet')).toBeHidden()
-            // The toast that says so lies over the next card's controls: it is taken away.
+            // The toast that says so lies over the inbox and the body of the next card: it is taken away.
             await page.locator('.toast').getByRole('button', { name: 'Dismiss' }).click()
             await expect(page.locator('.toast')).toBeHidden()
           }
@@ -481,10 +482,86 @@ test.describe('a new invitation while the inbox is scrolled', () => {
 
 // KR-REQ-13.19, KR-REQ-18.13: a message in passing rests above the footer of the card an invitation
 // opens, and not over what accepts or puts off, at every text size and wherever the clock stands. The
-// words of a message about when a share ends are longer after midnight; at the largest size in a wide
-// face they are too many for the message's box, and the message then stays until it is dismissed.
+// words of a message about when a share ends are longer when it ends on another day; at the largest
+// size they are too many for the message's box, and the message then stays until it is dismissed.
 test.describe('a message in passing over the card an invitation opens', () => {
   test.use({ timezoneId: 'UTC' })
+
+  /**
+   * Accepts invitation 3, holds the message that says so (a `pointerover` event on it, which is what a
+   * pointer resting on it does: the engines differ in whether a pointer that is already there counts,
+   * so no timer decides the case), opens invitation 4's card and says where the message rests against
+   * the card's footer and its two actions.
+   */
+  async function messageOverCard(
+    page: Page,
+    how: {
+      surface: 'ios' | 'android'
+      ratio: number
+      face: (typeof FACES)[number]
+      at: string
+      reduced?: boolean
+      inset?: number
+      shot: string
+    }
+  ): Promise<void> {
+    if (how.reduced === true) await page.emulateMedia({ reducedMotion: 'reduce' })
+    await withClockAt(page, how.at)
+    await withSystemTextScale(page, how.ratio)
+    await withFace(page, how.face.css)
+    await page.setViewportSize({ width: 320, height: 720 })
+    await open(page, how.surface, 'attention', offers)
+    // The platform's inset under the card is the page's own property, which a phone's web view fills in.
+    if (how.inset !== undefined) {
+      await page.evaluate((inset) => {
+        document.documentElement.style.setProperty('--safe-bottom', `${String(inset)}px`)
+      }, how.inset)
+    }
+    await page.getByRole('button', { name: /shared session 3 with you/ }).click()
+    await page.getByTestId('accept-offer').click()
+    await expect(page.getByTestId('sheet')).toBeHidden()
+    const toast = page.locator('.toast')
+    await expect(toast).toContainText('Session 3 is shared with you until')
+    await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
+    await page.getByRole('button', { name: /shared session 4 with you/ }).dispatchEvent('click')
+    const accept = page.getByTestId('accept-offer')
+    const notNow = page.getByTestId('not-now')
+    await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here')
+    await expect(accept).toBeVisible()
+    await expect(toast).toBeVisible()
+
+    // The message does not overlap the footer or either action, and is inside the screen.
+    const overlaps = () =>
+      page.evaluate(() => {
+        const message = document.querySelector('.toast')?.getBoundingClientRect()
+        if (message === undefined) return ['no message']
+        const found: string[] = []
+        if (message.top < 0 || message.bottom > window.innerHeight) found.push('the message is off the screen')
+        const meets = (box: DOMRect): boolean =>
+          box.left < message.right && box.right > message.left && box.top < message.bottom && box.bottom > message.top
+        for (const [name, selector] of [
+          ['the footer', '.sheet .dialog-footer'],
+          ['accept-offer', '[data-testid="accept-offer"]'],
+          ['not-now', '[data-testid="not-now"]']
+        ] as const) {
+          const box = document.querySelector(selector)?.getBoundingClientRect()
+          if (box === undefined) found.push(`no ${name}`)
+          else if (meets(box)) found.push(`the message lies over ${name}`)
+        }
+        return found
+      })
+    await expect.poll(overlaps, 'where the message and the card overlap').toEqual([])
+    // A trial press fails where something else would take it.
+    for (const control of [accept, notNow]) await control.click({ trial: true, timeout: 5_000 })
+    await page.screenshot({ path: `/tmp/kr-shared-with-you-toast-${how.shot}-${test.info().project.name}.png` })
+
+    // It settles back when the card goes.
+    await notNow.click()
+    await expect(page.getByTestId('sheet')).toBeHidden()
+    await expect
+      .poll(() => page.evaluate(() => document.documentElement.style.getPropertyValue('--toast-lift')))
+      .toBe('')
+  }
 
   for (const surface of ['ios', 'android'] as const) {
     for (const size of SIZES) {
@@ -493,76 +570,55 @@ test.describe('a message in passing over the card an invitation opens', () => {
           test(`rests above the card's footer on ${surface} at the ${size.name} text size${face.suffix}, ${clock.name}`, async ({
             page
           }) => {
-            await withClockAt(page, clock.at)
-            await withSystemTextScale(page, size.ratio)
-            await withFace(page, face.css)
-            await page.setViewportSize({ width: 320, height: 720 })
-            await open(page, surface, 'attention', offers)
-            // The first invitation is accepted. The message that says so is held, as a pointer resting on
-            // it holds it (the engines differ in whether the pointer that is already there counts), while
-            // the second is opened, so nothing here waits for it to go or depends on how long it stays.
-            await page.getByRole('button', { name: /shared session 3 with you/ }).click()
-            await page.getByTestId('accept-offer').click()
-            await expect(page.getByTestId('sheet')).toBeHidden()
-            const toast = page.locator('.toast')
-            await expect(toast).toContainText('Session 3 is shared with you until')
-            await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
-            await page.getByRole('button', { name: /shared session 4 with you/ }).dispatchEvent('click')
-            const accept = page.getByTestId('accept-offer')
-            const notNow = page.getByTestId('not-now')
-            await expect(accept).toBeVisible()
-            await expect(toast).toBeVisible()
-            // The card has come to rest: its action has held its place for ten frames in a row.
-            await page.evaluate(
-              () =>
-                new Promise<void>((resolve) => {
-                  let last = Number.NaN
-                  let still = 0
-                  const look = (): void => {
-                    const top = document.querySelector('[data-testid="accept-offer"]')?.getBoundingClientRect().top
-                    still = top === last ? still + 1 : 0
-                    last = top ?? Number.NaN
-                    if (still >= 10) resolve()
-                    else requestAnimationFrame(look)
-                  }
-                  look()
-                })
-            )
-
-            // The message and the card's actions do not overlap, and the message is inside the screen.
-            const overlaps = () =>
-              page.evaluate(() => {
-                const message = document.querySelector('.toast')?.getBoundingClientRect()
-                if (message === undefined) return ['no message']
-                const found: string[] = []
-                if (message.top < 0 || message.bottom > window.innerHeight) found.push('the message is off the screen')
-                for (const id of ['accept-offer', 'not-now']) {
-                  const box = document.querySelector(`[data-testid="${id}"]`)?.getBoundingClientRect()
-                  if (box === undefined) found.push(`no ${id}`)
-                  else if (box.left < message.right && box.right > message.left && box.top < message.bottom && box.bottom > message.top) {
-                    found.push(`the message lies over ${id}`)
-                  }
-                }
-                return found
-              })
-            await expect.poll(overlaps, 'where the message and the card overlap').toEqual([])
-            // A trial press fails where something else would take it.
-            for (const control of [accept, notNow]) await control.click({ trial: true, timeout: 5_000 })
-            await page.screenshot({
-              path: `/tmp/kr-shared-with-you-toast-${surface}-${size.name}${face.shot}-${clock.name.replace(/ /g, '-')}-${test.info().project.name}.png`
+            await messageOverCard(page, {
+              surface,
+              ratio: size.ratio,
+              face,
+              at: clock.at,
+              shot: `${surface}-${size.name}${face.shot}-${clock.name.replace(/ /g, '-')}`
             })
-
-            // It settles back when the card goes.
-            await notNow.click()
-            await expect(page.getByTestId('sheet')).toBeHidden()
-            await expect
-              .poll(() => page.evaluate(() => document.documentElement.style.getPropertyValue('--toast-lift')))
-              .toBe('')
           })
         }
       }
     }
   }
+
+  // The two rules that rest the message for a person who asked for less motion are not the others'.
+  test('rests above the card’s footer when the person asked for less motion', async ({ page }) => {
+    await messageOverCard(page, {
+      surface: 'ios',
+      ratio: 1,
+      face: FACES[0],
+      at: CLOCKS[0].at,
+      reduced: true,
+      shot: 'reduced-motion'
+    })
+  })
+
+  // A phone pads the foot of the card by the platform's inset (the home indicator), so the footer's
+  // top is higher than its height says: the message clears that too.
+  test('rests above the card’s footer and the inset that pads it', async ({ page }) => {
+    await messageOverCard(page, {
+      surface: 'ios',
+      ratio: 1,
+      face: FACES[0],
+      at: CLOCKS[0].at,
+      inset: 34,
+      shot: 'inset'
+    })
+  })
+
+  // A sheet whose decisions are in its body, above a footer that leads elsewhere, does not lift the
+  // message: the lifted message would lie over the next request's decisions.
+  test('lifts no message over the sheet that holds an item’s decisions', async ({ page }) => {
+    await withClockAt(page, CLOCKS[0].at)
+    await page.setViewportSize({ width: 320, height: 720 })
+    await page.goto('/harness.html?surface=ios&tab=attention')
+    await expect(page.locator('.m-shell')).toBeVisible()
+    await page.locator('.m-list [data-attention]').first().click()
+    await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here')
+    expect(await page.evaluate(() => document.documentElement.style.getPropertyValue('--toast-lift'))).toBe('')
+  })
 })
 
 // KR-REQ-13.19: the pill lies over the inbox, so it is sized as the bars are, and focus that goes to
