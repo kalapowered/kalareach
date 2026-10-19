@@ -28,10 +28,9 @@
 //! there, whoever wrote it, before it reconciles. Settings and drafts both ask [`Fence`], as a
 //! [`PublishGate`], before they read and seal what they send, so a send it refuses leaves no record
 //! and no sealed bytes behind. A send that has passed the gate is on its way and cannot be called
-//! back. A device that the host on this computer lists as revoked without this computer having sent the
-//! request is
-//! written down when this computer reads that list; a record that cannot be written then holds this
-//! process only, until it can be.
+//! back. A device that the host on this computer lists as revoked without this computer having sent
+//! the request is written down when this computer reads that list; a record that cannot be written
+//! then holds this process only, until it can be.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -117,21 +116,25 @@ impl Fence {
             error,
             landed: false,
         };
-        // The directory and its name are made durable before anything is written in it, as
-        // settings sync does its own: a hold that a crash could lose is not one.
-        create_private_directory(&self.directory)
-            .map_err(|error| error.to_string())
-            .and_then(|()| flush_path_names(&self.directory).map_err(|error| error.to_string()))
-            .map_err(|error| {
-                before_the_write(CommandError::local_failure(format!(
-                    "this computer's record of revocations not yet taken in could not be made: \
-                     {error}"
-                )))
-            })?;
+        // The directory is made, then locked, and only then are its names made durable: a flush
+        // under the lock covers every rename the read below can see, whoever made it, so a change
+        // with nothing to write stands on a record that is durable too.
+        create_private_directory(&self.directory).map_err(|error| {
+            before_the_write(CommandError::local_failure(format!(
+                "this computer's record of revocations not yet taken in could not be made: \
+                 {error}"
+            )))
+        })?;
         let _lock = crate::settings::locked_file(&self.directory.join(LOCK)).map_err(|error| {
             before_the_write(CommandError::local_failure(format!(
                 "this computer's record of revocations not yet taken in could not be locked: \
                  {error}"
+            )))
+        })?;
+        flush_path_names(&self.directory).map_err(|error| {
+            before_the_write(CommandError::local_failure(format!(
+                "this computer's record of revocations not yet taken in could not be made \
+                 durable: {error}"
             )))
         })?;
         let mut devices = self.on_disk().map_err(before_the_write)?;
@@ -168,7 +171,7 @@ impl Fence {
     /// directory is flushed. When the record may name the devices all the same, it is a hold, for
     /// every reader and for this process, and it stands: it is not rolled back, since a rollback is
     /// the same write and can fail the same way. The error says so, the request is not sent, and
-    /// the next step takes the devices out.
+    /// the next step takes the devices out where a membership exists.
     ///
     /// # Errors
     ///
@@ -187,6 +190,9 @@ impl Fence {
             Err(unwritten) if unwritten.landed => {
                 self.held().extend(devices.iter().copied());
                 let mut error = unwritten.error;
+                if !error.message.ends_with('.') {
+                    error.message.push('.');
+                }
                 error.message.push_str(
                     " The record may have been kept all the same, so this computer holds its \
                      settings back from that device.",
@@ -302,8 +308,9 @@ mod tests {
         assert!(!fence.holds_none_of(&[key(7)]));
     }
 
-    /// A directory `settings-sync` reached through a link, so that the path it is written under and
-    /// the path a flush of its name resolves to are two. Returns the fence, the first and the second.
+    /// A directory `settings-sync` reached through a link, so that the path it is written under
+    /// and the path a flush of its name resolves to are two. Returns the fence, the first and the
+    /// second.
     #[cfg(unix)]
     fn through_a_link() -> (
         tempfile::TempDir,
@@ -361,5 +368,32 @@ mod tests {
             fence.on_disk().expect("readable").contains(&key(7)),
             "the record names the device"
         );
+    }
+
+    /// A record that can be read and cannot be written into place is not a hold: the write stops
+    /// before the rename, so the record does not name the device, nothing is held for it, and the
+    /// error does not say that the record may have been kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_hold_whose_write_stops_before_the_rename_holds_nothing_of_the_new_device() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let kept = directory.path().join("settings-sync");
+        let fence = Fence::in_directory(&kept);
+        fence.raise(&[key(7)]).expect("the first hold");
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o500))
+            .expect("the directory is read only");
+        let refused = fence.raise(&[key(8)]);
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o700))
+            .expect("the directory is writable again");
+
+        let error = refused.expect_err("the record cannot be written into place");
+        assert!(
+            !error.message.contains("kept all the same"),
+            "nothing was kept: {error}"
+        );
+        assert!(fence.holds_none_of(&[key(8)]), "the new device is not held");
+        assert!(!fence.holds_none_of(&[key(7)]), "the first still is");
     }
 }

@@ -754,8 +754,8 @@ impl Revocations {
         if let Some(settings) = settings {
             settings.hold_for_revocation(&keys).map_err(|error| {
                 CommandError::local_failure(format!(
-                    "nothing was sent, because this computer could not hold its settings back \
-                     first: {}",
+                    "nothing was sent, because the hold on this computer's settings could not be \
+                     made durable first: {}",
                     error.message
                 ))
             })?;

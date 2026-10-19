@@ -596,7 +596,9 @@ impl Settings {
     ///
     /// # Errors
     ///
-    /// Returns why the record could not be written; nothing is held then.
+    /// Returns why the record could not be made durable. Nothing is held then, unless the error
+    /// says that the record may have been kept: it is held all the same, no request is sent, and
+    /// the next step takes the devices out where a membership exists.
     pub fn hold_for_revocation(
         &self,
         devices: &[kr_protocol::scalars::AuthorisationKey],

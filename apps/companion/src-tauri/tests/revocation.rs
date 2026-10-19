@@ -854,6 +854,43 @@ async fn a_revocation_whose_outcome_is_not_known_still_takes_the_device_out_of_t
     rig.settings_sync_hears_of(&rig.phone).await;
 }
 
+/// A membership whose record of the collection is missing, as an interrupted join leaves it, is a
+/// collection all the same: the hold stays, and the step that resumes it takes the device in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_stays_while_a_membership_has_no_record_of_its_collection() {
+    let rig = Rig::start().await;
+    rig.with_settings_sync().await;
+    let settings = rig
+        .app
+        .app
+        .state::<AppState>()
+        .settings()
+        .expect("settings are open");
+    let phone = *rig.phone.keys().authorisation.public();
+    let settings_sync = rig.data.path().join("settings-sync");
+    std::fs::remove_file(settings_sync.join("sync.json")).expect("the record goes");
+    settings
+        .hold_for_revocation(&[phone])
+        .expect("the hold is written down");
+
+    let taken_in = settings
+        .revocations_sent(&[phone])
+        .await
+        .expect("the step is tried");
+    assert!(!taken_in, "there is no record to take the device out under");
+    let held: Vec<String> =
+        serde_json::from_slice(&std::fs::read(settings_sync.join("revoking.json")).expect("held"))
+            .expect("a list");
+    assert_eq!(held.len(), 1, "the hold stays: {held:?}");
+
+    // Settings sync resumes the collection, and its first step takes the device in.
+    settings
+        .sync_turn_on()
+        .await
+        .expect("settings sync resumes");
+    rig.settings_sync_hears_of(&rig.phone).await;
+}
+
 /// Where no settings are shared there is nothing to take the device out of: the person is told
 /// nothing of settings, and the hold is let go of.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

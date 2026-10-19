@@ -25,6 +25,11 @@ use crate::sync::store::{Lock, private_directory, write_whole};
 
 /// The name of the file the facts are kept in.
 const FACTS_NAME: &str = "membership.facts";
+/// The name of the lock every operation holds.
+const LOCK_NAME: &str = "membership.lock";
+/// The extension of a file being written, which is not yet a file.
+const PARTIAL_EXTENSION: &str = "partial";
+
 /// Whether `directory` holds a membership: facts that a device started or joined a collection
 /// with. A directory that cannot be inspected is taken to hold one, since the question is asked to
 /// say what a step would do there.
@@ -32,11 +37,6 @@ const FACTS_NAME: &str = "membership.facts";
 pub(crate) fn holds_membership(directory: &std::path::Path) -> bool {
     directory.join(FACTS_NAME).try_exists().unwrap_or(true)
 }
-
-/// The name of the lock every operation holds.
-const LOCK_NAME: &str = "membership.lock";
-/// The extension of a file being written, which is not yet a file.
-const PARTIAL_EXTENSION: &str = "partial";
 
 /// The bounds the file is read under.
 ///

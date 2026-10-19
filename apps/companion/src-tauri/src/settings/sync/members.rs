@@ -669,7 +669,13 @@ impl SettingsSync {
         self.fence.raise_regardless(devices);
         let _step = self.step().await?;
         let Some(mut record) = self.record()? else {
-            self.fence.lift(devices)?;
+            // A membership with no record of its collection is a start or a join that was
+            // interrupted: the step that resumes it takes the devices in.
+            if !kr_client::sync::membership::holds_membership(
+                &self.directory.join(super::MEMBERSHIP),
+            ) {
+                self.fence.lift(devices)?;
+            }
             return Ok(false);
         };
         let service = self.managed(&record.origin()?)?;
