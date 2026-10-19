@@ -23,7 +23,7 @@ use kr_protocol::sharing::{DeviceListParams, DeviceListResult};
 use tauri::{AppHandle, Manager as _, Runtime};
 
 use super::drafts::{Holds, HostLists, HostPrivacy, Hosts};
-use crate::connection::{Connection, Standing};
+use crate::connection::{Connection, Replacer, Standing};
 use crate::drafts::DraftHost;
 use crate::error::CommandError;
 use crate::state::AppState;
@@ -178,6 +178,32 @@ pub(crate) async fn listed(session: &Arc<Session>) -> Listing {
     }
 }
 
+/// What the host on this computer lists of its devices, asked over the connection this application
+/// holds to it.
+///
+/// A revocation withdraws the connections the host admitted before it, and the host answers every
+/// request on one with a refusal that says to open a new connection. It does not close it, so a
+/// connection that is held and not asked for what it is refused goes on being refused. When the
+/// host refuses this connection, it is asked again over another; when that lists, the refused
+/// connection was withdrawn, and `replace` puts the other in its place and ends it. What a fresh
+/// connection is answered is the host's word; one that cannot be opened says nothing of the host.
+pub(crate) async fn listed_replacing(connection: &Connection, replace: &Replacer) -> Listing {
+    let listing = listed(&connection.session()).await;
+    if !matches!(listing, Listing::Refused) || !matches!(connection.standing(), Standing::Owner) {
+        return listing;
+    }
+    match tokio::time::timeout(ANSWER_WITHIN, connection.another()).await {
+        Ok(Ok(fresh)) => {
+            let listing = listed(&fresh.session()).await;
+            if matches!(listing, Listing::Listed(_)) {
+                replace(&connection.session(), fresh);
+            }
+            listing
+        }
+        _ => Listing::Silent,
+    }
+}
+
 impl<R: Runtime> Hosts for ConnectedHosts<R> {
     fn device_lists(
         &self,
@@ -195,7 +221,7 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
                     Standing::Paired { rights, .. } => rights.contains(&ActionRight::HostManage),
                 };
                 if owns {
-                    match listed(&connection.session()).await {
+                    match listed_replacing(&connection, &state.replacer()).await {
                         Listing::Listed(list) => found.lists.push(list),
                         Listing::Refused => found.refused = true,
                         Listing::Silent => found.silent = true,

@@ -32,7 +32,7 @@ pub enum RecordsNotOpen {
 /// The backend's long-lived state.
 #[derive(Debug)]
 pub struct AppState {
-    connection: RwLock<Option<Connection>>,
+    connection: Arc<RwLock<Option<Connection>>>,
     reason: RwLock<Option<String>>,
     device: OnceLock<Arc<Device>>,
     /// Why the pairing records are not open, when they are not.
@@ -72,7 +72,7 @@ impl AppState {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            connection: RwLock::new(None),
+            connection: Arc::new(RwLock::new(None)),
             reason: RwLock::new(Some(
                 "this application has not reached a host yet".to_owned(),
             )),
@@ -234,6 +234,50 @@ impl AppState {
             .expect("the state lock is not poisoned")
             .clone()
             .ok_or_else(CommandError::not_connected)
+    }
+
+    /// Replaces the connection `session` is with one the host admits, when it is the one held to
+    /// the host on this machine and that host has withdrawn it.
+    ///
+    /// A revocation withdraws the connections the host admitted before it. The host refuses every
+    /// request on one and keeps it open, so a connection that is held and not asked for what it
+    /// is refused goes on being refused, and nothing ends it. The host is asked for its devices,
+    /// which it lists to any connection of this computer's that it admits and to no other: a
+    /// refusal of that over this connection, and an answer over another, say it was withdrawn,
+    /// where one command's refusal for its own reasons does not. The other takes its place, and
+    /// the withdrawn one is ended; whatever keeps a connection to the host opens one of its own in
+    /// turn.
+    pub async fn replace_if_withdrawn(&self, session: &Arc<Session>) {
+        let held = self
+            .connection
+            .read()
+            .expect("the state lock is not poisoned")
+            .clone();
+        let Some(connection) = held else {
+            return;
+        };
+        if Arc::ptr_eq(&connection.session(), session) {
+            crate::settings::connected::listed_replacing(&connection, &self.replacer()).await;
+        }
+    }
+
+    /// What replaces a withdrawn connection held to the host on this machine.
+    #[must_use]
+    pub fn replacer(&self) -> crate::connection::Replacer {
+        let held = Arc::clone(&self.connection);
+        Arc::new(move |withdrawn, fresh| {
+            let mut held = held.write().expect("the state lock is not poisoned");
+            // Only the connection that was refused is replaced: one installed since is the host's
+            // to have admitted.
+            if held
+                .as_ref()
+                .is_some_and(|connection| Arc::ptr_eq(&connection.session(), withdrawn))
+            {
+                *held = Some(fresh);
+                drop(held);
+                withdrawn.close();
+            }
+        })
     }
 
     /// Records that the connection `session` belongs to has ended, and why, unless a newer
@@ -474,6 +518,7 @@ impl AppState {
     pub fn revocation_context(&self) -> crate::revocation::Context {
         crate::revocation::Context {
             local: self.connection().ok(),
+            replace: self.replacer(),
             origin: self.sync_service().ok().map(|service| service.origin()),
             settings: self.settings().ok(),
         }

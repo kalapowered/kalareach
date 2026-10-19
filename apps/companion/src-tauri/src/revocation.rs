@@ -75,7 +75,7 @@ use crate::device::Device;
 use crate::error::{CommandError, Result};
 use crate::recovery::{DeviceSigner, now};
 use crate::settings::Settings;
-use crate::settings::connected::{ANSWER_WITHIN, Listing, listed};
+use crate::settings::connected::{ANSWER_WITHIN, Listing, listed, listed_replacing};
 use crate::sync_service::host_of;
 
 /// How long the person is given at the ceremony.
@@ -310,6 +310,8 @@ struct Known {
 pub struct Context {
     /// The connection to the host on this computer, when the application holds one.
     pub local: Option<Connection>,
+    /// What replaces that connection when the host withdrew it.
+    pub replace: crate::connection::Replacer,
     /// The sync service a request for a paired host is published at.
     pub origin: Option<GatewayOrigin>,
     /// Settings sync, which is told of a device whose revocation this computer sent.
@@ -495,7 +497,12 @@ impl Revocations {
         let visits: Vec<_> = hosts
             .into_iter()
             .map(|host| {
-                tauri::async_runtime::spawn(visit(Arc::clone(&self.device), host, client.clone()))
+                tauri::async_runtime::spawn(visit(
+                    Arc::clone(&self.device),
+                    host,
+                    client.clone(),
+                    context.replace.clone(),
+                ))
             })
             .collect();
         let mut readings = Vec::new();
@@ -682,13 +689,6 @@ impl Revocations {
         }
         match (read, memory.known.get(&key)) {
             (DeviceStanding::Active, Some(known)) => (known.standing, Some(known.at_ms)),
-            _ => (read, None),
-        }
-    }
-
-    /// The requests in a host's feed that are this computer's own.
-    fn verified<'a>(&self, reading: &'a Reading) -> Vec<Verified<'a>> {
-        match (&reading.host, &reading.feed) {
             // The host's own list, read just now, says the device is revoked: the standing kept
             // from the feed is the request's, and now says the host lists it so.
             (DeviceStanding::Revoked, Some(known)) => match known.standing {
@@ -716,6 +716,13 @@ impl Revocations {
                 }
                 _ => (read, None),
             },
+            _ => (read, None),
+        }
+    }
+
+    /// The requests in a host's feed that are this computer's own.
+    fn verified<'a>(&self, reading: &'a Reading) -> Vec<Verified<'a>> {
+        match (&reading.host, &reading.feed) {
             (Host::Paired(host), Some(Ok(feed))) => own_requests(
                 &feed.records,
                 host.device_id,
@@ -1163,21 +1170,10 @@ async fn visit(
     device: Arc<Device>,
     host: Host,
     client: Option<std::result::Result<AuthorityFeedClient, String>>,
+    replace: crate::connection::Replacer,
 ) -> Reading {
     let (listing, feed) = match &host {
-        Host::Local(connection) => {
-            let mut listing = listed(&connection.session()).await;
-            // A change of the host's authority, a revocation among them, withdraws the connections
-            // it admitted before, and the host says to open a new one. What a fresh connection is
-            // answered is the host's word; one that cannot be opened says nothing of the host.
-            if matches!(listing, Listing::Refused) {
-                listing = match tokio::time::timeout(ANSWER_WITHIN, connection.another()).await {
-                    Ok(Ok(fresh)) => listed(&fresh.session()).await,
-                    _ => Listing::Silent,
-                };
-            }
-            (listing, None)
-        }
+        Host::Local(connection) => (listed_replacing(connection, &replace).await, None),
         Host::Paired(paired) => {
             let listing = async {
                 let pairing = device.pairing();

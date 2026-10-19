@@ -73,6 +73,10 @@ pub type Reopen = Arc<
         + Sync,
 >;
 
+/// What puts a connection in the place of the withdrawn connection `session` was, when that is
+/// still the connection held to the host on this machine.
+pub type Replacer = Arc<dyn Fn(&Arc<Session>, Connection) + Send + Sync>;
+
 /// A live connection to a host: the one on this machine, or one this device is paired with.
 ///
 /// Cloning it shares the session; it does not open another connection.
@@ -152,7 +156,8 @@ impl Connection {
     /// Returns why the host could not be reached, or that this connection cannot be opened again.
     pub async fn another(&self) -> Result<Self> {
         match &self.reopen {
-            Some(reopen) => reopen().await,
+            // The one opened can be opened from again: it may take the place of this one.
+            Some(reopen) => Ok(reopen().await?.reopening(Arc::clone(reopen))),
             None => Err(CommandError::unavailable(
                 "this application cannot open a second connection to this host",
             )),
