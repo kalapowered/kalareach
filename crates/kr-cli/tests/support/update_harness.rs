@@ -512,6 +512,12 @@ impl Assembled {
         )
     }
 
+    /// This release as one whose table of public majors lists `majors` and no other.
+    fn listing_public_majors(mut self, majors: &[u16]) -> Self {
+        self.manifest.public_majors = majors.to_vec();
+        self
+    }
+
     /// This release as a build that did not yet need `names` would have assembled it: it lists none
     /// of them and its tree holds none, the rest unchanged.
     fn without(mut self, names: &[&str]) -> Self {
@@ -1794,6 +1800,14 @@ impl Host {
             .as_ref()
             .map(|build| build.build_id.as_str().to_owned())
             .unwrap_or_default()
+    }
+
+    /// The identity of the process this host's daemon runs as, which differs each time a daemon
+    /// starts.
+    async fn daemon_process(&self) -> kr_protocol::identity::ProcessStartIdentity {
+        let pid = self.daemon_started_like().await.pid.get();
+        kr_ipc::identity::process_start_identity(u32::try_from(pid).expect("a process identifier"))
+            .expect("the daemon's process")
     }
 
     /// Closes a session with a release's `kr`.

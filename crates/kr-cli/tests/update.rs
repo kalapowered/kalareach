@@ -616,6 +616,127 @@ async fn an_update_waits_for_a_session_its_release_does_not_retain() {
     assert!(host.store.release_directory(elsewhere.name()).is_dir());
 }
 
+/// KR-REQ-26.07: how long a session lasts across updates is decided by the compatibility levels a
+/// release retains and by how long the session runs, whatever the release's table of public majors
+/// lists. A release whose table lists major 2 and no longer major 1, the major the session's release
+/// listed, and whose daemon retains the session's level, is updated to with the session kept: the
+/// worker is the process it was, and the session closes at the end through release two's `kr`. A
+/// release whose table lists no major 1 either, and whose daemon does not retain the level, still
+/// waits for the session, exit 9, with nothing stopped. This build has one public major, so no public
+/// window ends in this case: it shows that an update reads the levels a release retains and never its
+/// table of public majors, so the local window is independent of the public table, and not that the
+/// local window outlasts a public window that ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_keeps_or_waits_for_a_session_by_the_levels_it_retains_whatever_its_table_lists()
+{
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    assert_eq!(
+        one.manifest.public_majors,
+        [1],
+        "the release the session starts from lists major 1"
+    );
+    host.install(&one);
+    let started_through_current = host.store.stable(Program::Controller);
+    host.start_daemon(&started_through_current).await;
+    let (display, session_id) = host.new_session(&host.program(one.name(), Program::Kr));
+    let worker = host.worker_process(session_id);
+    let scratch = host.scratch("archives");
+
+    // A release whose table no longer lists major 1 and whose daemon retains the session's level.
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).listing_public_majors(&[2]);
+    let archive_two = scratch.join("two.tar.gz");
+    two.archive(&archive_two);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive_two.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "an update whose table no longer lists the session's major still goes ahead over a \
+         session it retains: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name()),
+        "the daemon is the new release's"
+    );
+    let daemon_of_two = host.daemon_process().await;
+    assert_eq!(
+        host.worker_process(session_id),
+        worker,
+        "the session's worker is the process it was"
+    );
+    assert_eq!(
+        host.worker_build(session_id).await,
+        format!("kr-worker/{}", one.name()),
+        "and it answers, on the release it started from"
+    );
+
+    // A release whose table does not list major 1 either, and whose daemon does not retain the
+    // session's level: the session still holds the update.
+    let another = if PACKAGE_VERSION.major == 0 {
+        PackageVersion::new(0, PACKAGE_VERSION.minor + 1, 0)
+    } else {
+        PackageVersion::new(PACKAGE_VERSION.major + 1, 0, 0)
+    };
+    let three = Assembled::new(
+        "0.3.0+cccccccccccc",
+        3,
+        CompatibilityLevel::of(another),
+        the_root(),
+    )
+    .listing_public_majors(&[2]);
+    let archive_three = scratch.join("three.tar.gz");
+    three.archive(&archive_three);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive_three.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "the table having no major 1 does not free the host of the session: {said}"
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains(&format!(
+            "the update to {} waits: session {display} runs kr-worker/{}",
+            three.name(),
+            one.name()
+        )),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
+    assert_eq!(
+        host.daemon_process().await,
+        daemon_of_two,
+        "nothing was stopped: the daemon is the process that started with release two"
+    );
+    assert_eq!(
+        kr_ipc::identity::process_state(&worker),
+        kr_ipc::identity::ProcessState::Running,
+        "the session's worker runs on"
+    );
+    // The session closes through release two's `kr`.
+    host.close(&host.store.stable(Program::Kr), &display);
+    host.worker_ended(&worker).await;
+}
+
 /// KR-REQ-26.09: an update an earlier run left after its switch is finished by the next run: the
 /// daemon it recorded is started from the release `current` names, and the update settles.
 #[tokio::test(flavor = "multi_thread")]
