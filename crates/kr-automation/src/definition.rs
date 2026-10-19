@@ -53,6 +53,31 @@ pub const fn produced_event(action_kind: WorkflowActionKind) -> Option<&'static 
     })
 }
 
+/// Whether a node of `action_kind` creates a session of its own, which spends the chain's
+/// session allowance and needs the right to create one.
+///
+/// `request_review` is not among them while the host cannot start a reviewer: it is refused at
+/// dispatch before it creates anything.
+#[must_use]
+pub const fn creates_session(action_kind: WorkflowActionKind) -> bool {
+    matches!(
+        action_kind,
+        WorkflowActionKind::ShellCommand
+            | WorkflowActionKind::RunTests
+            | WorkflowActionKind::CreateSession
+    )
+}
+
+/// Whether a node of `action_kind` runs a command as the root of a session it creates, and closes
+/// that session when it settles: the kinds that type into a shell account.
+#[must_use]
+pub const fn runs_a_command(action_kind: WorkflowActionKind) -> bool {
+    matches!(
+        action_kind,
+        WorkflowActionKind::ShellCommand | WorkflowActionKind::RunTests
+    )
+}
+
 /// What one action of `action_kind` spends of its chain's managed allowance.
 ///
 /// No kind this engine carries out spends one, so a chain that inherited no managed allowance
@@ -125,6 +150,13 @@ pub fn validate_definition(definition: &WorkflowDefinition, grant: &Grant) -> Re
 
     let mut shell_nodes = Vec::new();
     for node in &definition.nodes {
+        // A command is run as a session's root through a POSIX shell, which this platform has not.
+        // A definition that holds one is refused when it is offered rather than at each dispatch.
+        if cfg!(windows) && runs_a_command(node.action_kind) {
+            return Err(AutomationError::ActionUnavailable {
+                action_kind: node.action_kind,
+            });
+        }
         validate_typed_action_params(&node.node_id, node.action_kind, &node.action_params)?;
 
         if node.action_kind == WorkflowActionKind::ShellCommand {
@@ -566,6 +598,16 @@ pub fn node_workspace(node: &WorkflowNode) -> Option<WorkspaceId> {
         }
         _ => None,
     }
+}
+
+/// Returns true when a `create_session` node names the shell its session runs, which any session
+/// creation can but which, from a workflow, runs a program the definition chose.
+#[must_use]
+pub fn node_names_a_shell(node: &WorkflowNode) -> bool {
+    node.action_kind == WorkflowActionKind::CreateSession
+        && serde_json::from_str::<SessionCreateParams>(&node.action_params)
+            .ok()
+            .is_some_and(|params| params.shell.is_present())
 }
 
 /// Returns the environment a node creates a session in, when its action kind creates one.

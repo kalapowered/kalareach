@@ -55,6 +55,7 @@ pub mod causal;
 pub mod definition;
 pub mod engine;
 pub mod error;
+pub mod resources;
 pub mod service;
 pub mod source_workflow;
 pub mod store;

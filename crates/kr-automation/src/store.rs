@@ -3159,6 +3159,23 @@ impl WorkflowStore {
         self.read(|journal| journal.trigger_is_recorded(workflow_id, revision, event_id))
     }
 
+    /// Reads one run's recorded status.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be read.
+    pub fn run_status(&self, run_id: WorkflowRunId) -> Result<Option<WorkflowRunStatus>> {
+        let conn = self.lock();
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM workflow_runs WHERE run_id = ?1",
+                params![run_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(status.and_then(|value| WorkflowRunStatus::from_wire(&value)))
+    }
+
     /// Reads one node's recorded status.
     ///
     /// # Errors

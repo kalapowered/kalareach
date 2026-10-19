@@ -623,6 +623,91 @@ async fn an_action_that_outlives_its_wait_is_asked_to_stop() {
     );
 }
 
+/// KR-REQ-25.19: a run cancelled while its action runs asks the action to stop, as the passing of
+/// its wait does, but it exceeded no limit: the node and the run are cancelled and the workflow is
+/// not paused and owes no attention item. An action that has not stopped is never read as having
+/// succeeded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_cancelled_while_its_action_runs_asks_it_to_stop_and_pauses_nothing() {
+    let stoppable = Arc::new(Stoppable::default());
+    let clock = Arc::new(ManualClock::new(1_000));
+    let service = Arc::new(
+        AutomationService::in_memory(common::host(
+            Arc::clone(&stoppable) as Arc<dyn ActionRunner>,
+            common::every_right(&[grant_id(42)]),
+            Arc::clone(&clock) as Arc<dyn kr_automation::HostClock>,
+        ))
+        .expect("a service"),
+    );
+    let definition = three_steps(workflow_id(42), grant_id(42), 1_800_000, 600_000);
+    installed(&service, &definition);
+
+    let running = {
+        let service = Arc::clone(&service);
+        let params = run_params(&definition, "evt-cancelled");
+        tokio::spawn(async move { service.submit_run(&params, 1_000).await })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while stoppable.entered.load(Ordering::SeqCst) < 1 {
+        assert!(std::time::Instant::now() < deadline, "the action began");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let run_id = service
+        .read(
+            &WorkflowReadParams {
+                workflow_id: Nullable::some(definition.workflow_id),
+                ..WorkflowReadParams::default()
+            },
+            None,
+            1_000,
+        )
+        .expect("reads")
+        .runs[0]
+        .run_id;
+    service
+        .store()
+        .cancel_run(run_id, "run cancelled by request", 1_000)
+        .expect("the run is cancelled");
+
+    let answered = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+        .await
+        .expect("the run stops waiting once it is cancelled")
+        .expect("the task ends")
+        .expect("the run answers");
+    assert_eq!(
+        answered.status,
+        WorkflowRunStatus::Cancelled,
+        "{answered:?}"
+    );
+    assert_eq!(
+        stoppable.stopped.load(Ordering::SeqCst),
+        1,
+        "the action was asked to stop"
+    );
+    assert!(
+        !service
+            .store()
+            .is_paused(definition.workflow_id, 1)
+            .expect("reads"),
+        "a cancellation is no limit exceeded, so the workflow is not paused"
+    );
+    assert!(
+        service
+            .read(
+                &WorkflowReadParams {
+                    workflow_id: Nullable::some(definition.workflow_id),
+                    ..WorkflowReadParams::default()
+                },
+                None,
+                1_000,
+            )
+            .expect("reads")
+            .alerts
+            .is_empty(),
+        "and no attention item is owed"
+    );
+}
+
 /// A host whose session limit can change while chains run.
 #[derive(Debug)]
 struct Moving(AtomicUsize);

@@ -499,16 +499,34 @@ async fn a_descendant_takes_its_ancestry_from_the_node_that_produced_its_trigger
 /// A node that creates a session spends the chain's session allowance.
 #[tokio::test]
 async fn created_sessions_are_reserved_against_the_chain() {
-    let clock = Arc::new(ManualClock::new(1_000));
-    let journal = tempfile::tempdir().expect("a journal directory");
-    let service = open(journal.path(), &clock);
-
-    let def = recurring_workflow(
+    sessions_are_reserved(
         6,
         "session-maker",
         "session.created",
         WorkflowActionKind::CreateSession,
-    );
+    )
+    .await;
+}
+
+/// KR-REQ-25.16: a node that runs a command runs it in a session of its own, so it spends the
+/// chain's session allowance as a node that creates one does.
+#[tokio::test]
+async fn a_command_node_spends_the_chains_session_allowance_too() {
+    sessions_are_reserved(
+        41,
+        "command-maker",
+        "command.completed",
+        WorkflowActionKind::ShellCommand,
+    )
+    .await;
+}
+
+async fn sessions_are_reserved(number: u8, name: &str, event: &str, kind: WorkflowActionKind) {
+    let clock = Arc::new(ManualClock::new(1_000));
+    let journal = tempfile::tempdir().expect("a journal directory");
+    let service = open(journal.path(), &clock);
+
+    let def = recurring_workflow(number, name, event, kind);
     install_and_enable(&service, &def, 1_000);
 
     let first = service

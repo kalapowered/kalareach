@@ -1214,3 +1214,163 @@ async fn a_revision_past_what_the_journal_holds_is_answered_as_not_installed() {
     );
     assert_eq!(owners_enable.code, absent.code, "{owners_enable:?}");
 }
+
+/// The rights a node that runs a command needs: it types into a shell account, creates its session
+/// and closes it when it settles.
+const COMMAND_RIGHTS: [ActionRight; 3] = [
+    ActionRight::TerminalInput,
+    ActionRight::SessionCreate,
+    ActionRight::SessionClose,
+];
+
+fn install_refusal(
+    grant: kr_protocol::grant::Grant,
+    nodes: Vec<WorkflowNode>,
+    workflow: u8,
+) -> Result<(), String> {
+    let grant_id = grant.grant_id;
+    let table = GrantTable::new();
+    table.insert(grant);
+    let service = service(Arc::new(MockActionRunner::new()), Arc::new(table));
+    let definition = create_workflow_definition(
+        test_wf_id(workflow),
+        1,
+        "a node that runs a command",
+        grant_id,
+        nodes,
+        vec![],
+    );
+    service
+        .submit_install(&install_params(&definition), 1_000)
+        .map(|_| ())
+        .map_err(|refusal| refusal.to_string())
+}
+
+/// KR-REQ-25.14, and section 23's rule that a composite action intersects every right it needs: a
+/// node that runs a command creates a session, types into a shell account and closes the session
+/// when it settles, so a grant missing any one of those installs it nowhere, and one that carries
+/// all of them does.
+#[tokio::test]
+async fn a_command_node_needs_every_right_its_composite_effect_has() {
+    let grant_id = test_grant_id(11);
+    for (workflow, missing) in [
+        (11_u8, ActionRight::TerminalInput),
+        (12, ActionRight::SessionCreate),
+        (13, ActionRight::SessionClose),
+    ] {
+        let rights: Vec<ActionRight> = COMMAND_RIGHTS
+            .iter()
+            .copied()
+            .filter(|right| *right != missing)
+            .collect();
+        let refusal = install_refusal(
+            common::grant_of(grant_id, &rights),
+            vec![node("run", WorkflowActionKind::ShellCommand)],
+            workflow,
+        )
+        .expect_err("a grant missing a right of the effect installs nothing");
+        assert!(
+            refusal.contains(missing.as_str()) || refusal.contains("terminal input"),
+            "the refusal names what the grant lacks ({missing:?}): {refusal}"
+        );
+    }
+    install_refusal(
+        common::grant_of(grant_id, &COMMAND_RIGHTS),
+        vec![node("run", WorkflowActionKind::ShellCommand)],
+        14,
+    )
+    .expect("a grant that carries all of them installs it");
+}
+
+/// KR-REQ-25.14 and section 10: a node that runs a command does it in a session of its own, in the
+/// selected environment, so a grant that selects one named session, or none, is not a broad shell
+/// grant. A `create_session` node that names the shell its session runs runs a program of the
+/// definition's choosing, and is held to the same grant; one that names none needs only the right
+/// to create a session.
+#[tokio::test]
+async fn a_command_runs_only_under_a_grant_that_selects_every_session() {
+    use kr_protocol::grant::SessionSelector;
+
+    let grant_id = test_grant_id(15);
+    let named = |selector: SessionSelector, rights: &[ActionRight]| {
+        let mut grant = common::grant_of(grant_id, rights);
+        grant.session_selector = selector;
+        grant
+    };
+    let one_session = SessionSelector::These {
+        session_ids: [kr_protocol::ids::SessionId::new(Uuid::from_bytes([5; 16]))]
+            .into_iter()
+            .collect(),
+    };
+    for (workflow, selector) in [(15_u8, one_session.clone()), (16, SessionSelector::None)] {
+        let refusal = install_refusal(
+            named(selector, &COMMAND_RIGHTS),
+            vec![node("run", WorkflowActionKind::ShellCommand)],
+            workflow,
+        )
+        .expect_err("a grant that does not select every session is not a broad shell grant");
+        assert!(refusal.contains("every session"), "{refusal}");
+    }
+    install_refusal(
+        named(SessionSelector::Any, &COMMAND_RIGHTS),
+        vec![node("run", WorkflowActionKind::ShellCommand)],
+        17,
+    )
+    .expect("the broad grant installs it");
+
+    // A session node that names a shell, and one that does not.
+    let mut with_a_shell = node("make", WorkflowActionKind::CreateSession);
+    let mut params: serde_json::Value =
+        serde_json::from_str(&with_a_shell.action_params).expect("typed parameters");
+    params["shell"] = serde_json::json!("/bin/sh");
+    with_a_shell.action_params = params.to_string();
+    let create_only = [ActionRight::SessionCreate];
+    let refusal = install_refusal(
+        named(SessionSelector::Any, &create_only),
+        vec![with_a_shell.clone()],
+        18,
+    )
+    .expect_err("a named shell needs terminal input");
+    assert!(refusal.contains("terminal.input"), "{refusal}");
+    let refusal = install_refusal(
+        named(
+            one_session,
+            &[ActionRight::SessionCreate, ActionRight::TerminalInput],
+        ),
+        vec![with_a_shell.clone()],
+        19,
+    )
+    .expect_err("and every session");
+    assert!(refusal.contains("every session"), "{refusal}");
+    install_refusal(
+        named(
+            SessionSelector::Any,
+            &[ActionRight::SessionCreate, ActionRight::TerminalInput],
+        ),
+        vec![with_a_shell],
+        20,
+    )
+    .expect("the broad grant installs a node that names a shell");
+    install_refusal(
+        named(SessionSelector::Any, &create_only),
+        vec![node("make", WorkflowActionKind::CreateSession)],
+        21,
+    )
+    .expect("a node that names none needs only the right to create a session");
+}
+
+/// A command runs in a session this host creates, in its own environment, so a node that declares
+/// another environment is refused wherever the grant would admit it.
+#[tokio::test]
+async fn a_command_that_declares_another_environment_installs_nowhere() {
+    let grant_id = test_grant_id(22);
+    let mut elsewhere = node("run", WorkflowActionKind::ShellCommand);
+    elsewhere.declared_environment = Nullable::some(EnvironmentId::new(Uuid::from_bytes([9; 16])));
+    let refusal = install_refusal(
+        common::grant_of(grant_id, &COMMAND_RIGHTS),
+        vec![elsewhere],
+        22,
+    )
+    .expect_err("this host runs a command in its own environment");
+    assert!(refusal.contains("its own environment"), "{refusal}");
+}

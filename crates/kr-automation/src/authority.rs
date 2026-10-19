@@ -23,7 +23,7 @@
 //! effect, so a workflow is not a way around the method the person would otherwise have called.
 
 use kr_protocol::automation::{WorkflowActionKind, WorkflowDefinition, WorkflowNode};
-use kr_protocol::grant::Grant;
+use kr_protocol::grant::{Grant, SessionSelector};
 use kr_protocol::ids::{EnvironmentId, GrantId};
 use kr_protocol::rights::ActionRight;
 
@@ -50,11 +50,23 @@ pub trait AuthoritySource: Send + Sync + std::fmt::Debug {
 #[must_use]
 pub const fn node_rights(action_kind: WorkflowActionKind) -> &'static [ActionRight] {
     match action_kind {
-        // Sending a command to a shell exposes the account the shell runs as, which is the right
-        // section 23 puts behind `shell.launch` and behind every other way of typing at a terminal.
-        WorkflowActionKind::ShellCommand | WorkflowActionKind::RunTests => {
-            &[ActionRight::TerminalInput]
-        }
+        // Running a command exposes the account the shell runs as, which is the right section 23
+        // puts behind `shell.launch` and behind every other way of typing at a terminal. The node
+        // creates its session and closes it when it settles, and composite actions intersect every
+        // right they need (section 23), so it needs `session.create` and `session.close` as well.
+        WorkflowActionKind::ShellCommand => &[
+            ActionRight::TerminalInput,
+            ActionRight::SessionCreate,
+            ActionRight::SessionClose,
+        ],
+        // A test run also writes the version it tests into a materialisation of its own, which is
+        // what `changeset.materialize` does under `workspace.manage`.
+        WorkflowActionKind::RunTests => &[
+            ActionRight::TerminalInput,
+            ActionRight::SessionCreate,
+            ActionRight::SessionClose,
+            ActionRight::WorkspaceManage,
+        ],
         // A review asks an agent to do something, which is `agent.prompt`, and it is read back
         // through the session it ran in.
         WorkflowActionKind::RequestReview => &[ActionRight::AgentPrompt, ActionRight::SessionView],
@@ -143,6 +155,41 @@ pub fn check_node(
             )));
         }
     }
+    // A node that runs a command types into a shell account, and does it in a session it creates
+    // inside the selected environment: a grant that selects one named session, or none, does not
+    // select that one. A broad grant selects every session there, and no other grant is one.
+    if crate::definition::runs_a_command(node.action_kind)
+        && !matches!(grant.session_selector, SessionSelector::Any)
+    {
+        return Err(AutomationError::PermissionDenied(format!(
+            "node {} runs a command in a session of its own, and grant {} does not select every \
+             session in the environment",
+            node.node_id, grant.grant_id
+        )));
+    }
+    // A session a node creates names its own shell only by running a program of the caller's
+    // choosing, which is what a command node is. A `create_session` node that names one is held
+    // to the same grant.
+    if node.action_kind == WorkflowActionKind::CreateSession
+        && crate::definition::node_names_a_shell(node)
+    {
+        if !grant.permits(ActionRight::TerminalInput) {
+            return Err(AutomationError::PermissionDenied(format!(
+                "node {} names the shell its session runs, which needs {} and grant {} does not \
+                 carry it",
+                node.node_id,
+                ActionRight::TerminalInput.as_str(),
+                grant.grant_id
+            )));
+        }
+        if !matches!(grant.session_selector, SessionSelector::Any) {
+            return Err(AutomationError::PermissionDenied(format!(
+                "node {} names the shell its session runs, and grant {} does not select every \
+                 session in the environment",
+                node.node_id, grant.grant_id
+            )));
+        }
+    }
     // A shell node names the environment it runs in, and the grant has to admit that one rather
     // than merely admitting the workflow's own scope.
     if let Some(environment_id) = node.declared_environment.0
@@ -151,6 +198,18 @@ pub fn check_node(
         return Err(AutomationError::PermissionDenied(format!(
             "node {} declares environment {environment_id}, which grant {} does not admit",
             node.node_id, grant.grant_id
+        )));
+    }
+    // A command runs in a session this host creates, and this host creates sessions in its own
+    // environment only: a node that declares another one names somewhere this host cannot run it.
+    if crate::definition::runs_a_command(node.action_kind)
+        && let Some(declared) = node.declared_environment.0
+        && declared != environment_id
+    {
+        return Err(AutomationError::PermissionDenied(format!(
+            "node {} declares environment {declared}, and this host runs a command in its own \
+             environment {environment_id}",
+            node.node_id
         )));
     }
     // A node that creates a session names the environment it creates it in, and that is the one
