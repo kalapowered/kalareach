@@ -822,6 +822,12 @@ host's authenticated bundle pinned, and `pair.finish` is sent only once the devi
 the live peer is that endpoint. A direct invitation goes to `pair.redeem` under the same check, and
 no proof leaves the device for any other peer.
 
+A device which has no lease with its host cannot be carried by a managed relay. Therefore, before the first dial of a route, the device asks the managed service for a pairing admission (`services::admission`). `IrohLink::admitted_by` gives the link the service origin, the device's authorisation key and the credential it signs with. The link sends one request for each relay of the invitation's network configuration, at most three, whose host is the service origin's host or a subdomain of it. A relay that is not the managed service's is never named to it. Each request is made in a task of its own, and the dial waits at most two seconds for the answers together, but proceeds regardless with whatever came. An answer that comes late is kept, and the next attempt uses it.
+
+The result is cached for each relay and host. An admission is kept until 30 seconds before it ends. A refusal is kept for the suggested retry time, or 60 seconds, whichever is longer. An answer that the pair needs no admission is kept for 60 seconds, and an answer that the relay is not managed for 10 minutes. A dial left in doubt, as one cancelled by its route's own timeout is, asks again after 20 seconds, at most three times. A service that answers 404, answers unreadably, or refuses the request or the caller is left alone for 10 minutes. A spent or unreachable service never stops the dial.
+
+When the first dial of a route ends as a host that could not be reached, and the entry for the relay it addressed is a refusal that is still kept, the attempt ends as `relay_capacity` instead of `host_unreachable`. This indicates that the managed relay had no free capacity for the pairing, but the host's own network or a direct invitation may still work. Only the first dial of the direct route and of the code route asks whether the relay refused for lack of capacity. A failure after the dial does not.
+
 Each host is reached through the relay and discovery services its own configuration names, with one
 dialling endpoint for each set of services. A key holds one endpoint on a relay at a time, so two
 configurations that share a relay are never open together, and binding one closes the other. An
