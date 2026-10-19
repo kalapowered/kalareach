@@ -4998,6 +4998,28 @@ async fn a_command_a_stopped_daemon_left_running_is_closed_and_released_by_the_n
         }
     };
     assert_eq!(owed_rows(&host), 1, "the dispatch wrote down what it owns");
+    // The dispatch wrote down its session's worker. A dispatch that ended before it had is the
+    // same row without the worker, and the next daemon's sweep takes the worker from the registry,
+    // which keeps the process the launcher started.
+    let ledger = rusqlite::Connection::open(
+        host._temp
+            .environment()
+            .state_dir()
+            .join(kr_automation::resources::RESOURCES_DB_NAME),
+    )
+    .expect("opens the resource ledger");
+    let worker_of_the_row = || -> Option<String> {
+        ledger
+            .query_row("SELECT worker_process FROM owned", [], |row| row.get(0))
+            .expect("reads the row")
+    };
+    assert!(
+        worker_of_the_row().is_some(),
+        "the dispatch wrote its session's worker down"
+    );
+    ledger
+        .execute("UPDATE owned SET worker_process = NULL", [])
+        .expect("the row loses its worker");
     drop(control);
 
     let host = restarted(host, apart).await;
@@ -5013,6 +5035,10 @@ async fn a_command_a_stopped_daemon_left_running_is_closed_and_released_by_the_n
         owed_rows(&host) == 0
     })
     .await;
+    assert!(
+        worker_of_the_row().is_some(),
+        "the sweep took the worker from the registry before it released the row"
+    );
     let scratch = host
         ._temp
         .environment()
