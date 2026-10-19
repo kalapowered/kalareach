@@ -972,8 +972,8 @@ impl ServiceWeb {
         }
         match moment {
             Some(Moment::Before) => return Handled::Lost,
-            Some(Moment::Hold) => return Handled::Held(*self.released.borrow()),
-            Some(Moment::Gate) => return Handled::Gated(*self.released.borrow()),
+            Some(Moment::Hold) => return Handled::Held(released),
+            Some(Moment::Gate) => return Handled::Gated(released),
             Some(Moment::Refuse {
                 status,
                 code,
