@@ -24,8 +24,10 @@ mod pkarr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kr_client::services::AccountToken;
 use kr_client::services::account::{IssuedGrant, RefreshToken};
+use kr_client::services::{
+    AccountToken, ManagedPairingAdmission, PairingAdmissions, ServiceSigner,
+};
 use kr_controller::relay_leases::{
     BLOCK_BYTES, LEASE_SECONDS, MIN_ASK_GAP, REFILL_WHEN_LEFT, STANDING_RETRY,
 };
@@ -4539,4 +4541,580 @@ async fn the_grace_an_answer_of_no_room_carries_is_shown_until_one_carries_none(
         "{}",
         shown.detail()
     );
+}
+
+/* -------------------------------------------------------------------------- */
+/* A device that has never paired with the host reaches it through the relay   */
+/* -------------------------------------------------------------------------- */
+
+/// A device's own key signing a service request as an installation.
+#[derive(Debug)]
+struct DeviceSigner(kr_crypto::keys::AuthorisationKeyPair);
+
+impl ServiceSigner for DeviceSigner {
+    fn signer(&self) -> kr_protocol::service::ServiceRequestSigner {
+        kr_protocol::service::ServiceRequestSigner::Installation
+    }
+
+    fn public_key(&self) -> AuthorisationKey {
+        *self.0.public()
+    }
+
+    fn sign(&self, message: &[u8]) -> kr_client::Result<kr_protocol::scalars::Signature64> {
+        let transcript = kr_crypto::sign::SigningTranscript::from_canonical_bytes(
+            self.signer().domain(),
+            message.to_vec(),
+        )
+        .expect("a domain-tagged transcript");
+        Ok(kr_crypto::sign::sign(&self.0, &transcript).expect("a signature"))
+    }
+}
+
+/// A device running the product's pairing client, with its records on the internal disk, that asks
+/// the managed service for an admission as it dials.
+struct NewDevice {
+    pairing: Arc<kr_client::pairing::candidate::Pairing>,
+    _directory: tempfile::TempDir,
+}
+
+impl NewDevice {
+    /// A device that reaches hosts through relays whose certificates `roots` hold, asks the service
+    /// the rig stands in for for an admission when `asks`, and pairs through the rig host's room.
+    fn start(rig: &Rig, roots: Vec<Vec<u8>>, asks: bool) -> Self {
+        use kr_client::pairing::candidate::{Candidate, CandidateRoom, Pairing};
+        use kr_client::pairing::link::{EndpointPool, HostLink, IrohLink};
+        use kr_client::pairing::paired::PairedHosts;
+        use kr_protocol::pairing::{DeviceName, DevicePlatform};
+
+        let keys = DeviceKeys::generate().expect("a device's keys");
+        let directory = tempfile::tempdir().expect("a directory on the internal disk");
+        let budget = Arc::new(
+            kr_pairing::budget::DurableClientBudgetStore::open(
+                directory.path().join("budget"),
+                Arc::new(kr_crypto::store::MemoryStore::new()),
+                "device",
+            )
+            .expect("a durable budget"),
+        );
+        let pool = EndpointPool::new(keys.transport.clone())
+            .bound_to("127.0.0.1:0".parse().expect("loopback"))
+            .through_relays_only()
+            .trusting_relays(roots);
+        let mut link = IrohLink::new(Arc::new(pool));
+        if asks {
+            let origin = kr_protocol::service::GatewayOrigin::new(rig.served.origin())
+                .expect("the service's origin");
+            let admit = ManagedPairingAdmission::new(
+                origin.clone(),
+                Arc::clone(rig.served.web()) as _,
+                Arc::new(DeviceSigner(keys.authorisation.clone())),
+            );
+            link = link.admitted_by(Arc::new(
+                PairingAdmissions::new(Arc::new(admit), &origin).expect("admissions"),
+            ));
+        }
+        let room: Arc<dyn CandidateRoom> = Arc::new(rig.host.room.clone());
+        let pairing = Arc::new(Pairing {
+            candidate: Candidate::new(
+                keys,
+                DeviceName::new("A new computer").expect("a name"),
+                DevicePlatform::Macos,
+                kr_protocol::ids::BuildId::new("kr-test/0").expect("a build"),
+            ),
+            budget,
+            clock: Arc::new(kr_client::pairing::clock::DeviceClock::current().expect("a clock")),
+            room,
+            link: Arc::new(link) as Arc<dyn HostLink>,
+            hosts: Arc::new(PairedHosts::open(directory.path().join("pairing")).expect("a store")),
+        });
+        Self {
+            pairing,
+            _directory: directory,
+        }
+    }
+
+    /// The same device, with a link that counts what the host answers it and the connections it
+    /// opens.
+    fn counting(
+        mut self,
+        answered: &Arc<std::sync::atomic::AtomicUsize>,
+        opened: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        let pairing = Arc::get_mut(&mut self.pairing).expect("a device nothing has started");
+        let inner = Arc::clone(&pairing.link);
+        pairing.link = Arc::new(Counting {
+            inner,
+            answered: Arc::clone(answered),
+            opened: Arc::clone(opened),
+        });
+        self
+    }
+
+    /// Redeems the direct invitation `text`.
+    fn redeem(
+        &self,
+        text: &str,
+    ) -> (
+        tokio::task::JoinHandle<
+            Result<kr_client::pairing::paired::PairedHost, kr_client::pairing::PairingFailure>,
+        >,
+        tokio::sync::watch::Receiver<kr_client::pairing::candidate::AttemptState>,
+    ) {
+        use kr_client::pairing::invitation::{Invitation, read_invitation};
+        let Invitation::Direct(payload) =
+            read_invitation(text, &kr_protocol::invitation::default_rendezvous_origin())
+                .expect("an invitation")
+        else {
+            panic!("a direct invitation's text reads as a direct invitation");
+        };
+        let (progress, shown) =
+            tokio::sync::watch::channel(kr_client::pairing::candidate::AttemptState::Idle);
+        let pairing = Arc::clone(&self.pairing);
+        let attempt = tokio::spawn(async move { pairing.pair_directly(&payload, &progress).await });
+        (attempt, shown)
+    }
+
+    /// Enters the code of a code invitation through the host's room.
+    fn enter(
+        &self,
+        origin: &kr_protocol::pairing::RendezvousOrigin,
+        code: &str,
+    ) -> tokio::task::JoinHandle<
+        Result<kr_client::pairing::paired::PairedHost, kr_client::pairing::PairingFailure>,
+    > {
+        let (progress, _) =
+            tokio::sync::watch::channel(kr_client::pairing::candidate::AttemptState::Idle);
+        let pairing = Arc::clone(&self.pairing);
+        let origin = origin.clone();
+        let code = kr_pairing::code::EnteredCode::parse(code).expect("a code");
+        tokio::spawn(async move { pairing.pair_by_code(&origin, &code, &progress).await })
+    }
+
+    fn endpoint(&self) -> kr_protocol::scalars::EndpointKey {
+        self.pairing.candidate.endpoint_id()
+    }
+}
+
+impl Rig {
+    /// The owner issues a direct invitation for a viewer, and returns its answer and its QR text.
+    async fn direct_invitation(&self) -> (kr_protocol::invitation::PairInviteResult, String) {
+        use kr_protocol::invitation::{InviteEntry, InviteGrantKind};
+        let mut client = self.host.client().await;
+        let owner = net_support::pairing::Signer::OwnerDevice(&self.owner);
+        let invited = net_support::pairing::invite_direct(
+            self.host.environment_id,
+            &mut client,
+            InviteGrantKind::SessionInvitation,
+            &proposal(&[ActionRight::SessionView]),
+            &owner,
+        )
+        .await
+        .expect("a direct invitation");
+        let InviteEntry::Direct { qr_text } = &invited.entry else {
+            panic!("a direct invitation is offered as a QR");
+        };
+        let text = qr_text.as_str().to_owned();
+        (invited, text)
+    }
+
+    /// The owner issues a code invitation for a viewer, and returns the origin and the code.
+    async fn code_invitation(&self) -> (kr_protocol::pairing::RendezvousOrigin, String) {
+        use kr_protocol::confirmation::ConfirmationSubject;
+        use kr_protocol::invitation::{
+            InviteEntry, InviteGrantKind, InviteMode, InviteModeKind, PairInviteParams,
+        };
+        let mut client = self.host.client().await;
+        let owner = net_support::pairing::Signer::OwnerDevice(&self.owner);
+        let grant = proposal(&[ActionRight::SessionView]);
+        net_support::pairing::confirm_subject(
+            self.host.environment_id,
+            &mut client,
+            ConfirmationSubject::IssueInvitation {
+                mode: InviteModeKind::Code,
+                rendezvous_origin: kr_protocol::scalars::Nullable::null(),
+                grant_kind: InviteGrantKind::SessionInvitation,
+                proposed_grant: grant.clone(),
+            },
+            &owner,
+        )
+        .await
+        .expect("answered");
+        let invited: kr_protocol::invitation::PairInviteResult = net_support::pairing::mutate(
+            self.host.environment_id,
+            &mut client,
+            Method::PairInvite,
+            &PairInviteParams {
+                mode: InviteMode::Code {
+                    rendezvous_origin: kr_protocol::scalars::Nullable::null(),
+                },
+                grant_kind: InviteGrantKind::SessionInvitation,
+                proposed_grant: grant,
+            },
+        )
+        .await
+        .expect("a code invitation");
+        let InviteEntry::Code {
+            rendezvous_origin,
+            code,
+            ..
+        } = &invited.entry
+        else {
+            panic!("a code invitation is offered as a code");
+        };
+        (rendezvous_origin.clone(), code.as_str().to_owned())
+    }
+
+    /// The owner approves the device that redeemed `invited`.
+    async fn approves(&self, invited: &kr_protocol::invitation::PairInviteResult) {
+        let mut client = self.host.client().await;
+        let owner = net_support::pairing::Signer::OwnerDevice(&self.owner);
+        net_support::pairing::confirm_candidate(
+            self.host.environment_id,
+            &mut client,
+            invited.invitation_id,
+            &owner,
+        )
+        .await
+        .expect("the owner approves");
+    }
+}
+
+/// Waits until an attempt shows the value both devices display, or ends.
+async fn shows_the_value(
+    shown: &mut tokio::sync::watch::Receiver<kr_client::pairing::candidate::AttemptState>,
+) {
+    use kr_client::pairing::candidate::AttemptState;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        shown.wait_for(|state| {
+            matches!(
+                state,
+                AttemptState::AwaitingApproval { .. } | AttemptState::Ended { .. }
+            )
+        }),
+    )
+    .await
+    .expect("the attempt reaches the owner")
+    .expect("the attempt runs");
+}
+
+/// KR-REQ-10.54, KR-REQ-17.40: a device that has never paired with the host pairs with it through the
+/// managed relay while the host holds a lease for another device. The relay carries a lease's pair
+/// and nothing else, so this device asks the service for the admission that lets the relay forward
+/// its pairing, as it dials, and the pairing completes for a device that has no direct path to the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_pairs_through_the_managed_relay_while_the_host_holds_a_lease() {
+    let relays = Relays::spawn().await;
+    let rig = Rig::start_over(
+        true,
+        8 * 1024 * 1024,
+        relays.host(),
+        Some(relays.leased.url.as_str()),
+    )
+    .await;
+    let owner = rig.owner_device();
+    rig.until("the owner's device holds a lease", || rig.holds(&owner))
+        .await;
+    rig.until_held_to(&relays.leased.url).await;
+    rig.until_homed_on(&relays.leased.url).await;
+
+    let (invited, text) = rig.direct_invitation().await;
+    assert_eq!(
+        rig.invitation_relays(),
+        vec![relays.leased.url.clone()],
+        "the invitation names the relay the host's lease is on"
+    );
+
+    let device = NewDevice::start(&rig, relays.roots(), true);
+    let before = relays.leased.forwarded();
+    let (attempt, mut shown) = device.redeem(&text);
+    shows_the_value(&mut shown).await;
+    rig.approves(&invited).await;
+    let paired = tokio::time::timeout(Duration::from_secs(120), attempt)
+        .await
+        .expect("the attempt ends")
+        .expect("the attempt ran")
+        .expect("the device paired with the host");
+    assert_eq!(paired.host_endpoint_id, rig.host.network().endpoint_id());
+
+    // It asked the service for this pair at that relay, and the pairing crossed that relay.
+    let asked = rig.served.web().relay_admission_requests();
+    assert!(
+        asked
+            .iter()
+            .any(|asked| asked.host == paired.host_endpoint_id
+                && asked.candidate == device.endpoint()
+                && asked.relay_url.trim_end_matches('/')
+                    == relays.leased.url.as_str().trim_end_matches('/')),
+        "no request for this host, this device and the relay it dialled: {asked:?}"
+    );
+    assert!(
+        relays.leased.forwarded() > before,
+        "the pairing crossed the relay"
+    );
+}
+
+/// KR-REQ-10.54, KR-REQ-17.48: a device that is refused free capacity is told so when it could not
+/// pair for it, not that the host is out of reach, by a code as by an invitation. The relay here carries nothing for it, as one that
+/// has no admission for a device does, so the dial ends by its own deadline, and what the person is
+/// told turns on what the service said. With the service's budget available the same failure is the
+/// host being unreachable, which is the control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_is_refused_free_capacity_is_told_so_when_it_cannot_pair() {
+    use kr_client::pairing::failure::FailureKind;
+
+    let relays = Relays::spawn().await;
+    let rig = Rig::start_over(false, 8 * 1024 * 1024, relays.host(), None).await;
+    rig.until_homed_on(&relays.configured.url).await;
+    // The service carries that relay, so it answers for it.
+    rig.served.web().carry_relay(
+        relays.configured.url.as_str(),
+        kr_service_stand_in::AdmissionBehaviour::Admit,
+    );
+    // The relay takes no new session from the device, as one that has no admission for it does not.
+    relays.configured.refuse_sessions(true);
+
+    // The control: the service has capacity, and the host is still out of reach.
+    let (_, text) = rig.direct_invitation().await;
+    let device = NewDevice::start(&rig, relays.roots(), true);
+    let (attempt, _) = device.redeem(&text);
+    let failure = tokio::time::timeout(Duration::from_secs(120), attempt)
+        .await
+        .expect("the attempt ends")
+        .expect("the attempt ran")
+        .expect_err("a relay that takes no session carries nothing");
+    assert_eq!(failure.kind, FailureKind::HostUnreachable);
+
+    // The service has none to give. The invitation is the same: a dial that reached nothing spent
+    // nothing of it.
+    rig.served.web().spend_admission_budget(true);
+    let device = NewDevice::start(&rig, relays.roots(), true);
+    let (attempt, _) = device.redeem(&text);
+    let failure = tokio::time::timeout(Duration::from_secs(120), attempt)
+        .await
+        .expect("the attempt ends")
+        .expect("the attempt ran")
+        .expect_err("a relay that takes no session carries nothing");
+    assert_eq!(failure.kind, FailureKind::RelayCapacity);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_is_refused_free_capacity_is_told_so_when_it_pairs_by_code() {
+    use kr_client::pairing::failure::FailureKind;
+
+    let relays = Relays::spawn().await;
+    let rig = Rig::start_over(false, 8 * 1024 * 1024, relays.host(), None).await;
+    rig.until_homed_on(&relays.configured.url).await;
+    rig.served.web().carry_relay(
+        relays.configured.url.as_str(),
+        kr_service_stand_in::AdmissionBehaviour::Admit,
+    );
+    relays.configured.refuse_sessions(true);
+    let (origin, code) = rig.code_invitation().await;
+
+    // The service has none to give.
+    rig.served.web().spend_admission_budget(true);
+    let device = NewDevice::start(&rig, relays.roots(), true);
+    let failure = tokio::time::timeout(Duration::from_secs(120), device.enter(&origin, &code))
+        .await
+        .expect("the attempt ends")
+        .expect("the attempt ran")
+        .expect_err("a relay that takes no session carries nothing");
+    assert_eq!(failure.kind, FailureKind::RelayCapacity);
+}
+
+/// A link that counts what the host answers a device on the connections it opens, and the
+/// connections it opens, and otherwise is the product's.
+struct Counting {
+    inner: Arc<dyn kr_client::pairing::link::HostLink>,
+    answered: Arc<std::sync::atomic::AtomicUsize>,
+    opened: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl kr_client::pairing::link::HostLink for Counting {
+    fn dial<'a>(
+        &'a self,
+        network: &'a kr_protocol::pairing::NetworkConfig,
+        endpoint: &'a kr_protocol::scalars::EndpointKey,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<iroh::endpoint::Connection, kr_client::pairing::link::LinkError>,
+    > {
+        self.inner.dial(network, endpoint)
+    }
+
+    fn open_unpaired<'a>(
+        &'a self,
+        connection: &'a iroh::endpoint::Connection,
+        identity: &'a kr_transport::handshake::LocalIdentity,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<Box<dyn kr_client::pairing::link::Preauth>, kr_client::pairing::link::LinkError>,
+    > {
+        self.opened
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            let inner = self.inner.open_unpaired(connection, identity).await?;
+            Ok(Box::new(CountedAnswers {
+                inner,
+                answered: Arc::clone(&self.answered),
+            }) as Box<dyn kr_client::pairing::link::Preauth>)
+        })
+    }
+
+    fn connect_paired_transport<'a>(
+        &'a self,
+        host: &'a kr_client::pairing::paired::PairedHost,
+        identity: &'a kr_transport::handshake::LocalIdentity,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<
+            Arc<dyn kr_client::transport::ControlTransport>,
+            kr_client::pairing::link::LinkError,
+        >,
+    > {
+        self.inner.connect_paired_transport(host, identity)
+    }
+
+    fn hold<'a>(
+        &'a self,
+        network: &'a kr_protocol::pairing::NetworkConfig,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<kr_client::pairing::link::EndpointHold, kr_client::pairing::link::LinkError>,
+    > {
+        self.inner.hold(network)
+    }
+}
+
+/// A pre-authorisation surface that counts the host's answers.
+struct CountedAnswers {
+    inner: Box<dyn kr_client::pairing::link::Preauth>,
+    answered: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl kr_client::pairing::link::Preauth for CountedAnswers {
+    fn selection(&self) -> &kr_protocol::hello::HostSelection {
+        self.inner.selection()
+    }
+
+    fn finish<'a>(
+        &'a mut self,
+        request: &'a kr_protocol::pairing::PairFinishRequest,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<kr_protocol::preauth::PairFinishResult, kr_client::pairing::link::LinkError>,
+    > {
+        Box::pin(async move {
+            let answer = self.inner.finish(request).await;
+            self.answered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            answer
+        })
+    }
+
+    fn redeem<'a>(
+        &'a mut self,
+        params: &'a kr_protocol::preauth::PairRedeemParams,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<kr_protocol::preauth::PairRedeemResult, kr_client::pairing::link::LinkError>,
+    > {
+        Box::pin(async move {
+            let answer = self.inner.redeem(params).await;
+            self.answered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            answer
+        })
+    }
+
+    fn status<'a>(
+        &'a mut self,
+        params: &'a kr_protocol::preauth::PairStatusParams,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<kr_protocol::preauth::PairStatusResult, kr_client::pairing::link::LinkError>,
+    > {
+        Box::pin(async move {
+            let answer = self.inner.status(params).await;
+            self.answered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            answer
+        })
+    }
+}
+
+/// KR-REQ-10.54, KR-REQ-10.25: the ceiling an admission carries is enough for a whole attempt. A device
+/// pairs through the relay with the owner's approval held until the host has answered it more times
+/// than one connection allows, which is when the device moves to a fresh connection, and the bytes
+/// the relay carried from the first dial to the paired connection stay under what the service signs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_whole_pairing_through_a_relay_fits_in_the_admission_ceiling() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let relays = Relays::spawn().await;
+    let rig = Rig::start_over(
+        true,
+        8 * 1024 * 1024,
+        relays.host(),
+        Some(relays.leased.url.as_str()),
+    )
+    .await;
+    let owner = rig.owner_device();
+    rig.until("the owner's device holds a lease", || rig.holds(&owner))
+        .await;
+    rig.until_held_to(&relays.leased.url).await;
+    rig.until_homed_on(&relays.leased.url).await;
+    let (invited, text) = rig.direct_invitation().await;
+
+    let device = NewDevice::start(&rig, relays.roots(), true);
+    let answered = Arc::new(AtomicUsize::new(0));
+    let opened = Arc::new(AtomicUsize::new(0));
+    let device = device.counting(&answered, &opened);
+
+    // The host's request for a lease for this device is not begun on until the pairing is over, so
+    // that nothing but the admission can have carried it: the worst case, and the one the ceiling
+    // has to hold for.
+    rig.served.web().fail_matching(
+        ISSUE,
+        serde_json::json!({ "destination_endpoint_key": device.endpoint() }),
+        1,
+        Moment::Gate,
+    );
+    let before = relays.leased.forwarded();
+    let (attempt, mut shown) = device.redeem(&text);
+    shows_the_value(&mut shown).await;
+    // The owner takes their time: the host has answered the device more often than one connection
+    // allows, so the device has moved to another.
+    let in_all = kr_transport::preauth::PreAuthLimits::default().max_requests;
+    tokio::time::timeout(Duration::from_secs(300), async {
+        while answered.load(Ordering::SeqCst) <= in_all {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device is answered more times than one connection allows");
+    rig.approves(&invited).await;
+    let paired = tokio::time::timeout(Duration::from_secs(120), attempt)
+        .await
+        .expect("the attempt ends")
+        .expect("the attempt ran")
+        .expect("the device paired with the host");
+    assert_eq!(paired.host_endpoint_id, rig.host.network().endpoint_id());
+
+    // The paired connection is inside the window: the device connected as what it became before the
+    // pairing call returned, and the host's lease for it is not what carried it.
+    let carried = relays.leased.forwarded() - before;
+    rig.served.web().release_held();
+    assert!(
+        opened.load(Ordering::SeqCst) >= 2,
+        "the device moved to a fresh connection while it waited"
+    );
+    assert!(
+        carried < kr_service_stand_in::ADMISSION_BYTES,
+        "a whole pairing carried {carried} bytes through the relay, and an admission allows {}",
+        kr_service_stand_in::ADMISSION_BYTES
+    );
+    println!("== a whole pairing carried {carried} bytes through the relay");
 }
