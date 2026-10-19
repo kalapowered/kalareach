@@ -97,8 +97,8 @@ async fn this_computer_asks_the_managed_service_to_admit_it_as_it_dials_a_host()
         "a relay that is not the service's was named to it"
     );
 
-    // A relay of the service: it is asked, with this device's own key, and the credential it signed
-    // is one the service accepts, for the stand-in records only those.
+    // A relay of the service: it is asked, with this device's own key. The stand-in lists a request
+    // for an admission only when it accepted the credential.
     let _ = tokio::time::timeout(
         Duration::from_secs(4),
         link.dial(&network("http://127.0.0.1:9/"), &host),
@@ -117,7 +117,8 @@ async fn this_computer_asks_the_managed_service_to_admit_it_as_it_dials_a_host()
     );
 
     // The request was signed as an installation by this device's own authorisation key: the stand-in
-    // keeps the kind and the key that signed what it accepted.
+    // keeps the kind and the key each request arrived signed with, and the one that was accepted is
+    // the only one.
     let signed = service
         .arrived()
         .into_iter()

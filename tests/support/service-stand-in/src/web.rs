@@ -943,11 +943,18 @@ impl ServiceWeb {
                 body: document["body"].clone(),
                 token: token.map(str::to_owned),
                 content: content.map(<[u8]>::to_vec),
-                signed_by: serde_json::from_value::<ServiceRequestSignature>(
-                    document["signature"].clone(),
+                // The kind and the key are read on their own: a request of a route whose method
+                // this crate's typed signature does not list, a relay route's, is signed all the same.
+                signed_by: serde_json::from_value::<ServiceRequestSigner>(
+                    document["signature"]["signer"].clone(),
                 )
                 .ok()
-                .map(|signature| (signature.signer, signature.public_key)),
+                .zip(
+                    serde_json::from_value::<kr_protocol::scalars::AuthorisationKey>(
+                        document["signature"]["public_key"].clone(),
+                    )
+                    .ok(),
+                ),
                 reached,
             });
             arrived.len()

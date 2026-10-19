@@ -5187,10 +5187,15 @@ async fn a_whole_pairing_through_a_relay_fits_in_the_admission_ceiling() {
     // the host takes for it is what carries it from here.
     let destination = serde_json::json!(device.endpoint());
     tokio::time::timeout(Duration::from_secs(120), async {
-        while !rig.served.web().arrived().iter().any(|arrived| {
-            arrived.path == ISSUE && arrived.body["destination_endpoint_key"] == destination
-        }) {
+        loop {
+            // The count is read before the arrivals are looked at, so a request that comes between
+            // the two is one the wait for the next does not miss.
             let asked = rig.served.web().requests_to(ISSUE);
+            if rig.served.web().arrived().iter().any(|arrived| {
+                arrived.path == ISSUE && arrived.body["destination_endpoint_key"] == destination
+            }) {
+                break;
+            }
             rig.served.web().requests_reach(ISSUE, asked + 1).await;
         }
     })
