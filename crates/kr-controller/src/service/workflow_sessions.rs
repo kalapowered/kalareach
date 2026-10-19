@@ -279,7 +279,11 @@ impl Controller {
         self.shared_clock.boot_elapsed_ms()
     }
 
-    /// The session a node's create token resolved to, when one was reserved.
+    /// The session a node's create token resolved to, when one was reserved, and whether anything
+    /// was ever launched for it.
+    ///
+    /// A reservation that failed before its worker started holds no session to close and none to
+    /// wait for: its node has nothing left to release but what the node itself owned.
     ///
     /// # Errors
     ///
@@ -294,6 +298,7 @@ impl Controller {
             .lock()
             .await
             .reservation_for_token(actor_id, token.get())?
+            .filter(|reservation| reservation.phase != crate::registry::LaunchPhase::Failed)
             .map(|reservation| reservation.session_id))
     }
 }
