@@ -106,14 +106,16 @@ ALLOWED = (".env.example",)
 # Shapes that are a credential wherever they appear. Narrow on purpose: a check that guessed at what
 # a secret looks like would refuse a release for a string in a dependency.
 PEM_HEADER = re.compile(rb"-----BEGIN ((?:[A-Z0-9]+ )*)PRIVATE KEY( BLOCK)?-----")
-# What follows a private key's header: white space and escaped line breaks, the quotes, joiners,
-# commas and comment markers a key written out as source text has between its lines, optional
-# `Name: value` header lines (an encrypted key's `Proc-Type`), then a run of base64. A run of 16
-# keeps a key wrapped in short lines, and still ends at the first word of prose or the first brace
-# of a format string that follows a quoted header.
-PEM_BODY = re.compile(
-    rb"\A(?:\s|\\[rnt\\]|[\"'`+,;#*]|//|[A-Za-z-]+: [^\r\n\\]*(?:\r?\n|\\r|\\n))*[A-Za-z0-9+/]{16,}"
-)
+# What follows a private key's header: what a key written out as source text has between its lines
+# (white space, escaped line breaks, a backslash that continues a string, quotes, joiners, commas,
+# comment markers including `///` and `//!`) and optional `Name: value` header lines (an encrypted
+# key's `Proc-Type`), then a body: a run of base64 of 32 or more, or two runs of 16 or more with
+# only that between them, which is a key wrapped in short lines. A quoted header followed by code
+# or prose does not read as a key: the first word ends the run, and one identifier of 16 letters
+# or more is not two runs. Every item of the loop is decided by its first character, so the match
+# takes time in proportion to the window and no more; keep it so.
+_BETWEEN = rb"(?:\s|\\[rnt\\]|\\\r?\n|[\"'`+,;#*/!]|[A-Za-z-]+: [^\r\n\\]*(?:\r?\n|\\r|\\n))"
+PEM_BODY = re.compile(rb"\A" + _BETWEEN + rb"*[A-Za-z0-9+/]{16,}" + _BETWEEN + rb"*[A-Za-z0-9+/]{16,}")
 LIVE_KEY = re.compile(rb"\bsk_live_[0-9A-Za-z]{20,}")
 WEBHOOK_SECRET = re.compile(rb"\bwhsec_[0-9A-Za-z]{20,}")
 
@@ -542,7 +544,7 @@ class Fixture:
         clean = {k: v for k, v in os.environ.items() if not k.startswith("GITHUB_")}
         clean.update(environment or {})
         done = subprocess.run(
-            [sys.executable, SCRIPT, "check", *arguments],
+            [sys.executable, "-I", SCRIPT, "check", *arguments],
             cwd=self.directory,
             env=clean,
             capture_output=True,
@@ -683,8 +685,20 @@ def cases(scratch, expect):
         "src/joined.rs": f'const K: &str = "{header}\\n" + "{key_body[:32]}" + "{key_body[32:]}";\n',
         "src/lines.js": f'const K = ["{header}", "{key_body[:32]}", "{key_body[32:]}"].join("\\n");\n',
         "src/comment.py": f"# {header}\n# {key_body}\n",
+        "src/slashes.ts": f"// {header}\n// {key_body}\n",
+        "src/docs.rs": f"//! {header}\n//! {key_body}\n",
+        "src/triple.rs": f"/// {header}\n/// {key_body}\n",
+        "src/continued.rs": f'const K: &str = "{header}\\n\\\n{key_body}";\n',
+        "src/quoted.sh": f"K='{header}\n'\"'\"'{key_body}'\n",
+        "src/ticks.js": f"const K = `{header}` + `{key_body}`;\n",
+        "src/starred.c": f"/*\n * {header}\n * {key_body}\n */\n",
+        "src/semi.txt": f"{header};\t{key_body};\n",
         "src/escaped.json": json.dumps({"k": f"{header}\n{key_body}\n"}).replace("\\n", "\\\\n"),
-        "src/short.txt": header + "\n" + "\n".join(key_body[i : i + 16] for i in range(0, len(key_body), 16)) + "\n",
+        "src/short.txt": header
+        + "\n"
+        + "\n".join(key_body[i : i + 16] for i in range(0, len(key_body), 16))
+        + "\n",
+        "src/encrypted.pem.txt": f"{header}\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123456789ABCDEF\n\n{key_body}\n",
     }
     fx = Fixture(scratch)
     for path, text in shapes.items():
@@ -704,6 +718,9 @@ def cases(scratch, expect):
     fx.write("src/test.rs", f'write("server.txt", "{header}\\n");\n')
     fx.write("src/format.rs", f'format!("{header}\\n{{}}\\n", body);\n')
     fx.write("docs/prose.md", f"The file starts with {header} and then carries the base64 text.\n")
+    fx.write("src/call.js", f'const marker = "{header}";\nvalidatePrivateKey(marker);\n')
+    fx.write("src/name.js", f"const marker = '{header}\\n' + base64PrivateKey;\n")
+    fx.write("docs/long.md", f"Quoting {header} in internationalization notes is not a key.\n")
     head = fx.commit("Quote a header")
     status, output = fx.run("--range", f"{fx.base}..{head}")
     expect("a private key header with no body after it, quoted or in prose, is not a key", status == 0, output)

@@ -25,10 +25,11 @@ permissions:
   contents: read
 
 # A push is read from the commit it replaced, so a push run that a later push cancelled would leave
-# its commits unread by `outgoing-records`: each push has a group of its own. A pull request still
-# replaces its own earlier run.
+# its commits unread by `outgoing-records`: each push run has a group of its own (two pushes can
+# even carry the same head commit). A pull request or a manual run still replaces an earlier run on
+# the same ref.
 concurrency:
-  group: release-checks-${{ github.event_name == 'push' && github.sha || github.ref }}
+  group: release-checks-${{ github.event_name == 'push' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 env:
