@@ -416,6 +416,12 @@ export interface DevicesView {
   readonly waiting: boolean
   readonly members: readonly DeviceMember[]
   readonly candidates: readonly DeviceCandidate[]
+  /**
+   * Devices this computer took out when the person revoked them, that the hosts still list as
+   * unrevoked: the revoke may not have gone through. Sharing with one again is the person's choice,
+   * and is asked for as sharing with any device is.
+   */
+  readonly held_out: readonly DeviceCandidate[]
   readonly offers: readonly DeviceOffer[]
   readonly outcomes: readonly DeviceHappened[]
 }

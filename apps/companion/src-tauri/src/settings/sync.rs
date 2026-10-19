@@ -192,6 +192,7 @@ impl SyncView {
                 waiting: false,
                 members: Vec::new(),
                 candidates: Vec::new(),
+                held_out: Vec::new(),
                 offers: Vec::new(),
                 outcomes: Vec::new(),
             },
@@ -392,7 +393,8 @@ pub struct SettingsSync {
     listed: Arc<Listed>,
     /// The collections the service said name this installation, which a join can name.
     offered: Mutex<Vec<CollectionRef>>,
-    /// Whether the settings the service holds are sealed under keys this computer has not been given.
+    /// Whether the settings the service holds are sealed under keys this computer has not been
+    /// given.
     waiting: std::sync::atomic::AtomicBool,
     /// The revocations that the membership has not recorded, which hold back everything sent.
     fence: Arc<Fence>,
@@ -1179,8 +1181,8 @@ impl SettingsSync {
         Ok(())
     }
 
-    /// Makes the settings this computer holds carry what `copies` went over, as a new revision, when
-    /// they do not yet. Returns whether it did.
+    /// Makes the settings this computer holds carry what `copies` went over, as a new revision,
+    /// when they do not yet. Returns whether it did.
     fn carry_marks(
         &self,
         store: &SyncStore,
@@ -1580,6 +1582,10 @@ fn member_failure(error: kr_client::sync::membership::MembershipError) -> Comman
         MembershipError::NotAMember => {
             CommandError::refused("that device does not share the settings")
         }
+        MembershipError::NotHeldOut => CommandError::refused(
+            "that device is not one this computer took out when you revoked it, so it is not \
+             shared with again",
+        ),
         MembershipError::Plan(_) => CommandError::refused(
             "the confirmation is no longer valid, so nothing was changed; try again",
         ),

@@ -486,14 +486,23 @@ removal. This record persists across restarts of this computer. The next step of
 the same data takes the device out of the shared settings. Nothing takes the record back. Note that
 the revocation request might have reached the host even if the computer receives no answer.
 Therefore the device will be removed from the shared settings in any case. In the case that settings
-are shared with other devices, the person is told that the device was removed. That exclusion is for
-good on this computer: a device revoked on this computer is out of the collection for every device
-that shares it. If another member of the collection adds the device again, this computer takes it
-out again. Even pairing the device again will not add it to the collection again. Revoking the
-device again finishes the job. If a view finds that a device is revoked, either because a host's
-feed contains a revocation signed by this computer or because the host on this computer lists it as
-revoked (regardless of who revoked it), the device is taken out as described above. Note that there
-is no way to stop a send of settings or drafts that is already on its way.
+are shared with other devices, the person is told that the device was removed. If you revoke a
+device, this computer will remove it from the list of devices sharing your settings. It is out for
+every device that shares them. If another device that shares your settings adds it again, this
+computer will again remove it. Pairing the device again does not bring it back. If you attempt to
+revoke a device, but this operation fails, this computer will remove it from the list of devices
+sharing your settings nevertheless, because the revoke request may have reached its host. As long as
+a host still lists it as paired (and not revoked), this device will be listed on this sheet,
+separated from the devices that have never had your settings. You can select it by pressing the
+button “Share again” in its row. This runs the ceremony on the respective platform, with the reason
+“Share your settings with”, the device's name and “again”. If the ceremony succeeds, this computer
+will first take back its record of the revoke, ask the hosts again, and then attempt to add the
+device again, just as if it were added for the first time. Again, this will succeed only if the
+device is still listed by at least one of its hosts and none of them lists it as revoked. A device
+that a host reports as revoked is not offered. If a view finds that a device is revoked, either
+because a host's feed contains a revocation signed by this computer or because the host on this
+computer lists it as revoked (regardless of who revoked it), the device is taken out as described
+above. Note that there is no way to stop a send of settings or drafts that is already on its way.
 
 The Devices screen, which appears after the Hosts screen in the desktop navigation, shows one card
 for each host with the card for the local host (that is, the host which is on this computer) first.

@@ -23,8 +23,8 @@
 //! * **The page is shown** [`DevicesView`], made at the end of each step from the membership's own
 //!   record, so showing it asks nobody anything.
 //!
-//! Every operation here takes the step settings sync holds, so the ceremony a person is at keeps the
-//! next background step waiting rather than running under it.
+//! Every operation here takes the step settings sync holds, so the ceremony a person is at keeps
+//! the next background step waiting rather than running under it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -70,6 +70,10 @@ pub struct DevicesView {
     pub members: Vec<Member>,
     /// The devices a host lists that could be given the key.
     pub candidates: Vec<Candidate>,
+    /// The devices this computer took out when the person revoked them, that the hosts still list
+    /// as unrevoked: the revoke may not have gone through. Sharing with one again is the person's
+    /// choice, and is asked for as sharing with any device is.
+    pub held_out: Vec<Candidate>,
     /// The collections other devices share with this one, which it could join.
     pub offers: Vec<Offer>,
     /// What happened to changes the person asked for, until they dismiss it.
@@ -86,8 +90,8 @@ pub struct Member {
     /// Whether it is this computer.
     pub this_computer: bool,
     /// Whether a host still lists it as able to manage the host, or none that answered mentions it
-    /// while one did not answer or refused to list, and its hosts vouched for it before. One that is not is taken out at
-    /// the next step.
+    /// while one did not answer or refused to list, and its hosts vouched for it before. One that
+    /// is not is taken out at the next step.
     pub vouched: bool,
 }
 
@@ -335,6 +339,7 @@ impl SettingsSync {
             let mut cached = self.devices.lock().unwrap_or_else(PoisonError::into_inner);
             cached.members.clear();
             cached.candidates.clear();
+            cached.held_out.clear();
             cached.out = false;
             return;
         };
@@ -350,6 +355,7 @@ impl SettingsSync {
             let mut cached = self.devices.lock().unwrap_or_else(PoisonError::into_inner);
             cached.members.clear();
             cached.candidates.clear();
+            cached.held_out.clear();
             cached.outcomes = outcomes;
             cached.out = true;
             return;
@@ -381,15 +387,30 @@ impl SettingsSync {
                 name: name(device),
             })
             .collect();
+        let held_out = membership
+            .held_out()
+            .unwrap_or_default()
+            .iter()
+            .filter(|device| {
+                !self.listed.is_disputed(&device.authorisation)
+                    && !self.listed.cannot_join(&device.authorisation)
+            })
+            .map(|device| Candidate {
+                reference: installation_id_of(device),
+                name: name(device),
+            })
+            .collect();
         let mut cached = self.devices.lock().unwrap_or_else(PoisonError::into_inner);
         cached.members = members;
         cached.candidates = candidates;
+        cached.held_out = held_out;
         cached.outcomes = outcomes;
         cached.out = false;
         cached.offers.clear();
     }
 
-    /// The membership of this computer's collection, with the hosts asked for as much as `ask` says.
+    /// The membership of this computer's collection, with the hosts asked for as much as `ask`
+    /// says.
     pub(super) fn membership_asking(
         &self,
         service: &Arc<ManagedSyncService>,
@@ -532,12 +553,24 @@ impl SettingsSync {
         // none of them answered leaves the answers of an earlier one in place, which are not what
         // a key is given on.
         Self::answered(membership.refresh().await.map_err(member_failure)?)?;
-        let device = membership
+        let candidate = membership
             .candidates()
             .map_err(member_failure)?
             .into_iter()
-            .find(|device| installation_id_of(device) == reference)
-            .ok_or_else(|| CommandError::refused("no host lists that device any more"))?;
+            .find(|device| installation_id_of(device) == reference);
+        // A device this computer took out when the person revoked it is shared with again only
+        // when the person names it, here, and a revocation still on its way is not forgotten.
+        let sharing_again = candidate.is_none();
+        let device = match candidate {
+            Some(device) => device,
+            None => membership
+                .held_out()
+                .map_err(member_failure)?
+                .into_iter()
+                .find(|device| installation_id_of(device) == reference)
+                .filter(|device| self.fence.holds_none_of(&[device.authorisation]))
+                .ok_or_else(|| CommandError::refused("no host lists that device any more"))?,
+        };
         if self.listed.is_disputed(&device.authorisation) {
             return Err(CommandError::refused(
                 "your hosts do not agree on the keys of that device, so nothing is shared with it",
@@ -553,15 +586,22 @@ impl SettingsSync {
             .listed
             .name_of(&device.authorisation)
             .unwrap_or_else(|| "another device".to_owned());
-        let plan = membership
-            .plan_share(&device.authorisation, now())
-            .map_err(member_failure)?;
-        self.confirmed(
-            &mut membership,
-            &plan,
-            &format!("Share your settings with {name}"),
-        )
-        .await?;
+        let (plan, reason) = if sharing_again {
+            (
+                membership
+                    .plan_share_again(&device.authorisation, now())
+                    .map_err(member_failure)?,
+                format!("Share your settings with {name} again"),
+            )
+        } else {
+            (
+                membership
+                    .plan_share(&device.authorisation, now())
+                    .map_err(member_failure)?,
+                format!("Share your settings with {name}"),
+            )
+        };
+        self.confirmed(&mut membership, &plan, &reason).await?;
         // The person took their time. A host may have revoked the device, or two hosts may now
         // disagree about its keys: the hosts are asked again, and the device must still be one they
         // list, alone. (Another member may have changed the collection meanwhile. The person
@@ -571,10 +611,15 @@ impl SettingsSync {
             Ok(refreshed) => Self::answered(refreshed),
             Err(error) => Err(member_failure(error)),
         };
-        let still = membership
-            .candidates()
-            .is_ok_and(|candidates| candidates.contains(&device))
-            && !self.listed.is_disputed(&device.authorisation);
+        let still = if sharing_again {
+            membership
+                .held_out()
+                .is_ok_and(|held| held.contains(&device))
+        } else {
+            membership
+                .candidates()
+                .is_ok_and(|candidates| candidates.contains(&device))
+        } && !self.listed.is_disputed(&device.authorisation);
         if again.is_err() || !still {
             membership.cancel(&plan);
             return Err(again.err().unwrap_or_else(|| {

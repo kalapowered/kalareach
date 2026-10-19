@@ -22,6 +22,7 @@ import type { ReactNode, RefObject } from 'react'
 import type { DeviceMember, DevicesView } from '../host/port'
 import {
   DEVICES_CANNOT_CONFIRM,
+  DEVICES_HELD_OUT,
   DEVICES_HELP,
   DEVICES_OFFER,
   DEVICES_WAITING,
@@ -117,6 +118,33 @@ export function SettingsDevices({
                   }}
                 >
                   Share settings
+                </Button>
+              </li>
+            ))}
+          </ul>
+        </>
+      ) : null}
+      {devices.held_out.length > 0 && devices.can_confirm ? (
+        <>
+          <p className="account-note" data-testid="settings-devices-held-out-note">
+            {DEVICES_HELD_OUT}
+          </p>
+          <ul className="device-list" data-testid="settings-devices-held-out">
+            {devices.held_out.map((held) => (
+              <li className="device-row" key={held.reference}>
+                <div className="device-words">
+                  <p className="account-lead">{held.name}</p>
+                </div>
+                <Button
+                  data-wraps
+                  disabled={busy}
+                  aria-label={`Share settings with ${held.name} again`}
+                  style={{ minBlockSize: target }}
+                  onClick={() => {
+                    onShare(held.reference)
+                  }}
+                >
+                  Share again
                 </Button>
               </li>
             ))}

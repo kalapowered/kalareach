@@ -139,6 +139,10 @@ export const DEVICES_HELP =
   'Your settings can follow you to your other devices. A device your hosts list as yours is given ' +
   'the key only when you confirm here, on this computer.'
 
+/** What is said of the devices this computer took out when the person revoked them. */
+export const DEVICES_HELD_OUT =
+  'Taken out when you revoked them. Your hosts still list them, so a revoke may not have gone through.'
+
 /** The sentence a person reads first, for who shares the settings. */
 export function describeDevices(devices: DevicesView): string {
   if (devices.out) return 'This computer was taken out of the shared settings.'

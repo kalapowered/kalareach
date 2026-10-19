@@ -15,13 +15,15 @@
 //! the record into the membership lets go of it, or a step that finds no collection to take it
 //! out of.
 //!
-//! The cost is stated, not hidden: a device taken in is out of the shared settings for good on this
-//! computer. The membership keeps a revoked device's key for as long as it keeps its own records,
-//! the device is out of the collection for every device that shares it (and if another member adds
-//! it back, this computer takes it out again), and the device's keys are the same when it is paired
-//! again, so pairing it anew does not undo it. A person who revoked a device and was told the
-//! request failed can revoke it again to finish the job; nothing here brings it back into the
-//! shared settings.
+//! The cost is stated, not hidden: a device taken in is out of the shared settings until the person
+//! shares with it again. The membership keeps the revocation it was told of for as long as it keeps
+//! its own records, the device is out of the collection for every device that shares it (and if
+//! another member adds it back, this computer takes it out again), and the device's keys are the
+//! same when it is paired again, so pairing it anew does not undo it. A person who revoked a device
+//! and was told the request failed finds it on the account sheet, apart from the devices never
+//! shared with, as long as a host still lists it as unrevoked, and shares with it again there: the
+//! confirmation takes back what the membership recorded, and the hosts' answers decide the device
+//! from then on.
 //!
 //! The record is a file beside the other records of settings sync, so it is kept across a restart
 //! and seen by a second companion over the same data directory: each step takes in what it finds

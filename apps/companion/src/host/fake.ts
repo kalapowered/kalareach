@@ -1154,6 +1154,7 @@ export function fakeHost(
         waiting: false,
         members: [],
         candidates: [],
+        held_out: [],
         offers: [],
         outcomes: []
       }
@@ -2540,7 +2541,9 @@ export function fakeHost(
     },
     settingsDeviceShare: (reference) => {
       devicesAsked.push(`share ${reference}`)
-      const candidate = settings.sync.devices.candidates.find((one) => one.reference === reference)
+      const candidate =
+        settings.sync.devices.candidates.find((one) => one.reference === reference) ??
+        settings.sync.devices.held_out.find((one) => one.reference === reference)
       if (candidate === undefined) refuse('PERMISSION_DENIED', 'No host lists that device any more.')
       if (!settings.sync.devices.can_confirm) {
         refuse('UNSUPPORTED_CAPABILITY', 'This computer has no way to ask you to confirm.')
@@ -2555,7 +2558,8 @@ export function fakeHost(
               ...settings.sync.devices.members,
               { reference, name: candidate.name, this_computer: false, vouched: true }
             ],
-            candidates: settings.sync.devices.candidates.filter((one) => one.reference !== reference)
+            candidates: settings.sync.devices.candidates.filter((one) => one.reference !== reference),
+            held_out: settings.sync.devices.held_out.filter((one) => one.reference !== reference)
           }
         }
       })

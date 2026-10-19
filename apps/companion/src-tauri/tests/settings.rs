@@ -642,7 +642,8 @@ struct OwnStore {
 
 impl Computer {
     /// A client at `epoch` over the store this computer's settings sync keeps, as the application
-    /// itself reads and writes it: for a case that arranges the store as a step that stopped left it.
+    /// itself reads and writes it: for a case that arranges the store as a step that stopped left
+    /// it.
     fn client_on_its_own_store(&self, epoch: u64) -> OwnStore {
         let record = sync_record(self);
         let collection_id: SyncCollectionId =
@@ -1931,8 +1932,8 @@ async fn a_draft_is_published_sealed_once_drafts_sync_is_on_and_again_only_when_
     assert_eq!(fetched.remote.text, "a prompt to send tomorrow");
 }
 
-/// Privacy mode at a host keeps that host's drafts on this device, and the view says so. A host with
-/// it off lets them go; the colour mode, which carries no session content, goes either way.
+/// Privacy mode at a host keeps that host's drafts on this device, and the view says so. A host
+/// with it off lets them go; the colour mode, which carries no session content, goes either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_draft_of_a_host_in_privacy_mode_stays_here_until_the_host_lets_it_go() {
     let computer = Computer::new().await;
@@ -2052,9 +2053,9 @@ async fn the_drafts_of_a_host_this_computer_cannot_read_stay_here_and_the_view_s
     assert!(detail.contains("not connected"), "{detail}");
 }
 
-/// A draft another device wrote arrives as a copy kept beside this computer's own: it is never one of
-/// this computer's drafts, a version of it that was brought down is not brought down again, and a
-/// later version is another copy.
+/// A draft another device wrote arrives as a copy kept beside this computer's own: it is never one
+/// of this computer's drafts, a version of it that was brought down is not brought down again, and
+/// a later version is another copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_draft_another_device_wrote_arrives_as_a_kept_copy_and_nothing_is_sent_for_it() {
     let computer = Computer::new().await;
@@ -2117,8 +2118,8 @@ async fn a_draft_another_device_wrote_arrives_as_a_kept_copy_and_nothing_is_sent
 }
 
 /// A draft thrown away or sent is removed at the service, so its place is free and its sealed copy
-/// does not stay there. A draft that never left asks nothing of the service, and a removal owed to a
-/// host in privacy mode waits for the host.
+/// does not stay there. A draft that never left asks nothing of the service, and a removal owed to
+/// a host in privacy mode waits for the host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_draft_thrown_away_is_removed_at_the_service_when_its_host_allows_it() {
     let computer = Computer::new().await;
@@ -2571,8 +2572,9 @@ async fn a_host_that_goes_private_during_a_pass_keeps_the_drafts_that_had_not_le
 }
 
 /// A draft thrown away while its first publication is out, and whose answer is lost, still leaves
-/// nothing at the service: the answer is found by asking, it settles a note after the draft is gone,
-/// and the removal is made against that position. It is not brought back as another device's draft.
+/// nothing at the service: the answer is found by asking, it settles a note after the draft is
+/// gone, and the removal is made against that position. It is not brought back as another device's
+/// draft.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_draft_thrown_away_while_its_first_publication_is_out_leaves_nothing_at_the_service() {
     let computer = Computer::new().await;
@@ -2770,8 +2772,9 @@ async fn an_entry_left_for_a_draft_that_is_still_stored_is_dropped_and_the_draft
     );
 }
 
-/// A stale entry for a draft that is still stored is dropped by the pass that reads it, and a discard
-/// that adopts it while that pass is out at the service keeps it: the draft is removed afterwards.
+/// A stale entry for a draft that is still stored is dropped by the pass that reads it, and a
+/// discard that adopts it while that pass is out at the service keeps it: the draft is removed
+/// afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_discard_that_adopts_a_stale_entry_while_a_pass_is_out_keeps_the_removal_owed() {
     let computer = Computer::new().await;
@@ -3077,8 +3080,8 @@ fn from_other_devices(drafts: &[Value]) -> usize {
 }
 
 /// A host that reports an older privacy generation than this computer holds for it (its state was
-/// reset) is not believed: the store keeps the generation it has, so a host that says privacy mode is
-/// on would otherwise leave the store open. Nothing of that host is sent, and the others go on.
+/// reset) is not believed: the store keeps the generation it has, so a host that says privacy mode
+/// is on would otherwise leave the store open. Nothing of that host is sent, and the others go on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_host_that_reports_an_older_generation_than_this_computer_holds_is_not_believed() {
     let computer = Computer::new().await;
@@ -3664,8 +3667,8 @@ async fn a_computer_the_person_does_not_confirm_on_does_not_join() {
     );
 }
 
-/// A device is offered the settings only when a host lists all four of its keys and says it holds the
-/// right to manage the host: the pairing the owner approved is what binds a key to a device.
+/// A device is offered the settings only when a host lists all four of its keys and says it holds
+/// the right to manage the host: the pairing the owner approved is what binds a key to a device.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_a_host_lists_without_its_keys_or_the_right_to_manage_is_not_offered_the_key() {
     let (this, other) = two_computers().await;
@@ -4523,9 +4526,9 @@ async fn three_computers_sharing() -> (Computer, Computer, Computer, Page, Page,
     (this, phone_computer, tablet_computer, page, phone, tablet)
 }
 
-/// The change the first computer makes goes over what the tablet last wrote once the tablet is taken
-/// out, as the write of a device nobody believes. The phone never held that write, so it follows the
-/// change and is asked nothing, and nobody is offered what the tablet wrote.
+/// The change the first computer makes goes over what the tablet last wrote once the tablet is
+/// taken out, as the write of a device nobody believes. The phone never held that write, so it
+/// follows the change and is asked nothing, and nobody is offered what the tablet wrote.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_change_over_the_last_write_of_a_device_taken_out_asks_nobody_and_offers_it_to_nobody() {
     let (_this, _phone_computer, _tablet_computer, page, phone, tablet) =
@@ -4717,8 +4720,8 @@ async fn a_second_change_over_unreadable_settings_still_asks_the_device_that_hel
     assert_eq!(view["sync"]["conflicts"], 1, "{view}");
 }
 
-/// A change made from the settings that went over a write is still one that went over it: the device
-/// that held the write is asked when it meets either.
+/// A change made from the settings that went over a write is still one that went over it: the
+/// device that held the write is asked when it meets either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_later_change_made_from_settings_that_went_over_a_write_still_asks_the_device_that_held_it()
  {
