@@ -1383,8 +1383,8 @@ async fn an_unknown_outcome_is_never_retried_and_names_the_action_to_ask_about()
         .expect_err("an uncertain outcome");
     assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
     assert_eq!(script.actions.lock().await.len(), 1);
-    // The host's answer names no action; the client holds the identifier it recorded before it sent,
-    // and carries it with what the host said.
+    // The host's answer names no action; the client holds the identifier it recorded before it
+    // sent, and carries it with what the host said.
     let sent = script.actions.lock().await[0];
     assert!(
         matches!(&error, ClientError::OutcomeUnknown { action_id, .. } if *action_id == sent),
@@ -1405,7 +1405,8 @@ async fn an_unknown_outcome_is_never_retried_and_names_the_action_to_ask_about()
 
 /// Section 9: an action the host could not establish stays on the unresolved list until the host's
 /// own record says what became of it. A record that is applied, refused or rejected settles it; a
-/// record that says less does not; and an action its caller holds stays until the caller settles it.
+/// record that says less does not; and an action its caller holds stays until the caller settles
+/// it.
 #[tokio::test]
 async fn a_definite_record_of_an_action_nobody_knew_the_end_of_settles_it() {
     let host = side(1, true).await;
@@ -1661,7 +1662,8 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
             // position the exchange carries.
             let answered =
                 if current.and_then(|position| position.revision.0) == expected_object(expected) {
-                    // The service's own order: each applied write of an object takes the next place.
+                    // The service's own order: each applied write of an object takes the next
+                    // place.
                     let next = SyncPosition {
                         recovery: Nullable::from(recovery),
                         ..at(current.map_or(1, |position| position.write_sequence + 1))
@@ -2965,13 +2967,13 @@ impl kr_client::services::ManagedVoiceService for ForkServices {
 }
 
 /// KR-REQ-17.14: every managed service a client uses is a replaceable client, and what a client
-/// knows of its services explains availability and protects nothing. A fork puts its own client
-/// in each of the places: account login, relay leases, push, sync and backup (settings sync,
-/// managed storage and the backup manifest), and managed inference. Each call made through those places reaches the fork's client, and what the fork's
-/// service decides, here that the allowance is spent, is what the caller is told, with nothing
-/// of this library's own between them. Availability says each service is configured and claims no
-/// entitlement, and a refusal from the service leaves it as it was: it explains, and the service
-/// enforces.
+/// knows of its services explains availability and protects nothing. A fork puts its own client in
+/// each of the places: account login, relay leases, push, sync and backup (settings sync, managed
+/// storage and the backup manifest), and managed inference. Each call made through those places
+/// reaches the fork's client, and what the fork's service decides, here that the allowance is
+/// spent, is what the caller is told, with nothing of this library's own between them. Availability
+/// says each service is configured and claims no entitlement, and a refusal from the service leaves
+/// it as it was: it explains, and the service enforces.
 #[tokio::test]
 async fn a_fork_replaces_every_service_client_and_availability_only_explains_it() {
     let fork = Arc::new(ForkServices::default());

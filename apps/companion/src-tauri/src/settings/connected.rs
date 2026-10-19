@@ -228,6 +228,9 @@ pub(crate) async fn listed(session: &Arc<Session>) -> Listing {
 
 /// What the host lists of its devices, asked as a question about the connection: a refusal of it
 /// raises nothing on the session, however late it arrives, since it is the answer.
+///
+/// Every caller of [`listed_replacing`] asks this way: the visit of the Devices screen and the host
+/// lists of settings sync as much as the supervision's own question.
 async fn listed_unsignalled(session: &Arc<Session>) -> Listing {
     let params = DeviceListParams {
         include_revoked: true,

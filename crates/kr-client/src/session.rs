@@ -392,7 +392,8 @@ struct SessionState {
     events: broadcast::Sender<Notification>,
     /// True once the connection has ended, which a holder of the session may wait for.
     ended: tokio::sync::watch::Sender<bool>,
-    /// Raised each time the host refuses a request on the connection as not permitted.
+    /// Raised each time the host refuses a request on the connection as not permitted, except a
+    /// read sent with [`Session::read_unsignalled`].
     denied: tokio::sync::Notify,
     /// The requests whose refusal is not raised: those a holder asks to learn whether the host
     /// withdrew the connection, whose refusal is its answer and not a new question.
@@ -830,8 +831,8 @@ impl Session {
 
         // The registry decides whether this method needs the connection's freshness resource. A
         // method whose entry does not name one still carries the current window: the host derives
-        // the accepted deadline from whichever bound is earliest, and a window it did not need costs
-        // nothing.
+        // the accepted deadline from whichever bound is earliest, and a window it did not need
+        // costs nothing.
         let action_window_id = {
             let window = self.state.action_window.lock().await;
             if entry.freshness == FreshnessRequirement::ActionWindow
@@ -921,8 +922,9 @@ impl Session {
     /// It takes the connection's current action window, as [`Session::mutate`] does, and returns
     /// the whole request: the action identifier the caller chose, the window's identity and the
     /// requested time to live. Nothing is recorded in this session's book and nothing leaves, so a
-    /// caller can write its own record of the attempt first and send afterwards ([`Session::send`]),
-    /// and can ask the host again with exactly this request ([`Session::repeat`]).
+    /// caller can write its own record of the attempt first and send afterwards
+    /// ([`Session::send`]), and can ask the host again with exactly this request
+    /// ([`Session::repeat`]).
     ///
     /// The identifier is the caller's because a caller may have to name it before it exists: an
     /// owner's confirmation of a transfer is asked for the action that will spend it.
@@ -1280,7 +1282,8 @@ impl Session {
         let _ = ended.wait_for(|ended| *ended).await;
     }
 
-    /// Resolves when the host refuses a request on this connection as not permitted.
+    /// Resolves when the host refuses a request on this connection as not permitted, except a read
+    /// sent with [`Self::read_unsignalled`], whose refusal raises nothing.
     ///
     /// A holder that owns the connection uses it to ask the host again, over another connection,
     /// whether it was the connection the host refused: a host that has withdrawn what a connection

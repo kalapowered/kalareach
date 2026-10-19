@@ -1606,8 +1606,8 @@ async fn a_connection_the_host_withdrew_is_replaced_whichever_way_the_applicatio
 
     the_owner_at_the_machine_revokes_the_paired_device(&rig).await;
 
-    // The host keeps the connection and refuses what is asked over it, which is its way of saying to
-    // open another. A request made straight over the session, as any path of the application may
+    // The host keeps the connection and refuses what is asked over it, which is its way of saying
+    // to open another. A request made straight over the session, as any path of the application may
     // make one, is refused so; the application then takes up another connection of its own.
     let refused = first
         .read::<_, HostInfoResult>(Method::HostInfo, &json!({}))
@@ -1639,8 +1639,9 @@ async fn a_connection_the_host_withdrew_is_replaced_whichever_way_the_applicatio
         1,
         "once for one withdrawal"
     );
-    // One withdrawal asked the host one question, over one other connection: what the question was
-    // itself refused, over the connection it asked about, was not another.
+    // One withdrawal opened one other connection to ask the host. The refusal of the question
+    // itself is not a second withdrawal: the client's own case of a read sent apart from the
+    // signal holds that, and this one that the application opens no second connection for it.
     assert_eq!(
         reopens.load(std::sync::atomic::Ordering::SeqCst),
         1,
