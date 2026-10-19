@@ -1973,7 +1973,8 @@ impl DraftSync {
     /// - **refused** settles it as a write that did not replace the draft, records the copy the
     ///   service kept of it, and brings down what the service holds instead, beside the draft;
     /// - **no receipt** leaves it counted while its generation is in force, and past that
-    ///   generation it is fenced in the same pass;
+    ///   generation it is fenced in the same pass, as is one whose bytes were sealed under another
+    ///   key epoch than this half writes under, which is never attempted again;
     /// - **fenced** ends it, with no account where the service says nothing ran and with the
     ///   account kept where it cannot say so.
     ///
