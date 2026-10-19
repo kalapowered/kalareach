@@ -554,9 +554,11 @@
         "version": 1,
         "migrates_from": 1
       },
-      "digest": "d6114325ecb0681bd851c105d9fdd0f46488862f8db02a0cb529e3f3c8cd7e00",
+      "digest": "a9274c43aed9bb17686bb5e4b86e1ec2fbec7c7a154efb44fd55ccecc8fae92e",
       "kept": [
-        "WorkflowActionKind"
+        "WorkflowActionKind",
+        "ProcessStartIdentity",
+        "BootIdentity"
       ]
     },
     {
@@ -788,6 +790,14 @@
       "children": [],
       "opaque": true,
       "databases": false
+    },
+    {
+      "scope": "environment",
+      "path": "workflow-scratch",
+      "reason": "the directories a workflow's commands run in, one for each node and removed when its row in the resource ledger is released; what a command writes there is its own",
+      "children": [],
+      "opaque": true,
+      "databases": true
     },
     {
       "scope": "state_root",
