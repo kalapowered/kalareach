@@ -369,10 +369,10 @@ pub(super) async fn fake_world_on(
     fake_world_with(clocks, false, serve).await
 }
 
-/// The same world with the daemon's record already saying that the worker does not take what the
-/// host's local owner may do, as it says once the daemon has reached a worker that does not. A
-/// worker the daemon has not reached is one its publisher goes to by itself, so the record is made
-/// before the worker is listed and not after.
+/// The same world with the worker on the daemon's record as one it sends no statement of what the
+/// host's local owner may do, which its publisher then skips. A worker the daemon has not reached
+/// is one its publisher goes to by itself, so the record is made before the worker is listed and
+/// not after.
 pub(super) async fn fake_world_reached(
     serve: impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()>,
 ) -> Silent {
