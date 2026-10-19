@@ -109,7 +109,8 @@ describe('revoking a device', () => {
     controls.revocation.stand('studio', 'the-phone', {
       state: 'acknowledged',
       at_ms: Date.UTC(2026, 9, 18, 9, 40),
-      pending_workers: 2
+      pending_workers: 2,
+      host_lists_revoked: true
     })
     await person.click(screen.getByTestId('devices-refresh'))
     await waitFor(() => {
@@ -128,6 +129,29 @@ describe('revoking a device', () => {
     })
     // A person who cannot see the row hears it too.
     expect(screen.getByTestId('devices-heard')).toHaveTextContent('the-phone is revoked')
+  })
+
+  it('tells a person to revoke at the host when the host acknowledged and its own list does not bear it out', async () => {
+    screenOf(
+      view([
+        host({
+          devices: [
+            device('the-phone', {
+              state: 'acknowledged',
+              at_ms: Date.UTC(2026, 9, 18, 9, 40),
+              pending_workers: null,
+              host_lists_revoked: false
+            })
+          ]
+        })
+      ])
+    )
+    const row = await rowOf('the-phone')
+    expect(within(row).getByText('Acknowledged')).toBeInTheDocument()
+    expect(within(row).getByTestId('devices-standing')).toHaveTextContent(
+      'Its own list does not show the device as revoked. Revoke it at the host.'
+    )
+    expect(within(row).queryByText('Revoked')).not.toBeInTheDocument()
   })
 
   it('is named for the ceremony this computer offers, and is not offered without one', async () => {
@@ -225,7 +249,12 @@ describe('revoking a device', () => {
       route: 'direct',
       feed: null,
       devices: [
-        device('the-phone', { state: 'acknowledged', at_ms: Date.UTC(2026, 9, 18, 9, 40), pending_workers: 1 })
+        device('the-phone', {
+          state: 'acknowledged',
+          at_ms: Date.UTC(2026, 9, 18, 9, 40),
+          pending_workers: 1,
+          host_lists_revoked: true
+        })
       ]
     })
     const { port } = screenOf(view([local]))

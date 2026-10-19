@@ -675,7 +675,13 @@ export type RevocationStanding =
   | { readonly state: 'active' }
   | { readonly state: 'revoked' }
   | { readonly state: 'sent'; readonly at_ms: number; readonly host_lists_revoked: boolean }
-  | { readonly state: 'acknowledged'; readonly at_ms: number; readonly pending_workers: number | null }
+  | {
+      readonly state: 'acknowledged'
+      readonly at_ms: number
+      readonly pending_workers: number | null
+      /** Whether the host's own list shows the device as revoked. A host that acknowledged and does not contradicts its feed. */
+      readonly host_lists_revoked: boolean
+    }
   | { readonly state: 'done'; readonly at_ms: number }
   | { readonly state: 'refused'; readonly reason: RevocationRefusal }
 

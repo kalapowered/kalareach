@@ -483,7 +483,8 @@ one on this computer first. A card says how requests reach its host. For a host 
 feed it also says what the feed holds: when the host last acknowledged a request, how many requests
 wait for it, and whether the feed removed it. Each device has a row that says in words where its
 revocation stands, with a badge for sent, acknowledged, revoked or refused. A request that has not
-been acknowledged is never called revoked.
+been acknowledged is never called revoked. An acknowledgement that the host's own list does not bear
+out is shown as acknowledged, and the row tells the person to revoke the device at the host.
 
 The control is named for this computer's ceremony: "Revoke with Touch ID", "Revoke with your
 password" or "Revoke with Windows Hello". The row asks no second question, because the system's

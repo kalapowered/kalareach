@@ -58,7 +58,8 @@ const EVERYTHING = {
       devices: [
         device('a', LONG_NAME + '-phone', { state: 'active' }),
         device('b', 'the-tablet', { state: 'sent', at_ms: AT, host_lists_revoked: true }),
-        device('c', 'the-watch', { state: 'acknowledged', at_ms: AT, pending_workers: 3 }),
+        device('c', 'the-watch', { state: 'acknowledged', at_ms: AT, pending_workers: 3, host_lists_revoked: true }),
+        device('j', 'the-pad', { state: 'acknowledged', at_ms: AT, pending_workers: null, host_lists_revoked: false }),
         device('d', 'the-laptop', { state: 'done', at_ms: AT }, { platform: 'macos' }),
         device('e', 'the-old-phone', { state: 'refused', reason: 'unknown_target' }),
         device('f', 'the-spare', { state: 'revoked' }, { platform: 'android' }),
@@ -98,7 +99,9 @@ const EVERYTHING = {
       host_synchronised_at_ms: null,
       host_feed_stale: false,
       feed: null,
-      devices: [device('i', 'the-phone', { state: 'acknowledged', at_ms: AT, pending_workers: null })]
+      devices: [
+        device('i', 'the-phone', { state: 'acknowledged', at_ms: AT, pending_workers: null, host_lists_revoked: true })
+      ]
     }
   ]
 } as const
@@ -149,6 +152,7 @@ for (const [size, face] of [
     // Every standing is said in its row, and none is called revoked but the one the host acknowledged.
     await expect(page.getByTestId('devices-device').filter({ hasText: 'the-tablet' })).toContainText('Sent')
     await expect(page.getByTestId('devices-device').filter({ hasText: 'the-watch' })).toContainText('Acknowledged')
+    await expect(page.getByTestId('devices-device').filter({ hasText: 'the-pad' })).toContainText('Revoke it at the host')
     await expect(page.getByTestId('devices-device').filter({ hasText: 'the-laptop' })).toContainText('Revoked')
     await expect(page.getByTestId('devices-device').filter({ hasText: 'the-old-phone' })).toContainText('Refused')
     expect(await overrunning(page, '[data-testid="devices-host"]')).toEqual([])

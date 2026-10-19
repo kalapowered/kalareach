@@ -114,14 +114,18 @@ export function describeStanding(
       return standing.host_lists_revoked ? `${sent} It already lists the device as revoked.` : sent
     }
     case 'acknowledged': {
-      const when = momentOf(standing.at_ms, now)
+      const who = host.route === 'direct' ? "This computer's host recorded it" : `${host.name} acknowledged it`
+      const at = `${who} ${momentOf(standing.at_ms, now)}`
+      // A host that has not said how many sessions are left has not said that none are.
       const stopped =
-        standing.pending_workers === null
-          ? 'some of its sessions had not stopped yet'
-          : `${sessions(standing.pending_workers)} had not stopped yet`
-      return host.route === 'direct'
-        ? `This computer's host recorded it ${when}, and ${stopped}.`
-        : `${host.name} acknowledged it ${when}, and ${stopped}.`
+        standing.pending_workers !== null
+          ? `, and ${sessions(standing.pending_workers)} had not stopped yet`
+          : standing.host_lists_revoked
+            ? ', and has not said that every session stopped'
+            : ''
+      return standing.host_lists_revoked
+        ? `${at}${stopped}.`
+        : `${at}${stopped}. Its own list does not show the device as revoked. Revoke it at the host.`
     }
     case 'done':
       return host.route === 'direct'
@@ -254,7 +258,11 @@ export function announcements(before: RevocationView | null, after: RevocationVi
           said.push(`${device.name} is revoked: ${host.name} acknowledged it.`)
           break
         case 'acknowledged':
-          said.push(`${host.name} acknowledged the revocation of ${device.name}, and some sessions have not stopped.`)
+          said.push(
+            device.standing.host_lists_revoked
+              ? `${host.name} acknowledged the revocation of ${device.name}, and some sessions have not stopped.`
+              : `${host.name} acknowledged the revocation of ${device.name}, but its own list does not show it revoked.`
+          )
           break
         case 'refused':
           said.push(`${host.name} refused the request to revoke ${device.name}.`)
