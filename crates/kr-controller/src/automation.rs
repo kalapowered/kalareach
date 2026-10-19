@@ -3226,6 +3226,58 @@ mod tests {
         assert!(outside.exists(), "a path outside the root is never removed");
     }
 
+    /// A worker a closure could not account for is gone when the boot it ran in has ended, or when
+    /// the kernel says the process that was recorded has. One that is still running in the same
+    /// boot is not, and a row that recorded neither says nothing.
+    #[test]
+    fn a_worker_is_gone_when_its_boot_or_its_process_has_ended() {
+        use kr_protocol::identity::{BootIdentity, BootIdentitySource};
+
+        let boot = |byte: u8| BootIdentity {
+            source: BootIdentitySource::LinuxBootId,
+            value: kr_protocol::scalars::Bytes::new(vec![byte; 4]),
+        };
+        let row = |worker, boot| Owned {
+            action_id: kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes(
+                [1; 16],
+            )),
+            run_id: kr_protocol::ids::WorkflowRunId::new(kr_protocol::scalars::Uuid::from_bytes(
+                [2; 16],
+            )),
+            node_id: "command".to_owned(),
+            kind: WorkflowActionKind::ShellCommand,
+            grant_id: GrantId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16])),
+            owns_session: true,
+            materialisation_id: None,
+            scratch: None,
+            scratch_identity: None,
+            workspace_id: None,
+            session_id: None,
+            worker,
+            boot,
+            state: OwnedState::Open,
+        };
+        let running = kr_ipc::identity::current_process_start_identity().expect("this process");
+        let ended = kr_ipc::identity::ended_process_identity(u32::MAX - 1);
+
+        assert!(
+            !worker_has_ended(&row(Some(running.clone()), Some(boot(1))), &boot(1)),
+            "a worker still running in the same boot is not gone"
+        );
+        assert!(
+            worker_has_ended(&row(Some(running), Some(boot(1))), &boot(2)),
+            "a worker of an earlier boot is gone with that boot"
+        );
+        assert!(
+            worker_has_ended(&row(Some(ended), Some(boot(1))), &boot(1)),
+            "a worker the kernel says has ended is gone"
+        );
+        assert!(
+            !worker_has_ended(&row(None, None), &boot(1)),
+            "a row that recorded neither says nothing"
+        );
+    }
+
     #[test]
     fn every_method_of_the_group_is_reachable_from_a_local_caller() {
         use kr_protocol::actor::ActorIngress;
