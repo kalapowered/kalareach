@@ -674,10 +674,10 @@ pub fn watch_settings<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 
 /// Lets this computer take part in settings sync, on `identity`'s keys and secure store and the
 /// sync service the setting names, with its records under the data directory the settings were
-/// opened with. The drafts of this computer's
-/// draft desk travel in the same collection when the person turns that on, `hosts` says what this
-/// computer can read of each host's privacy mode and which devices each lists, and `ceremony` is
-/// what adding a device to the settings and joining them ask the person to complete.
+/// opened with. The drafts of this computer's draft desk travel in the same collection when the
+/// person turns that on, `hosts` says what this computer can read of each host's privacy mode and
+/// which devices each lists, and `ceremony` is what adding a device to the settings and joining
+/// them ask the person to complete.
 ///
 /// # Errors
 ///

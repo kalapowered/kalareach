@@ -283,8 +283,9 @@ mod tests {
     }
 
     /// A revocation this computer is about to send is held in full or not at all: a record that
-    /// cannot be written holds nothing, since the request is not sent, and what is not sent must
-    /// not leave the device out of the shared settings.
+    /// cannot be read or written (here a directory stands where it would be) holds nothing, since
+    /// the request is not sent, and what is not sent must not leave the device out of the shared
+    /// settings.
     #[test]
     fn a_hold_that_cannot_be_written_holds_nothing() {
         let directory = tempfile::tempdir().expect("a directory");

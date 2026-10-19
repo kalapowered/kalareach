@@ -100,11 +100,6 @@ use serde::{Deserialize, Serialize};
 mod fence;
 mod members;
 
-/// Whether the settings kept under `data` hold a membership of a collection.
-pub(super) fn holds_membership(data: &Path) -> bool {
-    kr_client::sync::membership::holds_membership(&data.join(DIRECTORY).join(MEMBERSHIP))
-}
-
 pub use fence::Fence;
 use members::{Ask, Listed};
 pub use members::{Candidate as DeviceCandidate, DevicesView, Happened, Member, Offer};
@@ -113,6 +108,11 @@ use super::{ColourMode, Hosts, LocalSettings};
 use crate::error::{CommandError, Result};
 use crate::recovery::{DeviceSigner, now};
 use crate::sync_service::{SyncService, SyncServiceView, host_of};
+
+/// Whether the settings kept under `data` hold a membership of a collection.
+pub(super) fn holds_membership(data: &Path) -> bool {
+    kr_client::sync::membership::holds_membership(&data.join(DIRECTORY).join(MEMBERSHIP))
+}
 
 /// The scope in the device's secure store that the collection's keys are kept under.
 pub const SCOPE: &str = "settings-sync";
@@ -394,8 +394,7 @@ pub struct SettingsSync {
     offered: Mutex<Vec<CollectionRef>>,
     /// Whether the settings the service holds are sealed under keys this computer has not been given.
     waiting: std::sync::atomic::AtomicBool,
-    /// The revocations that the membership has not recorded, which hold back
-    /// everything sent.
+    /// The revocations that the membership has not recorded, which hold back everything sent.
     fence: Arc<Fence>,
 }
 
