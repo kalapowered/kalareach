@@ -4325,7 +4325,12 @@ fn run_from_another_task(
                 },
             )
             .await
-            .expect("the call reaches the daemon")
+            .unwrap_or_else(|error| {
+                Err(ProtocolError::new(
+                    ErrorCode::OutcomeUnknown,
+                    format!("the daemon did not answer: {error}"),
+                ))
+            })
     })
 }
 
