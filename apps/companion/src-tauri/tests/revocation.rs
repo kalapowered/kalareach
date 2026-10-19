@@ -1515,32 +1515,104 @@ async fn the_owner_at_the_machine_revokes_the_paired_device(rig: &Rig) {
     .expect("the owner at the machine revokes the device");
 }
 
+/// Ends the task that keeps the application's connection to the host when a case ends, so that
+/// nothing tries the host's endpoint after it is gone.
+struct EndsTheKeeper<'a>(tauri::State<'a, AppState>);
+
+impl Drop for EndsTheKeeper<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.choose_host("a case is over", |_| {
+            Ok(tauri::async_runtime::spawn(async {}))
+        });
+    }
+}
+
+/// The application's own keeping of its connection to the host on this machine, with this rig's
+/// host in place of the user's: the connection is reached, and reached again when it ends.
+async fn keeps_its_connection(rig: &Rig) -> EndsTheKeeper<'_> {
+    use companion_tauri::connection::Attempt;
+
+    let endpoint = rig.host.endpoint().clone();
+    companion_tauri::connection::reach_host_on_this_machine(rig.app.app.handle(), move || {
+        let endpoint = endpoint.clone();
+        async move {
+            let reopen: companion_tauri::connection::Reopen = Arc::new({
+                let endpoint = endpoint.clone();
+                move || {
+                    let endpoint = endpoint.clone();
+                    Box::pin(async move { local_connection(&endpoint).await })
+                }
+            });
+            match local_connection(&endpoint).await {
+                Ok(connection) => Attempt::Reached(connection.reopening(reopen)),
+                Err(error) => Attempt::Failed(error),
+            }
+        }
+    })
+    .expect("the choice of the host is made");
+    let keeper = EndsTheKeeper(rig.app.app.state::<AppState>());
+    eventually("the host is reached", || keeper.0.session().ok()).await;
+    keeper
+}
+
+/// Waits until `found` gives a value, or the watchdog runs out.
+async fn eventually<T>(what: &str, mut found: impl FnMut() -> Option<T>) -> T {
+    let deadline = tokio::time::Instant::now() + WATCHDOG;
+    loop {
+        if let Some(value) = found() {
+            return value;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what} did not happen"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_command_the_host_refuses_on_a_connection_it_withdrew_replaces_that_connection() {
+async fn a_connection_the_host_withdrew_is_replaced_whichever_way_the_application_was_refused_on_it()
+ {
+    use kr_protocol::hostinfo::HostInfoResult;
+    use kr_protocol::method::Method;
+
     let rig = Rig::start().await;
     rig.host_polls().await;
-    let held = held_connection(&rig).await;
+    let _keeper = keeps_its_connection(&rig).await;
     let state = rig.app.app.state::<AppState>();
-    rig.app
-        .call("host_info", json!({}))
+    let first = state.session().expect("connected");
+    let _: HostInfoResult = first
+        .read(Method::HostInfo, &json!({}))
+        .await
         .expect("the host answers on the connection it admitted");
 
     the_owner_at_the_machine_revokes_the_paired_device(&rig).await;
 
-    // The host refuses what is asked over the connection it withdrew, which is its way of saying to
-    // open another, and the application does: the next command goes through.
-    let refused = rig
-        .app
-        .call("host_info", json!({}))
+    // The host keeps the connection and refuses what is asked over it, which is its way of saying to
+    // open another. A request made straight over the session, as any path of the application may
+    // make one, is refused so; the application then takes up another connection of its own.
+    let refused = first
+        .read::<_, HostInfoResult>(Method::HostInfo, &json!({}))
+        .await
         .expect_err("the host refuses a connection it withdrew");
-    assert_eq!(refused["code"], "PERMISSION_DENIED", "{refused}");
+    assert!(
+        matches!(refused, kr_client::ClientError::Host(ref refusal) if refusal.code == kr_protocol::error::ErrorCode::PermissionDenied),
+        "{refused:?}"
+    );
+    let second = eventually("the application holds a connection the host admits", || {
+        state
+            .session()
+            .ok()
+            .filter(|session| !Arc::ptr_eq(session, &first))
+    })
+    .await;
+    let _: HostInfoResult = second
+        .read(Method::HostInfo, &json!({}))
+        .await
+        .expect("the connection the application then holds is one the host admits");
     rig.app
         .call("host_info", json!({}))
-        .expect("the connection the application then holds is one the host admits");
-    assert!(
-        !Arc::ptr_eq(&state.session().expect("connected"), &held.session()),
-        "the application no longer holds the connection the host withdrew"
-    );
+        .expect("a command goes through on it");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1562,4 +1634,40 @@ async fn a_view_of_the_hosts_replaces_a_connection_the_host_withdrew_before_anyt
     rig.app
         .call("host_info", json!({}))
         .expect("the first command after the view goes through");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_view_over_a_copy_of_a_connection_that_was_replaced_still_lists_the_host() {
+    let rig = Rig::start().await;
+    rig.host_polls().await;
+    let held = held_connection(&rig).await;
+    let state = rig.app.app.state::<AppState>();
+    // What a revocation holds while the person is at the ceremony: a copy of the connection.
+    let copy = state.connection().expect("connected");
+
+    the_owner_at_the_machine_revokes_the_paired_device(&rig).await;
+    // Another look at the hosts replaces the connection, which ends the one the copy is.
+    assert_eq!(host_by(&rig.view().await, "direct")["contact"], "answered");
+    assert!(
+        !Arc::ptr_eq(&state.session().expect("connected"), &held.session()),
+        "the application holds another connection"
+    );
+
+    let mut context = state.revocation_context();
+    context.local = Some(copy);
+    let view = state
+        .revocations()
+        .expect("revocations")
+        .view(&context)
+        .await;
+    let direct = view
+        .hosts
+        .iter()
+        .find(|host| host.route == companion_tauri::revocation::Route::Direct)
+        .expect("the host on this computer");
+    assert_eq!(
+        direct.contact,
+        companion_tauri::revocation::Contact::Answered,
+        "a connection that ended says nothing of the host"
+    );
 }
