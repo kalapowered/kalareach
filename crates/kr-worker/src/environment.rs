@@ -560,6 +560,31 @@ mod tests {
         assert_eq!(built.sources.path, EnvironmentSource::CreatorSnapshot);
     }
 
+    /// KR-REQ-07.17: `SHELL` names the executable the session launched, whatever login shell the
+    /// creator had and whatever an execution context supplies.
+    #[test]
+    fn shell_names_the_launched_executable_and_not_the_creators() {
+        let mut context = ExecutionContext::default();
+        context
+            .variables
+            .insert("SHELL".to_owned(), "/bin/sh".to_owned());
+        for context in [&ExecutionContext::default(), &context] {
+            let built = build(
+                &snapshot(&[("SHELL", "/usr/bin/fish"), ("PATH", "/usr/bin")]),
+                EnvironmentOrigin::CreatorSnapshot,
+                &[],
+                context,
+                "/opt/kalareach/shells/zsh",
+                "0.1.0",
+                test_session(),
+            );
+            assert_eq!(
+                built.variables.get("SHELL").map(String::as_str),
+                Some("/opt/kalareach/shells/zsh")
+            );
+        }
+    }
+
     #[test]
     fn connection_facts_that_describe_the_environment_are_kept() {
         let built = build(
