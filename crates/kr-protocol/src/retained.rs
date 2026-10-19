@@ -301,9 +301,11 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
         Compatible {
             at: "SessionSummary.root",
             reason: "A member that is absent from the wire for the interactive shell every other \
-                     session has, so a summary of such a session is what the retained level \
-                     reads. A session whose root is a command is described by the worker that \
-                     runs it, which is not of the retained level.",
+                     session has. Summaries travel from a worker to the daemon, and a worker of \
+                     the retained level never writes this member, so this build's daemon reads \
+                     what it writes as a session whose root is a shell. A summary that carries \
+                     the member is written only by a worker of this build, for a session it was \
+                     started to run a command in.",
         },
     ],
 )

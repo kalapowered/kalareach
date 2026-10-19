@@ -161,17 +161,27 @@ session its first attempt made and is never a second one; and the digest that to
 covers only what stays the same for the node. The grant, with the rights above, and the moment the
 engine stops waiting for the node are checked at the launch transition under the registry guard,
 where the session comes into being, and again when the worker claims its launch, which is when the
-command is released to start: a grant withdrawn, or a wait that ended, in between starts nothing.
+program is released to start: a grant withdrawn, a wait that ended, or a run cancelled, in between
+starts nothing. A command also carries the moment after which it may not start, the earlier of the
+node's wait and the grant's own end (its expiry, an organisation lease, a bounded offline
+validity), and the worker checks it where the process is created, after everything it prepares.
 The chain's session allowance is spent for each node that creates a session, a command's included.
 
 A `create_session` node creates a session through `session.create`'s own parameters and leaves it
-running; the session is the node's output and belongs to whoever uses it afterwards. A node asked
-to stop cannot stop it, so it is left unknown.
+running; the session is the node's output and belongs to whoever uses it afterwards. The create
+runs on a task of the daemon's own, so a node whose wait ends in the middle of it leaves no
+half-made reservation. A node asked to stop before its session has been admitted at the launch
+transition stops, and makes none; once the session has been admitted it stays, and the node is
+left unknown.
 
 A `shell_command` node runs its command as the root of a session of its own: the worker runs the
 command line through `/bin/sh -c`, with no login or interactive startup and with `SHELL` naming
 that interpreter, in the workspace the definition's scope names (a shared checkout only because
-the definition named it) or in a private directory made for the node. Standard input is the
+the definition named it) or in a private directory made for the node. A workspace is opened the way
+a capture opens it, so a tree that was moved, removed or replaced since the project service
+recorded it is refused and the node pauses, and the worker refuses a directory that is not there
+instead of running the command somewhere else. The directory is verified when the command is
+accepted; one swapped in the moments after that is not detected. Standard input is the
 session's terminal, so a command that reads it waits for a person or for the node's wait. The
 result is how the root ended, as this host recorded it: a command that exits zero succeeds; one
 that exits with another status, or is ended by a signal, fails and says which; a session that was
@@ -185,10 +195,19 @@ When the node's wait or its run's deadline passes, or its run is cancelled, the 
 is closed and the node settles cancelled, which says the host stopped asking and nothing about
 what the command did. Everything a command node owns outside the journal (its session, its
 directory, the run's hold on its workspace) is written down in a ledger of its own before any of
-it is made, and released once the session's closure accounts for its worker. A dispatch owns its
-row while it runs; after a restart, or when a dispatch ends without releasing, a sweep closes the
-session, removes the directory, ends the hold and releases the row, without waiting for the run to
-end. The ledger is a store of its own beside the journal, so a release that does not know it reads
+it is made, and released once the session's closure accounts for its worker. A node's private
+directory is made for it alone, its identity is written down before the command can start, and it
+is removed only while it still has that identity; a directory that was never identified is removed
+only when it is empty. A dispatch owns its row while it runs; after a restart, or when a dispatch
+ends without releasing, a sweep closes the session, removes the directory, ends the hold and
+releases the row, without waiting for the run to end. A run holds a workspace once, however many of
+its nodes ran there, and the hold ends with the last of them; a paused run does not keep a
+workspace between its nodes. A closure that could not account for the worker keeps the row until
+the kernel says the worker's process has ended or the boot it ran in has, and the sweep looks again
+less and less often while a row stays owed. What the worker could not account for stays outside
+the release: a process the command started that left the session's boundary can outlive it, and
+where the platform gives incomplete coverage of owned processes (always on macOS) the closure says
+so. The ledger is a store of its own beside the journal, so a release that does not know it reads
 the journal as before.
 
 The host carries out the change-set nodes against the environment's own change-set service. A
@@ -199,9 +218,8 @@ records the run that asked for it, whatever the document said, so evidence a lat
 bound to the execution that made it. The node's receipt carries the captured version, or the
 version and the materialisation that holds it.
 
-Every registered action kind this host does not carry out yet (`run_tests`, `request_review`,
-`attention_notice` and `apply_diff`, and the command kinds on a platform without a POSIX shell) is
-refused by name. A refusal is not an uncertain outcome: nothing was dispatched and nothing was
+`run_tests`, `request_review`, `attention_notice` and `apply_diff`, and the command kinds on a
+platform without a POSIX shell, are refused by name. A refusal is not an uncertain outcome: nothing was dispatched and nothing was
 made on the way to refusing it, so the node failed and its dependants see a failure rather than a
 result nobody produced.
 

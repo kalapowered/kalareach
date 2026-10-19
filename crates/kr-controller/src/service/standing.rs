@@ -539,6 +539,61 @@ impl Controller {
             .map(|intersection| intersection.rights)
     }
 
+    /// Decides a workflow's grant like [`Self::decide_for_workflow`], and answers how long it
+    /// stands from the moment of the answer, on the continuous clock.
+    ///
+    /// The end is the earliest of three: the grant's own expiry as this boot anchored it, the
+    /// organisation lease the decision was taken under, and the bounded offline validity it was
+    /// taken under. It is for a caller that starts something at a later moment than it asks, and
+    /// holds that moment to the authority's end as well as to its own wait. `None` says the
+    /// decision stood on no end.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::decide_for_workflow`].
+    pub(crate) fn decide_for_workflow_until(
+        &self,
+        record: &crate::grants::GrantRecord,
+        ingress: kr_protocol::actor::ActorIngress,
+        now_ms: u64,
+        read_at: kr_transport::clock::ContinuousInstant,
+    ) -> kr_automation::Result<(
+        CanonicalSet<kr_protocol::rights::ActionRight>,
+        Option<std::time::Duration>,
+    )> {
+        let intersection = self.decide_standing(record, ingress, now_ms, read_at, Anchor::Host)?;
+        let own = match self.grant_anchor(record) {
+            Ok(net::lifetimes::Anchored::Until(end)) => Some(end),
+            Ok(net::lifetimes::Anchored::Unlimited) => None,
+            // Run out between the decision and this look: it ends now.
+            Ok(net::lifetimes::Anchored::Over) => Some(self.clock.now()),
+            Err(error) => {
+                return Err(kr_automation::AutomationError::AuthorityUnavailable(
+                    error.to_string(),
+                ));
+            }
+        };
+        let end = [
+            own,
+            intersection
+                .lease
+                .as_ref()
+                .and_then(crate::grants::policy::HeldBound::continuous_deadline),
+            intersection
+                .offline
+                .as_ref()
+                .and_then(crate::grants::policy::HeldBound::continuous_deadline),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let now = self.clock.now();
+        Ok((
+            intersection.rights,
+            end.map(|end| end.saturating_duration_since(now)),
+        ))
+    }
+
     /// Decides whether a paired device's pairing grant stands under this host's policy, for a
     /// request decided under a share the device holds, and returns what it was decided under.
     ///

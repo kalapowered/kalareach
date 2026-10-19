@@ -76,7 +76,7 @@ struct Host {
     endpoint: kr_ipc::paths::Endpoint,
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
     /// The rendezvous of a daemon that starts workers.
-    rendezvous: Option<tokio::task::JoinHandle<kr_controller::error::Result<()>>>,
+    _rendezvous: Option<tokio::task::JoinHandle<kr_controller::error::Result<()>>>,
     work: tempfile::TempDir,
 }
 
@@ -154,7 +154,7 @@ async fn host_on(clocks: Clocks) -> Host {
         environment_id,
         endpoint,
         clients,
-        rendezvous: None,
+        _rendezvous: None,
         work: tempfile::TempDir::new().expect("a working directory on the internal disk"),
     }
 }
@@ -255,7 +255,7 @@ async fn working_host_on(
         environment_id,
         endpoint,
         clients,
-        rendezvous: Some(rendezvous),
+        _rendezvous: Some(rendezvous),
         work: tempfile::TempDir::new().expect("a working directory on the internal disk"),
     }
 }
@@ -332,7 +332,7 @@ async fn working_host_apart() -> (Host, Apart) {
             environment_id,
             endpoint,
             clients,
-            rendezvous: Some(rendezvous),
+            _rendezvous: Some(rendezvous),
             work: tempfile::TempDir::new().expect("a working directory on the internal disk"),
         },
         Apart {
@@ -2598,6 +2598,12 @@ async fn a_workflow_grant_is_held_to_the_offline_bound_on_the_continuous_clock()
     );
     let grants = HostGrants::for_daemon(&host.controller);
     grants.grant(grant.grant_id, T).expect("inside the bound");
+    // The bound is an end the grant stands on, and a command that starts later than the node
+    // asks is held to it.
+    let (_, ends_in) = grants
+        .grant_standing(grant.grant_id, T)
+        .expect("inside the bound");
+    assert_eq!(ends_in, Some(std::time::Duration::from_millis(200)));
 
     // The control: a hundred milliseconds on both clocks, still inside the bound.
     continuous.advance(std::time::Duration::from_millis(100));
@@ -2605,6 +2611,10 @@ async fn a_workflow_grant_is_held_to_the_offline_bound_on_the_continuous_clock()
     grants
         .grant(grant.grant_id, T + 100)
         .expect("inside the bound a hundred milliseconds on");
+    let (_, ends_in) = grants
+        .grant_standing(grant.grant_id, T + 100)
+        .expect("inside the bound a hundred milliseconds on");
+    assert_eq!(ends_in, Some(std::time::Duration::from_millis(100)));
 
     // Two hundred more on the continuous clock, and the wall clock wound back five seconds. The
     // host's floor holds UTC at T + 100, inside the bound, so only the continuous clock can refuse.
@@ -3670,6 +3680,16 @@ async fn a_workflow_under_a_stored_grant_stops_when_either_deadline_passes() {
     grants
         .grant(by_continuous.grant_id, T)
         .expect("the control: before either deadline");
+    // A grant that expires is an end it stands on: a command that starts later than the node asks
+    // is held to the earlier of that and its own wait.
+    let (_, ends_in) = grants
+        .grant_standing(by_continuous.grant_id, T)
+        .expect("before the deadline");
+    assert_eq!(ends_in, Some(std::time::Duration::from_secs(120)));
+    let (_, ends_in) = grants
+        .grant_standing(by_utc.grant_id, T)
+        .expect("before the deadline");
+    assert_eq!(ends_in, Some(std::time::Duration::from_secs(60)));
 
     // UTC runs past the first grant's expiry while the continuous clock moves one second.
     continuous.advance(std::time::Duration::from_secs(1));
@@ -3829,9 +3849,9 @@ async fn an_owner_managed_workflow_runs_under_a_members_organisation_grant_while
         .expect("the lease installs and binds the device");
     install(&mut control, &host, &document).await;
 
-    // The role ceiling carries no right to create a session, and a node that runs a command needs
-    // that right beside the right to type, so no node of that kind is installed under the member's
-    // grant, whatever the grant says.
+    // A node that runs a command needs the right to create a session beside the right to type,
+    // and the member's grant carries neither (nor does any role ceiling), so no node of that kind
+    // is installed under it.
     let command = definition(
         workflow_id(28),
         grant.grant_id,
@@ -3863,6 +3883,18 @@ async fn an_owner_managed_workflow_runs_under_a_members_organisation_grant_while
         .expect("the member's lease answers");
     kr_automation::authority::check_node(&held, &document, &document.nodes[0], host.environment_id)
         .expect("the node is inside the grant");
+    // The lease is an end the grant stands on: a command that starts later than the node asks is
+    // held to it, and the end moves with the continuous clock.
+    let (_, ends_in) = grants
+        .grant_standing(grant.grant_id, T + 60_000)
+        .expect("the member's lease answers");
+    assert_eq!(ends_in, Some(std::time::Duration::from_millis(LEASE_MS)));
+    continuous.advance(std::time::Duration::from_millis(LEASE_MS - 1_000));
+    let (_, ends_in) = grants
+        .grant_standing(grant.grant_id, T + 60_000)
+        .expect("the lease has a second left");
+    assert_eq!(ends_in, Some(std::time::Duration::from_secs(1)));
+    continuous.advance(std::time::Duration::from_secs(1));
 
     // The control: the member's grant does not reach workflow.install itself.
     let managing = Grant {
@@ -3898,7 +3930,6 @@ async fn an_owner_managed_workflow_runs_under_a_members_organisation_grant_while
     );
 
     // Once the lease has ended, the node is refused.
-    continuous.advance(std::time::Duration::from_millis(LEASE_MS));
     wall.store(T + LEASE_MS, Ordering::SeqCst);
     let refused = grants
         .grant(grant.grant_id, T + LEASE_MS)
@@ -4002,12 +4033,13 @@ fn command_node(host: &Host, node_id: &str, command: &str) -> WorkflowNode {
     }
 }
 
-/// A `create_session` node asking for an invisible session in this host's own environment.
-fn create_session_node(host: &Host) -> WorkflowNode {
+/// A `create_session` node asking for an invisible session in this host's own environment, running
+/// the shell it names or, when it names none, the account's own.
+fn create_session_node(host: &Host, shell: Option<&str>) -> WorkflowNode {
     let params = kr_protocol::session::SessionCreateParams {
         environment_id: host.environment_id,
         presentation: kr_protocol::session::Presentation::Invisible,
-        shell: Nullable::null(),
+        shell: Nullable(shell.map(str::to_owned)),
         shell_mode: kr_protocol::session::ShellMode::NativeCompat,
         cwd: Nullable::some(host.work().display().to_string()),
         dimensions: Nullable::null(),
@@ -4107,6 +4139,116 @@ fn owed_rows(host: &Host) -> i64 {
         .expect("counts the open rows")
 }
 
+/// The statuses the journal holds for the nodes of every run, as it holds them now.
+fn node_statuses(host: &Host) -> Vec<String> {
+    let journal = rusqlite::Connection::open(
+        host._temp
+            .environment()
+            .state_dir()
+            .join(kr_automation::store::WORKFLOW_DB_NAME),
+    )
+    .expect("opens the journal");
+    let mut statement = journal
+        .prepare("SELECT status FROM node_receipts ORDER BY rowid")
+        .expect("prepares");
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("reads")
+        .collect::<std::result::Result<_, _>>()
+        .expect("rows")
+}
+
+/// The run the journal holds, when it holds one.
+fn only_run(host: &Host) -> kr_protocol::ids::WorkflowRunId {
+    let journal = rusqlite::Connection::open(
+        host._temp
+            .environment()
+            .state_dir()
+            .join(kr_automation::store::WORKFLOW_DB_NAME),
+    )
+    .expect("opens the journal");
+    let run: String = journal
+        .query_row("SELECT run_id FROM workflow_runs", [], |row| row.get(0))
+        .expect("one run");
+    kr_protocol::ids::WorkflowRunId::new(run.parse::<Uuid>().expect("a run identifier"))
+}
+
+/// The phases of the reservations the sessions of one grant's workflows made.
+fn reservation_phases(host: &Host, grant: GrantId) -> Vec<String> {
+    let registry = rusqlite::Connection::open(host._temp.environment().registry_database())
+        .expect("opens the registry");
+    let mut statement = registry
+        .prepare("SELECT phase FROM reservations WHERE actor_id = ?1 ORDER BY created_at_ms")
+        .expect("prepares");
+    statement
+        .query_map([kr_automation::resources::session_principal(grant)], |row| {
+            row.get::<_, String>(0)
+        })
+        .expect("reads")
+        .collect::<std::result::Result<_, _>>()
+        .expect("rows")
+}
+
+/// The first live session whose root is a command, once there is one.
+async fn live_command_session(control: &mut LocalClient) -> kr_protocol::session::SessionSummary {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if let Some(session) = all_sessions(control).await.into_iter().find(|session| {
+            session.closure.0.is_none()
+                && session.root == Some(kr_protocol::session::SessionRoot::Command)
+        }) {
+            return session;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "no session whose root is a command came up"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// A host whose launches wait at the supervisor's door until the test lets them through.
+struct Door {
+    open: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    arrived: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Door {
+    fn shut() -> Self {
+        Self {
+            open: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+            arrived: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    async fn host(&self) -> Host {
+        let (open, arrived) = (Arc::clone(&self.open), Arc::clone(&self.arrived));
+        working_host_through(move |inner| {
+            Box::new(AtTheDoor {
+                inner,
+                open,
+                arrived,
+            })
+        })
+        .await
+    }
+
+    async fn until_a_launch_arrives(&self) {
+        until("a launch to reach the door", || {
+            self.arrived.load(std::sync::atomic::Ordering::SeqCst) > 0
+        })
+        .await;
+    }
+
+    fn let_through(&self) {
+        let (lock, wake) = &*self.open;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        wake.notify_all();
+    }
+}
+
 /// KR-REQ-25.14 and KR-REQ-18.04: a `shell_command` node runs its command as the root of a session
 /// of its own and reports how that root ended, as the host observed it. A command that exits zero
 /// succeeds and names its session; one that exits with a status fails and says which; and the
@@ -4182,20 +4324,42 @@ async fn a_shell_command_node_reports_how_its_command_ended() {
 }
 
 /// KR-REQ-25.15: a `create_session` node creates a session through the daemon's own create path
-/// and leaves it running; the session is the node's output and nothing closes it afterwards.
+/// and leaves it running; the session is the node's output and nothing closes it afterwards. A
+/// workflow triggered by the node's event descends from it: the daemon, not the caller, says which
+/// run and node produced the trigger, one level deeper in the same chain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_create_session_node_creates_a_session_that_outlives_its_node() {
     let host = working_host().await;
     let mut control = client(&host).await;
     host.issue(grant_id(24), &[ActionRight::SessionCreate]);
+    host.issue(grant_id(34), &[ActionRight::SessionView]);
     let document = definition(
         workflow_id(24),
         grant_id(24),
         "a session",
-        create_session_node(&host),
+        create_session_node(&host, None),
     );
-    install(&mut control, &host, &document).await;
-    enable(&mut control, &host, &document).await;
+    let mut follower = definition(
+        workflow_id(34),
+        grant_id(34),
+        "after a session",
+        WorkflowNode {
+            node_id: "notice".to_owned(),
+            action_kind: WorkflowActionKind::AttentionNotice,
+            action_params: serde_json::to_string(&kr_protocol::automation::AttentionNoticeParams {
+                summary: "a session was created".to_owned(),
+            })
+            .expect("a notice node's typed parameters"),
+            declared_environment: Nullable::null(),
+        },
+    );
+    follower.trigger = WorkflowTrigger {
+        event_type: "session.created".to_owned(),
+    };
+    for document in [&document, &follower] {
+        install(&mut control, &host, document).await;
+        enable(&mut control, &host, document).await;
+    }
 
     let run: WorkflowRunResult = typed(
         &start(&mut control, &host, &document, "evt-1")
@@ -4211,7 +4375,6 @@ async fn a_create_session_node_creates_a_session_that_outlives_its_node() {
     };
 
     // The session is there, running, and a node's end did not close it.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let sessions = all_sessions(&mut control).await;
     let session = sessions
         .iter()
@@ -4220,14 +4383,19 @@ async fn a_create_session_node_creates_a_session_that_outlives_its_node() {
     assert!(session.closure.0.is_none(), "{session:?}");
     assert_eq!(session.root, None, "an ordinary session's root is a shell");
     assert_eq!(owed_rows(&host), 0, "the node owns nothing to release");
+
+    let descendant = first_run_of(&mut control, &follower).await;
+    assert_eq!(descendant.causal_root_id, run.causal_root_id);
+    assert_eq!(descendant.depth.get(), 2);
+    assert_eq!(descendant.parent_run_id.0, Some(run.run_id));
+    assert_eq!(descendant.parent_node_id.0.as_deref(), Some("session"));
     host.clients.abort();
 }
 
 /// KR-REQ-25.14 and KR-REQ-25.19: a command that outlives the node's wait is asked to stop, and
-/// its session is closed; nothing is claimed about what it did. A `create_session` node asked to
-/// stop cannot be, so its session survives and the node is left unknown.
+/// its session is closed; nothing is claimed about what it did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_command_that_outlives_its_wait_is_stopped_and_a_created_session_is_not() {
+async fn a_command_that_outlives_its_wait_is_stopped() {
     let host = working_host().await;
     let mut control = client(&host).await;
     host.issue(grant_id(25), &COMMAND_RIGHTS);
@@ -4252,18 +4420,7 @@ async fn a_command_that_outlives_its_wait_is_stopped_and_a_created_session_is_no
             let mut other = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
                 .await
                 .expect("connects to the control endpoint");
-            let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                let live = all_sessions(&mut other).await;
-                if let Some(session) = live.into_iter().find(|session| {
-                    session.closure.0.is_none()
-                        && session.root == Some(kr_protocol::session::SessionRoot::Command)
-                }) {
-                    return session;
-                }
-                assert!(std::time::Instant::now() < until, "the command's session");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+            live_command_session(&mut other).await
         })
     };
     let run: WorkflowRunResult = typed(
@@ -4292,6 +4449,169 @@ async fn a_command_that_outlives_its_wait_is_stopped_and_a_created_session_is_no
         "what the dispatch owned to be released once the closure was recorded",
         || owed_rows(&host) == 0,
     )
+    .await;
+    host.clients.abort();
+}
+
+/// KR-REQ-25.19: a run cancelled by request while its command runs stops the command and closes
+/// its session, and nothing is paused: the run exceeded no limit, so the workflow stays enabled
+/// and no attention item is owed. What the dispatch owned is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_run_cancelled_while_its_command_runs_stops_it_and_pauses_nothing() {
+    let host = working_host().await;
+    let mut control = client(&host).await;
+    host.issue(grant_id(35), &COMMAND_RIGHTS);
+    let document = definition(
+        workflow_id(35),
+        grant_id(35),
+        "a long command",
+        command_node(&host, "long", "sleep 120"),
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+    let running = run_from_another_task(&host, &document, "evt-cancelled");
+    let live = live_command_session(&mut control).await;
+
+    host.controller
+        .automation()
+        .journal()
+        .cancel_run(only_run(&host), "run cancelled by request", kr_ipc::now_ms().get())
+        .expect("the run is cancelled");
+
+    let answered: WorkflowRunResult = typed(
+        &running
+            .await
+            .expect("the run answers")
+            .expect("the cancelled run is answered"),
+    );
+    assert_eq!(answered.status, WorkflowRunStatus::Cancelled, "{answered:?}");
+    let closed = closed_session(&mut control, live.session_id).await;
+    assert_eq!(
+        closed.closure.0.expect("closed").reason,
+        kr_protocol::session::ClosureReason::CloseRequested,
+        "the command's session was closed because its run was cancelled"
+    );
+    assert_eq!(node_statuses(&host), [NodeStatus::Cancelled.as_str()]);
+    assert!(
+        !host
+            .controller
+            .automation()
+            .journal()
+            .is_paused(document.workflow_id, 1)
+            .expect("reads"),
+        "a cancellation is no limit exceeded"
+    );
+    until("what the dispatch owned to be released", || {
+        owed_rows(&host) == 0
+    })
+    .await;
+    host.clients.abort();
+}
+
+/// KR-REQ-25.14: the directory a command ran in is removed only while it is the one that was made.
+/// A directory put at its path in the meantime is not this host's to remove, and the row is
+/// released all the same. The control is the case above it, where the directory is the one made
+/// and is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_directory_put_in_place_of_a_commands_own_is_left_alone() {
+    let host = working_host().await;
+    let mut control = client(&host).await;
+    host.issue(grant_id(36), &COMMAND_RIGHTS);
+    let document = definition(
+        workflow_id(36),
+        grant_id(36),
+        "a long command",
+        command_node(&host, "long", "sleep 120"),
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+    let running = run_from_another_task(&host, &document, "evt-replaced");
+    let live = live_command_session(&mut control).await;
+
+    let scratch = host
+        ._temp
+        .environment()
+        .state_dir()
+        .join("workflow-scratch");
+    let made = std::fs::read_dir(&scratch)
+        .expect("the directories commands run in")
+        .next()
+        .expect("the command's directory")
+        .expect("it is readable")
+        .path();
+    let moved = scratch.join("moved-away");
+    std::fs::rename(&made, &moved).expect("the command's directory is moved");
+    std::fs::create_dir(&made).expect("another directory is put in its place");
+    std::fs::write(made.join("precious"), b"not the command's").expect("a file in it");
+
+    host.controller
+        .automation()
+        .journal()
+        .cancel_run(only_run(&host), "run cancelled by request", kr_ipc::now_ms().get())
+        .expect("the run is cancelled");
+    let _ = running.await;
+    let _ = closed_session(&mut control, live.session_id).await;
+    until("what the dispatch owned to be released", || {
+        owed_rows(&host) == 0
+    })
+    .await;
+    assert!(
+        made.join("precious").exists(),
+        "a directory that is not the one the command ran in is not removed"
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-25.14: a command declared for a workspace runs in the tree the project service recorded
+/// for it and nowhere else. A tree that was moved aside, with another directory put at its path,
+/// is refused where the command would start, the node pauses, and nothing runs in the other
+/// directory. The control is the same node before the directory is replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_command_runs_only_in_the_workspace_that_was_recorded() {
+    let host = working_host().await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    let tree = host.work().join("source");
+    host.issue(grant_id(37), &COMMAND_RIGHTS);
+    let mut document = definition(
+        workflow_id(37),
+        grant_id(37),
+        "a command in a workspace",
+        command_node(&host, "command", "touch ran-here"),
+    );
+    document.resource_scope = WorkflowResourceScope {
+        environment_id: Nullable::null(),
+        workspace_id: Nullable::some(workspace),
+        session_id: Nullable::null(),
+    };
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+
+    let run: WorkflowRunResult = typed(
+        &start(&mut control, &host, &document, "evt-in-place")
+            .await
+            .expect("the run is admitted"),
+    );
+    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+    assert!(tree.join("ran-here").exists(), "the command ran in the tree");
+    std::fs::remove_file(tree.join("ran-here")).expect("the mark is removed");
+
+    std::fs::rename(&tree, host.work().join("moved-away")).expect("the tree is moved aside");
+    std::fs::create_dir(&tree).expect("another directory is put at its path");
+    let refused = failure(start(&mut control, &host, &document, "evt-replaced").await);
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        !tree.join("ran-here").exists(),
+        "nothing ran in a directory that is not the recorded tree"
+    );
+    assert_eq!(
+        node_statuses(&host),
+        [NodeStatus::Success.as_str(), NodeStatus::Paused.as_str()]
+    );
+    assert_eq!(all_sessions(&mut control).await.len(), 1, "no second session");
+    until("the refused node to leave nothing owed", || {
+        owed_rows(&host) == 0
+    })
     .await;
     host.clients.abort();
 }
@@ -4348,9 +4668,10 @@ fn hold_the_registry(host: &Host) -> rusqlite::Connection {
 /// KR-REQ-25.14 and KR-REQ-19.04: the moment the engine stops waiting for a node is asked where
 /// the node's session comes into being, and not only before the runner is called. The create waits
 /// for the registry, as it does behind another writer, until the node's wait has ended; when it
-/// reaches its launch it is refused. No session is made for a `create_session` node, and no command
-/// runs for a `shell_command` node. The control is the same node with the registry free, which
-/// makes its session (the cases above).
+/// reaches its launch it is refused there, its reservation fails, and nothing is left counting
+/// against the session limit. No session is made for a `create_session` node, and no command runs
+/// for a `shell_command` node. The control is the same node with the registry free, which makes
+/// its session (the cases above).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_wait_that_ends_before_the_session_comes_into_being_makes_no_session() {
     let host = working_host().await;
@@ -4360,7 +4681,7 @@ async fn a_wait_that_ends_before_the_session_comes_into_being_makes_no_session()
         (
             30_u8,
             vec![ActionRight::SessionCreate],
-            create_session_node(&host),
+            create_session_node(&host, None),
         ),
         (
             31,
@@ -4377,22 +4698,42 @@ async fn a_wait_that_ends_before_the_session_comes_into_being_makes_no_session()
         install(&mut control, &host, &document).await;
         enable(&mut control, &host, &document).await;
 
-        // Another writer holds the registry for longer than the node's wait. The run passes every
-        // check the engine and the runner make, and the create waits.
+        // Another writer holds the registry. The run passes every check the engine and the runner
+        // make, and the create waits for it until the node's wait has ended.
+        let settled_before = node_statuses(&host).len();
         let registry = hold_the_registry(&host);
         let running = run_from_another_task(&host, &document, "evt-too-late");
-        tokio::time::sleep(std::time::Duration::from_millis(3_500)).await;
+        until("the node's wait to end", || {
+            node_statuses(&host).len() > settled_before
+                && node_statuses(&host)
+                    .last()
+                    .is_some_and(|status| status != NodeStatus::Running.as_str())
+        })
+        .await;
         registry
             .execute_batch("COMMIT")
             .expect("the other writer finishes");
-        let answered = running.await.expect("the run answers");
-        if let Ok(answer) = answered {
-            let run: WorkflowRunResult = typed(&answer);
-            assert_ne!(run.status, WorkflowRunStatus::Completed, "{run:?}");
-        }
+        let run: WorkflowRunResult = typed(
+            &running
+                .await
+                .expect("the run answers")
+                .expect("the run is answered"),
+        );
+        assert_eq!(run.status, WorkflowRunStatus::Cancelled, "{run:?}");
+
+        // The create reaches its launch once the registry is free, is refused there, and leaves
+        // a reservation that failed and nothing else.
+        until("the refused create to have failed its reservation", || {
+            reservation_phases(&host, grant_id(number)) == ["failed"]
+        })
+        .await;
+        assert_eq!(
+            node_statuses(&host).last().map(String::as_str),
+            Some(NodeStatus::Cancelled.as_str())
+        );
         let receipts = receipts_of_workflow(&mut control, &document).await;
         assert!(
-            receipts.iter().all(|receipt| receipt.output.0.is_none()),
+            !receipts.is_empty() && receipts.iter().all(|receipt| receipt.output.0.is_none()),
             "the node produced nothing: {receipts:?}"
         );
     }
@@ -4402,6 +4743,10 @@ async fn a_wait_that_ends_before_the_session_comes_into_being_makes_no_session()
         "no session is live for either node: {sessions:?}"
     );
     assert!(!marker.exists(), "the command never ran");
+    until("what the command's dispatch owned to be released", || {
+        owed_rows(&host) == 0
+    })
+    .await;
     host.clients.abort();
 }
 
@@ -4428,76 +4773,132 @@ async fn receipts_of_workflow(
     read.node_receipts
 }
 
-/// KR-REQ-19.04 and KR-REQ-25.14: the command is released to start at the worker's claim, which
-/// comes after the launch transition, so the grant is asked there as well. The grant is withdrawn
-/// while the launch waits at the supervisor's door; the worker is started, connects and is
-/// refused its claim, and the command never runs. The node pauses on the refusal.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_grant_withdrawn_before_the_worker_claims_its_launch_runs_no_command() {
-    let open = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-    let arrived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let host = working_host_through({
-        let (open, arrived) = (Arc::clone(&open), Arc::clone(&arrived));
-        move |inner| {
-            Box::new(AtTheDoor {
-                inner,
-                open,
-                arrived,
-            })
-        }
-    })
-    .await;
+/// A grant is withdrawn while a node's launch waits at the supervisor's door, after the launch
+/// transition admitted it. The worker is started, connects and is refused its claim; the node
+/// pauses on the refusal, its reservation fails, and what it would have started never starts.
+async fn a_grant_withdrawn_at_the_door_starts_nothing(
+    number: u8,
+    rights: &[ActionRight],
+    node: impl FnOnce(&Host, &Path) -> WorkflowNode,
+) {
+    let door = Door::shut();
+    let host = door.host().await;
     let mut control = client(&host).await;
     let marker = host.work().join("a-command-ran");
-    host.issue(grant_id(32), &COMMAND_RIGHTS);
+    host.issue(grant_id(number), rights);
     let document = definition(
-        workflow_id(32),
-        grant_id(32),
-        "a command",
-        command_node(&host, "command", &format!("touch {}", marker.display())),
+        workflow_id(number),
+        grant_id(number),
+        "a node",
+        node(&host, &marker),
     );
     install(&mut control, &host, &document).await;
     enable(&mut control, &host, &document).await;
 
     let running = run_from_another_task(&host, &document, "evt-at-the-door");
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while arrived.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(
-            std::time::Instant::now() < until,
-            "the launch reached the door"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    door.until_a_launch_arrives().await;
     host.controller
         .sharing()
         .grants()
-        .revoke(grant_id(32), kr_ipc::now_ms().get(), || Ok(()))
+        .revoke(grant_id(number), kr_ipc::now_ms().get(), || Ok(()))
         .expect("the grant is withdrawn");
-    {
-        let (lock, wake) = &*open;
-        *lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-        wake.notify_all();
-    }
+    door.let_through();
 
     let refused = running
         .await
         .expect("the run answers")
-        .expect_err("the withdrawn grant stops the command");
+        .expect_err("the withdrawn grant stops the node");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert_eq!(node_statuses(&host), [NodeStatus::Paused.as_str()]);
+    until("the refused launch to have failed its reservation", || {
+        reservation_phases(&host, grant_id(number)) == ["failed"]
+    })
+    .await;
     assert!(!marker.exists(), "the command never ran");
     assert!(
         all_sessions(&mut control)
             .await
             .iter()
-            .all(|session| session.closure.0.is_some() || session.root.is_none()),
-        "no session whose root is a command is live"
+            .all(|session| session.closure.0.is_some()),
+        "no session is live"
     );
     host.clients.abort();
 }
 
-/// KR-REQ-25.14, KR-REQ-25.15 and KR-REQ-24.10: a command that is running when the daemon stops is
+/// KR-REQ-19.04 and KR-REQ-25.14: the command is released to start at the worker's claim, which
+/// comes after the launch transition, so the grant is asked there as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_grant_withdrawn_before_the_worker_claims_its_launch_runs_no_command() {
+    a_grant_withdrawn_at_the_door_starts_nothing(32, &COMMAND_RIGHTS, |host, marker| {
+        command_node(host, "command", &format!("touch {}", marker.display()))
+    })
+    .await;
+}
+
+/// KR-REQ-19.04 and KR-REQ-25.14: a session that names the shell it runs starts a program the
+/// definition chose, and is held to its grant at the claim as a command is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_grant_withdrawn_before_the_worker_claims_its_launch_starts_no_named_shell() {
+    a_grant_withdrawn_at_the_door_starts_nothing(
+        38,
+        &[ActionRight::SessionCreate, ActionRight::TerminalInput],
+        |host, _| create_session_node(host, Some("/bin/sh")),
+    )
+    .await;
+}
+
+/// KR-REQ-25.19: a `create_session` node whose session passed its admission cannot be stopped. The
+/// node's wait ends while the launch waits at the door, the node settles unknown, and the session
+/// comes into being once the door opens and stays: nothing closes a session a node created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_created_session_is_kept_when_its_node_is_asked_to_stop_after_its_admission() {
+    let door = Door::shut();
+    let host = door.host().await;
+    let mut control = client(&host).await;
+    host.issue(grant_id(33), &[ActionRight::SessionCreate]);
+    let mut document = definition(
+        workflow_id(33),
+        grant_id(33),
+        "a session",
+        create_session_node(&host, None),
+    );
+    document.deadlines = WorkflowDeadlines {
+        run_deadline_ms: U64::new(60_000),
+        action_wait_ms: U64::new(1_500),
+    };
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+
+    let running = run_from_another_task(&host, &document, "evt-held");
+    door.until_a_launch_arrives().await;
+    until("the node's wait to end", || {
+        node_statuses(&host) == [NodeStatus::Unknown.as_str()]
+    })
+    .await;
+    door.let_through();
+    let _ = running.await;
+
+    let until_live = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let session = loop {
+        let sessions = all_sessions(&mut control).await;
+        if let Some(session) = sessions
+            .into_iter()
+            .find(|session| session.closure.0.is_none() && session.state == kr_protocol::session::SessionState::Live)
+        {
+            break session;
+        }
+        assert!(
+            std::time::Instant::now() < until_live,
+            "the session came into being"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    assert_eq!(session.root, None);
+    assert_eq!(owed_rows(&host), 0, "the node owns nothing to release");
+    host.clients.abort();
+}
+
+/// KR-REQ-25.14 and KR-REQ-24.10: a command that is running when the daemon stops is
 /// not forgotten. The node it belonged to settles unknown, nothing runs it again, and the new
 /// daemon's sweep finds what the dispatch wrote down, closes the session, removes the directory the
 /// command ran in and releases the row, without waiting for the run to end. A `create_session`
@@ -4514,7 +4915,7 @@ async fn a_command_a_stopped_daemon_left_running_is_closed_and_released_by_the_n
         workflow_id(27),
         grant_id(27),
         "a session",
-        create_session_node(&host),
+        create_session_node(&host, None),
     );
     install(&mut control, &host, &created).await;
     enable(&mut control, &host, &created).await;

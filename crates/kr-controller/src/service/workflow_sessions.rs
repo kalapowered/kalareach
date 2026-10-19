@@ -34,7 +34,7 @@ use crate::error::{ControllerError, Result};
 use crate::registry::Registry;
 
 use super::close::CLOSE_EXCHANGE;
-use super::create::{CreateFor, HeldRoot};
+use super::create::{CreateFor, HeldLaunch};
 use super::{Controller, parse};
 
 /// The window a workflow's close is sent under. A forwarded mutation's freshness is the deadline
@@ -57,10 +57,15 @@ pub(crate) struct WorkflowCreate {
     pub(crate) digest: Digest256,
     /// The request.
     pub(crate) create: SessionCreateParams,
-    /// The command the session's root runs, when the node runs one.
-    pub(crate) root: Option<HeldRoot>,
-    /// Asked at the launch transition, under the registry guard. A node's grant, its widened
-    /// rights and its accepted deadline are checked here.
+    /// The command the session's root runs and the run and node it is for, when the node runs a
+    /// command.
+    pub(crate) command: Option<(
+        kr_protocol::worker::RootCommand,
+        kr_protocol::worker::WorkflowSession,
+    )>,
+    /// Asked at the launch transition and again at the worker's claim, both under the registry
+    /// guard. A node's grant, its widened rights, its accepted deadline and whether its run was
+    /// cancelled are checked here.
     pub(crate) admit: Arc<dyn Fn(&Registry) -> Result<()> + Send + Sync>,
 }
 
@@ -108,6 +113,10 @@ impl Controller {
     ) -> Result<SessionCreateResult> {
         let under_way = self.handover.admit()?;
         let admit = Arc::clone(&order.admit);
+        let launch = HeldLaunch {
+            admit: Arc::clone(&admit),
+            command: order.command,
+        };
         let created = self
             .create_under(
                 &under_way,
@@ -118,7 +127,7 @@ impl Controller {
                     origin: EnvironmentOrigin::HostContext,
                 },
                 order.create,
-                order.root,
+                Some(launch),
                 &*admit,
             )
             .await?;
@@ -278,9 +287,12 @@ impl Controller {
     /// The admission a workflow node's create stands on, as the registry guard asks it.
     ///
     /// It first asks whether this host owes a fence it could not raise, and then `check`, which
-    /// the caller supplies: the node's grant on both clocks and the moment its wait ends. It is
-    /// asked at the launch transition and again at the worker's claim, both under the guard, and
-    /// holds the daemon weakly, so a create that outlives it asks nothing.
+    /// the caller supplies: the node's grant on both clocks, the moment its wait ends and whether
+    /// its run was cancelled. It is asked at the launch transition and again at the worker's
+    /// claim, both under the guard, and holds the daemon weakly, so a create that outlives it
+    /// asks nothing. The decision reads the grant and policy stores, so it runs where the runtime
+    /// may block, and the other tasks of the thread move to its peers meanwhile; the guard is
+    /// held across it, which is what keeps a revocation from completing in between.
     pub(crate) fn workflow_admission(
         self: &Arc<Self>,
         check: impl Fn() -> Result<()> + Send + Sync + 'static,
@@ -292,9 +304,38 @@ impl Controller {
                 .ok_or_else(|| ControllerError::PermissionDenied {
                     detail: "this host's daemon is not serving".to_owned(),
                 })?;
-            daemon.check_fence()?;
-            check()
+            crate::supervision::blocking_start(|| {
+                daemon.check_fence()?;
+                check()
+            })
         })
+    }
+
+    /// The boot this daemon runs in, which a worker of an earlier boot did not survive.
+    pub(crate) fn boot(&self) -> &kr_protocol::identity::BootIdentity {
+        &self.boot_identity
+    }
+
+    /// The process of a session's worker, while the registry holds the session's worker.
+    ///
+    /// A session that closed already has no worker row; a closure that could not account for the
+    /// worker is then released by the boot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    pub(crate) async fn workflow_worker_of(
+        self: &Arc<Self>,
+        session_id: SessionId,
+    ) -> Result<Option<kr_protocol::identity::ProcessStartIdentity>> {
+        Ok(self
+            .registry
+            .lock()
+            .await
+            .workers()?
+            .into_iter()
+            .find(|record| record.session_id == session_id)
+            .map(|record| record.process_identity))
     }
 
     /// Milliseconds on the machine's continuous clock since boot, which a worker also reads.

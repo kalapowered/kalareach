@@ -309,19 +309,22 @@ impl Controller {
                      launch is not admitted",
                 ));
             }
-            // A command the session's root runs starts only after this claim, and the answer the
-            // launch transition had can have gone stale since: the authority it stood on is asked
-            // again here, under the guard, before the claim commits. A refusal admits no launch
-            // and is given to the create that waits, which is told what was refused.
-            if let Some(root) = environment.as_ref().and_then(|held| held.root.as_ref())
-                && let Err(refusal) = (root.admit)(&registry)
+            // The program a workflow's session starts runs only after this claim, and the answer
+            // the launch transition had can have gone stale since: the authority it stood on is
+            // asked again here, under the guard, before the claim commits. A refusal admits no
+            // launch and is given to the create that waits, which is told what was refused.
+            if let Some(launch) = environment.as_ref().and_then(|held| held.launch.as_ref())
+                && let Err(refusal) = (launch.admit)(&registry)
             {
-                registry.fail_if_spawned(claim.reservation_id)?;
+                let failed = registry.fail_if_spawned(claim.reservation_id)?;
                 drop(registry);
+                // The create that waits is told what was refused and retires the job when it
+                // is, as it does for any worker that fails its rendezvous.
                 self.resolve(claim.reservation_id, Err(refusal.to_protocol_error()))
                     .await;
-                self.discard_worker_dir(claim.session_id);
-                self.retire_job_when_ended(claim.reservation_id, Some(launcher));
+                if failed {
+                    self.discard_worker_dir(claim.session_id);
+                }
                 return Err(refusal);
             }
             match registry.claim_rendezvous(claim.reservation_id, claim.worker_public_key) {
@@ -358,7 +361,7 @@ impl Controller {
             ControllerError::rendezvous("this claim found no environment to launch with")
         })?;
         create.environment_snapshot = environment.variables;
-        let root = environment.root;
+        let command = environment.launch.and_then(|held| held.command);
 
         // The package this worker will launch is resolved here, by the daemon, against the
         // package root the daemon is configured with. The worker is told which directory to read
@@ -424,8 +427,8 @@ impl Controller {
             // This daemon tells its workers what the host's local owner may do, so a worker it
             // launches serves no local caller what the host holds to that lease until it has.
             holds_local_access: true,
-            root_command: root.as_ref().map(|held| held.command.clone()),
-            workflow: root.map(|held| held.workflow),
+            root_command: command.as_ref().map(|(command, _)| command.clone()),
+            workflow: command.map(|(_, workflow)| workflow),
         };
         // The specification is one control frame. Beside a create request that leaves too little
         // room, the largest integrations are left out as well. The session starts without them,

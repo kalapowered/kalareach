@@ -133,10 +133,11 @@ pub(super) struct SessionEnvironment {
     pub(super) origin: EnvironmentOrigin,
     /// The names, never the values, of the configured variables among them. None for a creator's.
     pub(super) additions: Vec<String>,
-    /// The command the session's root runs, when the host started the session to run one. It is
-    /// held with the variables for the same reason: it is for the worker's launch and nothing
-    /// else, so it is in no registry row and in no recorded request.
-    pub(super) root: Option<HeldRoot>,
+    /// What a workflow's node holds true until its session's worker has been admitted: the
+    /// admission, and the command the session's root runs when the node runs one. It is held with
+    /// the variables for the same reason: it is for the worker's launch and nothing else, so it
+    /// is in no registry row and in no recorded request.
+    pub(super) launch: Option<HeldLaunch>,
 }
 
 /// Who asks for a create, and the identity the create is kept under.
@@ -151,16 +152,20 @@ pub(super) struct CreateFor<'a> {
     pub(super) origin: EnvironmentOrigin,
 }
 
-/// A command a session's root runs, with what keeps the right to start it true until it starts.
-pub(crate) struct HeldRoot {
-    /// The command, as the worker is told it.
-    pub(crate) command: kr_protocol::worker::RootCommand,
-    /// The workflow run and node the session is for.
-    pub(crate) workflow: kr_protocol::worker::WorkflowSession,
+/// What keeps a workflow node's right to start its session true until the worker is admitted, and
+/// the command the session's root runs when the node runs one.
+pub(crate) struct HeldLaunch {
     /// Asked again at the worker's claim, under the registry guard and before the claim commits,
-    /// because the command starts only after the claim and the launch transition's answer can
-    /// have gone stale in between.
+    /// because the program starts only after the claim and the launch transition's answer can have
+    /// gone stale in between. A session that runs a command and one that starts a shell the
+    /// definition named are both held to it.
     pub(crate) admit: Arc<dyn Fn(&crate::registry::Registry) -> Result<()> + Send + Sync>,
+    /// The command the session's root runs and the workflow run and node it is for, when the node
+    /// runs a command.
+    pub(crate) command: Option<(
+        kr_protocol::worker::RootCommand,
+        kr_protocol::worker::WorkflowSession,
+    )>,
 }
 
 impl SessionEnvironment {
@@ -170,7 +175,7 @@ impl SessionEnvironment {
             variables,
             origin: EnvironmentOrigin::CreatorSnapshot,
             additions: Vec::new(),
-            root: None,
+            launch: None,
         }
     }
 }
@@ -337,7 +342,7 @@ impl Controller {
                 .collect(),
             origin: EnvironmentOrigin::HostContext,
             additions,
-            root: None,
+            launch: None,
         }
     }
 
@@ -402,12 +407,13 @@ impl Controller {
     /// can fail on its own, the reservation under the create token, the launch transition, the
     /// worker's rendezvous and the answer. What differs between a connection's create and a
     /// workflow node's is who is asking and how the ask is kept true until the launch, and those
-    /// come in as `who`, `root` and `admit`.
+    /// come in as `who`, `launch` and `admit`.
     ///
     /// `admit` is asked at the launch transition, under the registry guard, immediately before the
-    /// reservation moves to launched; a refusal there starts nothing. `root`, when there is one,
-    /// is the command the session's root runs in place of a shell, and it is held in memory with
-    /// the session's environment until the worker's claim takes both.
+    /// reservation moves to launched; a refusal there starts nothing. `launch`, when there is one,
+    /// is held in memory with the session's environment until the worker's claim takes both: the
+    /// claim asks its admission again, and hands the worker the command the session's root runs in
+    /// place of a shell, when it carries one.
     ///
     /// `under_way` is the handover guard the caller took first; it is kept until the create has
     /// settled.
@@ -421,7 +427,7 @@ impl Controller {
         _under_way: &super::host::UnderWay<'_>,
         who: CreateFor<'_>,
         mut create: SessionCreateParams,
-        root: Option<HeldRoot>,
+        launch: Option<HeldLaunch>,
         admit: &(dyn Fn(&crate::registry::Registry) -> Result<()> + Sync),
     ) -> Result<ParamsValue> {
         let CreateFor {
@@ -466,7 +472,7 @@ impl Controller {
             }
             EnvironmentOrigin::HostContext => self.host_context_environment(),
         };
-        environment.root = root;
+        environment.launch = launch;
         // The create request itself is recorded with the reservation, before anything is spawned.
         // A daemon that dies between the reservation and the launch then finds a request it can
         // resolve rather than an identifier with nothing behind it.

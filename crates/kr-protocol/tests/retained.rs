@@ -100,7 +100,8 @@ static AUTHORITY: Declared = Declared {
     golden: &[],
 };
 
-/// The surface this build keeps for the release before it is covered: nothing differs from it.
+/// The surface this build keeps for the release before it is covered: it differs from it only
+/// where an entry says why the difference is safe.
 #[test]
 fn the_surface_kept_for_the_previous_release_is_the_one_this_build_has() {
     if let Err(problems) = kr_protocol::retained::check() {

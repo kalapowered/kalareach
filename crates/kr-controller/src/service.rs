@@ -101,7 +101,6 @@ pub use start::{BOOT_FILE, ControllerSetup, JOB_SWEEP_BOUND};
 use admission::{AdmittedConnection, LeaseDenied, remaining_deadline};
 use barrier::{Debts, Reach};
 use capabilities::DesktopReading;
-pub(crate) use create::HeldRoot;
 use create::PendingCreate;
 use inhibition::DemandScan;
 use workers::{UNACCOUNTED_WORKER, WORKER_EXCHANGE};
