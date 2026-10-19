@@ -1241,21 +1241,24 @@ fn remove_contents(directory: std::os::fd::BorrowedFd<'_>, depth: u32) -> std::i
     }
     // Not the owner's to change when it is not the owner's: the removal below then says so.
     let _ = fchmod(directory, Mode::RWXU);
-    let entries = Dir::read_from(directory)?;
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name == c"." || name == c".." {
-            continue;
+    // The names are read first: what a directory lists while its entries are being removed is not
+    // specified, and an entry that is skipped would be left behind.
+    let mut names = Vec::new();
+    for entry in Dir::read_from(directory)? {
+        let name = entry?.file_name().to_owned();
+        if name.as_bytes() != b"." && name.as_bytes() != b".." {
+            names.push(name);
         }
-        let about = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    }
+    for name in names {
+        let about = statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW)?;
         if FileType::from_raw_mode(about.st_mode) == FileType::Directory {
             let opened = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-            let child = openat(directory, name, opened, Mode::empty())?;
+            let child = openat(directory, &name, opened, Mode::empty())?;
             remove_contents(std::os::fd::AsFd::as_fd(&child), depth + 1)?;
-            unlinkat(directory, name, AtFlags::REMOVEDIR)?;
+            unlinkat(directory, &name, AtFlags::REMOVEDIR)?;
         } else {
-            unlinkat(directory, name, AtFlags::empty())?;
+            unlinkat(directory, &name, AtFlags::empty())?;
         }
     }
     Ok(())
