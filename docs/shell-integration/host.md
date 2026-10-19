@@ -197,6 +197,9 @@ could be a reserved word, an assignment or an alias:
 | Fish | `'it\'s'` |
 | PowerShell | `'it''s'` |
 
+PowerShell reads U+2018, U+2019, U+201A and U+201B as single quotes too, so each of the five is
+written twice: `'it’’s'`.
+
 PowerShell puts the call operator before the line, since a quoted word at the start of a line is a
 string and not a program. A command the caller has already quoted for its target shell is
 installed exactly as given. The host quotes one thing itself: the path of a package in a startup

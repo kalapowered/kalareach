@@ -286,10 +286,12 @@ function Invoke-KrCancelKeyWait {
 # Every argument is quoted, including the first: an argument vector is installed as literal
 # arguments, and a bare word at command position would be a function, an alias or an application
 # resolved from the path rather than the name the caller asked to run. Inside this shell's single
-# quotes only the quote itself means anything, and it is written twice.
+# quotes only a quote means anything, and it is written twice. This shell reads five characters as
+# a single quote: the ASCII one (U+0027) and the typographic ones U+2018, U+2019, U+201A and
+# U+201B, and any of them ends the string unless it is doubled.
 function Get-KrQuotedArgument {
     param([string]$Argument)
-    "'" + $Argument.Replace("'", "''") + "'"
+    "'" + [regex]::Replace($Argument, '([\u0027\u2018\u2019\u201A\u201B])', '$1$1') + "'"
 }
 
 # Prints one line above the prompt and draws the prompt again below it.

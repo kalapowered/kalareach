@@ -1297,59 +1297,23 @@ fn pipeline_for(kind: ShellKind) -> (&'static str, &'static str) {
     }
 }
 
-/// KR-REQ-23.54: a launch is quoted for the shell that reads it and is never evaluated.
-///
-/// The first launch is an executable whose path has a space in it, with an argument vector that
-/// holds an embedded quote, a backslash, an empty word, a glob, a tilde, a variable, a splatting
-/// word, two separators and a command substitution. The executable prints each argument it was
-/// given between angle brackets, so the line that appears is the argument vector that arrived, and
-/// the echo of the installed line, which carries quotes and no brackets, cannot produce it. The
-/// second launch is a pipeline the caller quoted for the shell itself, which runs as written.
-pub fn a_launch_is_quoted_for_its_own_shell_and_never_evaluated(kind: ShellKind) {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let package = Package::built(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    session.forget_events();
-    assert!(session.answered("kr-ready"));
-
-    let directory = session.home().join("kr launch directory");
-    std::fs::create_dir_all(&directory).expect("a directory with a space in its name");
-    let program = directory.join("show arguments");
-    std::fs::write(
-        &program,
-        "#!/bin/sh\nfor argument in \"$@\"; do printf '<%s>' \"$argument\"; done\nprintf '\\n'\n",
-    )
-    .expect("a program that prints its arguments");
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-        .expect("the program can be run");
-
-    let substitution = match kind {
-        ShellKind::Fish => "(echo substituted)",
-        _ => "$(echo substituted)",
-    };
-    let words = [
-        "it's",
-        r"a\b",
-        "",
-        "*",
-        "~",
-        "$HOME",
-        "@payload",
-        "a;b",
-        "a|b",
-        substitution,
-    ];
+/// Installs `program` with `words` as its arguments through a launch, and says that the terminal
+/// shows the program printing exactly those words.
+fn launch_prints_what_was_named(
+    session: &mut Session,
+    program: &std::path::Path,
+    words: &[&str],
+    prompt_seed: u8,
+    transaction_seed: u8,
+) {
     let expected: String = words.iter().map(|word| format!("<{word}>")).collect();
-    let mut vector = vec![told(&program)];
+    let mut vector = vec![told(program)];
     vector.extend(words.iter().map(|word| (*word).to_owned()));
-
-    let (enter, fence) = session.fenced_prompt(20);
+    let (enter, fence) = session.fenced_prompt(prompt_seed);
     let before_install = session.written();
     let id = session.ask(WorkerRequest::Launch(LaunchMailboxRequest {
         session_id: session.session_id,
-        transaction: LaunchTransactionId::new(Uuid::from_bytes([0x75; 16])),
+        transaction: LaunchTransactionId::new(Uuid::from_bytes([transaction_seed; 16])),
         fence_id: fence.fence_id,
         command: LaunchCommand::Arguments(vector),
         expected_prompt_generation: enter.prompt_generation,
@@ -1377,6 +1341,72 @@ pub fn a_launch_is_quoted_for_its_own_shell_and_never_evaluated(kind: ShellKind)
             .was_drawn(),
         "the arguments that ran are not the arguments the caller named; wanted {expected}:\n{}",
         session.terminal_output()
+    );
+}
+
+/// KR-REQ-23.54: a launch is quoted for the shell that reads it and is never evaluated.
+///
+/// The first launch is an executable whose path has a space in it, with one hostile word: for
+/// PowerShell, a word that ends its string at a typographic quote and then names a command of its
+/// own. The second has an argument vector that holds every quote character PowerShell reads, an
+/// embedded quote, a backslash, an empty word, a glob, a tilde, a variable, a splatting word, two
+/// separators and a command substitution. The executable prints each argument it was given between
+/// angle brackets, so the line that appears is the argument vector that arrived, and the echo of
+/// the installed line, which carries quotes and no brackets, cannot produce it. The last launch is
+/// a pipeline the caller quoted for the shell itself, which runs as written.
+pub fn a_launch_is_quoted_for_its_own_shell_and_never_evaluated(kind: ShellKind) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+    assert!(session.answered("kr-ready"));
+
+    let directory = session.home().join("kr launch directory");
+    std::fs::create_dir_all(&directory).expect("a directory with a space in its name");
+    let program = directory.join("show arguments");
+    std::fs::write(
+        &program,
+        "#!/bin/sh\nfor argument in \"$@\"; do printf '<%s>' \"$argument\"; done\nprintf '\\n'\n",
+    )
+    .expect("a program that prints its arguments");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("the program can be run");
+
+    let substitution = match kind {
+        ShellKind::Fish => "(echo substituted)",
+        _ => "$(echo substituted)",
+    };
+    // PowerShell reads five characters as a single quote: the ASCII one and the four typographic
+    // ones, so a word holding any of them must keep it inside the string. The first launch is one
+    // word that ends its string early in a reader that doubles only the ASCII quote, and what
+    // follows the word then runs as a command of its own. The second holds every quote character,
+    // and every other character a shell treats as more than itself.
+    let injected = "x\u{2019}; Write-Output kr-injected; \u{2019}";
+    launch_prints_what_was_named(&mut session, &program, &[injected], 19, 0x74);
+    launch_prints_what_was_named(
+        &mut session,
+        &program,
+        &[
+            "it's",
+            "it\u{2019}s",
+            "\u{2018}",
+            "\u{2019}",
+            "\u{201A}",
+            "\u{201B}",
+            r"a\b",
+            "",
+            "*",
+            "~",
+            "$HOME",
+            "@payload",
+            "a;b",
+            "a|b",
+            substitution,
+        ],
+        20,
+        0x75,
     );
 
     let (pipeline, printed) = pipeline_for(kind);
