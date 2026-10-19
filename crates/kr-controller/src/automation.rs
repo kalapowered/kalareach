@@ -784,7 +784,7 @@ fn node_admission(
     held: &Arc<HeldGrant>,
     wait_until_ms: u64,
     task: &Arc<NodeTask>,
-) -> Arc<dyn Fn(&crate::registry::Registry) -> Result<()> + Send + Sync> {
+) -> crate::service::WorkflowAdmission {
     let held = Arc::clone(held);
     let task = Arc::clone(task);
     controller.workflow_admission(move || {

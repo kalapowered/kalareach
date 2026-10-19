@@ -159,7 +159,7 @@ pub(crate) struct HeldLaunch {
     /// because the program starts only after the claim and the launch transition's answer can have
     /// gone stale in between. A session that runs a command and one that starts a shell the
     /// definition named are both held to it.
-    pub(crate) admit: Arc<dyn Fn(&crate::registry::Registry) -> Result<()> + Send + Sync>,
+    pub(crate) admit: super::workflow_sessions::WorkflowAdmission,
     /// The command the session's root runs and the workflow run and node it is for, when the node
     /// runs a command.
     pub(crate) command: Option<(

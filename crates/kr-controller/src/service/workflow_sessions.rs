@@ -46,6 +46,10 @@ const CLOSE_WINDOW: &str = "workflow";
 /// which the mutation's digest covers.
 const CLOSE_TTL_MS: u64 = 30_000;
 
+/// What keeps a workflow node's right to start its session true: asked under the registry guard at
+/// the launch transition and again at the worker's claim.
+pub(crate) type WorkflowAdmission = Arc<dyn Fn(&Registry) -> Result<()> + Send + Sync>;
+
 /// What a workflow node asks the daemon to create.
 pub(crate) struct WorkflowCreate {
     /// The principal the create is attributed to: stable, scoped to the definition's grant.
@@ -66,7 +70,7 @@ pub(crate) struct WorkflowCreate {
     /// Asked at the launch transition and again at the worker's claim, both under the registry
     /// guard. A node's grant, its widened rights, its accepted deadline and whether its run was
     /// cancelled are checked here.
-    pub(crate) admit: Arc<dyn Fn(&Registry) -> Result<()> + Send + Sync>,
+    pub(crate) admit: WorkflowAdmission,
 }
 
 /// A close a workflow asks of a session it started.
@@ -296,7 +300,7 @@ impl Controller {
     pub(crate) fn workflow_admission(
         self: &Arc<Self>,
         check: impl Fn() -> Result<()> + Send + Sync + 'static,
-    ) -> Arc<dyn Fn(&Registry) -> Result<()> + Send + Sync> {
+    ) -> WorkflowAdmission {
         let daemon = Arc::downgrade(self);
         Arc::new(move |_registry: &Registry| {
             let daemon = daemon
