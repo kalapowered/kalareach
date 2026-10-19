@@ -37,6 +37,7 @@ const EVERYTHING = {
       { reference: 'b', name: 'the-phone', this_computer: false, vouched: true }
     ],
     candidates: [{ reference: 'c', name: 'the-tablet-in-the-kitchen' }],
+    held_out: [{ reference: 'h', name: LONG_NAME }],
     offers: [{ reference: 'o', name: 'the-laptop' }],
     outcomes: [{ what: 'addition', ended: 'refused', name: LONG_NAME }]
   }
@@ -114,6 +115,9 @@ for (const [surface, size, face] of [
     await expect(card.getByTestId('settings-devices-outcome')).toBeVisible()
     await expect(card.getByTestId('settings-devices-waiting')).toBeVisible()
     await expect(card.getByTestId('settings-devices-offer')).toBeVisible()
+    // A device taken out after a revoke has its own words and a control named for it.
+    await expect(card.getByTestId('settings-devices-held-out-note')).toBeVisible()
+    await expect(card.getByRole('button', { name: `Share settings with ${LONG_NAME} again` })).toBeVisible()
     // The question about taking a device out is part of the card too, with a long name in it.
     await card.getByRole('button', { name: `Take ${LONG_NAME} out` }).click()
     await expect(card.getByTestId('settings-devices-taking-out')).toBeVisible()

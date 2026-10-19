@@ -553,6 +553,7 @@ describe('the devices that share the settings', () => {
       waiting: false,
       members: [{ reference: 'me', name: 'This computer', this_computer: true, vouched: true }],
       candidates: [{ reference: 'phone', name: 'the-phone' }],
+      held_out: [],
       offers: [],
       outcomes: []
     }
@@ -612,6 +613,36 @@ describe('the devices that share the settings', () => {
     })
     expect(within(card).queryByTestId('settings-devices-candidates')).toBeNull()
     expect(within(card).getByTestId('settings-devices-status')).toHaveTextContent(/1 other device/)
+  })
+
+  it('offers a device taken out after a revoke apart from the others, and shares with it again when the person says so', async () => {
+    const { person, controls, sheet } = await openOnAccount()
+    act(() => {
+      controls.settings.change({
+        sync: {
+          ...sharing,
+          devices: {
+            ...sharing.devices,
+            candidates: [],
+            held_out: [{ reference: 'phone', name: 'the-phone' }]
+          }
+        }
+      })
+    })
+    const card = await within(sheet).findByTestId('settings-devices')
+    // It is not one of the devices the hosts list as new: it was taken out, and the words say why
+    // and that the revoke may not have gone through.
+    expect(within(card).queryByTestId('settings-devices-candidates')).toBeNull()
+    expect(within(card).getByTestId('settings-devices-held-out-note')).toHaveTextContent(
+      /Your hosts still list them, so a revoke may not have gone through/
+    )
+
+    await person.click(within(card).getByRole('button', { name: 'Share settings with the-phone again' }))
+    expect(controls.settings.devicesAsked).toContain('share phone')
+    await waitFor(() => {
+      expect(within(card).getByTestId('settings-devices-members')).toHaveTextContent('the-phone')
+    })
+    expect(within(card).queryByTestId('settings-devices-held-out')).toBeNull()
   })
 
   it('asks once before taking a member out, names it in both answers, and keeps it on the safe one', async () => {

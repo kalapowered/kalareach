@@ -1262,7 +1262,8 @@ describe('whether this device is reaching the host', () => {
           environment_id: null,
           reason: 'this host cannot be contacted right now',
           rights: null,
-          paired: false
+          paired: false,
+          replaced: 0
         })
     })
     await startCall()
