@@ -210,7 +210,8 @@ no confirmed outcome, and ends by saying that nothing was sent again.
   user is asking to grow, and the platform layout margins don't grow. On every tab of a screen 320
   points wide, the text of a card or a row keeps more than half of the width at every text size. A
   pill that lies over the content, such as the one that tells of a new invitation, is sized as the
-  bars are, and a control that focus moves to is brought into view clear of it.
+  bars are, and a control that focus moves to is brought into view clear of it. A message in passing
+  rests above the footer of a card that holds its actions there, and does not lie over them.
 - **An entry in an agent's history is named in words**, such as "Conversation started" or "Tool
   finished", and never by its identifier. A kind this build does not know is called "Update from the
   agent", and its identifier stays on the entry as data.
