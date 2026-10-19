@@ -2576,6 +2576,7 @@ fn a_path_that_is_not_text_is_refused_rather_than_told_as_another() {
 
 mod cases;
 mod commands;
+mod confinement;
 mod dialect;
 mod identity;
 mod inbox;
@@ -2589,6 +2590,8 @@ mod stacks;
 pub use cases::*;
 #[allow(unused_imports)]
 pub use commands::*;
+#[allow(unused_imports)]
+pub use confinement::*;
 pub use dialect::*;
 #[allow(unused_imports)]
 pub use inbox::*;

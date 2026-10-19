@@ -307,3 +307,10 @@ fn an_alias_that_changes_an_agent_name_is_reported_by_the_comparison() {
 fn an_enabled_integration_flags_only_the_named_agents_interactive_invocation() {
     shellpkg::an_enabled_integration_adds_its_flags_only_to_the_agents_interactive_invocation(ZSH);
 }
+
+/// KR-REQ-07.44
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_integration_stays_in_the_root_shell_and_adds_no_global_accept_line_or_mark() {
+    shellpkg::the_integration_stays_in_the_root_shell_and_adds_no_global_accept_line_or_mark(ZSH);
+}

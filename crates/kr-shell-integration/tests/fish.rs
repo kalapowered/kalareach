@@ -351,3 +351,10 @@ fn the_capability_reaches_a_lines_commands_and_nothing_around_them() {
 fn a_reader_a_line_starts_keeps_the_lines_block_and_capability() {
     shellpkg::a_reader_a_line_starts_keeps_the_lines_block_and_capability(FISH);
 }
+
+/// KR-REQ-07.44
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_integration_stays_in_the_root_shell_and_adds_no_global_accept_line_or_mark() {
+    shellpkg::the_integration_stays_in_the_root_shell_and_adds_no_global_accept_line_or_mark(FISH);
+}
