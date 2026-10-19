@@ -825,6 +825,10 @@ impl Controller {
         // accepted is opened whether or not a feed is selected, so the environment's stored
         // formats do not depend on the configuration.
         let mailbox_record = crate::mailbox_reader::record::Record::open(setup.paths.state_dir())?;
+        let capability_answers = crate::capability_answers::Record::open(
+            setup.paths.state_dir(),
+            kr_ipc::now_ms().get(),
+        )?;
         let mailbox_reader = match started.authority.origin() {
             None => None,
             Some(origin) => {
@@ -1118,6 +1122,7 @@ impl Controller {
                 read_at: std::time::Instant::now(),
             }),
             checks: std::sync::Mutex::new(super::capability_checks::Checks::new()),
+            capability_answers,
             inhibitor: Mutex::new(Inhibitor::new()),
             demand_scan: Mutex::new(DemandScan::default()),
             finalising: Mutex::new(()),

@@ -547,9 +547,9 @@ pub fn retained_answers() -> Vec<(kr_protocol::method::Method, &'static str)> {
 pub fn table() -> Vec<Store> {
     use kr_controller::registry::LaunchPhase;
     use kr_protocol::{
-        action, archive, attention, automation, catalogue, changeset, delivery, describe, grant,
-        hostinfo, identity, invitation, machine, mailbox, organisation, pairing, privacy, project,
-        push, session, sharing, skill, transfer, voice,
+        action, archive, attention, automation, catalogue, changeset, delivery, describe, desktop,
+        grant, hostinfo, identity, invitation, machine, mailbox, organisation, pairing, privacy,
+        project, push, session, sharing, skill, transfer, voice,
     };
 
     let mut stores = vec![
@@ -813,6 +813,21 @@ pub fn table() -> Vec<Store> {
             ),
             owned: Vec::new(),
             kept: Vec::new(),
+        },
+        Store {
+            levels: None,
+            writers: Writers::Daemon,
+            entry: entry(
+                "capability-answers",
+                StoreScope::Environment,
+                "capability-answers.sqlite3",
+                sqlite_table("capability_answers_schema"),
+                version(kr_controller::capability_answers::SCHEMA_VERSION),
+                version(kr_controller::capability_answers::OLDEST_SCHEMA_VERSION),
+            ),
+            owned: Vec::new(),
+            // The answer a repeat of a request for the disclosed checks is given, kept for 30 days.
+            kept: vec![protocol::<desktop::CapabilityChecks>("CapabilityChecks")],
         },
         Store {
             levels: None,

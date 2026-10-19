@@ -44,6 +44,7 @@ pub mod authority_feed;
 pub mod automation;
 pub mod backup;
 pub mod bridge;
+pub mod capability_answers;
 pub mod catalogue;
 pub mod changeset;
 pub mod config;

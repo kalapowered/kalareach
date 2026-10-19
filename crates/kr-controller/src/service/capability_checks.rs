@@ -23,10 +23,10 @@ use kr_protocol::desktop::{
 use kr_protocol::digest::mutation_digest;
 use kr_protocol::envelope::{ControlFrame, MutationRequest, ParamsValue};
 use kr_protocol::identity::WorkerProfile;
-use kr_protocol::ids::{ActionId, ActorId, EnvironmentId, RequestId, SessionId};
+use kr_protocol::ids::{ActorId, EnvironmentId, RequestId, SessionId};
 use kr_protocol::local::ControllerConnectionRole;
 use kr_protocol::retained::Level;
-use kr_protocol::scalars::{Digest256, Nullable, TimestampMs};
+use kr_protocol::scalars::{Nullable, TimestampMs};
 use kr_worker::desktop::capability::{context_refuses, tools_of};
 use kr_worker::desktop::probe::{Fingerprint, stale};
 
@@ -53,20 +53,6 @@ const FINDINGS: [&str; 4] = [
     capabilities::SCREEN_CAPTURE,
 ];
 
-/// How many answers to the request for the checks this daemon keeps, the newest of them.
-const KEPT_ANSWERS: usize = 64;
-
-/// An answer this daemon gave to a request for the checks, which a retry of that request is given
-/// again.
-#[derive(Debug)]
-struct KeptAnswer {
-    actor: ActorId,
-    action: ActionId,
-    /// The digest of the request, which says whether a retry is the same request.
-    digest: Digest256,
-    answer: CapabilityChecks,
-}
-
 /// A run of the checks that is in progress.
 #[derive(Debug)]
 struct Running {
@@ -92,8 +78,6 @@ struct Held {
 pub(super) struct Checks {
     /// The identifier of the latest run, which its answer carries.
     latest_request: u64,
-    /// The answers given to requests, oldest first, until this daemon ends.
-    kept: std::collections::VecDeque<KeptAnswer>,
     running: Option<Running>,
     /// How the latest run ended, or that there has been none.
     latest: CapabilityChecks,
@@ -110,7 +94,6 @@ impl Checks {
     pub(super) const fn new() -> Self {
         Self {
             latest_request: 0,
-            kept: std::collections::VecDeque::new(),
             running: None,
             latest: CapabilityChecks::not_run(),
             held: None,
@@ -135,53 +118,6 @@ impl Checks {
             view.state = CapabilityChecksState::Stale;
         }
         view
-    }
-
-    /// What was answered to this actor's request under this action identifier: the answer when the
-    /// request is the same one, and nothing is said of a different request, which a caller is told
-    /// is a reused identifier.
-    fn kept_for(
-        &self,
-        actor: &ActorId,
-        action: ActionId,
-        digest: &Digest256,
-    ) -> Option<std::result::Result<CapabilityChecks, ()>> {
-        self.kept
-            .iter()
-            .find(|kept| kept.actor == *actor && kept.action == action)
-            .map(|kept| {
-                if kept.digest == *digest {
-                    Ok(kept.answer.clone())
-                } else {
-                    Err(())
-                }
-            })
-    }
-
-    /// Keeps the answer given to a request, forgetting the oldest beyond [`KEPT_ANSWERS`].
-    fn keep(
-        &mut self,
-        actor: &ActorId,
-        action: ActionId,
-        digest: Digest256,
-        answer: CapabilityChecks,
-    ) {
-        if self
-            .kept
-            .iter()
-            .any(|kept| kept.actor == *actor && kept.action == action)
-        {
-            return;
-        }
-        if self.kept.len() == KEPT_ANSWERS {
-            self.kept.pop_front();
-        }
-        self.kept.push_back(KeptAnswer {
-            actor: actor.clone(),
-            action,
-            digest,
-            answer,
-        });
     }
 
     /// Whether a run is in progress.
@@ -399,29 +335,30 @@ pub(super) fn worker_for(workers: Vec<KnownWorker>, profile: WorkerProfile) -> O
 }
 
 impl Controller {
-    /// Answers a retry of a request for the checks from what this daemon kept, when it kept one.
+    /// Answers a retry of a request for the checks from the record of what this host answered,
+    /// when it holds one.
     ///
     /// The de-duplication key is the actor and the action together, and the digest of the request
-    /// decides whether it is the same request or a reused identifier. Nothing is kept past this
-    /// daemon: the run a request started ends with it, so there is nothing a later daemon could
-    /// answer a retry with.
+    /// decides whether it is the same request or a reused identifier. The record outlives the
+    /// daemon, so a repeat on a later connection, after its window or after a restart, is given
+    /// the answer it was given; the run that answer describes is not started again.
     pub(super) fn kept_capability_checks(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
     ) -> Option<ControlFrame> {
         let digest = mutation_digest(mutation, actor_id).ok()?;
-        let kept = self
-            .checks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .kept_for(actor_id, mutation.action_id, &digest)?;
-        let outcome = match kept {
-            Ok(answer) => ParamsValue::from_typed(&answer)
+        let held =
+            self.capability_answers
+                .recall(actor_id, mutation.action_id, kr_ipc::now_ms().get());
+        let outcome = match held {
+            Ok(None) => return None,
+            Ok(Some(held)) if held.digest == digest => ParamsValue::from_typed(&held.answer)
                 .map_err(|error| ControllerError::InvalidArgument(error.to_string())),
-            Err(()) => Err(ControllerError::IdConflict {
+            Ok(Some(_)) => Err(ControllerError::IdConflict {
                 token: mutation.action_id.to_string(),
             }),
+            Err(error) => Err(error),
         };
         Some(super::respond(mutation.request_id, outcome))
     }
@@ -477,10 +414,18 @@ impl Controller {
             // The lookup before admission and this are two looks: a request of the same actor and
             // action that was answered between them is answered here again, or refused as a reused
             // identifier, under the one hold that also starts a run.
-            if let Some(kept) = checks.kept_for(actor_id, mutation.action_id, &digest) {
-                return kept.map_err(|()| ControllerError::IdConflict {
-                    token: mutation.action_id.to_string(),
-                });
+            match self
+                .capability_answers
+                .recall(actor_id, mutation.action_id, now_ms.get())
+            {
+                Ok(Some(held)) if held.digest == digest => return Ok(held.answer),
+                Ok(Some(_)) => {
+                    return Err(ControllerError::IdConflict {
+                        token: mutation.action_id.to_string(),
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => return Err(error),
             }
             let asked = checks.ask(
                 now_ms,
@@ -488,7 +433,18 @@ impl Controller {
                 taken,
             );
             let view = checks.view();
-            checks.keep(actor_id, mutation.action_id, digest, view.clone());
+            // What is answered is written down before it is given, and a record that cannot be
+            // written does not change what the start did: the caller is told where the checks
+            // stand, and a repeat of this action is then a request like a first one.
+            if let Err(unrecorded) = self.capability_answers.remember(
+                actor_id,
+                mutation.action_id,
+                &digest,
+                &view,
+                now_ms.get(),
+            ) {
+                eprintln!("kr-controller: an action's receipt could not be kept: {unrecorded}");
+            }
             drop(checks);
             if let (Some(request_id), Some(worker)) = (asked, worker) {
                 let request = DesktopChecksRequest {
@@ -988,44 +944,6 @@ mod tests {
         assert_ne!(
             after, before,
             "and not the findings a reading was made against"
-        );
-    }
-
-    #[test]
-    fn an_answer_is_kept_for_a_retry_of_the_same_request_and_not_for_another() {
-        let actor = ActorId::new("local:501").expect("an actor");
-        let action = ActionId::new(Uuid::from_bytes([1; 16]));
-        let digest = Digest256::from_bytes([2; 32]);
-        let mut checks = Checks::new();
-        assert!(checks.kept_for(&actor, action, &digest).is_none());
-        checks.keep(&actor, action, digest, CapabilityChecks::not_run());
-        assert_eq!(
-            checks.kept_for(&actor, action, &digest),
-            Some(Ok(CapabilityChecks::not_run())),
-            "the same request is answered again"
-        );
-        assert_eq!(
-            checks.kept_for(&actor, action, &Digest256::from_bytes([3; 32])),
-            Some(Err(())),
-            "another request under the identifier is a reused identifier"
-        );
-        let other = ActorId::new("local:502").expect("another actor");
-        assert!(
-            checks.kept_for(&other, action, &digest).is_none(),
-            "an identifier is an actor's own"
-        );
-        // Only the newest are kept.
-        for byte in 0..=u8::try_from(KEPT_ANSWERS).expect("a small bound") {
-            checks.keep(
-                &actor,
-                ActionId::new(Uuid::from_bytes([byte.wrapping_add(10); 16])),
-                digest,
-                CapabilityChecks::not_run(),
-            );
-        }
-        assert!(
-            checks.kept_for(&actor, action, &digest).is_none(),
-            "the oldest is forgotten past the bound"
         );
     }
 

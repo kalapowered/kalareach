@@ -82,6 +82,23 @@
     },
     {
       "entry": {
+        "store": "capability-answers",
+        "scope": "environment",
+        "path": "capability-answers.sqlite3",
+        "recording": {
+          "kind": "sqlite_table",
+          "table": "capability_answers_schema"
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "0caa930b49882cb2fd1253e2271c2df5f2ff266b5173029b9cc50d35d9d4fc68",
+      "kept": [
+        "CapabilityChecks"
+      ]
+    },
+    {
+      "entry": {
         "store": "catalogue",
         "scope": "environment",
         "path": "catalogue/catalogue.sqlite3",

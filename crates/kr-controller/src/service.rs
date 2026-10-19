@@ -730,6 +730,8 @@ pub struct Controller {
     /// The disclosed checks a person asked for: whether a run is in progress, how the latest ended,
     /// and the findings while nothing has ended them.
     checks: std::sync::Mutex<capability_checks::Checks>,
+    /// What this host answered to requests for the checks, kept for 30 days.
+    capability_answers: crate::capability_answers::Record,
     /// The sleep assertion this daemon holds, where it holds one, and whether a review of it is
     /// running.
     inhibitor: Mutex<Inhibitor>,

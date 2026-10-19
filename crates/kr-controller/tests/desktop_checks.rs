@@ -357,6 +357,58 @@ async fn a_later_run_replaces_the_findings_and_moves_the_revision_only_when_they
     adopted.stop().await;
 }
 
+/// KR-REQ-03.29: the answer given to a request for the checks is kept for 30 days and outlives the
+/// daemon: a repeat on a later connection after a restart, when the window it was sent in is gone,
+/// is given the answer it was given and no run of its own, and another request under the same
+/// identifier is refused as a reused identifier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_answer_to_a_request_outlives_the_daemon_and_the_identifier_stays_the_requests() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let mut first = host.client().await;
+    let request = request_for(&host, &mut first, action, None).await;
+    let asked = send(&mut first, &request).await.expect("asked");
+    assert_eq!(asked.state, CapabilityChecksState::Failed, "{asked:?}");
+    drop(first);
+
+    let host = host.restart().await;
+    // The daemon that answered is gone with every window it issued, and the host has asked nothing
+    // since it started.
+    assert_eq!(
+        shown(&host).await.checks.state,
+        CapabilityChecksState::NotRun,
+        "nothing a restart could carry is held in memory"
+    );
+    let mut later = host.client().await;
+    let repeated = send(&mut later, &request).await.expect("asked again");
+    assert_eq!(
+        repeated, asked,
+        "the answer that was given, with the time it was given, and not a run of its own"
+    );
+    assert_eq!(
+        shown(&host).await.checks.state,
+        CapabilityChecksState::NotRun,
+        "and the repeat started nothing"
+    );
+    let different = request_for(
+        &host,
+        &mut later,
+        action,
+        Some(std::path::Path::new("/tmp/x")),
+    )
+    .await;
+    let conflict = send(&mut later, &different)
+        .await
+        .expect_err("a reused identifier");
+    assert_eq!(
+        conflict.code,
+        kr_protocol::error::ErrorCode::IdConflict,
+        "{conflict:?}"
+    );
+    host.stop().await;
+}
+
 /// KR-REQ-03.29: with no session to perform them in, nothing is started and the answer says why,
 /// and a later read shows the same, so the setup assistant can tell a person to start a session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
