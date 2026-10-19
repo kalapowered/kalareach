@@ -892,9 +892,11 @@ pub fn table() -> Vec<Store> {
                 kr_automation::resources::RESOURCES_OLDEST_SCHEMA_VERSION,
             ),
             owned: Vec::new(),
-            kept: vec![protocol::<automation::WorkflowActionKind>(
-                "WorkflowActionKind",
-            )],
+            kept: vec![
+                protocol::<automation::WorkflowActionKind>("WorkflowActionKind"),
+                protocol::<identity::ProcessStartIdentity>("ProcessStartIdentity"),
+                protocol::<identity::BootIdentity>("BootIdentity"),
+            ],
         },
         Store {
             levels: None,
@@ -1438,6 +1440,14 @@ pub fn named() -> Vec<Named> {
             opaque: true,
             databases: true,
             reason: "the per-session journals, which keep the archive's own rule (kr host import-journals)",
+        },
+        Named {
+            scope: StoreScope::Environment,
+            name: "workflow-scratch",
+            children: &[],
+            opaque: true,
+            databases: true,
+            reason: "the directories a workflow's commands run in, one for each node and removed when its row in the resource ledger is released; what a command writes there is its own",
         },
         content(
             StoreScope::Environment,

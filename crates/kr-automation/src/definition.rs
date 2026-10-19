@@ -56,8 +56,7 @@ pub const fn produced_event(action_kind: WorkflowActionKind) -> Option<&'static 
 /// Whether a node of `action_kind` creates a session of its own, which spends the chain's
 /// session allowance and needs the right to create one.
 ///
-/// `request_review` is not among them while the host cannot start a reviewer: it is refused at
-/// dispatch before it creates anything.
+/// `request_review` is not among them: it is refused at dispatch before it creates anything.
 #[must_use]
 pub const fn creates_session(action_kind: WorkflowActionKind) -> bool {
     matches!(

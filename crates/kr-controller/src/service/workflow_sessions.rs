@@ -152,15 +152,21 @@ impl Controller {
     ///
     /// # Errors
     ///
+    /// Answers whether a worker was asked: `false` says the directory holds no worker for the
+    /// session, because it has closed or because its worker has not yet reported, and nothing was
+    /// sent. A caller that must see a session closed asks again until it is.
+    ///
+    /// # Errors
+    ///
     /// Returns an error when the worker could not be reached or did not answer in the time a close
     /// is given. Neither says the session is still open.
     pub(crate) async fn workflow_session_close(
         self: &Arc<Self>,
         order: WorkflowClose<'_>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let worker = self.directory.lock().await.get(order.session_id).cloned();
         let Some(worker) = worker else {
-            return Ok(());
+            return Ok(false);
         };
         let close_action = close_action_of(order.node_action);
         let mutation = MutationRequest {
@@ -200,7 +206,7 @@ impl Controller {
         let budget = tokio::time::Instant::now() + CLOSE_EXCHANGE;
         let mut link = match tokio::time::timeout_at(budget, self.worker_client(&worker)).await {
             Ok(Ok(link)) => link,
-            Ok(Err(ControllerError::UnknownSession { .. })) => return Ok(()),
+            Ok(Err(ControllerError::UnknownSession { .. })) => return Ok(false),
             Ok(Err(error)) => return Err(error),
             Err(_) => {
                 return Err(ControllerError::supervision(
@@ -235,7 +241,7 @@ impl Controller {
                     order.session_id,
                     kr_protocol::session::ClosureReason::CloseRequested,
                 ));
-                Ok(())
+                Ok(true)
             }
             Ok(Ok(Err(refusal))) => {
                 link.give_back();
@@ -322,38 +328,18 @@ impl Controller {
         &self.boot_identity
     }
 
-    /// The process of a session's worker, while the registry holds the session's worker.
-    ///
-    /// A session that closed already has no worker row; a closure that could not account for the
-    /// worker is then released by the boot.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the registry cannot be read.
-    pub(crate) async fn workflow_worker_of(
-        self: &Arc<Self>,
-        session_id: SessionId,
-    ) -> Result<Option<kr_protocol::identity::ProcessStartIdentity>> {
-        Ok(self
-            .registry
-            .lock()
-            .await
-            .workers()?
-            .into_iter()
-            .find(|record| record.session_id == session_id)
-            .map(|record| record.process_identity))
-    }
-
     /// Milliseconds on the machine's continuous clock since boot, which a worker also reads.
     pub(crate) fn boot_elapsed_ms(&self) -> u64 {
         self.shared_clock.boot_elapsed_ms()
     }
 
-    /// The session a node's create token resolved to, when one was reserved, and whether anything
-    /// was ever launched for it.
+    /// The session a node's create token resolved to, when one was launched, with the process of
+    /// its worker.
     ///
     /// A reservation that failed before its worker started holds no session to close and none to
-    /// wait for: its node has nothing left to release but what the node itself owned.
+    /// wait for: its node has nothing left to release but what the node itself owned. The process
+    /// is the one the launcher reported, which the worker's claim proved to be the worker's own,
+    /// and the registry keeps it after the session has closed and its worker's row is gone.
     ///
     /// # Errors
     ///
@@ -362,15 +348,26 @@ impl Controller {
         self: &Arc<Self>,
         actor_id: &ActorId,
         token: ActionId,
-    ) -> Result<Option<SessionId>> {
+    ) -> Result<Option<NodeSession>> {
         Ok(self
             .registry
             .lock()
             .await
             .reservation_for_token(actor_id, token.get())?
             .filter(|reservation| reservation.phase != crate::registry::LaunchPhase::Failed)
-            .map(|reservation| reservation.session_id))
+            .map(|reservation| NodeSession {
+                session_id: reservation.session_id,
+                worker: reservation.launcher_identity,
+            }))
     }
+}
+
+/// The session a workflow node's create token resolved to.
+pub(crate) struct NodeSession {
+    /// The session.
+    pub(crate) session_id: SessionId,
+    /// The process of its worker, once the launcher has reported it.
+    pub(crate) worker: Option<kr_protocol::identity::ProcessStartIdentity>,
 }
 
 /// A request identifier for a close, derived from its action so the bytes of a retry match.
@@ -379,4 +376,35 @@ fn request_id_for(action: ActionId) -> RequestId {
     let mut head = [0_u8; 8];
     head.copy_from_slice(&bytes.as_bytes()[..8]);
     RequestId::new(u64::from_le_bytes(head))
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::ids::{ActionId, ActorId, SessionId, WorkflowRunId};
+    use kr_protocol::scalars::Uuid;
+
+    use super::WorkflowClose;
+    use crate::service::a_link_that_is_not_given_back::Served;
+
+    /// A close for a session whose worker is not in the directory asks nobody and says so: the
+    /// session has closed, or its worker has not reported yet, and a caller that must see it closed
+    /// asks again. Answering that as a close that was made would end the asking while the worker,
+    /// once it reported, ran on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_close_for_a_session_with_no_worker_in_the_directory_says_nobody_was_asked() {
+        let world = Served::recorded().await;
+        let stranger = SessionId::new(Uuid::from_bytes([0x5a; 16]));
+        let actor_id = ActorId::new("workflow:grant").expect("a principal");
+        let asked = world
+            .controller
+            .workflow_session_close(WorkflowClose {
+                actor_id: &actor_id,
+                run_id: WorkflowRunId::new(Uuid::from_bytes([0x21; 16])),
+                session_id: stranger,
+                node_action: ActionId::new(Uuid::from_bytes([0x33; 16])),
+            })
+            .await
+            .expect("having nobody to ask is no failure");
+        assert!(!asked, "no worker was asked to close the session");
+    }
 }

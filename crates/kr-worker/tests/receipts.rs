@@ -1125,18 +1125,39 @@ fn workflow_close(
     named: Option<kr_protocol::ids::WorkflowRunId>,
     grant: Option<kr_protocol::ids::GrantId>,
 ) -> ControlFrame {
+    // A paired device's close is complete: its device, its grant and the right to close. Only the
+    // run it names is what the worker refuses it for.
+    let paired = ingress == kr_protocol::actor::ActorIngress::PairedDevice;
     ControlFrame::Forwarded(Box::new(kr_protocol::local::ForwardedMutation {
         mutation: mutation.clone(),
         actor: kr_protocol::actor::ActorEnvelope {
             actor_id: actor("workflow:grant"),
             ingress,
-            device_id: Nullable::null(),
-            grant_id: Nullable(grant),
-            grant_revision: Nullable::null(),
+            device_id: if paired {
+                Nullable::some(kr_protocol::ids::DeviceId::new(Uuid::from_bytes([9; 16])))
+            } else {
+                Nullable::null()
+            },
+            grant_id: if paired {
+                Nullable::some(kr_protocol::ids::GrantId::new(Uuid::from_bytes([8; 16])))
+            } else {
+                Nullable(grant)
+            },
+            grant_revision: if paired {
+                Nullable::some(kr_protocol::ids::AuthorityRevision::new(1))
+            } else {
+                Nullable::null()
+            },
             controller_generation: ControllerGeneration::new(1),
             connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([8; 16])),
         },
-        grant_rights: kr_protocol::scalars::CanonicalSet::new(),
+        grant_rights: if paired {
+            [kr_protocol::rights::ActionRight::SessionClose]
+                .into_iter()
+                .collect()
+        } else {
+            kr_protocol::scalars::CanonicalSet::new()
+        },
         accepted_deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms() + 120_000),
         history: None,
         screen_basis: None,
@@ -1251,10 +1272,9 @@ async fn a_workflow_closes_the_session_its_run_started_and_nothing_else() {
     else {
         panic!("a retry of the close is answered");
     };
-    assert!(
-        matches!(again.outcome, Outcome::Ok(_)),
-        "{:?}",
-        again.outcome
+    assert_eq!(
+        again.outcome, accepted.outcome,
+        "the retry is answered with what the first close produced"
     );
     authority
         .confirm_delivery(mutation.action_id)
@@ -1266,6 +1286,20 @@ async fn a_workflow_closes_the_session_its_run_started_and_nothing_else() {
     )
     .await
     .expect("the closure finishes");
+    // The close is recorded under the workflow's own principal, as it was forwarded.
+    let journal = rusqlite::Connection::open_with_flags(
+        &host.journal_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("opens the journal");
+    let principal: String = journal
+        .query_row(
+            "SELECT actor_id FROM receipts WHERE action_id = ?1",
+            [mutation.action_id.get().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("the close left a receipt");
+    assert_eq!(principal, "workflow:grant");
 }
 
 /// A workflow's close does not travel over a proxy link, whatever run it names. The

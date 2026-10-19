@@ -95,7 +95,8 @@ pub struct Owned {
     /// The process of the session's worker, once the session exists. A closure that could not
     /// account for the worker leaves the row open until the kernel says this process has ended.
     pub worker: Option<ProcessStartIdentity>,
-    /// The boot the session was made in. A worker of an earlier boot is gone with that boot.
+    /// The boot the dispatch began in, which is the boot its session is made in. A worker of an
+    /// earlier boot is gone with that boot.
     pub boot: Option<BootIdentity>,
     /// Where the resources stand.
     pub state: OwnedState,
@@ -193,8 +194,8 @@ impl ResourceLedger {
         self.lock().execute(
             "INSERT OR IGNORE INTO owned
                (action_id, run_id, node_id, kind, grant_id, owns_session, materialisation_id,
-                scratch, workspace_id, session_id, state, began_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                scratch, workspace_id, session_id, boot, state, began_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 owned.action_id.get().to_string(),
                 owned.run_id.to_string(),
@@ -206,6 +207,7 @@ impl ResourceLedger {
                 owned.scratch,
                 owned.workspace_id.map(|id| id.to_string()),
                 owned.session_id.map(|id| id.to_string()),
+                owned.boot.as_ref().map(encoded).transpose()?,
                 OwnedState::Open.as_str(),
                 i64::try_from(now_ms).unwrap_or(i64::MAX),
             ],
@@ -227,8 +229,9 @@ impl ResourceLedger {
         Ok(())
     }
 
-    /// Records the session a dispatch made, the process of its worker when the registry still
-    /// holds one, and the boot it was made in.
+    /// Records the session a dispatch made and the process of its worker, which is the process the
+    /// launcher started once the registry has one. The boot the row was begun in stays as it was
+    /// written: the session is made in the boot its dispatch runs in.
     ///
     /// # Errors
     ///
@@ -238,18 +241,12 @@ impl ResourceLedger {
         action_id: ActionId,
         session_id: SessionId,
         worker: Option<&ProcessStartIdentity>,
-        boot: &BootIdentity,
     ) -> Result<()> {
         let worker = worker.map(encoded).transpose()?;
         self.lock().execute(
-            "UPDATE owned SET session_id = ?2, worker_process = ?3, boot = ?4
+            "UPDATE owned SET session_id = ?2, worker_process = COALESCE(?3, worker_process)
               WHERE action_id = ?1",
-            params![
-                action_id.get().to_string(),
-                session_id.to_string(),
-                worker,
-                encoded(boot)?,
-            ],
+            params![action_id.get().to_string(), session_id.to_string(), worker],
         )?;
         Ok(())
     }
@@ -515,7 +512,12 @@ mod tests {
     #[test]
     fn what_a_dispatch_made_is_found_again_from_the_row() {
         let ledger = ResourceLedger::in_memory().expect("a ledger");
-        let row = owned(3, WorkflowActionKind::ShellCommand, true);
+        let boot = BootIdentity {
+            source: kr_protocol::identity::BootIdentitySource::LinuxBootId,
+            value: kr_protocol::scalars::Bytes::new(vec![1, 2, 3]),
+        };
+        let mut row = owned(3, WorkflowActionKind::ShellCommand, true);
+        row.boot = Some(boot.clone());
         ledger.begin(&row, 10).expect("it begins");
         ledger
             .note_scratch_identity(row.action_id, "12:34")
@@ -525,13 +527,9 @@ mod tests {
             kr_protocol::identity::ProcessStartSource::LinuxProcStat,
             1_234,
         );
-        let boot = BootIdentity {
-            source: kr_protocol::identity::BootIdentitySource::LinuxBootId,
-            value: kr_protocol::scalars::Bytes::new(vec![1, 2, 3]),
-        };
         let session = SessionId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
         ledger
-            .note_session(row.action_id, session, Some(&worker), &boot)
+            .note_session(row.action_id, session, Some(&worker))
             .expect("the session is written down");
         let found = ledger.get(row.action_id).expect("reads").expect("a row");
         assert_eq!(found.scratch_identity.as_deref(), Some("12:34"));

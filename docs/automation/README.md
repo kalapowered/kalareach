@@ -203,13 +203,18 @@ what the command did. Everything a command node owns outside the journal (its se
 directory, the run's hold on its workspace) is written down in a ledger of its own before any of
 it is made, and released once the session's closure accounts for its worker. A node's private
 directory is made for it alone, its identity is written down before the command can start, and it
-is removed only while it still has that identity; a directory that was never identified is removed
-only when it is empty. A dispatch owns its row while it runs; after a restart, or when a dispatch
+is removed only while it still has that identity: the directory is opened once, its identity is
+read from that handle and everything in it is removed through the handle, a tree the command left
+without write access included, so what is removed is the directory that was checked and never one
+put at its path afterwards. A directory that was never identified is removed only when it is
+empty. A dispatch owns its row while it runs; after a restart, or when a dispatch
 ends without releasing, a sweep closes the session, removes the directory, ends the hold and
 releases the row, without waiting for the run to end. A run holds a workspace once, however many of
 its nodes ran there, and the hold ends with the last of them; a paused run does not keep a
 workspace between its nodes. A closure that could not account for the worker keeps the row until
-the kernel says the worker's process has ended or the boot it ran in has, and the sweep looks again
+the kernel says the worker's process has ended or the boot it ran in has (the row records the
+boot it began in, and the process the launcher started, which the registry keeps after the
+session has closed), and the sweep looks again
 less and less often while a row stays owed. What the worker could not account for stays outside
 the release: a process the command started that left the session's boundary can outlive it, and
 where the platform gives incomplete coverage of owned processes (always on macOS) the closure says

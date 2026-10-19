@@ -56,7 +56,7 @@ use kr_protocol::method::{Method, MethodGroup};
 use kr_protocol::scalars::Nullable;
 
 use crate::error::{ControllerError, Result};
-use crate::service::Controller;
+use crate::service::{Controller, NodeSession};
 
 /// What an automation call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
@@ -406,18 +406,17 @@ impl NodeTask {
         self.state().cancelled
     }
 
-    /// Asks the node to stop. A session that passed its admission is stopped only by a node that
-    /// closes its session; one that keeps it cannot be stopped from here, and the answer is that
-    /// it was not.
+    /// Asks the node to stop. Whatever has not started never will: the worker's claim of a node
+    /// that was asked to stop is refused. A session that passed its first admission is stopped
+    /// only by a node that closes its session; one that keeps it cannot be stopped from here, and
+    /// the answer is that it was not.
     fn cancel(&self, closes_its_session: bool) -> bool {
         let mut state = self.state();
-        if state.committed && !closes_its_session {
-            return false;
-        }
         state.cancelled = true;
+        let stopped = !state.committed || closes_its_session;
         drop(state);
         self.woken.notify_one();
-        true
+        stopped
     }
 
     /// Whether the node's session may start: not when the node was asked to stop. It is asked at
@@ -496,9 +495,10 @@ impl std::fmt::Debug for HostActions {
 impl ActionRunner for HostActions {
     /// A command's session is closed when its dispatch is asked to stop: the dispatch sees the
     /// flag, closes the session, and releases what it owned once the closure is recorded. A
-    /// `create_session` node is stopped only while its session has not passed its admission; the
-    /// session of one that has stays, and the node settles unknown. Nothing is claimed about what
-    /// a command did before it stopped.
+    /// `create_session` node is stopped only while its session has not passed its first
+    /// admission, and the node of one that has settles unknown. Its worker's claim is refused if
+    /// it comes after the request, so no program starts, and a session whose claim came before it
+    /// stays. Nothing is claimed about what a command did before it stopped.
     ///
     /// Neither change-set kind can be stopped once it has begun: the change-set service offers no
     /// point inside a capture or a materialisation to stop at. An action that outlives its wait
@@ -1017,7 +1017,7 @@ async fn run_command(
         workspace_id,
         session_id: None,
         worker: None,
-        boot: None,
+        boot: Some(context.daemon.get()?.boot().clone()),
         state: OwnedState::Open,
     };
     // The row is written down before any of what it stands for is made, and the run's hold on its
@@ -1155,35 +1155,122 @@ fn directory_identity(_path: &std::path::Path) -> std::io::Result<String> {
 /// A directory with the identity written down is removed with what is in it. One that was never
 /// identified was never used, and is removed only if it is empty. Another directory at the path,
 /// or none, is not this host's to remove.
+///
+/// The directory is opened once, through its parent, and its identity is read from the open
+/// handle. Everything is removed through that handle, so what is removed is the directory that was
+/// checked and never whatever the path names a moment later.
+#[cfg(unix)]
 fn remove_scratch(
     root: &std::path::Path,
     path: &std::path::Path,
     identity: Option<&str>,
 ) -> std::io::Result<()> {
+    remove_scratch_after(root, path, identity, || {})
+}
+
+/// [`remove_scratch`], calling `verified` once the open directory has been found to be the one
+/// that was made and before anything in it is removed.
+#[cfg(unix)]
+fn remove_scratch_after(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    identity: Option<&str>,
+    verified: impl FnOnce(),
+) -> std::io::Result<()> {
+    use rustix::fs::{AtFlags, CWD, Mode, OFlags, openat, unlinkat};
+    use rustix::io::Errno;
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::MetadataExt;
+
     if !path.starts_with(root) {
         return Ok(());
     }
-    let found = match directory_identity(path) {
-        Ok(found) => found,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        // A file or a link at the path is not the directory that was made.
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => return Ok(()),
-        Err(error) => return Err(error),
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Ok(());
+    };
+    let opened = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let parent = match openat(CWD, parent, opened, Mode::empty()) {
+        Ok(parent) => parent,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let directory = match openat(&parent, name, opened, Mode::empty()) {
+        Ok(directory) => std::fs::File::from(directory),
+        // Gone, or a file or a link in its place: not the directory that was made.
+        Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let found = {
+        let about = directory.metadata()?;
+        format!("{}:{}", about.dev(), about.ino())
     };
     match identity {
-        Some(recorded) if recorded == found => match std::fs::remove_dir_all(path) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-            _ => Ok(()),
-        },
-        Some(_) => Ok(()),
-        None => match std::fs::remove_dir(path) {
-            Ok(()) => Ok(()),
-            // Something is in it that this host did not put there.
-            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        },
+        Some(recorded) if recorded == found => {
+            verified();
+            remove_contents(directory.as_fd(), 0)?;
+        }
+        Some(_) => return Ok(()),
+        // Never identified, so never used: whatever is in it was not put there by this host.
+        None => {}
     }
+    match unlinkat(&parent, name, AtFlags::REMOVEDIR) {
+        // Gone already, or not empty: another directory was put at the path, or this one holds
+        // something this host did not put there.
+        Ok(()) | Err(Errno::NOENT | Errno::NOTEMPTY) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// How deep a tree of a command's making is removed. Nothing a command is given to do makes a
+/// tree this deep, and a tree that is stays, with the row that owns it.
+#[cfg(unix)]
+const SCRATCH_DEPTH: u32 = 256;
+
+/// Removes everything in an open directory, through the handle, and leaves the directory itself.
+///
+/// A directory the command made without write access to it is made the owner's again first, so a
+/// tree a build left read-only goes like any other.
+#[cfg(unix)]
+fn remove_contents(directory: std::os::fd::BorrowedFd<'_>, depth: u32) -> std::io::Result<()> {
+    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, fchmod, openat, statat, unlinkat};
+
+    if depth > SCRATCH_DEPTH {
+        return Err(std::io::Error::other(
+            "the tree a command left is nested deeper than this host removes",
+        ));
+    }
+    // Not the owner's to change when it is not the owner's: the removal below then says so.
+    let _ = fchmod(directory, Mode::RWXU);
+    let entries = Dir::read_from(directory)?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == c"." || name == c".." {
+            continue;
+        }
+        let about = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if FileType::from_raw_mode(about.st_mode) == FileType::Directory {
+            let opened = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            let child = openat(directory, name, opened, Mode::empty())?;
+            remove_contents(std::os::fd::AsFd::as_fd(&child), depth + 1)?;
+            unlinkat(directory, name, AtFlags::REMOVEDIR)?;
+        } else {
+            unlinkat(directory, name, AtFlags::empty())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn remove_scratch(
+    _root: &std::path::Path,
+    _path: &std::path::Path,
+    _identity: Option<&str>,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "a directory a command ran in is removed on POSIX hosts",
+    ))
 }
 
 /// Makes the session a command runs as the root of, waits for it to close, and says whether what
@@ -1238,11 +1325,14 @@ async fn drive_command(
         Ok(created) => created,
         Err(error) => {
             // A create that made no session leaves nothing to wait for. One whose launch may
-            // still complete has a session the registry holds under the node's token: the sweep
-            // closes it, and the row stays.
+            // still complete has a session the registry holds under the node's token: it is
+            // written down with its worker, the sweep closes it, and the row stays.
             let session = controller
                 .workflow_session_of(&actor_id, context.action_id)
                 .await;
+            if let Ok(Some(found)) = &session {
+                note_node_session(context, held, found).await;
+            }
             let outcome = creation_failed(held, error);
             return Driven {
                 outcome,
@@ -1251,44 +1341,18 @@ async fn drive_command(
         }
     };
     let session_id = created.session.session_id;
-    // The session is written down at once, with its worker's process and the boot it was made in,
-    // and bound to the workspace it runs in: a live session is a writer there, which a capture
-    // that wants the workspace held still has to count.
+    // The session is written down at once, with its worker's process, and bound to the workspace
+    // it runs in: a live session is a writer there, which a capture that wants the workspace held
+    // still has to count. The worker's process is the one the launcher reported, which the
+    // registry keeps after the session has closed.
     let worker = controller
-        .workflow_worker_of(session_id)
+        .workflow_session_of(&actor_id, context.action_id)
         .await
         .ok()
-        .flatten();
-    let boot = controller.boot().clone();
+        .flatten()
+        .and_then(|found| found.worker);
     drop(controller);
-    {
-        let ledger = Arc::clone(&context.ledger);
-        let changesets = Arc::clone(&context.changesets);
-        let action_id = context.action_id;
-        let workspace_id = held.definition.resource_scope.workspace_id.0;
-        let noted = blocking(move || -> kr_automation::Result<()> {
-            ledger.note_session(action_id, session_id, worker.as_ref(), &boot)?;
-            if let Some(workspace_id) = workspace_id {
-                changesets
-                    .project()
-                    .bind_session(workspace_id, session_id, true)
-                    .map_err(|error| {
-                        kr_automation::AutomationError::InvalidArgument(format!(
-                            "the session was not bound to its workspace: {}",
-                            kr_project::git::redact(&error.to_string())
-                        ))
-                    })?;
-            }
-            Ok(())
-        })
-        .await;
-        if let Err(error) = noted {
-            eprintln!(
-                "kr-controller: the session of workflow node {} was not written down: {error}",
-                context.action_id.get()
-            );
-        }
-    }
+    note_node_session(context, held, &NodeSession { session_id, worker }).await;
     let closure = wait_for_closure(context, task, &actor_id, session_id).await;
     let outcome = match &closure {
         Some(closure) => command_outcome(closure),
@@ -1303,6 +1367,38 @@ async fn drive_command(
         release: closure
             .as_ref()
             .is_some_and(|closure| !left_unaccounted(closure)),
+    }
+}
+
+/// Writes down the session a dispatch made and the process of its worker, and binds the session to
+/// the workspace it runs in.
+async fn note_node_session(context: &NodeContext, held: &Arc<HeldGrant>, found: &NodeSession) {
+    let ledger = Arc::clone(&context.ledger);
+    let changesets = Arc::clone(&context.changesets);
+    let action_id = context.action_id;
+    let workspace_id = held.definition.resource_scope.workspace_id.0;
+    let (session_id, worker) = (found.session_id, found.worker.clone());
+    let noted = blocking(move || -> kr_automation::Result<()> {
+        ledger.note_session(action_id, session_id, worker.as_ref())?;
+        if let Some(workspace_id) = workspace_id {
+            changesets
+                .project()
+                .bind_session(workspace_id, session_id, true)
+                .map_err(|error| {
+                    kr_automation::AutomationError::InvalidArgument(format!(
+                        "the session was not bound to its workspace: {}",
+                        kr_project::git::redact(&error.to_string())
+                    ))
+                })?;
+        }
+        Ok(())
+    })
+    .await;
+    if let Err(error) = noted {
+        eprintln!(
+            "kr-controller: the session of workflow node {} was not written down: {error}",
+            context.action_id.get()
+        );
     }
 }
 
@@ -1544,7 +1640,7 @@ impl HostActions {
             }
         };
         let mut stuck = 0;
-        for row in rows {
+        for mut row in rows {
             if self.live.get(row.action_id).is_some() {
                 continue;
             }
@@ -1570,7 +1666,26 @@ impl HostActions {
                 Ok(None)
             };
             match session {
-                Ok(Some(session_id)) => {
+                Ok(Some(found)) => {
+                    let session_id = found.session_id;
+                    // A dispatch that ended before it wrote its session down leaves a row with no
+                    // worker. The registry keeps the process the launcher started, so the row is
+                    // given it before anything is decided from it.
+                    if row.worker.is_none() && found.worker.is_some() {
+                        let ledger = Arc::clone(&self.ledger);
+                        let (action_id, worker) = (row.action_id, found.worker.clone());
+                        let noted = blocking(move || {
+                            ledger.note_session(action_id, session_id, worker.as_ref())
+                        })
+                        .await;
+                        match noted {
+                            Ok(()) => row.worker = found.worker,
+                            Err(error) => eprintln!(
+                                "kr-controller: the worker of a workflow session its node left \
+                                 behind was not written down: {error}"
+                            ),
+                        }
+                    }
                     match controller.workflow_session_closure(session_id).await {
                         Ok(Some(closure)) if !left_unaccounted(&closure) => {}
                         Ok(Some(_)) if worker_has_ended(&row, controller.boot()) => {}
@@ -1651,12 +1766,15 @@ impl HostActions {
             })
             .await;
         match closed {
-            Ok(()) => {
+            // Remembered only when a worker was asked. A session whose worker has not reported
+            // yet is asked again at the next look, once its worker is there to be asked.
+            Ok(true) => {
                 self.closing
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(row.action_id);
             }
+            Ok(false) => {}
             Err(error) => {
                 eprintln!(
                     "kr-controller: a workflow session its node left behind was not closed: \
@@ -3189,6 +3307,64 @@ mod tests {
         let identity = directory_identity(&outside).expect("it has an identity");
         remove_scratch(root.path(), &outside, Some(&identity)).expect("not this host's");
         assert!(outside.exists(), "a path outside the root is never removed");
+    }
+
+    /// What is removed is the directory that was checked, whatever is put at its path after the
+    /// check: the replacement is left as it is, with what is in it, and the directory that was
+    /// checked is emptied through its own handle.
+    #[test]
+    fn a_directory_put_at_the_path_after_the_check_is_not_removed() {
+        let root = tempfile::tempdir().expect("a root");
+        let scratch = root.path().join("node");
+        std::fs::create_dir(&scratch).expect("the directory is made");
+        std::fs::write(scratch.join("output"), b"x").expect("a file in it");
+        let identity = directory_identity(&scratch).expect("it has an identity");
+        let moved = root.path().join("moved");
+
+        remove_scratch_after(root.path(), &scratch, Some(&identity), || {
+            std::fs::rename(&scratch, &moved).expect("the checked directory is moved aside");
+            std::fs::create_dir(&scratch).expect("another is put at its path");
+            std::fs::write(scratch.join("precious"), b"y").expect("a file in it");
+        })
+        .expect("the removal goes on");
+
+        assert!(
+            scratch.join("precious").exists(),
+            "what was put at the path after the check is not removed"
+        );
+        assert!(
+            !moved.join("output").exists(),
+            "the directory that was checked is the one that was emptied"
+        );
+    }
+
+    /// A tree a command left without write access, as a build's cache is, is removed like any other.
+    #[test]
+    fn a_tree_a_command_left_read_only_is_removed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("a root");
+        let scratch = root.path().join("node");
+        let cache = scratch.join("cache").join("deep");
+        std::fs::create_dir_all(&cache).expect("the tree is made");
+        std::fs::write(cache.join("module"), b"x").expect("a file in it");
+        let outside = tempfile::tempdir().expect("a directory outside the tree");
+        std::fs::write(outside.path().join("kept"), b"z").expect("a file in it");
+        std::os::unix::fs::symlink(outside.path(), scratch.join("link")).expect("a link in it");
+        for path in [cache.join("module"), cache.clone(), cache.parent().expect("a parent").to_path_buf()] {
+            let mode = if path.is_dir() { 0o555 } else { 0o444 };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("the tree is made read-only");
+        }
+        let identity = directory_identity(&scratch).expect("it has an identity");
+
+        remove_scratch(root.path(), &scratch, Some(&identity)).expect("it is removed");
+
+        assert!(!scratch.exists(), "the whole tree goes");
+        assert!(
+            outside.path().join("kept").exists(),
+            "a link in the tree is removed and never followed"
+        );
     }
 
     /// A worker a closure could not account for is gone when the boot it ran in has ended, or when

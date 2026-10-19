@@ -4467,6 +4467,11 @@ async fn a_command_that_outlives_its_wait_is_stopped() {
     assert_eq!(sessions.len(), 1);
     let closed = closed_session(&mut control, sessions[0].session_id).await;
     assert_eq!(
+        closed.root,
+        Some(kr_protocol::session::SessionRoot::Command),
+        "a command's session says its root was a command after it has closed"
+    );
+    assert_eq!(
         closed.closure.0.expect("closed").reason,
         kr_protocol::session::ClosureReason::CloseRequested,
         "the session was closed because the node was asked to stop"
@@ -4903,7 +4908,10 @@ async fn a_created_session_is_kept_when_its_node_is_asked_to_stop_after_its_admi
 
     let (claimed, resume) = host.controller.pause_rendezvous_after_claim();
     let running = run_from_another_task(&host, &document, "evt-held");
-    claimed.await.expect("the worker's claim was committed");
+    tokio::time::timeout(std::time::Duration::from_secs(60), claimed)
+        .await
+        .expect("the worker claimed its launch")
+        .expect("the worker's claim was committed");
     until("the node's wait to end", || {
         node_statuses(&host) == [NodeStatus::Unknown.as_str()]
     })
@@ -5022,6 +5030,271 @@ async fn a_command_a_stopped_daemon_left_running_is_closed_and_released_by_the_n
     assert!(
         still.closure.0.is_none(),
         "a session a create_session node made is not any sweep's to close: {still:?}"
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-19.04 and KR-REQ-25.14: a command is held to its grant's own end where its process is
+/// created, whatever its wait still allows. The grant ends while the worker's rendezvous is held
+/// after its claim, which the grant still stood at, and the worker, going on, creates no process:
+/// the command leaves no mark and its reservation fails. The control is a grant with no end, whose
+/// command starts through the same hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_command_does_not_start_after_its_grants_end_though_its_wait_has_time_left() {
+    let host = working_host().await;
+    let mut control = client(&host).await;
+    let marker = host.work().join("a-command-ran");
+    let local = kr_protocol::ids::DeviceId::new(host.environment_id.get());
+    for (number, ends) in [(50_u8, true), (51, false)] {
+        let ends_at = kr_ipc::now_ms().get() + 20_000;
+        issue_grant(
+            &host,
+            grant_id(number),
+            local,
+            &COMMAND_RIGHTS,
+            if ends {
+                GrantExpiry::At {
+                    expires_at_ms: kr_protocol::scalars::TimestampMs::new(ends_at),
+                }
+            } else {
+                GrantExpiry::Never
+            },
+        );
+        let mut document = definition(
+            workflow_id(number),
+            grant_id(number),
+            "a command",
+            command_node(&host, "command", &format!("touch {}", marker.display())),
+        );
+        document.deadlines = WorkflowDeadlines {
+            run_deadline_ms: U64::new(600_000),
+            action_wait_ms: U64::new(300_000),
+        };
+        install(&mut control, &host, &document).await;
+        enable(&mut control, &host, &document).await;
+
+        let (claimed, resume) = host.controller.pause_rendezvous_after_claim();
+        let running = run_from_another_task(&host, &document, "evt-grant-end");
+        tokio::time::timeout(std::time::Duration::from_secs(60), claimed)
+            .await
+            .expect("the worker claimed its launch")
+            .expect("the worker's claim was committed");
+        if ends {
+            until("the grant's end to pass", || {
+                kr_ipc::now_ms().get() > ends_at
+            })
+            .await;
+        }
+        resume.send(()).expect("the rendezvous goes on");
+        let _ = running.await;
+
+        if ends {
+            until("the refused start to have failed its reservation", || {
+                reservation_phases(&host, grant_id(number)) == ["failed"]
+            })
+            .await;
+            assert!(
+                !marker.exists(),
+                "no process was created after the grant's end"
+            );
+        } else {
+            let sessions = all_sessions(&mut control).await;
+            let session = sessions
+                .iter()
+                .max_by_key(|session| session.display_number.get())
+                .expect("the command's session");
+            let closed = closed_session(&mut control, session.session_id).await;
+            assert_eq!(
+                closed.closure.0.expect("closed").reason,
+                kr_protocol::session::ClosureReason::RootExit
+            );
+            assert!(marker.exists(), "a grant with no end let the command run");
+        }
+    }
+    until("what each dispatch owned to be released", || {
+        owed_rows(&host) == 0
+    })
+    .await;
+    host.clients.abort();
+}
+
+/// A run is cancelled while a node's launch waits at the supervisor's door, after the launch
+/// transition admitted it. The worker starts, connects and is refused its claim: the node's session
+/// is never made, the reservation fails, and what it would have started never starts.
+async fn a_run_cancelled_at_the_door_starts_nothing(
+    number: u8,
+    rights: &[ActionRight],
+    node: impl FnOnce(&Host, &Path) -> WorkflowNode,
+) {
+    let door = Door::shut();
+    let host = door.host().await;
+    let mut control = client(&host).await;
+    let marker = host.work().join("a-command-ran");
+    host.issue(grant_id(number), rights);
+    let document = definition(
+        workflow_id(number),
+        grant_id(number),
+        "a node",
+        node(&host, &marker),
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+
+    let running = run_from_another_task(&host, &document, "evt-cancelled-at-the-door");
+    door.until_a_launch_arrives().await;
+    host.controller
+        .automation()
+        .journal()
+        .cancel_run(
+            only_run(&host),
+            "run cancelled by request",
+            kr_ipc::now_ms().get(),
+        )
+        .expect("the run is cancelled");
+    let answered: WorkflowRunResult = typed(
+        &running
+            .await
+            .expect("the run answers")
+            .expect("the cancelled run is answered"),
+    );
+    assert_eq!(
+        answered.status,
+        WorkflowRunStatus::Cancelled,
+        "{answered:?}"
+    );
+    door.let_through();
+
+    until("the refused claim to have failed the reservation", || {
+        reservation_phases(&host, grant_id(number)) == ["failed"]
+    })
+    .await;
+    assert!(!marker.exists(), "the command never ran");
+    assert!(
+        all_sessions(&mut control)
+            .await
+            .iter()
+            .all(|session| session.closure.0.is_some()),
+        "no session is live"
+    );
+    until("what the node owned to be released", || {
+        owed_rows(&host) == 0
+    })
+    .await;
+    host.clients.abort();
+}
+
+/// KR-REQ-25.19: the command of a node whose run was cancelled before its worker's claim never
+/// starts. The control is every case that lets a command's launch through the door uncancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_run_cancelled_before_the_worker_claims_its_launch_runs_no_command() {
+    a_run_cancelled_at_the_door_starts_nothing(52, &COMMAND_RIGHTS, |host, marker| {
+        command_node(host, "command", &format!("touch {}", marker.display()))
+    })
+    .await;
+}
+
+/// KR-REQ-25.19: a `create_session` node whose run was cancelled after its launch transition and
+/// before its worker's claim makes no session: the claim is refused, and the node is left unknown
+/// because its session had passed its first admission.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_run_cancelled_before_the_worker_claims_its_launch_creates_no_session() {
+    a_run_cancelled_at_the_door_starts_nothing(
+        53,
+        &[ActionRight::SessionCreate, ActionRight::TerminalInput],
+        |host, _| create_session_node(host, Some("/bin/sh")),
+    )
+    .await;
+}
+
+/// The rows of the resource ledger that were released.
+fn released_rows(host: &Host) -> i64 {
+    let ledger = rusqlite::Connection::open(
+        host._temp
+            .environment()
+            .state_dir()
+            .join(kr_automation::resources::RESOURCES_DB_NAME),
+    )
+    .expect("opens the resource ledger");
+    ledger
+        .query_row(
+            "SELECT COUNT(*) FROM owned WHERE state = 'released'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("counts the released rows")
+}
+
+/// KR-REQ-25.19: a run cancelled while its node waits to write down what it will own is not a
+/// dispatch that is dropped half way. The engine stops waiting for the node, the node's task goes
+/// on once the ledger is free, writes its row, finds it was asked to stop, makes no session and
+/// releases the row: nothing stays owed and the command never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_run_cancelled_while_its_node_writes_down_what_it_owns_leaves_nothing_owed() {
+    let host = working_host().await;
+    let mut control = client(&host).await;
+    let marker = host.work().join("a-command-ran");
+    host.issue(grant_id(54), &COMMAND_RIGHTS);
+    let document = definition(
+        workflow_id(54),
+        grant_id(54),
+        "a command",
+        command_node(&host, "command", &format!("touch {}", marker.display())),
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+
+    // Another writer holds the ledger, so the node's row waits for it.
+    let ledger = rusqlite::Connection::open(
+        host._temp
+            .environment()
+            .state_dir()
+            .join(kr_automation::resources::RESOURCES_DB_NAME),
+    )
+    .expect("opens the resource ledger");
+    ledger
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("another writer holds the ledger");
+    let running = run_from_another_task(&host, &document, "evt-cancelled-at-the-ledger");
+    until("the node to be running", || {
+        node_statuses(&host) == [NodeStatus::Running.as_str()]
+    })
+    .await;
+    host.controller
+        .automation()
+        .journal()
+        .cancel_run(
+            only_run(&host),
+            "run cancelled by request",
+            kr_ipc::now_ms().get(),
+        )
+        .expect("the run is cancelled");
+    let answered: WorkflowRunResult = typed(
+        &running
+            .await
+            .expect("the run answers")
+            .expect("the cancelled run is answered"),
+    );
+    assert_eq!(
+        answered.status,
+        WorkflowRunStatus::Cancelled,
+        "{answered:?}"
+    );
+    ledger
+        .execute_batch("COMMIT")
+        .expect("the other writer finishes");
+
+    until("the node's task to have written its row and released it", || {
+        released_rows(&host) == 1
+    })
+    .await;
+    assert_eq!(owed_rows(&host), 0, "nothing stays owed");
+    assert!(!marker.exists(), "the command never ran");
+    assert!(
+        all_sessions(&mut control)
+            .await
+            .iter()
+            .all(|session| session.closure.0.is_some()),
+        "no session is live"
     );
     host.clients.abort();
 }
