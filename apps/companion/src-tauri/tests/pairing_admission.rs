@@ -23,7 +23,7 @@ use kr_client::pairing::room::{RoomError, RoomSocket};
 use kr_crypto::store::{MemoryStore, SecretStore};
 use kr_protocol::pairing::{Locator, NetworkConfig, NetworkHint, RendezvousOrigin};
 use kr_protocol::scalars::{EndpointKey, Nullable};
-use kr_protocol::service::GatewayOrigin;
+use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_service_stand_in::ServiceWeb;
 
 /// A room that serves nothing: nothing here pairs.
@@ -114,5 +114,21 @@ async fn this_computer_asks_the_managed_service_to_admit_it_as_it_dials_a_host()
     assert_eq!(
         asked[0].relay_url.trim_end_matches('/'),
         "http://127.0.0.1:9"
+    );
+
+    // The request was signed as an installation by this device's own authorisation key: the stand-in
+    // keeps the kind and the key that signed what it accepted.
+    let signed = service
+        .arrived()
+        .into_iter()
+        .filter(|arrived| arrived.path == "/api/relay/admission")
+        .map(|arrived| arrived.signed_by)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        signed,
+        vec![Some((
+            ServiceRequestSigner::Installation,
+            *device.identity().keys.authorisation.public()
+        ))]
     );
 }

@@ -4581,6 +4581,37 @@ impl NewDevice {
     /// A device that reaches hosts through relays whose certificates `roots` hold, asks the service
     /// the rig stands in for for an admission when `asks`, and pairs through the rig host's room.
     fn start(rig: &Rig, roots: Vec<Vec<u8>>, asks: bool) -> Self {
+        let http =
+            asks.then(|| Arc::clone(rig.served.web()) as Arc<dyn kr_client::services::ServiceHttp>);
+        Self::start_over(rig, roots, http)
+    }
+
+    /// As [`Self::start`], asking the service through the product's own transport to the rig's
+    /// loopback listener, which holds a request a test holds open, as the in-process stand-in
+    /// cannot: it answers a held request with a dropped connection at once. The transport's
+    /// deadlines are longer than any test waits.
+    fn start_over_the_listener(rig: &Rig, roots: Vec<Vec<u8>>) -> Self {
+        let origin = kr_protocol::service::GatewayOrigin::new(rig.served.origin())
+            .expect("the service's origin");
+        let http = kr_client::services::HttpService::with(
+            origin,
+            kr_client::services::HttpDeadlines {
+                connect: Duration::from_secs(10),
+                read: Duration::from_secs(600),
+                total: Duration::from_secs(600),
+            },
+            kr_client::services::managed_response_limits(),
+        )
+        .expect("a transport to the service");
+        Self::start_over(rig, roots, Some(Arc::new(http)))
+    }
+
+    /// A device that asks through `http`, when it asks.
+    fn start_over(
+        rig: &Rig,
+        roots: Vec<Vec<u8>>,
+        http: Option<Arc<dyn kr_client::services::ServiceHttp>>,
+    ) -> Self {
         use kr_client::pairing::candidate::{Candidate, CandidateRoom, Pairing};
         use kr_client::pairing::link::{EndpointPool, HostLink, IrohLink};
         use kr_client::pairing::paired::PairedHosts;
@@ -4601,12 +4632,12 @@ impl NewDevice {
             .through_relays_only()
             .trusting_relays(roots);
         let mut link = IrohLink::new(Arc::new(pool));
-        if asks {
+        if let Some(http) = http {
             let origin = kr_protocol::service::GatewayOrigin::new(rig.served.origin())
                 .expect("the service's origin");
             let admit = ManagedPairingAdmission::new(
                 origin.clone(),
-                Arc::clone(rig.served.web()) as _,
+                http,
                 Arc::new(DeviceSigner(keys.authorisation.clone())),
             );
             link = link.admitted_by(Arc::new(
@@ -4637,7 +4668,7 @@ impl NewDevice {
     /// opens.
     fn counting(
         mut self,
-        answered: &Arc<std::sync::atomic::AtomicUsize>,
+        answered: &Arc<tokio::sync::watch::Sender<usize>>,
         opened: &Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
         let pairing = Arc::get_mut(&mut self.pairing).expect("a device nothing has started");
@@ -4877,7 +4908,7 @@ async fn a_service_that_never_answers_for_an_admission_does_not_stop_a_pairing()
     let (invited, text) = rig.direct_invitation().await;
 
     rig.served.web().fail(ADMISSION, 1, Moment::Hold);
-    let device = NewDevice::start(&rig, relays.roots(), true);
+    let device = NewDevice::start_over_the_listener(&rig, relays.roots());
     let (attempt, mut shown) = device.redeem(&text);
     shows_the_value(&mut shown).await;
     rig.approves(&invited).await;
@@ -4888,7 +4919,8 @@ async fn a_service_that_never_answers_for_an_admission_does_not_stop_a_pairing()
         .expect("the device paired with the host");
     assert_eq!(paired.host_endpoint_id, rig.host.network().endpoint_id());
 
-    // The service was asked, and is holding the request still.
+    // The service was asked, and was still holding the request when the pairing was done: it has
+    // answered nothing, so the pairing did not wait for it.
     assert!(
         rig.served.web().requests_to(ADMISSION) >= 1,
         "the device never asked the service"
@@ -4969,7 +5001,7 @@ async fn a_device_that_is_refused_free_capacity_is_told_so_when_it_pairs_by_code
 /// connections it opens, and otherwise is the product's.
 struct Counting {
     inner: Arc<dyn kr_client::pairing::link::HostLink>,
-    answered: Arc<std::sync::atomic::AtomicUsize>,
+    answered: Arc<tokio::sync::watch::Sender<usize>>,
     opened: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -5040,7 +5072,7 @@ impl kr_client::pairing::link::HostLink for Counting {
 /// A pre-authorisation surface that counts the host's answers.
 struct CountedAnswers {
     inner: Box<dyn kr_client::pairing::link::Preauth>,
-    answered: Arc<std::sync::atomic::AtomicUsize>,
+    answered: Arc<tokio::sync::watch::Sender<usize>>,
 }
 
 impl kr_client::pairing::link::Preauth for CountedAnswers {
@@ -5057,8 +5089,7 @@ impl kr_client::pairing::link::Preauth for CountedAnswers {
     > {
         Box::pin(async move {
             let answer = self.inner.finish(request).await;
-            self.answered
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.answered.send_modify(|count| *count += 1);
             answer
         })
     }
@@ -5072,8 +5103,7 @@ impl kr_client::pairing::link::Preauth for CountedAnswers {
     > {
         Box::pin(async move {
             let answer = self.inner.redeem(params).await;
-            self.answered
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.answered.send_modify(|count| *count += 1);
             answer
         })
     }
@@ -5087,8 +5117,7 @@ impl kr_client::pairing::link::Preauth for CountedAnswers {
     > {
         Box::pin(async move {
             let answer = self.inner.status(params).await;
-            self.answered
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.answered.send_modify(|count| *count += 1);
             answer
         })
     }
@@ -5118,7 +5147,7 @@ async fn a_whole_pairing_through_a_relay_fits_in_the_admission_ceiling() {
     let (invited, text) = rig.direct_invitation().await;
 
     let device = NewDevice::start(&rig, relays.roots(), true);
-    let answered = Arc::new(AtomicUsize::new(0));
+    let answered = Arc::new(tokio::sync::watch::channel(0usize).0);
     let opened = Arc::new(AtomicUsize::new(0));
     let device = device.counting(&answered, &opened);
 
@@ -5137,14 +5166,13 @@ async fn a_whole_pairing_through_a_relay_fits_in_the_admission_ceiling() {
     // The owner takes their time: the host has answered the device more often than one connection
     // allows, so the device has moved to another.
     let in_all = kr_transport::preauth::PreAuthLimits::default().max_requests;
-    tokio::time::timeout(Duration::from_secs(300), async {
-        while answered.load(Ordering::SeqCst) <= in_all {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+    tokio::time::timeout(
+        Duration::from_secs(300),
+        answered.subscribe().wait_for(|count| *count > in_all),
+    )
     .await
-    .expect("the device is answered more times than one connection allows");
+    .expect("the device is answered more times than one connection allows")
+    .expect("the count is kept");
     rig.approves(&invited).await;
     let paired = tokio::time::timeout(Duration::from_secs(120), attempt)
         .await
@@ -5162,8 +5190,8 @@ async fn a_whole_pairing_through_a_relay_fits_in_the_admission_ceiling() {
         while !rig.served.web().arrived().iter().any(|arrived| {
             arrived.path == ISSUE && arrived.body["destination_endpoint_key"] == destination
         }) {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            let asked = rig.served.web().requests_to(ISSUE);
+            rig.served.web().requests_reach(ISSUE, asked + 1).await;
         }
     })
     .await
