@@ -122,10 +122,12 @@ PEM_HEADER = re.compile(rb"-----BEGIN ((?:[A-Z0-9]+ )*)PRIVATE KEY( BLOCK)?-----
 # structure, so a placeholder shorter than 32 characters is not a key. Where there is no structure
 # to check (ciphertext, or a kind of block this does not know, unless its body is a DER structure)
 # the 32 characters have to look like random bytes: no words (the pieces that source text breaks
-# apart, by quotes, joiners, comment markers or line breaks, are one word; spaces and commas end a
-# word; every word is at least 8 characters), 17 or more different characters, and the text after
-# them goes on as a body goes on (a line break, a quote, an escape, the end marker, padding, the
-# end, or a space and another long run of base64), not into a short word or a call.
+# apart, by quotes, joiners, comment markers or line breaks, are one word; a comma, or spaces alone,
+# ends a word, which is what separates the pieces of a body from a list of short strings; every word
+# is at least 8 characters), 17 or more different characters, and the text after them goes on as a
+# body goes on (a line break, a quote, an escape, the end marker, padding, the end, or a space and
+# another long run of base64, or a last short one that padding, the end marker, a quote or the end
+# follows), not into a short word, a call or code.
 # A quoted header followed by code or prose does not decode to one. The read goes forward one item
 # at a time and never back, so its time is in proportion to the window; keep it so.
 STRING_PREFIX = rb"(?:u8|[bBrRuUfFL]{1,2})(?=[\"'])"
@@ -138,8 +140,8 @@ ENCRYPTED_LINE = re.compile(rb"(?:Proc-Type|DEK-Info): ")
 # JSON may write the `/` of base64 as `\/`, and it is a character of the body there.
 BASE64 = re.compile(rb"(?:[A-Za-z0-9+/]|\\+/)+")
 MINIMUM_RUN = 8
-WORD_GAP = re.compile(rb"[ \t,;]+")
-SHORT_WORD = re.compile(rb"[ \t]+[A-Za-z0-9+/]{1,%d}(?![A-Za-z0-9+/])" % (MINIMUM_RUN - 1))
+WORD_GAP = re.compile(rb"[ \t;]+")
+SPACED_RUN = re.compile(rb"[ \t]+([A-Za-z0-9+/]*)")
 BODY_CHARACTERS = 32
 DISTINCT_CHARACTERS = 17
 KEY_WINDOW = 8192
@@ -198,12 +200,22 @@ def pgp_private_key(raw):
 STRUCTURED_KINDS = (b"", b"RSA", b"DSA", b"EC", b"ENCRYPTED", b"OPENSSH", b"PGP")
 
 
+CLEAN_ENDS = (b"", b"\r", b"\n", b'"', b"'", b"`", b"\\", b"-", b"=", b"<")
+LAST_PIECE_ENDS = (b"", b"=", b"-", b'"', b"'", b"`", b"<")
+
+
 def body_ends_cleanly(window, position):
-    """Whether the text after a body goes on as a body goes on, and not into a short word or a call."""
-    following = window[position : position + 1]
-    if following in (b"", b"\r", b"\n", b'"', b"'", b"`", b"\\", b"-", b"=", b"<"):
+    """Whether the text after a body goes on as a body goes on, and not into a short word, a call or code."""
+    if window[position : position + 1] in CLEAN_ENDS:
         return True
-    return following in (b" ", b"\t") and SHORT_WORD.match(window, position) is None
+    spaced = SPACED_RUN.match(window, position)
+    if spaced is None:
+        return False
+    after = window[spaced.end() : spaced.end() + 1]
+    if not spaced.group(1):
+        return after in CLEAN_ENDS
+    # The next line of a body written on one line is a long run; its last line may be a short one.
+    return len(spaced.group(1)) >= MINIMUM_RUN or after in LAST_PIECE_ENDS
 
 
 def key_body_follows(window, kind):
@@ -234,7 +246,8 @@ def key_body_follows(window, kind):
             # A `+` or a `/` by itself is a joiner or a comment marker, not part of the body.
             if characters.strip(b"+/"):
                 taken += characters[: BODY_CHARACTERS - len(taken)]
-                if words and WORD_GAP.fullmatch(window, last, run.start()) is None:
+                gap = window[last : run.start()]
+                if words and b"," not in gap and WORD_GAP.fullmatch(gap) is None:
                     words[-1] += len(characters)
                 else:
                     words.append(len(characters))
@@ -847,6 +860,7 @@ def cases(scratch, expect):
         bytes.fromhex("3082021206066781050a0103a0030101ff02044000000104") + b"a-blob-the-tpm-wrapped"
     ).decode()
     nebula_header = planted("-----", "BEGIN NEBULA X25519 PRIVATE KEY", "-----")
+    nebula_end = planted("-----", "END NEBULA X25519 PRIVATE KEY", "-----")
     tendermint_header = planted("-----", "BEGIN TENDERMINT PRIVATE KEY", "-----")
     fragments = [f"b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB"[i : i + 12] for i in range(0, 52, 12)]
     shapes = {
@@ -888,6 +902,16 @@ def cases(scratch, expect):
         + "".join(f'     b"{piece}"\n' for piece in pieces(cipher, 4))
         + "     )\n",
         "src/nebula-pieces.js": f'const key = "{nebula_header}\\n" +\n' + " +\n".join(f'  "{piece}"' for piece in pieces(cipher, 7)) + ";\n",
+        "src/nebula-padded.yml": f"key: |\n  {nebula_header}\n  {cipher}=\n  {nebula_end}\n",
+        "src/nebula-crlf.txt": f"{nebula_header}\r\n{cipher}\r\n",
+        "src/nebula-single.py": f"K = '{nebula_header}\\n' '{cipher}'\n",
+        "src/nebula-template.js": f"const k = `{nebula_header}\n{cipher}`;\n",
+        "src/nebula-xml.xml": f"<key>{nebula_header}\n{cipher}</key>\n",
+        "src/nebula-eof.txt": f"{nebula_header}\n{cipher}",
+        "src/nebula-collapsed.env": f"KEY={nebula_header}{cipher}{nebula_end}\n",
+        "src/nebula-oneline.sh": f'KEY="{nebula_header} {cipher[:40]} {cipher[40:]}= {nebula_end}"\n',
+        "src/nebula-distinct17.txt": f"{nebula_header}\n{'AbCdEfGhIjKlMnOpQ' * 3}\n",
+        "src/nebula-eights.txt": f"{nebula_header}\n" + " ".join(pieces(cipher[:40], 8)) + "\n",
         "src/nebula-spaces.sh": f'KEY="{nebula_header} {cipher[:16]} {cipher[16:32]} {cipher[32:]}"\n',
         "src/nebula-pieces.rs": f"// {nebula_header}\n" + "".join(f"// {piece}\n" for piece in pieces(cipher, 5)),
         "src/openssh.txt": planted("-----", "BEGIN OPENSSH PRIVATE KEY", "-----") + "\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB\n",
@@ -948,6 +972,8 @@ def cases(scratch, expect):
         fx.write(f"src/{name}.js", f'const marker = "{unknown}";\nvalidatePrivateKeyAndCertificateChain(marker);\n')
         fx.write(f"docs/{name}.md", f"{unknown} This header identifies a private key in the configuration file.\n")
     fx.write("src/nebula-call.js", f'const marker = "{nebula_header}";\nexportPrivateKeyAndCertificateChain(marker);\n')
+    fx.write("docs/spaced-call.md", f"{nebula_header} {cipher} (see the key format notes)\n")
+    fx.write("src/nebula-args.js", f'assertKeyFormat("{nebula_header}",\n  "private", "public", "export", "format", "X25519", "chain");\n')
     fx.write("src/tendermint-args.js", f'assertKeyFormat("{tendermint_header}", unmarshalX25519PrivateKey, marshalX25519PrivateKey);\n')
     fx.write("src/tendermint-comment.rs", f"// {tendermint_header}\n// TendermintArmoredPrivateKeyDecoder handles everything\n")
     fx.write("docs/words.md", f"{nebula_header}\nprivate backups storage folders rotated\n")
