@@ -8161,6 +8161,15 @@ export interface WorkerLaunchSpec {
    */
   shell_package: string | null
   /**
+   * The last moment, on the machine's continuous clock since boot, at which the daemon accepted
+   * that this session's root process may be created, when a workflow started the session.
+   *
+   * Absent from the wire when absent. A worker that reaches the moment first starts nothing and
+   * ends the session without a root; it reads the clock where the process is created, after
+   * everything else it prepares. It bounds a command and a shell a workflow node named alike.
+   */
+  start_not_after_boot_ms?: U64 | null
+  /**
    * The workflow run and node this session was started for, when a workflow started it.
    *
    * Absent from the wire when absent. A worker admits a close from a workflow only for a
@@ -8383,10 +8392,6 @@ export interface RootCommand {
    * The absolute path of the POSIX shell that runs the command line, resolved by the daemon.
    */
   interpreter: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  not_after_boot_ms: string
 }
 /**
  * The workflow a session was started for.

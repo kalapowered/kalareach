@@ -295,6 +295,7 @@ impl Controller {
 
         // Admission is consumed here, in one transaction, together with the key that authenticates
         // this worker from now on. Everything above is a check; this is the commitment.
+        let mut start_not_after = None;
         let reservation = {
             let mut registry = self.registry.lock().await;
             if environment.is_none() && registry.fail_if_spawned(claim.reservation_id)? {
@@ -313,19 +314,24 @@ impl Controller {
             // the launch transition had can have gone stale since: the authority it stood on is
             // asked again here, under the guard, before the claim commits. A refusal admits no
             // launch and is given to the create that waits, which is told what was refused.
-            if let Some(launch) = environment.as_ref().and_then(|held| held.launch.as_ref())
-                && let Err(refusal) = (launch.admit)(&registry)
-            {
-                let failed = registry.fail_if_spawned(claim.reservation_id)?;
-                drop(registry);
-                // The create that waits is told what was refused and retires the job when it
-                // is, as it does for any worker that fails its rendezvous.
-                self.resolve(claim.reservation_id, Err(refusal.to_protocol_error()))
-                    .await;
-                if failed {
-                    self.discard_worker_dir(claim.session_id);
+            if let Some(launch) = environment.as_ref().and_then(|held| held.launch.as_ref()) {
+                match (launch.admit)(&registry) {
+                    // The last moment the worker may create the process, decided now, with the
+                    // grant as it stands, and handed to the worker in its specification.
+                    Ok(moment) => start_not_after = Some(moment),
+                    Err(refusal) => {
+                        let failed = registry.fail_if_spawned(claim.reservation_id)?;
+                        drop(registry);
+                        // The create that waits is told what was refused and retires the job
+                        // when it is, as it does for any worker that fails its rendezvous.
+                        self.resolve(claim.reservation_id, Err(refusal.to_protocol_error()))
+                            .await;
+                        if failed {
+                            self.discard_worker_dir(claim.session_id);
+                        }
+                        return Err(refusal);
+                    }
                 }
-                return Err(refusal);
             }
             match registry.claim_rendezvous(claim.reservation_id, claim.worker_public_key) {
                 Ok(reservation) => {
@@ -429,6 +435,7 @@ impl Controller {
             holds_local_access: true,
             root_command: command.as_ref().map(|(command, _)| command.clone()),
             workflow: command.map(|(_, workflow)| workflow),
+            start_not_after_boot_ms: start_not_after.map(kr_protocol::scalars::U64::new),
         };
         // The specification is one control frame. Beside a create request that leaves too little
         // room, the largest integrations are left out as well. The session starts without them,

@@ -2308,7 +2308,7 @@ async fn the_palette_a_create_request_names_reaches_the_launched_session() {
                 generation: kr_protocol::scalars::U64::ZERO,
                 enabled: false,
             },
-            None,
+            kr_worker::session::StartTerms::default(),
             std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
         )
         .expect("the session launches");
@@ -2334,7 +2334,10 @@ fn command_session(
     let mut config = configuration(host, &format!("touch {}", marker.display()));
     config.shell.cwd = cwd.display().to_string();
     let mut session = Session::open(config).expect("opens");
-    session.start_as_command(not_after_boot_ms);
+    session.start_under(kr_worker::session::StartTerms {
+        root_is_command: true,
+        not_after_boot_ms: Some(not_after_boot_ms),
+    });
     (session, marker)
 }
 
@@ -2357,6 +2360,52 @@ async fn a_command_does_not_start_after_the_moment_it_was_accepted_for() {
         ClosureReason::RootLaunchFailed
     );
     assert!(!marker.exists(), "the command did not run");
+}
+
+/// A shell a workflow named is held to the moment the daemon accepted its start for, as a command
+/// is: past it, no process is created and the session closes with the record of a launch that
+/// failed. The control is the same shell before its moment, which starts and is not a command's
+/// session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shell_a_workflow_named_does_not_start_after_the_moment_it_was_accepted_for() {
+    for (not_after_boot_ms, starts) in [(0, false), (u64::MAX, true)] {
+        let host = kr_ipc::testing::TempHost::create();
+        let marker = host.root().join("the-shell-ran");
+        let config = configuration(&host, &format!("touch {}; sleep 30", marker.display()));
+        let mut session = Session::open(config).expect("opens");
+        session.start_under(kr_worker::session::StartTerms {
+            root_is_command: false,
+            not_after_boot_ms: Some(not_after_boot_ms),
+        });
+        if starts {
+            session.launch().expect("the shell starts");
+            assert_eq!(session.summary().root, None, "its root is a shell");
+            let runtime = std::sync::Arc::new(
+                SessionRuntime::start(
+                    session,
+                    std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+                )
+                .expect("starts"),
+            );
+            let (_, gate) = runtime.close(ClosureReason::CloseRequested);
+            gate.release();
+            let _ = closure_record(&runtime, "the session closes").await;
+        } else {
+            let error = session.launch().expect_err("the shell does not start");
+            assert_eq!(
+                error.code(),
+                kr_protocol::error::ErrorCode::PermissionDenied
+            );
+            assert_eq!(
+                session
+                    .closure()
+                    .expect("a refused start leaves its record")
+                    .reason,
+                ClosureReason::RootLaunchFailed
+            );
+            assert!(!marker.exists(), "the shell did not run");
+        }
+    }
 }
 
 /// A command whose directory is not there does not start: the terminal library would run it in the

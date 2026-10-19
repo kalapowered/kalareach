@@ -292,6 +292,15 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
                      level never meets it without also refusing the specification for the command.",
         },
         Compatible {
+            at: "WorkerLaunchSpec.start_not_after_boot_ms",
+            reason: "A member that is absent from the wire unless a workflow started the session, \
+                     and sent only to the worker the daemon started that session with. The \
+                     specification of an ordinary session is byte for byte what a worker of the \
+                     retained level reads, and a worker of that level that is sent one with the \
+                     member refuses the specification as a frame it cannot read, so it starts \
+                     nothing the daemon bounded.",
+        },
+        Compatible {
             at: "ForwardedMutation.workflow_run_id",
             reason: "A member that is absent from the wire except in a workflow's close of a session \
                      it started, which the daemon sends only to the worker it started that \

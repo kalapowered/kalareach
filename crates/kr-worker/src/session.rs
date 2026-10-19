@@ -110,30 +110,43 @@ pub struct SessionConfig {
     pub time: crate::action::time::TimeSources,
 }
 
-/// What a session started to run a command is held to when its process starts.
-#[derive(Clone, Copy, Debug)]
-struct CommandStart {
-    /// The moment on the machine's continuous clock after which the command does not start.
-    not_after_boot_ms: u64,
+/// What a session a workflow started is held to at the moment its root process is created.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StartTerms {
+    /// The root is a command the host started the session to run, which the session says from its
+    /// first summary on, and which runs only in a directory that is there.
+    pub root_is_command: bool,
+    /// The moment on the machine's continuous clock after which the process is not created.
+    pub not_after_boot_ms: Option<u64>,
 }
 
-impl CommandStart {
-    /// Whether `command` may start now, at `now_boot_ms` on the continuous clock.
-    fn admits(self, command: &ShellCommand, now_boot_ms: u64) -> Result<()> {
-        if now_boot_ms >= self.not_after_boot_ms {
-            return Err(WorkerError::PermissionDenied {
-                detail: "the moment the daemon accepted this command for passed before it could \
-                         start"
-                    .to_owned(),
-            });
-        }
+impl StartTerms {
+    /// Whether the process of `command` may be created now.
+    ///
+    /// The directory is checked first and the clock read last, so what the check itself took is
+    /// part of the time the moment is held to.
+    fn admits(
+        self,
+        command: &ShellCommand,
+        directory_is_there: impl FnOnce(&std::path::Path) -> bool,
+        now_boot_ms: impl FnOnce() -> u64,
+    ) -> Result<()> {
         // The terminal library starts a process in the account's home directory when the
         // directory it was given is not there, which would run the command somewhere nobody
         // chose.
-        if !std::path::Path::new(&command.cwd).is_dir() {
+        if self.root_is_command && !directory_is_there(std::path::Path::new(&command.cwd)) {
             return Err(WorkerError::InvalidArgument(
                 "the directory this command runs in is not there".to_owned(),
             ));
+        }
+        if let Some(not_after_boot_ms) = self.not_after_boot_ms
+            && now_boot_ms() >= not_after_boot_ms
+        {
+            return Err(WorkerError::PermissionDenied {
+                detail: "the moment the daemon accepted this session's start for passed before \
+                         its process could be created"
+                    .to_owned(),
+            });
         }
         Ok(())
     }
@@ -379,8 +392,8 @@ pub struct Session {
     /// What the root process is, where it is not an interactive shell: a command the host
     /// started the session to run.
     root: Option<kr_protocol::session::SessionRoot>,
-    /// What a session started to run a command is held to at the moment its process starts.
-    command_start: Option<CommandStart>,
+    /// What a session a workflow started is held to at the moment its process is created.
+    start_terms: StartTerms,
     owned: Option<OwnedProcesses>,
     /// Writes what the session owns to the journal, off this session's lock, where the journal is
     /// a file.
@@ -664,7 +677,7 @@ impl Session {
             created_at_ms: kr_ipc::now_ms(),
             environment_sources: None,
             root: None,
-            command_start: None,
+            start_terms: StartTerms::default(),
             owned: None,
             owned_writer: None,
             root_exit: None,
@@ -732,17 +745,19 @@ impl Session {
             ));
         }
         let command = self.config.shell.clone();
-        // A command is held to what the daemon accepted it for at the last moment before it
-        // exists, after everything this worker prepared first, so a delay in any of that cannot
-        // carry it past its moment.
-        if let Some(start) = self.command_start
-            && let Err(error) = start.admits(&command, kr_ipc::clock::boot_elapsed_ms())
-        {
+        // Before the shell exists, so that whatever it leaves behind stays this worker's.
+        crate::ownership::adopt_orphans();
+        // A session a workflow started is held to what the daemon accepted it for at the last
+        // moment before its process exists, after everything this worker prepared first, so a
+        // delay in any of that cannot carry it past its moment.
+        if let Err(error) = self.start_terms.admits(
+            &command,
+            std::path::Path::is_dir,
+            kr_ipc::clock::boot_elapsed_ms,
+        ) {
             self.record_closure(ClosureReason::RootLaunchFailed, None);
             return Err(error);
         }
-        // Before the shell exists, so that whatever it leaves behind stays this worker's.
-        crate::ownership::adopt_orphans();
         match self.pty.launch(&command) {
             Ok(shell) => {
                 // Ownership is established with the shell, not at closure: a process that started
@@ -1972,15 +1987,18 @@ impl Session {
         self.environment_sources = Some(sources);
     }
 
-    /// Says that the root process is a command the host started the session to run, which every
-    /// summary of the session then carries, the first one written at launch among them.
+    /// Holds the session's start to the terms the daemon accepted it under, and says that the root
+    /// process is a command the host started the session to run when it is, which every summary of
+    /// the session then carries, the first one written at launch among them.
     ///
-    /// The command starts only if the machine's continuous clock has not reached
-    /// `not_after_boot_ms` and the directory it runs in exists, both read immediately before the
-    /// process is created.
-    pub const fn start_as_command(&mut self, not_after_boot_ms: u64) {
-        self.root = Some(kr_protocol::session::SessionRoot::Command);
-        self.command_start = Some(CommandStart { not_after_boot_ms });
+    /// A process is created only if the machine's continuous clock has not reached the moment the
+    /// terms name and, for a command, the directory it runs in exists, both read immediately
+    /// before the process is created.
+    pub const fn start_under(&mut self, terms: StartTerms) {
+        if terms.root_is_command {
+            self.root = Some(kr_protocol::session::SessionRoot::Command);
+        }
+        self.start_terms = terms;
     }
 
     /// Where the session's palette came from.
@@ -5290,7 +5308,7 @@ impl Answered {
 mod tests {
     use kr_protocol::root::{CommandBypassReason, PromptGeneration};
 
-    use super::Answered;
+    use super::{Answered, StartTerms};
 
     /// An adoption is given the bypass its own line was answered with, and none of an earlier
     /// line's: a later line that asked nothing, such as a pipeline, inherits nothing.
@@ -5320,5 +5338,38 @@ mod tests {
             vec![("/usr/local/bin/claude".to_owned(), None)],
             "a line's own answer replaces an earlier line's"
         );
+    }
+
+    /// The moment a session is held to is read after the directory is checked, so the time that
+    /// check takes counts against it: a directory lookup that outlasts what is left is a start
+    /// that comes too late, and the same lookup with time to spare is not.
+    #[test]
+    fn the_clock_is_read_after_the_directory_is_checked() {
+        let command = crate::pty::ShellCommand {
+            program: "/bin/sh".to_owned(),
+            arguments: Vec::new(),
+            cwd: "/".to_owned(),
+            environment: Vec::new(),
+        };
+        let terms = StartTerms {
+            root_is_command: true,
+            not_after_boot_ms: Some(100),
+        };
+        for (taken_to_the_check, admitted) in [(99, true), (100, false)] {
+            let clock = std::cell::Cell::new(10_u64);
+            let outcome = terms.admits(
+                &command,
+                |_| {
+                    clock.set(taken_to_the_check);
+                    true
+                },
+                || clock.get(),
+            );
+            assert_eq!(
+                outcome.is_ok(),
+                admitted,
+                "a check that took the clock to {taken_to_the_check}"
+            );
+        }
     }
 }

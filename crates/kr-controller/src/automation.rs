@@ -621,10 +621,16 @@ impl HeldGrant {
         self.standing().map(|_| ())
     }
 
-    /// Reads the grant as it stands now, checks this node against it, and answers how long the
-    /// grant stands from now: the earliest of its own expiry, an organisation lease and a bounded
-    /// offline validity, `None` when it has no end.
-    fn standing(&self) -> kr_automation::Result<Option<std::time::Duration>> {
+    /// Reads the grant as it stands now, checks this node against it, and answers the moment the
+    /// grant stands until, in milliseconds of the machine's continuous clock since boot: the
+    /// earliest of its own expiry, an organisation lease and a bounded offline validity, `None`
+    /// when it has no end.
+    ///
+    /// The clock is read before the decision, and the decision's own duration is added to that
+    /// reading, so the moment is never later than the grant's end: whatever the decision took
+    /// comes off the grant and is never added to it.
+    fn standing(&self) -> kr_automation::Result<Option<u64>> {
+        let read_at = self.daemon.get()?.boot_elapsed_ms();
         let (grant, ends_in) = self
             .authority
             .grant_standing(self.definition.grant_reference, self.daemon.now_ms())?;
@@ -634,7 +640,9 @@ impl HeldGrant {
             &self.node,
             self.environment_id,
         )?;
-        Ok(ends_in)
+        Ok(ends_in.map(|ends_in| {
+            read_at.saturating_add(u64::try_from(ends_in.as_millis()).unwrap_or(u64::MAX))
+        }))
     }
 
     /// The refusal a hold recorded, in the engine's terms, when the change-set service reports
@@ -779,6 +787,11 @@ fn node_digest(
 /// registry guard: whether the node was asked to stop, the node's grant, read as it stands now on
 /// both clocks, and then the moment the engine stops waiting for the node, read after the grant
 /// has been decided.
+///
+/// It answers the last moment the session's process may be created, in milliseconds of the machine's
+/// continuous clock since boot: the moment the engine stops waiting or the moment the grant ends,
+/// whichever is first. Each is the moment it ends read now and never a duration added to a later
+/// reading, so a delay between this answer and the process's creation counts against it.
 fn node_admission(
     controller: &Arc<Controller>,
     held: &Arc<HeldGrant>,
@@ -795,16 +808,23 @@ fn node_admission(
                 )),
             );
         }
-        held.still_authorised()
+        let grant_ends = held
+            .standing()
             .map_err(|refusal| held.refuse_session(refusal))?;
-        if held.daemon.now_ms() >= wait_until_ms {
+        let daemon = held
+            .daemon
+            .get()
+            .map_err(|refusal| held.refuse_session(refusal))?;
+        let (boot_ms, now_ms) = (daemon.boot_elapsed_ms(), held.daemon.now_ms());
+        if now_ms >= wait_until_ms {
             return Err(
                 held.refuse_session(kr_automation::AutomationError::AuthorityUnavailable(
                     "the wait for this node ended before its session could start".to_owned(),
                 )),
             );
         }
-        Ok(())
+        let wait_ends = boot_ms.saturating_add(wait_until_ms - now_ms);
+        Ok(grant_ends.map_or(wait_ends, |grant_ends| grant_ends.min(wait_ends)))
     })
 }
 
@@ -1064,15 +1084,6 @@ impl Driven {
     }
 }
 
-/// How long from now a command may still start: the rest of the node's wait, or the time the
-/// grant has left when that is shorter.
-fn start_window(
-    remaining_wait: std::time::Duration,
-    grant_ends_in: Option<std::time::Duration>,
-) -> std::time::Duration {
-    grant_ends_in.map_or(remaining_wait, |ends_in| remaining_wait.min(ends_in))
-}
-
 /// Makes the directory a command with no workspace runs in, and answers its identity.
 ///
 /// The directory is made here and nowhere else: one that is already there is the leftover of this
@@ -1192,27 +1203,7 @@ async fn drive_command(
         Ok(controller) => controller,
         Err(error) => return Driven::nothing_was_made(Err(error)),
     };
-    // How long the grant stands, so the command starts no later than the grant does as well as no
-    // later than the node's wait. A grant that is already gone is a refusal, and starts nothing.
-    let ends_in = {
-        let held = Arc::clone(held);
-        match blocking(move || held.standing()).await {
-            Ok(ends_in) => ends_in,
-            Err(error) => return Driven::nothing_was_made(Err(error)),
-        }
-    };
     let admit = node_admission(&controller, held, context.wait_until_ms, task);
-    // The command may start no later than the moment the engine stops waiting for the node or the
-    // grant ends, whichever is first, expressed on the clock the worker reads too.
-    let remaining = std::time::Duration::from_millis(
-        context
-            .wait_until_ms
-            .saturating_sub(context.daemon.now_ms()),
-    );
-    let window = start_window(remaining, ends_in);
-    let not_after = controller
-        .boot_elapsed_ms()
-        .saturating_add(u64::try_from(window.as_millis()).unwrap_or(u64::MAX));
     let create = kr_protocol::session::SessionCreateParams {
         environment_id: context.changesets.environment_id(),
         presentation: kr_protocol::session::Presentation::Invisible,
@@ -1235,7 +1226,6 @@ async fn drive_command(
             kr_protocol::worker::RootCommand {
                 interpreter: COMMAND_INTERPRETER.to_owned(),
                 command: text,
-                not_after_boot_ms: kr_protocol::scalars::U64::new(not_after),
             },
             kr_protocol::worker::WorkflowSession {
                 workflow_run_id: context.run_id,
@@ -3148,31 +3138,6 @@ mod tests {
                 method.as_str()
             );
         }
-    }
-
-    /// A command may start no later than the node's wait or the grant's own end, whichever comes
-    /// first: the grant's end is one of three (its expiry, an organisation lease, a bounded offline
-    /// validity), and the decision hands over the earliest.
-    #[test]
-    fn a_command_may_start_no_later_than_the_wait_or_the_grants_end() {
-        use std::time::Duration;
-
-        let wait = Duration::from_secs(600);
-        assert_eq!(
-            start_window(wait, None),
-            wait,
-            "a grant with no end holds nothing back"
-        );
-        assert_eq!(
-            start_window(wait, Some(Duration::from_secs(3_600))),
-            wait,
-            "a grant that outlasts the wait leaves the wait"
-        );
-        assert_eq!(
-            start_window(wait, Some(Duration::from_secs(5))),
-            Duration::from_secs(5),
-            "a grant that ends first ends the window"
-        );
     }
 
     /// The directory a command ran in is removed with what is in it only while it still has the

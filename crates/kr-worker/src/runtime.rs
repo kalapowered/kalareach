@@ -2092,10 +2092,10 @@ pub struct LaunchFailure {
 /// same moment for the same reason: output a session prints before it knows privacy mode is on is
 /// output it would retain ([`Session::take_launch_privacy`]).
 ///
-/// `command_not_after_boot_ms` is set for a session whose root is a command the host started it
-/// to run: the session says so from its first summary on, and the command starts only before that
-/// moment on the machine's continuous clock and in a directory that is there
-/// ([`Session::start_as_command`]).
+/// `start` holds a session a workflow started to the terms the daemon accepted it under: its
+/// process is created only before the moment they name on the machine's continuous clock, and a
+/// session whose root is a command says so from its first summary on and runs it only in a
+/// directory that is there ([`Session::start_under`]).
 ///
 /// # Errors
 ///
@@ -2108,7 +2108,7 @@ pub fn start_or_record(
     environment_sources: kr_protocol::session::SessionEnvironmentSources,
     palette: crate::snapshot::PaletteChoice,
     privacy: kr_protocol::worker::PrivacyLaunch,
-    command_not_after_boot_ms: Option<u64>,
+    start: crate::session::StartTerms,
     shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
 ) -> std::result::Result<Arc<SessionRuntime>, Box<LaunchFailure>> {
     let mut session = match Session::open(config) {
@@ -2123,9 +2123,7 @@ pub fn start_or_record(
     // Before the shell starts, so the summary written when it does and the one its ready report
     // carries both say where its environment came from.
     session.set_environment_sources(environment_sources);
-    if let Some(not_after_boot_ms) = command_not_after_boot_ms {
-        session.start_as_command(not_after_boot_ms);
-    }
+    session.start_under(start);
     if let Err(error) = session.set_initial_palette(palette) {
         return Err(Box::new(LaunchFailure {
             error,

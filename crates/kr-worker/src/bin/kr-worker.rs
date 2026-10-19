@@ -293,10 +293,10 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         environment_sources,
         palette,
         specification.privacy,
-        specification
-            .root_command
-            .as_ref()
-            .map(|root| root.not_after_boot_ms.get()),
+        kr_worker::session::StartTerms {
+            root_is_command: specification.root_command.is_some(),
+            not_after_boot_ms: specification.start_not_after_boot_ms.map(kr_protocol::scalars::U64::get),
+        },
         std::sync::Arc::clone(&shared_clock),
     ) {
         Ok(runtime) => runtime,
@@ -990,7 +990,6 @@ mod tests {
         let command = |interpreter: &str| RootCommand {
             interpreter: interpreter.to_owned(),
             command: "exit 3".to_owned(),
-            not_after_boot_ms: kr_protocol::scalars::U64::new(100),
         };
         let accepted = command("/bin/sh");
         assert!(root_command_refusal(Some(&accepted), ShellMode::NativeCompat).is_none());

@@ -162,17 +162,21 @@ covers only what stays the same for the node. The grant, with the rights above, 
 engine stops waiting for the node are checked at the launch transition under the registry guard,
 where the session comes into being, and again when the worker claims its launch, which is when the
 program is released to start: a grant withdrawn, a wait that ended, or a run cancelled, in between
-starts nothing. A command also carries the moment after which it may not start, the earlier of the
-node's wait and the grant's own end (its expiry, an organisation lease, a bounded offline
-validity), and the worker checks it where the process is created, after everything it prepares.
-The chain's session allowance is spent for each node that creates a session, a command's included.
+starts nothing. The claim also decides the moment after which the session's process may not be
+created, the earlier of the node's wait and the grant's own end (its expiry, an organisation lease,
+a bounded offline validity), each read as the moment it ends on the machine's continuous clock, and
+the worker checks it where the process is created, after everything it prepares. A shell a
+`create_session` node names is held to that moment as a command is. The chain's session allowance
+is spent for each node that creates a session, a command's included.
 
 A `create_session` node creates a session through `session.create`'s own parameters and leaves it
 running; the session is the node's output and belongs to whoever uses it afterwards. The create
 runs on a task of the daemon's own, so a node whose wait ends in the middle of it leaves no
 half-made reservation. A node asked to stop before its session has been admitted at the launch
-transition stops, and makes none; once the session has been admitted it stays, and the node is
-left unknown.
+transition stops, and makes none. Once the session has been admitted the node cannot be stopped
+and is left unknown, but a request to stop that comes before the worker's claim is still held
+against the claim, which is refused, so no program starts and no session is made; a session whose
+claim came before the request stays.
 
 A `shell_command` node runs its command as the root of a session of its own: the worker runs the
 command line through `/bin/sh -c`, with no login or interactive startup and with `SHELL` naming

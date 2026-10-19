@@ -34431,16 +34431,11 @@
         "interpreter": {
           "description": "The absolute path of the POSIX shell that runs the command line, resolved by the daemon.",
           "type": "string"
-        },
-        "not_after_boot_ms": {
-          "$ref": "#/$defs/U64",
-          "description": "The last moment, on the machine's continuous clock since boot, at which the daemon accepted\nthat the command may start. A worker that reaches it first starts nothing and ends the\nsession without a root."
         }
       },
       "required": [
         "interpreter",
-        "command",
-        "not_after_boot_ms"
+        "command"
       ],
       "type": "object"
     },
@@ -40475,6 +40470,17 @@
             }
           ],
           "description": "The qualified shell package the controller resolved, as an absolute directory.\n\nNull for a create that launches no managed package. Where it is present the worker launches\nthat package and no other: the daemon and the worker can be configured with different\npackage roots, and a session must run the package its create was admitted against rather\nthan whichever one the worker's own environment would have found."
+        },
+        "start_not_after_boot_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last moment, on the machine's continuous clock since boot, at which the daemon accepted\nthat this session's root process may be created, when a workflow started the session.\n\nAbsent from the wire when absent. A worker that reaches the moment first starts nothing and\nends the session without a root; it reads the clock where the process is created, after\neverything else it prepares. It bounds a command and a shell a workflow node named alike."
         },
         "workflow": {
           "anyOf": [

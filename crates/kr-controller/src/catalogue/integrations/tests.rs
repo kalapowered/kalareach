@@ -840,6 +840,7 @@ fn specification(entries: Vec<CommandIntegration>) -> kr_protocol::worker::Worke
         holds_local_access: false,
         root_command: None,
         workflow: None,
+        start_not_after_boot_ms: None,
     }
 }
 

@@ -366,6 +366,14 @@ pub struct WorkerLaunchSpec {
     /// session whose provenance names the run that closes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<WorkflowSession>,
+    /// The last moment, on the machine's continuous clock since boot, at which the daemon accepted
+    /// that this session's root process may be created, when a workflow started the session.
+    ///
+    /// Absent from the wire when absent. A worker that reaches the moment first starts nothing and
+    /// ends the session without a root; it reads the clock where the process is created, after
+    /// everything else it prepares. It bounds a command and a shell a workflow node named alike.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_not_after_boot_ms: Option<U64>,
 }
 
 /// The command a session's root runs in place of an interactive shell.
@@ -381,10 +389,6 @@ pub struct RootCommand {
     pub interpreter: String,
     /// The command line.
     pub command: String,
-    /// The last moment, on the machine's continuous clock since boot, at which the daemon accepted
-    /// that the command may start. A worker that reaches it first starts nothing and ends the
-    /// session without a root.
-    pub not_after_boot_ms: U64,
 }
 
 /// The workflow a session was started for.
@@ -894,6 +898,7 @@ mod tests {
             holds_local_access: false,
             root_command: None,
             workflow: None,
+            start_not_after_boot_ms: None,
         }
     }
 
@@ -901,9 +906,9 @@ mod tests {
     /// without it is refused, and so is one that says more of it than a worker understands. A
     /// daemon speaks only to workers of its own release, so no specification of another shape
     /// reaches a worker.
-    /// A specification for an ordinary session has neither the command nor the workflow members,
-    /// so it is the specification a worker of an earlier release reads; one that carries either
-    /// is refused by such a worker rather than started as the shell it was meant to replace.
+    /// A specification for an ordinary session has none of the command, workflow and start-bound
+    /// members, so it is the specification a worker of an earlier release reads; one that carries
+    /// any is refused by such a worker rather than started as the shell it was meant to replace.
     #[test]
     fn a_command_and_its_workflow_are_on_the_wire_only_when_there_is_one() {
         use super::{RootCommand, WorkflowSession};
@@ -915,12 +920,12 @@ mod tests {
         let json = serde_json::to_value(&ordinary).expect("encodes");
         assert!(json.get("root_command").is_none(), "{json}");
         assert!(json.get("workflow").is_none(), "{json}");
+        assert!(json.get("start_not_after_boot_ms").is_none(), "{json}");
 
         let command = WorkerLaunchSpec {
             root_command: Some(RootCommand {
                 interpreter: "/bin/sh".to_owned(),
                 command: "exit 3".to_owned(),
-                not_after_boot_ms: U64::new(9),
             }),
             workflow: Some(WorkflowSession {
                 workflow_run_id: crate::ids::WorkflowRunId::new(crate::scalars::Uuid::from_bytes(
@@ -928,11 +933,13 @@ mod tests {
                 )),
                 node_id: "tests".to_owned(),
             }),
+            start_not_after_boot_ms: Some(U64::new(9)),
             ..ordinary.clone()
         };
         let json = serde_json::to_value(&command).expect("encodes");
         assert_eq!(json["root_command"]["interpreter"], "/bin/sh");
         assert_eq!(json["workflow"]["node_id"], "tests");
+        assert_eq!(json["start_not_after_boot_ms"], 9);
         let back: WorkerLaunchSpec = serde_json::from_value(json).expect("decodes");
         assert_eq!(back, command);
     }
