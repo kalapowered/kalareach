@@ -2538,22 +2538,62 @@ async fn a_deadline_that_passes_while_the_floor_is_written_is_decided_after_the_
 /// The owner's own grant is held to no offline bound, so its expiry in UTC is the only deadline:
 /// the decision is taken at the caller's reading advanced by the time the write took, not at the
 /// reading the caller took before it.
+///
+/// The daemon runs on clocks this test moves by hand: the continuous clock moves once the decision
+/// has taken its reading and before storage is let go, so the machine's speed bears on no step but
+/// one. The daemon's write waits at most five seconds for storage; a decision refused because that
+/// wait ran out (the store was held longer than the test meant, on a machine too busy to let it go)
+/// was not decided after a write, and is made again on a host of its own, so that nothing an
+/// earlier attempt left behind bears on the next.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_grant_that_expires_while_the_floor_is_written_is_refused_after_the_write() {
+    use kr_automation::AutomationError;
+
+    for _ in 0..5 {
+        match an_expiring_grant_is_decided_while_the_floor_is_written().await {
+            Err(AutomationError::AuthorityUnavailable(detail))
+                if detail == kr_controller::grants::FLOOR_UNRECORDED => {}
+            decided => {
+                let refused =
+                    decided.expect_err("the grant expired while the decision waited for storage");
+                assert!(
+                    matches!(&refused, AutomationError::PermissionDenied(detail) if detail.contains("expired")),
+                    "{refused}"
+                );
+                return;
+            }
+        }
+    }
+    panic!("the daemon's wait for storage ran out in every attempt");
+}
+
+/// One attempt: a host on clocks the test moves, a floor owed its record, and the decision of a
+/// grant that expires during the wait for storage.
+async fn an_expiring_grant_is_decided_while_the_floor_is_written() -> kr_automation::Result<Grant> {
     use kr_automation::{AuthoritySource, AutomationError};
     use kr_controller::automation::HostGrants;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    let host = host().await;
+    const T: u64 = 1_767_225_600_000;
+    let continuous = WatchedClock::new();
+    let wall = Arc::new(AtomicU64::new(T));
+    let host = host_on(Clocks {
+        continuous: Arc::new(continuous.clone()),
+        wall: WallClock::from_fn({
+            let wall = Arc::clone(&wall);
+            move || wall.load(Ordering::SeqCst)
+        }),
+    })
+    .await;
     let environment = host._temp.environment();
     let here = kr_protocol::ids::DeviceId::new(host.environment_id.get());
-    let now = kr_ipc::now_ms().get();
     let expiring = issue_grant(
         &host,
         grant_id(25),
         here,
         &[ActionRight::ChangesetCreate],
         GrantExpiry::At {
-            expires_at_ms: kr_protocol::scalars::TimestampMs::new(now + 300),
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(T + 300),
         },
     );
     let expired = issue_grant(
@@ -2562,7 +2602,7 @@ async fn a_grant_that_expires_while_the_floor_is_written_is_refused_after_the_wr
         here,
         &[ActionRight::ChangesetCreate],
         GrantExpiry::At {
-            expires_at_ms: kr_protocol::scalars::TimestampMs::new(now - 1),
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(T - 1),
         },
     );
     let grants = Arc::new(HostGrants::for_daemon(&host.controller));
@@ -2582,7 +2622,7 @@ async fn a_grant_that_expires_while_the_floor_is_written_is_refused_after_the_wr
         )
         .expect("the fault is in place");
     let owed = grants
-        .grant(expired.grant_id, kr_ipc::now_ms().get() + 50)
+        .grant(expired.grant_id, T + 50)
         .expect_err("an expired grant is refused");
     assert!(
         matches!(owed, AutomationError::AuthorityUnavailable(_)),
@@ -2595,23 +2635,21 @@ async fn a_grant_that_expires_while_the_floor_is_written_is_refused_after_the_wr
         .expect("storage is held");
     let deciding = {
         let grants = Arc::clone(&grants);
-        let reading = kr_ipc::now_ms().get();
-        std::thread::spawn(move || grants.grant(expiring.grant_id, reading))
+        let continuous = continuous.clone();
+        std::thread::spawn(move || {
+            continuous.watch_this_thread();
+            grants.grant(expiring.grant_id, T)
+        })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    continuous.until_read().await;
+    continuous.advance(std::time::Duration::from_millis(600));
     registry
         .execute_batch("ROLLBACK;")
         .expect("storage is free");
-    let refused = deciding
-        .join()
-        .expect("the decision returns")
-        .expect_err("the grant expired while the decision waited for storage");
-    assert!(
-        matches!(&refused, AutomationError::PermissionDenied(detail) if detail.contains("expired")),
-        "{refused}"
-    );
+    let decided = deciding.join().expect("the decision returns");
 
     host.clients.abort();
+    decided
 }
 
 /// A workflow's grant is decided as a device's request is: narrowed to the rights this host's
