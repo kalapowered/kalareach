@@ -209,9 +209,12 @@ impl Controller {
         match answered {
             Ok(Ok(Ok(_))) => {
                 // The worker holds its close on this link until the acceptance has been delivered,
-                // and signals nothing before it. A link that fails here is given up with its
-                // lease, and the close is still the worker's: the closure is read from the record.
+                // and signals nothing before it. The link is let go of first: confirming takes
+                // every worker's link in turn, this one included, and the slot is held for as long
+                // as the link is. A link that fails here is given up with its lease, and the close
+                // is still the worker's: the closure is read from the record.
                 link.give_back();
+                drop(link);
                 self.confirm_delivery(close_action).await;
                 tokio::spawn(Arc::clone(self).watch_closure(
                     order.session_id,
