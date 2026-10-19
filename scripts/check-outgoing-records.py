@@ -145,6 +145,7 @@ ENCRYPTED_LINE = re.compile(rb"(?:Proc-Type|DEK-Info): ")
 BASE64 = re.compile(rb"(?:[A-Za-z0-9+/]|\\+/)+")
 MINIMUM_RUN = 8
 PADDING = re.compile(rb"=+")
+WORD_GAP_WITH_COMMAS = re.compile(rb"[ \t,;]+")
 WORD_GAP = re.compile(rb"[ \t;]+")
 SPACED_RUN = re.compile(rb"[ \t]+((?:[A-Za-z0-9+/]|\\+/)*)")
 BODY_CHARACTERS = 32
@@ -224,11 +225,16 @@ def body_ends_cleanly(window, position):
     return len(spaced.group(1)) >= MINIMUM_RUN or after in LAST_PIECE_ENDS
 
 
-def completes_block(window, position, body):
-    """Whether the rest of a body, up to the block's end marker, is only base64 and what source text
-    puts between pieces of it, and the whole body has as many different characters as random bytes
-    do. The end marker is the evidence that makes pieces of any size, and a last short piece, safe."""
-    body = bytearray(body)
+def completes_block(window, position):
+    """Whether the body that starts at `position` runs up to the block's end marker as only base64
+    and what source text puts between pieces of it, in words of at least 8 characters (the last may
+    be shorter) that only spaces, tabs, commas and semicolons separate, and has as many different characters as random
+    bytes do. The end marker is the evidence that makes pieces of any size safe; the words and the
+    characters are what tell a body from a sentence, a heading or a list of names between the
+    markers."""
+    body = bytearray()
+    words = []
+    last = position
     while True:
         item = STRING_PREFIX.match(window, position)
         if item is None:
@@ -236,15 +242,22 @@ def completes_block(window, position, body):
             if run is not None:
                 characters = run.group().replace(b"\\", b"")
                 if characters.strip(b"+/"):
+                    if words and WORD_GAP_WITH_COMMAS.fullmatch(window, last, run.start()) is None:
+                        words[-1] += len(characters)
+                    else:
+                        words.append(len(characters))
                     body += characters
+                    last = run.end()
             item = run or PADDING.match(window, position) or LAYOUT.match(window, position)
         if item is None:
             break
         position = item.end()
     if not window.startswith(END_MARKER, position):
         return False
+    if any(word < MINIMUM_RUN for word in words[:-1]):
+        return False
     # 17 different characters in 32, and one more for each three after that, up to 40; random
-    # base64 holds 25 in 32, 28 in 43, 40 in 64 and 55 in 128, and words and identifiers fewer.
+    # base64 holds 25 in 32, 31 in 43, 40 in 64 and 55 in 128, and words and identifiers fewer.
     return len(set(body)) >= min(DISTINCT_CHARACTERS + (len(body) - BODY_CHARACTERS) // 3, 40)
 
 
@@ -261,6 +274,7 @@ def key_body_follows(window, kind):
         if item is None:
             break
         position = item.end()
+    start = position
     taken = bytearray()
     words = []
     last = 0
@@ -300,7 +314,7 @@ def key_body_follows(window, kind):
             len(set(taken[:BODY_CHARACTERS])) >= DISTINCT_CHARACTERS
             and min(words) >= MINIMUM_RUN
             and body_ends_cleanly(window, position)
-        ) or completes_block(window, position, taken)
+        ) or completes_block(window, start)
     if kind == b"PGP":
         return pgp_private_key(raw)
     return der_private_key(raw) or raw[:12] == b"openssh-key-"
@@ -944,6 +958,7 @@ def cases(scratch, expect):
         "src/nebula-distinct17.txt": f"{nebula_header}\n{'AbCdEfGhIjKlMnOpQ' * 3}\n",
         "src/nebula-eights.txt": f"{nebula_header}\n" + " ".join(pieces(cipher[:40], 8)) + "\n",
         "src/nebula-array.js": 'const key = ["' + nebula_header + '", "' + '", "'.join(pieces(cipher + "=", 4)) + '", "' + nebula_end + '"].join("\\n");\n',
+        "src/nebula-array-long.js": 'const key = ["' + nebula_header + '", "' + '", "'.join(pieces(cipher + wide + wide[::-1], 4)) + '", "' + nebula_end + '"].join("\\n");\n',
         "src/nebula-array.go": f"var key = []string{{\n\t\"{nebula_header}\",\n" + "".join(f'\t"{piece}",\n' for piece in pieces(cipher + "=", 7)) + f'\t"{nebula_end}",\n}}\n',
         "src/nebula-unpadded.sh": f"KEY='{nebula_header} {wide[:64]} {wide[64:68]} {nebula_end}'\n",
         "src/nebula-unpadded-lines.txt": f"{nebula_header} {wide[:64]} {wide[64:68]}\n{nebula_end}\n",
@@ -1016,8 +1031,19 @@ def cases(scratch, expect):
         fx.write(f"src/{name}.js", f'const marker = "{unknown}";\nvalidatePrivateKeyAndCertificateChain(marker);\n')
         fx.write(f"docs/{name}.md", f"{unknown} This header identifies a private key in the configuration file.\n")
     fx.write("src/nebula-call.js", f'const marker = "{nebula_header}";\nexportPrivateKeyAndCertificateChain(marker);\n')
-    fx.write("docs/placeholder-block.md", f"{nebula_header}\nyour base64 key goes here, one line per sixty four bytes\n{nebula_end}\n")
-    fx.write("docs/placeholder-words.md", f"{tendermint_header}\npaste the base64 encoded key here and keep the file private\n{planted('-----', 'END TENDERMINT PRIVATE KEY', '-----')}\n")
+    tendermint_end = planted("-----", "END TENDERMINT PRIVATE KEY", "-----")
+    # Between the markers of a block: a sentence, a table row, a list of words and a list of long words are not a body.
+    for name, text in {
+        "docs/placeholder-sentence.md": f"{nebula_header}\npaste your base64 encoded private key here\n{nebula_end}\n",
+        "docs/placeholder-insert.md": f"{tendermint_header}\nInsert the 32 byte X25519 private key in base64\n{tendermint_end}\n",
+        "docs/placeholder-table.md": f"| {nebula_header} | the private key in base64 | {nebula_end} |\n",
+        "docs/long-words.md": f"{nebula_header}\nSynchronization Administration Configuration Interoperability\n{nebula_end}\n",
+        "docs/comma-words.md": f"{nebula_header}\nBoxed, Browser, Carrier, Ending, Loopback, Plan, Reply, Unavailable,\n{nebula_end}\n",
+        "src/array-no-marker.js": f"{nebula_header}\n" + ", ".join(f'"{piece}"' for piece in pieces(cipher, 4)) + "\n- item\n",
+        "src/hyphenated.rs": f"{nebula_header}\nGrantExecutableCapabilityForTheHostAndMore-managed\n",
+        "src/capability.rs": f"{nebula_header}\nGrantExecutableCapability,\n/// Changing host-management\n",
+    }.items():
+        fx.write(name, text)
     fx.write("docs/spaced-call.md", f"{nebula_header} {cipher} (see the key format notes)\n")
     fx.write("src/nebula-args.js", f'assertKeyFormat("{nebula_header}",\n  "private", "public", "export", "format", "X25519", "chain");\n')
     fx.write("src/tendermint-args.js", f'assertKeyFormat("{tendermint_header}", unmarshalX25519PrivateKey, marshalX25519PrivateKey);\n')
