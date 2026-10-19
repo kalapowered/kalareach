@@ -5128,11 +5128,10 @@ async fn a_session_does_not_start_after_its_grants_end_though_its_wait_has_time_
             })
             .await;
             let settled = node_statuses(&host);
-            assert!(
-                settled.last().is_some_and(|status| {
-                    status != NodeStatus::Success.as_str() && status != NodeStatus::Running.as_str()
-                }),
-                "the node did not succeed in a session that did not start: {settled:?}"
+            assert_eq!(
+                settled.last().map(String::as_str),
+                Some(NodeStatus::Paused.as_str()),
+                "the worker's refusal to start pauses the node: {settled:?}"
             );
             assert!(
                 !marker.exists(),
