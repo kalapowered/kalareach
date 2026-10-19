@@ -16,12 +16,14 @@
 //! entry is changed to the line as it now is. A line that selects tests with `--exact` has to name
 //! each test the entry covers; an entry whose tests a call passes finds them on lines that begin
 //! with the call's words. A step of the report's own plan is found in the plan, not in text.
-//! Words are separated, and a comment begins, as the shell has them: at a space or a tab and at
-//! nothing else, and a backslash and the new line after it are taken out. Whether control reaches a
-//! line, what the script does with its result, the environment a step sets, what other syntax (a
-//! here-document, a quoted block over several lines, a folded scalar) makes of a line, and a filter
-//! in the line an entry itself gives are not read: the entry is taken as written, held only to the
-//! tests it covers by name, by `--skip`, `--list` and `--no-run`.
+//! Words are separated by a space or a tab and by nothing else, a comment begins at a `#` after a
+//! space or a tab, and a backslash and the new line after it are taken out and nothing is put in
+//! their place, as the shell has them. In a workflow (a `.yml` or `.yaml` file) a `run:` field is
+//! the exception: it is a plain scalar, where a backslash does not continue the line. Whether
+//! control reaches a line, what the script does with its result, the environment a step sets, what
+//! other syntax (a here-document, a quoted block over several lines, a folded scalar) makes of a
+//! line, and a filter in the line an entry itself gives are not read: the entry is taken as
+//! written, held only to the tests it covers by name, by `--skip`, `--list` and `--no-run`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -194,7 +196,8 @@ fn missing_command(
         return Some(format!("its line {wrong}"));
     }
     let wanted = words_of(line);
-    let lines: Vec<String> = commands(&text);
+    let workflow = file.ends_with(".yml") || file.ends_with(".yaml");
+    let lines: Vec<String> = commands(&text, workflow);
     if !lines.contains(&wanted) {
         return Some(format!(
             "{file} holds no line `{wanted}`{}",
@@ -408,14 +411,15 @@ fn plan_commands() -> Vec<String> {
 /// taken out (nothing put in their place, as the shell does, so a continuation that has no white
 /// space beside it joins two words into one), the white space made single, and what a comment holds
 /// left out. A comment on a line that continues another ends the command there, as it does for the
-/// shell. A line that begins `run:` is a workflow's plain scalar, where a backslash is not a
-/// continuation, and is not joined.
-fn commands(text: &str) -> Vec<String> {
+/// shell. In a workflow, a `run:` field is a plain scalar, where a backslash is not a continuation:
+/// a line that begins `run:` or `- run:` is not joined to the next. Every other line that ends in a
+/// backslash is, in every file.
+fn commands(text: &str, workflow: bool) -> Vec<String> {
     let mut joined: Vec<String> = Vec::new();
     let mut continuing = false;
     for physical in text.split('\n') {
         let (body, goes_on) = match physical.strip_suffix('\\') {
-            Some(body) if !words(physical).take(2).any(|word| word == "run:") => (body, true),
+            Some(body) if !(workflow && is_run_field(physical)) => (body, true),
             _ => (physical, false),
         };
         match joined.last_mut() {
@@ -429,6 +433,17 @@ fn commands(text: &str) -> Vec<String> {
         .map(|line| words_of(without_comment(line)))
         .filter(|line| !line.is_empty())
         .collect()
+}
+
+/// Whether `line` starts a workflow's `run:` field: its first word is `run:`, or its first two are
+/// `-` and `run:`.
+fn is_run_field(line: &str) -> bool {
+    let mut parts = words(line);
+    match parts.next() {
+        Some("run:") => true,
+        Some("-") => parts.next() == Some("run:"),
+        _ => false,
+    }
 }
 
 /// `line` up to the `#` that begins a comment: one at the start of the line or after white space,

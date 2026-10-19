@@ -799,18 +799,24 @@ fn found_in(
     line: &'static str,
     names_with: Option<&'static [&'static str]>,
 ) -> Vec<String> {
+    found_in_file("ci.sh", script, line, names_with)
+}
+
+fn found_in_file(
+    file: &'static str,
+    script: &str,
+    line: &'static str,
+    names_with: Option<&'static [&'static str]>,
+) -> Vec<String> {
     let map = held_to(&[]);
     let directory = tempfile::tempdir().expect("a directory");
-    std::fs::write(directory.path().join("ci.sh"), script).expect("the script");
+    std::fs::write(directory.path().join(file), script).expect("the script");
     let runs = [outcomes_entry(
         &[],
         match names_with {
-            None => Runs::Command {
-                file: "ci.sh",
-                line,
-            },
+            None => Runs::Command { file, line },
             Some(names_with) => Runs::Supplied {
-                file: "ci.sh",
+                file,
                 line,
                 names_with,
             },
@@ -916,17 +922,34 @@ fn a_command_is_the_line_the_entry_gives_and_nothing_else() {
         tests::is_ignored_for_a_reason_over_two_lines"
         .to_owned());
 
-    // A workflow's `run:` line is a plain scalar, where a backslash is not a continuation.
-    let run = format!("run: {COMMAND}");
-    let found = found_in(
-        &format!("{run}\n"),
-        Box::leak(run.clone().into_boxed_str()),
-        None,
-    );
-    assert!(found.is_empty(), "{found:?}");
-    let split = format!("run: cargo test --lib -- --ignored \\\n  --exact {NAMES}");
-    let found = found_in(&split, Box::leak(run.into_boxed_str()), None);
-    assert_eq!(found.len(), 1, "{found:?}");
+    // In a workflow, a `run:` field (`run:` or `- run:`) is a plain scalar, where a backslash is
+    // not a continuation.
+    for prefix in ["run:", "- run:"] {
+        let entry: &'static str = Box::leak(format!("{prefix} {COMMAND}").into_boxed_str());
+        let found = found_in_file("ci.yml", &format!("{entry}\n"), entry, None);
+        assert!(found.is_empty(), "{found:?}");
+        let split = format!("{prefix} cargo test --lib -- --ignored \\\n  --exact {NAMES}");
+        let found = found_in_file("ci.yml", &split, entry, None);
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+    // The word `run:` anywhere else is an ordinary word: in a script, whatever precedes it, and in
+    // a workflow past the key, a backslash at the end of the line joins the command that follows.
+    for (file, before) in [
+        ("ci.sh", "echo run: \\"),
+        ("ci.sh", ": run: \\"),
+        ("ci.sh", "run: \\"),
+        ("ci.sh", "- run: \\"),
+        ("ci.yml", "echo run: \\"),
+        ("ci.yml", ": run: \\"),
+        ("ci.yml", "echo - run: \\"),
+    ] {
+        let found = found_in_file(file, &format!("{before}\n{COMMAND}\n"), COMMAND, None);
+        assert_eq!(found.len(), 1, "{file} {before}: {found:?}");
+        assert!(
+            found[0].contains("holds no line"),
+            "{file} {before}: {found:?}"
+        );
+    }
 
     // A comment, and the words of two lines, are not the line.
     refused(format!("# {COMMAND}"), "holds no line");
