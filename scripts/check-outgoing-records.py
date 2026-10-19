@@ -121,13 +121,17 @@ PEM_HEADER = re.compile(rb"-----BEGIN ((?:[A-Z0-9]+ )*)PRIVATE KEY( BLOCK)?-----
 # characters of base64, taken wherever the source text breaks them, have to begin with that
 # structure, so a placeholder shorter than 32 characters is not a key. Where there is no structure
 # to check (ciphertext, or a kind of block this does not know, unless its body is a DER structure)
-# the 32 characters have to look like random bytes: no words (the pieces that source text breaks
-# apart, by quotes, joiners, comment markers or line breaks, are one word; a comma, or spaces alone,
-# ends a word, which is what separates the pieces of a body from a list of short strings; every word
-# is at least 8 characters), 17 or more different characters, and the text after them goes on as a
-# body goes on (a line break, a quote, an escape, the end marker, padding, the end, or a space and
-# another long run of base64, or a last short one that padding, the end marker, a quote or the end
-# follows), not into a short word, a call or code.
+# the body has to look like random bytes, in one of two ways. Where the block's end marker follows
+# the body, only base64 and what source text puts between its pieces (of any size) may lie between
+# the header and the marker, and the characters of the whole body have to be as many and as
+# different as those of random bytes. Where it does not (a body cut off, or a marker elsewhere), the
+# first 32 characters have no words (the pieces that source text breaks apart, by quotes, joiners,
+# comment markers or line breaks, are one word; a comma, a semicolon, or spaces alone, ends a word,
+# which is what separates the pieces of a body from a list of short strings; every word is at least
+# 8 characters), hold 17 or more different characters, and the text after them goes on as a body
+# goes on (a line break, a quote, an escape, padding, the end, or a space and another long run of
+# base64, or a last short one that padding, a quote or the end follows), not into a short word, a
+# call or code.
 # A quoted header followed by code or prose does not decode to one. The read goes forward one item
 # at a time and never back, so its time is in proportion to the window; keep it so.
 STRING_PREFIX = rb"(?:u8|[bBrRuUfFL]{1,2})(?=[\"'])"
@@ -140,9 +144,11 @@ ENCRYPTED_LINE = re.compile(rb"(?:Proc-Type|DEK-Info): ")
 # JSON may write the `/` of base64 as `\/`, and it is a character of the body there.
 BASE64 = re.compile(rb"(?:[A-Za-z0-9+/]|\\+/)+")
 MINIMUM_RUN = 8
+PADDING = re.compile(rb"=+")
 WORD_GAP = re.compile(rb"[ \t;]+")
-SPACED_RUN = re.compile(rb"[ \t]+([A-Za-z0-9+/]*)")
+SPACED_RUN = re.compile(rb"[ \t]+((?:[A-Za-z0-9+/]|\\+/)*)")
 BODY_CHARACTERS = 32
+END_MARKER = b"-----END "
 DISTINCT_CHARACTERS = 17
 KEY_WINDOW = 8192
 
@@ -200,8 +206,8 @@ def pgp_private_key(raw):
 STRUCTURED_KINDS = (b"", b"RSA", b"DSA", b"EC", b"ENCRYPTED", b"OPENSSH", b"PGP")
 
 
-CLEAN_ENDS = (b"", b"\r", b"\n", b'"', b"'", b"`", b"\\", b"-", b"=", b"<")
-LAST_PIECE_ENDS = (b"", b"=", b"-", b'"', b"'", b"`", b"<")
+CLEAN_ENDS = (b"", b"\r", b"\n", b'"', b"'", b"`", b"\\", b"=", b"<")
+LAST_PIECE_ENDS = (b"", b"=", b'"', b"'", b"`", b"<")
 
 
 def body_ends_cleanly(window, position):
@@ -216,6 +222,30 @@ def body_ends_cleanly(window, position):
         return after in CLEAN_ENDS
     # The next line of a body written on one line is a long run; its last line may be a short one.
     return len(spaced.group(1)) >= MINIMUM_RUN or after in LAST_PIECE_ENDS
+
+
+def completes_block(window, position, body):
+    """Whether the rest of a body, up to the block's end marker, is only base64 and what source text
+    puts between pieces of it, and the whole body has as many different characters as random bytes
+    do. The end marker is the evidence that makes pieces of any size, and a last short piece, safe."""
+    body = bytearray(body)
+    while True:
+        item = STRING_PREFIX.match(window, position)
+        if item is None:
+            run = BASE64.match(window, position)
+            if run is not None:
+                characters = run.group().replace(b"\\", b"")
+                if characters.strip(b"+/"):
+                    body += characters
+            item = run or PADDING.match(window, position) or LAYOUT.match(window, position)
+        if item is None:
+            break
+        position = item.end()
+    if not window.startswith(END_MARKER, position):
+        return False
+    # 17 different characters in 32, and one more for each three after that, up to 40; random
+    # base64 holds 25 in 32, 28 in 43, 40 in 64 and 55 in 128, and words and identifiers fewer.
+    return len(set(body)) >= min(DISTINCT_CHARACTERS + (len(body) - BODY_CHARACTERS) // 3, 40)
 
 
 def key_body_follows(window, kind):
@@ -245,7 +275,7 @@ def key_body_follows(window, kind):
             characters = run.group().replace(b"\\", b"")
             # A `+` or a `/` by itself is a joiner or a comment marker, not part of the body.
             if characters.strip(b"+/"):
-                taken += characters[: BODY_CHARACTERS - len(taken)]
+                taken += characters
                 gap = window[last : run.start()]
                 if words and b"," not in gap and WORD_GAP.fullmatch(gap) is None:
                     words[-1] += len(characters)
@@ -259,7 +289,7 @@ def key_body_follows(window, kind):
         position = item.end()
     if len(taken) < BODY_CHARACTERS:
         return False
-    raw = binascii.a2b_base64(bytes(taken))
+    raw = binascii.a2b_base64(bytes(taken[:BODY_CHARACTERS]))
     if encrypted or kind not in STRUCTURED_KINDS:
         # Ciphertext and key material in a format this does not know are random bytes, and 32
         # characters of random base64 hold 17 or more different ones (all but one draw in 478,000);
@@ -267,10 +297,10 @@ def key_body_follows(window, kind):
         if not encrypted and der_private_key(raw):
             return True
         return (
-            len(set(taken)) >= DISTINCT_CHARACTERS
+            len(set(taken[:BODY_CHARACTERS])) >= DISTINCT_CHARACTERS
             and min(words) >= MINIMUM_RUN
             and body_ends_cleanly(window, position)
-        )
+        ) or completes_block(window, position, taken)
     if kind == b"PGP":
         return pgp_private_key(raw)
     return der_private_key(raw) or raw[:12] == b"openssh-key-"
@@ -851,6 +881,7 @@ def cases(scratch, expect):
     # Ciphertext and key material in a format the check does not know are random bytes.
     cipher = base64.b64encode(hashlib.sha256(b"ciphertext").digest()).decode().rstrip("=")
     slashed = cipher[:3] + "/" + cipher[4:]
+    wide = base64.b64encode(hashlib.sha512(b"ciphertext").digest()).decode().rstrip("=")
 
     def pieces(text, size):
         return [text[i : i + size] for i in range(0, len(text), size)]
@@ -912,6 +943,19 @@ def cases(scratch, expect):
         "src/nebula-oneline.sh": f'KEY="{nebula_header} {cipher[:40]} {cipher[40:]}= {nebula_end}"\n',
         "src/nebula-distinct17.txt": f"{nebula_header}\n{'AbCdEfGhIjKlMnOpQ' * 3}\n",
         "src/nebula-eights.txt": f"{nebula_header}\n" + " ".join(pieces(cipher[:40], 8)) + "\n",
+        "src/nebula-array.js": 'const key = ["' + nebula_header + '", "' + '", "'.join(pieces(cipher + "=", 4)) + '", "' + nebula_end + '"].join("\\n");\n',
+        "src/nebula-array.go": f"var key = []string{{\n\t\"{nebula_header}\",\n" + "".join(f'\t"{piece}",\n' for piece in pieces(cipher + "=", 7)) + f'\t"{nebula_end}",\n}}\n',
+        "src/nebula-unpadded.sh": f"KEY='{nebula_header} {wide[:64]} {wide[64:68]} {nebula_end}'\n",
+        "src/nebula-unpadded-lines.txt": f"{nebula_header} {wide[:64]} {wide[64:68]}\n{nebula_end}\n",
+        "src/nebula-last-slash.json": json.dumps({"k": f"{nebula_header} {wide[:64]} ab/c="}).replace("/", "\\/"),
+        "src/nebula-padded-eof.txt": f"{nebula_header}\n{cipher}=\n",
+        "src/nebula-array-slash.json": json.dumps({"k": [nebula_header, *pieces(slashed + "=", 4), nebula_end]}).replace("/", "\\/"),
+        "src/last-quote.sh": f'KEY="{nebula_header} {wide[:64]} abcd"\n',
+        "src/last-single.sh": f"KEY='{nebula_header} {wide[:64]} abcd'\n",
+        "src/last-backtick.js": f"const key = `{nebula_header} {wide[:64]} abcd`;\n",
+        "src/last-xml.xml": f"<key>{nebula_header} {wide[:64]} abcd</key>\n",
+        "src/last-padding.txt": f"{nebula_header} {wide[:64]} ab==\n",
+        "src/last-eof.txt": f"{nebula_header} {wide[:64]} abcd",
         "src/nebula-spaces.sh": f'KEY="{nebula_header} {cipher[:16]} {cipher[16:32]} {cipher[32:]}"\n',
         "src/nebula-pieces.rs": f"// {nebula_header}\n" + "".join(f"// {piece}\n" for piece in pieces(cipher, 5)),
         "src/openssh.txt": planted("-----", "BEGIN OPENSSH PRIVATE KEY", "-----") + "\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB\n",
@@ -972,6 +1016,8 @@ def cases(scratch, expect):
         fx.write(f"src/{name}.js", f'const marker = "{unknown}";\nvalidatePrivateKeyAndCertificateChain(marker);\n')
         fx.write(f"docs/{name}.md", f"{unknown} This header identifies a private key in the configuration file.\n")
     fx.write("src/nebula-call.js", f'const marker = "{nebula_header}";\nexportPrivateKeyAndCertificateChain(marker);\n')
+    fx.write("docs/placeholder-block.md", f"{nebula_header}\nyour base64 key goes here, one line per sixty four bytes\n{nebula_end}\n")
+    fx.write("docs/placeholder-words.md", f"{tendermint_header}\npaste the base64 encoded key here and keep the file private\n{planted('-----', 'END TENDERMINT PRIVATE KEY', '-----')}\n")
     fx.write("docs/spaced-call.md", f"{nebula_header} {cipher} (see the key format notes)\n")
     fx.write("src/nebula-args.js", f'assertKeyFormat("{nebula_header}",\n  "private", "public", "export", "format", "X25519", "chain");\n')
     fx.write("src/tendermint-args.js", f'assertKeyFormat("{tendermint_header}", unmarshalX25519PrivateKey, marshalX25519PrivateKey);\n')
