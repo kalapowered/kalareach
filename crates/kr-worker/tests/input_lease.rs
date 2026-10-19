@@ -3611,6 +3611,106 @@ fn the_held_prefixes() -> Vec<&'static [u8]> {
     prefixes
 }
 
+/// How many times the split delimiter is offered before a run is taken for one that cannot keep the
+/// recogniser's deadline at all.
+const SPLIT_ATTEMPTS: u32 = 20;
+
+/// KR-PERF-002: the delimiter split across two writes, with `stalled` in force. The first part is
+/// held; the second arrives within the recogniser's deadline and completes it, so the delimiter is
+/// forwarded once whole and the paste it opens is recognised. A watchdog lets the stall go if
+/// either write waits for it.
+///
+/// The claim is about a second part that reaches the recogniser inside its deadline, and the
+/// deadline is the recogniser's own, kept exactly. Whether it did is read from the recogniser,
+/// which keeps the last prefix it forwarded because it had held it for the deadline:
+///
+/// - No such prefix since the first write began: the first part was still held when the second
+///   arrived, which is inside the deadline however busy the box was, and the delimiter must be
+///   whole. This is the claim.
+/// - Such a prefix: the first part ran out of time before the second reached the recogniser, as
+///   it is meant to, and says nothing of the claim. It must have been held for the whole
+///   deadline, and begun to be held after the first write began; anything shorter is a recogniser
+///   that forwards too soon, and the case fails. The delimiter is offered again.
+async fn a_delimiter_split_across_two_writes_meets(rig: &mut Rig, stalled: Stalled) {
+    for attempt in 1..=SPLIT_ATTEMPTS {
+        let delimiters_before = count(&rig.received(), PASTE_START);
+        let standing = stall(rig, stalled).await;
+        let letting_go = LetGo::after(standing.release.clone(), Duration::from_secs(5));
+        let (first, first_began) = rig.write(&PASTE_START[..4]).await;
+        assert_eq!(
+            first.held_prefix_bytes.get(),
+            4,
+            "{stalled:?}: the first part is held"
+        );
+        // The rest of the delimiter, and a payload behind it, in one write.
+        let rest = [&PASTE_START[4..], &b"kr-payload"[..]].concat();
+        let (second, _) = rig.write(&rest).await;
+        let (expiry, opened) = {
+            let input = rig.wired.runtime.input().lock();
+            (
+                input
+                    .last_expiry()
+                    .filter(|expired| expired.since >= first_began),
+                input.paste_open(),
+            )
+        };
+        if let Some(expired) = expiry {
+            assert!(
+                expired.now.saturating_duration_since(expired.since)
+                    >= kr_worker::input::RECOGNISER_DEADLINE,
+                "{stalled:?}: the recogniser forwarded the first part after holding it for {:?}, \
+                 before its deadline",
+                expired.now.saturating_duration_since(expired.since)
+            );
+        } else {
+            assert_eq!(
+                second.forwarded_bytes.get(),
+                (PASTE_START.len() + b"kr-payload".len()) as u64,
+                "{stalled:?}: the second part reached the worker inside the recogniser's deadline \
+                 and completes the delimiter, which is forwarded whole with the payload behind it"
+            );
+            assert!(
+                opened,
+                "{stalled:?}: the delimiter was recognised, which is what opens a paste: a prefix \
+                 that had expired and was forwarded with the bytes behind it opens none"
+            );
+        }
+        let arrived = rig.until_everything_typed_arrived().await;
+        assert!(
+            !letting_go.finish(),
+            "{stalled:?}: the split delimiter was kept waiting by the stall until it was let go"
+        );
+        assert!(
+            arrived.is_some(),
+            "{stalled:?}: the delimiter did not reach the application whole while the stall was in force: {:?}",
+            rig.received()
+        );
+        standing.release.send(()).expect("lets the stall go");
+        if let Some(stopped) = standing.stopped {
+            let _ = stopped.await;
+        }
+        if expiry.is_some() {
+            // Nothing is held and no paste is open, so the next attempt starts from a clean
+            // recogniser.
+            eprintln!(
+                "{stalled:?}: attempt {attempt} of the split delimiter reached the recogniser after \
+                 its deadline, and is offered again"
+            );
+            continue;
+        }
+        assert_eq!(
+            count(&rig.received(), PASTE_START) - delimiters_before,
+            1,
+            "{stalled:?}: the delimiter was forwarded once"
+        );
+        return;
+    }
+    panic!(
+        "{stalled:?}: none of {SPLIT_ATTEMPTS} attempts at the split delimiter reached the \
+         recogniser inside its deadline"
+    );
+}
+
 /// KR-PERF-002: every prefix length of the start delimiter, and the delimiter split across two
 /// writes, reaches the application while `stalled` is in force, with a disk writer beside the
 /// worker when `beside_a_disk_writer` says so.
@@ -3622,51 +3722,7 @@ async fn every_prefix_meets(stalled: Stalled, beside_a_disk_writer: bool) {
             a_prefix_meets(&mut rig, stalled, timing, prefix, Duration::from_secs(5)).await;
         }
     }
-    // The delimiter split across two writes, with the stall in force. The first part is held; the
-    // second arrives within the recogniser's deadline and completes it, so the delimiter is
-    // forwarded once whole and the paste it opens is recognised. A watchdog lets the stall go if
-    // either write waits for it.
-    let standing = stall(&mut rig, stalled).await;
-    let letting_go = LetGo::after(standing.release.clone(), Duration::from_secs(5));
-    let (first, _) = rig.write(&PASTE_START[..4]).await;
-    assert_eq!(
-        first.held_prefix_bytes.get(),
-        4,
-        "{stalled:?}: the first part is held"
-    );
-    // The rest of the delimiter, and a payload behind it, in one write.
-    let rest = [&PASTE_START[4..], &b"kr-payload"[..]].concat();
-    let (second, _) = rig.write(&rest).await;
-    assert_eq!(
-        second.forwarded_bytes.get(),
-        (PASTE_START.len() + b"kr-payload".len()) as u64,
-        "{stalled:?}: the second part reached the worker inside the recogniser's deadline and \
-         completes the delimiter, which is forwarded whole with the payload behind it"
-    );
-    assert!(
-        rig.wired.runtime.input().lock().paste_open(),
-        "{stalled:?}: the delimiter was recognised, which is what opens a paste: a prefix that \
-         had expired and was forwarded with the bytes behind it opens none"
-    );
-    let arrived = rig.until_everything_typed_arrived().await;
-    assert!(
-        !letting_go.finish(),
-        "{stalled:?}: the split delimiter was kept waiting by the stall until it was let go"
-    );
-    assert!(
-        arrived.is_some(),
-        "{stalled:?}: the delimiter did not reach the application whole while the stall was in force: {:?}",
-        rig.received()
-    );
-    standing.release.send(()).expect("lets the stall go");
-    if let Some(stopped) = standing.stopped {
-        let _ = stopped.await;
-    }
-    assert_eq!(
-        count(&rig.received(), PASTE_START),
-        1,
-        "{stalled:?}: the delimiter was forwarded once"
-    );
+    a_delimiter_split_across_two_writes_meets(&mut rig, stalled).await;
     if let Some(writer) = writer {
         writer.stop();
     }

@@ -1002,6 +1002,14 @@ impl InputDomain {
         self.framer.paste_open()
     }
 
+    /// Returns the last prefix the recogniser forwarded because it was held for its deadline, for
+    /// this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn last_expiry(&self) -> Option<crate::input::Expired> {
+        self.framer.last_expiry()
+    }
+
     /// Returns whether the session's integration admits bytes from outside it.
     ///
     /// A session with no managed reader always does. A managed one does only once its private

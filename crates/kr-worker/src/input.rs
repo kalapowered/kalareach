@@ -199,6 +199,21 @@ pub struct PasteFramer {
     paste_open: bool,
     held: Vec<u8>,
     held_since: Option<Instant>,
+    /// The last prefix forwarded because it was held for its deadline, for this host's own tests.
+    #[cfg(feature = "testing")]
+    last_expiry: Option<Expired>,
+}
+
+/// A prefix forwarded because it was held for its deadline, for this host's own tests: when it
+/// began to be held and the moment it was forwarded at. It is compiled away in every shipped build.
+#[cfg(feature = "testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Expired {
+    /// When the prefix began to be held.
+    pub since: Instant,
+    /// The moment it was found to have run out of time: the timer's reading, or the arrival of the
+    /// write that found it so.
+    pub now: Instant,
 }
 
 /// What one push produced.
@@ -257,7 +272,17 @@ impl PasteFramer {
             paste_open: false,
             held: Vec::new(),
             held_since: None,
+            #[cfg(feature = "testing")]
+            last_expiry: None,
         }
+    }
+
+    /// Returns the last prefix forwarded because it was held for its deadline, for this host's own
+    /// tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn last_expiry(&self) -> Option<Expired> {
+        self.last_expiry
     }
 
     /// Records whether the application has enabled canonical bracketed-paste mode.
@@ -307,6 +332,10 @@ impl PasteFramer {
             .held_since
             .is_some_and(|since| now.saturating_duration_since(since) >= RECOGNISER_DEADLINE)
         {
+            #[cfg(feature = "testing")]
+            if let Some(since) = self.held_since {
+                self.last_expiry = Some(Expired { since, now });
+            }
             expired = std::mem::take(&mut self.held);
             self.held_since = None;
         }
@@ -397,6 +426,10 @@ impl PasteFramer {
         let deadline = self.deadline()?;
         if now < deadline {
             return None;
+        }
+        #[cfg(feature = "testing")]
+        if let Some(since) = self.held_since {
+            self.last_expiry = Some(Expired { since, now });
         }
         self.held_since = None;
         Some(std::mem::take(&mut self.held))
