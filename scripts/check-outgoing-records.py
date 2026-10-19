@@ -14,8 +14,10 @@ The published package file lists. What a package would carry is not what Git tra
 `files`, an ignore file and a step that runs before packing all decide it, and only the packer knows
 the answer. Each public npm package under `packages/`, `apps/` and `workers/` is asked with
 `npm pack --dry-run`, running the steps the real pack runs, and each file it lists is read where it
-is. `--package-dir` names directories whose every file a package ships whole; a glob that matches no
-directory is a finding, because a check that looked at nothing has proved nothing.
+is. The release's own packer, `pnpm pack`, adds the workspace `LICENSE` to a package that has none;
+that file is tracked, so the commit scan reads it whenever a commit changes it. `--package-dir`
+names directories whose every file a package ships whole; a glob that matches no directory is a
+finding, because a check that looked at nothing has proved nothing.
 
 What it refuses is anything that is a record of building this product rather than part of it:
 local planning and review records, build-agent instruction files and credentials. A finding names
@@ -55,12 +57,17 @@ KEY = ""
 SCRIPT = os.path.abspath(__file__)
 MAX_CONTENT_BYTES = 32 * 1024 * 1024
 PACK_SECONDS = 600
+BATCH_BYTES = 64 * 1024 * 1024
 NPM_ROOTS = ("packages", "apps", "workers")
 EMPTY = "0" * 40
 
 # Paths that are a record of the build rather than the product, with why each is refused. The first
 # group is the build-agent instruction files and configuration, the second is this product's own
-# local records, which live outside every checkout, and the third is credential material.
+# local records, which live outside every checkout, and the third is credential material. The first
+# rule that matches names the reason, so `.cursorrules` reads as a configuration file. A single
+# letter in brackets (`artifact[s]`, `hand[o]ff`) matches what the plain letter does and keeps this
+# file's own text from matching the repository's patterns for records it must not name; do not
+# simplify them.
 FORBIDDEN = [
     (r"(^|/)(agents|claude|gemini)[^/]*\.md\Z", "a build-agent instruction file"),
     (
@@ -91,7 +98,7 @@ FORBIDDEN = [
     (r"(^|/)id_(rsa|dsa|ecdsa|ed25519)\Z", "a private SSH key"),
     (r"(^|/)[^/]*(service-account|credentials|secret)[^/]*\.json\Z", "a credential file"),
 ]
-FORBIDDEN = [(re.compile(pattern, re.IGNORECASE), why) for pattern, why in FORBIDDEN]
+FORBIDDEN = [(re.compile(pattern, re.IGNORECASE | re.ASCII), why) for pattern, why in FORBIDDEN]
 
 # Paths that may match a pattern above. The example file holds names and never values.
 ALLOWED = (".env.example",)
@@ -99,10 +106,13 @@ ALLOWED = (".env.example",)
 # Shapes that are a credential wherever they appear. Narrow on purpose: a check that guessed at what
 # a secret looks like would refuse a release for a string in a dependency.
 PEM_HEADER = re.compile(rb"-----BEGIN ((?:[A-Z0-9]+ )*)PRIVATE KEY( BLOCK)?-----")
-# What follows a private key's header: escaped or real line breaks, optional `Name: value` header
-# lines (an encrypted key's `Proc-Type`), then the base64 body.
+# What follows a private key's header: white space and escaped line breaks, the quotes, joiners,
+# commas and comment markers a key written out as source text has between its lines, optional
+# `Name: value` header lines (an encrypted key's `Proc-Type`), then a run of base64. A run of 16
+# keeps a key wrapped in short lines, and still ends at the first word of prose or the first brace
+# of a format string that follows a quoted header.
 PEM_BODY = re.compile(
-    rb"\A(?:\s|\\r|\\n)*(?:[A-Za-z-]+: [^\r\n\\]*(?:\r?\n|\\r|\\n)+)*[A-Za-z0-9+/]{32,}"
+    rb"\A(?:\s|\\[rnt\\]|[\"'`+,;#*]|//|[A-Za-z-]+: [^\r\n\\]*(?:\r?\n|\\r|\\n))*[A-Za-z0-9+/]{16,}"
 )
 LIVE_KEY = re.compile(rb"\bsk_live_[0-9A-Za-z]{20,}")
 WEBHOOK_SECRET = re.compile(rb"\bwhsec_[0-9A-Za-z]{20,}")
@@ -187,49 +197,59 @@ def tree_paths(commit, root):
 def blobs_added_or_changed(commit, root):
     """(path, blob) for every file the commit wrote. A merge's own resolution is read as well: a
     file that differs from both parents was written by the merge and is in nothing else."""
+    # A type change (`T`) is a symlink or a submodule that became a file: the new blob is read.
     raw = git(
-        "diff-tree", "-r", "-z", "-m", "--root", "--no-commit-id", "--raw", "--diff-filter=AM",
-        commit,
+        "diff-tree", "-r", "-z", "-m", "--root", "--no-commit-id", "--no-renames", "--raw",
+        "--diff-filter=AMT", commit,
         root=root,
     )
     parts = [part for part in raw.split(b"\0") if part]
-    found = []
+    found = {}
     for index in range(0, len(parts) - 1, 2):
         fields = parts[index].lstrip(b":").split()
         if len(fields) < 5 or fields[1] == b"160000":
             continue
-        found.append((os.fsdecode(parts[index + 1]), fields[3].decode()))
-    return found
+        # A merge lists a file once for each parent it differs from.
+        found[(os.fsdecode(parts[index + 1]), fields[3].decode())] = None
+    return list(found)
 
 
-def read_blobs(blobs, root):
-    """The contents of each blob, read once: a dict of blob id to bytes, or to None when larger
-    than this will read."""
-    contents = {}
-    ordered = sorted(set(blobs))
-    for start in range(0, len(ordered), 200):
-        chunk = ordered[start : start + 200]
-        wanted = b"".join(blob.encode() + b"\n" for blob in chunk)
-        sizes = git("cat-file", "--batch-check", input_bytes=wanted, root=root).decode().splitlines()
-        small = []
-        for blob, line in zip(chunk, sizes):
-            fields = line.split()
-            if len(fields) == 3 and int(fields[2]) <= MAX_CONTENT_BYTES:
-                small.append(blob)
-            else:
-                contents[blob] = None
-        if not small:
-            continue
-        stream = git(
-            "cat-file", "--batch", input_bytes=b"".join(blob.encode() + b"\n" for blob in small), root=root
-        )
+def scan_blobs(blobs, root):
+    """What each blob holds that is a credential: a dict of blob id to descriptions, or to None
+    when it could not be read or is larger than this will read. The blobs are read in batches and
+    only the verdict is kept, so a long range is never held in memory whole."""
+    verdicts = {}
+
+    def flush(batch):
+        if not batch:
+            return
+        wanted = b"".join(blob.encode() + b"\n" for blob in batch)
+        stream = git("cat-file", "--batch", input_bytes=wanted, root=root)
         at = 0
-        for blob in small:
+        for blob in batch:
             end = stream.index(b"\n", at)
             size = int(stream[at:end].split()[2])
-            contents[blob] = stream[end + 1 : end + 1 + size]
+            verdicts[blob] = refused_contents(stream[end + 1 : end + 1 + size])
             at = end + 1 + size + 1
-    return contents
+
+    ordered = sorted(set(blobs))
+    for start in range(0, len(ordered), 500):
+        chunk = ordered[start : start + 500]
+        wanted = b"".join(blob.encode() + b"\n" for blob in chunk)
+        sizes = git("cat-file", "--batch-check", input_bytes=wanted, root=root).decode().splitlines()
+        batch, held = [], 0
+        for blob, line in zip(chunk, sizes):
+            fields = line.split()
+            if len(fields) != 3 or int(fields[2]) > MAX_CONTENT_BYTES:
+                verdicts[blob] = None
+                continue
+            if batch and held + int(fields[2]) > BATCH_BYTES:
+                flush(batch)
+                batch, held = [], 0
+            batch.append(blob)
+            held += int(fields[2])
+        flush(batch)
+    return verdicts
 
 
 def pack_listing(text):
@@ -249,13 +269,15 @@ def pack_listing(text):
         offset += len(line)
     if listing is None:
         return None
-    return [
+    # A package lists at least its own manifest. A listing that names no file is no listing.
+    paths = [
         file["path"]
         for entry in listing
-        if isinstance(entry, dict)
-        for file in entry.get("files", [])
+        if isinstance(entry, dict) and isinstance(entry.get("files"), list)
+        for file in entry["files"]
         if isinstance(file, dict) and isinstance(file.get("path"), str)
     ]
+    return paths or None
 
 
 def npm_packages(root):
@@ -274,17 +296,28 @@ def npm_packages(root):
                 with open(manifest, encoding="utf-8") as handle:
                     parsed = json.load(handle)
             except ValueError:
-                packages.append({"name": f"{base}/{name}", "directory": directory, "files": None})
+                parsed = None
+            if not isinstance(parsed, dict):
+                packages.append(
+                    {
+                        "name": f"{base}/{name}",
+                        "directory": directory,
+                        "files": None,
+                        "reason": "package.json is not a JSON object",
+                    }
+                )
                 continue
             # A private package is never published, so what it would carry is not a way anything
             # leaves this repository.
-            if not isinstance(parsed, dict) or parsed.get("private") is True:
+            if parsed.get("private") is True:
                 continue
             label = parsed.get("name") if isinstance(parsed.get("name"), str) else f"{base}/{name}"
             reason = ""
             try:
+                # Whatever the configuration says, the steps that run before packing run: they
+                # generate files the package carries.
                 done = subprocess.run(
-                    ["npm", "pack", "--dry-run", "--json"],
+                    ["npm", "pack", "--dry-run", "--json", "--ignore-scripts=false"],
                     cwd=directory,
                     capture_output=True,
                     text=True,
@@ -292,7 +325,11 @@ def npm_packages(root):
                 )
                 files = pack_listing(done.stdout) if done.returncode == 0 else None
                 if files is None:
-                    lines = done.stderr.strip().splitlines()
+                    lines = [
+                        line
+                        for line in done.stderr.strip().splitlines()
+                        if line.strip() and "complete log of this run" not in line
+                    ]
                     reason = lines[-1][:200] if lines else f"npm exited {done.returncode}"
             except (OSError, subprocess.TimeoutExpired) as problem:
                 files = None
@@ -409,15 +446,16 @@ def run_check(range_argument, package_patterns):
                 fields = meta.split()
                 if len(fields) == 3 and fields[1] == b"blob":
                     written.append((commit, os.fsdecode(path), fields[2].decode()))
-    contents = read_blobs([blob for _, _, blob in written], root)
+    verdicts = scan_blobs([blob for _, _, blob in written], root)
     for commit, path, blob in written:
-        data = contents.get(blob)
-        if data is None:
+        problems = verdicts.get(blob)
+        if problems is None:
             findings.append(
-                f"{path} in commit {commit[:12]} could not be read, or is too large to, so its contents were not inspected"
+                f"{path} in commit {commit[:12]} could not be read, or is too large to, "
+                "so its contents were not inspected"
             )
             continue
-        for what in refused_contents(data):
+        for what in problems:
             findings.append(f"{path} contains {what}; it is in commit {commit[:12]}")
     print(f"  contents   {len(written)} files the range added or changed")
 
@@ -603,19 +641,15 @@ def cases(scratch, expect):
     fx.write("README.md", "# A product\n")
     removed = fx.commit("Remove every kind")
     status, output = fx.run("--range", f"{fx.base}..{removed}")
-    missing = [path for path, why in local_names.items() if path not in output or why not in output]
+    missing = [path for path, why in local_names.items() if f"  - {path} is {why}" not in output]
     expect(
         "every kind of local record, instruction file and credential name is refused by its path",
         status == 1 and not missing,
         f"not named: {missing}\n{output}",
     )
 
-    # The example environment file is the product; a suffix of it is not.
+    # The example environment file is the product (the first case adds it); a suffix of it is not.
     fx = Fixture(scratch)
-    fx.write(".env.example", "TOKEN=\n")
-    head = fx.commit("Add the example")
-    status, output = fx.run("--range", f"{fx.base}..{head}")
-    expect("the example environment file is the product", status == 0, output)
     fx.write(".env.example.private", "TOKEN=\n")
     head = fx.commit("Add a suffix")
     status, output = fx.run("--range", f"{fx.base}..{head}")
@@ -642,12 +676,37 @@ def cases(scratch, expect):
         output,
     )
 
-    # A header quoted in source text is not a key. The tests that refuse keys quote one.
+    # A key written out as source text is still a key. A header quoted in source text, or in prose,
+    # is not one: the tests that refuse keys quote one.
+    header = planted("-----", "BEGIN PRIVATE KEY", "-----")
+    shapes = {
+        "src/joined.rs": f'const K: &str = "{header}\\n" + "{key_body[:32]}" + "{key_body[32:]}";\n',
+        "src/lines.js": f'const K = ["{header}", "{key_body[:32]}", "{key_body[32:]}"].join("\\n");\n',
+        "src/comment.py": f"# {header}\n# {key_body}\n",
+        "src/escaped.json": json.dumps({"k": f"{header}\n{key_body}\n"}).replace("\\n", "\\\\n"),
+        "src/short.txt": header + "\n" + "\n".join(key_body[i : i + 16] for i in range(0, len(key_body), 16)) + "\n",
+    }
     fx = Fixture(scratch)
-    fx.write("src/test.rs", 'write("server.txt", "' + planted("-----", "BEGIN PRIVATE KEY", "-----") + '\\n");\n')
+    for path, text in shapes.items():
+        fx.write(path, text)
+    added = fx.commit("Add keys written as source")
+    fx.git("rm", "--quiet", *shapes)
+    removed = fx.commit("Remove them")
+    status, output = fx.run("--range", f"{fx.base}..{removed}")
+    missing = [path for path in shapes if f"  - {path} contains a private key" not in output]
+    expect(
+        "a key split by quotes, joiners, comment markers, doubled escapes or short lines is a key",
+        status == 1 and not missing and key_body[:32] not in output,
+        f"not named: {missing}\n{output}",
+    )
+
+    fx = Fixture(scratch)
+    fx.write("src/test.rs", f'write("server.txt", "{header}\\n");\n')
+    fx.write("src/format.rs", f'format!("{header}\\n{{}}\\n", body);\n')
+    fx.write("docs/prose.md", f"The file starts with {header} and then carries the base64 text.\n")
     head = fx.commit("Quote a header")
     status, output = fx.run("--range", f"{fx.base}..{head}")
-    expect("a private key header quoted with no body is not a key", status == 0, output)
+    expect("a private key header with no body after it, quoted or in prose, is not a key", status == 0, output)
 
     fx = Fixture(scratch)
     fx.write("src/pay.rs", f'const PAY: &str = "{live_key}";\n')
@@ -683,6 +742,45 @@ def cases(scratch, expect):
         output,
     )
 
+    # A merge's own resolution is read: a file that differs from both parents is in nothing else.
+    fx = Fixture(scratch)
+    fx.write("src/conf.txt", "base\n")
+    start = fx.commit("Add the file")
+    fx.git("checkout", "--quiet", "-b", "side")
+    fx.write("src/conf.txt", "side\n")
+    fx.commit("Change it on the side")
+    fx.git("checkout", "--quiet", "main")
+    fx.write("src/conf.txt", "main\n")
+    fx.commit("Change it on main")
+    fx.git("merge", "--quiet", "--no-commit", "-s", "ours", "side")
+    fx.write("src/conf.txt", private_key)
+    merged = fx.commit("Merge the side")
+    status, output = fx.run("--range", f"{start}..{merged}")
+    expect(
+        "a credential written by a merge's resolution alone is found, once",
+        status == 1
+        and output.count("src/conf.txt contains a private key") == 1
+        and merged[:12] in output,
+        output,
+    )
+
+    # A link that becomes a file holding a key, and the file removed in the next commit.
+    fx = Fixture(scratch)
+    os.makedirs(os.path.join(fx.directory, "config"))
+    os.symlink("elsewhere.toml", os.path.join(fx.directory, "config", "app.toml"))
+    linked = fx.commit("Add a link")
+    os.remove(os.path.join(fx.directory, "config", "app.toml"))
+    fx.write("config/app.toml", private_key)
+    changed = fx.commit("Make it a file")
+    fx.delete("config/app.toml")
+    removed = fx.commit("Remove the file")
+    status, output = fx.run("--range", f"{linked}..{removed}")
+    expect(
+        "a link that becomes a file holding a key is read, although the next commit removes it",
+        status == 1 and "config/app.toml contains a private key" in output and changed[:12] in output,
+        output,
+    )
+
     # The package file lists.
     npm_manifest = json.dumps(
         {
@@ -705,6 +803,18 @@ def cases(scratch, expect):
         status == 1
         and f"{agent_file} is a build-agent instruction file; it is in the package lib" in output
         and not fx.holds(head, "packages/lib/out/" + agent_file),
+        output,
+    )
+    # Fresh, because the run above left the generated files on disk.
+    fx = Fixture(scratch)
+    fx.write(".gitignore", "out/\n")
+    fx.write("packages/lib/package.json", npm_manifest)
+    fx.write("packages/lib/write.js", writes + f"fs.writeFileSync('out/{agent_file}', 'x');\n")
+    head = fx.commit("Add a package")
+    status, output = fx.run("--range", f"{fx.base}..{head}", environment={"NPM_CONFIG_IGNORE_SCRIPTS": "true"})
+    expect(
+        "a configuration that skips the steps before packing does not hide what they generate",
+        status == 1 and f"{agent_file} is a build-agent instruction file; it is in the package lib" in output,
         output,
     )
 
@@ -753,6 +863,16 @@ def cases(scratch, expect):
         output,
     )
 
+    fx = Fixture(scratch)
+    fx.write("packages/lib/package.json", "[]\n")
+    head = fx.commit("Add a manifest that is not an object")
+    status, output = fx.run("--range", f"{fx.base}..{head}")
+    expect(
+        "a manifest that is not a JSON object is a finding and not a skipped package",
+        status == 1 and "package.json is not a JSON object" in output,
+        output,
+    )
+
     # Directories whose every file a package ships.
     fx = Fixture(scratch)
     fx.write("plugins/acme/one/plugin.json", "{}\n")
@@ -798,11 +918,15 @@ def cases(scratch, expect):
 
     fx = Fixture(scratch)
     fx.write(agent_file, "notes\n")
-    head = fx.commit("Add notes")
+    fx.write("src/pay.rs", f'const PAY: &str = "{live_key}";\n')
+    head = fx.commit("Add notes and a key")
     status, output = fx.run("--range", f"{head}..{head}")
     expect(
-        "a range holding no commit inspects the tree at the head",
-        status == 1 and agent_file in output and "no commit" in output,
+        "a range holding no commit inspects the tree at the head, its names and its contents",
+        status == 1
+        and agent_file in output
+        and "no commit" in output
+        and "src/pay.rs contains a live payment provider key" in output,
         output,
     )
 
@@ -823,13 +947,14 @@ def cases(scratch, expect):
         status == 1 and "could not be worked out" in output,
         output,
     )
-    fx.git("update-ref", "refs/remotes/origin/main", fx.base)
-    status, output = fx.run(environment={"GITHUB_BASE_REF": "main"})
+    fx.git("update-ref", "refs/remotes/origin/release", fx.base)
+    status, output = fx.run(environment={"GITHUB_BASE_REF": "release"})
     expect(
-        "a pull request is read against its base branch",
+        "a pull request is read against its base branch, whichever branch that is",
         status == 1 and agent_file in output and added[:12] in output,
         output,
     )
+    fx.git("update-ref", "refs/remotes/origin/main", fx.base)
     status, output = fx.run()
     expect(
         "with nothing named the range is what origin/main lacks",

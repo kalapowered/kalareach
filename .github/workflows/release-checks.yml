@@ -24,8 +24,11 @@ on:
 permissions:
   contents: read
 
+# A push is read from the commit it replaced, so a push run that a later push cancelled would leave
+# its commits unread by `outgoing-records`: each push has a group of its own. A pull request still
+# replaces its own earlier run.
 concurrency:
-  group: release-checks-${{ github.ref }}
+  group: release-checks-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -92,12 +95,12 @@ jobs:
         run: pnpm install --frozen-lockfile --filter @kalareach/protocol --filter @kalareach/plugin-sdk
 
       - name: Test the refusals
-        run: python3 scripts/check-outgoing-records.py self-test
+        run: python3 -I scripts/check-outgoing-records.py self-test
 
       - name: Check the commits and the packages
         env:
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-        run: python3 scripts/check-outgoing-records.py check
+        run: python3 -I scripts/check-outgoing-records.py check
 
   mobile-graph:
     name: the companion links no host crate
