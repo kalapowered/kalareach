@@ -18,12 +18,14 @@
 //! with the call's words. A step of the report's own plan is found in the plan, not in text.
 //! Words are separated by a space or a tab and by nothing else, a comment begins at a `#` after a
 //! space or a tab, and a backslash and the new line after it are taken out and nothing is put in
-//! their place, as the shell has them. In a workflow (a `.yml` or `.yaml` file) a `run:` field is
-//! the exception: it is a plain scalar, where a backslash does not continue the line. Whether
-//! control reaches a line, what the script does with its result, the environment a step sets, what
-//! other syntax (a here-document, a quoted block over several lines, a folded scalar) makes of a
-//! line, and a filter in the line an entry itself gives are not read: the entry is taken as
-//! written, held only to the tests it covers by name, by `--skip`, `--list` and `--no-run`.
+//! their place. Those are the shell's rules for the plain text of a command; a quote, an operator
+//! or a redirection is only a word of the line, so changing one changes the line. In a workflow (a
+//! `.yml` or `.yaml` file) a `run:` field is the exception: it is a plain scalar, where a
+//! backslash does not continue the line. Whether control reaches a line, what the script does with
+//! its result, the environment a step sets, what other syntax (a here-document, a quoted block
+//! over several lines, a folded scalar) makes of a line, and a filter in the line an entry itself
+//! gives are not read: the entry is taken as written, held only to the tests it covers by name, by
+//! `--skip`, `--list` and `--no-run`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
