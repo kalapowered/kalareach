@@ -491,13 +491,13 @@ out again. Even pairing the device again will not add it to the collection again
 device again finishes the job. If a view finds that a device is revoked, either because a host's
 feed contains a revocation signed by this computer or because the host on this computer lists it as
 revoked (regardless of who revoked it), the device is taken out as described above. Note that there
-is no way to stop a settings send that is already on its way.
+is no way to stop a send of settings or drafts that is already on its way.
 
 The Devices screen, which appears after the Hosts screen in the desktop navigation, shows one card
 for each host with the card for the local host (that is, the host which is on this computer) first.
 Each card contains information about how requests reach the host and, if they do so via a feed, what
 is currently in that feed including when the host most recently acknowledged requests, how many
-requests are waiting to be acknowledged, when the host most recently read its feed and whether the
+requests are still waiting for the host, when the host most recently read its feed and whether the
 feed has removed the host. In each card is a row for each device showing the device’s revocation
 standing in words, along with a status badge indicating whether the status is sent, acknowledged,
 revoked or refused. A request which hasn’t been acknowledged yet is never called revoked, and a
@@ -516,12 +516,12 @@ local computer doesn’t have a ceremony, no button will appear and the screen w
 feed has removed the host, or if the host’s feed is currently unavailable to this computer, or if
 this is the local host and it’s not currently responding, no button will appear either and the card
 will explain why. If a revocation request has been refused by the host, it’s possible to revoke it
-again, but only if it was refused because an earlier revocation covers it; if it was refused for
-lack of owner authority, the row will tell the person to revoke the device at the host instead. If a
-revocation doesn’t go through, the row will say why and the screen will look again (since it’s
-possible that the request still reached its host despite the failure). Focus then goes back to the
-revoke button, unless that look finds the request sent, in which case focus will be set to the
-status text for that request instead.
+again, but only if it was refused because an earlier revocation covers it, and the button then
+begins “Revoke again”; if it was refused for lack of owner authority, the row will tell the person
+to revoke the device at the host instead. If a revocation doesn’t go through, the row will say why
+and the screen will look again (since it’s possible that the request still reached its host despite
+the failure). Focus then goes back to the revoke button, unless that look finds the request sent, in
+which case focus will be set to the status text for that request instead.
 
 The screen will automatically look again ten seconds after the last answer, but only while a request
 waits for its host: one that has been sent and not yet acknowledged, or one that a host reached
@@ -530,10 +530,12 @@ order to allow for hosts which may be slow to respond, and their answers are sho
 connect to all the hosts that it lists, since a host reads its feed when a device connects. A hidden
 screen will not look again until it has been shown. Since the local host answers each revocation
 request as it is asked, there is no need for the screen to look for it; instead, the row of a device
-that the host has acknowledged but not finished offers “Check again”. Any status changes on the
-screen will be announced via a live region, and when a revocation request is sent focus will be set
-to the status text for that request. Nothing on the screen moves. This screen does not exist on
-phones, since a phone has no ceremony to confirm with and so revokes nothing.
+that the host has acknowledged but not finished offers “Check again”. Any acknowledgement,
+completion or refusal of a request, any change in whether the host’s own list agrees with an
+acknowledgement, and any failure to revoke will be announced via a live region, and when a
+revocation request is sent focus will be set to the status text for that request. Nothing on the
+screen moves. This screen does not exist on phones, since a phone has no ceremony to confirm with
+and so revokes nothing.
 
 ## Sharing a session
 
