@@ -133,6 +133,34 @@ pub(super) struct SessionEnvironment {
     pub(super) origin: EnvironmentOrigin,
     /// The names, never the values, of the configured variables among them. None for a creator's.
     pub(super) additions: Vec<String>,
+    /// The command the session's root runs, when the host started the session to run one. It is
+    /// held with the variables for the same reason: it is for the worker's launch and nothing
+    /// else, so it is in no registry row and in no recorded request.
+    pub(super) root: Option<HeldRoot>,
+}
+
+/// Who asks for a create, and the identity the create is kept under.
+pub(super) struct CreateFor<'a> {
+    /// The principal the create is attributed to.
+    pub(super) actor_id: &'a ActorId,
+    /// The create token: one token, one session.
+    pub(super) token: kr_protocol::scalars::Uuid,
+    /// The digest of what the token was first used for.
+    pub(super) digest: kr_protocol::scalars::Digest256,
+    /// Whose environment the session is started with.
+    pub(super) origin: EnvironmentOrigin,
+}
+
+/// A command a session's root runs, with what keeps the right to start it true until it starts.
+pub(crate) struct HeldRoot {
+    /// The command, as the worker is told it.
+    pub(crate) command: kr_protocol::worker::RootCommand,
+    /// The workflow run and node the session is for.
+    pub(crate) workflow: kr_protocol::worker::WorkflowSession,
+    /// Asked again at the worker's claim, under the registry guard and before the claim commits,
+    /// because the command starts only after the claim and the launch transition's answer can
+    /// have gone stale in between.
+    pub(crate) admit: Arc<dyn Fn(&crate::registry::Registry) -> Result<()> + Send + Sync>,
 }
 
 impl SessionEnvironment {
@@ -142,6 +170,7 @@ impl SessionEnvironment {
             variables,
             origin: EnvironmentOrigin::CreatorSnapshot,
             additions: Vec::new(),
+            root: None,
         }
     }
 }
@@ -308,6 +337,7 @@ impl Controller {
                 .collect(),
             origin: EnvironmentOrigin::HostContext,
             additions,
+            root: None,
         }
     }
 
@@ -329,13 +359,77 @@ impl Controller {
     ) -> Result<ParamsValue> {
         // Through the gate first, and counted until this create has settled: a daemon making way
         // for an update of the host starts nothing new, and waits for what it has started.
-        let _under_way = self.handover.admit()?;
-        let mut create: SessionCreateParams = parse(&mutation.params)?;
+        let under_way = self.handover.admit()?;
+        let create: SessionCreateParams = parse(&mutation.params)?;
         // Before anything reads what is in force, the environment a host-context session is given
         // among it: a document put right since the last acceptance is accepted first, so this
         // create is made under what it now says. Before the registry is locked, because accepting
         // the document takes that lock.
         self.accept_when_unusable().await;
+        // Whose environment the session is started with, from where the create came through. A
+        // connection that is no longer registered has no door and no create.
+        let door = self.door_of(carried.connection_id).ok_or_else(|| {
+            ControllerError::PermissionDenied {
+                detail: "the authority this connection was admitted under has been withdrawn; \
+                         open a new connection"
+                    .to_owned(),
+            }
+        })?;
+        let origin = decide_origin(door, &create)?;
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        // The admission this create carries is asked at the launch transition, against the
+        // registry guard that transition holds: the authority revision it was admitted under, the
+        // registration behind it, and the deadline.
+        self.create_under(
+            &under_way,
+            CreateFor {
+                actor_id,
+                token: mutation.action_id.get(),
+                digest,
+                origin,
+            },
+            create,
+            None,
+            &|registry| self.check_admission(registry, &carried),
+        )
+        .await
+    }
+
+    /// Creates a session for a caller that has been admitted, however it was admitted.
+    ///
+    /// Everything a create does that does not depend on who asks is here: the checks a request
+    /// can fail on its own, the reservation under the create token, the launch transition, the
+    /// worker's rendezvous and the answer. What differs between a connection's create and a
+    /// workflow node's is who is asking and how the ask is kept true until the launch, and those
+    /// come in as `who`, `root` and `admit`.
+    ///
+    /// `admit` is asked at the launch transition, under the registry guard, immediately before the
+    /// reservation moves to launched; a refusal there starts nothing. `root`, when there is one,
+    /// is the command the session's root runs in place of a shell, and it is held in memory with
+    /// the session's environment until the worker's claim takes both.
+    ///
+    /// `under_way` is the handover guard the caller took first; it is kept until the create has
+    /// settled.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the request or the host refuses: an invalid request, an unusable document, a
+    /// full environment, a refused admission, a launch that failed or that cannot be told.
+    pub(super) async fn create_under(
+        self: &Arc<Self>,
+        _under_way: &super::host::UnderWay<'_>,
+        who: CreateFor<'_>,
+        mut create: SessionCreateParams,
+        root: Option<HeldRoot>,
+        admit: &(dyn Fn(&crate::registry::Registry) -> Result<()> + Sync),
+    ) -> Result<ParamsValue> {
+        let CreateFor {
+            actor_id,
+            token,
+            digest,
+            origin,
+        } = who;
         // Before the reservation, because this is a request that can never be served rather than
         // one this environment happens to have no room for. The palette travels to the worker in
         // the launch specification and is recorded there; what cannot travel is a provenance
@@ -353,16 +447,6 @@ impl Controller {
                     .to_owned(),
             ));
         }
-        // Whose environment the session is started with, from where the create came through. A
-        // connection that is no longer registered has no door and no create.
-        let door = self.door_of(carried.connection_id).ok_or_else(|| {
-            ControllerError::PermissionDenied {
-                detail: "the authority this connection was admitted under has been withdrawn; \
-                         open a new connection"
-                    .to_owned(),
-            }
-        })?;
-        let origin = decide_origin(door, &create)?;
         if origin == EnvironmentOrigin::HostContext && !create.environment_snapshot.is_empty() {
             // Said, and not ignored: a client that sends variables to a session that takes none of
             // them would think they had been used. Nothing of them is repeated here.
@@ -372,18 +456,17 @@ impl Controller {
                     .to_owned(),
             ));
         }
-        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         // The environment the session is started with is for the worker's launch and for nothing
         // else: held in memory until the worker claims it, and never written down. A create that
         // sends its own has it taken out of the request here, and the digest above covers it, as a
         // hash; any other takes the host's.
-        let environment = match origin {
+        let mut environment = match origin {
             EnvironmentOrigin::CreatorSnapshot => {
                 SessionEnvironment::of_creator(std::mem::take(&mut create.environment_snapshot))
             }
             EnvironmentOrigin::HostContext => self.host_context_environment(),
         };
+        environment.root = root;
         // The create request itself is recorded with the reservation, before anything is spawned.
         // A daemon that dies between the reservation and the launch then finds a request it can
         // resolve rather than an identifier with nothing behind it.
@@ -420,9 +503,7 @@ impl Controller {
             // this actor already made is a retry, and section 9 says a retry is answered from what
             // its first attempt produced; refusing one because the package went away, or the
             // document broke, in between would be refusing an action that already has an outcome.
-            let known = registry
-                .reservation_for_token(actor_id, mutation.action_id.get())?
-                .is_some();
+            let known = registry.reservation_for_token(actor_id, token)?.is_some();
             // A host that cannot use its configuration document creates no new session: the
             // owner's choice between the two execution contexts is in it, and neither is inside
             // the other. The request cannot say it chose: a client fills in the host's default.
@@ -438,13 +519,7 @@ impl Controller {
                 // later.
                 let _resolved = qualified?;
             }
-            registry.reserve(
-                actor_id,
-                mutation.action_id.get(),
-                digest,
-                &intent,
-                kr_ipc::now_ms(),
-            )?
+            registry.reserve(actor_id, token, digest, &intent, kr_ipc::now_ms())?
         };
         let reservation = admission.reservation;
         if admission.deduplicated {
@@ -552,10 +627,7 @@ impl Controller {
             // create came first; a document accepted after this section has no create left to
             // refuse.
             let unusable = self.refusal_for_unusable_document();
-            if let Err(refusal) = self
-                .check_admission(&registry, &carried)
-                .and_then(|()| unusable.map_or(Ok(()), Err))
-            {
+            if let Err(refusal) = admit(&registry).and_then(|()| unusable.map_or(Ok(()), Err)) {
                 // Nothing was started, so the reservation is resolved as a confirmed failure and
                 // stops occupying the environment. The caller is told which of the two it was.
                 registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
@@ -635,8 +707,16 @@ impl Controller {
             // no closure removes its job. It goes once the worker has ended.
             Ok(Ok(Err(error))) => {
                 self.retire_job_when_ended(reservation.reservation_id, Some(identity));
-                return Err(ControllerError::Supervision {
-                    detail: error.to_string(),
+                // A refusal of the authority the create stood on is that, and not a launch that
+                // failed: the caller pauses on the one and fails on the other.
+                return Err(if error.code == ErrorCode::PermissionDenied {
+                    ControllerError::PermissionDenied {
+                        detail: error.message,
+                    }
+                } else {
+                    ControllerError::Supervision {
+                        detail: error.to_string(),
+                    }
                 });
             }
             Ok(Err(_)) | Err(_) => {

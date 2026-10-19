@@ -1,0 +1,307 @@
+//! The sessions a workflow starts, closes and reads.
+//!
+//! A workflow node that runs a command or creates a session is not a connection: nothing in it
+//! has a door, a window or a registration. What it has is a grant, which the automation module
+//! decides, and a node whose action identifier the journal recorded. This module is where that
+//! asker meets the daemon's own create and close paths:
+//!
+//! * A **create** goes through the same code a connection's create does, with the principal the
+//!   workflow's grant scopes, the node's action identifier as the create token, and an admission
+//!   the caller supplies, which is asked at the launch transition under the registry guard and
+//!   again at the worker's claim.
+//! * A **close** is a `session.close` forwarded to the session's worker under the workflow
+//!   ingress, for the run that started the session. The request is built from the node's action
+//!   identifier alone, so the node's task and a later sweep send the same bytes and a second
+//!   close is answered from the first one's receipt.
+//! * A **closure** is read after asking whether the worker has gone: nothing records a root's exit
+//!   until something looks.
+
+use std::sync::Arc;
+
+use kr_protocol::actor::{ActorEnvelope, ActorIngress};
+use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
+use kr_protocol::ids::{
+    ActionId, ActionWindowId, ActorId, ConnectionId, RequestId, SessionId, WorkflowRunId,
+};
+use kr_protocol::method::{Method, MethodVersion};
+use kr_protocol::scalars::{Digest256, DurationMs, Nullable, U64, Uuid};
+use kr_protocol::session::{
+    ClosureRecord, SessionCloseParams, SessionCreateParams, SessionCreateResult,
+};
+use kr_protocol::worker::EnvironmentOrigin;
+
+use crate::error::{ControllerError, Result};
+use crate::registry::Registry;
+
+use super::close::CLOSE_EXCHANGE;
+use super::create::{CreateFor, HeldRoot};
+use super::{Controller, parse};
+
+/// The window a workflow's close is sent under. A forwarded mutation's freshness is the deadline
+/// the daemon vouches for, so the window is a fixed word and the bytes of a close do not change
+/// from one send to the next.
+const CLOSE_WINDOW: &str = "workflow";
+
+/// How long a workflow's close lives, which the worker does not read for a forwarded mutation but
+/// which the mutation's digest covers.
+const CLOSE_TTL_MS: u64 = 30_000;
+
+/// What a workflow node asks the daemon to create.
+pub(crate) struct WorkflowCreate {
+    /// The principal the create is attributed to: stable, scoped to the definition's grant.
+    pub(crate) actor_id: ActorId,
+    /// The node's journalled action identifier, which is the create token: one node, one session,
+    /// across a restart.
+    pub(crate) token: ActionId,
+    /// The digest of what the token stands for, covering only what stays the same for the node.
+    pub(crate) digest: Digest256,
+    /// The request.
+    pub(crate) create: SessionCreateParams,
+    /// The command the session's root runs, when the node runs one.
+    pub(crate) root: Option<HeldRoot>,
+    /// Asked at the launch transition, under the registry guard. A node's grant, its widened
+    /// rights and its accepted deadline are checked here.
+    pub(crate) admit: Arc<dyn Fn(&Registry) -> Result<()> + Send + Sync>,
+}
+
+/// A close a workflow asks of a session it started.
+pub(crate) struct WorkflowClose<'a> {
+    /// The principal the close is attributed to.
+    pub(crate) actor_id: &'a ActorId,
+    /// The run the session was started for, which the worker compares with its own provenance.
+    pub(crate) run_id: WorkflowRunId,
+    /// The session.
+    pub(crate) session_id: SessionId,
+    /// The node's action identifier, from which the close's own identity is derived.
+    pub(crate) node_action: ActionId,
+}
+
+/// The identity of a node's close: distinct from the identity of its create, stable across a
+/// restart, and shaped as a UUIDv4 as an action identifier is.
+#[must_use]
+pub(crate) fn close_action_of(node_action: ActionId) -> ActionId {
+    let mut covered = b"kalareach workflow close\n".to_vec();
+    covered.extend_from_slice(node_action.get().as_bytes());
+    let digest = kr_cbor::sha256(&covered);
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    ActionId::new(Uuid::from_bytes(bytes))
+}
+
+impl Controller {
+    /// Creates a session for a workflow node, through the same path a connection's create takes.
+    ///
+    /// The update handover gate is taken first and kept until the create has settled, as for any
+    /// create. The document in force is never accepted from here: an unattended workflow does not
+    /// put a configuration into force, and a document this host cannot use refuses the create.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the create refuses or fails with. A refusal of the node's admission is
+    /// [`ControllerError::PermissionDenied`] or [`ControllerError::WindowExpired`], which the
+    /// caller reads as authority gone, not as a launch that failed.
+    pub(crate) async fn workflow_session_create(
+        self: &Arc<Self>,
+        order: WorkflowCreate,
+    ) -> Result<SessionCreateResult> {
+        let under_way = self.handover.admit()?;
+        let admit = Arc::clone(&order.admit);
+        let created = self
+            .create_under(
+                &under_way,
+                CreateFor {
+                    actor_id: &order.actor_id,
+                    token: order.token.get(),
+                    digest: order.digest,
+                    origin: EnvironmentOrigin::HostContext,
+                },
+                order.create,
+                order.root,
+                &*admit,
+            )
+            .await?;
+        parse(&created)
+    }
+
+    /// Asks the worker that owns a workflow's session to close it, for the run that started it.
+    ///
+    /// The close is the same request every time it is made for one node, so a retry, or the sweep
+    /// after a restart, finds the first one's receipt. Its deadline is fresh: the node's own wait
+    /// has usually ended by the time anyone closes. After the worker's acceptance the daemon
+    /// confirms delivery, which is what lets the worker stop the group, and watches for the
+    /// worker to end. A session with no worker left in the directory is closed already or was
+    /// never launched, and its record, if there is one, is what [`Self::workflow_session_closure`]
+    /// reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the worker could not be reached or did not answer in the time a close
+    /// is given. Neither says the session is still open.
+    pub(crate) async fn workflow_session_close(
+        self: &Arc<Self>,
+        order: WorkflowClose<'_>,
+    ) -> Result<()> {
+        let worker = self.directory.lock().await.get(order.session_id).cloned();
+        let Some(worker) = worker else {
+            return Ok(());
+        };
+        let close_action = close_action_of(order.node_action);
+        let mutation = MutationRequest {
+            request_id: request_id_for(close_action),
+            method: Method::SessionClose.into(),
+            method_version: MethodVersion::V1,
+            action_id: close_action,
+            grant_id: Nullable::null(),
+            target: ActionTarget {
+                environment_id: self.paths.environment_id(),
+                session_id: Nullable::some(order.session_id),
+                session_epoch: Nullable::null(),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            expected: ParamsValue::empty(),
+            action_window_id: ActionWindowId::new(CLOSE_WINDOW)
+                .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?,
+            requested_ttl_ms: DurationMs::new(CLOSE_TTL_MS),
+            params: ParamsValue::from_typed(&SessionCloseParams {
+                session_id: order.session_id,
+            })
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?,
+        };
+        // The envelope names no connection of its own and no grant: the daemon decided the grant
+        // before it sent this, and a worker holds none. A connection identity is still a member of
+        // the envelope, and a fresh one is the honest value for a request no connection made.
+        let actor = ActorEnvelope {
+            actor_id: order.actor_id.clone(),
+            ingress: ActorIngress::Workflow,
+            device_id: Nullable::null(),
+            grant_id: Nullable::null(),
+            grant_revision: Nullable::null(),
+            controller_generation: self.generation,
+            connection_id: ConnectionId::new(kr_ipc::new_uuid()),
+        };
+        let budget = tokio::time::Instant::now() + CLOSE_EXCHANGE;
+        let mut link = match tokio::time::timeout_at(budget, self.worker_client(&worker)).await {
+            Ok(Ok(link)) => link,
+            Ok(Err(ControllerError::UnknownSession { .. })) => return Ok(()),
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(ControllerError::supervision(
+                    "the connection to the worker that owns this session did not come free in \
+                     time, so nothing was closed",
+                ));
+            }
+        };
+        // The deadline is read once the link is held, because holding it is where the wait was.
+        let deadline = U64::new(
+            self.shared_clock
+                .boot_elapsed_ms()
+                .saturating_add(u64::try_from(CLOSE_EXCHANGE.as_millis()).unwrap_or(u64::MAX)),
+        );
+        let answered = tokio::time::timeout_at(
+            budget,
+            link.client()
+                .forward_for_workflow(&mutation, &actor, order.run_id, deadline),
+        )
+        .await;
+        match answered {
+            Ok(Ok(Ok(_))) => {
+                // The worker holds its close on this link until the acceptance has been delivered,
+                // and signals nothing before it. A link that fails here is given up with its
+                // lease, and the close is still the worker's: the closure is read from the record.
+                link.give_back();
+                self.confirm_delivery(close_action).await;
+                tokio::spawn(Arc::clone(self).watch_closure(
+                    order.session_id,
+                    kr_protocol::session::ClosureReason::CloseRequested,
+                ));
+                Ok(())
+            }
+            Ok(Ok(Err(refusal))) => {
+                link.give_back();
+                Err(ControllerError::refused(&refusal))
+            }
+            Ok(Err(error)) => Err(error.into()),
+            Err(_) => Err(ControllerError::Uncertain {
+                detail: "the worker did not answer this close within the time a closure is \
+                         given, so whether the session is stopping is not known"
+                    .to_owned(),
+            }),
+        }
+    }
+
+    /// The closure of a session, after asking whether its worker has gone.
+    ///
+    /// A command that ends takes its worker with it, and nothing records that on its own: this
+    /// asks the kernel about the worker the registry holds, closes the session if it is gone (a
+    /// worker that handed over its own account has that account recorded as it stands), and reads
+    /// the record. `None` says the session has not closed, not that it is open.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    pub(crate) async fn workflow_session_closure(
+        self: &Arc<Self>,
+        session_id: SessionId,
+    ) -> Result<Option<ClosureRecord>> {
+        if let Some(closure) = self.registry.lock().await.closure(session_id)? {
+            return Ok(Some(closure));
+        }
+        self.reconcile(session_id).await
+    }
+
+    /// The admission a workflow node's create stands on, as the registry guard asks it.
+    ///
+    /// It first asks whether this host owes a fence it could not raise, and then `check`, which
+    /// the caller supplies: the node's grant on both clocks and the moment its wait ends. It is
+    /// asked at the launch transition and again at the worker's claim, both under the guard, and
+    /// holds the daemon weakly, so a create that outlives it asks nothing.
+    pub(crate) fn workflow_admission(
+        self: &Arc<Self>,
+        check: impl Fn() -> Result<()> + Send + Sync + 'static,
+    ) -> Arc<dyn Fn(&Registry) -> Result<()> + Send + Sync> {
+        let daemon = Arc::downgrade(self);
+        Arc::new(move |_registry: &Registry| {
+            let daemon = daemon
+                .upgrade()
+                .ok_or_else(|| ControllerError::PermissionDenied {
+                    detail: "this host's daemon is not serving".to_owned(),
+                })?;
+            daemon.check_fence()?;
+            check()
+        })
+    }
+
+    /// Milliseconds on the machine's continuous clock since boot, which a worker also reads.
+    pub(crate) fn boot_elapsed_ms(&self) -> u64 {
+        self.shared_clock.boot_elapsed_ms()
+    }
+
+    /// The session a node's create token resolved to, when one was reserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    pub(crate) async fn workflow_session_of(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        token: ActionId,
+    ) -> Result<Option<SessionId>> {
+        Ok(self
+            .registry
+            .lock()
+            .await
+            .reservation_for_token(actor_id, token.get())?
+            .map(|reservation| reservation.session_id))
+    }
+}
+
+/// A request identifier for a close, derived from its action so the bytes of a retry match.
+fn request_id_for(action: ActionId) -> RequestId {
+    let bytes = action.get();
+    let mut head = [0_u8; 8];
+    head.copy_from_slice(&bytes.as_bytes()[..8]);
+    RequestId::new(u64::from_le_bytes(head))
+}
