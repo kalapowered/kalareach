@@ -16,9 +16,12 @@
 //! entry is changed to the line as it now is. A line that selects tests with `--exact` has to name
 //! each test the entry covers; an entry whose tests a call passes finds them on lines that begin
 //! with the call's words. A step of the report's own plan is found in the plan, not in text.
-//! Whether control reaches a line, what the script does with its result, the environment a step
-//! sets, and what other syntax (a here-document, a quoted block over several lines, a folded
-//! scalar) makes of a line are not read.
+//! Words are separated, and a comment begins, as the shell has them: at a space or a tab and at
+//! nothing else, and a backslash and the new line after it are taken out. Whether control reaches a
+//! line, what the script does with its result, the environment a step sets, what other syntax (a
+//! here-document, a quoted block over several lines, a folded scalar) makes of a line, and a filter
+//! in the line an entry itself gives are not read: the entry is taken as written, held only to the
+//! tests it covers by name, by `--skip`, `--list` and `--no-run`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -191,14 +194,14 @@ fn missing_command(
         return Some(format!("its line {wrong}"));
     }
     let wanted = words_of(line);
-    let lines: Vec<String> = commands(&text).collect();
+    let lines: Vec<String> = commands(&text);
     if !lines.contains(&wanted) {
         return Some(format!(
             "{file} holds no line `{wanted}`{}",
             nearest(&lines, &wanted)
         ));
     }
-    let words: Vec<&str> = wanted.split_whitespace().collect();
+    let words: Vec<&str> = words(&wanted).collect();
     if words.contains(&"--exact") {
         let named = |name: &String| match names_with {
             None => words.contains(&name.as_str()),
@@ -216,14 +219,20 @@ fn missing_command(
 
 /// The words of `line` with single spaces between them.
 fn words_of(line: &str) -> String {
-    line.split_whitespace().collect::<Vec<_>>().join(" ")
+    words(line).collect::<Vec<_>>().join(" ")
+}
+
+/// The words of `text` as a shell reads them: separated by spaces and tabs, and by nothing else. A
+/// no-break space, a carriage return or a vertical tab is part of a word, as it is for the shell.
+fn words(text: &str) -> impl Iterator<Item = &str> {
+    text.split([' ', '\t']).filter(|word| !word.is_empty())
 }
 
 /// A hint to put after a missing line: the line of the file that shares most leading words with it.
 fn nearest(lines: &[String], wanted: &str) -> String {
     let shared = |line: &String| {
-        line.split_whitespace()
-            .zip(wanted.split_whitespace())
+        words(line)
+            .zip(words(wanted))
             .take_while(|(a, b)| a == b)
             .count()
     };
@@ -237,7 +246,7 @@ fn nearest(lines: &[String], wanted: &str) -> String {
 /// them, or a `--skip` filter in it selects one of them. The words are the entry's own, so this
 /// holds the table to the tests it says it covers.
 fn leaves_out(command: &str, covered: &BTreeSet<String>) -> Option<String> {
-    let words: Vec<&str> = command.split_whitespace().collect();
+    let words: Vec<&str> = words(command).collect();
     if let Some(word) = words
         .iter()
         .find(|word| matches!(**word, "--list" | "--no-run"))
@@ -269,7 +278,7 @@ fn missing_step(plan: &[String], line: &str, covered: &BTreeSet<String>) -> Opti
             "the report's plan has no step with the words `{wanted}`"
         ));
     }
-    let words: Vec<&str> = wanted.split_whitespace().collect();
+    let words: Vec<&str> = words(&wanted).collect();
     if words.contains(&"--exact") {
         return covered
             .iter()
@@ -395,21 +404,31 @@ fn plan_commands() -> Vec<String> {
     .collect()
 }
 
-/// The commands of a script or a workflow, one to a line: the continuations joined, the white space
-/// made single, and what a comment holds left out. A comment on a line that continues another ends
-/// the command there, as it does for the shell.
-fn commands(text: &str) -> impl Iterator<Item = String> + '_ {
-    text.replace("\\\n", " ")
-        .lines()
-        .map(|line| {
-            without_comment(line)
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
+/// The commands of a script or a workflow, one to a line: a backslash and the new line after it
+/// taken out (nothing put in their place, as the shell does, so a continuation that has no white
+/// space beside it joins two words into one), the white space made single, and what a comment holds
+/// left out. A comment on a line that continues another ends the command there, as it does for the
+/// shell. A line that begins `run:` is a workflow's plain scalar, where a backslash is not a
+/// continuation, and is not joined.
+fn commands(text: &str) -> Vec<String> {
+    let mut joined: Vec<String> = Vec::new();
+    let mut continuing = false;
+    for physical in text.split('\n') {
+        let (body, goes_on) = match physical.strip_suffix('\\') {
+            Some(body) if !words(physical).take(2).any(|word| word == "run:") => (body, true),
+            _ => (physical, false),
+        };
+        match joined.last_mut() {
+            Some(last) if continuing => last.push_str(body),
+            _ => joined.push(body.to_owned()),
+        }
+        continuing = goes_on;
+    }
+    joined
+        .iter()
+        .map(|line| words_of(without_comment(line)))
         .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .into_iter()
+        .collect()
 }
 
 /// `line` up to the `#` that begins a comment: one at the start of the line or after white space,
@@ -417,7 +436,7 @@ fn commands(text: &str) -> impl Iterator<Item = String> + '_ {
 fn without_comment(line: &str) -> &str {
     let mut previous = ' ';
     for (at, c) in line.char_indices() {
-        if c == '#' && previous.is_whitespace() {
+        if c == '#' && matches!(previous, ' ' | '\t') {
             return &line[..at];
         }
         previous = c;

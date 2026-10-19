@@ -892,6 +892,42 @@ fn a_command_is_the_line_the_entry_gives_and_nothing_else() {
         refused(format!("{changed} {NAMES}"), "holds no line");
     }
 
+    // White space is the shell's: a space or a tab. A no-break space, an em space, a vertical tab or
+    // a carriage return is part of a word, and a `#` after one is not a comment.
+    for separator in ['\u{a0}', '\u{2003}', '\u{b}', '\r'] {
+        refused(
+            format!("cargo test --lib -- --ignored{separator}--exact {NAMES}"),
+            "holds no line",
+        );
+        refused(format!("{COMMAND}{separator}"), "holds no line");
+        refused(format!("{COMMAND} {separator}# why"), "holds no line");
+    }
+    ok(format!("{COMMAND}\t# why"));
+
+    // A backslash and the new line after it are taken out and nothing is put in their place, so
+    // two names with no white space beside the join are one word, as the shell has them.
+    refused(
+        "cargo test --lib -- --ignored --exact tests::is_ignored\\\ntests::is_ignored_too \
+         tests::is_ignored_for_a_reason_over_two_lines"
+            .to_owned(),
+        "holds no line",
+    );
+    ok("cargo test --lib -- --ignored --exact tests::is_ignored \\\n  tests::is_ignored_too \\\n  \
+        tests::is_ignored_for_a_reason_over_two_lines"
+        .to_owned());
+
+    // A workflow's `run:` line is a plain scalar, where a backslash is not a continuation.
+    let run = format!("run: {COMMAND}");
+    let found = found_in(
+        &format!("{run}\n"),
+        Box::leak(run.clone().into_boxed_str()),
+        None,
+    );
+    assert!(found.is_empty(), "{found:?}");
+    let split = format!("run: cargo test --lib -- --ignored \\\n  --exact {NAMES}");
+    let found = found_in(&split, Box::leak(run.into_boxed_str()), None);
+    assert_eq!(found.len(), 1, "{found:?}");
+
     // A comment, and the words of two lines, are not the line.
     refused(format!("# {COMMAND}"), "holds no line");
     refused(
