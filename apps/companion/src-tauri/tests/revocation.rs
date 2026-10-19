@@ -1463,3 +1463,101 @@ fn the_view_native_code_gives_the_screen_is_the_view_the_page_reads() {
         serde_json::to_string_pretty(&view).unwrap_or_default()
     );
 }
+
+/// This computer's connection to its own host, as the application holds it: it can be opened again.
+async fn held_connection(rig: &Rig) -> companion_tauri::connection::Connection {
+    let endpoint = rig.host.endpoint().clone();
+    let reopen: companion_tauri::connection::Reopen = Arc::new({
+        let endpoint = endpoint.clone();
+        move || {
+            let endpoint = endpoint.clone();
+            Box::pin(async move { local_connection(&endpoint).await })
+        }
+    });
+    let connection = local_connection(&endpoint)
+        .await
+        .expect("connects to the control endpoint")
+        .reopening(reopen);
+    rig.app
+        .app
+        .state::<AppState>()
+        .connected(connection.clone());
+    connection
+}
+
+/// The owner at the machine revokes the paired device over a connection of its own, which
+/// withdraws the connections the host admitted before: this computer's is one of them.
+async fn the_owner_at_the_machine_revokes_the_paired_device(rig: &Rig) {
+    let phone = rig
+        .host
+        .controller()
+        .devices()
+        .devices()
+        .expect("the device directory answers")
+        .into_iter()
+        .find(|record| {
+            record.is_paired()
+                && Some(record.device_id) != rig.host.owner.as_ref().map(|owner| owner.device_id)
+        })
+        .expect("the paired device");
+    let mut client = rig.host.client().await;
+    let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+        rig.host.environment_id,
+        &mut client,
+        kr_protocol::method::Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: phone.device_id,
+        },
+    )
+    .await
+    .expect("the owner at the machine revokes the device");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_the_host_refuses_on_a_connection_it_withdrew_replaces_that_connection() {
+    let rig = Rig::start().await;
+    rig.host_polls().await;
+    let held = held_connection(&rig).await;
+    let state = rig.app.app.state::<AppState>();
+    rig.app
+        .call("host_info", json!({}))
+        .expect("the host answers on the connection it admitted");
+
+    the_owner_at_the_machine_revokes_the_paired_device(&rig).await;
+
+    // The host refuses what is asked over the connection it withdrew, which is its way of saying to
+    // open another, and the application does: the next command goes through.
+    let refused = rig
+        .app
+        .call("host_info", json!({}))
+        .expect_err("the host refuses a connection it withdrew");
+    assert_eq!(refused["code"], "PERMISSION_DENIED", "{refused}");
+    rig.app
+        .call("host_info", json!({}))
+        .expect("the connection the application then holds is one the host admits");
+    assert!(
+        !Arc::ptr_eq(&state.session().expect("connected"), &held.session()),
+        "the application no longer holds the connection the host withdrew"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_view_of_the_hosts_replaces_a_connection_the_host_withdrew_before_anything_is_refused() {
+    let rig = Rig::start().await;
+    rig.host_polls().await;
+    let held = held_connection(&rig).await;
+    let state = rig.app.app.state::<AppState>();
+
+    the_owner_at_the_machine_revokes_the_paired_device(&rig).await;
+
+    // The view asks the host for its devices, is told to open another connection, does, and the
+    // application keeps that one.
+    assert_eq!(host_by(&rig.view().await, "direct")["contact"], "answered");
+    assert!(
+        !Arc::ptr_eq(&state.session().expect("connected"), &held.session()),
+        "the application no longer holds the connection the host withdrew"
+    );
+    rig.app
+        .call("host_info", json!({}))
+        .expect("the first command after the view goes through");
+}
