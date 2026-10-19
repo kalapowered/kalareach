@@ -312,6 +312,26 @@ impl RecordedAnswers {
         listed && !self.revoked(&device.authorisation)
     }
 
+    /// Whether the revocation this device recorded is all that keeps a device from passing check
+    /// 3: a host reports it paired and holding the right to manage the host with the keys it is
+    /// named by, and none reports it revoked.
+    fn held_out_by_record(&self, device: &Device) -> bool {
+        let reports = || {
+            self.hosts
+                .reports
+                .iter()
+                .flat_map(|report| report.devices.iter())
+        };
+        self.verified.contains(&device.authorisation)
+            && reports().any(|reported| {
+                reported.authorisation == device.authorisation
+                    && reported.stored_envelope == device.stored_envelope
+                    && reported.manages_host
+            })
+            && !reports()
+                .any(|reported| reported.authorisation == device.authorisation && reported.revoked)
+    }
+
     /// Whether a device the collection already lists stays in it. It passes check 3, or a host did
     /// not answer, this device's hosts vouched for it before, and no answering host mentions it or
     /// reports it revoked: the host that did not answer may be the one that lists it. It decides a
@@ -738,6 +758,10 @@ pub enum MembershipError {
     /// under, so nothing may be sealed to it.
     #[error("no host this device is paired with reports that device committed")]
     NotCommitted,
+    /// No revocation recorded on this device is what keeps that device out: it is a member, it is
+    /// being added or taken out, or a host reports it revoked or does not list it.
+    #[error("that device is not held out by a revocation recorded on this device")]
+    NotHeldOut,
     /// No host answered, so check 3 cannot run.
     #[error("no host this device is paired with answered")]
     NoHostAnswered,
@@ -803,7 +827,8 @@ crate::debug_as_display!(MembershipError);
 pub struct MemberStatus {
     /// The device.
     pub device: Device,
-    /// Whether it stays in the collection at the recorded host answers ([`RecordedAnswers::retains`]).
+    /// Whether it stays in the collection at the recorded host answers
+    /// ([`RecordedAnswers::retains`]).
     pub passes: bool,
     /// Whether it is this device.
     pub is_self: bool,
@@ -1056,6 +1081,90 @@ impl SyncMembership {
                 collection: facts.collection,
                 epoch: DeviceKinds::epoch(installed),
                 device: recipient,
+                again: false,
+            },
+            now,
+        )?)
+    }
+
+    /// The devices a revocation recorded on this device keeps out of the collection though the
+    /// hosts report them paired and unrevoked, as when the request that was to revoke one did not
+    /// go through: the owner may share with one again ([`Self::plan_share_again`]).
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    pub fn held_out(&self) -> Result<Vec<Device>, MembershipError> {
+        let Some((facts, _)) = self.reconciler.read()? else {
+            return Ok(Vec::new());
+        };
+        let listed = |device: &Device| {
+            [facts.installed_record(), facts.head_record()]
+                .into_iter()
+                .flatten()
+                .flat_map(DeviceKinds::members)
+                .any(|member| member.authorisation == device.authorisation)
+        };
+        let pending = |device: &Device| {
+            facts
+                .addition
+                .is_some_and(|added| added.authorisation == device.authorisation)
+                || facts
+                    .removals
+                    .iter()
+                    .any(|removed| removed.authorisation == device.authorisation)
+        };
+        let mut found = BTreeSet::new();
+        for report in &facts.answers.hosts.reports {
+            for reported in &report.devices {
+                let device = Device {
+                    authorisation: reported.authorisation,
+                    stored_envelope: reported.stored_envelope,
+                };
+                if facts.answers.held_out_by_record(&device)
+                    && !listed(&device)
+                    && !pending(&device)
+                {
+                    found.insert(device);
+                }
+            }
+        }
+        Ok(found.into_iter().collect())
+    }
+
+    /// Plans sharing this collection again with a device a recorded revocation keeps out
+    /// ([`Self::held_out`]), for the owner to confirm on this device ("share settings with *name*
+    /// again"). Confirming takes the recorded revocation back, so the hosts' answers decide the
+    /// device from then on, and adds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MembershipError::NotHeldOut`] for a device that is not held out.
+    pub fn plan_share_again(
+        &mut self,
+        device: &AuthorisationKey,
+        now: TimestampMs,
+    ) -> Result<Plan, MembershipError> {
+        let held = self
+            .held_out()?
+            .into_iter()
+            .find(|held| held.authorisation == *device)
+            .ok_or(MembershipError::NotHeldOut)?;
+        let (facts, _) = self
+            .reconciler
+            .read()?
+            .ok_or(MembershipError::NoMembership)?;
+        let installed = facts
+            .installed_record()
+            .ok_or(MembershipError::NotInstalled)?;
+        let id = self.fresh_id()?;
+        Ok(self.plans.make(
+            id,
+            PlannedOperation::Share {
+                collection: facts.collection,
+                epoch: DeviceKinds::epoch(installed),
+                device: held,
+                again: true,
             },
             now,
         )?)
@@ -1075,10 +1184,24 @@ impl SyncMembership {
             collection,
             epoch,
             device,
+            again,
         } = plan.operation
         else {
             return Err(PlanRefusal::Substituted.into());
         };
+        if again {
+            // Confirmed by the owner, so the recorded revocation goes, and the hosts' answers alone
+            // decide whether the device is added. A device that has since stopped being held out
+            // has nothing to take back, and is refused.
+            if !self
+                .held_out()?
+                .iter()
+                .any(|held| held.authorisation == device.authorisation)
+            {
+                return Err(MembershipError::NotHeldOut);
+            }
+            self.reconciler.forget_revocation(device.authorisation)?;
+        }
         self.reconciler.add(device, collection, epoch)
     }
 

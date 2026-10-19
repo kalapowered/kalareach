@@ -62,10 +62,10 @@ pub(crate) trait Kinds:
     /// the right to manage the host with the keys it is named by, and nothing reports it revoked.
     fn passes(answers: &Self::Answers, member: &Self::Member) -> bool;
     /// Whether a device the collection already lists stays in it at the recorded answers: check 3
-    /// as [`Self::passes`] has it, and also a device this device's hosts vouched for before and that
-    /// no answering host mentions while a host did not answer. It is what decides a removal and who
-    /// the next epoch's key is wrapped to, among the members already listed. It never decides what
-    /// is accepted, opened or added, and a device never vouched for is not kept by it.
+    /// as [`Self::passes`] has it, and also a device this device's hosts vouched for before and
+    /// that no answering host mentions while a host did not answer. It is what decides a removal
+    /// and who the next epoch's key is wrapped to, among the members already listed. It never
+    /// decides what is accepted, opened or added, and a device never vouched for is not kept by it.
     fn retains(answers: &Self::Answers, member: &Self::Member) -> bool {
         Self::passes(answers, member)
     }
@@ -74,6 +74,9 @@ pub(crate) trait Kinds:
     fn silent(answers: &Self::Answers) -> bool;
     /// Records a revocation this device verified from an authority feed.
     fn revoke(answers: &mut Self::Answers, revocation: Self::Revocation);
+    /// Takes back a revocation recorded by [`Self::revoke`]: the device is then judged by what the
+    /// hosts answer alone.
+    fn forget(answers: &mut Self::Answers, revocation: Self::Revocation);
     /// Returns the answers a refresh records: the hosts' answers now, and every revocation this
     /// device verified from a feed, which a host that has not caught up yet does not undo.
     fn refreshed(previous: &Self::Answers, fresh: Self::Answers) -> Self::Answers;

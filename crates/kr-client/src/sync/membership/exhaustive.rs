@@ -220,6 +220,10 @@ impl Kinds for ModelKinds {
         answers.verified |= bit(revocation);
     }
 
+    fn forget(answers: &mut ModelAnswers, revocation: Dev) {
+        answers.verified &= !bit(revocation);
+    }
+
     fn refreshed(previous: &ModelAnswers, fresh: ModelAnswers) -> ModelAnswers {
         let mut answers = ModelAnswers {
             hosts: fresh.hosts,

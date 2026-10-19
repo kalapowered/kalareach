@@ -250,6 +250,10 @@ impl Kinds for DeviceKinds {
         answers.verified.insert(revocation);
     }
 
+    fn forget(answers: &mut RecordedAnswers, revocation: AuthorisationKey) {
+        answers.verified.remove(&revocation);
+    }
+
     fn refreshed(previous: &RecordedAnswers, fresh: RecordedAnswers) -> RecordedAnswers {
         let mut verified = previous.verified.clone();
         verified.extend(fresh.verified);

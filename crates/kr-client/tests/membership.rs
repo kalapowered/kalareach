@@ -1199,7 +1199,8 @@ async fn a_host_that_did_not_answer_takes_no_member_out_but_one_that_did_can() {
 
 /// KR-REQ-20.11, check 3: while a host did not answer, what is accepted, opened or added still
 /// needs a host that answered to list the device. A record whose issuer no answering host lists is
-/// not accepted and its key is not opened, though this device's hosts vouched for the issuer before.
+/// not accepted and its key is not opened, though this device's hosts vouched for the issuer
+/// before.
 #[tokio::test]
 async fn a_record_from_an_issuer_no_answering_host_lists_is_not_accepted_while_a_host_is_silent() {
     let world = World::default();
@@ -1346,9 +1347,9 @@ async fn no_key_is_wrapped_to_a_device_a_record_waiting_for_a_host_took_out() {
 }
 
 /// KR-REQ-20.11, check 3: a record that waits for a host is built over by nobody, whatever lies on
-/// top of it. Another member's record on top of it, refused for a reason that has nothing to do with
-/// silence, leaves the head one that does not wait, but the record below it still may have taken a
-/// device out, and a key wrapped to that device is a key given away.
+/// top of it. Another member's record on top of it, refused for a reason that has nothing to do
+/// with silence, leaves the head one that does not wait, but the record below it still may have
+/// taken a device out, and a key wrapped to that device is a key given away.
 #[tokio::test]
 async fn nothing_is_built_over_a_record_waiting_for_a_host_when_a_refused_record_lies_on_top() {
     let world = World::default();
@@ -1452,9 +1453,9 @@ async fn a_join_waits_for_a_host_that_did_not_answer() {
     assert!(joiner.publishes());
 }
 
-/// Whether a device stays is not whether it passes: a device this device's hosts vouched for before,
-/// that no answering host mentions while a host did not answer, stays; one never vouched for, one an
-/// answering host mentions, and one reported revoked do not.
+/// Whether a device stays is not whether it passes: a device this device's hosts vouched for
+/// before, that no answering host mentions while a host did not answer, stays; one never vouched
+/// for, one an answering host mentions, and one reported revoked do not.
 #[test]
 fn a_device_stays_through_silence_only_when_it_was_vouched_for_and_nothing_that_answered_says_otherwise()
  {
@@ -1608,6 +1609,7 @@ async fn a_removal_needs_no_new_ceremony_and_an_addition_does() {
             collection,
             epoch: 2,
             device: third.device(),
+            again: false,
         },
         expires_at_ms: TimestampMs::new(now().get() + 1000),
         digest: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
@@ -2692,8 +2694,8 @@ async fn a_device_a_recorded_revocation_keeps_out_is_given_the_settings_again_wh
     assert!(owner.publishes());
 }
 
-/// A device a host reports revoked is not held out by what was recorded here, and is not given back:
-/// the hosts' word stands whatever this computer recorded.
+/// A device a host reports revoked is not held out by what was recorded here, and is not given
+/// back: the hosts' word stands whatever this computer recorded.
 #[tokio::test]
 async fn a_device_a_host_reports_revoked_is_not_held_out_and_cannot_be_given_back() {
     let world = World::default();

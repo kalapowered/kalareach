@@ -32,6 +32,9 @@ pub enum PlannedOperation {
         epoch: u64,
         /// The device, with both keys as its hosts reported them.
         device: Device,
+        /// Whether the device is one a revocation recorded on this device keeps out, which the
+        /// owner's confirmation takes back: "share settings with *name* again".
+        again: bool,
     },
     /// Join a collection another device shares: "join settings shared by *name*".
     Join {

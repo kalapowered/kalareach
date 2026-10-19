@@ -845,6 +845,23 @@ impl<E: Environment> Reconciler<E> {
         Ok(())
     }
 
+    /// Takes back a revocation recorded by [`Self::feed_revocation`]: the answers the hosts give
+    /// decide the device from then on.
+    pub(crate) fn forget_revocation(
+        &mut self,
+        revocation: <E::Kinds as Kinds>::Revocation,
+    ) -> Result<(), MembershipError> {
+        let _guard = self.env.lock()?;
+        let facts = self.load()?.ok_or(MembershipError::NoMembership)?;
+        let before = facts.outcomes.len();
+        let mut next = facts.clone();
+        <E::Kinds as Kinds>::forget(&mut next.answers, revocation);
+        if next != facts {
+            self.commit(before, next)?;
+        }
+        Ok(())
+    }
+
     /// The owner confirmed a join on this device: the newest record that lists it becomes the
     /// join record, checked as a new member, and the host answers are recorded with the removals
     /// they require before anything is installed.
