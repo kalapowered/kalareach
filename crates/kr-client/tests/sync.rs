@@ -18,9 +18,10 @@ use kr_client::services::{
 };
 use kr_client::sync::{
     Across, Claimed, ClientSelection, ConflictCopy, Dispatch, Outcome, PrivacyRecord, Publication,
-    Published, Reconciled, RequestRecord, RequestRevision, RequestState, Resolutions, Restored,
-    SettingValue, Settlement, StorageFeature, SyncBody, SyncCheckpoint, SyncClient, SyncError,
-    SyncObject, SyncSettings, SyncStore, Unread, fresh_object_id, fresh_revision, sync_collection,
+    PublishGate, Published, Reconciled, RequestRecord, RequestRevision, RequestState, Resolutions,
+    Restored, SettingValue, Settlement, StorageFeature, SyncBody, SyncCheckpoint, SyncClient,
+    SyncError, SyncObject, SyncSettings, SyncStore, Unread, fresh_object_id, fresh_revision,
+    sync_collection,
 };
 use kr_crypto::envelope::{open_sync_object, seal_sync_object};
 use kr_crypto::secret::{Secret, SymmetricKey};
@@ -2077,6 +2078,106 @@ async fn a_draft_publication_keeps_one_account_in_the_store_settings_keep_theirs
 
     // And the draft is exactly as the person left it.
     assert_eq!(drafts.load(draft.draft_id).expect("the draft"), draft);
+}
+
+/// A gate a test closes and opens again.
+#[derive(Debug, Default)]
+struct Switch(std::sync::atomic::AtomicBool);
+
+impl Switch {
+    fn close(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn open(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl PublishGate for Switch {
+    fn is_open(&self) -> bool {
+        !self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// While its gate is closed a client sends nothing, and what it refused leaves no account and no
+/// sealed bytes, so nothing is outstanding and nothing can go later under a key the gate was
+/// closed for. Once the gate is open the same content is sent.
+#[tokio::test]
+async fn a_closed_gate_sends_no_setting_and_leaves_nothing_behind() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let gate = Arc::new(Switch::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let client = client.gated(Arc::clone(&gate) as Arc<dyn PublishGate>);
+    client
+        .store()
+        .put_object(&object(
+            object_id,
+            1,
+            SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+            NOW,
+        ))
+        .expect("stored");
+
+    gate.close();
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect_err("the gate is closed");
+    assert!(service.exchanges().await.is_empty(), "nothing left");
+    assert_eq!(accounts(&client), 0, "nothing was recorded");
+    assert_eq!(client.outstanding().expect("a count"), 0);
+
+    gate.open();
+    assert_eq!(
+        client
+            .publish(object_id, TimestampMs::new(NOW))
+            .await
+            .expect("published"),
+        Published::Accepted { position: at(1) }
+    );
+}
+
+/// The same for a draft: a gate that is closed reads, seals and records nothing.
+#[tokio::test]
+async fn a_closed_gate_sends_no_draft_and_leaves_nothing_behind() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let gate = Arc::new(Switch::default());
+    let sync = sync.gated(Arc::clone(&gate) as Arc<dyn PublishGate>);
+    let draft = drafts
+        .create(
+            draft_target(),
+            "a prompt written while a device was being taken out".to_owned(),
+            TimestampMs::new(NOW),
+        )
+        .expect("a draft");
+
+    gate.close();
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the gate is closed");
+    assert!(service.exchanges().await.is_empty(), "nothing left");
+    assert_eq!(accounts(&client), 0, "nothing was sealed and recorded");
+    assert_eq!(client.outstanding().expect("a count"), 0);
+
+    gate.open();
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect("published");
+    assert_eq!(service.exchanges().await.len(), 1);
 }
 
 #[tokio::test]

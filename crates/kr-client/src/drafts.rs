@@ -1605,6 +1605,7 @@ pub struct DraftSync {
     service: std::sync::Arc<dyn crate::services::SyncBackupService>,
     sealer: std::sync::Arc<dyn DraftSealer>,
     store: SyncStore,
+    gate: Option<std::sync::Arc<dyn crate::sync::PublishGate>>,
 }
 
 impl DraftSync {
@@ -1624,7 +1625,15 @@ impl DraftSync {
             service,
             sealer,
             store,
+            gate: None,
         }
+    }
+
+    /// This half, publishing drafts only while `gate` is open.
+    #[must_use]
+    pub fn gated(mut self, gate: std::sync::Arc<dyn crate::sync::PublishGate>) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// Returns the store this half keeps its publications' records in.
@@ -1655,8 +1664,9 @@ impl DraftSync {
     ///
     /// # Errors
     ///
-    /// Returns [`SyncError::Fenced`] while privacy mode is on, [`SyncError::InFlight`] when a call
-    /// for this publication is already out, [`SyncError::StaleCheckpoint`] or
+    /// Returns a refusal while a [`crate::sync::PublishGate`] is closed, with nothing recorded and
+    /// no draft read, [`SyncError::Fenced`] while privacy mode is on, [`SyncError::InFlight`] when
+    /// a call for this publication is already out, [`SyncError::StaleCheckpoint`] or
     /// [`SyncError::ForkedHistory`] when the answer cannot follow what this device's records hold,
     /// [`SyncError::SignedBeforeCutoff`] when the service refused the attempt as signed before its
     /// cutoff, which ends the publication with its account kept, the service's refusal, and,
@@ -1672,6 +1682,9 @@ impl DraftSync {
         expected_revision: DraftRevision,
         now: TimestampMs,
     ) -> crate::sync::Result<Published> {
+        if self.gate.as_ref().is_some_and(|gate| !gate.is_open()) {
+            return Err(crate::sync::client::withheld().into());
+        }
         let (stored, note) = drafts.draft_and_checkpoint(draft_id)?;
         if stored.device_id != drafts.device_id() {
             return Err(ClientError::from(DraftError::NotOwned {

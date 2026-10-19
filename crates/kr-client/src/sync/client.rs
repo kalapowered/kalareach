@@ -325,6 +325,28 @@ pub struct SyncClient {
     service: Arc<dyn SyncBackupService>,
     sealer: Arc<dyn DraftSealer>,
     store: SyncStore,
+    gate: Option<Arc<dyn PublishGate>>,
+}
+
+/// Decides, when content is about to leave this device, whether it may.
+///
+/// A caller that has to hold back everything sent for a while gives its clients one: while a device
+/// is being taken out of a collection, nothing more may be sealed under a key that device holds.
+/// The gate is asked before the content is read and sealed and before anything is recorded, so a
+/// send it refuses leaves nothing behind: no record, no held bytes, and nothing a later attempt
+/// could send again under another key's name. A send that has passed the gate is on its way, and
+/// the gate cannot call it back.
+pub trait PublishGate: Send + Sync + std::fmt::Debug {
+    /// Whether content may leave this device now.
+    fn is_open(&self) -> bool;
+}
+
+/// What a send refused by a closed [`PublishGate`] is answered with.
+pub(crate) fn withheld() -> crate::ClientError {
+    crate::ClientError::refusal(
+        ErrorCode::ResourceUnavailable,
+        crate::Shown::said("nothing is sent while a device is being taken out of the collection"),
+    )
 }
 
 impl SyncClient {
@@ -343,7 +365,15 @@ impl SyncClient {
             service,
             sealer,
             store,
+            gate: None,
         }
+    }
+
+    /// This client, sending content only while `gate` is open.
+    #[must_use]
+    pub fn gated(mut self, gate: Arc<dyn PublishGate>) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// Returns the store this client keeps its state in.
@@ -418,13 +448,17 @@ impl SyncClient {
     ///
     /// # Errors
     ///
-    /// Returns [`SyncError::Fenced`] while privacy mode is on, [`SyncError::Unknown`] when this
-    /// device holds no such object, [`SyncError::StaleCheckpoint`] or
+    /// Returns a refusal while a [`PublishGate`] is closed, with nothing recorded,
+    /// [`SyncError::Fenced`] while privacy mode is on, [`SyncError::Unknown`]
+    /// when this device holds no such object, [`SyncError::StaleCheckpoint`] or
     /// [`SyncError::ForkedHistory`] when what the service holds cannot follow the note beside this
     /// object, [`SyncError::SignedBeforeCutoff`] when the service refused the attempt as signed
     /// before its cutoff, which ends the request with its account kept, and the service's own
     /// refusal otherwise.
     pub async fn publish(&self, object_id: SyncObjectId, now: TimestampMs) -> Result<Published> {
+        if self.gate.as_ref().is_some_and(|gate| !gate.is_open()) {
+            return Err(withheld().into());
+        }
         let staged = self.store.admit(object_id, |object| self.seal(object))?;
         let collection = staged.collection();
 

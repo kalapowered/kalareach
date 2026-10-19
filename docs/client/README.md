@@ -405,6 +405,11 @@ in one `sync::SyncStore`.
   down or the copy here was pruned, is named in `exported` as deletable, and
   `SyncClient::drop_kept_copy` drops it when the person asks for exactly that. None of this sends
   content, so privacy mode does not stop it.
+- `SyncClient::gated` and `DraftSync::gated` give a client a `sync::PublishGate`, which a host
+  closes while it must hold back everything sent, as when a device is being taken out of a shared
+  collection. The client asks it before it reads or seals content and before it records anything, so
+  a refusal leaves no account and no held bytes behind. A send that has passed the gate is on its
+  way, and the gate cannot call it back.
 - `SyncClient::fetch` applies nothing. It brings the other device's object back, keeps it as a copy
   when this device holds another revision, and writes the note. Putting a chosen object in place is
   the caller's own step through `SyncStore::put_object`. Whether there is a choice to keep is
