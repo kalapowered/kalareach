@@ -12232,6 +12232,7 @@ export interface ConfigurationDocument {
     [k: string]: AgentChoice
   }
   authority?: AuthoritySelection
+  automation?: AutomationSelection
   ceilings?: ConfigurationCeilings
   /**
    * The profile selected when a request and the allowlist name none.
@@ -12298,6 +12299,38 @@ export interface AuthoritySelection {
    * spelled as a gateway origin is, with no path and no trailing slash.
    */
   origin?: string | null
+}
+/**
+ * What this host's workflows run: the test suites a `run_tests` node names.
+ *
+ * A section of level 5: written when its `test_suites` member is not null, and ignored,
+ * with a count, by a release that reads level 4. Read when a workflow dispatches, from the document
+ * as it was last accepted, so a change applies to the next dispatch and to none that has
+ * begun. No profile, request or environment variable can set a command, so a command
+ * here is the owner's own.
+ */
+export interface AutomationSelection {
+  /**
+   * The suites, by the name a `run_tests` node gives. Null or absent names none.
+   */
+  test_suites?: {
+    [k: string]: TestSuite
+  } | null
+}
+/**
+ * One test suite a workflow can run.
+ */
+export interface TestSuite {
+  /**
+   * The command line a POSIX shell runs in the private copy of the version.
+   */
+  command: string
+  /**
+   * The paths, relative to the copy's root, the suite writes besides the source it was
+   * given. A report names them and their listing, and a result that attests the version
+   * despite them says so.
+   */
+  outputs?: string[]
 }
 /**
  * The ceilings this host configures. They intersect; they never raise anything.

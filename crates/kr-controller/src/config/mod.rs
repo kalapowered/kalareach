@@ -304,6 +304,8 @@ pub struct InForce {
     /// The variables a session started now with this host's environment is given beside it. The
     /// values are the owner's own and are printed by nothing.
     pub environment_additions: configuration::EnvironmentAdditions,
+    /// The test suites a workflow's `run_tests` node can name, by name.
+    pub test_suites: std::collections::BTreeMap<String, configuration::TestSuite>,
     /// Why this host fails closed, when it cannot use its configuration document.
     pub unusable: Option<Unusable>,
 }
@@ -317,6 +319,12 @@ impl InForce {
             worker_profile: resolver.chosen_worker_profile(),
             command_integrations: resolver.command_integrations().value,
             environment_additions: resolver.environment_additions().value,
+            test_suites: resolver
+                .loaded()
+                .document
+                .as_ref()
+                .map(|document| document.automation.suites().clone())
+                .unwrap_or_default(),
             unusable: Unusable::of(resolver.loaded()),
         }
     }
@@ -700,6 +708,11 @@ pub fn effective(
     // The ownership the owner wrote down for each package's agent. Nothing acts on it, and the
     // row says so.
     values.push(configuration::agents_row(
+        resolver.loaded().document.as_ref(),
+        &resolver.document().display().to_string(),
+    ));
+    // The test suites workflows can run, by name and declared output paths, and never by command.
+    values.extend(configuration::automation_rows(
         resolver.loaded().document.as_ref(),
         &resolver.document().display().to_string(),
     ));

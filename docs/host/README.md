@@ -237,6 +237,7 @@ variables an older build read joins nothing because of them.
 | `authority.origin` | the authority feed this host reads its remote revocations from, and where it reads its own mailbox, in which a remote owner announces a change to the feed; a section of level 2: a release that reads level 1 ignores it, and its host takes a device's revocation only from the owner at the machine | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 | `mailbox.origin` | the mailbox service this host places the encrypted objects of its notifications in; a section of level 3, so a release that reads level 2 ignores it and its host places nothing, which leaves a notification whose detail does not fit reaching a device without it | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 | `relay.origin` | the relay lease service this host asks for a lease for each paired device, billed to the account the host is signed in as; a section of level 4 | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
+| `automation.test_suites` | the test suites a workflow's `run_tests` node can name: for each name, the `command` a POSIX shell runs in a private copy of the version under test, and the `outputs` it writes besides the source; a section of level 5, so a release that reads level 4 ignores it and its host runs no suite | at most 64 suites; a name of letters, digits, `.`, `_` and `-` that starts with a letter or a digit, at most 256 bytes; a command of 1 to 16384 bytes with no control character, line break included (chain commands with `&&` or `;`); at most 16 output paths of at most 1024 bytes each, relative, of names with no `.` or `..` and no backslash, none repeated and none inside another; a name this host does not carry as input (a colon, one of `< > " | ? *`, a trailing dot or space, a Windows device name with or without an extension, over 255 bytes) is accepted here and refused when the suite is dispatched |
 
 A field the document does not write selects nothing, because there is no public relay or discovery
 server to fall back on. A URL or an origin names its host the one way the protocol spells every
@@ -4625,7 +4626,7 @@ number admission enforces as a ceiling on the sessions it creates. Breaching a c
 the chain with error code `CAUSAL_LIMIT`, rejects further descendants, and commits one attention
 record in the same transaction as the pause.
 
-`docs/automation/` has the five methods, graph validation, the budget model, and source workflow coordination.
+`docs/automation/` has the five methods, graph validation, the budget model, and the evidence a test run leaves.
 
 ## The host time contract
 

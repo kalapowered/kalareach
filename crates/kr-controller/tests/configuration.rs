@@ -3176,11 +3176,11 @@ fn record_unreachable_worker(
     reservation.session_id
 }
 
-/// A document of level 5: a setting this build knows, a ceiling, and two sections of a newer
+/// A document of level 6: a setting this build knows, a ceiling, and two sections of a newer
 /// release, one whose name looks like a credential.
 const AT_A_HIGHER_LEVEL: &[u8] = br#"{
   "version": 3,
-  "level": 5,
+  "level": 6,
   "revision": 5,
   "preferences": { "sleep_inhibition": "battery_too" },
   "ceilings": { "session_limit": 4 },
@@ -3251,7 +3251,7 @@ async fn a_document_at_a_higher_level_applies_its_known_members_and_reports_the_
     assert_eq!(check.status, kr_protocol::hostinfo::DoctorStatus::Warning);
     let said = check.detail();
     assert!(
-        said.contains("level 5") && said.contains("reads level 4") && said.contains("2 members"),
+        said.contains("level 6") && said.contains("reads level 5") && said.contains("2 members"),
         "the levels and the count: {said}"
     );
     assert!(check.remedy().is_some(), "and what to do about it");
@@ -3288,7 +3288,7 @@ async fn a_document_at_a_higher_level_applies_its_known_members_and_reports_the_
         .expect_err("an edit of a document above this build's level is refused");
     let said = format!("{refused}");
     assert!(
-        said.contains("level 5") && said.contains("nothing was written"),
+        said.contains("level 6") && said.contains("nothing was written"),
         "{said}"
     );
     assert_eq!(std::fs::read(&path).expect("the document"), before);
@@ -3491,6 +3491,94 @@ async fn a_document_that_selects_a_relay_lease_service_is_accepted_with_its_sect
     let accepted = config::from_record(record.as_deref()).expect("accepted");
     assert_eq!(accepted.level, 4);
     assert_eq!(accepted.relay.origin(), Some("http://127.0.0.1:9"));
+    let file = std::fs::read(kr_worker::config::document_path(&environment)).expect("the file");
+    assert_eq!(
+        Some(accepted),
+        kr_protocol::hostinfo::configuration::load(Some(&file)).document,
+        "the copy is the file's reading"
+    );
+}
+
+/// A document of level 5 that names a test suite for workflows to run.
+const WITH_A_SUITE: &[u8] = br#"{
+  "version": 3,
+  "level": 5,
+  "revision": 5,
+  "preferences": { "sleep_inhibition": "battery_too" },
+  "automation": {
+    "test_suites": {
+      "unit": { "command": "echo secret-token && cargo test", "outputs": ["target", "dist/docs"] }
+    }
+  }
+}"#;
+
+/// KR-REQ-25.14: a daemon over a document that names a test suite reads the section as one of the
+/// level it reads, accepts it, and keeps the document as it read it, section and level included;
+/// the report an owner reads names the suite and its declared paths and never its command, and the
+/// daemon holds the suite for the dispatches that come after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_that_names_a_test_suite_is_accepted_with_its_section() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let environment = host.tree().environment();
+    write_document_bytes(&environment, WITH_A_SUITE);
+    let host = host.restart().await;
+
+    let mut local = host.client().await;
+    let result: HostDoctorResult = typed(
+        &local
+            .request(Method::HostDoctor, &())
+            .await
+            .expect("the call reaches the daemon")
+            .expect("host.doctor is served on the local socket"),
+    );
+    assert_eq!(result.configuration.status.state, DocumentState::Loaded);
+    let row_of = |key: &str| {
+        result
+            .configuration
+            .values
+            .iter()
+            .find(|value| value.key == key)
+            .unwrap_or_else(|| panic!("{key} is reported"))
+    };
+    assert_eq!(row_of("automation.test_suites").value(), "unit");
+    let outputs = row_of("automation.test_outputs").value().to_owned();
+    assert!(
+        outputs.contains("unit=target") && outputs.contains("unit=dist/docs"),
+        "{outputs}"
+    );
+    assert!(
+        !format!("{result:?}").contains("secret-token"),
+        "the report names no command"
+    );
+    let ignored = result
+        .configuration
+        .values
+        .iter()
+        .any(|value| value.key == config_ignored_members());
+    assert!(!ignored, "the section is one this build reads");
+
+    drop(local);
+    let stopped = host.shut_down().await;
+    let database = stopped.tree().environment().registry_database();
+    let connection = rusqlite::Connection::open(&database).expect("the registry file");
+    let record: Option<String> = connection
+        .query_row("SELECT accepted_document FROM environment", [], |row| {
+            row.get(0)
+        })
+        .expect("the accepted document");
+    drop(connection);
+    let accepted = config::from_record(record.as_deref()).expect("accepted");
+    assert_eq!(accepted.level, 5);
+    assert_eq!(
+        accepted
+            .automation
+            .suites()
+            .get("unit")
+            .map(|suite| suite.command.as_str()),
+        Some("echo secret-token && cargo test"),
+        "the registry's copy states the suite"
+    );
     let file = std::fs::read(kr_worker::config::document_path(&environment)).expect("the file");
     assert_eq!(
         Some(accepted),

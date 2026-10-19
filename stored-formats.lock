@@ -165,7 +165,7 @@
       "kept": [
         "ConfigurationDocument"
       ],
-      "level": 4,
+      "level": 5,
       "near_miss": 2,
       "members": [
         {
@@ -182,6 +182,11 @@
           "member": "relay",
           "level": 4,
           "digest": "296b90c8b8d86ec44000bc79097cf70f3087f967b7d984a42c5b85c36f262132"
+        },
+        {
+          "member": "automation",
+          "level": 5,
+          "digest": "aeec99e9503ad243bbc0acab8163afd55c573b43d4070f99a12bf0217052516b"
         }
       ]
     },

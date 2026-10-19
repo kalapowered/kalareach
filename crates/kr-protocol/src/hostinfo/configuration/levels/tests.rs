@@ -10,8 +10,8 @@ use serde_json::Value;
 
 use super::{Levelled, Newer, Release, THIS_RELEASE};
 use crate::hostinfo::configuration::{
-    BASE_LEVEL, Change, ConfigurationDocument, DocumentState, EditRefused, VERSION, contents_in,
-    edit_in, is_known_term, load_in, still_current,
+    BASE_LEVEL, Change, ConfigurationDocument, DocumentState, EditRefused, TestSuite, VERSION,
+    contents_in, edit_in, is_known_term, load_in, still_current,
 };
 use crate::hostinfo::export::Sentence;
 use crate::scalars::Nullable;
@@ -79,6 +79,30 @@ const BEFORE_RELAY: Release = Release {
         Levelled {
             member: "relay",
             level: 4,
+        },
+    ],
+};
+
+/// A release that reads level 4 and predates the automation section: it takes the section for a
+/// member of a newer release.
+const BEFORE_AUTOMATION: Release = Release {
+    level: 4,
+    levelled: &[
+        Levelled {
+            member: "authority",
+            level: 2,
+        },
+        Levelled {
+            member: "mailbox",
+            level: 3,
+        },
+        Levelled {
+            member: "relay",
+            level: 4,
+        },
+        Levelled {
+            member: "automation",
+            level: 5,
         },
     ],
 };
@@ -887,4 +911,148 @@ fn a_selected_relay_survives_the_file_and_the_registrys_copy() {
         load_in(Some(stray), &THIS_RELEASE).status.state,
         DocumentState::Invalid
     );
+}
+
+/// A suite as an owner writes it.
+fn a_suite() -> TestSuite {
+    TestSuite {
+        command: "cargo test --workspace".to_owned(),
+        outputs: vec!["target".to_owned()],
+    }
+}
+
+/// A document that names a test suite, as this build writes it.
+fn with_a_suite() -> ConfigurationDocument {
+    let mut document = ConfigurationDocument::empty();
+    document.automation.test_suites =
+        Nullable::some([("unit".to_owned(), a_suite())].into_iter().collect());
+    document.ceilings.session_limit = Nullable::some(4);
+    document
+}
+
+/// The automation section is a section of level 5, and a writer stamps the highest level among
+/// the sections the document holds. A document that selects only a relay stays at level 4, so a
+/// release that reads level 4 still reads and edits it; one that names no suite is written without
+/// the section.
+#[test]
+fn a_document_with_no_automation_section_is_stamped_below_the_sections_level() {
+    let mut relay_only = ConfigurationDocument::empty();
+    relay_only.relay.origin = Nullable::some(FEED.to_owned());
+    let written = contents_in(&relay_only, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 4, "{written}");
+    assert!(json(&written).get("automation").is_none(), "{written}");
+
+    let mut both = relay_only;
+    both.automation.test_suites =
+        Nullable::some([("unit".to_owned(), a_suite())].into_iter().collect());
+    let written = contents_in(&both, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 5, "{written}");
+    assert_eq!(json(&written)["relay"]["origin"], FEED, "{written}");
+    assert_eq!(
+        json(&written)["automation"]["test_suites"]["unit"]["command"],
+        "cargo test --workspace",
+        "{written}"
+    );
+}
+
+/// A release that reads level 4 takes the automation section for a section of a newer release: it
+/// applies every member it knows, leaves the section out, counts and names it, does not fail
+/// closed, and does not edit the document. Without the section a host runs no suite for a
+/// workflow.
+#[test]
+fn a_release_at_level_4_ignores_the_automation_section_and_applies_the_rest() {
+    let mut document = with_a_suite();
+    document.relay.origin = Nullable::some(FEED.to_owned());
+    let written = contents_in(&document, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 5, "{written}");
+
+    let loaded = load_in(Some(written.as_bytes()), &BEFORE_AUTOMATION);
+    assert_eq!(
+        loaded.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        loaded.status
+    );
+    assert!(!loaded.fails_closed());
+    assert_eq!(
+        loaded.newer,
+        Some(Newer {
+            declared: 5,
+            count: 1,
+            names: vec!["automation".to_owned()]
+        })
+    );
+    let used = loaded.document.as_ref().expect("the document is used");
+    assert_eq!(used.ceilings.session_limit.0, Some(4));
+    assert_eq!(used.relay.origin(), Some(FEED), "level 4 is still read");
+    assert!(
+        used.automation.suites().is_empty(),
+        "the section is left out"
+    );
+    assert!(matches!(
+        edit_in(&loaded, &Change::SessionLimit(Some(2)), &BEFORE_AUTOMATION),
+        Err(EditRefused::NotOurs(_))
+    ));
+}
+
+/// The positive control of omission, and the round trip of an active value: a document with no
+/// suite is written without the section and is read, and edited, by a release at level 4 as it was
+/// before the section existed; once a suite is named the next write is at level 5 and keeps every
+/// other member, and the suite survives the file, the typed document and the registry's copy.
+#[test]
+fn a_named_suite_survives_the_file_and_the_registrys_copy() {
+    let mut earlier = ConfigurationDocument::empty();
+    earlier.relay.origin = Nullable::some(FEED.to_owned());
+    earlier.ceilings.session_limit = Nullable::some(4);
+    let before = contents_in(&earlier, &THIS_RELEASE);
+    assert!(json(&before).get("automation").is_none(), "{before}");
+    let read = load_in(Some(before.as_bytes()), &BEFORE_AUTOMATION);
+    assert_eq!(read.status.state, DocumentState::Loaded);
+    assert!(
+        read.newer.is_none(),
+        "a document at the level is read strictly"
+    );
+
+    let mut document = load_in(Some(before.as_bytes()), &THIS_RELEASE)
+        .document
+        .expect("used");
+    document.automation = with_a_suite().automation;
+    let written = contents_in(&document, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 5, "{written}");
+    assert_eq!(json(&written)["ceilings"]["session_limit"], 4, "{written}");
+    assert_eq!(json(&written)["relay"]["origin"], FEED, "{written}");
+
+    let read = load_in(Some(written.as_bytes()), &THIS_RELEASE);
+    assert_eq!(
+        read.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        read.status
+    );
+    let typed = read.document.expect("used");
+    assert_eq!(typed.automation.suites().get("unit"), Some(&a_suite()));
+    assert_eq!(typed.level, 5);
+    let copy = contents_in(&typed, &THIS_RELEASE);
+    assert_eq!(
+        load_in(Some(copy.as_bytes()), &THIS_RELEASE)
+            .document
+            .as_ref(),
+        Some(&typed)
+    );
+    assert_eq!(
+        copy, written,
+        "the copy is the file's reading written again"
+    );
+
+    // The section is as strict as any other: a member it does not declare refuses the document.
+    for stray in [
+        r#"{"version": 3, "level": 5, "automation": {"test_suites": {}, "region": "eu"}}"#,
+        r#"{"version": 3, "level": 5, "automation": {"test_suites": {"unit": {"command": "true", "shell": "zsh"}}}}"#,
+    ] {
+        assert_eq!(
+            load_in(Some(stray.as_bytes()), &THIS_RELEASE).status.state,
+            DocumentState::Invalid,
+            "{stray}"
+        );
+    }
 }

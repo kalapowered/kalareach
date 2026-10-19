@@ -4720,6 +4720,28 @@
       },
       "type": "object"
     },
+    "AutomationSelection": {
+      "additionalProperties": false,
+      "description": "What this host's workflows run.\n\nA `run_tests` node names a suite and the immutable version it runs against, and never a\ncommand: the command is the owner's, written here. The host makes a private copy of the\nversion, runs the suite's command in it as the root of a session of its own, and records\nwhat it observed. A suite that declares output paths (build directories and the like) is\nnot held to have changed the source by writing there: those paths are left out of the\ncomparison with the version and recorded as references.\n\nThe section arrived with level 5. A release that reads level 4 does not know it: it\napplies the rest of the document, counts the section among the members it ignores, and\ndoes not edit the document, so a host rolled back to such a release runs no suite until it\nis brought forward again.",
+      "properties": {
+        "test_suites": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/TestSuite"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The suites, by the name a `run_tests` node gives. Null or absent names none."
+        }
+      },
+      "type": "object"
+    },
     "BackupBundle": {
       "description": "The recovery bundle at a locator, as the service answered it.\n\nThe two answers are kept apart because they mean different things to a restore: a bundle that is\nheld is ciphertext to authenticate, and one that is not is a locator nobody wrote, written\nwrongly, or read by an account that does not own it.",
       "oneOf": [
@@ -9316,6 +9338,10 @@
         "authority": {
           "$ref": "#/$defs/AuthoritySelection",
           "description": "The authority feed this host reads its remote revocations from.\n\nA section of level 2: written only when it selects something, and ignored, with a\ncount, by a release that reads level 1. Read when the daemon starts, so a change applies\nat the next start. No environment variable reaches it."
+        },
+        "automation": {
+          "$ref": "#/$defs/AutomationSelection",
+          "description": "What this host's workflows run: the test suites a `run_tests` node names.\n\nA section of level 5: written when its `test_suites` member is not null, and ignored,\nwith a count, by a release that reads level 4. Read when a workflow dispatches, from the document\nas it was last accepted, so a change applies to the next dispatch and to none that has\nbegun. No profile, request or environment variable can set a command, so a command\nhere is the owner's own."
         },
         "ceilings": {
           "$ref": "#/$defs/ConfigurationCeilings",
@@ -37688,6 +37714,27 @@
         "identity",
         "name",
         "forced"
+      ],
+      "type": "object"
+    },
+    "TestSuite": {
+      "additionalProperties": false,
+      "description": "One test suite a workflow can run.",
+      "properties": {
+        "command": {
+          "description": "The command line a POSIX shell runs in the private copy of the version.",
+          "type": "string"
+        },
+        "outputs": {
+          "description": "The paths, relative to the copy's root, the suite writes besides the source it was\ngiven. A report names them and their listing, and a result that attests the version\ndespite them says so.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "command"
       ],
       "type": "object"
     },

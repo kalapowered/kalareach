@@ -326,9 +326,9 @@ fn the_effective_report_names_every_value_its_source_and_its_effect() {
     assert_eq!(report.overrides.len(), 2);
     assert_eq!(
         report.values.len(),
-        6 + configuration::SELECTIONS.len() + 1,
-        "four preferences, two locations, every selection read at the next start and the agents \
-         the document names an ownership for"
+        6 + configuration::SELECTIONS.len() + 1 + 2,
+        "four preferences, two locations, every selection read at the next start, the agents the \
+         document names an ownership for and the two rows of the automation section"
     );
     for (row, selection) in report.values[6..].iter().zip(configuration::SELECTIONS) {
         assert_eq!(row.key, selection.key);

@@ -1381,6 +1381,11 @@ impl ComposedBundle {
 ///   "storage": { "origin": "https://reach.example.com" },
 ///   "authority": { "origin": "https://reach.example.com" },
 ///   "mailbox": { "origin": "https://reach.example.com" },
+///   "automation": {
+///     "test_suites": {
+///       "unit": { "command": "cargo test --workspace", "outputs": ["target"] }
+///     }
+///   },
 ///   "relay": { "origin": "https://reach.example.com" }
 /// }
 /// ```
@@ -1759,6 +1764,15 @@ pub mod configuration {
     /// How many packages the document's `agents` section may name.
     pub const MAX_AGENT_ENTRIES: usize = 64;
 
+    /// How many test suites the document's `automation` section may name.
+    pub const MAX_TEST_SUITES: usize = 64;
+
+    /// How many output paths one test suite may declare.
+    pub const MAX_SUITE_OUTPUTS: usize = 16;
+
+    /// The longest output path a test suite may declare, in bytes.
+    pub const MAX_SUITE_OUTPUT_BYTES: usize = 1024;
+
     /// How many variables one rung's `environment_additions` may name.
     pub const MAX_ENVIRONMENT_ADDITIONS: usize = 64;
 
@@ -2016,6 +2030,15 @@ pub mod configuration {
         /// applies at the next start. No environment variable reaches it.
         #[serde(default, skip_serializing_if = "levels::is_unused")]
         pub relay: RelaySelection,
+        /// What this host's workflows run: the test suites a `run_tests` node names.
+        ///
+        /// A section of level 5: written when its `test_suites` member is not null, and ignored,
+        /// with a count, by a release that reads level 4. Read when a workflow dispatches, from the document
+        /// as it was last accepted, so a change applies to the next dispatch and to none that has
+        /// begun. No profile, request or environment variable can set a command, so a command
+        /// here is the owner's own.
+        #[serde(default, skip_serializing_if = "levels::is_unused")]
+        pub automation: AutomationSelection,
         /// How this environment's control daemon is started when a command finds none running.
         ///
         /// Read by `kr new` when it finds no daemon to ask, so a change applies at the next start.
@@ -2070,6 +2093,7 @@ pub mod configuration {
                 authority: AuthoritySelection::default(),
                 mailbox: MailboxSelection::default(),
                 relay: RelaySelection::default(),
+                automation: AutomationSelection::default(),
                 startup: StartupSelection::default(),
                 descriptions: DescriptionsSelection::default(),
                 agents: BTreeMap::new(),
@@ -2695,6 +2719,48 @@ pub mod configuration {
         }
     }
 
+    /// What this host's workflows run.
+    ///
+    /// A `run_tests` node names a suite and the immutable version it runs against, and never a
+    /// command: the command is the owner's, written here. The host makes a private copy of the
+    /// version, runs the suite's command in it as the root of a session of its own, and records
+    /// what it observed. A suite that declares output paths (build directories and the like) is
+    /// not held to have changed the source by writing there: those paths are left out of the
+    /// comparison with the version and recorded as references.
+    ///
+    /// The section arrived with level 5. A release that reads level 4 does not know it: it
+    /// applies the rest of the document, counts the section among the members it ignores, and
+    /// does not edit the document, so a host rolled back to such a release runs no suite until it
+    /// is brought forward again.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct AutomationSelection {
+        /// The suites, by the name a `run_tests` node gives. Null or absent names none.
+        pub test_suites: Nullable<BTreeMap<String, TestSuite>>,
+    }
+
+    impl AutomationSelection {
+        /// The suites the document names, by name: none when the member is null or absent.
+        #[must_use]
+        pub fn suites(&self) -> &BTreeMap<String, TestSuite> {
+            static NONE: BTreeMap<String, TestSuite> = BTreeMap::new();
+            self.test_suites.as_ref().unwrap_or(&NONE)
+        }
+    }
+
+    /// One test suite a workflow can run.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct TestSuite {
+        /// The command line a POSIX shell runs in the private copy of the version.
+        pub command: String,
+        /// The paths, relative to the copy's root, the suite writes besides the source it was
+        /// given. A report names them and their listing, and a result that attests the version
+        /// despite them says so.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub outputs: Vec<String>,
+    }
+
     /// How this environment's control daemon is started when a command finds none running.
     ///
     /// Section 7 lets `kr new` start the per-user controller only on a host that was set up for
@@ -3165,6 +3231,32 @@ pub mod configuration {
             .is_some_and(|(publisher, plugin)| slug(publisher) && slug(plugin))
     }
 
+    /// Whether `text` is the name of a test suite: a letter or a digit first, then letters, digits,
+    /// `.`, `_` and `-`, at most [`crate::automation::MAX_TEST_SUITE_BYTES`] bytes.
+    fn is_suite_name(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        !bytes.is_empty()
+            && bytes.len() <= crate::automation::MAX_TEST_SUITE_BYTES
+            && bytes[0].is_ascii_alphanumeric()
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    }
+
+    /// Whether `text` is an output path a suite may declare: relative, of names with no `.` or
+    /// `..`, no empty name, no separator but `/`, no control character, at most
+    /// [`MAX_SUITE_OUTPUT_BYTES`] bytes.
+    fn is_output_path(text: &str) -> bool {
+        !text.is_empty()
+            && text.len() <= MAX_SUITE_OUTPUT_BYTES
+            && text.split('/').all(|name| {
+                !name.is_empty()
+                    && name != "."
+                    && name != ".."
+                    && !name.contains(|character: char| character.is_control() || character == '\\')
+            })
+    }
+
     /// Checks a document against every rule this schema states.
     ///
     /// # Errors
@@ -3330,6 +3422,87 @@ pub mod configuration {
                         .withheld(Name, package)
                         .stated(", which is not a package's publisher/plugin identifier"),
                 );
+            }
+        }
+        // The test suites a workflow can run: each a name, a command and the paths it writes. A
+        // refusal says a name or a command by its class and length and never repeats it, because
+        // a command is the owner's and a problem list travels into a diagnostic.
+        if document.automation.suites().len() > MAX_TEST_SUITES {
+            problems.push(
+                Sentence::new()
+                    .stated("automation names ")
+                    .number(document.automation.suites().len() as u64)
+                    .stated(" test suites, more than the ")
+                    .number(MAX_TEST_SUITES as u64)
+                    .stated(" a document may name"),
+            );
+        }
+        for (name, suite) in document.automation.suites() {
+            if !is_suite_name(name) {
+                problems.push(
+                    Sentence::new()
+                        .stated("automation names the test suite ")
+                        .withheld(Name, name)
+                        .stated(
+                            ", which is not a name of letters, digits, '.', '_' and '-' that \
+                             starts with a letter or a digit",
+                        ),
+                );
+            }
+            if suite.command.is_empty()
+                || suite.command.len() > crate::automation::MAX_SHELL_COMMAND_BYTES
+                || suite.command.chars().any(char::is_control)
+            {
+                problems.push(
+                    Sentence::new()
+                        .stated("the command of the test suite ")
+                        .withheld(Name, name)
+                        .stated(" (")
+                        .withheld(super::export::ContentClass::CommandLine, &suite.command)
+                        .stated(") must be between 1 and ")
+                        .number(crate::automation::MAX_SHELL_COMMAND_BYTES as u64)
+                        .stated(" bytes with no control character, line break included"),
+                );
+            }
+            if suite.outputs.len() > MAX_SUITE_OUTPUTS {
+                problems.push(
+                    Sentence::new()
+                        .stated("the test suite ")
+                        .withheld(Name, name)
+                        .stated(" declares ")
+                        .number(suite.outputs.len() as u64)
+                        .stated(" output paths, more than the ")
+                        .number(MAX_SUITE_OUTPUTS as u64)
+                        .stated(" one suite may declare"),
+                );
+            }
+            for (index, path) in suite.outputs.iter().enumerate() {
+                let held_by_another =
+                    suite.outputs.iter().enumerate().any(|(other, outer)| {
+                        other != index && path.starts_with(&format!("{outer}/"))
+                    });
+                if !is_output_path(path) {
+                    problems.push(
+                        Sentence::new()
+                            .stated("an output path of the test suite ")
+                            .withheld(Name, name)
+                            .stated(" (")
+                            .withheld(super::export::ContentClass::Path, path)
+                            .stated(
+                                ") is not a relative path of names: no '.' or '..', no empty \
+                                 name, no backslash, no control character",
+                            ),
+                    );
+                } else if suite.outputs[..index].contains(path) || held_by_another {
+                    problems.push(
+                        Sentence::new()
+                            .stated("an output path of the test suite ")
+                            .withheld(Name, name)
+                            .stated(" (")
+                            .withheld(super::export::ContentClass::Path, path)
+                            .stated(") repeats another or lies inside another"),
+                    );
+                }
             }
         }
         // The variables each rung adds to a session started with this host's environment: names a
@@ -5025,6 +5198,69 @@ pub mod configuration {
 
     /// The key of the row [`agents_row`] contributes.
     pub const AGENTS_OWNERSHIP_KEY: &str = "agents.ownership";
+
+    /// The rows the document's `automation` section contributes to the effective-value report:
+    /// the names of its test suites, and the output paths each declares as `suite=path`.
+    ///
+    /// The commands are the owner's and are in no row: a person who wants one reads their own
+    /// document, and an export carries the names and paths by class and length. Workflows read
+    /// the section when they dispatch, from the document as it was last accepted, so a change
+    /// applies to the next dispatch.
+    #[must_use]
+    pub fn automation_rows(
+        document: Option<&ConfigurationDocument>,
+        origin: &str,
+    ) -> Vec<super::EffectiveValue> {
+        use super::export::Declared;
+
+        let empty = ConfigurationDocument::empty();
+        let suites = document.unwrap_or(&empty).automation.suites();
+        let row = |key: &'static str, about: &'static str, entries: Vec<String>| {
+            super::EffectiveValue::new(
+                key,
+                about,
+                &if entries.is_empty() {
+                    Declared::term("none")
+                } else {
+                    Declared::names(entries.iter().map(String::as_str))
+                },
+                if entries.is_empty() {
+                    ValueSource::Default
+                } else {
+                    ValueSource::HostConfiguration
+                },
+                Nullable((!entries.is_empty()).then(|| origin.to_owned())),
+                Nullable::null(),
+                ValueEffect::Immediately,
+            )
+        };
+        vec![
+            row(
+                AUTOMATION_TEST_SUITES_KEY,
+                "the test suites the document names for workflows to run",
+                suites.keys().cloned().collect(),
+            ),
+            row(
+                AUTOMATION_TEST_OUTPUTS_KEY,
+                "the output paths each test suite declares",
+                suites
+                    .iter()
+                    .flat_map(|(name, suite)| {
+                        suite
+                            .outputs
+                            .iter()
+                            .map(move |path| format!("{name}={path}"))
+                    })
+                    .collect(),
+            ),
+        ]
+    }
+
+    /// The key of the row of test suite names [`automation_rows`] contributes.
+    pub const AUTOMATION_TEST_SUITES_KEY: &str = "automation.test_suites";
+
+    /// The key of the row of declared output paths [`automation_rows`] contributes.
+    pub const AUTOMATION_TEST_OUTPUTS_KEY: &str = "automation.test_outputs";
 
     /// The row a document of a level above this build's contributes: the members it holds that
     /// this build does not know and ignores.
@@ -9559,6 +9795,132 @@ mod tests {
             configuration::edit(&spelled, &off),
             Err(configuration::EditRefused::NotOurs(_))
         ));
+    }
+
+    /// KR-REQ-25.14: the document's `automation` section is the one place a command a workflow
+    /// runs is written. A suite is a name, a command and the paths it writes, each held to a rule
+    /// the document is refused for breaking, and a refusal repeats none of them. The report lists
+    /// the names and the declared paths, and carries no command.
+    #[test]
+    fn the_automation_section_names_suites_by_command_and_the_report_shows_no_command() {
+        use configuration::{AutomationSelection, TestSuite, ValueEffect};
+
+        let suite = |command: &str, outputs: &[&str]| TestSuite {
+            command: command.to_owned(),
+            outputs: outputs.iter().map(|path| (*path).to_owned()).collect(),
+        };
+        let document_with = |name: &str, suite: TestSuite| {
+            let mut document = ConfigurationDocument::empty();
+            document.automation = AutomationSelection {
+                test_suites: Nullable::some([(name.to_owned(), suite)].into_iter().collect()),
+            };
+            document
+        };
+        configuration::validate(&document_with("unit", suite("cargo test", &["target"])))
+            .expect("a usable suite");
+
+        let refused = |document: ConfigurationDocument, says: &str| {
+            let problems = configuration::validate(&document).expect_err("a document it refuses");
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.as_str().contains(says)),
+                "{says}: {problems:?}"
+            );
+            for problem in &problems {
+                assert!(
+                    !problem.as_str().contains("secret-token"),
+                    "a refusal repeats no command: {problem:?}"
+                );
+            }
+        };
+        refused(
+            document_with("-unit", suite("cargo test", &[])),
+            "automation names",
+        );
+        refused(
+            document_with("a b", suite("cargo test", &[])),
+            "automation names",
+        );
+        refused(
+            document_with("", suite("cargo test", &[])),
+            "automation names",
+        );
+        refused(
+            document_with("unit", suite("", &[])),
+            "command of the test suite",
+        );
+        refused(
+            document_with("unit", suite("echo secret-token\nrm -rf x", &[])),
+            "command of the test suite",
+        );
+        refused(
+            document_with("unit", suite(&"x".repeat(16 * 1024 + 1), &[])),
+            "command of the test suite",
+        );
+        for path in [
+            "", "/abs", "a//b", "a/./b", "../up", "a/..", "a\\b", "a/\u{7}",
+        ] {
+            refused(document_with("unit", suite("true", &[path])), "output path");
+        }
+        refused(
+            document_with("unit", suite("true", &["build", "build"])),
+            "repeats another",
+        );
+        refused(
+            document_with("unit", suite("true", &["build", "build/output"])),
+            "repeats another",
+        );
+        let many: Vec<&str> = vec!["a"; configuration::MAX_SUITE_OUTPUTS + 1];
+        refused(document_with("unit", suite("true", &many)), "declares");
+        let mut over = ConfigurationDocument::empty();
+        over.automation.test_suites = Nullable::some(
+            (0..=configuration::MAX_TEST_SUITES)
+                .map(|index| (format!("suite-{index}"), suite("true", &[])))
+                .collect(),
+        );
+        refused(over, "test suites");
+        // Unknown members are refused, and an empty section is no section.
+        for text in [
+            r#"{"version": 3, "level": 5, "automation": {"test_suites": {"unit": {}}}}"#,
+            r#"{"version": 3, "level": 5, "automation": {"test_suites": {"unit": {"command": "true", "shell": "zsh"}}}}"#,
+        ] {
+            assert_eq!(
+                configuration::load(Some(text.as_bytes())).status.state,
+                DocumentState::Invalid,
+                "{text}"
+            );
+        }
+
+        // The report: names and declared paths, no command, and the host reads them at dispatch.
+        let none = configuration::automation_rows(None, "/config.json");
+        assert_eq!(
+            none.iter()
+                .map(|row| (row.key.as_str(), row.value(), row.source))
+                .collect::<Vec<_>>(),
+            [
+                ("automation.test_suites", "none", ValueSource::Default),
+                ("automation.test_outputs", "none", ValueSource::Default),
+            ]
+        );
+        let document = document_with("unit", suite("secret-token --go", &["target", "dist/docs"]));
+        let rows = configuration::automation_rows(Some(&document), "/config.json");
+        assert_eq!(rows[0].value(), "unit");
+        assert!(
+            rows[1].value().contains("unit=target") && rows[1].value().contains("unit=dist/docs"),
+            "{:?}",
+            rows[1].value()
+        );
+        assert!(
+            rows.iter().all(|row| row.effect == ValueEffect::Immediately
+                && row.source == ValueSource::HostConfiguration
+                && row.class() == export::ContentClass::Name),
+            "{rows:?}"
+        );
+        assert!(
+            !format!("{rows:?}").contains("secret-token"),
+            "the report carries no command"
+        );
     }
 
     /// KR-REQ-07.64: the document's `agents` section is the one place an ownership is written
