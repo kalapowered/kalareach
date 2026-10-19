@@ -111,9 +111,11 @@ const SAME: &[Same] = &[
         digest: "1dbe88292acb0c5093405c88fd4b6de5b953318737d9466ff8a23c569a8db469",
         reason: "Three members that are absent from the wire unless a workflow started the \
                  session. The specification of an ordinary session is byte for byte what a \
-                 worker of the retained level reads, and a launch specification goes only to a \
-                 worker the daemon of this release started, so what that level accepts is \
-                 unchanged.",
+                 worker of the retained level reads. The daemon starts the workers of its own \
+                 release, and a worker of the retained level reaches a specification that \
+                 carries one of the members only where a person names that worker program by \
+                 hand, and that worker refuses the specification as a frame it cannot read, so \
+                 what that level accepts is unchanged.",
     },
 ];
 
