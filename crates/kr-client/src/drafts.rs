@@ -1446,6 +1446,11 @@ pub trait DraftSealer: Send + Sync + std::fmt::Debug {
     ///
     /// Returns whatever the client's own opening failed with, including a failed authentication.
     fn open(&self, ciphertext: &[u8]) -> Result<Vec<u8>>;
+
+    /// The key epoch [`Self::seal`] seals under: what it produces is presented to a service as
+    /// sealed under this epoch and no other, so a publication keeps the epoch beside its bytes and
+    /// never sends them under another.
+    fn epoch(&self) -> u64;
 }
 
 /// Returns the collection one draft is stored in.
@@ -1706,11 +1711,14 @@ impl DraftSync {
         // What this device last saw the service hold, read with the draft above. A draft that has
         // never been published expects nothing to be there, which is no position at all.
         let expected = note.map(|note| note.position);
-        let attempt = self
-            .store
-            .attempt_draft(draft_id, stored.revision, expected, now, || {
-                self.sealer.seal(&plaintext).map_err(SyncError::from)
-            })?;
+        let attempt = self.store.attempt_draft(
+            draft_id,
+            stored.revision,
+            expected,
+            now,
+            self.sealer.epoch(),
+            || self.sealer.seal(&plaintext).map_err(SyncError::from),
+        )?;
         let answer = self
             .service
             .compare_exchange(
@@ -2000,7 +2008,15 @@ impl DraftSync {
                 }
                 Claimed::Gone => continue,
             };
-            match ask_about(&*self.service, &self.store, &dispatch, &staged).await? {
+            match ask_about(
+                &*self.service,
+                &self.store,
+                &dispatch,
+                &staged,
+                self.sealer.epoch(),
+            )
+            .await?
+            {
                 Answer::Applied(position) => {
                     let settled = self.store.settle_draft(
                         &dispatch,

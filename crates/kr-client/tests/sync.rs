@@ -1040,12 +1040,16 @@ impl SyncBackupService for GatedService {
 #[derive(Debug)]
 struct DeviceSealer {
     key: SymmetricKey,
+    epoch: u64,
 }
 
 impl DeviceSealer {
+    /// A sealing under the key `byte` makes, which is the key of an epoch of that number: two
+    /// sealers of this suite with different keys are two epochs of one collection.
     fn new(byte: u8) -> Self {
         Self {
             key: Secret::from_bytes([byte; 32]),
+            epoch: u64::from(byte),
         }
     }
 }
@@ -1061,6 +1065,10 @@ impl DraftSealer for DeviceSealer {
             kr_cbor::from_canonical_slice(ciphertext, &kr_cbor::Limits::DEFAULT)?;
         let opened = open_sync_object(&self.key, &object).map_err(refused)?;
         Ok(opened.expose().to_vec())
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch
     }
 }
 

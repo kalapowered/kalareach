@@ -1668,6 +1668,10 @@ impl DraftSealer for ReversingSealer {
     fn open(&self, ciphertext: &[u8]) -> kr_client::Result<Vec<u8>> {
         Ok(ciphertext.iter().rev().copied().collect())
     }
+
+    fn epoch(&self) -> u64 {
+        0
+    }
 }
 
 /// KR-REQ-24.13: a draft outlives its attachment, its connection and another device's write; it is

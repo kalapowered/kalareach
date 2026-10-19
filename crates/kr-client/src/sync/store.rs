@@ -292,6 +292,18 @@ pub struct RequestRecord {
     /// which is the history every collection was read in then.
     #[serde(default = "Nullable::null", skip_serializing_if = "names_no_recovery")]
     pub attempted_in: Nullable<SyncRecoveryId>,
+    /// The key epoch the ciphertext of a draft publication was sealed under, null for any other
+    /// work and for a record written before the member existed.
+    ///
+    /// The bytes are sealed once, when the work is admitted, and every attempt sends those same
+    /// bytes. A shared collection takes what it is given under the epoch the call names, so bytes
+    /// sealed under an epoch the collection has since left must never travel under the name of
+    /// the one it is at: they are readable by what the earlier key opens, and by no one the later
+    /// key was made for. An attempt is made from the held bytes only under this epoch; under
+    /// another the work is not attempted again, its bytes are sealed anew under the epoch in force
+    /// as work of its own, and a reconciliation ends the first at the service.
+    #[serde(default = "Nullable::null", skip_serializing_if = "names_no_epoch")]
+    pub sealed_under: Nullable<U64>,
     /// The earliest instant any attempt under this identity was signed at.
     ///
     /// Null while the work is admitted and not sent, and written in the same replacement that
@@ -324,6 +336,12 @@ pub struct RequestRecord {
     pub cut_off: bool,
     /// Where the request has got to.
     pub state: RequestState,
+}
+
+/// Whether a record names no epoch its bytes were sealed under, which is when it leaves the member
+/// out.
+const fn names_no_epoch(epoch: &Nullable<U64>) -> bool {
+    !epoch.is_present()
 }
 
 /// Whether nothing has closed a request's attempts, which is when a record leaves the member out.
@@ -478,6 +496,13 @@ impl RequestRecord {
     #[must_use]
     pub fn collection(&self) -> String {
         collection_of(self.kind, self.object_id)
+    }
+
+    /// Returns true when this is a draft publication whose bytes were not sealed under `epoch`:
+    /// they are not sent under it, nor is the work attempted again.
+    #[must_use]
+    pub fn sealed_under_another(&self, epoch: u64) -> bool {
+        self.kind == SyncObjectKind::Draft && self.sealed_under.0 != Some(U64::new(epoch))
     }
 
     /// Returns true when the work has been admitted and not sent.
@@ -1706,6 +1731,7 @@ impl SyncStore {
                 expected: note.map_or(Nullable::null(), |note| Nullable::some(note.position)),
                 produced_under: privacy.generation,
                 attempted_in: history.current,
+                sealed_under: Nullable::null(),
                 first_signed_at_ms: Nullable::null(),
                 last_signed_at_ms: Nullable::null(),
                 cut_off: false,
@@ -1946,7 +1972,10 @@ impl SyncStore {
     /// instead of queueing behind it.
     ///
     /// `seal` runs only for a publication admitted here, inside the hold, so the ciphertext is made
-    /// under the generation the record names.
+    /// under the generation the record names. `epoch` is the key epoch it seals under, which the
+    /// record keeps: held bytes are sent again only under the epoch they were sealed under, and a
+    /// publication whose bytes were sealed under another is not attempted again, so what `seal`
+    /// makes is sent as work of its own.
     ///
     /// # Errors
     ///
@@ -1959,6 +1988,7 @@ impl SyncStore {
         revision: DraftRevision,
         expected: Option<SyncPosition>,
         signed_at: TimestampMs,
+        epoch: u64,
         seal: impl FnOnce() -> Result<Vec<u8>>,
     ) -> Result<Attempt> {
         let object_id = SyncObjectId::new(draft_id.get());
@@ -1971,13 +2001,15 @@ impl SyncStore {
                     generation: privacy.generation.get(),
                 });
             }
-            // The publication already out for this revision, under the generation in force and in the
-            // history of the collection this device reads. A publication attempted in a history the
+            // The publication already out for this revision, under the generation in force, in the
+            // history of the collection this device reads and sealed under the epoch this device
+            // writes under. A publication attempted in a history the
             // collection has since been put back from is never attempted again: the receipt of an
             // attempt the replaced history ran is not in the history that replaced it, so a later
             // attempt there could run a second time. A record this build cannot read is not one an
             // attempt can be made from, so it is left where it is and counted, as it is everywhere
-            // else.
+            // else. One sealed under another epoch is left where it is as well, and a reconciliation
+            // ends it: its bytes are not sent under an epoch they were not sealed for.
             let history = self.read_history(object_id)?;
             let out =
                 self.read_requests()?
@@ -1990,6 +2022,7 @@ impl SyncStore {
                                 && record.revision == revision
                                 && record.produced_under == privacy.generation
                                 && record.attempted_in == history.current
+                                && !record.sealed_under_another(epoch)
                                 && !record.cut_off
                                 && record.may_attempt_again(signed_at) =>
                         {
@@ -2025,6 +2058,7 @@ impl SyncStore {
                 expected: Nullable::from(expected),
                 produced_under: privacy.generation,
                 attempted_in: history.current,
+                sealed_under: Nullable::some(U64::new(epoch)),
                 first_signed_at_ms: Nullable::null(),
                 last_signed_at_ms: Nullable::null(),
                 cut_off: false,

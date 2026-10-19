@@ -1095,7 +1095,15 @@ impl SyncClient {
                 }
                 Claimed::Gone => continue,
             };
-            match ask_about(&*self.service, &self.store, &dispatch, &staged).await? {
+            match ask_about(
+                &*self.service,
+                &self.store,
+                &dispatch,
+                &staged,
+                self.sealer.epoch(),
+            )
+            .await?
+            {
                 Answer::Applied(position) => {
                     let settled =
                         self.store
@@ -1584,12 +1592,16 @@ pub(crate) enum Answer {
 /// cannot say for a while that nothing ran, so the account stays. A status answer from a history
 /// this device does not follow settles nothing. The other case is a request an attempt of which the
 /// service refused as signed before its cutoff while one signed later could still be on its way
-/// ([`RequestRecord::cut_off`]): it is never attempted again either, so the fence is what ends it.
+/// ([`RequestRecord::cut_off`]): it is never attempted again either, so the fence is what ends it. A
+/// draft publication sealed under another key epoch than `epoch`, the one this client writes under,
+/// is the third: its bytes are not sent under an epoch they were not sealed for, so the fence is what
+/// ends it.
 pub(crate) async fn ask_about(
     service: &dyn SyncBackupService,
     store: &SyncStore,
     dispatch: &Dispatch,
     staged: &RequestRecord,
+    epoch: u64,
 ) -> Result<Answer> {
     let collection = staged.collection();
     let Ok(status) = service.request_status(&collection, staged.work_id).await else {
@@ -1609,7 +1621,11 @@ pub(crate) async fn ask_about(
             let end_now = match store.crossed(dispatch, staged, recovery)? {
                 Crossing::Unfollowed => return Ok(Answer::Open),
                 Crossing::Crossed => true,
-                Crossing::InHistory => staged.cut_off || store.beyond_its_generation(staged)?,
+                Crossing::InHistory => {
+                    staged.cut_off
+                        || staged.sealed_under_another(epoch)
+                        || store.beyond_its_generation(staged)?
+                }
             };
             if !end_now {
                 return Ok(Answer::Open);

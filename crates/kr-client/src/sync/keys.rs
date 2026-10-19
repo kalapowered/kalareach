@@ -474,6 +474,10 @@ impl DraftSealer for CollectionSealer {
             )),
         }
     }
+
+    fn epoch(&self) -> u64 {
+        self.epoch
+    }
 }
 
 /// Where a collection key is kept, and what a sealer does with it.
