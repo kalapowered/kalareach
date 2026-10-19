@@ -357,6 +357,31 @@ fn until_the_journal_is_healthy(host: &Host) {
     }
 }
 
+/// Asks the host's maintenance to finish a recovery, as often as it takes, until the broker admits
+/// rich work again.
+///
+/// The broker's half of a recovery writes with the store's lock taken only if it is free, and a
+/// pass that finds another connection writing leaves what remains to the next one. The host's own
+/// maintenance is such a connection, on its first pass or when a pass of its own meets this one,
+/// so this asks again, as the next pass does, until the recovery has finished.
+async fn until_rich_work_is_back(host: &Host) {
+    let broker = host.service.broker();
+    let started = std::time::Instant::now();
+    loop {
+        host.service.recover_storage_now();
+        if broker.mode() == kr_protocol::gateway::GatewayMode::Normal {
+            return;
+        }
+        assert!(
+            started.elapsed() < common::LIVENESS_DEADLINE,
+            "with nothing owed, rich work is back: the gateway is still {} after {:?}",
+            broker.mode(),
+            started.elapsed()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Registers the instance every test here acts on, with the capability a prompt needs.
 fn register(host: &Host, dispatch: Option<Arc<dyn UpstreamDispatch>>) {
     until_the_journal_is_healthy(host);
@@ -1948,8 +1973,7 @@ async fn kr_req_11_37_one_fence_covers_the_receipt_journal_and_the_ledger_and_ma
             .release_size_cap()
             .expect("the store may grow again");
     }
-    host.service.recover_storage_now();
-    assert_eq!(broker.mode(), kr_protocol::gateway::GatewayMode::Normal);
+    until_rich_work_is_back(&host).await;
     let mutation = prompt_mutation(&client, &host, 33);
     let applied = send(&mut client, mutation).await;
     assert!(matches!(applied, Outcome::Ok(_)), "{applied:?}");
@@ -1981,8 +2005,7 @@ async fn kr_req_11_37_one_fence_covers_the_receipt_journal_and_the_ledger_and_ma
     broker
         .refuse_ledger_writes(false)
         .expect("the ledger takes writes again");
-    host.service.recover_storage_now();
-    assert_eq!(broker.mode(), kr_protocol::gateway::GatewayMode::Normal);
+    until_rich_work_is_back(&host).await;
     let mutation = prompt_mutation(&client, &host, 35);
     let applied = send(&mut client, mutation).await;
     assert!(matches!(applied, Outcome::Ok(_)), "{applied:?}");
@@ -2016,24 +2039,7 @@ async fn kr_req_11_37_a_receipt_fault_the_broker_never_saw_is_still_its_gap() {
             .release_size_cap()
             .expect("the store may grow again");
     }
-    // The broker's half of a recovery writes with the store's lock taken only if it is free, and a
-    // pass that finds another connection writing leaves what remains to the next one. The host's
-    // own maintenance is such a connection, on its first pass or when a pass of its own meets
-    // this one, so this asks again, as the next pass does, until the recovery has finished.
-    let started = std::time::Instant::now();
-    loop {
-        host.service.recover_storage_now();
-        if broker.mode() == kr_protocol::gateway::GatewayMode::Normal {
-            break;
-        }
-        assert!(
-            started.elapsed() < common::LIVENESS_DEADLINE,
-            "with nothing owed, rich work is back: the gateway is still {} after {:?}",
-            broker.mode(),
-            started.elapsed()
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    until_rich_work_is_back(&host).await;
 
     assert!(
         broker.recovery_generation() > before,
