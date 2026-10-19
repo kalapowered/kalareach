@@ -22,7 +22,9 @@
 //! service's is not asked about again, for a minute and for ten minutes. A dial marks its entry
 //! doubtful when it starts and clears the mark only when it connects, so a dial that was cut short
 //! leaves it doubtful without anything running when it is cut, and a later dial asks again after
-//! twenty seconds. No entry is asked about more than three times between connections.
+//! twenty seconds. No entry is asked about more than three times between connections, and the
+//! count starts again ten minutes after the last request, which is when what that request got has
+//! ended.
 //!
 //! A service that answers that it does not serve the request (it has no such route) or that this
 //! device is not allowed to ask stops every request for ten minutes. Nothing here ever turns that
@@ -68,6 +70,14 @@ const DOUBT_AFTER: Duration = Duration::from_secs(20);
 
 /// The longest an entry is asked about between connections.
 const MOST_ASKS: u32 = 3;
+
+/// How long after its last request an entry may be asked about again, though it has been asked
+/// [`MOST_ASKS`] times with no connection between: what the last request got has ended by then.
+const ASK_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// The longest the cache believes a time the service names, so that a figure that is not meant to
+/// be believed cannot overflow a clock reading.
+const LONGEST_NAMED: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How long an answer that the service is unable is kept, at least.
 const KEEP_UNAVAILABLE: Duration = Duration::from_secs(60);
@@ -353,9 +363,15 @@ impl Entry {
         }
     }
 
+    /// Whether the entry was last asked about [`ASK_WINDOW`] ago or longer.
+    fn window_passed(&self, now: Instant) -> bool {
+        self.asked_at
+            .is_some_and(|asked| now.saturating_duration_since(asked) >= ASK_WINDOW)
+    }
+
     /// Whether a dial that starts `now` asks for this entry again.
     fn asks_again(&self, now: Instant) -> bool {
-        if self.pending || self.asks >= MOST_ASKS {
+        if self.pending || (self.asks >= MOST_ASKS && !self.window_passed(now)) {
             return false;
         }
         match self.held {
@@ -509,6 +525,9 @@ impl PairingAdmissions {
                 let entry = state.entries.entry(key.clone()).or_insert_with(Entry::new);
                 let ask = !suspended && entry.asks_again(now);
                 if ask {
+                    if entry.window_passed(now) {
+                        entry.asks = 0;
+                    }
                     entry.pending = true;
                     entry.asks += 1;
                     entry.asked_at = Some(now);
@@ -564,7 +583,7 @@ impl PairingAdmissions {
             Ok(AdmissionAnswer::Admitted {
                 expires_in_seconds, ..
             }) => Held::Admitted {
-                until: now + Duration::from_secs(expires_in_seconds),
+                until: now + named_time(expires_in_seconds),
             },
             Ok(AdmissionAnswer::NotNeeded) => Held::Needs {
                 until: now + KEEP_NOT_NEEDED,
@@ -576,7 +595,7 @@ impl PairingAdmissions {
                 retry_after_seconds,
                 ..
             }) => {
-                let named = retry_after_seconds.map(Duration::from_secs);
+                let named = retry_after_seconds.map(named_time);
                 Held::Unavailable {
                     kept_until: now + named.unwrap_or_default().max(KEEP_UNAVAILABLE),
                     retry_at: now + named.unwrap_or(DOUBT_AFTER),
@@ -623,13 +642,18 @@ fn normalised(relay: &str) -> String {
     relay.trim_end_matches('/').to_ascii_lowercase()
 }
 
+/// A time the service names, in seconds, as the cache holds it.
+fn named_time(seconds: u64) -> Duration {
+    Duration::from_secs(seconds).min(LONGEST_NAMED)
+}
+
 /// How long after a failed request a dial asks again.
 fn retry_delay(error: &ClientError) -> Duration {
     match error {
         ClientError::Refused {
             retry_after_seconds: Some(seconds),
             ..
-        } => Duration::from_secs(*seconds).max(DOUBT_AFTER),
+        } => named_time(*seconds).max(DOUBT_AFTER),
         _ => DOUBT_AFTER,
     }
 }

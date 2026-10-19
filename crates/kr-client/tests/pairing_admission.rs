@@ -27,7 +27,7 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::pairing::{NetworkConfig, NetworkHint};
 use kr_protocol::scalars::{AuthorisationKey, EndpointKey, Nullable, Signature64};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
-use kr_service_stand_in::{AdmissionBehaviour, ServiceWeb};
+use kr_service_stand_in::{AdmissionBehaviour, Moment, ServiceWeb};
 
 /// The canonical bytes an admission request's body digest covers, for [`vector_request`], and
 /// their digest. The same strings are the `admission_request_body` case of
@@ -132,7 +132,7 @@ impl Service {
     }
 }
 
-/// KR-REQ-10.54: the bytes a request's credential covers are the bytes the service rebuilds.
+/// KR-REQ-10.39: the bytes a request's credential covers are the bytes the service rebuilds.
 #[test]
 fn the_body_a_request_covers_is_the_one_the_service_rebuilds() {
     let body = RelayAdmissionIssueBody::of(&AdmissionRequest {
@@ -146,7 +146,7 @@ fn the_body_a_request_covers_is_the_one_the_service_rebuilds() {
     assert_eq!(hex(&kr_cbor::sha256(&input)), REQUEST_SHA256);
 }
 
-/// KR-REQ-10.54, KR-REQ-17.48: the service answers an admission, a spent budget, a relay it does
+/// KR-REQ-10.39, KR-REQ-17.48: the service answers an admission, a spent budget, a relay it does
 /// not carry and a pair that holds a lease, and each answer is one the client reads, over the
 /// credential the service itself checks.
 #[tokio::test]
@@ -178,6 +178,20 @@ async fn the_services_four_answers_are_read() {
         .await
         .expect("an answer");
     assert_eq!(answered, AdmissionAnswer::NotManaged);
+
+    // A relay is known by the URL the Worker's registry reads, whichever way each side spells the
+    // host's case, the default port and the trailing slash.
+    service.web.carry_relay(
+        "https://Relay-2.reach.kala.to:443/",
+        AdmissionBehaviour::Admit,
+    );
+    assert!(matches!(
+        admit
+            .admit(&request("https://relay-2.reach.kala.to"))
+            .await
+            .expect("an answer"),
+        AdmissionAnswer::Admitted { .. }
+    ));
 
     // The budget is spent: the paths that still work, and nothing is installed.
     service.web.spend_admission_budget(true);
@@ -287,7 +301,7 @@ fn scripted_admissions(service: Arc<Scripted>, clock: &AdmissionClock) -> Pairin
         .waiting(Duration::from_millis(200))
 }
 
-/// KR-REQ-10.54: an invitation that names a managed relay causes one request for it before the dial
+/// KR-REQ-10.39: an invitation that names a managed relay causes one request for it before the dial
 /// and none for a relay that is not the service's: a self-hosted relay, an unrelated name, an address
 /// where the service has a name, and names that only look like the service's.
 #[tokio::test]
@@ -340,7 +354,7 @@ async fn only_a_relay_of_the_managed_service_is_ever_named_to_it() {
     assert_eq!(asked, vec!["https://127.0.0.1:9101".to_owned()]);
 }
 
-/// KR-REQ-10.54: one request serves a dial and its re-dials while the admission stands, and a dial
+/// KR-REQ-10.39: one request serves a dial and its re-dials while the admission stands, and a dial
 /// that connected leaves nothing in doubt.
 #[tokio::test]
 async fn a_re_dial_after_a_connection_reuses_the_admission() {
@@ -374,7 +388,7 @@ async fn a_re_dial_after_a_connection_reuses_the_admission() {
     assert_eq!(service.asked().len(), 2);
 }
 
-/// KR-REQ-10.54: a dial that was cut short before it connected leaves its entry in doubt, and a later
+/// KR-REQ-10.39: a dial that was cut short before it connected leaves its entry in doubt, and a later
 /// dial asks again after twenty seconds, at most three times between connections.
 #[tokio::test]
 async fn a_dial_that_never_connected_is_asked_about_again_a_few_times() {
@@ -430,6 +444,46 @@ async fn a_dial_that_never_connected_is_asked_about_again_a_few_times() {
         .before_dial(&relays, &host, key(0x22))
         .await;
     assert_eq!(service.asked().len(), 4);
+}
+
+/// KR-REQ-10.39: three requests with no connection between them are the most in ten minutes, not the
+/// most for good: a person whose host was off, or whose network blocked the relay, and who tries again
+/// after fixing it, is asked about again, from the same device and the same cache.
+#[tokio::test]
+async fn a_device_whose_dials_all_failed_asks_again_when_the_ten_minutes_have_passed() {
+    let service = Service::start();
+    let (host, relays) = (key(0x11), network(&[MANAGED]));
+
+    for _ in 0..3 {
+        service
+            .admissions
+            .before_dial(&relays, &host, key(0x22))
+            .await;
+        service.clock.advance(Duration::from_secs(25));
+    }
+    assert_eq!(service.asked().len(), 3);
+
+    service
+        .admissions
+        .before_dial(&relays, &host, key(0x22))
+        .await;
+    assert_eq!(
+        service.asked().len(),
+        3,
+        "the most inside the window, whatever the dials came to"
+    );
+
+    // Past ten minutes from the last request, the admission that came with it has ended too.
+    service.clock.advance(Duration::from_secs(10 * 60));
+    service
+        .admissions
+        .before_dial(&relays, &host, key(0x22))
+        .await;
+    assert_eq!(
+        service.asked().len(),
+        4,
+        "a device that never connected is never asked again"
+    );
 }
 
 /// KR-REQ-17.40, KR-REQ-17.48: what the service said it cannot do explains a dial that failed for a
@@ -535,7 +589,7 @@ async fn the_relay_a_dial_addresses_is_the_one_that_decides() {
     );
 }
 
-/// KR-REQ-10.54: a service that never answers does not stop a dial, and what it answers later is kept
+/// KR-REQ-10.39: a service that never answers does not stop a dial, and what it answers later is kept
 /// for the next one. The wait is the test's; what decides is that the dial went on.
 #[tokio::test]
 async fn a_service_that_does_not_answer_does_not_hold_up_a_dial() {
@@ -571,7 +625,7 @@ async fn a_service_that_does_not_answer_does_not_hold_up_a_dial() {
     .expect("a later answer is kept");
 }
 
-/// KR-REQ-10.54: a service that says it serves no such route, or does not allow this device to ask,
+/// KR-REQ-10.39: a service that says it serves no such route, or does not allow this device to ask,
 /// stops every request for ten minutes, and what it said is no reason a person is shown.
 #[tokio::test]
 async fn a_service_without_the_route_is_left_alone_for_ten_minutes() {
@@ -599,4 +653,46 @@ async fn a_service_without_the_route_is_left_alone_for_ten_minutes() {
     clock.advance(Duration::from_secs(10 * 60));
     admissions.before_dial(&relays, &key(0x33), key(0x22)).await;
     assert_eq!(service.asks(), 2);
+}
+
+/// KR-REQ-10.39: a deployment of the service that has no such route answers 404, as the Worker does,
+/// which the client's own reading of an answer turns into the same ten minutes of being left alone.
+#[tokio::test]
+async fn a_real_not_found_from_the_service_stops_requests_for_ten_minutes() {
+    let service = Service::start();
+    let relays = network(&[MANAGED]);
+    service.web.fail(
+        "/api/relay/admission",
+        1,
+        Moment::Refuse {
+            status: 404,
+            code: "NOT_FOUND",
+            retry_after_seconds: None,
+        },
+    );
+
+    service
+        .admissions
+        .before_dial(&relays, &key(0x11), key(0x22))
+        .await;
+    assert_eq!(service.web.requests_to("/api/relay/admission"), 1);
+    assert!(
+        !service.admissions.capacity_refused(&relays, &key(0x11)),
+        "that is no capacity text"
+    );
+
+    // Another host a minute on: nothing is sent.
+    service.clock.advance(Duration::from_secs(60));
+    service
+        .admissions
+        .before_dial(&relays, &key(0x33), key(0x22))
+        .await;
+    assert_eq!(service.web.requests_to("/api/relay/admission"), 1);
+
+    service.clock.advance(Duration::from_secs(10 * 60));
+    service
+        .admissions
+        .before_dial(&relays, &key(0x33), key(0x22))
+        .await;
+    assert_eq!(service.web.requests_to("/api/relay/admission"), 2);
 }
