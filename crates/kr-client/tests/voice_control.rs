@@ -1397,6 +1397,36 @@ async fn closing_the_call_returns_what_the_service_finalised() {
     assert_eq!(contexts(&route), 1);
 }
 
+/// A service that answers a closure late and then ends the connection must not take the
+/// confirmation with it: a request written behind the closure, and the heartbeats that follow, are
+/// unread when it ends the connection, and the closing handshake reads them. The first socket is
+/// turned away so that the request and the closure wait for the same socket and are written one
+/// behind the other.
+#[tokio::test]
+async fn a_closure_is_confirmed_when_a_request_was_written_behind_it() {
+    let route = ControlRoute::start().await;
+    route.refuse_next(&[503]);
+    route.confirm_closures_after(ms(200));
+    let (control, news) = open(&route, &Tokens::new());
+    tokio::spawn(async move {
+        let mut news = news;
+        while news.next().await.is_some() {}
+    });
+    let behind = tokio::spawn({
+        let control = control.clone();
+        async move {
+            control
+                .send(VoiceCommand::Commentary, None, Some("nothing was done"))
+                .await
+        }
+    });
+
+    let closure = control.close().await;
+
+    assert!(closure.is_ok(), "{closure:?}");
+    let _ = behind.await;
+}
+
 #[tokio::test]
 async fn a_closure_the_service_never_confirms_is_not_known_to_have_happened() {
     let route = ControlRoute::start().await;

@@ -34,6 +34,9 @@ use tokio::sync::{Notify, mpsc};
 use tokio_rustls::TlsAcceptor;
 use tokio_websockets::{Limits, Message, ServerBuilder};
 
+/// How long the route waits for a client to answer its closing handshake.
+const CLOSING_HANDSHAKE_WITHIN: Duration = Duration::from_secs(5);
+
 /// The call the route holds.
 pub const CALL: &str = "call-1";
 
@@ -497,6 +500,7 @@ where
                 if let Some(delay) = late {
                     tokio::time::sleep(delay).await;
                 }
+                let answered = !answers.is_empty();
                 for answer in answers {
                     if socket.send(Message::text(answer.to_string())).await.is_err() {
                         break;
@@ -504,6 +508,14 @@ where
                 }
                 shared.changed.notify_waiters();
                 if drop_after {
+                    // The service that has answered a closure ends the connection with the closing
+                    // handshake, which reads what the client wrote meanwhile: a connection closed with
+                    // a frame unread is reset at once, and the reset drops what the route wrote and
+                    // had not yet sent, which is the confirmation. A fault that is a lost connection
+                    // gives no answer to a closure and ends as it always did.
+                    if answered && text.contains(r#""command":"close""#) {
+                        let _ = tokio::time::timeout(CLOSING_HANDSHAKE_WITHIN, socket.close()).await;
+                    }
                     break;
                 }
             }
