@@ -233,6 +233,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(refusal) = root_command_refusal(
         specification.root_command.as_ref(),
         specification.create.shell_mode,
+        specification.start_not_after_boot_ms.is_some(),
     ) {
         writer
             .write_message(&ControlFrame::WorkerFailed(refusal.clone()))
@@ -295,7 +296,9 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         specification.privacy,
         kr_worker::session::StartTerms {
             root_is_command: specification.root_command.is_some(),
-            not_after_boot_ms: specification.start_not_after_boot_ms.map(kr_protocol::scalars::U64::get),
+            not_after_boot_ms: specification
+                .start_not_after_boot_ms
+                .map(kr_protocol::scalars::U64::get),
         },
         std::sync::Arc::clone(&shared_clock),
     ) {
@@ -756,6 +759,7 @@ fn session_config(
 fn root_command_refusal(
     root: Option<&kr_protocol::worker::RootCommand>,
     shell_mode: ShellMode,
+    has_a_start_bound: bool,
 ) -> Option<ProtocolError> {
     let root = root?;
     let refuse = |code: ErrorCode, message: &str| Some(ProtocolError::new(code, message));
@@ -763,6 +767,12 @@ fn root_command_refusal(
         return refuse(
             ErrorCode::ResourceUnavailable,
             "a session whose root is a command is not offered on Windows",
+        );
+    }
+    if !has_a_start_bound {
+        return refuse(
+            ErrorCode::InvalidArgument,
+            "a session whose root is a command starts only before a moment the daemon accepted",
         );
     }
     if shell_mode != ShellMode::NativeCompat {
@@ -992,15 +1002,18 @@ mod tests {
             command: "exit 3".to_owned(),
         };
         let accepted = command("/bin/sh");
-        assert!(root_command_refusal(Some(&accepted), ShellMode::NativeCompat).is_none());
-        assert!(root_command_refusal(None, ShellMode::Managed).is_none());
+        assert!(root_command_refusal(Some(&accepted), ShellMode::NativeCompat, true).is_none());
+        assert!(root_command_refusal(None, ShellMode::Managed, false).is_none());
 
-        let managed = root_command_refusal(Some(&accepted), ShellMode::Managed)
+        let managed = root_command_refusal(Some(&accepted), ShellMode::Managed, true)
             .expect("a managed session is the interactive shell");
         assert_eq!(managed.code, ErrorCode::InvalidArgument);
-        let relative = root_command_refusal(Some(&command("sh")), ShellMode::NativeCompat)
+        let relative = root_command_refusal(Some(&command("sh")), ShellMode::NativeCompat, true)
             .expect("an interpreter is named by an absolute path");
         assert_eq!(relative.code, ErrorCode::InvalidArgument);
+        let unbounded = root_command_refusal(Some(&accepted), ShellMode::NativeCompat, false)
+            .expect("a command with no moment to start before starts nothing");
+        assert_eq!(unbounded.code, ErrorCode::InvalidArgument);
     }
 
     /// KR-REQ-23.38: a stock shell reads the startup files the profile asks for, like a packaged
