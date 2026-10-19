@@ -740,7 +740,7 @@ where
 /// restarts.
 async fn replace_if_withdrawn<T>(
     state: &AppState,
-    session: &Arc<kr_client::Session>,
+    session: &std::sync::Arc<kr_client::Session>,
     answer: &std::result::Result<T, kr_client::ClientError>,
 ) {
     if let Err(kr_client::ClientError::Host(refusal)) = answer
