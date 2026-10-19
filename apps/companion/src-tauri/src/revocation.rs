@@ -204,6 +204,9 @@ pub struct DeviceView {
     pub this_computer: bool,
     /// Where its revocation stands.
     pub standing: DeviceStanding,
+    /// When the feed last said so, in UTC milliseconds, for a standing this computer keeps from an
+    /// earlier read because it could not read the feed this time. Null for a standing read now.
+    pub stale_since_ms: Option<u64>,
 }
 
 /// Where a device's revocation stands. A revocation is done only in [`Self::Done`].
@@ -255,6 +258,9 @@ struct Memory {
     direct: BTreeMap<DeviceId, Direct>,
     /// The devices that settings sync has been told of, or is being told of.
     fed: BTreeSet<AuthorisationKey>,
+    /// What a feed last said of each device's revocation, by host reference and device, for a feed
+    /// that cannot be read the next time.
+    known: BTreeMap<(String, DeviceId), Known>,
     /// The revocations being asked for, by host and device reference, so that a second call for one
     /// of them waits for neither the ceremony nor the request and sends nothing.
     revoking: BTreeSet<String>,
@@ -291,6 +297,13 @@ enum Direct {
     /// It recorded the revocation, and some workers have not confirmed the fence. It says how many
     /// when it can.
     Pending { at_ms: u64, workers: Option<u64> },
+}
+
+/// A standing a read of a feed gave, and when.
+#[derive(Clone, Copy)]
+struct Known {
+    standing: DeviceStanding,
+    at_ms: u64,
 }
 
 /// What a view and a command are told of this application beyond this computer's records.
@@ -595,19 +608,27 @@ impl Revocations {
                 {
                     told.push(keys.authorisation);
                 }
+                let read = standing(
+                    summary,
+                    &named,
+                    direct.get(&summary.device_id).copied(),
+                    reading.host.route(),
+                    reading.contact == Contact::Answered,
+                );
+                let (standing, stale_since_ms) = match &reading.feed {
+                    Some(feed) => {
+                        self.from_the_feed(&reference, summary.device_id, read, feed.is_ok())
+                    }
+                    None => (read, None),
+                };
                 DeviceView {
                     reference: device_reference(&reference, summary.device_id),
                     name: device_name(summary),
                     platform: summary.platform,
                     manages_host: summary.manages_host,
                     this_computer: this_computer == Some(summary.device_id),
-                    standing: standing(
-                        summary,
-                        &named,
-                        direct.get(&summary.device_id).copied(),
-                        reading.host.route(),
-                        reading.contact == Contact::Answered,
-                    ),
+                    standing,
+                    stale_since_ms,
                 }
             })
             .collect();
@@ -625,6 +646,43 @@ impl Revocations {
             host_feed_stale: reading.list.as_ref().is_some_and(|list| list.feed_stale),
             devices: rows,
             feed: reading.feed.as_ref().map(|feed| feed_view(feed, reading)),
+        }
+    }
+
+    /// Where a device's revocation stands for a host reached through its feed, given what this
+    /// read of the feed made of it. A feed that was read is the truth and is kept. A feed that
+    /// could not be read says nothing of this computer's requests, so a device it would show as
+    /// not asked about keeps the standing the feed last gave it, with the time of that read: the
+    /// screen shows a stale standing and says so, not a device nobody asked anything of.
+    fn from_the_feed(
+        &self,
+        host: &str,
+        device: DeviceId,
+        read: DeviceStanding,
+        feed_read: bool,
+    ) -> (DeviceStanding, Option<u64>) {
+        let mut memory = self.memory();
+        let key = (host.to_owned(), device);
+        if feed_read {
+            match read {
+                DeviceStanding::Active | DeviceStanding::Revoked => {
+                    memory.known.remove(&key);
+                }
+                _ => {
+                    memory.known.insert(
+                        key,
+                        Known {
+                            standing: read,
+                            at_ms: now().get(),
+                        },
+                    );
+                }
+            }
+            return (read, None);
+        }
+        match (read, memory.known.get(&key)) {
+            (DeviceStanding::Active, Some(known)) => (known.standing, Some(known.at_ms)),
+            _ => (read, None),
         }
     }
 
@@ -770,7 +828,24 @@ impl Revocations {
             self.tell(context, keys);
         }
         match sent {
-            Ok(()) => Ok(self.view(context).await),
+            Ok(()) => {
+                // The view that follows reads the feed again, and a feed that cannot be read then
+                // must still show that this request was sent.
+                if found.route() == Route::Feed {
+                    let at_ms = now().get();
+                    self.memory().known.insert(
+                        (host_now.reference.clone(), summary.device_id),
+                        Known {
+                            standing: DeviceStanding::Sent {
+                                at_ms,
+                                host_lists_revoked: false,
+                            },
+                            at_ms,
+                        },
+                    );
+                }
+                Ok(self.view(context).await)
+            }
             Err(mut error) if shared => {
                 if !error.message.ends_with('.') {
                     error.message.push('.');

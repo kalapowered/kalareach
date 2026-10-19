@@ -1,0 +1,167 @@
+{
+  "ceremony": "touch_id",
+  "feed_origin": "sync.example.org:8443",
+  "hosts": [
+    {
+      "reference": "here",
+      "name": "This computer",
+      "route": "direct",
+      "contact": "answered",
+      "listed_at_ms": 1760000100000,
+      "host_synchronised_at_ms": null,
+      "host_feed_stale": false,
+      "devices": [
+        {
+          "reference": "here-mac",
+          "name": "the-mac",
+          "platform": "macos",
+          "manages_host": true,
+          "this_computer": true,
+          "standing": { "state": "active" },
+          "stale_since_ms": null
+        },
+        {
+          "reference": "here-phone",
+          "name": "the-phone",
+          "platform": "ios",
+          "manages_host": false,
+          "this_computer": false,
+          "standing": {
+            "state": "acknowledged",
+            "at_ms": 1760000050000,
+            "pending_workers": 1,
+            "host_lists_revoked": true
+          },
+          "stale_since_ms": null
+        },
+        {
+          "reference": "here-tablet",
+          "name": "the-tablet",
+          "platform": "android",
+          "manages_host": false,
+          "this_computer": false,
+          "standing": { "state": "done", "at_ms": 1760000060000 },
+          "stale_since_ms": null
+        }
+      ],
+      "feed": null
+    },
+    {
+      "reference": "studio",
+      "name": "the-studio",
+      "route": "feed",
+      "contact": "answered",
+      "listed_at_ms": 1760000100000,
+      "host_synchronised_at_ms": 1760000090000,
+      "host_feed_stale": false,
+      "devices": [
+        {
+          "reference": "studio-laptop",
+          "name": "the-laptop",
+          "platform": "windows",
+          "manages_host": false,
+          "this_computer": false,
+          "standing": { "state": "active" },
+          "stale_since_ms": null
+        },
+        {
+          "reference": "studio-watch",
+          "name": "the-watch",
+          "platform": "linux",
+          "manages_host": false,
+          "this_computer": false,
+          "standing": { "state": "sent", "at_ms": 1760000070000, "host_lists_revoked": false },
+          "stale_since_ms": null
+        },
+        {
+          "reference": "studio-pad",
+          "name": "the-pad",
+          "platform": "ios",
+          "manages_host": false,
+          "this_computer": false,
+          "standing": {
+            "state": "acknowledged",
+            "at_ms": 1760000080000,
+            "pending_workers": null,
+            "host_lists_revoked": false
+          },
+          "stale_since_ms": null
+        },
+        {
+          "reference": "studio-old-phone",
+          "name": "the-old-phone",
+          "platform": "ios",
+          "manages_host": false,
+          "this_computer": false,
+          "standing": { "state": "refused", "reason": "no_owner_authority" },
+          "stale_since_ms": null
+        },
+        {
+          "reference": "studio-spare",
+          "name": "the-spare",
+          "platform": "android",
+          "manages_host": false,
+          "this_computer": false,
+          "standing": { "state": "revoked" },
+          "stale_since_ms": null
+        }
+      ],
+      "feed": {
+        "read": true,
+        "problem": null,
+        "removed": false,
+        "host_wrote_here": true,
+        "last_acknowledgement": { "at_ms": 1760000080000, "revision": 12, "pending_workers": 2 },
+        "outstanding": 1,
+        "poll_interval_seconds": 30
+      }
+    },
+    {
+      "reference": "attic",
+      "name": "the-attic",
+      "route": "feed",
+      "contact": "silent",
+      "listed_at_ms": 1760000010000,
+      "host_synchronised_at_ms": null,
+      "host_feed_stale": true,
+      "devices": [
+        {
+          "reference": "attic-kindle",
+          "name": "the-kindle",
+          "platform": "android",
+          "manages_host": false,
+          "this_computer": false,
+          "standing": { "state": "sent", "at_ms": 1760000020000, "host_lists_revoked": false },
+          "stale_since_ms": 1760000030000
+        },
+        {
+          "reference": "attic-stick",
+          "name": "the-stick",
+          "platform": "linux",
+          "manages_host": false,
+          "this_computer": false,
+          "standing": { "state": "refused", "reason": "unknown_target" },
+          "stale_since_ms": null
+        },
+        {
+          "reference": "attic-fridge",
+          "name": "the-fridge",
+          "platform": "linux",
+          "manages_host": false,
+          "this_computer": false,
+          "standing": { "state": "refused", "reason": "superseded" },
+          "stale_since_ms": null
+        }
+      ],
+      "feed": {
+        "read": false,
+        "problem": "it did not answer in time",
+        "removed": false,
+        "host_wrote_here": false,
+        "last_acknowledgement": null,
+        "outstanding": 0,
+        "poll_interval_seconds": null
+      }
+    }
+  ]
+}

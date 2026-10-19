@@ -719,6 +719,71 @@ async fn a_feed_that_cannot_be_read_is_said_and_nothing_is_sent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_that_was_sent_keeps_its_standing_while_its_feed_cannot_be_read() {
+    let rig = Rig::start().await;
+    rig.pairs_another().await;
+    let listed = host_by(&rig.view().await, "feed");
+    let phones = the_phones(&listed);
+    assert_eq!(
+        phones.len(),
+        2,
+        "the host lists both paired devices: {listed}"
+    );
+    let reference_of = |device: &Value| {
+        device["reference"]
+            .as_str()
+            .expect("a reference")
+            .to_owned()
+    };
+    let (asked, other) = (reference_of(&phones[0]), reference_of(&phones[1]));
+    let sent = rig
+        .revoke(listed["reference"].as_str().expect("a reference"), &asked)
+        .expect("the request is published");
+    let standing_of = |view: &Value, reference: &str| -> Value {
+        the_phones(&host_by(view, "feed"))
+            .into_iter()
+            .find(|device| device["reference"] == reference)
+            .unwrap_or_else(|| panic!("no device {reference}: {view}"))
+    };
+    let read = standing_of(&sent, &asked);
+    assert!(
+        ["sent", "done"].contains(&read["standing"]["state"].as_str().expect("a state")),
+        "{read}"
+    );
+    assert_eq!(read["stale_since_ms"], Value::Null, "read just now: {read}");
+
+    for nth in 1..=8 {
+        rig.served.web().fail(
+            AUTHORITY,
+            nth,
+            Moment::Refuse {
+                status: 503,
+                code: "SERVICE_UNAVAILABLE",
+                retry_after_seconds: None,
+            },
+        );
+    }
+    let unread = rig.view().await;
+    assert_eq!(host_by(&unread, "feed")["feed"]["read"], false);
+    let kept = standing_of(&unread, &asked);
+    assert_eq!(
+        kept["standing"], read["standing"],
+        "a request that was sent is not forgotten because its feed cannot be read"
+    );
+    assert!(
+        kept["stale_since_ms"].is_u64(),
+        "the screen says it is showing an earlier read: {kept}"
+    );
+    let untouched = standing_of(&unread, &other);
+    assert_eq!(untouched["standing"]["state"], "active", "{untouched}");
+    assert_eq!(untouched["stale_since_ms"], Value::Null, "{untouched}");
+
+    rig.served.web().mend();
+    let again = rig.view().await;
+    assert_eq!(standing_of(&again, &asked)["stale_since_ms"], Value::Null);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_host_on_this_computer_takes_the_revocation_itself_and_its_answer_is_the_acknowledgement()
  {
     let rig = Rig::start().await;
@@ -1173,5 +1238,228 @@ async fn a_host_on_this_computer_whose_connection_cannot_be_replaced_is_not_said
         rig.ceremony.reasons().is_empty(),
         "the person is not asked: {:?}",
         rig.ceremony.reasons()
+    );
+}
+
+/// The view the screen is given, as native code serialises it, in the fixture the page's tests read
+/// the same view from: every standing, every contact, and a feed read and a feed that was not.
+#[test]
+fn the_view_native_code_gives_the_screen_is_the_view_the_page_reads() {
+    use companion_tauri::revocation::{
+        Acknowledged, Contact, DeviceStanding, DeviceView, FeedView, HostView, RevocationView,
+        Route,
+    };
+    use kr_client::services::authority::RejectionReason;
+    use kr_protocol::pairing::DevicePlatform;
+
+    fn device(
+        reference: &str,
+        name: &str,
+        platform: DevicePlatform,
+        owner: bool,
+        here: bool,
+        standing: DeviceStanding,
+        stale_since_ms: Option<u64>,
+    ) -> DeviceView {
+        DeviceView {
+            reference: reference.to_owned(),
+            name: name.to_owned(),
+            platform,
+            manages_host: owner,
+            this_computer: here,
+            standing,
+            stale_since_ms,
+        }
+    }
+    let here = HostView {
+        reference: "here".to_owned(),
+        name: "This computer".to_owned(),
+        route: Route::Direct,
+        contact: Contact::Answered,
+        listed_at_ms: Some(1_760_000_100_000),
+        host_synchronised_at_ms: None,
+        host_feed_stale: false,
+        devices: vec![
+            device(
+                "here-mac",
+                "the-mac",
+                DevicePlatform::Macos,
+                true,
+                true,
+                DeviceStanding::Active,
+                None,
+            ),
+            device(
+                "here-phone",
+                "the-phone",
+                DevicePlatform::Ios,
+                false,
+                false,
+                DeviceStanding::Acknowledged {
+                    at_ms: 1_760_000_050_000,
+                    pending_workers: Some(1),
+                    host_lists_revoked: true,
+                },
+                None,
+            ),
+            device(
+                "here-tablet",
+                "the-tablet",
+                DevicePlatform::Android,
+                false,
+                false,
+                DeviceStanding::Done {
+                    at_ms: 1_760_000_060_000,
+                },
+                None,
+            ),
+        ],
+        feed: None,
+    };
+    let studio = HostView {
+        reference: "studio".to_owned(),
+        name: "the-studio".to_owned(),
+        route: Route::Feed,
+        contact: Contact::Answered,
+        listed_at_ms: Some(1_760_000_100_000),
+        host_synchronised_at_ms: Some(1_760_000_090_000),
+        host_feed_stale: false,
+        devices: vec![
+            device(
+                "studio-laptop",
+                "the-laptop",
+                DevicePlatform::Windows,
+                false,
+                false,
+                DeviceStanding::Active,
+                None,
+            ),
+            device(
+                "studio-watch",
+                "the-watch",
+                DevicePlatform::Linux,
+                false,
+                false,
+                DeviceStanding::Sent {
+                    at_ms: 1_760_000_070_000,
+                    host_lists_revoked: false,
+                },
+                None,
+            ),
+            device(
+                "studio-pad",
+                "the-pad",
+                DevicePlatform::Ios,
+                false,
+                false,
+                DeviceStanding::Acknowledged {
+                    at_ms: 1_760_000_080_000,
+                    pending_workers: None,
+                    host_lists_revoked: false,
+                },
+                None,
+            ),
+            device(
+                "studio-old-phone",
+                "the-old-phone",
+                DevicePlatform::Ios,
+                false,
+                false,
+                DeviceStanding::Refused {
+                    reason: RejectionReason::NoOwnerAuthority,
+                },
+                None,
+            ),
+            device(
+                "studio-spare",
+                "the-spare",
+                DevicePlatform::Android,
+                false,
+                false,
+                DeviceStanding::Revoked,
+                None,
+            ),
+        ],
+        feed: Some(FeedView {
+            read: true,
+            problem: None,
+            removed: false,
+            host_wrote_here: true,
+            last_acknowledgement: Some(Acknowledged {
+                at_ms: 1_760_000_080_000,
+                revision: 12,
+                pending_workers: Some(2),
+            }),
+            outstanding: 1,
+            poll_interval_seconds: Some(30),
+        }),
+    };
+    let attic = HostView {
+        reference: "attic".to_owned(),
+        name: "the-attic".to_owned(),
+        route: Route::Feed,
+        contact: Contact::Silent,
+        listed_at_ms: Some(1_760_000_010_000),
+        host_synchronised_at_ms: None,
+        host_feed_stale: true,
+        devices: vec![
+            device(
+                "attic-kindle",
+                "the-kindle",
+                DevicePlatform::Android,
+                false,
+                false,
+                DeviceStanding::Sent {
+                    at_ms: 1_760_000_020_000,
+                    host_lists_revoked: false,
+                },
+                Some(1_760_000_030_000),
+            ),
+            device(
+                "attic-stick",
+                "the-stick",
+                DevicePlatform::Linux,
+                false,
+                false,
+                DeviceStanding::Refused {
+                    reason: RejectionReason::UnknownTarget,
+                },
+                None,
+            ),
+            device(
+                "attic-fridge",
+                "the-fridge",
+                DevicePlatform::Linux,
+                false,
+                false,
+                DeviceStanding::Refused {
+                    reason: RejectionReason::Superseded,
+                },
+                None,
+            ),
+        ],
+        feed: Some(FeedView {
+            read: false,
+            problem: Some("it did not answer in time".to_owned()),
+            removed: false,
+            host_wrote_here: false,
+            last_acknowledgement: None,
+            outstanding: 0,
+            poll_interval_seconds: None,
+        }),
+    };
+    let view = RevocationView {
+        ceremony: CeremonyKind::TouchId,
+        feed_origin: Some("sync.example.org:8443".to_owned()),
+        hosts: vec![here, studio, attic],
+    };
+    let fixture: Value =
+        serde_json::from_str(include_str!("../../test/fixtures/revocation-view.json"))
+            .expect("the fixture");
+    assert_eq!(
+        serde_json::to_value(&view).expect("the view serialises"),
+        fixture,
+        "the screen is given a view the page's fixture does not describe: {}",
+        serde_json::to_string_pretty(&view).unwrap_or_default()
     );
 }
