@@ -317,6 +317,10 @@ pub struct ConnectionState {
     /// A file this application uploads goes to the host on this machine. A host this device is
     /// paired with takes no file from it, so the page offers no attachment over one.
     pub paired: bool,
+    /// How many times, since this application started, a connection the host withdrew has been
+    /// replaced by one it admits. A request refused on the withdrawn connection was answered with a
+    /// failure just before the replacement, so the page says so whenever this grows.
+    pub replaced: u64,
 }
 
 impl ConnectionState {
@@ -329,6 +333,7 @@ impl ConnectionState {
             reason: Some(reason.into()),
             rights: None,
             paired: false,
+            replaced: 0,
         }
     }
 
@@ -341,6 +346,7 @@ impl ConnectionState {
             reason: None,
             rights: Some(kr_protocol::rights::ActionRight::ALL.to_vec()),
             paired: false,
+            replaced: 0,
         }
     }
 
@@ -357,6 +363,7 @@ impl ConnectionState {
             reason: None,
             rights: Some(rights),
             paired: true,
+            replaced: 0,
         }
     }
 

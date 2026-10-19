@@ -351,7 +351,9 @@ connection is refused as such. The host on a computer's own machine is reached i
 whether it was not there when the application started or its connection ended. Each choice of host
 has a number, and a task that keeps the connection of an earlier choice can neither install its
 connection nor record its loss once a later one is made. The Sessions and Hosts screens read their lists again each time the connection
-comes or goes, and show nothing of a host that is not the one reached.
+comes or goes, and show nothing of a host that is not the one reached. A connection the host withdrew is
+replaced by one it admits, `connection_state` counts each replacement in `replaced`, and the window
+says so once for each. Nothing is sent again for the person.
 
 When a session screen loads on the phone, it opens that session before it asks anything about it: it picks a token and passes it, with the session and the share if it holds one, to `session_open`. The host opens the session on a connection of its own, under that grant, and says what the grant allows. Every command about the session carries the token. A token can be used once, and a command that names an opening another has replaced executes nowhere. The connection kept for the host alone serves the host's own reads, and the host refuses it every command that would reach a worker.
 

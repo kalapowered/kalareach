@@ -465,6 +465,11 @@ export interface FakeHostControls {
    */
   setConnected(connected: boolean, reason?: string): void
   /**
+   * The host withdrew the connection and the application replaced it with one the host admits: the
+   * connection state counts one more replacement, and says so to everything listening.
+   */
+  replaceConnection(): void
+  /**
    * Has the connection go to another host, as choosing one does: the environment the connection
    * belongs to changes and is told, the host lists no sessions of the earlier one, and reads of its
    * sessions or of its environments are refused when `refuseSessionList` or `refuseEnvironmentList`
@@ -1204,6 +1209,8 @@ export function fakeHost(
   let environmentListRefused = false
   /** Whether the host is one this device is paired with, not the one on its own computer. */
   let pairedDevice = false
+  /** How many times a connection the host withdrew has been replaced. */
+  let replacements = 0
   const hostDrafts = scriptedHostDrafts()
   const connectionNow = (): ConnectionState =>
     receivedConnection({
@@ -1211,7 +1218,8 @@ export function fakeHost(
       environment_id: connected ? hostEnvironment : null,
       reason: connected ? null : lostBecause,
       rights: connected ? rights : null,
-      paired: connected && pairedDevice
+      paired: connected && pairedDevice,
+      replaced: replacements
     })
   const connectionListeners = new Set<(state: ConnectionState) => void>()
 
@@ -2874,6 +2882,10 @@ export function fakeHost(
       }
       // A session's worker has a link of its own: losing the daemon's connection leaves it where it
       // was, and `questions.setReachable` is what takes a worker away.
+      for (const listener of connectionListeners) listener(connectionNow())
+    },
+    replaceConnection() {
+      replacements += 1
       for (const listener of connectionListeners) listener(connectionNow())
     },
     switchHost(environmentId, options) {

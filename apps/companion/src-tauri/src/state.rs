@@ -1,10 +1,11 @@
 //! What the backend holds between commands.
 //!
 //! One connection, this computer as a device that pairs, its owner confirmations, one draft store,
-//! and one record of where the last export was allowed to be written. Nothing here is reachable from the WebView except through the
-//! commands, and a command returns protocol values rather than handles: there is nothing the page
-//! can keep and use later.
+//! and one record of where the last export was allowed to be written. Nothing here is reachable
+//! from the WebView except through the commands, and a command returns protocol values rather than
+//! handles: there is nothing the page can keep and use later.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use kr_client::Session;
@@ -53,6 +54,8 @@ pub struct AppState {
     export_destinations: Mutex<Vec<std::path::PathBuf>>,
     dropped_files: Mutex<Vec<std::path::PathBuf>>,
     supervision: Mutex<Supervision>,
+    /// How many withdrawn connections have been replaced since this application started.
+    replaced: Arc<AtomicU64>,
 }
 
 /// The task that keeps the connection to the host the commands go to, and which choice of host it
@@ -92,6 +95,7 @@ impl AppState {
             export_destinations: Mutex::new(Vec::new()),
             dropped_files: Mutex::new(Vec::new()),
             supervision: Mutex::new(Supervision::default()),
+            replaced: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -122,8 +126,8 @@ impl AppState {
             before.abort();
         }
         // The host in use is told as changed first, and the sessions opened on the host before are
-        // let go with it, and the tokens that opened them are forgotten, after: a call that read the
-        // host before the change then finds the generation moved when it hands its link over.
+        // let go with it, and the tokens that opened them are forgotten, after: a call that read
+        // the host before the change then finds the generation moved when it hands its link over.
         self.disconnected(reason);
         self.paired_links.close_all();
         Ok(())
@@ -271,6 +275,7 @@ impl AppState {
     #[must_use]
     pub fn replacer(&self) -> crate::connection::Replacer {
         let held = Arc::clone(&self.connection);
+        let replaced = Arc::clone(&self.replaced);
         Arc::new(move |withdrawn, fresh| {
             let mut held = held.write().expect("the state lock is not poisoned");
             // Only the connection that was refused is replaced: one installed since is the host's
@@ -280,6 +285,10 @@ impl AppState {
                 .is_some_and(|connection| Arc::ptr_eq(&connection.session(), withdrawn))
             {
                 *held = Some(fresh);
+                // Counted with the swap, so a reader that finds the new connection finds the count
+                // that goes with it, and before the withdrawn connection ends, since its end is
+                // what tells the page the connection changed.
+                replaced.fetch_add(1, Ordering::SeqCst);
                 drop(held);
                 withdrawn.close();
             }
@@ -391,8 +400,12 @@ impl AppState {
             .connection
             .read()
             .expect("the state lock is not poisoned");
+        let replaced = self.replaced.load(Ordering::SeqCst);
         match held.as_ref() {
-            Some(connection) => ConnectionState::of(connection),
+            Some(connection) => ConnectionState {
+                replaced,
+                ..ConnectionState::of(connection)
+            },
             None => ConnectionState {
                 connected: false,
                 environment_id: None,
@@ -403,6 +416,7 @@ impl AppState {
                     .clone(),
                 rights: None,
                 paired: false,
+                replaced,
             },
         }
     }

@@ -36,6 +36,15 @@ const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] =
   { place: { view: 'plugins' }, label: 'Plugins' }
 ]
 
+/**
+ * What the toast says when the host withdrew the connection and the application replaced it. A
+ * request refused on the old connection was answered with a failure just before, and a request in
+ * flight when the host withdrew it has an outcome nobody knows, so the person is told to check and
+ * nothing is sent a second time for them.
+ */
+const CONNECTION_REPLACED =
+  'The connection to this computer was replaced. Check anything that just failed.'
+
 /** The application. */
 export function App(): ReactNode {
   const { place, go, toast, dismissToast, port, say, rememberRights } = useApp()
@@ -66,6 +75,10 @@ export function App(): ReactNode {
     }
   }, [account.view, accountOpen, say])
 
+  // How many replacements the last state counted: none until a state has been taken in, so the
+  // count the page starts with is not a replacement it saw.
+  const replacements = useRef<number | null>(null)
+
   // The state is read once the listener is registered, so no change can fall between the two, and
   // a change heard before the read answers is at least as new as it.
   useEffect(
@@ -74,6 +87,10 @@ export function App(): ReactNode {
         (listener) => port.onConnection(listener),
         () => port.connectionState(),
         (state) => {
+          if (replacements.current !== null && state.replaced > replacements.current) {
+            say(CONNECTION_REPLACED, 'pending')
+          }
+          replacements.current = Math.max(replacements.current ?? 0, state.replaced)
           if (state.connected && state.rights !== null) rememberRights(state.rights)
           setConnection({
             connected: state.connected,
@@ -92,7 +109,7 @@ export function App(): ReactNode {
           })
         }
       ),
-    [port, rememberRights]
+    [port, rememberRights, say]
   )
 
   // The last input device decides whether anything animates. A keyboard-driven change is instant;

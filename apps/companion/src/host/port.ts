@@ -154,6 +154,12 @@ export interface ConnectionState {
    * over one.
    */
   readonly paired: boolean
+  /**
+   * How many times, since the application started, a connection the host withdrew has been replaced
+   * by one it admits. A request refused on the withdrawn connection was answered with a failure just
+   * before, so the page says so each time this grows.
+   */
+  readonly replaced: number
 }
 
 /**
