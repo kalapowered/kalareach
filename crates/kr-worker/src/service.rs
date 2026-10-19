@@ -8734,8 +8734,8 @@ pub struct Caller {
     /// The remote dispatch lease the daemon took for this mutation, anchored on this worker's
     /// clock when its frame arrived.
     ///
-    /// Only a paired device's mutation carries one, and [`WorkerService`] holds the dispatch to it
-    /// in its serial path ([`WorkerService::check_dispatch_lease`]).
+    /// Only a paired device's mutation carries one, and the service holds the dispatch to it in its
+    /// serial path, immediately before the dispatch marker.
     pub dispatch_lease: Option<kr_transport::lease::DispatchLease>,
 }
 

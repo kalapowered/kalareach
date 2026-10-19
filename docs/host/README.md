@@ -2357,13 +2357,27 @@ suspend-aware continuous clock (`kr_transport::clock`).
   connection and to the host's boot. A window is replaced on the live connection at half its
   validity, without being asked for, and arrives as `ControlEvent::ActionWindowRenewed`. A window
   from another connection, or from before a restart, first-admits nothing.
-* The accepted deadline of a mutation is the earliest of the window's expiry, receipt time plus the
-  requested lifetime, and any applicable authority deadline. What one host process forwards to
-  another is what *remains* of it, as a duration: two processes measure on their own continuous
-  clocks and neither clock's origin means anything to the other.
-* Remote dispatch additionally needs a live lease from the current generation and revision. The
-  daemon takes it at the moment it forwards, not when the request arrived, and the lease's own
-  remaining time bounds the deadline the worker is given.
+* The accepted deadline of a mutation is the earliest of the window's expiry, the time the mutation
+  was received plus the requested lifetime, and any applicable authority deadline. The time of
+  receipt is when the listener read the frame from the device's stream. If a frame waits for the
+  answer to a previous frame, the mutation only lives for the lifetime the wait left it. What one
+  host process forwards to another is what *remains* of it, as a duration: each process measures on
+  its own continuous clock, and neither clock's origin means anything to the other.
+* Remote dispatch additionally needs a live lease from the current generation and revision, and the
+  lease is held by the worker as well as the daemon. The daemon takes the lease when it forwards the
+  action, not when the request arrived, and only after the worker has acknowledged the revision in
+  force. The lease's own remaining time bounds the deadline the worker is given. The daemon sends the
+  lease along with the mutation: its identity, generation, revision and end. The worker holds the
+  lease to at most five seconds whatever the frame says and checks it in its serial path, just before
+  writing the dispatch marker. It checks that the lease is of the generation it accepts, that it is
+  for a revision the worker has acknowledged to that generation and has installed, and that it has
+  not ended. If any of those checks fails, the worker rejects the action and writes no dispatch
+  marker. What the worker has acknowledged belongs to a generation, so a replacement daemon cannot
+  send on what the one before it queued: the old envelope and lease name the old generation, and the
+  worker acknowledges no revision to the new one until the new daemon announces it. A local caller's
+  action and a paired device's `session.close` need no lease. A worker of the release before is sent
+  no lease, because it cannot read one: it holds the deadline and the revision its grant was checked
+  at, and only the daemon holds the lease for it.
 
 ### The admission a mutation carries
 
