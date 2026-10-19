@@ -122,18 +122,6 @@ pub const FROZEN_VARIANTS: &[&str] = &[
     "PluginRuntimeWanted.session_id",
 ];
 
-/// The first level whose workers admit the `kr-hook` of their own release as the forwarder of a
-/// launch, beside the one an update keeps current.
-///
-/// A forwarder that runs from the release an update has made current can be of a release whose
-/// bridge exchange the worker it serves does not read. It starts the forwarder of the worker's own
-/// release instead, where the worker admits that one; a worker below this level admits only the
-/// forwarder reached through `current`, so the forwarder talks to it directly.
-///
-/// Remove it, and the direct path, once no retained level is below it.
-pub const FIRST_LEVEL_ADMITTING_OWN_FORWARDER: CompatibilityLevel =
-    CompatibilityLevel::of(crate::hello::PackageVersion::new(0, 75, 0));
-
 /// The protocol the plugin host speaks to the workers that register with it.
 ///
 /// A worker connects to its environment's one plugin host directly, so a daemon of one release can

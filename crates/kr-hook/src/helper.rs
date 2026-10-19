@@ -7,10 +7,11 @@
 //! standard input, output and arguments, and starts already holding the worker's release.
 //!
 //! The decision reads files and nothing else: the registration, which names the release the
-//! launch's worker runs, and that release's manifest, which states its level. A forwarder of the
-//! worker's release is started only where the worker admits it
-//! ([`kr_protocol::retained::FIRST_LEVEL_ADMITTING_OWN_FORWARDER`]); a worker below that level
-//! admits only the forwarder reached through `current`, and is spoken to directly.
+//! launch's worker runs, and that release's manifest, which states its level. Every worker a
+//! release retains admits the forwarder of its own release, so that forwarder is started when the
+//! worker's release is in the store and is not this one, its level is not this forwarder's own,
+//! its forwarder is there and, for a hook, enough of the deadline is left. In every other case
+//! this forwarder goes on and talks to the worker directly.
 //!
 //! A forwarder started this way is told so by [`MARKER`], and never starts another, so the hand-off
 //! cannot loop. For a hook the marker also carries the moment its deadline ends on the machine's
@@ -20,7 +21,6 @@
 use std::time::{Duration, Instant};
 
 use kr_ipc::install::Program;
-use kr_protocol::retained::FIRST_LEVEL_ADMITTING_OWN_FORWARDER;
 use kr_protocol::update::{CompatibilityLevel, THIS_LEVEL};
 
 use crate::registration::{self, Paths};
@@ -106,10 +106,11 @@ impl Marker {
 /// right, and returns only when it is not or when the replacement failed.
 ///
 /// `deadline` is the hook's own: when it began and how long it has altogether. A forwarder with no
-/// deadline passes `None`. The reasons to go on directly are not errors: no registration, a worker
-/// of this release, a worker below the level that admits the other forwarder, a release the store
-/// lacks or is removing, a forwarder that is not there. A failed replacement is returned, so the
-/// caller can say so.
+/// deadline passes `None`. The reasons to go on directly are not errors: this forwarder was itself
+/// started in another's place, there is no registration, the launch's worker runs this release or
+/// another at this forwarder's own level, the store lacks the release or is removing it, its
+/// forwarder is not there, or too little of a hook's deadline is left. A failed replacement is
+/// returned, so the caller can say so.
 pub fn hand_over(
     registration_wait: Duration,
     deadline: Option<(Instant, Duration)>,
@@ -129,7 +130,7 @@ pub fn hand_over(
     }
     let pin = store.pin(&target).ok().flatten()?;
     let level = CompatibilityLevel::of(pin.manifest().protocol_version);
-    if level == THIS_LEVEL || level < FIRST_LEVEL_ADMITTING_OWN_FORWARDER {
+    if level == THIS_LEVEL {
         return None;
     }
     let program = store

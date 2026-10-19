@@ -204,9 +204,9 @@ impl Launch {
 }
 
 /// KR-REQ-26.06, KR-REQ-26.08: a forwarder whose launch's worker runs another release, at a level
-/// above the first that admits that release's own forwarder and not its own level, is replaced by
-/// that release's forwarder with the same arguments and input. The release is held from before the
-/// replacement to after it, and the forwarder's own is not held by the replacement.
+/// other than its own, is replaced by that release's forwarder with the same arguments and input.
+/// The release is held from before the replacement to after it, and the forwarder's own is not held
+/// by the replacement.
 #[test]
 fn a_forwarder_hands_a_launch_of_another_release_to_that_releases_forwarder() {
     for arguments in [["claude-code", "hook"], ["claude-code", "channel"]] {
@@ -283,15 +283,13 @@ fn a_forwarder_hands_a_launch_of_another_release_to_that_releases_forwarder() {
 }
 
 /// A forwarder talks to its worker directly, and starts nothing, when the worker is of this release,
-/// when its level is this build's, when its level is below the first that admits the other
-/// forwarder, when the registration names no release, when the forwarder was itself started in
-/// another's place, and when the release is being removed by an update.
+/// when its level is this build's, when the registration names no release, when the forwarder was
+/// itself started in another's place, and when the release is being removed by an update.
 #[test]
 fn a_forwarder_goes_on_directly_where_the_other_forwarder_is_not_for_it() {
     enum Case {
         OwnRelease,
         ThisLevel,
-        BelowTheFirstLevelThatAdmitsIt,
         NoRelease,
         StartedInAnotherPlace,
         BeingRemoved,
@@ -299,21 +297,12 @@ fn a_forwarder_goes_on_directly_where_the_other_forwarder_is_not_for_it() {
     for case in [
         Case::OwnRelease,
         Case::ThisLevel,
-        Case::BelowTheFirstLevelThatAdmitsIt,
         Case::NoRelease,
         Case::StartedInAnotherPlace,
         Case::BeingRemoved,
     ] {
         let minor = match case {
             Case::ThisLevel => this_minor(),
-            // Below the level the constant names, whatever this build's own level is: the decision
-            // reads the manifest's level and not what a release still retains.
-            Case::BelowTheFirstLevelThatAdmitsIt => {
-                kr_protocol::retained::FIRST_LEVEL_ADMITTING_OWN_FORWARDER
-                    .minor()
-                    .expect("a level below 1.0")
-                    - 1
-            }
             _ => this_minor() + 1,
         };
         let launch = Launch::new(minor);
