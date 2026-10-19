@@ -37,9 +37,10 @@
 //! # Taking a device out
 //!
 //! A revocation this computer sends is written down in a record beside the others before the
-//! request leaves ([`Fence`], [`SettingsSync::hold_for_revocation`]), and a request whose record
-//! cannot be written is not sent. The membership cannot take the revocation in while a step holds
-//! it, and a step holds it for as long as it waits on the hosts or the service. While the record
+//! request leaves ([`Fence`], `Settings::hold_for_revocation`), and a request whose record cannot
+//! be written is not sent, whether or not settings sync started. The membership cannot take the
+//! revocation in while a step holds it, and a step holds it for as long as it waits on the hosts or
+//! the service. While the record
 //! holds a device, no step starts to publish, and settings and drafts both ask the record before
 //! they read and seal what they send, so a send it refuses leaves no record and no sealed bytes
 //! behind. Each step takes in what the record holds before it reconciles, whichever companion wrote
@@ -112,7 +113,7 @@ use crate::sync_service::{SyncService, SyncServiceView, host_of};
 pub const SCOPE: &str = "settings-sync";
 
 /// The directory under the application's data directory that settings sync keeps its records in.
-const DIRECTORY: &str = "settings-sync";
+pub(super) const DIRECTORY: &str = "settings-sync";
 
 /// The record of where this computer's collection is, in [`DIRECTORY`].
 const RECORD: &str = "sync.json";
@@ -422,6 +423,7 @@ impl SettingsSync {
     /// # Errors
     ///
     /// Returns a local failure when the directory cannot be made.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         data: &Path,
         local: Arc<LocalSettings>,
@@ -430,6 +432,7 @@ impl SettingsSync {
         desk: Arc<crate::drafts::DraftDesk>,
         hosts: Arc<dyn Hosts>,
         ceremony: Arc<dyn Ceremony>,
+        fence: Arc<Fence>,
     ) -> Result<Self> {
         let directory = data.join(DIRECTORY);
         create_private_directory(&directory)
@@ -440,7 +443,6 @@ impl SettingsSync {
                     "the directory settings sync keeps its records in could not be made: {error}"
                 ))
             })?;
-        let fence = Arc::new(Fence::in_directory(&directory));
         let drafts = Arc::new(super::drafts::DraftsSync::open(
             &directory,
             Arc::clone(&desk),

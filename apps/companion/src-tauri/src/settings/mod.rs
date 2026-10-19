@@ -327,6 +327,9 @@ pub struct Settings {
     local: Arc<LocalSettings>,
     sync: OnceLock<SettingsSync>,
     told: Arc<Told>,
+    /// The revocations this computer sent that settings sync has not taken in. It is here and not
+    /// in settings sync, so that a revocation is held back even where settings sync did not start.
+    fence: Arc<sync::Fence>,
 }
 
 impl Settings {
@@ -337,6 +340,7 @@ impl Settings {
             local: Arc::new(LocalSettings::open(data)),
             sync: OnceLock::new(),
             told: Arc::new(Told::default()),
+            fence: Arc::new(sync::Fence::in_directory(&data.join(sync::DIRECTORY))),
         }
     }
 
@@ -373,6 +377,7 @@ impl Settings {
             desk,
             hosts,
             ceremony,
+            Arc::clone(&self.fence),
         )?;
         let _ = self.sync.set(sync);
         Ok(())
@@ -574,34 +579,17 @@ impl Settings {
 
     /// Holds everything settings sync sends until `devices` are taken out of the shared settings.
     /// A revocation this computer is about to send calls this first and sends nothing when it
-    /// fails. A computer that shares no settings has nothing to hold.
+    /// fails. It holds whether or not settings sync started: the record is a file that a later
+    /// start, or a second companion, reads.
     ///
     /// # Errors
     ///
-    /// Returns why the record could not be written; this process holds the devices all the same.
+    /// Returns why the record could not be written; nothing is held then.
     pub fn hold_for_revocation(
         &self,
         devices: &[kr_protocol::scalars::AuthorisationKey],
     ) -> Result<()> {
-        match self.sync.get() {
-            Some(sync) => sync.hold_for_revocation(devices),
-            None => Ok(()),
-        }
-    }
-
-    /// Lets go of devices held for a revocation that was not sent.
-    ///
-    /// # Errors
-    ///
-    /// Returns why the record could not be written; the devices stay held.
-    pub fn release_revocation(
-        &self,
-        devices: &[kr_protocol::scalars::AuthorisationKey],
-    ) -> Result<()> {
-        match self.sync.get() {
-            Some(sync) => sync.release_revocation(devices),
-            None => Ok(()),
-        }
+        self.fence.raise(devices)
     }
 
     /// Tells settings sync that revocations of `devices` are known here, so that it takes them out

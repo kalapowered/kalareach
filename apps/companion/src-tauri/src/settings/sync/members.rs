@@ -648,46 +648,25 @@ impl SettingsSync {
             .map(|_| ())
     }
 
-    /// Holds everything settings sync sends until `devices` are taken out, and says whether it
-    /// could write that down. A revocation this computer is about to send calls this first and
-    /// sends nothing when it fails.
+    /// Takes devices whose revocation is known here out of the shared settings, as far as the hosts
+    /// and the service allow.
+    ///
+    /// The devices are held before anything else is done (already, for a revocation this computer
+    /// sent; here, from memory if the record cannot be written, for a device found revoked at a
+    /// host): a step in hand may be waiting on the network and holds the membership meanwhile, so
+    /// the membership takes them in under a step of its own, after it. One call for all the devices
+    /// of one view makes one removal step. A call that is dropped, or fails, leaves them held, and
+    /// the next step of any companion takes them in.
+    ///
+    /// Says whether none of the devices is held any longer, which is so when a step took them in.
+    /// A computer that shares no settings has none to take them out of, and says no.
     ///
     /// # Errors
     ///
-    /// Returns why the record could not be written; this process holds the devices all the same.
-    pub fn hold_for_revocation(&self, devices: &[AuthorisationKey]) -> Result<()> {
-        self.fence.raise(devices)
-    }
-
-    /// Lets go of devices held for a revocation that was not sent.
-    ///
-    /// # Errors
-    ///
-    /// Returns why the record could not be written; the devices stay held.
-    pub fn release_revocation(&self, devices: &[AuthorisationKey]) -> Result<()> {
-        self.fence.lift(devices)
-    }
-
-    /// Records that revocations of `devices` are known here, and carries out the removals they
-    /// require as far as the hosts and the service allow.
-    ///
-    /// The devices are held before anything else is done ([`Self::hold_for_revocation`], again
-    /// here for a device found revoked at a host): a step in hand may be waiting on the network and
-    /// holds the membership meanwhile, so the membership takes them in under a step of its own,
-    /// after it. One call for all the devices of one view makes one removal step. A call that is
-    /// dropped, or fails, leaves them held, and the next step of any companion takes them in.
-    ///
-    /// Says whether the membership took them in: a computer that shares no settings has none to
-    /// take them in.
-    ///
-    /// # Errors
-    ///
-    /// Returns what stopped the step before it could try: the step's lock or the record of the
-    /// collection could not be used, with the devices held all the same.
+    /// Returns what stopped the step before it could try: its lock or the record of the collection
+    /// could not be used, with the devices held all the same.
     pub async fn revocations_sent(&self, devices: &[AuthorisationKey]) -> Result<bool> {
-        // A record that cannot be written holds this process, and the step takes the devices in
-        // from memory.
-        let _ = self.fence.raise(devices);
+        self.fence.raise_regardless(devices);
         let _step = self.step().await?;
         let Some(mut record) = self.record()? else {
             self.fence.lift(devices)?;

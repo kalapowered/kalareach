@@ -8,6 +8,12 @@
 //! sealed under a key the device holds, so the record comes first and is forgotten once the
 //! membership has taken the revocation in.
 //!
+//! **A record is only ever taken in, never taken back.** What becomes of a request after the record
+//! is written is not always known here: a reply can be lost after a host acted, and two requests
+//! can name one device. So a failed request does not lift its record: the device stays out of the
+//! shared settings, and the person revokes it again or shares with it again by pairing it anew.
+//! Nothing lets go of a record but the step that has taken it into the membership.
+//!
 //! The record is a file beside the other records of settings sync, so it is kept across a restart
 //! and seen by a second companion over the same data directory: each step takes in what it finds
 //! there, whoever wrote it, before it reconciles. Settings and drafts both ask [`Fence`], as a
@@ -22,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use kr_client::sync::PublishGate;
-use kr_ipc::paths::{read_owner_only_file, write_owner_only_file};
+use kr_ipc::paths::{create_private_directory, read_owner_only_file, write_owner_only_file};
 use kr_protocol::scalars::AuthorisationKey;
 
 use crate::error::{CommandError, Result};
@@ -48,7 +54,7 @@ pub struct Fence {
 impl Fence {
     /// The record kept in `directory`.
     #[must_use]
-    pub fn in_directory(directory: &Path) -> Self {
+    pub(in crate::settings) fn in_directory(directory: &Path) -> Self {
         Self {
             directory: directory.to_path_buf(),
             held: Mutex::new(BTreeSet::new()),
@@ -80,6 +86,12 @@ impl Fence {
 
     /// Changes the file under its lock.
     fn change(&self, change: impl FnOnce(&mut BTreeSet<AuthorisationKey>)) -> Result<()> {
+        create_private_directory(&self.directory).map_err(|error| {
+            CommandError::local_failure(format!(
+                "this computer's record of revocations not yet taken in could not be made: \
+                 {error}"
+            ))
+        })?;
         let _lock = crate::settings::locked_file(&self.directory.join(LOCK)).map_err(|error| {
             CommandError::local_failure(format!(
                 "this computer's record of revocations not yet taken in could not be locked: \
@@ -105,24 +117,33 @@ impl Fence {
         })
     }
 
-    /// Holds everything sent until `devices` are recorded as revoked. Nothing here can undo it
-    /// except [`Self::lift`]: a record that cannot be written leaves this process holding its own,
-    /// and the error says so.
+    /// Holds everything sent until `devices` are taken out of the shared settings, for a revocation
+    /// this computer is about to send. All or nothing: a record that cannot be written holds
+    /// nothing, and the revocation is not sent.
     ///
     /// # Errors
     ///
     /// Returns why the record could not be written.
-    pub fn raise(&self, devices: &[AuthorisationKey]) -> Result<()> {
+    pub(in crate::settings) fn raise(&self, devices: &[AuthorisationKey]) -> Result<()> {
+        self.change(|kept| kept.extend(devices.iter().copied()))?;
         self.held().extend(devices.iter().copied());
-        self.change(|kept| kept.extend(devices.iter().copied()))
+        Ok(())
     }
 
-    /// Lets go of `devices`, whose revocation the membership has recorded.
+    /// Holds everything sent until `devices` are taken out of the shared settings, for devices a
+    /// host has revoked already: the revocation has happened, so this process holds them from
+    /// memory when the record cannot be written, and writes them down when it can.
+    pub(super) fn raise_regardless(&self, devices: &[AuthorisationKey]) {
+        self.held().extend(devices.iter().copied());
+        let _ = self.change(|kept| kept.extend(devices.iter().copied()));
+    }
+
+    /// Lets go of `devices`, which the membership has taken in.
     ///
     /// # Errors
     ///
     /// Returns why the record could not be written; the devices stay held.
-    pub fn lift(&self, devices: &[AuthorisationKey]) -> Result<()> {
+    pub(super) fn lift(&self, devices: &[AuthorisationKey]) -> Result<()> {
         self.change(|kept| {
             for device in devices {
                 kept.remove(device);
@@ -171,5 +192,40 @@ impl Fence {
 impl PublishGate for Fence {
     fn is_open(&self) -> bool {
         !self.is_raised()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(byte: u8) -> AuthorisationKey {
+        AuthorisationKey::from_bytes([byte; 32])
+    }
+
+    /// A revocation this computer is about to send is held in full or not at all: a record that
+    /// cannot be written holds nothing, since the request is not sent, and what is not sent must
+    /// not leave the device out of the shared settings.
+    #[test]
+    fn a_hold_that_cannot_be_written_holds_nothing() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let kept = directory.path().join("settings-sync");
+        let fence = Fence::in_directory(&kept);
+        kr_ipc::paths::create_private_directory(&kept).expect("the directory");
+        std::fs::create_dir(kept.join(FILE)).expect("an obstacle where the record would be");
+
+        fence
+            .raise(&[key(7)])
+            .expect_err("the record cannot be written");
+        std::fs::remove_dir(kept.join(FILE)).expect("the obstacle goes");
+
+        assert!(!fence.is_raised(), "nothing is held");
+        assert!(fence.pending().expect("readable").is_empty());
+        fence
+            .raise(&[key(7)])
+            .expect("the record can be written now");
+        assert!(fence.is_raised());
+        assert!(fence.holds_none_of(&[key(8)]));
+        assert!(!fence.holds_none_of(&[key(7)]));
     }
 }

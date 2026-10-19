@@ -337,6 +337,18 @@ impl Host {
     }
 }
 
+/// A request made ready to leave.
+enum Prepared {
+    /// To the host on this computer, over a connection it admits now.
+    Direct(Connection),
+    /// To a host's feed.
+    Feed {
+        client: Box<AuthorityFeedClient>,
+        feed: KeyId,
+        request: kr_protocol::pairing::RevocationRequest,
+    },
+}
+
 /// What a digest of `parts` is called to the page: its first twelve bytes in hexadecimal.
 fn digest(parts: &[&[u8]]) -> String {
     let mut hash = sha2::Sha256::new();
@@ -725,6 +737,9 @@ impl Revocations {
             self.confirmed(&format!("Revoke {} on {}", chosen.name, host_now.name))
                 .await?;
         }
+        // What can fail without a request having left is done first, so that nothing after the
+        // hold is known not to have left.
+        let prepared = self.prepare(&found, context, &summary).await?;
         // Settings sync holds everything it sends before the request leaves, so that nothing is
         // sealed under a key the device holds from the moment the host acts. A record that cannot
         // be written sends nothing.
@@ -744,40 +759,84 @@ impl Revocations {
                 ))
             })?;
         }
-        let sent = self.send(&found, context, &summary).await;
-        match (&sent, settings) {
-            // Told at once, and not at the end of the view that follows, which waits for every
-            // host and every feed.
-            (Ok(()), Some(_)) => self.tell(context, keys),
-            // Nothing is known to have left. If the host acted all the same, the next view finds
-            // the device listed as revoked and tells settings sync then.
-            (Err(_), Some(settings)) => {
-                let _ = settings.release_revocation(&keys);
-            }
-            _ => {}
+        let sent = self.dispatch(prepared, &summary).await;
+        // Told at once, and not at the end of the view that follows, which waits for every host and
+        // every feed. A request that failed may have reached its host all the same, a reply being
+        // lost, so it is told as one that left: the device is out of the shared settings.
+        if settings.is_some() {
+            self.tell(context, keys);
         }
-        sent?;
-        Ok(self.view(context).await)
+        match sent {
+            Ok(()) => Ok(self.view(context).await),
+            Err(mut error) if settings.is_some() => {
+                error.message.push_str(
+                    " This computer no longer shares its settings with that device, because the \
+                     request may have reached the host.",
+                );
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
-    /// Sends the request for `device` to `host`.
-    async fn send(&self, host: &Host, context: &Context, device: &DeviceSummary) -> Result<()> {
+    /// Does what a request needs before it leaves and that can fail without it having left.
+    async fn prepare(
+        &self,
+        host: &Host,
+        context: &Context,
+        device: &DeviceSummary,
+    ) -> Result<Prepared> {
         match host {
             Host::Local(connection) => {
                 // The host withdraws the connections it admitted before each revocation, and the
                 // person took their time: the revocation goes over one it admits now.
                 let fresh = tokio::time::timeout(ANSWER_WITHIN, connection.another()).await;
-                let over = match fresh {
+                Ok(Prepared::Direct(match fresh {
                     Ok(Ok(fresh)) => fresh,
                     _ => connection.clone(),
-                };
-                self.revoke_direct(&over, device).await
+                }))
             }
             Host::Paired(paired) => {
                 let origin = context.origin.as_ref().ok_or_else(|| {
                     CommandError::refused("this computer has no sync service to publish at")
                 })?;
-                self.publish(origin, paired, device).await
+                let request = kr_pairing::grants::sign_revocation_request(
+                    &self.device.identity().keys.authorisation,
+                    RevocationRequestId::new(kr_ipc::new_uuid()),
+                    paired.device_id,
+                    paired.host_device_id,
+                    RevocationTarget::Devices {
+                        device_ids: CanonicalSet::from_iter([device.device_id]),
+                    },
+                    now(),
+                )
+                .map_err(|error| {
+                    CommandError::local_failure(format!("the request could not be signed: {error}"))
+                })?;
+                Ok(Prepared::Feed {
+                    client: Box::new(self.feed_client(origin)?),
+                    feed: feed_of(paired),
+                    request,
+                })
+            }
+        }
+    }
+
+    /// Sends what [`Self::prepare`] made ready. From here a failure says nothing of whether the
+    /// request left.
+    async fn dispatch(&self, prepared: Prepared, device: &DeviceSummary) -> Result<()> {
+        match prepared {
+            Prepared::Direct(over) => self.revoke_direct(&over, device).await,
+            Prepared::Feed {
+                client,
+                feed,
+                request,
+            } => {
+                client
+                    .publish(feed, &request, None)
+                    .await
+                    .map_err(CommandError::from)?;
+                Ok(())
             }
         }
     }
@@ -835,33 +894,6 @@ impl Revocations {
             },
         };
         self.memory().direct.insert(device.device_id, answer);
-        Ok(())
-    }
-
-    /// Signs a request for `device` on `host` and publishes it in the host's feed.
-    async fn publish(
-        &self,
-        origin: &GatewayOrigin,
-        host: &PairedHost,
-        device: &DeviceSummary,
-    ) -> Result<()> {
-        let request = kr_pairing::grants::sign_revocation_request(
-            &self.device.identity().keys.authorisation,
-            RevocationRequestId::new(kr_ipc::new_uuid()),
-            host.device_id,
-            host.host_device_id,
-            RevocationTarget::Devices {
-                device_ids: CanonicalSet::from_iter([device.device_id]),
-            },
-            now(),
-        )
-        .map_err(|error| {
-            CommandError::local_failure(format!("the request could not be signed: {error}"))
-        })?;
-        self.feed_client(origin)?
-            .publish(feed_of(host), &request, None)
-            .await
-            .map_err(CommandError::from)?;
         Ok(())
     }
 }

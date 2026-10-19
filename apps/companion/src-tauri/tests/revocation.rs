@@ -771,17 +771,20 @@ async fn the_host_on_this_computer_takes_the_revocation_itself_and_its_answer_is
 }
 
 /// Settings sync holds everything it sends before a revocation leaves, so a revocation whose hold
-/// cannot be written down is not sent.
+/// cannot be written down is not sent, and one whose hold is written down is, whether or not
+/// settings sync started.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revocation_whose_hold_on_settings_sync_cannot_be_written_down_is_not_sent() {
+    // Settings sync did not start on this computer: the hold is a file all the same.
     let rig = Rig::start().await;
-    rig.with_settings_sync().await;
     let view = rig.view().await;
     let host = host_by(&view, "feed");
     let phone = the_phone(&host);
+    let held = rig.data.path().join("settings-sync").join("revoking.json");
     // A directory where the record would be, so that it can be neither read nor written.
-    std::fs::create_dir(rig.data.path().join("settings-sync").join("revoking.json"))
-        .expect("the obstacle");
+    kr_ipc::paths::create_private_directory(held.parent().expect("a directory"))
+        .expect("the directory settings sync keeps its records in");
+    std::fs::create_dir(&held).expect("the obstacle");
 
     let refused = rig
         .revoke(
@@ -791,11 +794,53 @@ async fn a_revocation_whose_hold_on_settings_sync_cannot_be_written_down_is_not_
         .expect_err("nothing leaves unless settings sync is held back first");
     assert_eq!(refused["code"], "RESOURCE_UNAVAILABLE", "{refused}");
     assert_eq!(rig.publications(), 0, "no request was published");
-    assert_eq!(
-        phone_state(&rig.view().await, "feed"),
-        "active",
-        "and nothing is said to have been asked"
+    std::fs::remove_dir(&held).expect("the obstacle goes");
+
+    rig.revoke(
+        host["reference"].as_str().expect("a reference"),
+        phone["reference"].as_str().expect("a reference"),
+    )
+    .expect("the hold is written down, and the request is published");
+    assert_eq!(rig.publications(), 1);
+    let record: Vec<String> =
+        serde_json::from_slice(&std::fs::read(&held).expect("the record")).expect("a list");
+    assert_eq!(record.len(), 1, "the device is held: {record:?}");
+}
+
+/// A request the service stored and answered that it cannot say whether it took effect may have
+/// reached the host, so the device is out of the shared settings all the same, and the person is
+/// told so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_whose_outcome_is_not_known_still_takes_the_device_out_of_the_settings() {
+    let rig = Rig::start().await;
+    rig.with_settings_sync().await;
+    let view = rig.view().await;
+    let host = host_by(&view, "feed");
+    let phone = the_phone(&host);
+    let body = json!({ "host": host["reference"], "device": phone["reference"] });
+    let (shown, release) = rig.ceremony.hold_the_dialog();
+    let call = rig.app.start_call("revocation_revoke", body);
+    tokio::time::timeout(WATCHDOG, shown.notified())
+        .await
+        .expect("the dialog is shown");
+    // The host has read its feed by now, so the next request to the feed is the publication.
+    rig.host_polls().await;
+    rig.served.web().fail(AUTHORITY, 1, Moment::ActedAndUnknown);
+    release.notify_one();
+
+    let lost = tokio::time::timeout(WATCHDOG, call)
+        .await
+        .expect("the call ends")
+        .expect("the call ends")
+        .expect_err("the service could not say whether it took effect");
+    assert_eq!(rig.publications(), 1, "the service stored the request");
+    assert!(
+        lost["message"]
+            .as_str()
+            .is_some_and(|words| words.contains("no longer shares its settings")),
+        "the person is told what became of the settings: {lost}"
     );
+    rig.settings_sync_hears_of(&rig.phone).await;
 }
 
 /// The host on this computer takes a revocation and answers, and the view that follows cannot list
