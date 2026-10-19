@@ -945,8 +945,9 @@ impl ServiceWeb {
                 token: token.map(str::to_owned),
                 content: content.map(<[u8]>::to_vec),
                 // The kind and the key are read on their own: the typed signature of
-                // `kr_protocol::service` names only the methods of the host protocol, and a relay
-                // route's request, signed all the same, would not parse as one.
+                // `kr_protocol::service` names a method of the protocol's registry, which has no
+                // relay route's method, so a relay route's request, signed all the same, would not
+                // parse as one.
                 signed_by: serde_json::from_value::<ServiceRequestSigner>(
                     document["signature"]["signer"].clone(),
                 )
