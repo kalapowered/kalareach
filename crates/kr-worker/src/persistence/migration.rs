@@ -129,7 +129,10 @@ pub const IMPORTER: &str =
 /// For an older version this is what the *first* build recording it created, because a version
 /// covered several builds and a later one added tables the earlier stores never had: requiring
 /// those would report a loss where there was none. For the current version it is the whole
-/// schema, because one build writes it.
+/// schema, because one build writes it, except for the `session_root` table: it was added without
+/// raising the version, so that a release that reads this version reads the journals of this one,
+/// and a journal an earlier build of the version wrote does not have it. It is created when
+/// absent and never required.
 #[must_use]
 pub fn tables_at(version: i64) -> &'static [&'static str] {
     match version {

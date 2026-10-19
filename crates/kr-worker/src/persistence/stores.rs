@@ -311,6 +311,18 @@ pub static STORES: &[StoreDescriptor] = &[
         served_by_archive: true,
     },
     StoreDescriptor {
+        name: "session_root",
+        holds: "what the session's root is where it is not a shell, kept beside the summary and not in it so a release that does not know the word reads the summary",
+        durability: Durability::CrashDurable,
+        retention: Retention::SessionLifetime,
+        content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::ArchiveService,
+        reconciliation: Reconciliation::ReadBack,
+        evictable_under_history_cap: false,
+        served_by_archive: true,
+    },
+    StoreDescriptor {
         name: "closure",
         holds: "the final closure record, with terminated identities and the coverage flag",
         durability: Durability::CrashDurable,

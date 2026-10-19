@@ -1460,6 +1460,9 @@ fn the_importer_brings_a_version_one_journal_to_the_current_version_once() {
             .iter()
             .map(|name| (*name).to_owned())
             .collect();
+        // The one table the version's list leaves out because journals of the version are read
+        // with or without it.
+        current.push("session_root".to_owned());
         current.sort();
         assert_eq!(
             tables, current,
