@@ -18,13 +18,14 @@
 
 #![cfg(unix)]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use kr_ipc::client::LocalClient;
 use kr_protocol::admission::ComponentState;
 use kr_protocol::envelope::{ActionTarget, ControlFrame, Outcome, ParamsValue};
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{ActionId, RequestId};
+use kr_protocol::ids::{ActionId, ControllerGeneration, RequestId};
 use kr_protocol::local::ControllerConnectionRole;
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::receipt::{ActionCancelParams, ActionReadParams, ActionReadResult};
@@ -393,61 +394,41 @@ async fn kr_req_23_30_an_authority_revision_announced_while_the_component_prepar
     );
 }
 
-/// KR-REQ-23.30 and KR-REQ-09.12: an action the daemon forwarded for a paired device, revoked
-/// while its component prepares it, is answered to the daemon with the rejected receipt, and
-/// nothing is written to the upstream.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_23_30_a_forwarded_action_revoked_while_the_component_prepared_is_answered_with_its_receipt()
- {
-    let Some(acting) = Acting::start().await else {
-        return;
-    };
-    // The daemon forwards a paired device's action over a proxy of that device's own, and announces
-    // authority revisions over its authority connection.
-    let mut proxy = acting
-        .hosted
-        .daemon_connection(ControllerConnectionRole::Proxy)
-        .await;
-    let mut authority = acting
-        .hosted
-        .daemon_connection(ControllerConnectionRole::Authority)
-        .await;
-    let device = kr_protocol::actor::ActorEnvelope {
+/// A paired device, as the daemon vouches for it to a worker whose daemon is of `generation`, with
+/// a grant it checked at authority revision 1.
+fn a_paired_device(generation: ControllerGeneration) -> kr_protocol::actor::ActorEnvelope {
+    kr_protocol::actor::ActorEnvelope {
         actor_id: kr_protocol::ids::ActorId::new("device:a-test-phone").expect("an actor"),
         ingress: kr_protocol::actor::ActorIngress::PairedDevice,
         device_id: Nullable::some(kr_protocol::ids::DeviceId::new(Uuid::from_bytes([9; 16]))),
         grant_id: Nullable::some(kr_protocol::ids::GrantId::new(Uuid::from_bytes([8; 16]))),
         grant_revision: Nullable::some(kr_protocol::ids::AuthorityRevision::new(1)),
-        controller_generation: acting.hosted.controller_generation,
+        controller_generation: generation,
         connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([7; 16])),
-    };
-    let mutation = acting.invocation(&proxy, "turn.cancel", b"{}");
-    let request_id = mutation.request_id.get();
-    let action_id = mutation.action_id;
-    let host = acting.stop_host();
-    proxy
-        .send(&ControlFrame::Forwarded(Box::new(
-            kr_protocol::local::ForwardedMutation {
-                mutation,
-                actor: device.clone(),
-                grant_rights: [kr_protocol::rights::ActionRight::AgentCancel]
-                    .into_iter()
-                    .collect(),
-                accepted_deadline_boot_ms: kr_protocol::scalars::U64::new(
-                    kr_ipc::clock::boot_elapsed_ms() + 30_000,
-                ),
-                history: None,
-                screen_basis: None,
-                workflow_run_id: None,
-                lease: None,
-            },
-        )))
+    }
+}
+
+/// The daemon's announcement to the worker of authority revision `revision`, over its authority
+/// connection, which the worker acknowledges.
+async fn announce(authority: &mut kr_ipc::client::BoundLink, acting: &Acting, revision: u64) {
+    authority
+        .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
+            environment_id: acting.hosted.environment_id,
+            revision: kr_protocol::ids::AuthorityRevision::new(revision),
+            reach: kr_protocol::worker::RevisionReach::Host,
+            evidence_from: 0,
+        })
         .await
-        .expect("writes the forwarded mutation");
-    // The action is accepted and being prepared when the daemon revokes what its device held: it
-    // announces the next authority revision over the connection it holds the worker's authority
-    // by. The device reads its own receipt through the daemon to know.
-    let mut accepted = false;
+        .expect("the worker installs the revision");
+}
+
+/// Reads `action_id`'s receipt for the device over its proxy until it is `accepted`, which is
+/// when the daemon's action is waiting for its component.
+async fn until_the_devices_action_is_accepted(
+    proxy: &mut kr_ipc::client::BoundLink,
+    device: &kr_protocol::actor::ActorEnvelope,
+    action_id: ActionId,
+) {
     for _ in 0..2_400 {
         proxy
             .send(&ControlFrame::ForwardedRead(Box::new(
@@ -469,7 +450,7 @@ async fn kr_req_23_30_a_forwarded_action_revoked_while_the_component_prepared_is
             )))
             .await
             .expect("writes the read");
-        if let Outcome::Ok(value) = answer(&mut proxy, Some(900)).await
+        if let Outcome::Ok(value) = answer(proxy, Some(900)).await
             && value
                 .to_typed::<ActionReadResult>()
                 .expect("decodes")
@@ -477,21 +458,64 @@ async fn kr_req_23_30_a_forwarded_action_revoked_while_the_component_prepared_is
                 .state
                 == ReceiptState::Accepted
         {
-            accepted = true;
-            break;
+            return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(accepted, "the forwarded action was never accepted");
-    authority
-        .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
-            environment_id: acting.hosted.environment_id,
-            revision: kr_protocol::ids::AuthorityRevision::new(2),
-            reach: kr_protocol::worker::RevisionReach::Host,
-            evidence_from: 0,
-        })
+    panic!("the forwarded action was never accepted");
+}
+
+/// KR-REQ-23.30 and KR-REQ-09.12: an action the daemon forwarded for a paired device, revoked
+/// while its component prepares it, is answered to the daemon with the rejected receipt, and
+/// nothing is written to the upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_30_a_forwarded_action_revoked_while_the_component_prepared_is_answered_with_its_receipt()
+ {
+    let Some(acting) = Acting::start().await else {
+        return;
+    };
+    // The daemon forwards a paired device's action over a proxy of that device's own, and announces
+    // authority revisions over its authority connection.
+    let mut proxy = acting
+        .hosted
+        .daemon_connection(ControllerConnectionRole::Proxy)
+        .await;
+    let mut authority = acting
+        .hosted
+        .daemon_connection(ControllerConnectionRole::Authority)
+        .await;
+    let device = a_paired_device(acting.hosted.controller_generation);
+    // The worker has acknowledged the revision the device's grant was checked at, as a daemon
+    // makes sure of before it takes the lease the action travels with.
+    announce(&mut authority, &acting, 1).await;
+    let mutation = acting.invocation(&proxy, "turn.cancel", b"{}");
+    let request_id = mutation.request_id.get();
+    let action_id = mutation.action_id;
+    let host = acting.stop_host();
+    proxy
+        .send(&ControlFrame::Forwarded(Box::new(
+            kr_protocol::local::ForwardedMutation {
+                mutation,
+                actor: device.clone(),
+                grant_rights: [kr_protocol::rights::ActionRight::AgentCancel]
+                    .into_iter()
+                    .collect(),
+                accepted_deadline_boot_ms: kr_protocol::scalars::U64::new(
+                    kr_ipc::clock::boot_elapsed_ms() + 30_000,
+                ),
+                history: None,
+                screen_basis: None,
+                workflow_run_id: None,
+                lease: Some(a_lease(&acting, 1, 5_000)),
+            },
+        )))
         .await
-        .expect("the worker installs the revision");
+        .expect("writes the forwarded mutation");
+    // The action is accepted and being prepared when the daemon revokes what its device held: it
+    // announces the next authority revision over the connection it holds the worker's authority
+    // by. The device reads its own receipt through the daemon to know.
+    until_the_devices_action_is_accepted(&mut proxy, &device, action_id).await;
+    announce(&mut authority, &acting, 2).await;
     signal(&host, rustix::process::Signal::CONT);
     // A retained answer, which the daemon holds back from a device whose authority has moved: a
     // plain response would reach the device unchecked.
@@ -513,6 +537,126 @@ async fn kr_req_23_30_a_forwarded_action_revoked_while_the_component_prepared_is
         format!("{:?}", value.as_value()).contains("rejected"),
         "{value:?}"
     );
+    assert!(
+        acting.frames().is_empty(),
+        "nothing was written to the upstream: {:?}",
+        acting.frames()
+    );
+}
+
+/// A remote dispatch lease of the worker's generation for revision `revision` that ends `ms` from
+/// now on the machine's clock.
+fn a_lease(acting: &Acting, revision: u64, ms: u64) -> kr_protocol::local::ForwardedLease {
+    kr_protocol::local::ForwardedLease {
+        lease_id: kr_protocol::ids::RemoteDispatchLeaseId::new(kr_ipc::new_uuid()),
+        controller_generation: acting.hosted.controller_generation,
+        authority_revision: kr_protocol::ids::AuthorityRevision::new(revision),
+        deadline_boot_ms: kr_protocol::scalars::U64::new(kr_ipc::clock::boot_elapsed_ms() + ms),
+    }
+}
+
+/// KR-REQ-09.10: the lease a paired device's action was accepted under is checked again when it
+/// comes back from its component. The lease ends while the component prepares the action, the
+/// accepted deadline is still thirty seconds off, and the worker rejects the action as expired
+/// without a dispatch marker and writes nothing to the upstream.
+///
+/// The worker's deadlines are measured on a clock the test moves, so the lease ends because the
+/// test moved the clock past it and not because the test waited for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_09_10_a_lease_that_ends_while_the_component_prepared_rejects_the_action() {
+    let clock = kr_transport::clock::ManualClock::new();
+    let Some(acting) = Acting::start_on(Arc::new(clock.clone())).await else {
+        return;
+    };
+    let mut proxy = acting
+        .hosted
+        .daemon_connection(ControllerConnectionRole::Proxy)
+        .await;
+    let mut authority = acting
+        .hosted
+        .daemon_connection(ControllerConnectionRole::Authority)
+        .await;
+    let device = a_paired_device(acting.hosted.controller_generation);
+    announce(&mut authority, &acting, 1).await;
+    let mutation = acting.invocation(&proxy, "turn.cancel", b"{}");
+    let request_id = mutation.request_id.get();
+    let action_id = mutation.action_id;
+    let host = acting.stop_host();
+    proxy
+        .send(&ControlFrame::Forwarded(Box::new(
+            kr_protocol::local::ForwardedMutation {
+                mutation,
+                actor: device.clone(),
+                grant_rights: [kr_protocol::rights::ActionRight::AgentCancel]
+                    .into_iter()
+                    .collect(),
+                accepted_deadline_boot_ms: kr_protocol::scalars::U64::new(
+                    kr_ipc::clock::boot_elapsed_ms() + 30_000,
+                ),
+                history: None,
+                screen_basis: None,
+                // Three seconds, against an accepted deadline of thirty.
+                workflow_run_id: None,
+                lease: Some(a_lease(&acting, 1, 3_000)),
+            },
+        )))
+        .await
+        .expect("writes the forwarded mutation");
+    // The action is accepted, and its lease is good: it waits for its component.
+    until_the_devices_action_is_accepted(&mut proxy, &device, action_id).await;
+    // Only the lease ends: the clock passes it, and the accepted deadline has twenty-six seconds.
+    clock.advance(Duration::from_secs(4));
+    signal(&host, rustix::process::Signal::CONT);
+    let response = loop {
+        match proxy.recv().await.expect("the worker answers") {
+            ControlFrame::Response(response) if response.request_id.get() == request_id => {
+                break response;
+            }
+            ControlFrame::RetainedResponse(response) if response.request_id.get() == request_id => {
+                panic!("the action was answered from a receipt it should not have: {response:?}");
+            }
+            _ => {}
+        }
+    };
+    let Outcome::Error(error) = response.outcome else {
+        panic!("an action whose lease ended is refused: {response:?}");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+    // Its receipt says it was rejected as expired, and was never dispatched.
+    proxy
+        .send(&ControlFrame::ForwardedRead(Box::new(
+            kr_protocol::local::ForwardedRequest {
+                request: kr_protocol::envelope::Request {
+                    request_id: RequestId::new(901),
+                    method: Method::ActionRead.into(),
+                    method_version: MethodVersion::V1,
+                    params: ParamsValue::from_typed(&ActionReadParams {
+                        action_id,
+                        session_id: None,
+                    })
+                    .expect("encodes"),
+                },
+                actor: device,
+                authority_deadline_boot_ms: Nullable::null(),
+                history: None,
+            },
+        )))
+        .await
+        .expect("writes the read");
+    let Outcome::Ok(read) = answer(&mut proxy, Some(901)).await else {
+        panic!("the device reads its own receipt");
+    };
+    let receipt = read
+        .to_typed::<ActionReadResult>()
+        .expect("decodes")
+        .receipt;
+    assert_eq!(receipt.state, ReceiptState::Rejected, "{receipt:?}");
+    assert_eq!(
+        receipt.reason.as_ref(),
+        Some(&kr_protocol::receipt::RejectionReason::Expired),
+        "{receipt:?}"
+    );
+    assert!(!receipt.state.has_dispatch_marker());
     assert!(
         acting.frames().is_empty(),
         "nothing was written to the upstream: {:?}",

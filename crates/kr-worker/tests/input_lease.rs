@@ -4930,6 +4930,17 @@ impl Proxied {
         })
         .await
         .expect("the worker accepts the generation");
+        // What the daemon does before it forwards a device's mutation: the worker acknowledges the
+        // revision, over the authority connection.
+        common::announced_over_a_link_of_its_own(
+            &wired.endpoint,
+            &wired.controller,
+            &wired.boot,
+            wired.environment_id,
+            1,
+            1,
+        )
+        .await;
         let actor = kr_protocol::actor::ActorEnvelope {
             actor_id: kr_protocol::ids::ActorId::new("device:phone").expect("an actor"),
             ingress: ActorIngress::PairedDevice,
@@ -4990,7 +5001,7 @@ impl Proxied {
                 &self.actor,
                 &self.rights(),
                 Self::deadline(),
-                None,
+                Some(common::a_lease(1, 1)),
             )
             .await
             .expect("reaches the worker")
@@ -5043,7 +5054,7 @@ impl Proxied {
                     history: None,
                     screen_basis: None,
                     workflow_run_id: None,
-                    lease: None,
+                    lease: Some(common::a_lease(1, 1)),
                 },
             )))
             .await

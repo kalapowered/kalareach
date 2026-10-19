@@ -88,6 +88,13 @@ pub enum WorkerError {
         /// Which part of the binding failed.
         detail: String,
     },
+    /// A paired device's dispatch holds no lease from the controller generation this worker
+    /// accepts, for the revision it acknowledged and installed.
+    #[error("{detail}")]
+    DispatchLeaseRefused {
+        /// Which part of the lease the worker could not match.
+        detail: String,
+    },
     /// The freshness window this first admission is bound to is expired or unknown.
     #[error("{detail}")]
     WindowExpired {
@@ -211,6 +218,7 @@ impl WorkerError {
             Self::SessionClosed => ErrorCode::SessionClosed,
             Self::IdConflict { .. } => ErrorCode::IdConflict,
             Self::GenerationFenced { .. }
+            | Self::DispatchLeaseRefused { .. }
             | Self::WindowExpired { .. }
             | Self::PermissionDenied { .. } => ErrorCode::PermissionDenied,
             Self::QuotaExceeded { .. } => ErrorCode::QuotaExceeded,

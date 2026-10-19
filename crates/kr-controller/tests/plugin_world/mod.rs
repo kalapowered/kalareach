@@ -562,11 +562,15 @@ pub enum Epoch {
 /// A daemon, a session whose worker is this process with a shell of its own, and the plugin host
 /// placed where the daemon looks for it, with the epoch running as a shipped host has it.
 pub async fn hosted() -> Hosted {
-    hosted_with(Epoch::Running).await
+    hosted_on(Epoch::Running, None).await
 }
 
-/// [`hosted`], with the plugin host's epoch as `epoch` says.
-pub async fn hosted_with(epoch: Epoch) -> Hosted {
+/// [`hosted`], with the plugin host's epoch as `epoch` says and, where there is a `clock`, the
+/// worker's deadlines measured on it, which the test moves by hand.
+pub async fn hosted_on(
+    epoch: Epoch,
+    clock: Option<Arc<dyn kr_transport::clock::ContinuousClock>>,
+) -> Hosted {
     let tree = kr_ipc::testing::TempHost::create();
     let environment = tree.environment();
     let environment_id = tree.environment_id();
@@ -741,22 +745,24 @@ pub async fn hosted_with(epoch: Epoch) -> Hosted {
         .worker_endpoint(specification.display_number)
         .expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the worker endpoint");
-    let service = Arc::new(
-        WorkerService::new(
-            Arc::clone(&runtime),
-            Arc::clone(&identity),
-            endpoint.clone(),
-            ServiceBinding {
-                environment_id,
-                boot_identity: boot,
-                controller_public_key: specification.controller_public_key,
-                controller_generation: specification.controller_generation,
-                journal_path: Some(journal_path),
-                build_id: build(),
-            },
-        )
-        .expect("a worker service"),
-    );
+    let mut service = WorkerService::new(
+        Arc::clone(&runtime),
+        Arc::clone(&identity),
+        endpoint.clone(),
+        ServiceBinding {
+            environment_id,
+            boot_identity: boot,
+            controller_public_key: specification.controller_public_key,
+            controller_generation: specification.controller_generation,
+            journal_path: Some(journal_path),
+            build_id: build(),
+        },
+    )
+    .expect("a worker service");
+    if let Some(clock) = clock {
+        service = service.on_clock(clock);
+    }
+    let service = Arc::new(service);
     tokio::spawn(Arc::clone(&service).serve(listener));
     let ready = {
         let session = runtime.session();

@@ -515,6 +515,17 @@ impl Wired {
             action_window_id: ActionWindowId::new("forwarded").expect("a window identifier"),
             requested_ttl_ms: kr_protocol::limits::DEFAULT_MUTATION_TTL,
         };
+        // A paired device's dispatch travels with the lease the daemon took for it, for the
+        // revision the grant was checked at, which the test has announced to the worker.
+        let lease = (actor.ingress == ActorIngress::PairedDevice).then(|| {
+            common::a_lease(
+                1,
+                actor
+                    .grant_revision
+                    .as_ref()
+                    .map_or(0, |revision| revision.get()),
+            )
+        });
         within(
             "the worker's answer",
             daemon.forward(
@@ -522,7 +533,7 @@ impl Wired {
                 actor,
                 &rights.iter().copied().collect(),
                 U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000),
-                None,
+                lease,
             ),
         )
         .await
@@ -1369,7 +1380,17 @@ async fn the_local_owner_is_drawn_the_whole_screen_and_a_device_the_live_screen(
         printable(&drawn)
     );
 
-    // A paired device is drawn the screen that is showing, and nothing behind it.
+    // A paired device is drawn the screen that is showing, and nothing behind it. The daemon has
+    // had the worker acknowledge the revision the device's grant was checked at.
+    common::announced_over_a_link_of_its_own(
+        &wired.endpoint,
+        &wired.controller,
+        &wired.boot,
+        wired.environment_id,
+        1,
+        1,
+    )
+    .await;
     let mut phone = wired.daemon(ControllerConnectionRole::Proxy).await;
     let drawn = wired.drawn_for(&mut phone, &device(1), true).await;
     assert!(
@@ -2182,7 +2203,9 @@ async fn a_revision_takes_a_devices_lease_and_leaves_the_local_owners() {
         AttachmentCapability::Input,
     ];
 
-    // A paired device's lease goes with the authority its grant carried.
+    // A paired device's lease goes with the authority its grant carried. The worker has
+    // acknowledged the revision the device's grant was checked at.
+    wired.revise(&mut authority, 1).await;
     let mut phone = wired.daemon(ControllerConnectionRole::Proxy).await;
     let phones = wired
         .attach_for(&mut phone, &device(1), WATCH_AND_TYPE, &observe_and_type)
@@ -2311,7 +2334,12 @@ impl Typing {
     }
 
     /// Takes the lease again at `revision`, which the daemon has validated the phone at by now.
+    ///
+    /// The daemon has the worker acknowledge that revision before it takes the lease the phone's
+    /// dispatch travels with: a revision whose fence the worker ran by itself has been installed
+    /// and not acknowledged, and the daemon's announcement of it again does that.
     async fn takes_the_lease_again(&mut self, revision: u64) {
+        self.wired.revise(&mut self.authority, revision).await;
         self.wired
             .acquire_for(
                 &mut self.phone,

@@ -597,3 +597,91 @@ pub fn bridge_of(stream: kr_worker::broker::Stream) -> Bridge {
         kr_worker::broker::Stream::Pipe(pipe) => pipe,
     }
 }
+
+/// Announces `revision` to the worker over the control daemon's authority connection, which the
+/// worker acknowledges, as the daemon does before it takes a lease for a paired device's dispatch.
+pub async fn announced(
+    daemon: &mut kr_ipc::client::Client<impl kr_ipc::client::Codec>,
+    environment_id: EnvironmentId,
+    revision: u64,
+) {
+    daemon
+        .send(&kr_protocol::envelope::ControlFrame::AuthorityRevision(
+            kr_protocol::worker::AuthorityRevisionNotice {
+                environment_id,
+                revision: kr_protocol::ids::AuthorityRevision::new(revision),
+                reach: kr_protocol::worker::RevisionReach::Host,
+                evidence_from: 0,
+            },
+        ))
+        .await
+        .expect("writes the announcement");
+    loop {
+        match daemon.recv().await.expect("the worker answers") {
+            kr_protocol::envelope::ControlFrame::AuthorityRevisionAck(_) => break,
+            kr_protocol::envelope::ControlFrame::Notification(_)
+            | kr_protocol::envelope::ControlFrame::Event(_) => {}
+            other => panic!("the worker answered {other:?}"),
+        }
+    }
+}
+
+/// What the control daemon's authority connection does before a paired device's dispatch goes over
+/// a proxy of its own: it presents `generation` over a connection of its own, announces `revision`,
+/// and is let go. What the worker acknowledged to the generation stays acknowledged.
+pub async fn announced_over_a_link_of_its_own(
+    endpoint: &kr_ipc::paths::Endpoint,
+    controller: &std::sync::Arc<kr_ipc::verify::ControllerIdentity>,
+    boot: &kr_protocol::identity::BootIdentity,
+    environment_id: EnvironmentId,
+    generation: u64,
+    revision: u64,
+) {
+    let mut daemon = kr_ipc::client::BoundLink::connect(
+        endpoint,
+        kr_protocol::ids::BuildId::new("kr-test/0").expect("a build identifier"),
+    )
+    .await
+    .expect("connects as the daemon");
+    let identity = std::sync::Arc::clone(controller);
+    let boot = boot.clone();
+    daemon
+        .present_generation(move |nonce| {
+            identity
+                .generation_token(
+                    kr_protocol::ids::ControllerGeneration::new(generation),
+                    &boot,
+                    nonce,
+                )
+                .map_err(kr_ipc::IpcError::from)
+        })
+        .await
+        .expect("the worker accepts the generation");
+    announced(&mut daemon, environment_id, revision).await;
+}
+
+/// A lease of `generation` for `revision` that ends five seconds from now: what a paired device's
+/// dispatch travels with once the worker has acknowledged the revision.
+///
+/// A worker holds a remote dispatch to a lease it can match to what it has acknowledged and
+/// installed, so a test that forwards a paired device's mutation by hand announces first
+/// ([`announced`]) and sends the lease beside the mutation.
+pub fn a_lease(generation: u64, revision: u64) -> kr_protocol::local::ForwardedLease {
+    kr_protocol::local::ForwardedLease {
+        lease_id: kr_protocol::ids::RemoteDispatchLeaseId::new(kr_ipc::new_uuid()),
+        controller_generation: kr_protocol::ids::ControllerGeneration::new(generation),
+        authority_revision: kr_protocol::ids::AuthorityRevision::new(revision),
+        deadline_boot_ms: kr_protocol::scalars::U64::new(kr_ipc::clock::boot_elapsed_ms() + 5_000),
+    }
+}
+
+/// [`announced`], and a lease of `generation` for what it announced.
+pub async fn a_lease_after_the_announcement(
+    daemon: &mut kr_ipc::client::Client<impl kr_ipc::client::Codec>,
+    environment_id: EnvironmentId,
+    generation: u64,
+    revision: u64,
+) -> kr_protocol::local::ForwardedLease {
+    announced(daemon, environment_id, revision).await;
+    a_lease(generation, revision)
+}

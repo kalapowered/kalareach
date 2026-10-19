@@ -3009,6 +3009,18 @@ async fn forwarded_outcome_for_device<T: serde::Serialize>(
             [7; 16],
         )),
     };
+    // What the daemon does before it forwards a device's mutation: the worker acknowledges the
+    // revision the grant was validated at, over the authority connection.
+    common::announced_over_a_link_of_its_own(
+        &host.endpoint,
+        &host.controller,
+        &host.boot,
+        host.environment_id,
+        1,
+        1,
+    )
+    .await;
+    let lease = common::a_lease(1, 1);
     let frame = ControlFrame::Forwarded(Box::new(kr_protocol::local::ForwardedMutation {
         mutation: MutationRequest {
             request_id,
@@ -3033,7 +3045,7 @@ async fn forwarded_outcome_for_device<T: serde::Serialize>(
         history: None,
         screen_basis: basis,
         workflow_run_id: None,
-        lease: None,
+        lease: Some(lease),
     }));
     client.send(&frame).await.expect("writes the request");
     loop {

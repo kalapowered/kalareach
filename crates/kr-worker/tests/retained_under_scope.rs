@@ -306,6 +306,14 @@ async fn forward<T: serde::Serialize>(
 ) -> Result<ParamsValue, ProtocolError> {
     let mutation = mutation_of(host, action_id, method, params);
     let request_id = mutation.request_id;
+    // A device's dispatch travels with the lease the daemon took for it, after the worker has
+    // acknowledged the revision over the daemon's authority connection.
+    let lease = if actor.ingress == ActorIngress::PairedDevice {
+        common::announced(daemon, host.environment_id, 1).await;
+        Some(common::a_lease(1, 1))
+    } else {
+        None
+    };
     let frame = ControlFrame::Forwarded(Box::new(ForwardedMutation {
         mutation,
         actor: actor.clone(),
@@ -314,7 +322,7 @@ async fn forward<T: serde::Serialize>(
         history: grant.history.clone(),
         screen_basis: None,
         workflow_run_id: None,
-        lease: None,
+        lease,
     }));
     exchange(daemon, frame, request_id).await
 }

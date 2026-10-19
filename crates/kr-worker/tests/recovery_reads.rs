@@ -521,6 +521,7 @@ async fn forwarded_mutation<T: serde::Serialize>(
     params: &T,
 ) -> Result<ParamsValue, ProtocolError> {
     let request_id = next_request();
+    let lease = common::a_lease_after_the_announcement(daemon, host.environment_id, 1, 1).await;
     let mutation = ControlFrame::Forwarded(Box::new(kr_protocol::local::ForwardedMutation {
         mutation: kr_protocol::envelope::MutationRequest {
             request_id,
@@ -541,7 +542,7 @@ async fn forwarded_mutation<T: serde::Serialize>(
         history: None,
         screen_basis: None,
         workflow_run_id: None,
-        lease: None,
+        lease: Some(lease),
     }));
     within("the worker's answer", async {
         daemon.send(&mutation).await.expect("writes the mutation");

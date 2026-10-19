@@ -674,6 +674,17 @@ impl Viewer {
         )
         .await
         .expect("the worker accepts the generation");
+        // What the daemon does before it forwards a device's mutation: the worker acknowledges the
+        // revision the grant was validated at.
+        common::announced_over_a_link_of_its_own(
+            &host.endpoint,
+            &host.controller,
+            &host.boot,
+            host.environment_id,
+            1,
+            1,
+        )
+        .await;
         Self {
             client: Wire::Daemon(client),
             device: Some(device()),
@@ -793,7 +804,7 @@ impl Viewer {
                     history: None,
                     screen_basis: None,
                     workflow_run_id: None,
-                    lease: None,
+                    lease: Some(common::a_lease(1, 1)),
                 }));
                 self.call(frame, request_id)
                     .await

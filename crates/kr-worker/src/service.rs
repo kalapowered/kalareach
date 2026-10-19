@@ -167,6 +167,16 @@ struct Authority {
     /// daemon announcing again is the *fence*, so the revision is recorded here and the host's own
     /// maintenance runs it, with the reach it was announced with.
     owed: Option<Owed>,
+    /// The highest revision this worker has acknowledged to a controller generation, and the
+    /// generation it acknowledged it to.
+    ///
+    /// It is the worker's side of the remote dispatch lease: renewal reaches a worker only after
+    /// the worker has acknowledged the revision, and the acknowledgement belongs to the generation
+    /// that was told. It only rises within a generation, as the issuer's does, because the daemon
+    /// asks for the evidence of older revisions after the newest has been acknowledged and an
+    /// answer about one of those says nothing about the newest. A higher generation replaces it
+    /// with nothing: the replacement is acknowledged to when it announces.
+    acknowledged: Option<(ControllerGeneration, kr_protocol::ids::AuthorityRevision)>,
 }
 
 /// A revision this worker owes a fence for, and whose authority it withdrew.
@@ -579,6 +589,7 @@ impl WorkerService {
                 descriptions_connection: None,
                 checks_connection: None,
                 owed: None,
+                acknowledged: None,
             }),
             dispatch: Mutex::new(()),
             expired: expired.0,
@@ -3540,6 +3551,9 @@ impl WorkerService {
                     .is_none_or(|accepted| token.generation.get() > accepted.get());
                 let mut fenced = Vec::new();
                 if superseded {
+                    // What was acknowledged to the generation that is replaced is no
+                    // acknowledgement to the one that replaces it.
+                    authority.acknowledged = None;
                     fenced.extend(authority.bound_connection.take());
                     fenced.extend(std::mem::take(&mut authority.proxy_connections));
                     fenced.extend(authority.attention_connection.take());
@@ -3831,7 +3845,8 @@ impl WorkerService {
             // The revision the *request* names, not whatever this worker has installed since: a
             // continuation offset belongs to the list it was issued against, and applying it to a
             // newer revision's list would skip that list's beginning.
-            return self.evidence_reply(state, notice.revision, page_from);
+            let reply = self.evidence_reply(state, notice.revision, page_from);
+            return self.acknowledged(state, notice.revision, reply);
         }
         // A named reach describes the revisions after its `since`, so it is trusted only when this
         // worker has fenced every revision up to that one. Otherwise a revision it missed, or one
@@ -3860,7 +3875,36 @@ impl WorkerService {
             // announcement names it as well as whatever the next pass reaches.
             return failure(RequestId::new(0), &error.to_protocol_error());
         }
-        self.evidence_reply(state, notice.revision, page_from)
+        let reply = self.evidence_reply(state, notice.revision, page_from);
+        self.acknowledged(state, notice.revision, reply)
+    }
+
+    /// Records that this worker has acknowledged `revision` to the generation this connection
+    /// proved, when `reply` is the acknowledgement, and returns `reply`.
+    ///
+    /// Only an acknowledgement counts: a reply that is a failure told the daemon nothing it can
+    /// renew a lease on. The value only rises within a generation.
+    fn acknowledged(
+        &self,
+        state: &ConnectionState,
+        revision: kr_protocol::ids::AuthorityRevision,
+        reply: ControlFrame,
+    ) -> ControlFrame {
+        if matches!(reply, ControlFrame::AuthorityRevisionAck(_))
+            && let Some(generation) = state.facts.generation
+        {
+            let mut authority = self
+                .authority
+                .lock()
+                .expect("the authority lock is not poisoned");
+            authority.acknowledged = Some(match authority.acknowledged {
+                Some((held_for, held)) if held_for == generation => {
+                    (generation, held.max(revision))
+                }
+                _ => (generation, revision),
+            });
+        }
+        reply
     }
 
     /// Fences this session for one revision, and records that it ran.
@@ -5245,6 +5289,12 @@ impl WorkerService {
             &*self.shared_clock,
             forwarded.accepted_deadline_boot_ms.get(),
         );
+        // The lease the daemon took for this dispatch is anchored the same way, at the moment
+        // the frame arrives and before anything is waited for, and is held to five seconds from
+        // now whatever it names. A lease that has already ended is one that ends now.
+        let remote_lease = forwarded
+            .lease
+            .map(|lease| self.anchored_dispatch_lease(&lease));
         // A test that moves a clock reads the record this makes, so it is made once the deadline is
         // anchored: a frame it can count is a frame whose lifetime no later movement can lengthen.
         #[cfg(feature = "testing")]
@@ -5292,7 +5342,8 @@ impl WorkerService {
             // shows of the answer, now and when the action is read again, is held to it.
             &Caller::forwarded(&forwarded.actor, &forwarded.grant_rights)
                 .within(forwarded.history.clone())
-                .with_screen_basis(forwarded.screen_basis),
+                .with_screen_basis(forwarded.screen_basis)
+                .holding_a_dispatch_lease(remote_lease),
             Freshness::Vouched(deadline),
             proxied,
         )
@@ -5620,6 +5671,9 @@ impl WorkerService {
         let revalidated = self
             .validate(&session, state, mutation, method, caller)
             .and_then(|()| Self::check_preconditions(&session, mutation))
+            // The remote dispatch lease, in the serial path and immediately before the deadline
+            // and the marker: a lease that was valid when the action was queued proves nothing.
+            .and_then(|()| self.check_dispatch_lease(caller, method))
             .and_then(|()| {
                 // The deadline the host derived is the deadline it keeps, measured on the
                 // continuous clock so a wall clock that moves cannot extend it. This is also what
@@ -5643,6 +5697,10 @@ impl WorkerService {
                 if let Some(journal) = session.journal_mut() {
                     let reason = if matches!(error, WorkerError::WindowExpired { .. }) {
                         kr_protocol::receipt::RejectionReason::Expired
+                    } else if matches!(error, WorkerError::DispatchLeaseRefused { .. }) {
+                        // The authority this dispatch was admitted under is not the one the
+                        // worker holds: a revocation's kind of rejection.
+                        kr_protocol::receipt::RejectionReason::Revoked
                     } else if second_pass {
                         // A fact the action stood on moved while it was prepared (the binding's
                         // revision, a declaration, the precondition the caller stated) is a stale
@@ -6067,6 +6125,97 @@ impl WorkerService {
                 ));
             }
             Some(_) => {}
+        }
+        Ok(())
+    }
+
+    /// The lease a forwarded frame carries, on this worker's own clock.
+    ///
+    /// What is left of the lease on the machine's clock is anchored on this worker's clock when
+    /// the frame arrives, as the accepted deadline is, and is held to the longest a lease can last.
+    /// A lease that has already ended is anchored at the moment it arrived, which `permits` reads
+    /// as ended.
+    fn anchored_dispatch_lease(
+        &self,
+        lease: &kr_protocol::local::ForwardedLease,
+    ) -> kr_transport::lease::DispatchLease {
+        let now = self.clock.now();
+        let deadline = kr_ipc::clock::remaining_of(
+            self.shared_clock.boot_elapsed_ms(),
+            lease.deadline_boot_ms.get(),
+        )
+        .map(|remaining| remaining.min(kr_transport::lease::MAX_LEASE))
+        .and_then(|remaining| now.checked_add(remaining))
+        .unwrap_or(now);
+        kr_transport::lease::DispatchLease {
+            lease_id: lease.lease_id,
+            generation: lease.controller_generation,
+            authority_revision: lease.authority_revision,
+            deadline,
+        }
+    }
+
+    /// Refuses a paired device's dispatch that does not hold a live lease from the generation this
+    /// worker accepts, for the revision it has acknowledged to that generation and installed.
+    ///
+    /// Section 9: remote dispatch additionally requires a live worker-held authority lease from the
+    /// current controller generation and revision, valid for five seconds at most, checked in the
+    /// serial path on the continuous clock. Renewal can occur only after the worker has
+    /// acknowledged the revision, and a replacement controller cannot adopt what its predecessor
+    /// queued: the envelope and the lease it presents both name a generation, and neither is
+    /// taken for another's. A local caller and a stop of what is owned
+    /// ([`kr_protocol::local::needs_a_dispatch_lease`]) do not depend on it.
+    ///
+    /// The authority state and the installed revision are read one after the other and never
+    /// nested.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::WindowExpired`] for a lease that has ended, and
+    /// [`WorkerError::DispatchLeaseRefused`] for any other lease the worker cannot match.
+    fn check_dispatch_lease(&self, caller: &Caller, method: Method) -> Result<()> {
+        if caller.ingress != ActorIngress::PairedDevice
+            || !kr_protocol::local::needs_a_dispatch_lease(method)
+        {
+            return Ok(());
+        }
+        let refused = |detail: &str| {
+            Err(WorkerError::DispatchLeaseRefused {
+                detail: detail.to_owned(),
+            })
+        };
+        let Some(lease) = caller.dispatch_lease else {
+            return refused(
+                "a remote dispatch needs a lease from the current controller generation",
+            );
+        };
+        let (accepted, acknowledged) = {
+            let authority = self
+                .authority
+                .lock()
+                .expect("the authority lock is not poisoned");
+            (authority.accepted_generation, authority.acknowledged)
+        };
+        if accepted != Some(lease.generation)
+            || caller.controller_generation != Some(lease.generation)
+        {
+            return refused(
+                "this dispatch is not under the controller generation this worker accepts",
+            );
+        }
+        if acknowledged != Some((lease.generation, lease.authority_revision)) {
+            return refused(
+                "this worker has not acknowledged the revision this lease was renewed for",
+            );
+        }
+        let installed = self.runtime.input().lock().revision();
+        if installed != Some(lease.authority_revision) {
+            return refused("this lease is for a revision this worker does not hold");
+        }
+        if !lease.permits(self.clock.now(), lease.generation, lease.authority_revision) {
+            return Err(WorkerError::WindowExpired {
+                detail: "the lease this dispatch was renewed under has ended".to_owned(),
+            });
         }
         Ok(())
     }
@@ -8577,6 +8726,17 @@ pub struct Caller {
     /// one a daemon did not say was decided under a pairing grant is drawn as a share's is: this
     /// worker holds no grants, and the narrower screen discloses nothing the other does not.
     pub screen_basis: Option<kr_protocol::local::ScreenBasis>,
+    /// The controller generation the daemon's envelope speaks for, for a forwarded request.
+    ///
+    /// A dispatch under the remote lease is held to the generation the worker accepts, so an
+    /// envelope a replaced generation built is not taken for a replacement's.
+    pub controller_generation: Option<ControllerGeneration>,
+    /// The remote dispatch lease the daemon took for this mutation, anchored on this worker's
+    /// clock when its frame arrived.
+    ///
+    /// Only a paired device's mutation carries one, and [`WorkerService`] holds the dispatch to it
+    /// in its serial path ([`WorkerService::check_dispatch_lease`]).
+    pub dispatch_lease: Option<kr_transport::lease::DispatchLease>,
 }
 
 impl Caller {
@@ -8595,6 +8755,8 @@ impl Caller {
             grant_rights: CanonicalSet::new(),
             history: None,
             screen_basis: None,
+            controller_generation: None,
+            dispatch_lease: None,
         }
     }
 
@@ -8616,7 +8778,19 @@ impl Caller {
             grant_rights: grant_rights.clone(),
             history: None,
             screen_basis: None,
+            controller_generation: Some(actor.controller_generation),
+            dispatch_lease: None,
         }
+    }
+
+    /// Returns the same caller, holding the remote dispatch lease its frame carried.
+    #[must_use]
+    pub const fn holding_a_dispatch_lease(
+        mut self,
+        lease: Option<kr_transport::lease::DispatchLease>,
+    ) -> Self {
+        self.dispatch_lease = lease;
+        self
     }
 
     /// Returns the same caller, with when the authority behind its request runs out.

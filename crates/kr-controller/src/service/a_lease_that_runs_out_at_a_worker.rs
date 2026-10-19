@@ -149,6 +149,8 @@ struct World {
     /// The link the worker has to a daemon of generation one, over which a forward is sent.
     link: Option<BoundLink>,
     actor: ActorEnvelope,
+    /// The action forwarded last, which the worker's receipt for it says what became of.
+    last_action: Option<ActionId>,
 }
 
 /// Starts the daemon and the worker on one manual clock, with the worker's serial boundary free
@@ -275,9 +277,20 @@ async fn world(steps: &Steps) -> World {
     .await
     .expect("the worker accepts the generation");
 
-    // The daemon holds this worker's acknowledgement of the revision in force, with its fence
-    // reported: complete for it, until something withdraws.
+    // The worker is told the revision in force and acknowledges it, over the connection this
+    // daemon holds its authority by, as a worker is before the daemon takes a lease for it.
     let revision = controller.leases.authority_revision();
+    steps.at("announcing the revision in force to the worker");
+    link.announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
+        environment_id,
+        revision,
+        reach: kr_protocol::worker::RevisionReach::Host,
+        evidence_from: 0,
+    })
+    .await
+    .expect("the worker acknowledges the revision in force");
+    // The daemon holds this worker's acknowledgement of it, with its fence reported: complete for
+    // it, until something withdraws.
     let binding = controller.leases.bind(session_id);
     assert!(controller.leases.acknowledge(
         session_id,
@@ -327,6 +340,7 @@ async fn world(steps: &Steps) -> World {
         environment_id,
         link: Some(link),
         actor,
+        last_action: None,
     }
 }
 
@@ -398,6 +412,7 @@ impl World {
     ) -> tokio::task::JoinHandle<(BoundLink, Result<ParamsValue, ProtocolError>)> {
         let mut link = self.link.take().expect("the link is free");
         let mutation = self.attach();
+        self.last_action = Some(mutation.action_id);
         let actor = self.actor.clone();
         let rights: CanonicalSet<ActionRight> = [ActionRight::SessionView].into_iter().collect();
         tokio::spawn(async move {
@@ -426,6 +441,33 @@ impl World {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// Asserts that the worker rejected the action forwarded last as expired, before it had a
+    /// dispatch marker: the code of what it answered and the reason its receipt records, which are
+    /// what a person is told, and not the words.
+    #[track_caller]
+    fn assert_the_last_action_was_rejected_as_expired(&self) {
+        let action_id = self.last_action.expect("an action was forwarded");
+        let receipt = self
+            .runtime
+            .session()
+            .journal_mut()
+            .expect("a journal")
+            .read(self.actor.actor_id.clone(), action_id)
+            .expect("reads")
+            .expect("the worker committed the action's intent");
+        assert_eq!(
+            receipt.state,
+            kr_protocol::receipt::ReceiptState::Rejected,
+            "{receipt:?}"
+        );
+        assert_eq!(
+            receipt.reason.as_ref(),
+            Some(&kr_protocol::receipt::RejectionReason::Expired),
+            "{receipt:?}"
+        );
+        assert!(!receipt.state.has_dispatch_marker());
     }
 
     /// Takes the lease an action for this device needs, the way a forward does.
@@ -519,12 +561,7 @@ async fn the_lease_runs_out_and_is_not_renewed(steps: &Steps) {
     world.link = Some(link);
     let refused = answer.expect_err("the lapse expires the action at the worker");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
-    assert!(
-        refused
-            .message
-            .contains("the accepted deadline for this action has passed"),
-        "the worker refused it as expired: {refused:?}"
-    );
+    world.assert_the_last_action_was_rejected_as_expired();
 
     // With no debt owed the next action is given a fresh lease, and the worker runs it.
     steps.at("the control: taking the next action's lease");
@@ -578,12 +615,7 @@ async fn the_lease_runs_out_and_is_not_renewed(steps: &Steps) {
     world.link = Some(link);
     let refused = answer.expect_err("the lease ran out before the action was dispatched");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
-    assert!(
-        refused
-            .message
-            .contains("the accepted deadline for this action has passed"),
-        "the worker refused it as expired: {refused:?}"
-    );
+    world.assert_the_last_action_was_rejected_as_expired();
 
     // Nothing renews it: the next action for this worker is given no lease.
     steps.at("the revocation: asking for the next action's lease");

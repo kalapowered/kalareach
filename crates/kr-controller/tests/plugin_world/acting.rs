@@ -41,7 +41,7 @@ use kr_worker::broker::{
     BrokerTransport, Credential, ManagedProcess, TransportHandle, UpstreamDispatch, subject,
 };
 
-use super::{Epoch, Hosted, PATIENCE, build, component, hosted_with, install};
+use super::{Epoch, Hosted, PATIENCE, build, component, hosted_on, install};
 
 pub fn instance() -> ApplicationInstanceId {
     ApplicationInstanceId::new(Uuid::from_bytes([2; 16]))
@@ -160,24 +160,33 @@ enum Registration {
 
 impl Acting {
     pub async fn start() -> Option<Self> {
-        Self::assemble(Registration::ByHand { told: true }).await
+        Self::assemble(Registration::ByHand { told: true }, None).await
+    }
+
+    /// Starts the world with the worker's deadlines measured on `clock`, which the test moves by
+    /// hand.
+    pub async fn start_on(clock: Arc<dyn kr_transport::clock::ContinuousClock>) -> Option<Self> {
+        Self::assemble(Registration::ByHand { told: true }, Some(clock)).await
     }
 
     /// Starts the world; `registered` says whether the worker has been told where the component
     /// stands, as its link tells it once the runtime has the component.
     pub async fn start_with(registered: bool) -> Option<Self> {
-        Self::assemble(Registration::ByHand { told: registered }).await
+        Self::assemble(Registration::ByHand { told: registered }, None).await
     }
 
     /// Starts the world with the worker's own link running: nothing is registered by the test, and
     /// the plugin runtime is not asked for until the link asks the daemon for it.
     pub async fn start_linked() -> Option<Self> {
-        Self::assemble(Registration::ByLink).await
+        Self::assemble(Registration::ByLink, None).await
     }
 
-    async fn assemble(registration: Registration) -> Option<Self> {
+    async fn assemble(
+        registration: Registration,
+        clock: Option<Arc<dyn kr_transport::clock::ContinuousClock>>,
+    ) -> Option<Self> {
         let wasm = component("preparing")?;
-        let hosted = hosted_with(Epoch::Held).await;
+        let hosted = hosted_on(Epoch::Held, clock).await;
         let source = install(&hosted.environment(), &wasm);
         let runtime = match registration {
             Registration::ByHand { .. } => Some(Arc::new(hosted.runtime().await)),

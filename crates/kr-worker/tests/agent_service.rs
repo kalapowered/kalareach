@@ -3005,13 +3005,15 @@ async fn forward_as_device(
         controller_generation: ControllerGeneration::new(1),
         connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([7; 16])),
     };
+    let lease =
+        common::a_lease_after_the_announcement(daemon, mutation.target.environment_id, 1, 1).await;
     daemon
         .forward(
             mutation,
             &envelope,
             &grant_rights.iter().copied().collect(),
             kr_protocol::scalars::U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000),
-            None,
+            Some(lease),
         )
         .await
         .expect("the forward reaches the worker")

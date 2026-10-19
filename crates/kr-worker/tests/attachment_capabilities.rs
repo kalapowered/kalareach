@@ -12,6 +12,8 @@
 
 use std::sync::Arc;
 
+mod common;
+
 use kr_ipc::client::{BoundLink, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
@@ -177,13 +179,14 @@ impl Wired {
                 .expect("a window identifier"),
             requested_ttl_ms: kr_protocol::limits::DEFAULT_MUTATION_TTL,
         };
+        let lease = common::a_lease_after_the_announcement(daemon, self.environment_id, 1, 1).await;
         daemon
             .forward(
                 &mutation,
                 &envelope,
                 grant_rights,
                 U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000),
-                None,
+                Some(lease),
             )
             .await
             .expect("the forward reaches the worker")
