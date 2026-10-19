@@ -464,12 +464,12 @@ this application asked, for as long as the application runs, shown with the time
 revocation is still published for it.
 
 A revocation this computer sent is told to settings sync, whether it went through a host's feed or
-the host on this computer took it directly. Settings sync stops sending at once, before any host has
-acknowledged the request or lists the device as revoked. That includes a step already under way:
-nothing written after the revocation leaves under a key the device holds, and what was held back is
-sent once the device is out, under the key that follows its removal. A send already on its way
-cannot be called back. The device is taken out of the shared settings in a step of its own, after
-the one in hand.
+the host on this computer lists the device as revoked. Settings sync writes it down at once, before
+any host has acknowledged the request, and holds back everything it sends until the device is out of
+the shared settings. That includes a step already under way: nothing written after the revocation is
+sealed under a key the device holds, and what was held back is sent once the device is out, under
+the key that follows its removal. The record is kept across a restart, and the next step of any
+companion over the same data takes the device out. A send already on its way cannot be called back.
 
 ## Sharing a session
 

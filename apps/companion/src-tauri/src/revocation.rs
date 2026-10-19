@@ -39,13 +39,14 @@
 //!
 //! # Settings sync
 //!
-//! A revocation this computer sent is told to settings sync, which holds publication at once,
-//! before any host has acknowledged the request, and takes the device out of the shared settings in
-//! a step of its own. For a host reached through its feed the proof is this computer's own signature
-//! on a request addressed to that host; for the host on this computer it is that host's answer to
-//! `device.revoke`. Settings sync holds every send of settings and drafts from the moment it is told,
-//! a step already under way included, so nothing written after the revocation is sent under a key
-//! the device holds. A send already on its way cannot be called back.
+//! A revocation this computer sent is told to settings sync, which writes it down at once, before
+//! any host has acknowledged the request, holds everything it sends until the device is out of the
+//! shared settings, and takes it out in a step of its own. For a host reached through its feed the
+//! proof is this computer's own signature on a request addressed to that host; for the host on this
+//! computer it is that host's list, which names the device as revoked, whoever revoked it. What
+//! settings sync was sending when it was told is held too, a step already under way included, so
+//! nothing written after the revocation is sealed under a key the device holds. A send already on
+//! its way cannot be called back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -227,9 +228,9 @@ pub enum DeviceStanding {
         /// How many workers have not, when the host said. Null when the host has not yet said that every
         /// worker confirmed, and did not say how many have not.
         pending_workers: Option<u64>,
-        /// Whether the host's own list shows the device as revoked. A host that acknowledged and
-        /// does not list the device as revoked contradicts what the feed says, and the device is
-        /// revoked at the host itself.
+        /// Whether the host's own list shows the device as revoked. False only for a host that
+        /// answered just now and does not list the device as revoked: it contradicts what the feed
+        /// says, so the device is to be revoked at the host itself.
         host_lists_revoked: bool,
     },
     /// The host acknowledged, and every session worker confirmed the fence.
@@ -497,7 +498,7 @@ impl Revocations {
     }
 
     /// Passes the devices of the revocations this computer sent to settings sync, which holds
-    /// publication at once and takes the devices out of the shared settings at its next step,
+    /// what it sends at once and takes the devices out of the shared settings in a step of its own,
     /// without waiting for a host to confirm. All the devices of one view go in one call. It runs on
     /// its own, so that a service that is slow to answer does not hold the screen.
     fn tell(&self, context: &Context, told: Vec<AuthorisationKey>) {
@@ -565,11 +566,17 @@ impl Revocations {
                     .iter()
                     .filter(|request| request.devices.contains(&summary.device_id))
                     .collect();
+                // A request of this computer's own that the feed holds and the host has not refused,
+                // or a device the host on this computer, which answered just now, lists as revoked.
+                let listed_revoked = summary.revoked
+                    && reading.list.is_some()
+                    && matches!(reading.host, Host::Local(_));
                 if let Some(keys) = summary.keys.0
                     && !fed.contains(&keys.authorisation)
-                    && named
-                        .iter()
-                        .any(|request| request.record.rejected.0.is_none())
+                    && (listed_revoked
+                        || named
+                            .iter()
+                            .any(|request| request.record.rejected.0.is_none()))
                 {
                     told.push(keys.authorisation);
                 }
@@ -726,16 +733,6 @@ impl Revocations {
                     _ => connection.clone(),
                 };
                 self.revoke_direct(&over, &summary).await?;
-                // The host's own answer is as good as a verified request in a feed.
-                self.tell(
-                    context,
-                    summary
-                        .keys
-                        .0
-                        .iter()
-                        .map(|keys| keys.authorisation)
-                        .collect(),
-                );
             }
             Host::Paired(paired) => {
                 let origin = context.origin.as_ref().ok_or_else(|| {
@@ -918,7 +915,7 @@ fn standing(
                             DeviceStanding::Acknowledged {
                                 at_ms,
                                 pending_workers: Some(pending_workers.get()),
-                                host_lists_revoked: device.revoked,
+                                host_lists_revoked: device.revoked || !host_answered,
                             },
                         ),
                     }
@@ -1223,6 +1220,15 @@ mod tests {
             },
             "a host that has not confirmed every worker and does not list the device as revoked \
              is told apart from one that does"
+        );
+        assert_eq!(
+            standing_when(false, false, std::slice::from_ref(&pending)),
+            DeviceStanding::Acknowledged {
+                at_ms: 200,
+                pending_workers: Some(3),
+                host_lists_revoked: true
+            },
+            "a list kept from before says nothing against the acknowledgement"
         );
         assert_eq!(
             standing_of(false, std::slice::from_ref(&refused)),

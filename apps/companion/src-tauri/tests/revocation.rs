@@ -770,6 +770,59 @@ async fn the_host_on_this_computer_takes_the_revocation_itself_and_its_answer_is
     assert_eq!(again["code"], "PERMISSION_DENIED", "{again}");
 }
 
+/// Whoever revokes a device at the host on this computer, and whether or not the host's answer
+/// reached this computer, the device leaves the shared settings once the host lists it revoked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_the_host_on_this_computer_lists_as_revoked_is_taken_out_of_the_settings_whoever_revoked_it()
+ {
+    let rig = Rig::start().await;
+    rig.with_settings_sync().await;
+    rig.view().await;
+    rig.host_polls().await;
+    let endpoint = rig.host.endpoint().clone();
+    let reopen: companion_tauri::connection::Reopen = Arc::new({
+        let endpoint = endpoint.clone();
+        move || {
+            let endpoint = endpoint.clone();
+            Box::pin(async move { local_connection(&endpoint).await })
+        }
+    });
+    let connection = local_connection(&endpoint)
+        .await
+        .expect("connects to the control endpoint")
+        .reopening(reopen);
+    rig.app.app.state::<AppState>().connected(connection);
+
+    // The owner at the machine revokes the paired device, which this computer was never asked to.
+    let phone = rig
+        .host
+        .controller()
+        .devices()
+        .devices()
+        .expect("the device directory answers")
+        .into_iter()
+        .find(|record| {
+            record.is_paired()
+                && Some(record.device_id) != rig.host.owner.as_ref().map(|owner| owner.device_id)
+        })
+        .expect("the paired device");
+    let mut client = rig.host.client().await;
+    let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+        rig.host.environment_id,
+        &mut client,
+        kr_protocol::method::Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: phone.device_id,
+        },
+    )
+    .await
+    .expect("the owner at the machine revokes the device");
+
+    // The next time the screen reads the host, settings sync is told.
+    rig.view().await;
+    rig.settings_sync_hears_of(&rig.phone).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_host_on_this_computer_takes_a_second_revocation_though_the_first_withdrew_the_connection()
  {
