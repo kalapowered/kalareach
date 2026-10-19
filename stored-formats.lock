@@ -545,6 +545,22 @@
     },
     {
       "entry": {
+        "store": "workflow-resources",
+        "scope": "environment",
+        "path": "workflow-resources.db",
+        "recording": {
+          "kind": "sqlite_user_version"
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "d6114325ecb0681bd851c105d9fdd0f46488862f8db02a0cb529e3f3c8cd7e00",
+      "kept": [
+        "WorkflowActionKind"
+      ]
+    },
+    {
+      "entry": {
         "store": "workflows",
         "scope": "environment",
         "path": "workflows.db",

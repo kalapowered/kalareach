@@ -884,6 +884,22 @@ pub fn table() -> Vec<Store> {
             levels: None,
             writers: Writers::Daemon,
             entry: entry(
+                "workflow-resources",
+                StoreScope::Environment,
+                "workflow-resources.db",
+                Recording::SqliteUserVersion,
+                kr_automation::resources::RESOURCES_SCHEMA_VERSION,
+                kr_automation::resources::RESOURCES_OLDEST_SCHEMA_VERSION,
+            ),
+            owned: Vec::new(),
+            kept: vec![protocol::<automation::WorkflowActionKind>(
+                "WorkflowActionKind",
+            )],
+        },
+        Store {
+            levels: None,
+            writers: Writers::Daemon,
+            entry: entry(
                 "catalogue",
                 StoreScope::Environment,
                 "catalogue/catalogue.sqlite3",

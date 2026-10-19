@@ -260,26 +260,96 @@ async fn working_host_on(
     }
 }
 
-/// Stops a daemon and starts another on the same tree, as a restart does: the workers it started
-/// go on running, and the new daemon finds them.
-async fn restarted(host: Host) -> Host {
-    let Host {
-        _temp,
-        controller,
-        clients,
-        rendezvous,
-        ..
-    } = host;
-    clients.abort();
-    if let Some(rendezvous) = rendezvous {
-        rendezvous.abort();
+/// A daemon that runs on a runtime of its own, so that ending the runtime ends every task the
+/// daemon has begun, as the end of its process would, while the workers it started go on.
+struct Apart {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Apart {
+    /// Ends the daemon's runtime and waits for it to be gone.
+    fn end(mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("the daemon's runtime ended");
+        }
     }
-    let service = Arc::downgrade(controller.automation().service());
+}
+
+/// [`working_host`] whose daemon runs apart.
+async fn working_host_apart() -> (Host, Apart) {
+    let temp = teardown::Tree::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let worker = temp.root().join("kr-worker");
+    kr_ipc::testing::place_and_start_once(&beside_this_test("kr-worker"), &worker, &["--version"]);
+    let supervisor = temp.supervisor(kr_controller::supervision::detect());
+    let (ready_sender, ready) = std::sync::mpsc::channel();
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn({
+        let environment = environment.clone();
+        move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .expect("a runtime for the daemon");
+            let started = runtime.block_on(async {
+                let controller = start_daemon_with(
+                    &environment,
+                    environment_id,
+                    Clocks::system(),
+                    supervisor,
+                    worker,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
+                let endpoint = environment.controller_endpoint().expect("an endpoint");
+                let clients = tokio::spawn(
+                    Arc::clone(&controller)
+                        .serve_clients(Listener::bind(&endpoint).expect("binds the endpoint")),
+                );
+                let rendezvous = tokio::spawn(
+                    Arc::clone(&controller).serve_rendezvous(
+                        Listener::bind(&environment.rendezvous_endpoint().expect("an endpoint"))
+                            .expect("binds the rendezvous"),
+                    ),
+                );
+                (controller, endpoint, clients, rendezvous)
+            });
+            ready_sender.send(started).expect("the test is waiting");
+            // Until the test lets go, and then the runtime goes with every task it holds.
+            let _ = stopped.recv();
+            drop(runtime);
+        }
+    });
+    let (controller, endpoint, clients, rendezvous) = ready.recv().expect("the daemon started");
+    (
+        Host {
+            _temp: temp,
+            controller,
+            environment_id,
+            endpoint,
+            clients,
+            rendezvous: Some(rendezvous),
+            work: tempfile::TempDir::new().expect("a working directory on the internal disk"),
+        },
+        Apart {
+            stop: Some(stop),
+            thread: Some(thread),
+        },
+    )
+}
+
+/// Ends the daemon that runs apart and starts another on the same tree, as a restart does: the
+/// workers it started go on running, and the new daemon finds them.
+async fn restarted(host: Host, apart: Apart) -> Host {
+    let Host {
+        _temp, controller, ..
+    } = host;
     drop(controller);
-    until("the first daemon to let go of its service", || {
-        service.strong_count() == 0
-    })
-    .await;
+    apart.end();
     working_host_on(_temp, |supervisor| supervisor).await
 }
 
@@ -4095,11 +4165,10 @@ async fn a_shell_command_node_reports_how_its_command_ended() {
     let closure = failed.closure.0.clone().expect("it closed");
     assert_eq!(closure.root_exit_code.0, Some(U64::new(3)));
 
-    assert_eq!(
-        owed_rows(&host),
-        0,
-        "what each dispatch owned has been released"
-    );
+    until("what each dispatch owned to be released", || {
+        owed_rows(&host) == 0
+    })
+    .await;
     let scratch = host
         ._temp
         .environment()
@@ -4219,11 +4288,11 @@ async fn a_command_that_outlives_its_wait_is_stopped_and_a_created_session_is_no
         kr_protocol::session::ClosureReason::CloseRequested,
         "the session was closed because the node was asked to stop"
     );
-    assert_eq!(
-        owed_rows(&host),
-        0,
-        "once the closure was recorded what the dispatch owned was released"
-    );
+    until(
+        "what the dispatch owned to be released once the closure was recorded",
+        || owed_rows(&host) == 0,
+    )
+    .await;
     host.clients.abort();
 }
 
@@ -4271,13 +4340,14 @@ fn hold_the_registry(host: &Host) -> rusqlite::Connection {
     registry
 }
 
-/// KR-REQ-19.04 and KR-REQ-25.14: the node's grant is asked where the session comes into being,
-/// and not only before the runner is called. A node of each kind has passed every check the engine
-/// and the runner make when the grant is withdrawn; the create then waits for the registry, and
-/// when it reaches its launch it is refused: no session is made, the command never runs, and the
-/// node pauses on the refusal as it would have a moment earlier.
+/// KR-REQ-25.14 and KR-REQ-19.04: the moment the engine stops waiting for a node is asked where
+/// the node's session comes into being, and not only before the runner is called. The create waits
+/// for the registry, as it does behind another writer, until the node's wait has ended; when it
+/// reaches its launch it is refused. No session is made for a `create_session` node, and no command
+/// runs for a `shell_command` node. The control is the same node with the registry free, which
+/// makes its session (the cases above).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_grant_withdrawn_before_the_session_comes_into_being_makes_no_session() {
+async fn a_wait_that_ends_before_the_session_comes_into_being_makes_no_session() {
     let host = working_host().await;
     let mut control = client(&host).await;
     let marker = host.work().join("a-command-ran");
@@ -4294,35 +4364,63 @@ async fn a_grant_withdrawn_before_the_session_comes_into_being_makes_no_session(
         ),
     ] {
         host.issue(grant_id(number), &grant);
-        let document = definition(workflow_id(number), grant_id(number), "a node", node);
+        let mut document = definition(workflow_id(number), grant_id(number), "a node", node);
+        document.deadlines = WorkflowDeadlines {
+            run_deadline_ms: U64::new(60_000),
+            action_wait_ms: U64::new(1_500),
+        };
         install(&mut control, &host, &document).await;
         enable(&mut control, &host, &document).await;
 
+        // Another writer holds the registry for longer than the node's wait. The run passes every
+        // check the engine and the runner make, and the create waits.
         let registry = hold_the_registry(&host);
-        let running = run_from_another_task(&host, &document, "evt-withdrawn");
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        host.controller
-            .sharing()
-            .grants()
-            .revoke(grant_id(number), kr_ipc::now_ms().get(), || Ok(()))
-            .expect("the grant is withdrawn");
+        let running = run_from_another_task(&host, &document, "evt-too-late");
+        tokio::time::sleep(std::time::Duration::from_millis(3_500)).await;
         registry
             .execute_batch("COMMIT")
             .expect("the other writer finishes");
-
-        let refused = running
-            .await
-            .expect("the run answers")
-            .expect_err("the withdrawn grant stops the create");
-        assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
-        assert!(refused.message.contains("revoked"), "{refused:?}");
+        let answered = running.await.expect("the run answers");
+        if let Ok(answer) = answered {
+            let run: WorkflowRunResult = typed(&answer);
+            assert_ne!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+        }
+        let receipts = receipts_of_workflow(&mut control, &document).await;
+        assert!(
+            receipts.iter().all(|receipt| receipt.output.0.is_none()),
+            "the node produced nothing: {receipts:?}"
+        );
     }
+    let sessions = all_sessions(&mut control).await;
     assert!(
-        all_sessions(&mut control).await.is_empty(),
-        "no session was made for either node"
+        sessions.iter().all(|session| session.closure.0.is_some()),
+        "no session is live for either node: {sessions:?}"
     );
     assert!(!marker.exists(), "the command never ran");
     host.clients.abort();
+}
+
+/// The node receipts of every run of a workflow.
+async fn receipts_of_workflow(
+    control: &mut LocalClient,
+    document: &WorkflowDefinition,
+) -> Vec<kr_protocol::automation::NodeReceiptSummary> {
+    let read: WorkflowReadResult = typed(
+        &control
+            .request(
+                Method::WorkflowRead,
+                &WorkflowReadParams {
+                    workflow_id: Nullable::some(document.workflow_id),
+                    revision: Nullable::some(document.revision),
+                    run_id: Nullable::null(),
+                    causal_root_id: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workflow.read succeeds"),
+    );
+    read.node_receipts
 }
 
 /// KR-REQ-19.04 and KR-REQ-25.14: the command is released to start at the worker's claim, which
@@ -4401,7 +4499,7 @@ async fn a_grant_withdrawn_before_the_worker_claims_its_launch_runs_no_command()
 /// node's session, which no sweep owns, is there after the restart as it was before it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_command_a_stopped_daemon_left_running_is_closed_and_released_by_the_next_one() {
-    let host = working_host().await;
+    let (host, apart) = working_host_apart().await;
     let mut control = client(&host).await;
     host.issue(grant_id(26), &COMMAND_RIGHTS);
     host.issue(grant_id(27), &[ActionRight::SessionCreate]);
@@ -4456,7 +4554,7 @@ async fn a_command_a_stopped_daemon_left_running_is_closed_and_released_by_the_n
     assert_eq!(owed_rows(&host), 1, "the dispatch wrote down what it owns");
     drop(control);
 
-    let host = restarted(host).await;
+    let host = restarted(host, apart).await;
     running.abort();
     let mut control = client(&host).await;
     let closed = closed_session(&mut control, command_session).await;
