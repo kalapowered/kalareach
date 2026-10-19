@@ -1188,7 +1188,9 @@ fn make_scratch(
         opened
             .check_privacy(Privacy::Exclusive)
             .map_err(|error| refused("is not private", &error))?;
-        let empty = std::fs::read_dir(scratch)
+        let empty = opened
+            .handle()
+            .entries()
             .map_err(|error| refused("could not be read", &error))?
             .next()
             .is_none();
@@ -1263,8 +1265,9 @@ fn remove_scratch(
     remove_scratch_after_root_opened(environment_id, root, path, identity, || {})
 }
 
-/// [`remove_scratch`], calling `opened` once the scratch root has been opened and before anything
-/// beneath it is looked at: the moment a root replaced after its open must change nothing.
+/// [`remove_scratch`], calling `opened_root` once the scratch root has been opened and before
+/// anything beneath it is looked at: the moment a root replaced after its open must change
+/// nothing.
 #[cfg(unix)]
 fn remove_scratch_after_root_opened(
     environment_id: EnvironmentId,
@@ -1302,8 +1305,9 @@ fn remove_scratch_after_root_opened(
                     kr_flush::flush_held_directory(&parent, kr_flush::NameKind::Directory)
                 {
                     eprintln!(
-                        "kr-controller: the removal of a workflow command's directory was not flushed: \
-                         {error}"
+                        "kr-controller: the removal of the workflow command's directory {} was not \
+                         flushed: {error}",
+                        path.display()
                     );
                 }
                 None
@@ -1329,10 +1333,10 @@ fn remove_scratch_after_root_opened(
         |descriptor: &rustix::fd::OwnedFd| -> std::result::Result<ObjectIdentity, String> {
             let spare = descriptor
                 .try_clone()
-                .map_err(|error| format!("it could not be looked at: {error}"))?;
+                .map_err(|error| format!("could not be looked at: {error}"))?;
             let about = std::fs::File::from(spare)
                 .metadata()
-                .map_err(|error| format!("it could not be looked at: {error}"))?;
+                .map_err(|error| format!("could not be looked at: {error}"))?;
             Ok(ObjectIdentity {
                 device: about.dev(),
                 file_id: about.ino(),
@@ -1349,7 +1353,7 @@ fn remove_scratch_after_root_opened(
     // The library opens the root by its path once more: it has to be the root that was opened
     // without following a link, or a root replaced in between is refused and named.
     match identity_of(&parent) {
-        Ok(opened_root) if held.check_identity(opened_root).is_ok() => {}
+        Ok(root_identity) if held.check_identity(root_identity).is_ok() => {}
         Ok(_) => return Some("the scratch root changed while it was being opened".to_owned()),
         Err(reason) => return Some(format!("the scratch root {reason}")),
     }
@@ -1384,7 +1388,9 @@ fn remove_scratch_after_root_opened(
     }
     if let Err(error) = held.sync(kr_flush::NameKind::Directory) {
         eprintln!(
-            "kr-controller: the removal of a workflow command's directory was not flushed: {error}"
+            "kr-controller: the removal of the workflow command's directory {} was not flushed: \
+             {error}",
+            path.display()
         );
     }
     None
@@ -3549,7 +3555,9 @@ mod tests {
     /// one the opened root holds, and what a link in its place leads to is never removed. The
     /// root is moved aside and a link to a directory that holds a directory of the same name is put
     /// at its path, in the moment after the open, for a directory that was never identified and
-    /// for one that was. A removal by path in either branch would take what the link leads to.
+    /// for one that was. The first is removed through the opened root, which is the moved one, and
+    /// a removal by path would take what the link leads to instead; the second is refused by name,
+    /// because the root the library opens again is not the one that was opened.
     #[cfg(unix)]
     #[test]
     fn a_scratch_root_replaced_after_it_was_opened_removes_nothing_it_leads_to() {
@@ -3567,17 +3575,31 @@ mod tests {
                 std::fs::rename(&root, parent.path().join("moved")).expect("the root is moved");
                 std::os::unix::fs::symlink(&outside, &root).expect("a link is put at its path");
             };
-            remove_scratch_after_root_opened(
+            let left = remove_scratch_after_root_opened(
                 environment(),
                 &root,
                 &scratch,
                 identified.then_some(identity.as_str()),
                 swap,
             );
+            let moved = parent.path().join("moved").join("node");
             assert!(
                 outside.join("node").exists(),
                 "what the link leads to is not removed (identified: {identified})"
             );
+            if identified {
+                assert!(
+                    left.is_some_and(|reason| reason.contains("scratch root")),
+                    "the root that changed is named"
+                );
+                assert!(moved.exists(), "a refused root removes nothing beneath it");
+            } else {
+                assert_eq!(left, None);
+                assert!(
+                    !moved.exists(),
+                    "the empty directory the opened root holds goes"
+                );
+            }
         }
     }
 
