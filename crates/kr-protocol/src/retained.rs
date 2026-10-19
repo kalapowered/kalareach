@@ -50,7 +50,7 @@ pub use surface::{
 /// Every entry has a directory `crates/kr-protocol/retained/<level>/` and a [`RetainedLevel`] in
 /// [`RETAINED`]; `kr-protocol-gen --check` fails when the three disagree.
 pub const RETAINED_WORKER_LEVELS: [CompatibilityLevel; 1] = [CompatibilityLevel::of(
-    crate::hello::PackageVersion::new(0, 74, 0),
+    crate::hello::PackageVersion::new(0, 75, 0),
 )];
 
 /// The roots of the surface: the frames, the descriptor, and the parameters and results of the
@@ -267,13 +267,13 @@ impl RetainedLevel {
 /// The levels this release retains, in the order of [`RETAINED_WORKER_LEVELS`].
 pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
     RETAINED_WORKER_LEVELS[0],
-    include_str!("../retained/0.74/surface.schema.json"),
-    include_str!("../retained/0.74/RELEASE"),
-    include_str!("../retained/0.74/PLUGIN_HOST"),
+    include_str!("../retained/0.75/surface.schema.json"),
+    include_str!("../retained/0.75/RELEASE"),
+    include_str!("../retained/0.75/PLUGIN_HOST"),
     &[],
     &[],
 )
-.with_public_majors(include_str!("../retained/0.74/PUBLIC_MAJORS"))];
+.with_public_majors(include_str!("../retained/0.75/PUBLIC_MAJORS"))];
 
 /// A level of a test's own: the surface this release retains besides its own, with its definitions
 /// changed by `edit`, and `declared` as the entries that cover what it differs by.

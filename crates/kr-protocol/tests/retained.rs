@@ -374,7 +374,7 @@ fn a_worker_is_at_this_level_at_a_retained_one_or_at_none() {
             .expect("a patch apart")
             .is_this()
     );
-    let previous = Level::of(Some(&stated(74, 0))).expect("the retained level");
+    let previous = Level::of(Some(&stated(75, 0))).expect("the retained level");
     assert!(!previous.is_this());
     assert_eq!(
         previous.level(),
@@ -652,7 +652,7 @@ fn a_kept_answer_reads_under_the_retained_level_as_it_reads_under_this_one() {
 }
 
 /// KR-REQ-26.06, KR-ACC-035: the exchange a control daemon had with a real worker of the release
-/// before (`retained/0.74/frames.json`: the payload of every frame either way, as they went over
+/// before (`retained/0.75/frames.json`: the payload of every frame either way, as they went over
 /// the wire in the upgrade suite) reads under the level that release stated, and reads the same
 /// under this build's own level while the two do not differ. What the daemon wrote reads back as
 /// the bytes it wrote.
@@ -661,18 +661,18 @@ fn a_kept_answer_reads_under_the_retained_level_as_it_reads_under_this_one() {
 /// upgrade the_frames_ -- --nocapture`, which prints it.
 #[test]
 fn the_exchange_recorded_with_a_real_worker_of_the_release_before_reads_under_its_level() {
-    let record: Vec<Value> = serde_json::from_str(include_str!("../retained/0.74/frames.json"))
+    let record: Vec<Value> = serde_json::from_str(include_str!("../retained/0.75/frames.json"))
         .expect("the record is a list");
     assert!(
         !record.is_empty(),
         "the retained level records no exchange with a worker of its release"
     );
-    // The record is of the 0.74 release, and is read under that level whatever else is retained.
-    let wanted = CompatibilityLevel::of(PackageVersion::new(0, 74, 0));
+    // The record is of the 0.75 release, and is read under that level whatever else is retained.
+    let wanted = CompatibilityLevel::of(PackageVersion::new(0, 75, 0));
     let retained = kr_protocol::retained::RETAINED
         .iter()
         .find(|retained| retained.level == wanted)
-        .expect("the 0.74 level is retained");
+        .expect("the 0.75 level is retained");
     let level = Level::retained(retained);
     // While this build's surface is the one the level kept, a frame reads the same under both.
     let alike = differences(retained.surface(), current()).is_empty();
