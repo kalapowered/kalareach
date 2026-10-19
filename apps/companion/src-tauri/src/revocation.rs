@@ -44,9 +44,10 @@
 //! Once the request has been sent, whatever becomes of it, settings sync takes the device out in a
 //! step of its own, without waiting for any host to acknowledge it: a request that failed may have
 //! reached its host all the same. What settings sync was sending is held too, a step already under
-//! way included, so nothing written after the revocation is sealed under a key the device holds. A device that a view finds revoked by this computer's own signature in a host's
-//! feed, or listed as revoked by the host on this computer, whoever revoked it, is passed to
-//! settings sync the same way. A send already on its way cannot be called back.
+//! way included, so nothing written after the revocation is sealed under a key the device holds. A
+//! device that a view finds revoked by this computer's own signature in a host's feed, or listed as
+//! revoked by the host on this computer, whoever revoked it, is passed to settings sync the same
+//! way. A send already on its way cannot be called back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -512,9 +513,9 @@ impl Revocations {
     /// Passes the devices of revocations to settings sync, which holds what it sends at once and
     /// takes the devices out of the shared settings in a step of its own, without waiting for a
     /// host to confirm: the devices a request just sent names, whether it succeeded or not, and
-    /// those a view finds this computer sent or a host on this computer lists as revoked. All the devices of one view go in one
-    /// call. It runs on its own, so that a service that is slow to answer does not hold the
-    /// screen.
+    /// those a view finds this computer sent or a host on this computer lists as revoked. All the
+    /// devices of one view go in one call. It runs on its own, so that a service that is slow to
+    /// answer does not hold the screen.
     fn tell(&self, context: &Context, told: Vec<AuthorisationKey>) {
         let Some(settings) = &context.settings else {
             return;

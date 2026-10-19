@@ -359,7 +359,8 @@ impl Settings {
         &self.told
     }
 
-    /// Lets this computer take part in settings sync, over the records kept under `data`.
+    /// Lets this computer take part in settings sync, over the records kept under the data
+    /// directory these settings were opened with.
     ///
     /// # Errors
     ///
@@ -579,10 +580,13 @@ impl Settings {
         Ok(self.view())
     }
 
-    /// Whether this computer shares its settings with other devices: settings sync is on.
+    /// Whether this computer holds a membership of a settings collection, so that a device taken in
+    /// by a revocation is taken out of settings shared with other devices. It reads the membership
+    /// as it is kept on disk, so it does not depend on whether settings sync started in this
+    /// process, or on which of its two records an interrupted start or join wrote first.
     #[must_use]
     pub fn shares_settings(&self) -> bool {
-        self.sync.get().is_some_and(SettingsSync::shares)
+        sync::holds_membership(&self.data)
     }
 
     /// Holds everything settings sync sends until `devices` are taken out of the shared settings.

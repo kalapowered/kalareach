@@ -143,6 +143,13 @@ use crate::error::ClientError;
 use crate::services::{ServiceFuture, SyncRecoveryId};
 use crate::sync::keys::StoredCollectionKeys;
 
+/// Whether `directory` holds a membership: a device started or joined a collection with it. A
+/// directory that cannot be inspected is taken to hold one.
+#[must_use]
+pub fn holds_membership(directory: &std::path::Path) -> bool {
+    file::holds_membership(directory)
+}
+
 /// A collection two or more devices share: the service's collection in its home's namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

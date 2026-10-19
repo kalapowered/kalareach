@@ -1,6 +1,6 @@
 //! The record of revocations that the membership has not taken in yet, and the gate it makes for
 //! everything settings sync sends: revocations this computer sent, whatever became of the request,
-//! and devices a host lists as revoked.
+//! and devices the host on this computer lists as revoked.
 //!
 //! A revocation this computer sends is written down before the request leaves, and a request whose
 //! record cannot be written is not sent. A step may be in hand, waiting on the network, when the
@@ -17,17 +17,19 @@
 //!
 //! The cost is stated, not hidden: a device taken in is out of the shared settings for good on this
 //! computer. The membership keeps a revoked device's key for as long as it keeps its own records,
-//! the exclusion covers the whole collection and every device that shares it, and the device's
-//! keys are the same when it is paired again, so pairing it anew does not undo it. A person who
-//! revoked a device and was told the request failed can revoke it again to finish the job; nothing
-//! here brings it back into the shared settings.
+//! the device is out of the collection for every device that shares it (and if another member adds
+//! it back, this computer takes it out again), and the device's keys are the same when it is paired
+//! again, so pairing it anew does not undo it. A person who revoked a device and was told the
+//! request failed can revoke it again to finish the job; nothing here brings it back into the
+//! shared settings.
 //!
 //! The record is a file beside the other records of settings sync, so it is kept across a restart
 //! and seen by a second companion over the same data directory: each step takes in what it finds
 //! there, whoever wrote it, before it reconciles. Settings and drafts both ask [`Fence`], as a
 //! [`PublishGate`], before they read and seal what they send, so a send it refuses leaves no record
 //! and no sealed bytes behind. A send that has passed the gate is on its way and cannot be called
-//! back. A device that a host lists as revoked without this computer having sent the request is
+//! back. A device that the host on this computer lists as revoked without this computer having sent the
+//! request is
 //! written down when this computer reads that list; a record that cannot be written then holds this
 //! process only, until it can be.
 
@@ -53,13 +55,21 @@ const LOCK: &str = "revoking.lock";
 const LIMIT: u64 = 1 << 20;
 
 /// The devices whose revocation is known here and the membership has not recorded yet: those this
-/// computer sent a request for, whatever became of it, and those a host lists as revoked.
+/// computer sent a request for, whatever became of it, and those the host on this computer lists as
+/// revoked.
 #[derive(Debug)]
 pub struct Fence {
     directory: PathBuf,
     /// The same devices as this process knows them, so that a record that cannot be written down
     /// still holds this process's sends.
     held: Mutex<BTreeSet<AuthorisationKey>>,
+}
+
+/// A change of the record that did not end well.
+struct Unwritten {
+    error: CommandError,
+    /// Whether the record may name the change all the same.
+    landed: bool,
 }
 
 impl Fence {
@@ -95,76 +105,105 @@ impl Fence {
         }
     }
 
-    /// Changes the file under its lock.
-    fn change(&self, change: impl FnOnce(&mut BTreeSet<AuthorisationKey>)) -> Result<()> {
+    /// Changes the file under its lock. `landed_if` says, of what the file holds after a write that
+    /// failed, whether the change is in it: it is asked under the same lock, so no other companion
+    /// has changed the file between the write and the question.
+    fn change(
+        &self,
+        change: impl FnOnce(&mut BTreeSet<AuthorisationKey>),
+        landed_if: impl Fn(&BTreeSet<AuthorisationKey>) -> bool,
+    ) -> std::result::Result<(), Unwritten> {
+        let before_the_write = |error: CommandError| Unwritten {
+            error,
+            landed: false,
+        };
         // The directory and its name are made durable before anything is written in it, as
         // settings sync does its own: a hold that a crash could lose is not one.
         create_private_directory(&self.directory)
             .map_err(|error| error.to_string())
             .and_then(|()| flush_path_names(&self.directory).map_err(|error| error.to_string()))
             .map_err(|error| {
-                CommandError::local_failure(format!(
+                before_the_write(CommandError::local_failure(format!(
                     "this computer's record of revocations not yet taken in could not be made: \
                      {error}"
-                ))
+                )))
             })?;
         let _lock = crate::settings::locked_file(&self.directory.join(LOCK)).map_err(|error| {
-            CommandError::local_failure(format!(
+            before_the_write(CommandError::local_failure(format!(
                 "this computer's record of revocations not yet taken in could not be locked: \
                  {error}"
-            ))
+            )))
         })?;
-        let mut devices = self.on_disk()?;
+        let mut devices = self.on_disk().map_err(before_the_write)?;
         let before = devices.clone();
         change(&mut devices);
         if devices == before {
             return Ok(());
         }
         let text = serde_json::to_vec(&devices).map_err(|error| {
-            CommandError::local_failure(format!(
+            before_the_write(CommandError::local_failure(format!(
                 "this computer's record of revocations not yet taken in could not be written: \
                  {error}"
-            ))
+            )))
         })?;
         write_owner_only_file(&self.directory.join(FILE), &text).map_err(|error| {
-            CommandError::local_failure(format!(
-                "this computer's record of revocations not yet taken in could not be kept: {error}"
-            ))
+            // The file is renamed into place and then its directory is flushed, so a failure can
+            // come after the record already names the change. A record that cannot be read to say
+            // is taken to name it: what is uncertain is held, not forgotten.
+            let landed = self.on_disk().map_or(true, |kept| landed_if(&kept));
+            Unwritten {
+                error: CommandError::local_failure(format!(
+                    "this computer's record of revocations not yet taken in could not be kept: \
+                     {error}"
+                )),
+                landed,
+            }
         })
     }
 
     /// Holds everything sent until `devices` are taken out of the shared settings, for a revocation
-    /// this computer is about to send. All or nothing: a record that cannot be written holds
-    /// nothing, and the revocation is not sent.
+    /// this computer is about to send. The request is not sent unless this returns `Ok`.
     ///
     /// A write can fail after it has done its work: the file is renamed into place and then the
-    /// directory is flushed. When the record names the devices all the same, it is a hold, for
-    /// every reader, and it stands: the request goes, and the flush that did not finish is the
-    /// risk of any write.
+    /// directory is flushed. When the record may name the devices all the same, it is a hold, for
+    /// every reader and for this process, and it stands: it is not rolled back, since a rollback is
+    /// the same write and can fail the same way. The error says so, the request is not sent, and
+    /// the next step takes the devices out.
     ///
     /// # Errors
     ///
-    /// Returns why the record could not be written, when it does not name the devices.
+    /// Returns why the record could not be made durable. The devices are held all the same when the
+    /// error says so.
     pub(in crate::settings) fn raise(&self, devices: &[AuthorisationKey]) -> Result<()> {
-        if let Err(error) = self.change(|kept| kept.extend(devices.iter().copied())) {
-            let named = self
-                .on_disk()
-                .is_ok_and(|kept| devices.iter().all(|device| kept.contains(device)));
-            if !named {
-                return Err(error);
+        let outcome = self.change(
+            |kept| kept.extend(devices.iter().copied()),
+            |kept| devices.iter().all(|device| kept.contains(device)),
+        );
+        match outcome {
+            Ok(()) => {
+                self.held().extend(devices.iter().copied());
+                Ok(())
             }
+            Err(unwritten) if unwritten.landed => {
+                self.held().extend(devices.iter().copied());
+                let mut error = unwritten.error;
+                error.message.push_str(
+                    " The record may have been kept all the same, so this computer holds its \
+                     settings back from that device.",
+                );
+                Err(error)
+            }
+            Err(unwritten) => Err(unwritten.error),
         }
-        self.held().extend(devices.iter().copied());
-        Ok(())
     }
 
     /// Holds everything sent until `devices` are taken out of the shared settings, for devices
-    /// whose revocation has happened or may have: a host lists them as revoked, or the request for
-    /// one was sent and failed. This process holds them from memory when the record cannot be
-    /// written, and writes them down when it can.
+    /// whose revocation has happened or may have: the host on this computer lists them as revoked,
+    /// or the request for one was sent and failed. This process holds them from memory when the
+    /// record cannot be written, and writes them down when it can.
     pub(super) fn raise_regardless(&self, devices: &[AuthorisationKey]) {
         self.held().extend(devices.iter().copied());
-        let _ = self.change(|kept| kept.extend(devices.iter().copied()));
+        let _ = self.change(|kept| kept.extend(devices.iter().copied()), |_| false);
     }
 
     /// Lets go of `devices`, which the membership has taken in or which have no collection to be
@@ -174,11 +213,15 @@ impl Fence {
     ///
     /// Returns why the record could not be written; the devices stay held.
     pub(super) fn lift(&self, devices: &[AuthorisationKey]) -> Result<()> {
-        self.change(|kept| {
-            for device in devices {
-                kept.remove(device);
-            }
-        })?;
+        self.change(
+            |kept| {
+                for device in devices {
+                    kept.remove(device);
+                }
+            },
+            |_| false,
+        )
+        .map_err(|unwritten| unwritten.error)?;
         let mut held = self.held();
         for device in devices {
             held.remove(device);
@@ -190,7 +233,7 @@ impl Fence {
     pub(super) fn keep_held(&self) {
         let held: Vec<AuthorisationKey> = self.held().iter().copied().collect();
         if !held.is_empty() {
-            let _ = self.change(|kept| kept.extend(held.iter().copied()));
+            let _ = self.change(|kept| kept.extend(held.iter().copied()), |_| false);
         }
     }
 
@@ -257,5 +300,66 @@ mod tests {
         assert!(fence.is_raised());
         assert!(fence.holds_none_of(&[key(8)]));
         assert!(!fence.holds_none_of(&[key(7)]));
+    }
+
+    /// A directory `settings-sync` reached through a link, so that the path it is written under and
+    /// the path a flush of its name resolves to are two. Returns the fence, the first and the second.
+    #[cfg(unix)]
+    fn through_a_link() -> (
+        tempfile::TempDir,
+        Fence,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let directory = tempfile::tempdir().expect("a directory");
+        let base = std::fs::canonicalize(directory.path()).expect("a path");
+        std::fs::create_dir(base.join("real")).expect("the real directory");
+        std::os::unix::fs::symlink(base.join("real"), base.join("alias")).expect("a link");
+        let as_written = base.join("alias").join("settings-sync");
+        let resolved = base.join("real").join("settings-sync");
+        (
+            directory,
+            Fence::in_directory(&as_written),
+            as_written,
+            resolved,
+        )
+    }
+
+    /// The name of the record's directory is made durable before anything is written in it, and a
+    /// flush of it that fails sends the revocation nowhere and holds nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_hold_whose_directory_cannot_be_made_durable_holds_nothing() {
+        let (_directory, fence, _as_written, resolved) = through_a_link();
+        let refused = kr_flush::testing::refuse_flushes_of(resolved);
+        fence
+            .raise(&[key(7)])
+            .expect_err("the name of the directory cannot be made durable");
+        drop(refused);
+        assert!(!fence.is_raised(), "nothing is held");
+        assert!(fence.pending().expect("readable").is_empty());
+    }
+
+    /// A write whose last step, the flush after the rename, fails has still renamed the record into
+    /// place: the hold stands for every reader and for this process, the request is not sent, and
+    /// the error says that the record may have been kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_hold_whose_flush_fails_after_the_rename_stands_and_stops_the_request() {
+        let (_directory, fence, as_written, _resolved) = through_a_link();
+        let refused = kr_flush::testing::refuse_flushes_of(as_written);
+        let error = fence
+            .raise(&[key(7)])
+            .expect_err("the record cannot be made durable");
+        drop(refused);
+        assert!(
+            error.message.contains("kept all the same"),
+            "the person is told: {error}"
+        );
+        assert!(fence.is_raised(), "the hold stands");
+        assert!(
+            fence.on_disk().expect("readable").contains(&key(7)),
+            "the record names the device"
+        );
     }
 }

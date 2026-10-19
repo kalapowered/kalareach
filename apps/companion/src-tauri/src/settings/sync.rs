@@ -40,11 +40,12 @@
 //! request leaves ([`Fence`], `Settings::hold_for_revocation`), and a request whose record cannot
 //! be written is not sent, whether or not settings sync started. The membership cannot take the
 //! revocation in while a step holds it, and a step holds it for as long as it waits on the hosts or
-//! the service. While the record holds a device, no step starts to publish, and settings and drafts both ask the record before
-//! they read and seal what they send, so a send it refuses leaves no record and no sealed bytes
-//! behind. Each step takes in what the record holds before it reconciles, whichever companion wrote
-//! it, and the same step takes the device out. What was held back is sent afterwards, under the key
-//! that follows the removal. A send already on its way cannot be called back.
+//! the service. While the record holds a device, no step starts to publish, and settings and drafts
+//! both ask the record before they read and seal what they send, so a send it refuses leaves no
+//! record and no sealed bytes behind. Each step takes in what the record holds before it
+//! reconciles, whichever companion wrote it, and the same step takes the device out. What was held
+//! back is sent afterwards, under the key that follows the removal. A send already on its way
+//! cannot be called back.
 //!
 //! # Agreeing with the service
 //!
@@ -98,6 +99,11 @@ use serde::{Deserialize, Serialize};
 
 mod fence;
 mod members;
+
+/// Whether the settings kept under `data` hold a membership of a collection.
+pub(super) fn holds_membership(data: &Path) -> bool {
+    kr_client::sync::membership::holds_membership(&data.join(DIRECTORY).join(MEMBERSHIP))
+}
 
 pub use fence::Fence;
 use members::{Ask, Listed};
@@ -388,7 +394,7 @@ pub struct SettingsSync {
     offered: Mutex<Vec<CollectionRef>>,
     /// Whether the settings the service holds are sealed under keys this computer has not been given.
     waiting: std::sync::atomic::AtomicBool,
-    /// The revocations this computer sent that the membership has not recorded, which hold back
+    /// The revocations that the membership has not recorded, which hold back
     /// everything sent.
     fence: Arc<Fence>,
 }
