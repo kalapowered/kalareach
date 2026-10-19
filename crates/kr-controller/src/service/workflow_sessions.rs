@@ -321,6 +321,32 @@ impl Controller {
         })
     }
 
+    /// The test suite a `run_tests` node names, as the configuration this daemon last accepted
+    /// holds it.
+    ///
+    /// The configuration is never accepted from here: an unattended workflow does not put a
+    /// document into force, and a document this host cannot use runs no suite. A dispatch reads
+    /// the suite once, so the document it began with is the one it ends with.
+    ///
+    /// # Errors
+    ///
+    /// Returns, in words for the owner, why no suite of that name can be run.
+    pub(crate) fn workflow_test_suite(
+        &self,
+        name: &str,
+    ) -> std::result::Result<kr_protocol::hostinfo::configuration::TestSuite, String> {
+        let in_force = self.in_force();
+        if let Some(unusable) = &in_force.unusable {
+            return Err(format!(
+                "this host cannot use its configuration document, so it runs no test suite: {}",
+                unusable.refusal()
+            ));
+        }
+        in_force.test_suites.get(name).cloned().ok_or_else(|| {
+            format!("this host's configuration names no test suite {name}, so none was run")
+        })
+    }
+
     /// The boot this daemon runs in, which a worker of an earlier boot did not survive.
     pub(crate) fn boot(&self) -> &kr_protocol::identity::BootIdentity {
         &self.boot_identity

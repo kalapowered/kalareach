@@ -34,7 +34,7 @@ use kr_protocol::automation::{
     WorkflowTrigger,
 };
 use kr_protocol::changeset::{
-    ChangesetCaptureParams, ChangesetReadParams, ChangesetReadResult, FileGrant,
+    ChangesetCaptureParams, ChangesetReadParams, ChangesetReadResult, FileGrant, TestedSource,
 };
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -4935,6 +4935,416 @@ async fn a_created_session_is_kept_when_its_node_is_asked_to_stop_after_its_admi
     };
     assert_eq!(session.root, None);
     assert_eq!(owed_rows(&host), 0, "the node owns nothing to release");
+    host.clients.abort();
+}
+
+/// A daemon with real sessions whose configuration document names `suites` (a name, its command,
+/// and the output paths it declares), started before anything else is done.
+async fn working_host_with_suites(suites: &[(&str, &str, &[&str])]) -> Host {
+    let temp = teardown::Tree::create();
+    let worker = temp.root().join("kr-worker");
+    kr_ipc::testing::place_and_start_once(&beside_this_test("kr-worker"), &worker, &["--version"]);
+    let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    document.automation.test_suites = kr_protocol::scalars::Nullable::some(
+        suites
+            .iter()
+            .map(|(name, command, outputs)| {
+                (
+                    (*name).to_owned(),
+                    kr_protocol::hostinfo::configuration::TestSuite {
+                        command: (*command).to_owned(),
+                        outputs: outputs.iter().map(|path| (*path).to_owned()).collect(),
+                    },
+                )
+            })
+            .collect(),
+    );
+    write_configuration(&temp.environment(), &document);
+    working_host_on(temp, |supervisor| supervisor).await
+}
+
+/// Captures the workspace into a version, through a workflow run, and returns the version.
+async fn captured(
+    control: &mut LocalClient,
+    host: &Host,
+    workspace: WorkspaceId,
+    number: u8,
+) -> kr_protocol::changeset::VersionRef {
+    host.issue(grant_id(number), &[ActionRight::ChangesetCreate]);
+    let document = definition(
+        workflow_id(number),
+        grant_id(number),
+        "a capture",
+        capture_node(workspace),
+    );
+    install(control, host, &document).await;
+    enable(control, host, &document).await;
+    let run: WorkflowRunResult = typed(
+        &start(control, host, &document, "evt-capture")
+            .await
+            .expect("the capture runs"),
+    );
+    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+    match receipts_of(control, &document, run.run_id).await[0]
+        .output
+        .0
+        .clone()
+    {
+        Some(kr_protocol::automation::NodeOutput::CaptureChangeset { version }) => version,
+        other => panic!("a capture names its version, not {other:?}"),
+    }
+}
+
+/// Runs a `run_tests` node for `suite` against `version`, and answers the run, its node and the
+/// version as the daemon reads it afterwards.
+async fn tests_run(
+    control: &mut LocalClient,
+    host: &Host,
+    number: u8,
+    suite: &str,
+    version: kr_protocol::changeset::VersionRef,
+) -> (
+    WorkflowRunResult,
+    kr_protocol::automation::NodeReceiptSummary,
+    kr_protocol::changeset::ChangesetReadResult,
+) {
+    tests_run_within(control, host, number, suite, version, None).await
+}
+
+/// [`tests_run`] with the deadlines the definition names, where it names any.
+async fn tests_run_within(
+    control: &mut LocalClient,
+    host: &Host,
+    number: u8,
+    suite: &str,
+    version: kr_protocol::changeset::VersionRef,
+    deadlines: Option<WorkflowDeadlines>,
+) -> (
+    WorkflowRunResult,
+    kr_protocol::automation::NodeReceiptSummary,
+    kr_protocol::changeset::ChangesetReadResult,
+) {
+    host.issue(grant_id(number), &COMMAND_RIGHTS);
+    let mut document = definition(
+        workflow_id(number),
+        grant_id(number),
+        "tests",
+        WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: serde_json::to_string(&kr_protocol::automation::RunTestsParams {
+                suite: suite.to_owned(),
+                version,
+            })
+            .expect("a test node's typed parameters"),
+            declared_environment: Nullable::some(host.environment_id),
+        },
+    );
+    if let Some(deadlines) = deadlines {
+        document.deadlines = deadlines;
+    }
+    install(control, host, &document).await;
+    enable(control, host, &document).await;
+    let run: WorkflowRunResult = typed(
+        &start(control, host, &document, "evt-tests")
+            .await
+            .expect("the run is admitted"),
+    );
+    let receipt = receipts_of(control, &document, run.run_id).await.remove(0);
+    until("what the tests owned to be released", || {
+        owed_rows(host) == 0
+    })
+    .await;
+    (run, receipt, version_as_read(control, version).await)
+}
+
+/// A version as `changeset.read` answers for it: its results and the evidence against it.
+async fn version_as_read(
+    control: &mut LocalClient,
+    version: kr_protocol::changeset::VersionRef,
+) -> kr_protocol::changeset::ChangesetReadResult {
+    typed(
+        &control
+            .request(
+                Method::ChangesetRead,
+                &kr_protocol::changeset::ChangesetReadParams {
+                    change_set_id: version.change_set_id,
+                    version: Nullable::some(version.version),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("changeset.read succeeds"),
+    )
+}
+
+/// KR-REQ-25.20 and KR-REQ-25.14: a suite that passes against a version succeeds, and the host
+/// records what it observed: the session the suite ran in, its exit status, and that the copy it
+/// ran in still held exactly the version. The edit a person makes in the main workspace after the
+/// capture changes nothing the suite reads, and a capture after it is a later version; the
+/// evidence stays against the earlier one. The copy is released when the node settles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_suite_that_passes_against_a_version_is_recorded_as_the_host_observed_it() {
+    let host = working_host_with_suites(&[(
+        "passes",
+        "grep -q 'changed after the commit' README.md",
+        &[],
+    )])
+    .await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    let version = captured(&mut control, &host, workspace, 60).await;
+
+    // The person goes on working: the copy the suite runs in is the version, not the tree.
+    std::fs::write(
+        host.work().join("source/README.md"),
+        "edited after the capture\n",
+    )
+    .expect("an edit in the main workspace");
+
+    let (run, receipt, read) = tests_run(&mut control, &host, 61, "passes", version).await;
+    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+    assert_eq!(receipt.status, NodeStatus::Success, "{receipt:?}");
+    assert_eq!(
+        receipt.output.0,
+        Some(kr_protocol::automation::NodeOutput::RunTests {
+            suite: "passes".to_owned(),
+            version,
+        })
+    );
+    assert_eq!(read.results.len(), 1, "{read:?}");
+    let result = &read.results[0];
+    assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
+    assert_eq!(result.tested_version.0, Some(version));
+    assert_eq!(result.receipt.exit_status.0, Some(U64::new(0)));
+    assert!(
+        result.receipt.detail.contains(&run.run_id.to_string())
+            && result.receipt.detail.contains("session"),
+        "the result names the session, the run and the node it was observed in: {result:?}"
+    );
+    let command = "grep -q 'changed after the commit' README.md";
+    assert!(
+        result.profile.contains(&kr_changeset::objects::hex_of(
+            kr_changeset::objects::digest_of(command.as_bytes())
+        )),
+        "the result names the command that ran by its digest: {}",
+        result.profile
+    );
+    assert!(
+        !result.profile.contains("grep"),
+        "and never by its text: {}",
+        result.profile
+    );
+    assert!(
+        read.evidence.iter().any(|evidence| evidence.kind
+            == kr_protocol::changeset::EvidenceKind::TestResult
+            && evidence.detail.contains("exited with status 0")),
+        "{:?}",
+        read.evidence
+    );
+    assert!(
+        read.materialisations
+            .iter()
+            .all(|copy| copy.released_at_ms.0.is_some()),
+        "the copy was released: {:?}",
+        read.materialisations
+    );
+
+    // The edit is a later version, and the evidence stays against the version the suite ran on.
+    host.issue(grant_id(62), &[ActionRight::ChangesetCreate]);
+    let later = definition(
+        workflow_id(62),
+        grant_id(62),
+        "a later capture",
+        capture_node(workspace),
+    );
+    install(&mut control, &host, &later).await;
+    enable(&mut control, &host, &later).await;
+    let run: WorkflowRunResult = typed(
+        &start(&mut control, &host, &later, "evt-later")
+            .await
+            .expect("the later capture runs"),
+    );
+    let Some(kr_protocol::automation::NodeOutput::CaptureChangeset { version: second }) =
+        receipts_of(&mut control, &later, run.run_id).await[0]
+            .output
+            .0
+            .clone()
+    else {
+        panic!("the later capture names its version");
+    };
+    assert_ne!(
+        second, version,
+        "an edit after the capture makes a later version"
+    );
+    assert!(
+        version_as_read(&mut control, second)
+            .await
+            .evidence
+            .iter()
+            .all(|evidence| evidence.kind != kr_protocol::changeset::EvidenceKind::TestResult),
+        "the tests are evidence about the version they ran on and not the later one"
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-25.20: a suite that fails is a failed node with its status, and the host records the
+/// status it observed. A caller's word that tests passed is nowhere in the path. A suite the
+/// configuration does not name fails the node before anything is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_suite_that_fails_is_recorded_with_the_status_the_host_observed() {
+    let host =
+        working_host_with_suites(&[("fails", "exit 3", &[]), ("killed", "kill -KILL $$", &[])])
+            .await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    let version = captured(&mut control, &host, workspace, 63).await;
+
+    let (run, receipt, read) = tests_run(&mut control, &host, 64, "fails", version).await;
+    assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
+    assert_eq!(receipt.status, NodeStatus::Failed, "{receipt:?}");
+    assert_eq!(read.results.len(), 1, "{read:?}");
+    assert_eq!(read.results[0].receipt.exit_status.0, Some(U64::new(3)));
+    assert!(
+        read.evidence.iter().any(|evidence| evidence.kind
+            == kr_protocol::changeset::EvidenceKind::TestResult
+            && evidence.detail.contains("exited with status 3")
+            && !evidence.detail.contains("passed")),
+        "{:?}",
+        read.evidence
+    );
+
+    // A suite a signal ended is a failed node, whatever the copy holds, and the result says that
+    // something stopped it and that it had no status.
+    let (run, receipt, read) = tests_run(&mut control, &host, 69, "killed", version).await;
+    assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
+    assert_eq!(receipt.status, NodeStatus::Failed, "{receipt:?}");
+    let killed = read
+        .results
+        .iter()
+        .find(|result| result.command == "killed")
+        .expect("the signal is recorded as the host observed it");
+    assert!(killed.receipt.stopped && killed.receipt.exit_status.0.is_none());
+    assert!(
+        read.evidence
+            .iter()
+            .any(|evidence| evidence.detail.contains("was ended by signal")),
+        "{:?}",
+        read.evidence
+    );
+
+    let sessions_before = all_sessions(&mut control).await.len();
+    let (run, receipt, read) = tests_run(&mut control, &host, 65, "no-such-suite", version).await;
+    assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
+    assert_eq!(receipt.status, NodeStatus::Failed, "{receipt:?}");
+    assert_eq!(read.results.len(), 2, "no further result: {read:?}");
+    assert_eq!(
+        all_sessions(&mut control).await.len(),
+        sessions_before,
+        "a suite the configuration does not name makes no session"
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-25.20 and KR-REQ-25.19: a suite that outlives the node's wait is asked to stop and its
+/// session is closed, and a suite that was stopped has no result to record: nothing is recorded
+/// against the version, the node is cancelled, and the copy it ran in is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_suite_that_outlives_its_wait_is_stopped_and_records_no_result() {
+    let host = working_host_with_suites(&[("long", "sleep 120", &[])]).await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    let version = captured(&mut control, &host, workspace, 70).await;
+
+    let (_, receipt, read) = tests_run_within(
+        &mut control,
+        &host,
+        71,
+        "long",
+        version,
+        Some(WorkflowDeadlines {
+            run_deadline_ms: U64::new(120_000),
+            action_wait_ms: U64::new(15_000),
+        }),
+    )
+    .await;
+    assert_eq!(receipt.status, NodeStatus::Cancelled, "{receipt:?}");
+    // The suite had started: its session was closed because its node was asked to stop.
+    let sessions = all_sessions(&mut control).await;
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let closed = closed_session(&mut control, sessions[0].session_id).await;
+    assert_eq!(
+        closed.closure.0.expect("closed").reason,
+        kr_protocol::session::ClosureReason::CloseRequested
+    );
+    assert!(
+        read.results.is_empty(),
+        "a suite that was stopped attests nothing: {read:?}"
+    );
+    assert!(
+        read.evidence
+            .iter()
+            .all(|evidence| evidence.kind != kr_protocol::changeset::EvidenceKind::TestResult),
+        "{:?}",
+        read.evidence
+    );
+    assert!(
+        read.materialisations
+            .iter()
+            .all(|copy| copy.released_at_ms.0.is_some()),
+        "the copy was released: {:?}",
+        read.materialisations
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-25.20: a suite that writes where it declares output attests the version it ran on, with
+/// the output as a reference; one that writes anywhere else has changed the source, so its pass
+/// attests nothing and the node is left unknown with the version the copy held recorded beside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_suite_that_writes_only_its_declared_output_still_attests_the_version() {
+    let host = working_host_with_suites(&[
+        (
+            "builds",
+            "mkdir -p build/out && echo built > build/out/artefact",
+            &["build/out"],
+        ),
+        (
+            "strays",
+            "mkdir -p build/out && echo built > build/out/artefact && echo stray > stray.txt",
+            &["build/out"],
+        ),
+    ])
+    .await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    let version = captured(&mut control, &host, workspace, 66).await;
+
+    let (run, receipt, read) = tests_run(&mut control, &host, 67, "builds", version).await;
+    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+    assert_eq!(receipt.status, NodeStatus::Success, "{receipt:?}");
+    assert_eq!(
+        read.results[0].tested_source,
+        TestedSource::UnmodifiedVersion
+    );
+    assert!(
+        read.results[0]
+            .outputs
+            .iter()
+            .any(|output| output.label == "build/out" && output.kind == "directory listing"),
+        "{:?}",
+        read.results[0].outputs
+    );
+
+    let (_, receipt, read) = tests_run(&mut control, &host, 68, "strays", version).await;
+    assert_eq!(receipt.status, NodeStatus::Unknown, "{receipt:?}");
+    let result = read
+        .results
+        .iter()
+        .find(|result| result.tested_source == TestedSource::Indeterminate)
+        .expect("the second run is recorded as indeterminate");
+    assert!(result.derived_output_version.0.is_some());
+    assert_eq!(result.tested_version.0, None, "it attests no version");
     host.clients.abort();
 }
 

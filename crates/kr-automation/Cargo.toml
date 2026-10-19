@@ -30,9 +30,6 @@ uuid.workspace = true
 # The test that stands the journal in the interval its previous holder is letting go of its index.
 kr-flush = { workspace = true, features = ["testing"] }
 kr-ipc = { workspace = true, features = ["testing"] }
-# The source workflow's tests hold the bound a brokered Git read is given, in the seam the project
-# service compiles only for tests.
-kr-project = { workspace = true, features = ["git-fixtures"] }
 tempfile.workspace = true
 
 [lints]

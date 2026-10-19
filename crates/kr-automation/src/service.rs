@@ -54,7 +54,6 @@ use crate::causal::CausalContext;
 use crate::definition::validate_definition;
 use crate::engine::WorkflowEngine;
 use crate::error::{AutomationError, Result};
-use crate::source_workflow::SourceWorkflowCoordinator;
 use crate::store::{
     ATTENTION_CONSUMER, ATTENTION_EVENTS, Acted, ActionKey, ActionRecord, AttentionSubject,
     EVENT_NODE_SETTLED, InstalledDefinition, Journal, JournalEvent, JournalEventKind,
@@ -249,7 +248,6 @@ pub struct AutomationService {
     authority: Arc<dyn AuthoritySource>,
     environment_id: EnvironmentId,
     engine: Arc<WorkflowEngine>,
-    source_workflow: Arc<SourceWorkflowCoordinator>,
     events: Arc<tokio::sync::Notify>,
 }
 
@@ -299,7 +297,6 @@ impl AutomationService {
             authority,
             environment_id,
             engine,
-            source_workflow: Arc::new(SourceWorkflowCoordinator::new()),
             events,
         }
     }
@@ -314,12 +311,6 @@ impl AutomationService {
     #[must_use]
     pub fn engine(&self) -> &Arc<WorkflowEngine> {
         &self.engine
-    }
-
-    /// Accessor for the source workflow coordinator.
-    #[must_use]
-    pub fn source_workflow(&self) -> &Arc<SourceWorkflowCoordinator> {
-        &self.source_workflow
     }
 
     /// Woken each time a run this service executed has stopped, which is when its nodes' events

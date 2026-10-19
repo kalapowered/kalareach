@@ -37,7 +37,7 @@ use kr_automation::{
     Dispatch, Host, Submitted, WorkflowStore,
 };
 use kr_changeset::ChangeSetService;
-use kr_changeset::materialise;
+use kr_changeset::materialise::{self, Outputs, RunReport};
 use kr_changeset::service::CaptureOrder;
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::automation::{
@@ -509,7 +509,9 @@ impl ActionRunner for HostActions {
         let kind = dispatch.node.action_kind;
         if matches!(
             kind,
-            WorkflowActionKind::ShellCommand | WorkflowActionKind::CreateSession
+            WorkflowActionKind::ShellCommand
+                | WorkflowActionKind::RunTests
+                | WorkflowActionKind::CreateSession
         ) && let Some(task) = self.live.get(dispatch.action_id)
             && task.cancel(kr_automation::definition::runs_a_command(kind))
         {
@@ -539,7 +541,9 @@ impl ActionRunner for HostActions {
         // given up when the node's task ends, or here if nothing ever polls the future.
         let entry = matches!(
             dispatch.node.action_kind,
-            WorkflowActionKind::ShellCommand | WorkflowActionKind::CreateSession
+            WorkflowActionKind::ShellCommand
+                | WorkflowActionKind::RunTests
+                | WorkflowActionKind::CreateSession
         )
         .then(|| self.live.enter(dispatch.action_id));
         let node_context = NodeContext {
@@ -586,7 +590,10 @@ impl ActionRunner for HostActions {
                 // A command runs through a POSIX shell as the root of a session, which this
                 // platform has not.
                 (WorkflowActionKind::ShellCommand, Some(entry)) if !cfg!(windows) => {
-                    command_node(node_context, Arc::new(held), entry).await
+                    command_node(node_context, Arc::new(held), entry, false).await
+                }
+                (WorkflowActionKind::RunTests, Some(entry)) if !cfg!(windows) => {
+                    command_node(node_context, Arc::new(held), entry, true).await
                 }
                 (other, _) => {
                     Err(kr_automation::AutomationError::ActionUnavailable { action_kind: other })
@@ -987,15 +994,29 @@ async fn command_node(
     context: NodeContext,
     held: Arc<HeldGrant>,
     entry: LiveEntry,
+    tests: bool,
 ) -> kr_automation::Result<ActionOutcome> {
     // The daemon is looked up for each call and never held across the command, which can run for
     // as long as the node's wait: a task that kept it would keep a daemon that is being let go.
     context.daemon.get()?;
-    let params: kr_protocol::automation::ShellCommandParams =
-        serde_json::from_str(&held.node.action_params)?;
+    // A node's parameters are read before its task starts, so one that cannot be read is a refusal
+    // of the node and not a task that ended without an answer.
+    let (command, suite) = if tests {
+        let params: kr_protocol::automation::RunTestsParams =
+            serde_json::from_str(&held.node.action_params)?;
+        (None, Some(params))
+    } else {
+        let params: kr_protocol::automation::ShellCommandParams =
+            serde_json::from_str(&held.node.action_params)?;
+        (Some(params.command), None)
+    };
     let (sender, receiver) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let outcome = run_command(&context, &held, &entry.task, params.command).await;
+        let outcome = match (command, suite) {
+            (Some(command), _) => run_command(&context, &held, &entry.task, command).await,
+            (None, Some(suite)) => run_tests(&context, &held, &entry.task, suite).await,
+            (None, None) => unreachable!("a node is a command or a suite"),
+        };
         drop(entry);
         let _ = sender.send(outcome);
     });
@@ -1122,7 +1143,7 @@ async fn run_command(
         })
         .await?;
     }
-    let driven = drive_command(context, held, task, cwd, text).await;
+    let driven = drive_command(context, held, task, cwd, text, workspace_id).await;
     // Nothing made means nothing to wait for. Otherwise what the dispatch owned is released once
     // its session's closure accounts for the worker; if it cannot yet, the row stays open and the
     // sweep keeps looking.
@@ -1136,6 +1157,13 @@ async fn run_command(
 struct Driven {
     outcome: kr_automation::Result<ActionOutcome>,
     release: bool,
+    /// How the session ended, when its closure was recorded: what a test run is judged by.
+    closure: Option<kr_protocol::session::ClosureRecord>,
+    /// The session, and when it began, once it was made.
+    session: Option<(
+        kr_protocol::ids::SessionId,
+        kr_protocol::scalars::TimestampMs,
+    )>,
 }
 
 impl Driven {
@@ -1143,6 +1171,8 @@ impl Driven {
         Self {
             outcome,
             release: true,
+            closure: None,
+            session: None,
         }
     }
 }
@@ -1414,6 +1444,7 @@ async fn drive_command(
     task: &Arc<NodeTask>,
     cwd: String,
     text: String,
+    bound_workspace: Option<kr_protocol::ids::WorkspaceId>,
 ) -> Driven {
     let actor_id = match workflow_principal(held.definition.grant_reference) {
         Ok(actor_id) => actor_id,
@@ -1464,16 +1495,19 @@ async fn drive_command(
                 .workflow_session_of(&actor_id, context.action_id)
                 .await;
             if let Ok(Some(found)) = &session {
-                note_node_session(context, held, found).await;
+                note_node_session(context, found, bound_workspace).await;
             }
             let outcome = creation_failed(held, error);
             return Driven {
                 outcome,
                 release: matches!(session, Ok(None)),
+                closure: None,
+                session: None,
             };
         }
     };
     let session_id = created.session.session_id;
+    let began_at_ms = created.session.created_at_ms;
     // The session is written down at once, with its worker's process, and bound to the workspace
     // it runs in: a live session is a writer there, which a capture that wants the workspace held
     // still has to count. The worker's process is the one the launcher reported, which the
@@ -1485,7 +1519,12 @@ async fn drive_command(
         .flatten()
         .and_then(|found| found.worker);
     drop(controller);
-    note_node_session(context, held, &NodeSession { session_id, worker }).await;
+    note_node_session(
+        context,
+        &NodeSession { session_id, worker },
+        bound_workspace,
+    )
+    .await;
     let closure = wait_for_closure(context, task, &actor_id, session_id).await;
     let outcome = match &closure {
         Some(closure) => command_outcome(closure),
@@ -1500,16 +1539,21 @@ async fn drive_command(
         release: closure
             .as_ref()
             .is_some_and(|closure| !left_unaccounted(closure)),
+        closure,
+        session: Some((session_id, began_at_ms)),
     }
 }
 
 /// Writes down the session a dispatch made and the process of its worker, and binds the session to
 /// the workspace it runs in.
-async fn note_node_session(context: &NodeContext, held: &Arc<HeldGrant>, found: &NodeSession) {
+async fn note_node_session(
+    context: &NodeContext,
+    found: &NodeSession,
+    workspace_id: Option<kr_protocol::ids::WorkspaceId>,
+) {
     let ledger = Arc::clone(&context.ledger);
     let changesets = Arc::clone(&context.changesets);
     let action_id = context.action_id;
-    let workspace_id = held.definition.resource_scope.workspace_id.0;
     let (session_id, worker) = (found.session_id, found.worker.clone());
     let noted = blocking(move || -> kr_automation::Result<()> {
         ledger.note_session(action_id, session_id, worker.as_ref())?;
@@ -1533,6 +1577,297 @@ async fn note_node_session(context: &NodeContext, held: &Arc<HeldGrant>, found: 
             context.action_id.get()
         );
     }
+}
+
+/// Runs a `run_tests` node: the suite the host's configuration names, as the root of a session of
+/// its own, in a private copy of the version it is to test, and the node's result is what this
+/// host observed of that session, never a caller's account of it.
+///
+/// Nothing is made before the suite is found in the configuration the daemon accepted, the version
+/// is found inside the workflow's scope and the suite's declared outputs are found to agree with
+/// the version. The copy is then made under the identifier the ledger row already names, so a stop
+/// at any point leaves something the sweep finds from the row. When the session has closed, the
+/// copy is read back and the version it still holds, or what it holds instead, is recorded with
+/// the command's exit status as evidence against the version; the copy is released after that.
+async fn run_tests(
+    context: &NodeContext,
+    held: &Arc<HeldGrant>,
+    task: &Arc<NodeTask>,
+    params: kr_protocol::automation::RunTestsParams,
+) -> kr_automation::Result<ActionOutcome> {
+    let controller = context.daemon.get()?;
+    // One accepted configuration is read for the whole dispatch.
+    let suite = match controller.workflow_test_suite(&params.suite) {
+        Ok(suite) => suite,
+        Err(detail) => return Ok(ActionOutcome::Failed { error: detail }),
+    };
+    drop(controller);
+    let version = params.version;
+    let outputs = {
+        let (changesets, held, declared) = (
+            Arc::clone(&context.changesets),
+            Arc::clone(held),
+            suite.outputs.clone(),
+        );
+        let checked = blocking(
+            move || -> kr_automation::Result<std::result::Result<Outputs, String>> {
+                held.still_authorised()?;
+                version_in_scope(
+                    &changesets,
+                    &held.definition,
+                    &ChangesetMaterializeParams {
+                        change_set_id: version.change_set_id,
+                        version: version.version,
+                        purpose: kr_protocol::changeset::MaterialisationPurpose::Test,
+                        label: String::new(),
+                    },
+                    held.environment_id,
+                )?;
+                let manifest = changesets
+                    .manifest(version.change_set_id, version.version)
+                    .map_err(|error| {
+                        kr_automation::AutomationError::PermissionDenied(format!(
+                            "the version this suite tests could not be read: {}",
+                            kr_project::git::redact(&error.to_string())
+                        ))
+                    })?;
+                Ok(Outputs::new(&declared, &manifest))
+            },
+        )
+        .await?;
+        match checked {
+            Ok(outputs) => outputs,
+            Err(detail) => {
+                return Ok(ActionOutcome::Failed {
+                    error: format!(
+                        "the outputs suite {} declares cannot be used: {detail}",
+                        params.suite
+                    ),
+                });
+            }
+        }
+    };
+    let materialisation_id = kr_protocol::ids::MaterialisationId::new(kr_ipc::new_uuid());
+    let owned = Owned {
+        action_id: context.action_id,
+        run_id: context.run_id,
+        node_id: held.node.node_id.clone(),
+        kind: held.node.action_kind,
+        grant_id: held.definition.grant_reference,
+        owns_session: true,
+        materialisation_id: Some(materialisation_id),
+        scratch: None,
+        scratch_identity: None,
+        workspace_id: None,
+        session_id: None,
+        worker: None,
+        boot: Some(context.daemon.get()?.boot().clone()),
+        state: OwnedState::Open,
+    };
+    {
+        let ledger = Arc::clone(&context.ledger);
+        let now = context.daemon.now_ms();
+        blocking(move || ledger.begin(&owned, now)).await?;
+    }
+    // The copy of the version, written under the grant the node holds.
+    let made = {
+        let (changesets, held) = (Arc::clone(&context.changesets), Arc::clone(held));
+        let label = format!("{} for workflow node {}", params.suite, held.node.node_id);
+        blocking(move || {
+            materialise::materialise_as(
+                &changesets,
+                materialisation_id,
+                version,
+                kr_protocol::changeset::MaterialisationPurpose::Test,
+                &label,
+                Some(&*held),
+            )
+        })
+        .await
+    };
+    let record = match made {
+        Ok(record) if record.unapplied.is_empty() => record,
+        failed => {
+            // Nothing was run, so nothing is owed a wait: the copy, if one was begun, goes now.
+            release_row(context, context.action_id).await;
+            return match failed {
+                Ok(record) => Ok(ActionOutcome::Failed {
+                    error: format!(
+                        "the copy of version {} of change set {} left {} of its paths unwritten, \
+                         so no tests ran",
+                        version.version,
+                        version.change_set_id,
+                        record.unapplied.len()
+                    ),
+                }),
+                Err(error) => held.refusal_of(error),
+            };
+        }
+    };
+    let driven = drive_command(
+        context,
+        held,
+        task,
+        record.directory_path.clone(),
+        suite.command.clone(),
+        None,
+    )
+    .await;
+    let outcome = match (&driven.closure, &driven.session) {
+        (Some(closure), Some((session_id, began_at_ms))) => {
+            observe_tests(
+                context,
+                held,
+                &TestRun {
+                    suite: &params.suite,
+                    command_digest: kr_changeset::objects::hex_of(
+                        kr_changeset::objects::digest_of(suite.command.as_bytes()),
+                    ),
+                    version,
+                    materialisation_id,
+                    outputs,
+                    session_id: *session_id,
+                    began_at_ms: *began_at_ms,
+                },
+                closure,
+            )
+            .await
+        }
+        _ => driven.outcome,
+    };
+    if driven.release {
+        release_row(context, context.action_id).await;
+    }
+    outcome
+}
+
+/// What a test run is recorded against.
+struct TestRun<'a> {
+    suite: &'a str,
+    /// The digest of the command the suite's configuration gave when the node dispatched, so a
+    /// result says which command ran and the command's text is kept out of it.
+    command_digest: String,
+    version: kr_protocol::changeset::VersionRef,
+    materialisation_id: kr_protocol::ids::MaterialisationId,
+    outputs: Outputs,
+    session_id: kr_protocol::ids::SessionId,
+    began_at_ms: kr_protocol::scalars::TimestampMs,
+}
+
+/// Records what this host observed of a finished test session, and judges the node by it.
+///
+/// A result is recorded only for a suite that ran to an end of its own: it exited with a status, or
+/// a signal ended it. A suite that never started, or that was stopped, has no result to record, and
+/// the node's answer says how the session closed. Of the suites that ran, the session's own exit
+/// status and the copy as it is read back now decide the node. A suite that exits zero against a
+/// copy that still holds exactly the version has passed that version; one that exits zero against a
+/// copy that was changed, or that cannot be read back, has passed nothing this host can name, and
+/// the node is left unknown. A non-zero status or a signal fails the node whatever the copy holds.
+async fn observe_tests(
+    context: &NodeContext,
+    held: &HeldGrant,
+    run: &TestRun<'_>,
+    closure: &kr_protocol::session::ClosureRecord,
+) -> kr_automation::Result<ActionOutcome> {
+    use kr_protocol::changeset::{EvidenceKind, TestedSource};
+    use kr_protocol::session::ClosureReason;
+
+    // How the session closed decides everything but a pass: the same account a command's node gives.
+    let outcome = command_outcome(closure);
+    let ended = match closure.reason {
+        ClosureReason::RootExit => closure
+            .root_exit_code
+            .0
+            .map(|code| format!("exited with status {}", code.get())),
+        ClosureReason::RootSignal => Some(match closure.root_signal.0.as_deref() {
+            Some(signal) => format!("was ended by signal {signal}"),
+            None => "was ended by a signal".to_owned(),
+        }),
+        _ => None,
+    };
+    let Some(ended) = ended else {
+        return Ok(outcome);
+    };
+    let report = RunReport {
+        command: run.suite.to_owned(),
+        profile: format!("workflow run_tests; command digest {}", run.command_digest),
+        tool: kr_protocol::changeset::ToolIdentity {
+            name: COMMAND_INTERPRETER.to_owned(),
+            version: "not reported".to_owned(),
+        },
+        receipt: kr_protocol::changeset::ExecutionReceipt {
+            started_at_ms: run.began_at_ms,
+            ended_at_ms: closure.closed_at_ms,
+            exit_status: closure.root_exit_code,
+            // A signal stopped it rather than it finishing.
+            stopped: closure.reason != ClosureReason::RootExit,
+            detail: format!(
+                "observed by this host: session {}, workflow run {}, node {}; the suite {ended}",
+                run.session_id, context.run_id, held.node.node_id
+            ),
+        },
+        outputs: Vec::new(),
+    };
+    let recorded = {
+        let changesets = Arc::clone(&context.changesets);
+        let (id, outputs, version, suite) = (
+            run.materialisation_id,
+            run.outputs.clone(),
+            run.version,
+            run.suite.to_owned(),
+        );
+        let session_id = run.session_id;
+        blocking(
+            move || -> kr_changeset::Result<kr_protocol::changeset::MaterialisationResult> {
+                let result = materialise::record_result_with(&changesets, id, &report, &outputs)?;
+                changesets.record_evidence(
+                    version.change_set_id,
+                    version.version,
+                    EvidenceKind::TestResult,
+                    &format!(
+                        "suite '{suite}' in session {session_id} {ended}; the tested source is {}",
+                        match result.tested_source {
+                            TestedSource::UnmodifiedVersion => "this version, unmodified",
+                            TestedSource::Indeterminate => "indeterminate",
+                        }
+                    ),
+                )?;
+                Ok(result)
+            },
+        )
+        .await
+    };
+    let result = match recorded {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(ActionOutcome::Unknown {
+                detail: format!(
+                    "the suite's session closed, but what this host observed could not be \
+                     recorded: {}",
+                    kr_project::git::redact(&error.to_string())
+                ),
+            });
+        }
+    };
+    Ok(match outcome {
+        // Only a suite that passed is judged by what it ran against.
+        ActionOutcome::Success { .. } => match result.tested_source {
+            TestedSource::UnmodifiedVersion => ActionOutcome::Success {
+                output: NodeOutput::RunTests {
+                    suite: run.suite.to_owned(),
+                    version: run.version,
+                },
+            },
+            TestedSource::Indeterminate => ActionOutcome::Unknown {
+                detail: format!(
+                    "the suite exited with status 0, but what it ran against cannot be \
+                     established: {}",
+                    result.attestation
+                ),
+            },
+        },
+        other => other,
+    })
 }
 
 /// Whether a closure could not account for the session's own worker, which may then still write
@@ -1711,6 +2046,29 @@ async fn release(
                 "the session's binding to its workspace was not ended: {}",
                 kr_project::git::redact(&error.to_string())
             )));
+        }
+        // The copy a test run was given, by the identifier the row named before it was made: taken
+        // away when it has a record, and its empty directory when a stop left one with none.
+        if let Some(materialisation_id) = row.materialisation_id {
+            match materialise::release(&changesets, materialisation_id) {
+                Ok(_) => {}
+                Err(kr_changeset::ChangeSetError::UnknownMaterialisation { .. }) => {
+                    materialise::discard_unrecorded(&changesets, materialisation_id).map_err(
+                        |error| {
+                            kr_automation::AutomationError::InvalidArgument(format!(
+                                "a test run's directory was not taken away: {}",
+                                kr_project::git::redact(&error.to_string())
+                            ))
+                        },
+                    )?;
+                }
+                Err(error) => {
+                    return Err(kr_automation::AutomationError::InvalidArgument(format!(
+                        "a test run's copy of its version was not released: {}",
+                        kr_project::git::redact(&error.to_string())
+                    )));
+                }
+            }
         }
         // The run holds a workspace once however many of its nodes ran there, so the hold ends
         // with the last row that holds it. A dispatch that is taking the hold for a node that

@@ -15,7 +15,6 @@
 //! | [`admission`] | Per-workflow concurrency and pending limits, and host-wide and per-grant rates, decided from the journal |
 //! | [`store`] | The SQLite workflow journal holding definitions, triggers, runs, receipts, budgets and the attention outbox |
 //! | [`engine`] | Topological node sequencing, dependency resolution, and outcomes |
-//! | [`source_workflow`] | The completion-tests-reviewer workflow and evidence binding |
 //! | [`service`] | The top-level automation service dispatching the `Automation` group |
 //! | [`error`] | Error kinds and conversions to wire protocol errors |
 //!
@@ -57,7 +56,6 @@ pub mod engine;
 pub mod error;
 pub mod resources;
 pub mod service;
-pub mod source_workflow;
 pub mod store;
 
 pub use crate::admission::Placement;
@@ -74,7 +72,6 @@ pub use crate::service::{
     AdmittedTriggers, Answer, AutomationService, DERIVED_TRIGGER_PREFIX, StartedRun,
     TRIGGER_CONSUMER, TriggerDecision,
 };
-pub use crate::source_workflow::{ReviewerTurn, SourceWorkflowCoordinator};
 pub use crate::store::{
     Acted, ActionKey, ActionRecord, AttentionOutboxRecord, AttentionSubject, Breach, Continuation,
     InstalledDefinition, Journal, JournalEvent, JournalEventKind, NodeSettlement, Outlived,
