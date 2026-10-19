@@ -162,7 +162,8 @@ pub struct Arrived {
     pub token: Option<String>,
     /// The content beside it, for a part.
     pub content: Option<Vec<u8>>,
-    /// The kind of key that signed it and that key's public half, when it carried a signature.
+    /// The kind and the public key its signature names, when it carried one. It is what arrived, not
+    /// proof that the signature verified: a test that needs the proof reads what the service accepted.
     pub signed_by: Option<(ServiceRequestSigner, kr_protocol::scalars::AuthorisationKey)>,
     /// Whether the service saw it.
     pub reached: bool,
@@ -943,8 +944,9 @@ impl ServiceWeb {
                 body: document["body"].clone(),
                 token: token.map(str::to_owned),
                 content: content.map(<[u8]>::to_vec),
-                // The kind and the key are read on their own: a request of a route whose method
-                // this crate's typed signature does not list, a relay route's, is signed all the same.
+                // The kind and the key are read on their own: the typed signature of
+                // `kr_protocol::service` names only the methods of the host protocol, and a relay
+                // route's request, signed all the same, would not parse as one.
                 signed_by: serde_json::from_value::<ServiceRequestSigner>(
                     document["signature"]["signer"].clone(),
                 )
