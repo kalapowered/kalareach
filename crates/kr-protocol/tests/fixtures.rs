@@ -230,6 +230,97 @@ fn host_selection_matches_fixture() {
     assert_matches_fixture(&document, "host_selection", &host_selection());
 }
 
+/// The members of a map, by name, in the order the canonical form sorts them.
+fn members_of(value: &CanonicalValue) -> Vec<String> {
+    let CanonicalValue::Map(map) = value else {
+        panic!("a message is a map");
+    };
+    let mut names: Vec<String> = map.entries().iter().map(|(name, _)| name.clone()).collect();
+    names.sort();
+    names
+}
+
+fn names(members: &[&str]) -> Vec<String> {
+    let mut names: Vec<String> = members.iter().map(|name| (*name).to_owned()).collect();
+    names.sort();
+    names
+}
+
+/// KR-REQ-23.23: a request carries `request_id`, `method`, `method_version` and `params`; a
+/// mutation carries those and, in addition, `action_id`, its grant reference, its target, its
+/// subject preconditions, `action_window_id` and `requested_ttl_ms`; a response correlates
+/// `request_id`; a notification carries a stream ID, a sequence, an event type and a payload. Each
+/// is exactly those members in what the types write, and in the committed bytes where the frames
+/// fixture has them (it has no plain read request).
+#[test]
+fn requests_responses_and_notifications_carry_the_members_section_23_names() {
+    use kr_protocol::envelope::{Notification, Outcome, Request, Response};
+
+    let request_members = ["request_id", "method", "method_version", "params"];
+    let mutation_members: Vec<&str> = request_members
+        .into_iter()
+        .chain([
+            "action_id",
+            "grant_id",
+            "target",
+            "expected",
+            "action_window_id",
+            "requested_ttl_ms",
+        ])
+        .collect();
+    let notification_members = ["stream_id", "sequence", "event_type", "payload"];
+    let response_members = ["request_id", "outcome"];
+
+    // The committed bytes.
+    let document = load("frames.json");
+    let committed = |id: &str| {
+        let bytes = hex::decode(case_hex(&document, id)).expect("hex");
+        members_of(&decode(&bytes, &Limits::DEFAULT).expect("decodes"))
+    };
+    assert_eq!(committed("mutation_request"), names(&mutation_members));
+    assert_eq!(committed("notification"), names(&notification_members));
+    assert_eq!(committed("ok_response"), names(&response_members));
+    assert_eq!(committed("error_response"), names(&response_members));
+
+    // What the types write.
+    let written = |bytes: Vec<u8>| members_of(&decode(&bytes, &Limits::DEFAULT).expect("decodes"));
+    assert_eq!(
+        written(kr_cbor::to_canonical_vec(&mutation_request()).expect("encodes")),
+        names(&mutation_members)
+    );
+    let read = Request {
+        request_id: RequestId::new(42),
+        method: Method::SessionList.into(),
+        method_version: MethodVersion::V1,
+        params: ParamsValue::new(CanonicalValue::Map(CanonicalMap::new())),
+    };
+    assert_eq!(
+        written(kr_cbor::to_canonical_vec(&read).expect("encodes")),
+        names(&request_members),
+        "a read request is not given a mutation's members"
+    );
+    let notification_bytes = hex::decode(
+        case(&document, "notification")["cbor_hex"]
+            .as_str()
+            .expect("hex"),
+    )
+    .expect("hex");
+    let notification: Notification =
+        kr_cbor::from_canonical_slice(&notification_bytes, &Limits::DEFAULT).expect("typed");
+    assert_eq!(
+        written(kr_cbor::to_canonical_vec(&notification).expect("encodes")),
+        names(&notification_members)
+    );
+    let response = Response {
+        request_id: RequestId::new(43),
+        outcome: Outcome::Ok(ParamsValue::new(CanonicalValue::Map(CanonicalMap::new()))),
+    };
+    assert_eq!(
+        written(kr_cbor::to_canonical_vec(&response).expect("encodes")),
+        names(&response_members)
+    );
+}
+
 /// KR-REQ-09.01: a mutation's elements, in the published bytes.
 #[test]
 fn mutation_request_matches_fixture() {
@@ -379,6 +470,91 @@ fn connect_transcript_matches_fixture() {
         hex::encode(digest.as_bytes()),
         case["sha256"].as_str().expect("sha256")
     );
+}
+
+/// KR-ACC-026: the proofs of a connection are made over exact canonical bytes. The published
+/// transcript is the array of the domain, the offer, the selection, the client's endpoint and the
+/// host's endpoint, and its offer and selection are, byte for byte, the published hello frames: a
+/// proof covers the complete hello and nothing else. The types write that transcript, and a
+/// different nonce in either hello makes another.
+#[test]
+fn the_connect_transcript_is_the_published_hello_frames_and_both_endpoints() {
+    let frames = load("frames.json");
+    let transcripts = load("transcripts.json");
+    let case = case(&transcripts, "connect_transcript");
+    let transcript = hex::decode(case["hex"].as_str().expect("hex")).expect("hex");
+
+    let CanonicalValue::Array(elements) = decode(&transcript, &Limits::DEFAULT).expect("decodes")
+    else {
+        panic!("the transcript is an array");
+    };
+    assert_eq!(elements.len(), 5);
+    assert_eq!(elements[0], CanonicalValue::text(CONNECT_DOMAIN));
+    for (element, frame) in [
+        (&elements[1], "client_offer"),
+        (&elements[2], "host_selection"),
+    ] {
+        assert_eq!(
+            hex::encode(encode(element)),
+            case_hex(&frames, frame),
+            "the transcript carries the published {frame} frame as it is"
+        );
+    }
+    for (element, endpoint) in [
+        (&elements[3], "client_endpoint_id"),
+        (&elements[4], "host_endpoint_id"),
+    ] {
+        assert_eq!(
+            element,
+            &CanonicalValue::Bytes(
+                hex::decode(case[endpoint].as_str().expect("hex")).expect("hex")
+            )
+        );
+    }
+
+    let endpoint = |name: &str| {
+        EndpointKey::from_bytes(
+            hex::decode(case[name].as_str().expect("hex"))
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes"),
+        )
+    };
+    let (client_endpoint, host_endpoint) =
+        (endpoint("client_endpoint_id"), endpoint("host_endpoint_id"));
+    assert_eq!(
+        connect_transcript(
+            &client_offer(),
+            &host_selection(),
+            &client_endpoint,
+            &host_endpoint
+        )
+        .expect("transcript"),
+        transcript
+    );
+    let mut other_offer = client_offer();
+    other_offer.client_nonce = Nonce256::from_bytes([0x12; 32]);
+    let mut other_selection = host_selection();
+    other_selection.host_nonce = Nonce256::from_bytes([0x23; 32]);
+    for (offer, selection) in [
+        (other_offer, host_selection()),
+        (client_offer(), other_selection),
+    ] {
+        assert_ne!(
+            connect_transcript(&offer, &selection, &client_endpoint, &host_endpoint)
+                .expect("transcript"),
+            transcript,
+            "a hello that differs in one nonce is a transcript that differs"
+        );
+    }
+}
+
+/// The hex of a published frame's canonical bytes.
+fn case_hex(document: &Json, id: &str) -> String {
+    case(document, id)["cbor_hex"]
+        .as_str()
+        .expect("cbor_hex")
+        .to_owned()
 }
 
 /// KR-REQ-23.07: the mutation digest's signing input, in the published bytes.

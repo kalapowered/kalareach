@@ -1312,6 +1312,66 @@ mod tests {
         );
     }
 
+    /// KR-REQ-23.23: an upstream JSON-RPC identifier stays inside its connector. Two connections
+    /// whose terminals both call a request `11` hold two requests, a response correlates to the
+    /// connection that carried it, and an identifier an upstream spells like one of this host's
+    /// own (a UUID) is kept as the text the upstream wrote, which is not an identifier of this
+    /// host's.
+    #[test]
+    fn an_upstream_identifier_is_namespaced_by_its_connection_and_never_a_host_identifier() {
+        use std::str::FromStr as _;
+
+        let mut gateway = native_gateway();
+        gateway
+            .open_native(
+                GatewayConnectionId::new(2),
+                instance(),
+                ProcessStartIdentity::new(42, ProcessStartSource::MacosProcBsdInfo, 901),
+                table(),
+                rich(),
+                "1",
+            )
+            .expect("a second terminal of the same instance");
+        let frame = br#"{"id":"11","method":"fs/write_text_file"}"#;
+        let first = gateway
+            .forward_native(GatewayConnectionId::new(1), frame)
+            .expect("forwarded")
+            .request
+            .expect("it carried one");
+        let second = gateway
+            .forward_native(GatewayConnectionId::new(2), frame)
+            .expect("forwarded")
+            .request
+            .expect("it carried one");
+        assert_eq!(first.upstream, second.upstream, "one upstream spelling");
+        assert_ne!(first, second, "and two requests, one to each connection");
+        let answered = gateway
+            .correlate_response(GatewayConnectionId::new(2), br#"{"id":"11","result":{}}"#)
+            .expect("a response");
+        assert_eq!(
+            answered, second,
+            "a response resolves the request of the connection that carried it"
+        );
+        assert_ne!(answered, first);
+
+        let host_shaped = "e52e8d1a-6818-4be7-b4b8-f93a8b1c0c6d";
+        let spelled = format!(r#"{{"id":"{host_shaped}","method":"fs/write_text_file"}}"#);
+        let carried = gateway
+            .forward_native(GatewayConnectionId::new(1), spelled.as_bytes())
+            .expect("forwarded")
+            .request
+            .expect("it carried one");
+        assert_eq!(
+            carried.upstream.as_str(),
+            format!("\"{host_shaped}\""),
+            "the upstream's own JSON text, quotes included"
+        );
+        assert!(
+            kr_protocol::scalars::Uuid::from_str(carried.upstream.as_str()).is_err(),
+            "so it is not an identifier of this host's, whatever it looks like"
+        );
+    }
+
     #[test]
     fn an_identifier_is_bounded_by_its_value_and_never_by_what_encoding_costs() {
         let gateway = native_gateway();
