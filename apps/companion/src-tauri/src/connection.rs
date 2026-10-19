@@ -570,6 +570,18 @@ pub async fn forward_events<R: Runtime>(
     loop {
         let heard = tokio::select! {
             heard = events.recv() => heard,
+            // The host refused a request on this connection as not permitted. A host that
+            // withdrew what the connection was admitted under refuses everything on it and does
+            // not close it, so whether this is that is asked of the host, over another connection,
+            // and nothing waits on the answer: events go on being forwarded meanwhile.
+            () = session.denied() => {
+                let app = app.clone();
+                let session = Arc::clone(&session);
+                tauri::async_runtime::spawn(async move {
+                    app.state::<AppState>().replace_if_withdrawn(&session).await;
+                });
+                continue;
+            }
             () = session.closed() => {
                 let state = app.state::<AppState>();
                 state.disconnected_from(&session, "the connection to this host ended");

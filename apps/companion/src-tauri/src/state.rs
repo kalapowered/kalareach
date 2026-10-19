@@ -241,12 +241,13 @@ impl AppState {
     ///
     /// A revocation withdraws the connections the host admitted before it. The host refuses every
     /// request on one and keeps it open, so a connection that is held and not asked for what it
-    /// is refused goes on being refused, and nothing ends it. The host is asked for its devices,
-    /// which it lists to any connection of this computer's that it admits and to no other: a
-    /// refusal of that over this connection, and an answer over another, say it was withdrawn,
-    /// where one command's refusal for its own reasons does not. The other takes its place, and
-    /// the withdrawn one is ended; whatever keeps a connection to the host opens one of its own in
-    /// turn.
+    /// is refused goes on being refused, and nothing ends it. The connection's supervision calls
+    /// this when the host refuses a request on it as not permitted, whichever path of the
+    /// application made the request. The host is asked for its devices, which it lists to any
+    /// connection of this computer's that it admits and to no other: a refusal of that over this
+    /// connection, and an answer over another, say it was withdrawn, where one request's refusal
+    /// for its own reasons does not. The other takes its place, and the withdrawn one is ended,
+    /// which the supervision takes up in turn.
     pub async fn replace_if_withdrawn(&self, session: &Arc<Session>) {
         let held = self
             .connection

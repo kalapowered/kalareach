@@ -133,6 +133,9 @@ pub(crate) enum Listing {
     /// It did not answer in time, could not be reached, or refused for a reason that says nothing
     /// of its devices.
     Silent,
+    /// The connection it was asked over has ended, which says nothing of the host: a connection
+    /// that was replaced while a caller still held a copy of it.
+    Ended,
 }
 
 impl Listing {
@@ -174,6 +177,7 @@ pub(crate) async fn listed(session: &Arc<Session>) -> Listing {
     match asked {
         Ok(Ok(list)) => Listing::Listed(list),
         Ok(Err(ClientError::Host(refused))) => Listing::of_refusal(refused.code),
+        Ok(Err(ClientError::ConnectionEnded)) => Listing::Ended,
         Ok(Err(_)) | Err(_) => Listing::Silent,
     }
 }
@@ -185,11 +189,16 @@ pub(crate) async fn listed(session: &Arc<Session>) -> Listing {
 /// request on one with a refusal that says to open a new connection. It does not close it, so a
 /// connection that is held and not asked for what it is refused goes on being refused. When the
 /// host refuses this connection, it is asked again over another; when that lists, the refused
-/// connection was withdrawn, and `replace` puts the other in its place and ends it. What a fresh
-/// connection is answered is the host's word; one that cannot be opened says nothing of the host.
+/// connection was withdrawn, and `replace` puts the other in its place and ends it. A connection
+/// that has ended, because a caller held a copy of one that was replaced, is asked about the same
+/// way. What a fresh connection is answered is the host's word; one that cannot be opened says
+/// nothing of the host.
 pub(crate) async fn listed_replacing(connection: &Connection, replace: &Replacer) -> Listing {
+    if !matches!(connection.standing(), Standing::Owner) {
+        return listed(&connection.session()).await;
+    }
     let listing = listed(&connection.session()).await;
-    if !matches!(listing, Listing::Refused) || !matches!(connection.standing(), Standing::Owner) {
+    if !matches!(listing, Listing::Refused | Listing::Ended) {
         return listing;
     }
     match tokio::time::timeout(ANSWER_WITHIN, connection.another()).await {
@@ -224,7 +233,7 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
                     match listed_replacing(&connection, &state.replacer()).await {
                         Listing::Listed(list) => found.lists.push(list),
                         Listing::Refused => found.refused = true,
-                        Listing::Silent => found.silent = true,
+                        Listing::Silent | Listing::Ended => found.silent = true,
                     }
                 }
                 if let Standing::Paired { host, .. } = connection.standing() {
@@ -263,7 +272,7 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
                 match visit.await {
                     Ok(Listing::Listed(list)) => found.lists.push(list),
                     Ok(Listing::Refused) => found.refused = true,
-                    Ok(Listing::Silent) | Err(_) => found.silent = true,
+                    Ok(Listing::Silent | Listing::Ended) | Err(_) => found.silent = true,
                 }
             }
             found

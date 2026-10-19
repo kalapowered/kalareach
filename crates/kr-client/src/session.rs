@@ -392,6 +392,8 @@ struct SessionState {
     events: broadcast::Sender<Notification>,
     /// True once the connection has ended, which a holder of the session may wait for.
     ended: tokio::sync::watch::Sender<bool>,
+    /// Raised each time the host refuses a request on the connection as not permitted.
+    denied: tokio::sync::Notify,
     outstanding: AtomicU64,
     max_outstanding: u64,
 }
@@ -479,6 +481,7 @@ impl Session {
             outcomes: Mutex::new(Outcomes::default()),
             events,
             ended: tokio::sync::watch::channel(false).0,
+            denied: tokio::sync::Notify::new(),
             outstanding: AtomicU64::new(0),
             max_outstanding: limits.max_outstanding_mutations.get(),
         });
@@ -1237,6 +1240,17 @@ impl Session {
         let _ = ended.wait_for(|ended| *ended).await;
     }
 
+    /// Resolves when the host refuses a request on this connection as not permitted.
+    ///
+    /// A holder that owns the connection uses it to ask the host again, over another connection,
+    /// whether it was the connection the host refused: a host that has withdrawn what a connection
+    /// was admitted under refuses everything on it and does not close it, so nothing else says the
+    /// connection is dead. Refusals that arrive while nobody waits are kept as one, so a holder is
+    /// told once it asks, and told once for any number that arrived meanwhile.
+    pub async fn denied(&self) {
+        self.state.denied.notified().await;
+    }
+
     /// Ends the session and the connection, waking every waiting call.
     ///
     /// The transition is synchronous, so a caller that drops this future still leaves the session
@@ -1386,6 +1400,11 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
     match frame {
         ControlFrame::Response(response) => {
             let request_id = response.request_id;
+            if let Outcome::Error(error) = &response.outcome
+                && error.code == kr_protocol::error::ErrorCode::PermissionDenied
+            {
+                state.denied.notify_one();
+            }
             // A correlated answer settles the action *when it is definite*. Most are: the host
             // reached a decision about whatever the request carried, and settling it here rather
             // than in the caller means a caller that has gone away does not leave its action

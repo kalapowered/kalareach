@@ -1202,7 +1202,7 @@ async fn visit(
     let (contact, list) = match listing {
         Listing::Listed(list) => (Contact::Answered, Some(list)),
         Listing::Refused => (Contact::Refused, None),
-        Listing::Silent => (Contact::Silent, None),
+        Listing::Silent | Listing::Ended => (Contact::Silent, None),
     };
     Reading {
         host,

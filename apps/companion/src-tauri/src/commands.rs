@@ -734,22 +734,6 @@ where
     }
 }
 
-/// Replaces the connection `session` is when a command over it was refused because the host
-/// withdrew it. The host keeps a withdrawn connection open and refuses what it is asked, so a
-/// command that takes the refusal as its own answer would be refused again until the application
-/// restarts.
-async fn replace_if_withdrawn<T>(
-    state: &AppState,
-    session: &std::sync::Arc<kr_client::Session>,
-    answer: &std::result::Result<T, kr_client::ClientError>,
-) {
-    if let Err(kr_client::ClientError::Host(refusal)) = answer
-        && refusal.code == kr_protocol::error::ErrorCode::PermissionDenied
-    {
-        state.replace_if_withdrawn(session).await;
-    }
-}
-
 /// Declares a command that performs one read and nothing else.
 macro_rules! read_command {
     ($(#[$meta:meta])* $name:ident, $method:expr, () => $result:ty) => {
@@ -757,9 +741,8 @@ macro_rules! read_command {
         #[tauri::command]
         pub async fn $name(state: State<'_, AppState>) -> Result<Value> {
             let session = state.session()?;
-            let answer = session.read::<_, $result>($method, &NoParams {}).await;
-            replace_if_withdrawn(&state, &session, &answer).await;
-            encode(&answer?)
+            let answer: $result = session.read($method, &NoParams {}).await?;
+            encode(&answer)
         }
     };
     ($(#[$meta:meta])* $name:ident, $method:expr, $params:ty => $result:ty) => {
@@ -768,9 +751,8 @@ macro_rules! read_command {
         pub async fn $name(state: State<'_, AppState>, params: Value) -> Result<Value> {
             let typed: $params = decode(params)?;
             let session = state.session()?;
-            let answer = session.read::<_, $result>($method, &typed).await;
-            replace_if_withdrawn(&state, &session, &answer).await;
-            encode(&answer?)
+            let answer: $result = session.read($method, &typed).await?;
+            encode(&answer)
         }
     };
 }
@@ -788,11 +770,11 @@ macro_rules! mutate_command {
             let typed: $params = decode(params)?;
             let target = subject.target(state.environment_id()?)?;
             let session = state.session()?;
-            let answer = session
-                .mutate($method, target, None, &NoPreconditions {}, &typed, MUTATION_TTL)
-                .await;
-            replace_if_withdrawn(&state, &session, &answer).await;
-            submitted(answer)
+            submitted(
+                session
+                    .mutate($method, target, None, &NoPreconditions {}, &typed, MUTATION_TTL)
+                    .await,
+            )
         }
     };
 }
@@ -810,11 +792,11 @@ macro_rules! mutate_result_command {
             let typed: $params = decode(params)?;
             let target = subject.target(state.environment_id()?)?;
             let session = state.session()?;
-            let answer = session
-                .mutate($method, target, None, &NoPreconditions {}, &typed, MUTATION_TTL)
-                .await;
-            replace_if_withdrawn(&state, &session, &answer).await;
-            submitted_as::<$result>(answer)
+            submitted_as::<$result>(
+                session
+                    .mutate($method, target, None, &NoPreconditions {}, &typed, MUTATION_TTL)
+                    .await,
+            )
         }
     };
 }
@@ -865,11 +847,11 @@ macro_rules! session_mutate_command {
             if state.paired_context().is_none() {
                 let target = subject.target(state.environment_id()?)?;
                 let session = state.session()?;
-                let answer = session
-                    .mutate($method, target, None, &NoPreconditions {}, &typed, MUTATION_TTL)
-                    .await;
-                replace_if_withdrawn(&state, &session, &answer).await;
-                return submitted(answer);
+                return submitted(
+                    session
+                        .mutate($method, target, None, &NoPreconditions {}, &typed, MUTATION_TTL)
+                        .await,
+                );
             }
             let session_id: kr_protocol::ids::SessionId = subject
                 .session_id
