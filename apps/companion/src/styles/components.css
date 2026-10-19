@@ -877,7 +877,8 @@ textarea::placeholder {
   box-shadow: var(--shadow);
   font-size: 0.75rem;
   opacity: 1;
-  transform: translate(-50%, 0);
+  /* It rests above the footer of a surface that is open, which says how far in `--toast-lift`. */
+  transform: translate(-50%, calc(0px - var(--toast-lift, 0px)));
   transition:
     transform var(--surface-in) var(--ease-out),
     opacity var(--surface-in) var(--ease-out);
@@ -900,7 +901,8 @@ textarea::placeholder {
    a whole stays under half of it whatever the words. At the largest size a long message scrolls
    inside its own box, and the controls below it are never pushed off the screen. The 80px floor
    keeps the words usable on a screen too short for half of it to hold them: the toast is then more
-   than half of that screen. */
+   than half of that screen. Over an open surface the toast rests above its footer, by `--toast-lift`,
+   and its words give up the room that lifts it. */
 .toast {
   /* The height of the tallest control: Dismiss is a target high, and a button that names an action
      is one line of its own text, its padding and its border. */
@@ -912,7 +914,7 @@ textarea::placeholder {
 }
 
 .toast-text {
-  max-height: min(12rem, max(80px, calc(49dvh - var(--toast-controls) - 24px)));
+  max-height: min(12rem, max(80px, calc(49dvh - var(--toast-lift, 0px) - var(--toast-controls) - 24px)));
   /* Words never scroll sideways: they wrap, and what cannot wrap is cut off, not scrolled to. */
   overflow-x: hidden;
   overflow-y: auto;
@@ -943,13 +945,13 @@ textarea::placeholder {
 @media (prefers-reduced-motion: reduce) {
   .toast,
   .toast[data-leaving='true'] {
-    transform: translate(-50%, 0);
+    transform: translate(-50%, calc(0px - var(--toast-lift, 0px)));
     transition: opacity 120ms ease;
   }
 
   @starting-style {
     .toast {
-      transform: translate(-50%, 0);
+      transform: translate(-50%, calc(0px - var(--toast-lift, 0px)));
       opacity: 0;
     }
   }

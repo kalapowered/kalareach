@@ -370,6 +370,9 @@ export interface ToastMessage {
  * something to do, which takes a decision as well as a reading.
  */
 const TOAST_MS = 4200
+
+/** The custom property on the root that says how far an open surface's footer lifts the toast. */
+const TOAST_LIFT = '--toast-lift'
 const TOAST_WITH_ACTION_MS = 8000
 
 /** Shows the newest message, and takes it away. */
@@ -546,6 +549,7 @@ export function Sheet({
   readonly footer?: ReactNode
 }): ReactNode {
   const sheetRef = useRef<HTMLDivElement | null>(null)
+  const footerRef = useRef<HTMLElement | null>(null)
   const scrimRef = useRef<HTMLDivElement | null>(null)
   const animation = useRef<Animation | null>(null)
   const tracker = useRef(new VelocityTracker())
@@ -561,6 +565,7 @@ export function Sheet({
   // is one piece of motion and clears it; whatever ends that motion sets it again.
   const [atRest, setAtRest] = useState(false)
   const reduced = prefersReducedMotion()
+  const hasFooter = Boolean(footer)
 
   // Opening is a render-phase adjustment rather than an effect: the surface has to exist in the
   // same commit that starts its motion, or its first frame is missing.
@@ -583,6 +588,26 @@ export function Sheet({
   const close = useCallback(() => {
     onClose()
   }, [onClose])
+
+  // A message in passing rests above the footer of an open surface, where its actions are, and not
+  // over them: the footer's height is measured, as it changes with the text size, and handed to the
+  // toast as `--toast-lift`. It goes as the surface starts to leave, so the message settles back as
+  // the surface goes.
+  useLayoutEffect(() => {
+    const footer = footerRef.current
+    if (!open || footer === null) return
+    const root = document.documentElement
+    const measure = () => {
+      root.style.setProperty(TOAST_LIFT, `${String(footer.offsetHeight)}px`)
+    }
+    measure()
+    const watching = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure)
+    watching?.observe(footer)
+    return () => {
+      watching?.disconnect()
+      root.style.removeProperty(TOAST_LIFT)
+    }
+  }, [open, hasFooter])
 
   useEffect(() => {
     if (!mounted) {
@@ -873,7 +898,11 @@ export function Sheet({
           </IconButton>
         </header>
         <div className="dialog-body">{children}</div>
-        {footer ? <footer className="dialog-footer">{footer}</footer> : null}
+        {footer ? (
+          <footer className="dialog-footer" ref={footerRef}>
+            {footer}
+          </footer>
+        ) : null}
       </div>
     </>
   )

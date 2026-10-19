@@ -23,6 +23,21 @@ const SIZES = [
 ] as const
 
 /**
+ * Two moments for the page's clock, in UTC (the pages that use them say so): by day, and in the hour
+ * before midnight, when a share that lasts an hour ends on the next day and its end is told with the
+ * day's name, which makes the words of a message about it longer.
+ */
+const CLOCKS = [
+  { name: 'by day', at: '2026-10-18T14:00:00Z' },
+  { name: 'in the hour before midnight', at: '2026-10-18T23:30:00Z' }
+] as const
+
+/** Stands the page's clock at `at`, from its first frame; timers go on running. */
+async function withClockAt(page: Page, at: string): Promise<void> {
+  await page.clock.setFixedTime(new Date(at))
+}
+
+/**
  * The letters the page is drawn in. The system's own face differs from one platform to the next, and
  * a layout that holds only for the widths of the face it was drawn with does not hold. The second
  * face is Verdana, or DejaVu Sans where Verdana is not installed; DejaVu Sans is also the face the
@@ -459,6 +474,92 @@ test.describe('a new invitation while the inbox is scrolled', () => {
     await expect(page.getByRole('button', { name: /new invitation/ })).toHaveCount(0)
     await expect(page.getByTestId('offers-said')).toHaveText('New invitation. Studio shared session 4 with you.')
   })
+})
+
+// KR-REQ-13.19, KR-REQ-18.13: a message in passing rests above the footer of the card an invitation
+// opens, and not over what accepts or puts off, at every text size and wherever the clock stands. The
+// words of a message about when a share ends are longer after midnight; at the largest size in a wide
+// face they are too many for the message's box, and the message then stays until it is dismissed.
+test.describe('a message in passing over the card an invitation opens', () => {
+  test.use({ timezoneId: 'UTC' })
+
+  for (const surface of ['ios', 'android'] as const) {
+    for (const size of SIZES) {
+      for (const face of FACES) {
+        for (const clock of CLOCKS) {
+          test(`rests above the card's footer on ${surface} at the ${size.name} text size${face.suffix}, ${clock.name}`, async ({
+            page
+          }) => {
+            await withClockAt(page, clock.at)
+            await withSystemTextScale(page, size.ratio)
+            await withFace(page, face.css)
+            await page.setViewportSize({ width: 320, height: 720 })
+            await open(page, surface, 'attention', offers)
+            // The first invitation is accepted. The message that says so is held, as a pointer resting on
+            // it holds it (the engines differ in whether the pointer that is already there counts), while
+            // the second is opened, so nothing here waits for it to go or depends on how long it stays.
+            await page.getByRole('button', { name: /shared session 3 with you/ }).click()
+            await page.getByTestId('accept-offer').click()
+            await expect(page.getByTestId('sheet')).toBeHidden()
+            const toast = page.locator('.toast')
+            await expect(toast).toContainText('Session 3 is shared with you until')
+            await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
+            await page.getByRole('button', { name: /shared session 4 with you/ }).dispatchEvent('click')
+            const accept = page.getByTestId('accept-offer')
+            const notNow = page.getByTestId('not-now')
+            await expect(accept).toBeVisible()
+            await expect(toast).toBeVisible()
+            // The card has come to rest: its action has held its place for ten frames in a row.
+            await page.evaluate(
+              () =>
+                new Promise<void>((resolve) => {
+                  let last = Number.NaN
+                  let still = 0
+                  const look = (): void => {
+                    const top = document.querySelector('[data-testid="accept-offer"]')?.getBoundingClientRect().top
+                    still = top === last ? still + 1 : 0
+                    last = top ?? Number.NaN
+                    if (still >= 10) resolve()
+                    else requestAnimationFrame(look)
+                  }
+                  look()
+                })
+            )
+
+            // The message and the card's actions do not overlap, and the message is inside the screen.
+            const overlaps = () =>
+              page.evaluate(() => {
+                const message = document.querySelector('.toast')?.getBoundingClientRect()
+                if (message === undefined) return ['no message']
+                const found: string[] = []
+                if (message.top < 0 || message.bottom > window.innerHeight) found.push('the message is off the screen')
+                for (const id of ['accept-offer', 'not-now']) {
+                  const box = document.querySelector(`[data-testid="${id}"]`)?.getBoundingClientRect()
+                  if (box === undefined) found.push(`no ${id}`)
+                  else if (box.left < message.right && box.right > message.left && box.top < message.bottom && box.bottom > message.top) {
+                    found.push(`the message lies over ${id}`)
+                  }
+                }
+                return found
+              })
+            await expect.poll(overlaps, 'where the message and the card overlap').toEqual([])
+            // A trial press fails where something else would take it.
+            for (const control of [accept, notNow]) await control.click({ trial: true, timeout: 5_000 })
+            await page.screenshot({
+              path: `/tmp/kr-shared-with-you-toast-${surface}-${size.name}${face.shot}-${clock.name.replace(/ /g, '-')}-${test.info().project.name}.png`
+            })
+
+            // It settles back when the card goes.
+            await notNow.click()
+            await expect(page.getByTestId('sheet')).toBeHidden()
+            await expect
+              .poll(() => page.evaluate(() => document.documentElement.style.getPropertyValue('--toast-lift')))
+              .toBe('')
+          })
+        }
+      }
+    }
+  }
 })
 
 // KR-REQ-13.19: the pill lies over the inbox, so it is sized as the bars are, and focus that goes to
