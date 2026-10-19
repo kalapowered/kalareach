@@ -66,8 +66,10 @@
   background: var(--brand-reach);
 }
 
+/* The wordmark is a mark, drawn at a size of its own like the image beside it: a larger text size
+   would make it wider than the sidebar it sits in. */
 .brand-word {
-  font: 1.5625rem/1 Kala, var(--font-ui);
+  font: 25px/1 Kala, var(--font-ui);
   color: var(--brand-word);
   white-space: nowrap;
 }
