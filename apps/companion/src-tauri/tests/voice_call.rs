@@ -1577,7 +1577,6 @@ async fn a_stop_during_the_repeats_stops_the_media_and_revokes_what_the_repeats_
             Duration::from_millis(50),
             Duration::from_secs(4),
         ],
-        host_within: Duration::from_millis(300),
         ..quick()
     };
     let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
@@ -1661,9 +1660,11 @@ async fn forgetting_the_host_ends_the_call_and_owes_the_revocation() {
         .call("hosts_forget", json!({ "reference": reference }))
         .expect("the host is forgotten");
 
+    // The end is over when the device holds nothing: the cause is shown while the device is still
+    // finishing it, before it has noted what it owes.
     let ended = scene
         .state_where("the end", |state| {
-            state["ended"]["cause"] == "host_forgotten"
+            state["ended"]["cause"] == "host_forgotten" && state["setting_up"] == false
         })
         .await;
     assert_eq!(ended["running"], false);
