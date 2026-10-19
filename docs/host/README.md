@@ -1485,7 +1485,8 @@ nothing was established either way rather than claiming an answer.
 Every result is a capability record in the shared shape: the state, `disclosed_probe` as what
 produced it, the exact facility it was established about, and what makes it stale. That last part
 is what decides when findings stop standing: a facility being installed, removed or replaced, the
-host agent being replaced, a new login, or a different execution profile. An operating-system permission changing is on the list but
+host agent being replaced, a new login, or a different execution profile. An operating-system
+permission changing is on the list but
 cannot be read, so it is found when you ask for the checks again. Time is not on the list. Nothing
 about a permission changes because an hour passed, and a check that re-ran on a clock would take an
 image of your screen for no reason. Nothing runs again on its own.

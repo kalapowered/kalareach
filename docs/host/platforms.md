@@ -273,10 +273,10 @@ The worker's findings replace the platform's record of each capability in
 no platform record, so its record is added. The findings are valid until the worker goes away (or is
 replaced), a new login occurs (new desktop generation), the execution profile changes or a tool
 the checks use is installed, removed or replaced. When any of those things happen the findings are
-dropped and the state will report `stale`. The checks won't be run automatically again. One thing they can't detect is a
-change in permission, so the user needs to request a check again if that happens. A grant that macOS
-gives only to a process when it starts reaches the next session's worker. A daemon restart also
-loses the findings.
+dropped and the state will report `stale`. The checks won't be run automatically again. One thing
+they can't detect is a change in permission, so the user needs to request a check again if that
+happens. A grant that macOS gives only to a process when it starts reaches the next session's
+worker. A daemon restart also loses the findings.
 
 The revision every record carries advances whenever any of this changes. It is kept in the
 environment's state directory and written before it is handed out, so a host that restarts does not

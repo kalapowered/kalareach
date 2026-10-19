@@ -306,7 +306,14 @@ fn a_forwarder_goes_on_directly_where_the_other_forwarder_is_not_for_it() {
     ] {
         let minor = match case {
             Case::ThisLevel => this_minor(),
-            Case::BelowTheFirstLevelThatAdmitsIt => this_minor() - 1,
+            // Below the level the constant names, whatever this build's own level is: the decision
+            // reads the manifest's level and not what a release still retains.
+            Case::BelowTheFirstLevelThatAdmitsIt => {
+                kr_protocol::retained::FIRST_LEVEL_ADMITTING_OWN_FORWARDER
+                    .minor()
+                    .expect("a level below 1.0")
+                    - 1
+            }
             _ => this_minor() + 1,
         };
         let launch = Launch::new(minor);

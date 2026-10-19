@@ -9,8 +9,8 @@
 //!
 //! What ends the findings is what the records themselves list ([`probe::stale`]): the worker that
 //! performed them is gone or replaced, a new login moved the desktop's generation, the execution
-//! profile changed, or a tool they use was installed, removed or replaced. A change of permission is not something this
-//! host can read; it is found by performing the checks again.
+//! profile changed, or a tool they use was installed, removed or replaced. A change of permission
+//! is not something this host can read; it is found by performing the checks again.
 
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
