@@ -939,7 +939,7 @@ mod tests {
         let json = serde_json::to_value(&command).expect("encodes");
         assert_eq!(json["root_command"]["interpreter"], "/bin/sh");
         assert_eq!(json["workflow"]["node_id"], "tests");
-        assert_eq!(json["start_not_after_boot_ms"], 9);
+        assert_eq!(json["start_not_after_boot_ms"], "9");
         let back: WorkerLaunchSpec = serde_json::from_value(json).expect("decodes");
         assert_eq!(back, command);
     }

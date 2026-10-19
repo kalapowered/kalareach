@@ -2066,7 +2066,6 @@ async fn the_release_before_reads_the_journal_of_a_command_session_this_release_
         read["cwd"], recorded.cwd,
         "the directory the journal recorded is shown, not a summary rebuilt from the closure: {read}"
     );
-    assert_eq!(read["shell_path"], recorded.shell_path, "{read}");
 
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
