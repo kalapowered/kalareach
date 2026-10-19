@@ -387,6 +387,8 @@ export interface FakeRevocation {
    * and only once `release` is called: a host that is slow to answer.
    */
   holdNextView(): { release(): void }
+  /** Makes the next revocation wait, as one does while the person is at the ceremony, until `release`. */
+  holdNextRevocation(): { release(): void }
 }
 
 /** The sync service setting, as the backend reports it. */
@@ -872,6 +874,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   const revocationAsked: string[] = []
   let revocationFailure: { readonly code: string; readonly message: string } | null = null
   let revocationHold: ((release: () => void) => void) | null = null
+  let revocationRevokeHold: ((release: () => void) => void) | null = null
   const ownerListeners = new Set<(view: OwnerView) => void>()
   const publishOwner = (next: OwnerView) => {
     owner = next
@@ -2044,8 +2047,15 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
         })
       })
     },
-    revocationRevoke: (host, device) => {
+    revocationRevoke: async (host, device) => {
       revocationAsked.push(`${host} ${device}`)
+      const wait = revocationRevokeHold
+      if (wait !== null) {
+        revocationRevokeHold = null
+        await new Promise<void>((resolve) => {
+          wait(resolve)
+        })
+      }
       if (revocationFailure !== null) {
         return refused(revocationFailure.code, revocationFailure.message)
       }
@@ -2631,6 +2641,17 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       },
       failWith(message, code = 'PERMISSION_DENIED') {
         revocationFailure = message === null ? null : { code, message }
+      },
+      holdNextRevocation() {
+        let release = () => {}
+        revocationRevokeHold = (answer) => {
+          release = answer
+        }
+        return {
+          release: () => {
+            release()
+          }
+        }
       },
       holdNextView() {
         let release = () => {}

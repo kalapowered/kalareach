@@ -66,7 +66,7 @@ const EVERYTHING = {
         device('c', 'the-watch', { state: 'acknowledged', at_ms: AT, pending_workers: 3, host_lists_revoked: true }),
         device('j', 'the-pad', { state: 'acknowledged', at_ms: AT, pending_workers: null, host_lists_revoked: false }),
         device('d', 'the-laptop', { state: 'done', at_ms: AT }, { platform: 'macos' }),
-        device('e', 'the-old-phone', { state: 'refused', reason: 'unknown_target' }),
+        device('e', 'the-old-phone', { state: 'refused', reason: 'superseded' }),
         device('f', 'the-spare', { state: 'revoked' }, { platform: 'android' }),
         device(
           'g',
@@ -241,18 +241,31 @@ test('revokes a device from the keyboard alone, and focus goes to where the requ
   })
   await page.getByTestId('devices-refresh').click()
   await expect(row).toContainText('Revoked')
-  await expect(page.getByTestId('devices-heard')).toContainText('is revoked')
+  await expect(page.getByTestId('devices-heard')).toContainText('every session confirmed it')
 })
 
 test('says a refusal in the row and returns focus to the control that was pressed', async ({ page }) => {
   await openTheScreen(page)
+  // The person is at the ceremony for a while: the control is disabled over several frames, long
+  // enough for a browser to take focus from it.
   await page.evaluate(() => {
     window.krTestHost?.revocation.failWith('It was not confirmed, so nothing was changed.')
+    const held = window.krTestHost?.revocation.holdNextRevocation()
+    ;(window as unknown as { releaseRevocation: () => void }).releaseRevocation = () => {
+      held?.release()
+    }
   })
   const row = page.getByTestId('devices-device').filter({ hasText: `${LONG_NAME}-phone` })
   const button = row.getByRole('button', { name: /^Revoke with Touch ID/ })
   await button.focus()
   await page.keyboard.press('Enter')
+  await expect(button).toBeDisabled()
+  await page.evaluate(
+    () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+  )
+  await page.evaluate(() => {
+    ;(window as unknown as { releaseRevocation: () => void }).releaseRevocation()
+  })
   await expect(row.getByTestId('devices-failure')).toContainText('was not confirmed')
   // The control is back, enabled and focused, so a second attempt is one key away.
   await expect(button).toBeEnabled()
