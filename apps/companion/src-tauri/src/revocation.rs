@@ -16,11 +16,11 @@
 //! # What is shown, and when it is called done
 //!
 //! A revocation is done when the host's acknowledgement has been read and says the host's dispatch
-//! barrier held. A request that sits in the feed is **sent**, and the screen says only that; one the
-//! host acknowledged while some of its session workers have not confirmed the fence is **acknowledged**
-//! and says how many; a request the host refused is **refused** and says why. The acknowledgements are read
-//! from the feed, which stores them and judges nothing: they are the service's word for what the
-//! host answered, not something this computer can check.
+//! barrier held. A request that sits in the feed is **sent**, and the screen says only that; one
+//! the host acknowledged while some of its session workers have not confirmed the fence is
+//! **acknowledged** and says how many; a request the host refused is **refused** and says why. The
+//! acknowledgements are read from the feed, which stores them and judges nothing: they are the
+//! service's word for what the host answered, not something this computer can check.
 //!
 //! # Which feed
 //!
@@ -229,8 +229,8 @@ pub enum DeviceStanding {
     Acknowledged {
         /// When the host acknowledged, in UTC milliseconds.
         at_ms: u64,
-        /// How many workers have not, when the host said. Null when the host has not yet said that every
-        /// worker confirmed, and did not say how many have not.
+        /// How many workers have not, when the host said. Null when the host has not yet said that
+        /// every worker confirmed, and did not say how many have not.
         pending_workers: Option<u64>,
         /// Whether the host's own list shows the device as revoked. False only for a host that
         /// answered just now and does not list the device as revoked: it contradicts what the feed
@@ -712,24 +712,20 @@ impl Revocations {
         let reference = reading.host.reference();
         let (devices, listed_at_ms, direct, fed) = {
             let mut memory = self.memory();
-            if let Some(list) = &reading.list {
-                memory.listed.insert(
-                    reference.clone(),
-                    Listed {
-                        devices: list.devices.clone(),
-                        at_ms: now().get(),
-                    },
-                );
-            } else if reading.contact == Contact::Refused {
-                // A host that will not list its devices to this computer says nothing of them, and
-                // what it listed before is no longer what it lists.
-                memory.listed.remove(&reference);
-            }
+            note_listing(
+                &mut memory.listed,
+                &reference,
+                reading.started,
+                reading.list.as_ref(),
+                reading.contact == Contact::Refused,
+                now().get(),
+            );
             let (devices, at_ms) = memory
                 .listed
                 .get(&reference)
-                .map_or((Vec::new(), None), |held| {
-                    (held.devices.clone(), Some(held.at_ms))
+                .and_then(|held| held.devices.as_ref())
+                .map_or((Vec::new(), None), |(devices, at_ms)| {
+                    (devices.clone(), Some(*at_ms))
                 });
             (devices, at_ms, memory.direct.clone(), memory.fed.clone())
         };
@@ -888,8 +884,9 @@ impl Revocations {
             .memory()
             .listed
             .get(&host_now.reference)
-            .and_then(|held| {
-                held.devices.iter().find(|summary| {
+            .and_then(|held| held.devices.as_ref())
+            .and_then(|(devices, _)| {
+                devices.iter().find(|summary| {
                     device_reference(&host_now.reference, summary.device_id) == device
                 })
             })
@@ -1134,9 +1131,9 @@ fn feed_of(host: &PairedHost) -> KeyId {
     )
 }
 
-/// The records of a feed that are this computer's own, naming devices: published by `key`, issued as
-/// the device `issuer` this computer is on the host `host`, and signed as they say. A feed judges no
-/// owner's authority, so what it says a record is does not make it this computer's.
+/// The records of a feed that are this computer's own, naming devices: published by `key`, issued
+/// as the device `issuer` this computer is on the host `host`, and signed as they say. A feed
+/// judges no owner's authority, so what it says a record is does not make it this computer's.
 fn own_requests<'a>(
     records: &'a [AuthorityFeedRecord],
     issuer: DeviceId,
@@ -1440,9 +1437,52 @@ mod tests {
         standing(&device(revoked), &named, None, Route::Feed, host_answered)
     }
 
-    /// A pending acknowledgement is not done: some of the host's workers have not confirmed, and the
-    /// screen says how many. No host that can be started here is in that state, so this table is
-    /// the one place it is held.
+    fn list_of(devices: Vec<DeviceSummary>) -> DeviceListResult {
+        DeviceListResult {
+            devices,
+            authority_revision: AuthorityRevision::new(1),
+            feed_synchronised_at_ms: Nullable::null(),
+            feed_stale: false,
+            feed_removed: false,
+        }
+    }
+
+    /// What the screen is told of a host's devices after its visits, as a view reads them.
+    fn devices_held(listed: &BTreeMap<String, Listed>) -> Option<Vec<bool>> {
+        listed
+            .get("host")
+            .and_then(|held| held.devices.as_ref())
+            .map(|(devices, _)| devices.iter().map(|device| device.revoked).collect())
+    }
+
+    /// Two views of a host overlap and the host answers the earlier one last. What the later one
+    /// found stands: the earlier one began before it, so its answer, though it comes last, is the
+    /// older finding. The same holds for a host that refused to list since: the refusal is kept, so
+    /// an earlier visit's list does not bring back what the host no longer lists.
+    #[test]
+    fn a_visit_that_began_earlier_does_not_overwrite_what_a_later_one_found() {
+        let mut listed = BTreeMap::new();
+        let before = list_of(vec![device(false)]);
+        let after = list_of(vec![device(true)]);
+
+        // The later visit (2) answers first; the earlier one (1) answers after it.
+        note_listing(&mut listed, "host", 2, Some(&after), false, 20);
+        note_listing(&mut listed, "host", 1, Some(&before), false, 30);
+        assert_eq!(devices_held(&listed), Some(vec![true]));
+
+        // The later visit is refused; the earlier one's list arrives after the refusal.
+        note_listing(&mut listed, "host", 3, None, true, 40);
+        note_listing(&mut listed, "host", 1, Some(&before), false, 50);
+        assert_eq!(devices_held(&listed), None, "the refusal stands");
+
+        // A visit that began after the refusal and was listed is what the host lists again.
+        note_listing(&mut listed, "host", 4, Some(&before), false, 60);
+        assert_eq!(devices_held(&listed), Some(vec![false]));
+    }
+
+    /// A pending acknowledgement is not done: some of the host's workers have not confirmed, and
+    /// the screen says how many. No host that can be started here is in that state, so this table
+    /// is the one place it is held.
     #[test]
     fn a_request_is_done_only_when_the_hosts_acknowledgement_and_list_say_every_worker_confirmed() {
         let sent = record(10, None, None);
