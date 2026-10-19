@@ -275,9 +275,8 @@ fn the_rules_of_the_surface_are_the_ones_the_previous_release_had() {
             }
         }
     }
-    // An entry says why this checkout's digest of a root differs from the record, so it is held
-    // to this checkout. A release's own tree has no difference to explain and is never held to
-    // one.
+    // An entry carries this checkout's digest of a root, so it is held to this checkout and not to
+    // a release's tree, whose digests are the recorded ones.
     let own_tree = std::env::var_os("KR_RELEASE_TREE").is_none();
     for entry in SAME.iter().filter(|_| own_tree) {
         let now = followed.get(entry.root);
