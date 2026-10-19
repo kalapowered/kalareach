@@ -1882,6 +1882,14 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         },
     },
     IgnoredRun {
+        package: "kr-controller",
+        target: "--test network_input",
+        cases: &["remote_input_forwarding_latency"],
+        runs: Runs::ByHand {
+            why: "it is a measurement run by name in a release build, beside the worker's input latency measurements",
+        },
+    },
+    IgnoredRun {
         package: "kr-worker",
         target: "--bench input_latency",
         cases: &[],
