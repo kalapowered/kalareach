@@ -99,6 +99,20 @@ fn the_reader_refuses_a_launch_its_own_state_does_not_match() {
     shellpkg::the_reader_refuses_a_launch_its_own_state_does_not_match(BASH);
 }
 
+/// KR-REQ-23.38: the reader refuses a launch for another working directory and installs nothing.
+#[test]
+#[ignore = "drives this tree's built Bash package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_launch_for_another_working_directory_is_a_conflict_and_installs_nothing() {
+    shellpkg::a_launch_for_another_working_directory_is_a_conflict_and_installs_nothing(BASH);
+}
+
+/// KR-REQ-23.38: the reader refuses a launch over typed text and installs nothing.
+#[test]
+#[ignore = "drives this tree's built Bash package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_launch_over_typed_text_is_a_conflict_and_installs_nothing() {
+    shellpkg::a_launch_over_typed_text_is_a_conflict_and_installs_nothing(BASH);
+}
+
 /// KR-REQ-07.35
 #[test]
 #[ignore = "drives this tree's built Bash package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]

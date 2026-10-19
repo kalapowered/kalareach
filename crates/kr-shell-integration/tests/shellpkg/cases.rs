@@ -261,6 +261,29 @@ impl Session {
             self.pump(Duration::from_millis(10));
         }
     }
+
+    /// Types `text` and returns once the reader has reported a buffer that is not empty.
+    ///
+    /// The reader reports what it holds each time it comes to wait for a key, so the first report
+    /// that arrives after the key was typed is about a reader that has dealt with it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no such report arrives inside the reply window.
+    pub fn type_text(&mut self, text: &[u8]) {
+        self.pump(Duration::ZERO);
+        let reports = self.idle_reports;
+        self.type_bytes(text);
+        let deadline = self.deadline_for(REPLY);
+        while !(self.idle_reports > reports && !self.last_idle_empty) {
+            assert!(
+                !deadline.passed(),
+                "the reader did not report the text it was typed:\n{}",
+                self.terminal_output()
+            );
+            self.pump(Duration::from_millis(10));
+        }
+    }
 }
 
 /// KR-REQ-07.34, KR-REQ-07.35, KR-REQ-07.85, and `handshake-accept`.
@@ -1390,6 +1413,137 @@ pub fn the_reader_refuses_a_launch_its_own_state_does_not_match(kind: ShellKind)
             reason.as_str()
         );
     }
+}
+
+/// A launch of the argument vector `launch_expectation` expects, for the prompt `enter` opened and
+/// the fence `fence` the worker published at it.
+fn launch_at(
+    session: &Session,
+    transaction: u8,
+    enter: &RootEditorEnterParams,
+    fence: &kr_protocol::root::EditorFence,
+    substitution: &str,
+) -> LaunchMailboxRequest {
+    LaunchMailboxRequest {
+        session_id: session.session_id,
+        transaction: LaunchTransactionId::new(Uuid::from_bytes([transaction; 16])),
+        fence_id: fence.fence_id,
+        command: LaunchCommand::Arguments(vec![
+            "printf".to_owned(),
+            "%s|".to_owned(),
+            "kr launch ok".to_owned(),
+            substitution.to_owned(),
+        ]),
+        expected_prompt_generation: enter.prompt_generation,
+        expected_buffer_revision: enter.editor.buffer_revision,
+        expected_cwd_revision: enter.cwd_revision,
+        deadline_ms: LAUNCH_BUDGET_NOT_UNDER_TEST,
+    }
+}
+
+/// KR-REQ-23.38: a launch whose working-directory revision is not the shell's own is refused by
+/// the reader as a draft conflict. A refused launch installs nothing: the same launch at the
+/// shell's own revision, at the same prompt, is then installed and runs, which a reader whose
+/// buffer the first had changed would have refused.
+pub fn a_launch_for_another_working_directory_is_a_conflict_and_installs_nothing(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+    assert!(session.answered("kr-ready"));
+
+    let (enter, fence) = session.fenced_prompt(8);
+    let substitution = match kind {
+        ShellKind::Fish => "(echo substituted)",
+        _ => "$(echo substituted)",
+    };
+    let mut stale = launch_at(&session, 0x73, &enter, &fence, substitution);
+    stale.expected_cwd_revision = kr_protocol::root::CwdRevision::new(enter.cwd_revision.get() + 7);
+    let before = session.written();
+    let id = session.ask(WorkerRequest::Launch(stale));
+    let BridgeAnswer::Launch(decision) = session.answer(id) else {
+        panic!("the reader answered a launch with something else")
+    };
+    let refusal = decision
+        .rejection()
+        .expect("the reader refused a launch for another working directory");
+    assert_eq!(refusal, LaunchRejectionReason::CwdRevisionMismatch);
+    assert_eq!(refusal.code(), kr_protocol::error::ErrorCode::DraftConflict);
+
+    // At the shell's own revision the same launch installs and runs.
+    let id = session.ask(WorkerRequest::Launch(launch_at(
+        &session,
+        0x74,
+        &enter,
+        &fence,
+        substitution,
+    )));
+    let BridgeAnswer::Launch(decision) = session.answer(id) else {
+        panic!("the reader answered a launch with something else")
+    };
+    assert!(
+        matches!(decision, LaunchDecision::Accepted(_)),
+        "the launch at the shell's own revision was refused: {:?}",
+        decision.rejection()
+    );
+    session.nudge();
+    assert!(
+        session
+            .drew_after(before, dialect(kind).launch_expectation, REPLY)
+            .was_drawn(),
+        "the launch the reader accepted did not run:\n{}",
+        session.terminal_output()
+    );
+}
+
+/// KR-REQ-23.38: a launch over text the person has typed is refused by the reader as a draft
+/// conflict: the prompt has to be empty. The refusal leaves the buffer as the person made it: a
+/// second launch is refused for the same reason at the same buffer revision. This case is for the
+/// editors whose reader answers while the person types; one that answers at its next boundary is
+/// not driven into it from here.
+pub fn a_launch_over_typed_text_is_a_conflict_and_installs_nothing(kind: ShellKind) {
+    assert!(
+        !dialect(kind).answers_at_the_next_step,
+        "{} answers a launch at its next boundary once the person has typed, so this case does \
+         not reach it",
+        kind.as_str()
+    );
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+    assert!(session.answered("kr-ready"));
+
+    let (enter, fence) = session.fenced_prompt(8);
+    let substitution = match kind {
+        ShellKind::Fish => "(echo substituted)",
+        _ => "$(echo substituted)",
+    };
+    session.type_text(b"x");
+    let mut refusals = Vec::new();
+    for transaction in [0x75, 0x76] {
+        let id = session.ask(WorkerRequest::Launch(launch_at(
+            &session,
+            transaction,
+            &enter,
+            &fence,
+            substitution,
+        )));
+        let BridgeAnswer::Launch(LaunchDecision::Rejected(refusal)) = session.answer(id) else {
+            panic!("the reader did not refuse a launch over typed text")
+        };
+        assert_eq!(refusal.reason, LaunchRejectionReason::BufferNotEmpty);
+        assert_eq!(
+            refusal.reason.code(),
+            kr_protocol::error::ErrorCode::DraftConflict
+        );
+        refusals.push(refusal.buffer_revision);
+    }
+    assert_eq!(
+        refusals[0], refusals[1],
+        "the refused launch changed the buffer the person typed in"
+    );
+    session.clear_line();
 }
 
 /// Whether the reader raised the flag this wait is supposed to raise.

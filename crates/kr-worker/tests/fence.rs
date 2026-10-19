@@ -5003,7 +5003,7 @@ async fn a_launch_is_installed_through_the_reader_and_never_written_into_the_ter
     let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
-    let _holder = holder_over(&mut client, &wired).await;
+    let holder = holder_over(&mut client, &wired).await;
     let fence = fenced(&mut wired, 1, 1).await;
     let params = ShellLaunchParams {
         session_id: wired.session_id,
@@ -5017,15 +5017,18 @@ async fn a_launch_is_installed_through_the_reader_and_never_written_into_the_ter
         expected_buffer_revision: EditorBufferRevision::new(1),
     };
     let target = wired.target();
+    // The caller's connection is handed back with its answer and kept until the case ends: it is
+    // the lease holder's, and the keys typed below are accepted only while it holds them.
     let calling = tokio::spawn(async move {
-        client
+        let outcome = client
             .mutate(
                 Method::ShellLaunch,
                 ActionId::new(kr_ipc::new_uuid()),
                 target,
                 &params,
             )
-            .await
+            .await;
+        (client, outcome)
     });
     let request = loop {
         match wired.next().await {
@@ -5064,15 +5067,28 @@ async fn a_launch_is_installed_through_the_reader_and_never_written_into_the_ter
         )
         .await
         .expect("installs");
-    let outcome = tokio::time::timeout(SOON, calling)
+    let (_client, outcome) = tokio::time::timeout(SOON, calling)
         .await
         .expect("the caller was answered")
-        .expect("joins")
-        .expect("reaches the worker")
-        .expect("installed");
+        .expect("joins");
+    let outcome = outcome.expect("reaches the worker").expect("installed");
     let result: ShellLaunchResult = outcome.to_typed().expect("a launch result");
     assert_eq!(result.fence_id, fence.fence_id);
     assert_eq!(result.buffer_revision, EditorBufferRevision::new(2));
+
+    // Nothing of the launch went into the terminal. The shell here echoes what it is given, and a
+    // key typed after the launch is echoed after anything the launch had written, so once that key
+    // is back the retained output holds all that the launch could have put there.
+    type_keys(&wired, holder, 0, b"kr-after-the-launch\n");
+    echoed(&wired.runtime, b"kr-after-the-launch").await;
+    let seen = retained(&wired.runtime.session());
+    for word in ["git", "commit", "it's done"] {
+        assert!(
+            !contains(&seen, word.as_bytes()),
+            "the launch reached the terminal ({word:?}): {}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
     wired.close().await;
 }
 
@@ -6094,6 +6110,381 @@ async fn a_launch_answered_after_its_revocation_is_reported_and_recorded() {
         "the session records a command the reader installed after the transaction was revoked"
     );
     wired.close().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// KR-REQ-23.38: what `shell.launch` checks before it asks the reader to install anything.
+// --------------------------------------------------------------------------------------------
+
+/// A launch of `command` for the prompt `fence` was published at, with the buffer revision the
+/// reader reports for an empty one.
+fn launch_of(
+    wired: &Wired,
+    fence: &kr_protocol::root::EditorFence,
+    command: &str,
+) -> ShellLaunchParams {
+    ShellLaunchParams {
+        session_id: wired.session_id,
+        command: LaunchCommand::QuotedCommand(command.to_owned()),
+        expected_prompt_generation: fence.prompt_generation,
+        expected_buffer_revision: EditorBufferRevision::new(1),
+    }
+}
+
+/// What `shell.launch` answers a launch it refuses without asking the reader. A launch that is not
+/// refused waits for the reader, so the call is given a bound rather than an unending wait.
+async fn refused_launch(
+    client: &mut LocalClient,
+    wired: &Wired,
+    params: &ShellLaunchParams,
+) -> kr_protocol::error::ProtocolError {
+    tokio::time::timeout(
+        SOON,
+        client.mutate(
+            Method::ShellLaunch,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            params,
+        ),
+    )
+    .await
+    .expect("the launch was refused, and was not sent to a reader that would take it")
+    .expect("reaches the worker")
+    .expect_err("refused")
+}
+
+/// Waits for the next launch the worker asks the reader to install.
+async fn next_launch_asked(
+    wired: &mut Wired,
+) -> kr_shell_integration::contract::requests::LaunchMailboxRequest {
+    loop {
+        if let ToBridge::Request { request, .. } = wired.next().await
+            && let WorkerRequest::Launch(request) = *request
+        {
+            return request;
+        }
+    }
+}
+
+/// The reader's answer that it installed `request` at the prompt `fence` stands at.
+fn installed(
+    request: &kr_shell_integration::contract::requests::LaunchMailboxRequest,
+    fence: &kr_protocol::root::EditorFence,
+) -> BridgeAnswer {
+    BridgeAnswer::Launch(LaunchDecision::Accepted(LaunchAccepted {
+        transaction: request.transaction,
+        installed: request.command.clone(),
+        fence_id: request.fence_id,
+        prompt_generation: fence.prompt_generation,
+        buffer_revision: EditorBufferRevision::new(2),
+        reader_revision: ReaderRevision::new(1),
+    }))
+}
+
+/// Asserts that the terminal holds none of `words`, after a key typed behind everything the
+/// launches could have put there has come back from it.
+async fn terminal_holds_none_of(
+    wired: &Wired,
+    holder: AttachmentId,
+    sequence: u64,
+    words: &[&str],
+) {
+    type_keys(wired, holder, sequence, b"kr-sentinel\n");
+    echoed(&wired.runtime, b"kr-sentinel").await;
+    let seen = retained(&wired.runtime.session());
+    for word in words {
+        assert!(
+            !contains(&seen, word.as_bytes()),
+            "the launch reached the terminal ({word:?}): {}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
+}
+
+/// KR-REQ-23.38: `shell.launch` checks the current input lease. A connection that holds no
+/// attachment is refused LEASE_LOST, and so is one that attached and does not hold the keys,
+/// whoever does; the reader is asked to install nothing for either, and the first launch it is
+/// asked for is the holder's. Once the holder releases the keys, its own connection is refused
+/// too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_is_refused_unless_its_connection_holds_the_current_input_lease() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let holder = holder_over(&mut client, &wired).await;
+    let fence = fenced(&mut wired, 1, 1).await;
+
+    let mut onlooker = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let refused = refused_launch(
+        &mut onlooker,
+        &wired,
+        &launch_of(&wired, &fence, "kr-from-no-attachment"),
+    )
+    .await;
+    assert_eq!(refused.code, ErrorCode::LeaseLost, "{refused}");
+    onlooker
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &terminal(wired.session_id),
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("attaches without taking the keys");
+    let refused = refused_launch(
+        &mut onlooker,
+        &wired,
+        &launch_of(&wired, &fence, "kr-from-an-attachment-without-the-keys"),
+    )
+    .await;
+    assert_eq!(refused.code, ErrorCode::LeaseLost, "{refused}");
+
+    // The holder's launch is the first the reader is asked for, so neither of the others reached
+    // it.
+    let target = wired.target();
+    let params = launch_of(&wired, &fence, "kr-from-the-holder");
+    let calling = tokio::spawn(async move {
+        let outcome = client
+            .mutate(
+                Method::ShellLaunch,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &params,
+            )
+            .await;
+        (client, outcome)
+    });
+    let request = next_launch_asked(&mut wired).await;
+    assert_eq!(
+        request.command,
+        LaunchCommand::QuotedCommand("kr-from-the-holder".to_owned()),
+        "the reader was asked for the holder's launch and for no other"
+    );
+    wired
+        .bridge
+        .answer(
+            kr_protocol::ids::RequestId::new(0),
+            installed(&request, &fence),
+        )
+        .await
+        .expect("installs");
+    let (mut client, outcome) = tokio::time::timeout(SOON, calling)
+        .await
+        .expect("the caller was answered")
+        .expect("joins");
+    outcome.expect("reaches the worker").expect("installed");
+
+    // The holder lets the keys go, and its connection is then refused as well.
+    let epoch = wired.runtime.session().lease().epoch;
+    client
+        .mutate(
+            Method::InputRelease,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &kr_protocol::input::InputReleaseParams {
+                session_id: wired.session_id,
+                attachment_id: holder,
+                epoch,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("releases the keys");
+    let refused = refused_launch(
+        &mut client,
+        &wired,
+        &launch_of(&wired, &fence, "kr-after-the-release"),
+    )
+    .await;
+    assert_eq!(refused.code, ErrorCode::LeaseLost, "{refused}");
+    wired.close().await;
+}
+
+/// KR-REQ-23.38: `shell.launch` checks the prompt: a fence has to stand, at the prompt generation
+/// the caller names. A launch before any reader has entered is refused EDITOR_BUSY, and one that
+/// names another prompt than the one fenced is refused DRAFT_CONFLICT; the reader is asked to
+/// install neither, and none of either reaches the terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_is_refused_without_a_fence_and_at_a_prompt_other_than_the_one_fenced() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let holder = holder_over(&mut client, &wired).await;
+
+    // No reader has entered, so there is no fence to launch under.
+    let unfenced = ShellLaunchParams {
+        session_id: wired.session_id,
+        command: LaunchCommand::QuotedCommand("kr-before-any-fence".to_owned()),
+        expected_prompt_generation: PromptGeneration::new(1),
+        expected_buffer_revision: EditorBufferRevision::new(1),
+    };
+    let refused = refused_launch(&mut client, &wired, &unfenced).await;
+    assert_eq!(refused.code, ErrorCode::EditorBusy, "{refused}");
+
+    // The reader fences prompt 1, and a launch that names prompt 2 is not for this prompt.
+    let fence = fenced(&mut wired, 1, 1).await;
+    let mut elsewhere = launch_of(&wired, &fence, "kr-for-another-prompt");
+    elsewhere.expected_prompt_generation = PromptGeneration::new(fence.prompt_generation.get() + 1);
+    let refused = refused_launch(&mut client, &wired, &elsewhere).await;
+    assert_eq!(refused.code, ErrorCode::DraftConflict, "{refused}");
+
+    // The launch for the fenced prompt is the first the reader is asked for.
+    let target = wired.target();
+    let params = launch_of(&wired, &fence, "kr-at-this-prompt");
+    let calling = tokio::spawn(async move {
+        let outcome = client
+            .mutate(
+                Method::ShellLaunch,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &params,
+            )
+            .await;
+        (client, outcome)
+    });
+    let request = next_launch_asked(&mut wired).await;
+    assert_eq!(
+        request.command,
+        LaunchCommand::QuotedCommand("kr-at-this-prompt".to_owned()),
+        "the reader was asked for the launch at the fenced prompt and for no other"
+    );
+    wired
+        .bridge
+        .answer(
+            kr_protocol::ids::RequestId::new(0),
+            installed(&request, &fence),
+        )
+        .await
+        .expect("installs");
+    // The connection is kept until the case ends, with the keys typed below.
+    let (_client, outcome) = tokio::time::timeout(SOON, calling)
+        .await
+        .expect("the caller was answered")
+        .expect("joins");
+    outcome.expect("reaches the worker").expect("installed");
+    terminal_holds_none_of(
+        &wired,
+        holder,
+        0,
+        &["kr-before-any-fence", "kr-for-another-prompt"],
+    )
+    .await;
+    wired.close().await;
+}
+
+/// KR-REQ-23.38: `shell.launch` hands the reader the working-directory revision the session
+/// recorded, which is the one the reader reported when it fenced the prompt and not the one it
+/// entered at, and the buffer revision the caller expects, and the reader decides them: a reader
+/// that refuses because the directory moved, or because the prompt is not empty, installs nothing,
+/// and the caller is told DRAFT_CONFLICT with nothing of the launch in the terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_carries_the_recorded_directory_and_a_refusal_for_it_or_an_edit_is_a_conflict() {
+    for reason in [
+        LaunchRejectionReason::CwdRevisionMismatch,
+        LaunchRejectionReason::BufferNotEmpty,
+    ] {
+        let mut wired = wired().await;
+        let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+        let holder = holder_over(&mut client, &wired).await;
+
+        // The reader enters at the third revision of the shell's working directory, and when it
+        // answers the worker's fence it says the shell is at the fourth.
+        wired
+            .bridge
+            .send_event(BridgeEvent::EditorEnter(RootEditorEnterParams {
+                session_id: wired.session_id,
+                root_process: kr_ipc::identity::current_process_start_identity()
+                    .expect("this process"),
+                prompt_generation: PromptGeneration::new(1),
+                reader_revision: ReaderRevision::new(1),
+                reader_context: ReaderContext::Primary,
+                editor: editor_state(true, 1),
+                cwd_revision: CwdRevision::new(3),
+            }))
+            .await
+            .expect("enters");
+        let fence_id = asked_for_a_fence(&mut wired).await;
+        wired
+            .bridge
+            .answer(
+                kr_protocol::ids::RequestId::new(0),
+                BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(FenceAcknowledgement {
+                    fence_id,
+                    prompt_generation: PromptGeneration::new(1),
+                    reader_revision: ReaderRevision::new(1),
+                    reader_context: ReaderContext::Primary,
+                    queues: QueueDrainReport::CLEAR,
+                    snapshot: KeyQueueSnapshot::drained(),
+                    editor: editor_state(true, 1),
+                    cwd_revision: CwdRevision::new(4),
+                })),
+            )
+            .await
+            .expect("acknowledges");
+        let fence = published(&mut wired).await;
+
+        let target = wired.target();
+        let params = launch_of(&wired, &fence, "kr-refused-by-the-reader");
+        let calling = tokio::spawn(async move {
+            let outcome = client
+                .mutate(
+                    Method::ShellLaunch,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    target,
+                    &params,
+                )
+                .await;
+            (client, outcome)
+        });
+        let request = next_launch_asked(&mut wired).await;
+        assert_eq!(
+            request.expected_cwd_revision,
+            CwdRevision::new(4),
+            "{reason:?}: the reader is handed the revision it reported when it fenced the prompt"
+        );
+        assert_eq!(
+            request.expected_buffer_revision,
+            EditorBufferRevision::new(1),
+            "{reason:?}: and the buffer revision the caller expects"
+        );
+        wired
+            .bridge
+            .answer(
+                kr_protocol::ids::RequestId::new(0),
+                BridgeAnswer::Launch(LaunchDecision::Rejected(LaunchRejection {
+                    transaction: request.transaction,
+                    reason,
+                    fence_id: request.fence_id,
+                    prompt_generation: fence.prompt_generation,
+                    buffer_revision: EditorBufferRevision::new(1),
+                })),
+            )
+            .await
+            .expect("refuses");
+        // The connection is kept until the case ends, with the keys typed below.
+        let (_client, outcome) = tokio::time::timeout(SOON, calling)
+            .await
+            .expect("the caller was answered")
+            .expect("joins");
+        let refused = outcome
+            .expect("reaches the worker")
+            .expect_err("the reader installed nothing");
+        assert_eq!(
+            refused.code,
+            ErrorCode::DraftConflict,
+            "{reason:?}: {refused}"
+        );
+        assert!(wired.runtime.session().late_installations().is_empty());
+        terminal_holds_none_of(&wired, holder, 0, &["kr-refused-by-the-reader"]).await;
+        wired.close().await;
+    }
 }
 
 // --------------------------------------------------------------------------------------------
