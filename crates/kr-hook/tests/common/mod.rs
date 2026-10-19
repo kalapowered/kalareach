@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+#[cfg(unix)]
+pub mod gateway;
 pub mod launched;
 #[cfg(unix)]
 pub mod session;
