@@ -1529,18 +1529,28 @@ impl Drop for EndsTheKeeper<'_> {
 
 /// The application's own keeping of its connection to the host on this machine, with this rig's
 /// host in place of the user's: the connection is reached, and reached again when it ends.
-async fn keeps_its_connection(rig: &Rig) -> EndsTheKeeper<'_> {
+async fn keeps_its_connection(
+    rig: &Rig,
+    reopens: Arc<std::sync::atomic::AtomicUsize>,
+) -> EndsTheKeeper<'_> {
     use companion_tauri::connection::Attempt;
 
     let endpoint = rig.host.endpoint().clone();
     companion_tauri::connection::reach_host_on_this_machine(rig.app.app.handle(), move || {
         let endpoint = endpoint.clone();
+        let reopens = Arc::clone(&reopens);
         async move {
+            // Another connection is slow to open, as one to a host that is busy is: refusals that
+            // come while it is being opened meet a question that is already out.
             let reopen: companion_tauri::connection::Reopen = Arc::new({
                 let endpoint = endpoint.clone();
                 move || {
                     let endpoint = endpoint.clone();
-                    Box::pin(async move { local_connection(&endpoint).await })
+                    reopens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        local_connection(&endpoint).await
+                    })
                 }
             });
             match local_connection(&endpoint).await {
@@ -1578,7 +1588,8 @@ async fn a_connection_the_host_withdrew_is_replaced_whichever_way_the_applicatio
 
     let rig = Rig::start().await;
     rig.host_polls().await;
-    let _keeper = keeps_its_connection(&rig).await;
+    let reopens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _keeper = keeps_its_connection(&rig, Arc::clone(&reopens)).await;
     let state = rig.app.app.state::<AppState>();
     let first = state.session().expect("connected");
     let _: HostInfoResult = first
@@ -1613,6 +1624,13 @@ async fn a_connection_the_host_withdrew_is_replaced_whichever_way_the_applicatio
     rig.app
         .call("host_info", json!({}))
         .expect("a command goes through on it");
+    // One withdrawal asked the host one question, over one other connection: what the question was
+    // itself refused, over the connection it asked about, was not another.
+    assert_eq!(
+        reopens.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one other connection was opened to ask"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
