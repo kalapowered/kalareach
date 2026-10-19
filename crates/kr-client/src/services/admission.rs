@@ -631,9 +631,18 @@ impl PairingAdmissions {
         };
         let now = self.clock.now();
         let state = self.state.lock().expect("the admission cache");
-        state.entries.get(&key).is_some_and(
-            |entry| matches!(entry.held, Held::Unavailable { kept_until, .. } if now < kept_until),
-        )
+        // An answer that the service is unable stands for as long as it explains a failed dial, and
+        // for as long as the cache will not ask again (three requests with no connection, until the
+        // ten minutes after the last), because nothing renews it while no request is made.
+        state
+            .entries
+            .get(&key)
+            .is_some_and(|entry| match entry.held {
+                Held::Unavailable { kept_until, .. } => {
+                    now < kept_until || (entry.asks >= MOST_ASKS && !entry.window_passed(now))
+                }
+                _ => false,
+            })
     }
 }
 

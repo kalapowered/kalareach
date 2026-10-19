@@ -486,6 +486,53 @@ async fn a_device_whose_dials_all_failed_asks_again_when_the_ten_minutes_have_pa
     );
 }
 
+/// KR-REQ-17.40, KR-REQ-17.48: a service that is unable and names no time to try again is believed as
+/// long as the cache will not ask it again. After three requests with no connection that is until
+/// ten minutes after the last, not the minute the answer is kept for: a person who tries again a few
+/// minutes on is told the managed relay had no capacity, and not that the host is out of reach.
+#[tokio::test]
+async fn an_answer_that_the_service_is_unable_stands_while_the_cache_will_not_ask_again() {
+    let service = Service::start();
+    let (host, relays) = (key(0x11), network(&[MANAGED]));
+    service.web.carry_relay(
+        MANAGED,
+        AdmissionBehaviour::Unavailable {
+            retry_after_seconds: None,
+        },
+    );
+
+    for _ in 0..3 {
+        service
+            .admissions
+            .before_dial(&relays, &host, key(0x22))
+            .await;
+        assert!(service.admissions.capacity_refused(&relays, &host));
+        service.clock.advance(Duration::from_secs(25));
+    }
+    assert_eq!(service.asked().len(), 3);
+
+    // Two minutes on, past the minute the answer is kept for. No request is made, and the answer
+    // that explains the failure still stands.
+    service.clock.advance(Duration::from_secs(120));
+    service
+        .admissions
+        .before_dial(&relays, &host, key(0x22))
+        .await;
+    assert_eq!(service.asked().len(), 3);
+    assert!(
+        service.admissions.capacity_refused(&relays, &host),
+        "a refusal with no retry time stopped explaining the failure while nothing asked again"
+    );
+
+    // Ten minutes after the last request it is asked again, and the answer is the service's own.
+    service.clock.advance(Duration::from_secs(10 * 60));
+    service
+        .admissions
+        .before_dial(&relays, &host, key(0x22))
+        .await;
+    assert_eq!(service.asked().len(), 4);
+}
+
 /// KR-REQ-17.40, KR-REQ-17.48: what the service said it cannot do explains a dial that failed for a
 /// minute, though a dial asks again when the service said to, and a relay that was named first is the
 /// one that decides.
@@ -623,6 +670,45 @@ async fn a_service_that_does_not_answer_does_not_hold_up_a_dial() {
     })
     .await
     .expect("a later answer is kept");
+}
+
+/// KR-REQ-10.39: a dial that its route ends while it waits for the service leaves the request running.
+/// The answer that comes after the dial is gone is kept, the next dial reads it, and the service is
+/// not asked a second time.
+#[tokio::test]
+async fn a_dial_that_its_route_ends_while_it_waits_leaves_its_request_to_finish() {
+    let clock = AdmissionClock::default();
+    let (service, gate) = Scripted::gated(AdmissionAnswer::Unavailable {
+        message: "spent".to_owned(),
+        alternatives: vec!["a direct connection".to_owned()],
+        retry_after_seconds: None,
+    });
+    let admissions = scripted_admissions(Arc::clone(&service), &clock);
+    let (host, relays) = (key(0x11), network(&[MANAGED]));
+
+    // The route's own deadline ends the dial long before the wait for the answer would.
+    let ended = tokio::time::timeout(
+        Duration::from_millis(50),
+        admissions.before_dial(&relays, &host, key(0x22)),
+    )
+    .await;
+    assert!(ended.is_err(), "the dial was not cut short while it waited");
+    assert_eq!(service.asks(), 1);
+    assert!(!admissions.capacity_refused(&relays, &host));
+
+    // The service answers once the dial has gone, and the answer is kept.
+    gate.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !admissions.capacity_refused(&relays, &host) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the answer to a dial that was cut short is kept");
+
+    // The next dial reads it and asks nothing.
+    admissions.before_dial(&relays, &host, key(0x22)).await;
+    assert_eq!(service.asks(), 1);
 }
 
 /// KR-REQ-10.39: a service that says it serves no such route, or does not allow this device to ask,
