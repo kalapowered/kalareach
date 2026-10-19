@@ -787,7 +787,7 @@ impl Controller {
                     .await;
             }
             // The disclosed checks are started once per actor's action: what the start came to is
-            // kept in memory for this daemon's life and a retry is answered from it
+            // written down for 30 days before it is given, and a retry is answered from that record
             // ([`Controller::retained`]), so a retry does not start another run.
             Method::EnvironmentCapabilitiesCheck => {
                 return respond(

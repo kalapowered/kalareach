@@ -54,7 +54,7 @@ const FINDINGS: [&str; 4] = [
 ];
 
 /// A run of the checks that is in progress.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Running {
     started_at_ms: TimestampMs,
     session_id: SessionId,
@@ -64,7 +64,7 @@ struct Running {
 }
 
 /// What a worker found, and what it was found against.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Held {
     fingerprint: Fingerprint,
     records: Vec<CapabilityRecord>,
@@ -74,7 +74,7 @@ struct Held {
 ///
 /// In memory only: a daemon that starts again has asked nothing, and the findings were about a
 /// moment, a worker and a login that it has no way to vouch for.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Checks {
     /// The identifier of the latest run, which its answer carries.
     latest_request: u64,
@@ -348,9 +348,7 @@ impl Controller {
         mutation: &MutationRequest,
     ) -> Option<ControlFrame> {
         let digest = mutation_digest(mutation, actor_id).ok()?;
-        let held =
-            self.capability_answers
-                .recall(actor_id, mutation.action_id, kr_ipc::now_ms().get());
+        let held = self.capability_answers.recall(actor_id, mutation.action_id);
         let outcome = match held {
             Ok(None) => return None,
             Ok(Some(held)) if held.digest == digest => ParamsValue::from_typed(&held.answer)
@@ -374,8 +372,10 @@ impl Controller {
     /// # Errors
     ///
     /// Returns [`ControllerError::WindowExpired`] for an action that carries no freshness, the
-    /// admission's refusal, and [`ControllerError::InvalidArgument`] for a request that is not
-    /// for this environment.
+    /// admission's refusal, [`ControllerError::InvalidArgument`] for a request that is not for
+    /// this environment, [`ControllerError::IdConflict`] for an identifier the record holds for
+    /// another request, and the error of the registry or of the record of answers, which answers
+    /// `STORAGE_UNAVAILABLE`, when either cannot be read or the answer cannot be written down.
     pub(super) async fn start_capability_checks(
         self: &Arc<Self>,
         actor_id: &ActorId,
@@ -414,10 +414,7 @@ impl Controller {
             // The lookup before admission and this are two looks: a request of the same actor and
             // action that was answered between them is answered here again, or refused as a reused
             // identifier, under the one hold that also starts a run.
-            match self
-                .capability_answers
-                .recall(actor_id, mutation.action_id, now_ms.get())
-            {
+            match self.capability_answers.recall(actor_id, mutation.action_id) {
                 Ok(Some(held)) if held.digest == digest => return Ok(held.answer),
                 Ok(Some(_)) => {
                     return Err(ControllerError::IdConflict {
@@ -427,24 +424,25 @@ impl Controller {
                 Ok(None) => {}
                 Err(error) => return Err(error),
             }
-            let asked = checks.ask(
+            // What the start comes to is worked out on a copy and written down before anything
+            // is changed or started: a record that cannot be written refuses the start, with the
+            // checks standing as they did, so that no run goes on without its action being the
+            // one the record says was answered, and a repeat is then a request like a first one.
+            let mut next = (*checks).clone();
+            let asked = next.ask(
                 now_ms,
                 worker.as_ref().map(|worker| worker.descriptor.session_id),
                 taken,
             );
-            let view = checks.view();
-            // What is answered is written down before it is given, and a record that cannot be
-            // written does not change what the start did: the caller is told where the checks
-            // stand, and a repeat of this action is then a request like a first one.
-            if let Err(unrecorded) = self.capability_answers.remember(
+            let view = next.view();
+            self.capability_answers.remember(
                 actor_id,
                 mutation.action_id,
                 &digest,
                 &view,
-                now_ms.get(),
-            ) {
-                eprintln!("kr-controller: an action's receipt could not be kept: {unrecorded}");
-            }
+                self.wall_now_ms(),
+            )?;
+            *checks = next;
             drop(checks);
             if let (Some(request_id), Some(worker)) = (asked, worker) {
                 let request = DesktopChecksRequest {
@@ -456,8 +454,42 @@ impl Controller {
             }
             Ok(view)
         })??;
+        self.forget_old_capability_answers();
         ParamsValue::from_typed(&begun)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+
+    /// Lets go of the answers older than the retention section 9 gives a de-duplication record,
+    /// when this host can show that its clock has outlived it.
+    ///
+    /// Forgetting is taken like every forgetting on this host, through the one check they all pass
+    /// ([`crate::service::net::lifetimes::GrantLifetimes::may_forget_at`]), and the retention is
+    /// counted as the transfer sweep counts its own: from the earlier of the wall reading the
+    /// check covers and the wall clock as it stands with the record held, never from the floor,
+    /// which only rises and can stand above the clock after an owner has corrected it. The record
+    /// is held from that second reading to the delete, so an answer stamped after a correction is
+    /// never reached by a reading from before it. An answer that cannot be shown to have outlived
+    /// its retention is kept, because forgetting it lets the same action be submitted as a new one.
+    /// It is called after an answer is written or answered again, and before the reply; it writes
+    /// the floor when the floor has risen, and deletes only once the check has said yes.
+    pub(crate) fn forget_old_capability_answers(&self) {
+        let asked = self.wall_now_ms();
+        // The floor is raised to the reading and written down first, so that the check covers it.
+        self.settled_now_ms();
+        if !self.lifetimes().may_forget_at(asked) {
+            return;
+        }
+        #[cfg(test)]
+        self.after_the_answers_clock_is_proven.wait();
+        let retention = kr_protocol::limits::DEDUPLICATION_RETENTION.get();
+        let forgotten = self
+            .capability_answers
+            .forget_before(|| asked.min(self.wall_now_ms()).saturating_sub(retention));
+        if let Err(error) = forgotten {
+            eprintln!(
+                "kr-controller: old answers to the disclosed checks were not forgotten: {error}"
+            );
+        }
     }
 
     /// Records how a run ended.

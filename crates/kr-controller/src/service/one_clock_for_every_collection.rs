@@ -1,18 +1,20 @@
 //! Every collection of the daemon that lets go of a record by the wall clock reads its one record
 //! of the clock.
 //!
-//! The transfer sweep's de-duplication records, the voice coordinator's spent delegations and the
-//! attention store's action records are forgotten when the wall clock says they are old, and the
-//! wall clock is the one thing section 9 lets a host doubt. A rollback any reader finds withholds
-//! all three, and the owner's one retrust frees all three: no collection keeps a private opinion
-//! of the clock. Each test runs a real daemon on clocks it moves by hand. A worker's own contract
-//! is a second record, which the owner's retrust reaches through the clock floor.
+//! The transfer sweep's de-duplication records, the voice coordinator's spent delegations, the
+//! attention store's action records and the answers to a request for the disclosed checks are
+//! forgotten when the wall clock says they are old, and the wall clock is the one thing section 9
+//! lets a host doubt. A rollback any reader finds withholds all four, and the owner's one retrust
+//! frees all four: no collection keeps a private opinion of the clock. Each test runs a real daemon
+//! on clocks it moves by hand. A worker's own contract is a second record, which the owner's
+//! retrust reaches through the clock floor.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use kr_protocol::ids::{ActionId, DeviceId};
+use kr_protocol::desktop::CapabilityChecks;
+use kr_protocol::ids::{ActionId, ActorId, DeviceId};
 use kr_protocol::scalars::{Digest256, Uuid};
 use kr_transfer::service::RetainedOutcome;
 use kr_voice::seams::VoiceAuthority as _;
@@ -24,7 +26,7 @@ use crate::service::net::tests::{daemon_on, manual_clocks, stopped};
 
 const DAY: u64 = 86_400_000;
 
-/// What the daemon's three collections hold, and the way to ask each of them to forget.
+/// What the daemon's four collections hold, and the way to ask each of them to forget.
 struct Collections<'a> {
     temp: &'a kr_ipc::testing::TempHost,
     controller: &'a Arc<Controller>,
@@ -64,6 +66,7 @@ impl<'a> Collections<'a> {
     /// then on finds a clock it cannot prove.
     fn age_one_of_each(&self) {
         self.age_the_transfer_record();
+        self.age_the_capability_answer();
         let attention = self.attention_store();
         attention
             .execute(
@@ -72,6 +75,28 @@ impl<'a> Collections<'a> {
                 [],
             )
             .expect("the attention store takes a record");
+    }
+
+    /// Puts one answer to a request for the checks into its record, as old as a clock can say.
+    fn age_the_capability_answer(&self) {
+        self.controller
+            .capability_answers
+            .remember(
+                &ActorId::new("local:501").expect("an actor"),
+                ActionId::new(kr_ipc::new_uuid()),
+                &Digest256::from_bytes([1; 32]),
+                &CapabilityChecks::not_run(),
+                1,
+            )
+            .expect("the record takes an answer");
+    }
+
+    /// How many answers to a request for the checks the record holds.
+    fn capability_answers_kept(&self) -> usize {
+        self.controller
+            .capability_answers
+            .len()
+            .expect("counts the answers")
     }
 
     /// Puts one de-duplication record into the transfer store, as old as a clock can say.
@@ -114,6 +139,7 @@ impl<'a> Collections<'a> {
 
     /// One pass of each collection.
     async fn pass(&self) {
+        self.controller.forget_old_capability_answers();
         swept(self.controller).await;
         self.controller
             .attention()
@@ -125,15 +151,19 @@ impl<'a> Collections<'a> {
     /// Whether the collections hold everything they were given, after a pass of each.
     async fn forgot_nothing(&self) -> bool {
         self.pass().await;
-        kept(self.temp) == 1 && self.attention_kept() == 1 && !self.spend()
+        kept(self.temp) == 1
+            && self.attention_kept() == 1
+            && self.capability_answers_kept() == 1
+            && !self.spend()
     }
 }
 
 /// KR-REQ-09.14, KR-REQ-09.18, KR-REQ-09.19: a wall clock that went backwards withholds every forgetting, and
 /// the owner's one retrust frees every forgetting. A record of each kind is as old as the clock can
 /// say; the clock goes back by more than the tolerance, and then reads a plausible later moment.
-/// The transfer sweep, the voice spend and the attention store's pass each keep their record. After
-/// the owner's one establishment each lets go of its record.
+/// The transfer sweep, the voice spend, the attention store's pass and the record of answers to the
+/// disclosed checks each keep their record. After the owner's one establishment each lets go of
+/// its record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_rollback_withholds_every_forgetting_and_one_retrust_frees_them() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -170,7 +200,226 @@ async fn one_rollback_withholds_every_forgetting_and_one_retrust_frees_them() {
         0,
         "the attention record is forgotten"
     );
+    assert_eq!(
+        collections.capability_answers_kept(),
+        0,
+        "the answer to the checks is forgotten"
+    );
     assert!(collections.spend(), "the spent delegation is forgotten");
+}
+
+/// KR-REQ-09.14: an answer to a request for the checks that is stamped after the owner corrected a
+/// wrong clock is not reached by the floor from before the correction. The host has seen the wall
+/// clock at a late moment, so its floor stands there, and then far behind it; the owner establishes
+/// the clock where it is. The record counts its cutoff from the wall clock, as the transfer sweep
+/// does, and not from the floor, which only rises: the answer stamped after the correction is kept,
+/// and the one that is older than the retention by the clock that now stands is forgotten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_stamped_after_the_clock_was_corrected_is_not_forgotten_by_the_floor_before_it() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let start = wall.load(Ordering::SeqCst);
+    let late = start + kr_protocol::limits::DEDUPLICATION_RETENTION.get() + DAY;
+    let trust = || {
+        controller
+            .lifetimes()
+            .clock_trust()
+            .sample(controller.devices())
+            .expect("the host samples its clock")
+    };
+
+    wall.store(late, Ordering::SeqCst);
+    assert!(trust().is_some(), "a forward step is accepted");
+    wall.store(start, Ordering::SeqCst);
+    assert!(trust().is_none(), "the step back is found");
+    wall.store(late, Ordering::SeqCst);
+    controller.settled_now_ms();
+    wall.store(start, Ordering::SeqCst);
+    super::an_owner_establishes_the_clock::the_owner_establishes(&temp, &controller).await;
+
+    let actor = ActorId::new("local:501").expect("an actor");
+    let (old, stamped_after) = (
+        ActionId::new(kr_ipc::new_uuid()),
+        ActionId::new(kr_ipc::new_uuid()),
+    );
+    let digest = Digest256::from_bytes([1; 32]);
+    let remember = |action: ActionId, answered_ms: u64| {
+        controller
+            .capability_answers
+            .remember(
+                &actor,
+                action,
+                &digest,
+                &CapabilityChecks::not_run(),
+                answered_ms,
+            )
+            .expect("the record takes an answer");
+    };
+    remember(old, 1);
+    remember(stamped_after, controller.wall_now_ms());
+
+    controller.forget_old_capability_answers();
+    let held = |action: ActionId| {
+        controller
+            .capability_answers
+            .recall(&actor, action)
+            .expect("reads")
+            .is_some()
+    };
+    assert!(
+        held(stamped_after),
+        "the answer stamped after the correction is kept, whatever the floor stands at"
+    );
+    assert!(
+        !held(old),
+        "and the answer the established clock has outlived is forgotten"
+    );
+}
+
+/// KR-REQ-09.14: a forgetting that has read the wall clock at a late moment and been stopped before
+/// it takes the record counts from the clock as it stands once it does, not from that moment. The
+/// owner corrects the clock and establishes it while the forgetting waits, and an answer is stamped
+/// after the correction; the answer is kept, and the one the established clock has outlived goes.
+/// The record being held from that reading to the delete is not shown here, because the reading is
+/// taken after the wait either way; the store's own case shows it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forgetting_that_waited_through_a_correction_counts_from_the_clock_as_it_stands() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let start = wall.load(Ordering::SeqCst);
+    let late = start + kr_protocol::limits::DEDUPLICATION_RETENTION.get() + DAY;
+    let trust = || {
+        controller
+            .lifetimes()
+            .clock_trust()
+            .sample(controller.devices())
+            .expect("the host samples its clock")
+    };
+
+    // The wall clock reads late and is accepted, so the floor stands there, and the forgetting
+    // starts from that reading.
+    wall.store(late, Ordering::SeqCst);
+    assert!(trust().is_some(), "a forward step is accepted");
+    controller.settled_now_ms();
+    let actor = ActorId::new("local:501").expect("an actor");
+    let digest = Digest256::from_bytes([1; 32]);
+    let (old, stamped_after) = (
+        ActionId::new(kr_ipc::new_uuid()),
+        ActionId::new(kr_ipc::new_uuid()),
+    );
+    let remember = |action: ActionId, answered_ms: u64| {
+        controller
+            .capability_answers
+            .remember(
+                &actor,
+                action,
+                &digest,
+                &CapabilityChecks::not_run(),
+                answered_ms,
+            )
+            .expect("the record takes an answer");
+    };
+    remember(old, 1);
+    let (arrived, go) = controller.after_the_answers_clock_is_proven.arm();
+    let forgetting = {
+        let controller = Arc::clone(&controller);
+        tokio::task::spawn_blocking(move || controller.forget_old_capability_answers())
+    };
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(10)))
+        .await
+        .expect("the wait ran")
+        .expect("the forgetting reached the record");
+
+    // The owner corrects the clock and establishes it, and an answer is stamped.
+    wall.store(start, Ordering::SeqCst);
+    assert!(trust().is_none(), "the step back is found");
+    super::an_owner_establishes_the_clock::the_owner_establishes(&temp, &controller).await;
+    remember(stamped_after, controller.wall_now_ms());
+    go.send(()).expect("the forgetting goes on");
+    forgetting.await.expect("the forgetting ends");
+
+    let held = |action: ActionId| {
+        controller
+            .capability_answers
+            .recall(&actor, action)
+            .expect("reads")
+            .is_some()
+    };
+    assert!(
+        held(stamped_after),
+        "the answer stamped after the correction is kept"
+    );
+    assert!(
+        !held(old),
+        "and the answer the established clock has outlived is forgotten"
+    );
+}
+
+/// KR-REQ-09.14: a forgetting counts from the earlier of the reading the host's check covered and
+/// the clock as it stands with the record held, so a clock that steps forward while the forgetting
+/// waits does not bring an answer within reach that the check never covered. The clock is trusted
+/// throughout; an answer stamped at the covered reading is kept, and the one that is older than the
+/// retention by that reading goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forgetting_that_waited_through_a_step_forward_counts_from_the_reading_the_check_covered()
+{
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let start = wall.load(Ordering::SeqCst);
+    let late = start + kr_protocol::limits::DEDUPLICATION_RETENTION.get() + DAY;
+
+    let actor = ActorId::new("local:501").expect("an actor");
+    let digest = Digest256::from_bytes([1; 32]);
+    let (old, stamped_at_start) = (
+        ActionId::new(kr_ipc::new_uuid()),
+        ActionId::new(kr_ipc::new_uuid()),
+    );
+    let remember = |action: ActionId, answered_ms: u64| {
+        controller
+            .capability_answers
+            .remember(
+                &actor,
+                action,
+                &digest,
+                &CapabilityChecks::not_run(),
+                answered_ms,
+            )
+            .expect("the record takes an answer");
+    };
+    remember(old, 1);
+    remember(stamped_at_start, start);
+    let (arrived, go) = controller.after_the_answers_clock_is_proven.arm();
+    let forgetting = {
+        let controller = Arc::clone(&controller);
+        tokio::task::spawn_blocking(move || controller.forget_old_capability_answers())
+    };
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(10)))
+        .await
+        .expect("the wait ran")
+        .expect("the forgetting reached the record");
+
+    wall.store(late, Ordering::SeqCst);
+    go.send(()).expect("the forgetting goes on");
+    forgetting.await.expect("the forgetting ends");
+
+    let held = |action: ActionId| {
+        controller
+            .capability_answers
+            .recall(&actor, action)
+            .expect("reads")
+            .is_some()
+    };
+    assert!(
+        held(stamped_at_start),
+        "the answer stamped at the reading the check covered is kept"
+    );
+    assert!(
+        !held(old),
+        "and the answer that reading has outlived is forgotten"
+    );
 }
 
 /// KR-REQ-09.18: a step back smaller than the time between two readings is a rollback. The wall
@@ -508,10 +757,11 @@ const EARLIER_BUILD_THAT_NEVER_TRUSTED: &[u8] =
 
 /// KR-REQ-09.14, KR-REQ-09.19: a clock an earlier build never trusted holds every forgetting and
 /// quiet hours, and holds no decision about a grant, until the owner establishes it. A daemon
-/// started over that file keeps the transfer record, the voice spend and the attention record that
-/// have outlived their retention, withholds quiet hours, and goes on deciding an expiring grant,
-/// the host's reading of its clock being proven all the while: the file cannot say whether only the
-/// platform's time service failed. The owner's establishment frees the three and quiet hours.
+/// started over that file keeps the transfer record, the voice spend, the attention record and the
+/// answer to the disclosed checks that have outlived their retention, withholds quiet hours, and
+/// goes on deciding an expiring grant, the host's reading of its clock being proven all the while:
+/// the file cannot say whether only the platform's time service failed. The owner's establishment
+/// frees the four and quiet hours.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_clock_an_earlier_build_never_trusted_holds_every_forgetting_until_the_owner_says_so() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -574,6 +824,11 @@ async fn a_clock_an_earlier_build_never_trusted_holds_every_forgetting_until_the
         collections.attention_kept(),
         0,
         "the attention record is forgotten"
+    );
+    assert_eq!(
+        collections.capability_answers_kept(),
+        0,
+        "the answer to the checks is forgotten"
     );
     assert!(collections.spend(), "the spent delegation is forgotten");
 }

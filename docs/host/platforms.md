@@ -278,6 +278,10 @@ they can't detect is a change in permission, so the user needs to request a chec
 happens. A grant that macOS gives only to a process when it starts reaches the next session's
 worker. A daemon restart also loses the findings.
 
+The host keeps the answer to a request for 30 days, in `capability-answers.sqlite3` in the
+environment's state directory. A repeat of the action is given that answer, after a restart too, and
+starts no run.
+
 The revision every record carries advances whenever any of this changes. It is kept in the
 environment's state directory and written before it is handed out, so a host that restarts does not
 hand out a revision it has used before; where that record cannot be read the revision stays at

@@ -602,6 +602,11 @@ pub struct Controller {
     /// in every shipped build.
     #[cfg(test)]
     before_a_descriptor_is_written: BlockingPause,
+    /// Where this host's own tests stop the thread that forgets old answers to a request for the
+    /// checks, once the host has said it may forget and before the record is taken, so that a
+    /// correction of the clock can land in between. Compiled away in every shipped build.
+    #[cfg(test)]
+    after_the_answers_clock_is_proven: BlockingPause,
     /// The step this host's own tests have made stop where a crash would, if one is armed
     /// ([`StopPoint`]). Compiled away in every shipped build.
     #[cfg(test)]

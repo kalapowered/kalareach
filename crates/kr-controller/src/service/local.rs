@@ -342,9 +342,10 @@ impl Controller {
         if RETAINED_AUTHORITY_ANSWERS.contains(&method) {
             return self.retained_authority_answer(actor_id, mutation).await;
         }
-        // The request for the disclosed checks is answered the same way from what this daemon kept
-        // in memory of it, on a later connection and after its window has closed. What it kept is
-        // not in the registry: the run it started lives only as long as this daemon.
+        // The request for the disclosed checks is answered the same way from the record of what
+        // this host answered, on a later connection, after its window has closed and after a
+        // restart. The record is not in the registry; what the run found lives only as long as
+        // this daemon, and the record holds only where the checks stood when it was answered.
         if method == Method::EnvironmentCapabilitiesCheck {
             return self.kept_capability_checks(actor_id, mutation);
         }

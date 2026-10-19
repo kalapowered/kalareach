@@ -749,6 +749,27 @@ impl Host {
             .join("attention.sqlite3")
     }
 
+    /// The record of the answers the daemon gave to a request for the disclosed checks, for a
+    /// suite that puts a fault in it.
+    pub fn capability_answers_database(&self) -> PathBuf {
+        self.temp
+            .environment()
+            .state_dir()
+            .join("capability-answers.sqlite3")
+    }
+
+    /// Arms the pause the next mutation stops at once it has looked for a retained answer, whether
+    /// or not it found one. Returns the end that says the call has arrived, and the end that lets
+    /// it go. The pause fires once.
+    pub fn pause_retained_lookup(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.controller.pause_retained_lookup()
+    }
+
     /// Connects one local client on the daemon's own socket.
     pub async fn client(&self) -> LocalClient {
         LocalClient::connect(&self.endpoint, LocalClientKind::Cli, build())

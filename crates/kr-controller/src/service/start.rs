@@ -825,10 +825,7 @@ impl Controller {
         // accepted is opened whether or not a feed is selected, so the environment's stored
         // formats do not depend on the configuration.
         let mailbox_record = crate::mailbox_reader::record::Record::open(setup.paths.state_dir())?;
-        let capability_answers = crate::capability_answers::Record::open(
-            setup.paths.state_dir(),
-            kr_ipc::now_ms().get(),
-        )?;
+        let capability_answers = crate::capability_answers::Record::open(setup.paths.state_dir())?;
         let mailbox_reader = match started.authority.origin() {
             None => None,
             Some(origin) => {
@@ -1058,6 +1055,8 @@ impl Controller {
             after_the_local_access_is_drawn: ReadPause::default(),
             #[cfg(test)]
             before_a_descriptor_is_written: BlockingPause::default(),
+            #[cfg(test)]
+            after_the_answers_clock_is_proven: BlockingPause::default(),
             #[cfg(test)]
             stopped_at: std::sync::Mutex::new(None),
             boot_identity: setup.boot_identity,

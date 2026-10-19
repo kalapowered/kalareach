@@ -409,6 +409,108 @@ async fn the_answer_to_a_request_outlives_the_daemon_and_the_identifier_stays_th
     host.stop().await;
 }
 
+/// KR-REQ-03.29, KR-REQ-09.14: an answer that cannot be written down is not given. The start is
+/// refused with the host's storage error, no run is started and the checks stand as they did, and
+/// once the record can be written again the same request is a first request and starts the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_answer_that_cannot_be_written_down_refuses_the_start_and_starts_no_run() {
+    let adopted = Adopted::start_with_document(1, &headless()).await;
+    let host = &adopted.host;
+    let directory = tempfile::tempdir().expect("a directory of this test's own");
+    let file = directory.path().join("authorised.txt");
+    std::fs::write(&file, b"the person nominated this").expect("the test's file");
+
+    // The record takes no row, as a disk that is full or a file that is read-only takes none.
+    let record =
+        rusqlite::Connection::open(host.capability_answers_database()).expect("opens the record");
+    record
+        .busy_timeout(Duration::from_secs(10))
+        .expect("waits for the daemon's own use");
+    record
+        .execute_batch(
+            "CREATE TRIGGER no_room BEFORE INSERT ON capability_answers
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("puts the fault in the record");
+
+    let mut client = host.client().await;
+    let request = request_for(
+        host,
+        &mut client,
+        ActionId::new(kr_ipc::new_uuid()),
+        Some(&file),
+    )
+    .await;
+    let refused = send(&mut client, &request)
+        .await
+        .expect_err("an answer that cannot be written down is not given");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::StorageUnavailable,
+        "{refused:?}"
+    );
+    assert_eq!(
+        shown(host).await.checks.state,
+        CapabilityChecksState::NotRun,
+        "the checks stand as they did: no run was started, and none is left owing an end"
+    );
+
+    record
+        .execute_batch("DROP TRIGGER no_room")
+        .expect("clears the fault");
+    let asked = send(&mut client, &request).await.expect("asked");
+    assert!(
+        matches!(
+            asked.state,
+            CapabilityChecksState::Running | CapabilityChecksState::Current
+        ),
+        "the same request, now that it can be recorded, starts the run: {asked:?}"
+    );
+    until(host, CapabilityChecksState::Current).await;
+}
+
+/// KR-REQ-03.29, KR-REQ-09.14: two connections that ask under one action identifier, each in a
+/// window of its own, are two requests, and only the one that is answered first is run. The other
+/// looked for an answer before the first was written; it is refused as a reused identifier when it
+/// goes on, and starts no second run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn two_connections_asking_under_one_identifier_start_one_run_and_the_later_is_refused() {
+    let adopted = Adopted::start_with_document(1, &headless()).await;
+    let host = &adopted.host;
+    let directory = tempfile::tempdir().expect("a directory of this test's own");
+    let file = directory.path().join("authorised.txt");
+    std::fs::write(&file, b"the person nominated this").expect("the test's file");
+
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let mut looked_first = host.client().await;
+    let mut answered_first = host.client().await;
+    let late = request_for(host, &mut looked_first, action, Some(&file)).await;
+    let early = request_for(host, &mut answered_first, action, Some(&file)).await;
+
+    let (arrived, go) = host.pause_retained_lookup();
+    let waiting = tokio::spawn(async move { send(&mut looked_first, &late).await });
+    arrived.await.expect("the request has looked for an answer");
+    let asked = send(&mut answered_first, &early)
+        .await
+        .expect("the request answered first is run");
+    let _ = go.send(());
+
+    let conflict = waiting
+        .await
+        .expect("the request ran")
+        .expect_err("the request that looked before the answer was written is refused");
+    assert_eq!(
+        conflict.code,
+        kr_protocol::error::ErrorCode::IdConflict,
+        "{conflict:?}"
+    );
+    let done = until(host, CapabilityChecksState::Current).await;
+    assert_eq!(
+        done.checks.started_at_ms, asked.started_at_ms,
+        "one run: the findings are those of the request that was answered"
+    );
+}
+
 /// KR-REQ-03.29: with no session to perform them in, nothing is started and the answer says why,
 /// and a later read shows the same, so the setup assistant can tell a person to start a session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

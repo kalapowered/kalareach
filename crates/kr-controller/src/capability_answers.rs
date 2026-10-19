@@ -3,9 +3,14 @@
 //! Section 9 keeps the record of an action for 30 days, so that a repeat of it is answered from the
 //! record, on a later connection, after the window it was sent in has closed and after a restart,
 //! and so that the same identifier on a different request is refused as a reused identifier. The
-//! answer says where the checks stood when the request was answered; what the checks found stays
-//! in memory, because the worker that performed them goes with the daemon, and a repeat is given
-//! the answer it was given and no run of its own.
+//! answer says where the checks stood when the request was answered. What the checks found is held
+//! in memory only, so a daemon that starts again holds none of it, and a repeat is given the answer
+//! it was given and no run of its own.
+//!
+//! The record holds an answer until the host lets go of it: it counts no age of its own. Forgetting
+//! is a decision about the clock, which every collection of this host takes through the one check
+//! in [`crate::service::Controller::forget_old_capability_answers`], and a row that is still here
+//! is the record of its action.
 //!
 //! The record is a database of its own, and not a table of the registry: the registry's schema is
 //! one every release before this one has to be able to read, and an answer nothing before this
@@ -30,9 +35,6 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// The oldest schema version this build opens: it reads no other.
 pub const OLDEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION;
 
-/// How long an answer is kept, in milliseconds: 30 days.
-pub const RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
-
 /// What the record holds for one actor's action.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Answered {
@@ -54,8 +56,7 @@ fn counter(value: u64) -> i64 {
 }
 
 impl Record {
-    /// Opens the record in `state_dir`, forgetting every answer older than [`RETENTION_MS`] at
-    /// `now_ms`.
+    /// Opens the record in `state_dir`.
     ///
     /// A database that holds a schema this build does not read is refused before anything is
     /// written to it.
@@ -63,7 +64,7 @@ impl Record {
     /// # Errors
     ///
     /// Returns an error when the file cannot be opened, or holds a schema this build does not read.
-    pub fn open(state_dir: &Path, now_ms: u64) -> Result<Self> {
+    pub fn open(state_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(state_dir).map_err(ControllerError::registry)?;
         let connection =
             kr_flush::release::open_connection(&state_dir.join(CAPABILITY_ANSWERS_RECORD), None)
@@ -122,11 +123,9 @@ impl Record {
                 )
                 .map_err(ControllerError::registry)?;
         }
-        let record = Self {
+        Ok(Self {
             connection: Mutex::new(connection),
-        };
-        record.forget_the_old(now_ms)?;
-        Ok(record)
+        })
     }
 
     fn with<T>(&self, body: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
@@ -137,37 +136,40 @@ impl Record {
         body(&connection).map_err(ControllerError::registry)
     }
 
-    /// Forgets every answer given more than [`RETENTION_MS`] before `now_ms`.
-    fn forget_the_old(&self, now_ms: u64) -> Result<()> {
-        let oldest = counter(now_ms.saturating_sub(RETENTION_MS));
+    /// Lets go of every answer given before the moment `cutoff` names, and says how many that was.
+    ///
+    /// The caller has shown that the host's clock has outlived the retention at the reading the
+    /// cutoff is counted from, and nothing here looks at a clock. `cutoff` is called with the
+    /// record held, so that the moment it counts from is read after every answer written before
+    /// the delete is, and no answer can be written between that reading and the delete: a delete
+    /// by a predicate over every row is a decision about a moment, and the moment must be the
+    /// latest one that can be vouched for when the rows are chosen.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record cannot be written.
+    pub fn forget_before(&self, cutoff: impl FnOnce() -> u64) -> Result<usize> {
         self.with(|connection| {
             connection.execute(
                 "DELETE FROM capability_answers WHERE answered_ms < ?1",
-                params![oldest],
-            )?;
-            Ok(())
+                params![counter(cutoff())],
+            )
         })
     }
 
-    /// What was answered to this actor's request under this action identifier, where an answer
-    /// younger than [`RETENTION_MS`] at `now_ms` is held.
+    /// What was answered to this actor's request under this action identifier, where the record
+    /// still holds one.
     ///
     /// # Errors
     ///
     /// Returns an error when the record cannot be read, or holds an answer it cannot read.
-    pub fn recall(
-        &self,
-        actor_id: &ActorId,
-        action_id: ActionId,
-        now_ms: u64,
-    ) -> Result<Option<Answered>> {
-        let oldest = counter(now_ms.saturating_sub(RETENTION_MS));
+    pub fn recall(&self, actor_id: &ActorId, action_id: ActionId) -> Result<Option<Answered>> {
         let row: Option<(Vec<u8>, String)> = self.with(|connection| {
             connection
                 .query_row(
                     "SELECT digest, answer FROM capability_answers
-                     WHERE actor_id = ?1 AND action_id = ?2 AND answered_ms >= ?3",
-                    params![actor_id.as_str(), action_id.to_string(), oldest],
+                     WHERE actor_id = ?1 AND action_id = ?2",
+                    params![actor_id.as_str(), action_id.to_string()],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
@@ -189,8 +191,8 @@ impl Record {
         }))
     }
 
-    /// Writes down the answer given to this actor's request, and forgets what is past its
-    /// retention. An answer already held for the identifier stays as it was.
+    /// Writes down the answer given to this actor's request at `answered_ms`, the host's reading
+    /// of the wall clock. An answer already held for the identifier stays as it was.
     ///
     /// # Errors
     ///
@@ -201,10 +203,9 @@ impl Record {
         action_id: ActionId,
         digest: &Digest256,
         answer: &CapabilityChecks,
-        now_ms: u64,
+        answered_ms: u64,
     ) -> Result<()> {
         let text = serde_json::to_string(answer).map_err(ControllerError::registry)?;
-        self.forget_the_old(now_ms)?;
         self.with(|connection| {
             connection.execute(
                 "INSERT OR IGNORE INTO capability_answers
@@ -215,7 +216,7 @@ impl Record {
                     action_id.to_string(),
                     digest.as_bytes().as_slice(),
                     text,
-                    counter(now_ms)
+                    counter(answered_ms)
                 ],
             )?;
             Ok(())
@@ -274,13 +275,8 @@ mod tests {
     fn an_answer_is_held_across_a_restart_and_belongs_to_one_actor_and_one_request() {
         let directory = tempfile::tempdir().expect("a directory");
         let now = 40 * DAY;
-        let record = Record::open(directory.path(), now).expect("opens");
-        assert!(
-            record
-                .recall(&actor(), action(1), now)
-                .expect("reads")
-                .is_none()
-        );
+        let record = Record::open(directory.path()).expect("opens");
+        assert!(record.recall(&actor(), action(1)).expect("reads").is_none());
         record
             .remember(
                 &actor(),
@@ -292,19 +288,16 @@ mod tests {
             .expect("writes");
         drop(record);
 
-        let record = Record::open(directory.path(), now + DAY).expect("opens again");
+        let record = Record::open(directory.path()).expect("opens again");
         let held = record
-            .recall(&actor(), action(1), now + DAY)
+            .recall(&actor(), action(1))
             .expect("reads")
             .expect("the answer is still held");
         assert_eq!(held.digest, digest(2));
         assert_eq!(held.answer, CapabilityChecks::not_run());
         let other = ActorId::new("local:502").expect("another actor");
         assert!(
-            record
-                .recall(&other, action(1), now + DAY)
-                .expect("reads")
-                .is_none(),
+            record.recall(&other, action(1)).expect("reads").is_none(),
             "an identifier is an actor's own"
         );
         // A second answer under the same identifier does not replace the first.
@@ -319,7 +312,7 @@ mod tests {
             .expect("writes");
         assert_eq!(
             record
-                .recall(&actor(), action(1), now + DAY)
+                .recall(&actor(), action(1))
                 .expect("reads")
                 .expect("held")
                 .digest,
@@ -327,13 +320,14 @@ mod tests {
         );
     }
 
-    /// KR-REQ-03.29: an answer is kept for 30 days and not longer, whether the record is read or
-    /// opened again after it.
+    /// KR-REQ-03.29, KR-REQ-09.14: the record counts no age of its own. A row is the record of its
+    /// action, however long ago it was written, until the host lets go of the answers given before
+    /// a cutoff it has shown it may count; an answer given at the cutoff stays.
     #[test]
-    fn an_answer_is_forgotten_after_thirty_days() {
+    fn an_answer_is_held_until_the_host_forgets_those_given_before_its_cutoff() {
         let directory = tempfile::tempdir().expect("a directory");
         let given = 100 * DAY;
-        let record = Record::open(directory.path(), given).expect("opens");
+        let record = Record::open(directory.path()).expect("opens");
         record
             .remember(
                 &actor(),
@@ -343,23 +337,35 @@ mod tests {
                 given,
             )
             .expect("writes");
+        assert_eq!(record.forget_before(|| given).expect("forgets"), 0);
         assert!(
-            record
-                .recall(&actor(), action(1), given + 30 * DAY)
-                .expect("reads")
-                .is_some(),
-            "kept for the whole of the thirtieth day"
-        );
-        assert!(
-            record
-                .recall(&actor(), action(1), given + 30 * DAY + 1)
-                .expect("reads")
-                .is_none(),
-            "gone once it is older than thirty days"
+            record.recall(&actor(), action(1)).expect("reads").is_some(),
+            "an answer given at the cutoff stays"
         );
         drop(record);
-        let record = Record::open(directory.path(), given + 31 * DAY).expect("opens");
-        assert!(record.is_empty().expect("counts"), "and pruned when opened");
+        let record = Record::open(directory.path()).expect("opens again");
+        assert!(
+            record.recall(&actor(), action(1)).expect("reads").is_some(),
+            "and opening the record forgets nothing"
+        );
+        assert_eq!(record.forget_before(|| given + 1).expect("forgets"), 1);
+        assert!(record.is_empty().expect("counts"));
+    }
+
+    /// KR-REQ-09.14: the moment a forgetting counts from is read with the record held, so an answer
+    /// written after a correction of the clock cannot be chosen by a reading from before it.
+    #[test]
+    fn the_cutoff_is_counted_with_the_record_held() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let record = Record::open(directory.path()).expect("opens");
+        let mut held = false;
+        record
+            .forget_before(|| {
+                held = record.connection.try_lock().is_err();
+                0
+            })
+            .expect("forgets");
+        assert!(held, "the record is held while the cutoff is counted");
     }
 
     /// A record of a schema this build does not read is refused and left as it is.
@@ -376,7 +382,7 @@ mod tests {
                 )
                 .expect("a newer schema");
         }
-        let refused = Record::open(directory.path(), 0).expect_err("another schema");
+        let refused = Record::open(directory.path()).expect_err("another schema");
         assert!(refused.to_string().contains("schema 2"), "{refused}");
         let connection = Connection::open(&path).expect("opens again");
         let tables: i64 = connection
