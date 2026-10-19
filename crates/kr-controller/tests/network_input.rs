@@ -860,7 +860,9 @@ impl Rig {
             }
             Instant::now()
         });
-        ready.await.expect("the watcher read the file");
+        ready
+            .await
+            .expect("the application had a byte before the key was sent");
         let report = self.viewport_report();
         let report = if behind_a_report {
             Some(

@@ -66,8 +66,8 @@ type Read = Option<ControlFrame>;
 ///
 /// The loop that serves a connection is dropped when the control stream ends, and what it was
 /// awaiting stops with it. A task that is spawned for the answer would outlive that, so dropping
-/// this aborts it. It stops at its next await, where it waits now or after the step it is running,
-/// as dropping the answer's future would have stopped it.
+/// this aborts it. It stops when it next yields to the runtime, which can be after the step it is
+/// running, as dropping the answer's future would have stopped it at its next await.
 struct Answering(tokio::task::JoinHandle<Option<Answered>>);
 
 impl Drop for Answering {
@@ -95,13 +95,15 @@ impl RemoteConnection {
     /// What `frame` is to the order a key keeps on a connection with this route.
     ///
     /// The method rule is [`kr_protocol::ordering`]'s. A frame this host decides over a session
-    /// other than the route's, or a mutation over a grant other than the route's, is `Blocking`
-    /// whatever its method: deciding it can note another share on the registration. A key naming
-    /// another session is `Blocking` for the same reason, and the link refuses it anyway. An
-    /// `action.read` that names no session is decided over the session its recorded route names,
-    /// and one whose route names none, or that has no route yet, is `Blocking`: another connection
-    /// of the device can claim the route first. A voice read is `Blocking` too. Any other read that
-    /// names no session is decided under the pairing grant, which notes no share, and goes ahead.
+    /// other than the route's, or a mutation that names no session or a grant other than the
+    /// route's, is `Blocking` whatever its method: deciding it can note another share on the
+    /// registration, and the daemon refuses a mutation that names no session before the worker. A
+    /// key naming another session is `Blocking` for the same reason, and the link refuses it
+    /// anyway. An `action.read` that names no session is decided over the session its recorded
+    /// route names, and one whose route names none, or that has no route yet, is `Blocking`:
+    /// another connection of the device can claim the route first. A voice read is `Blocking` too.
+    /// Any other read that names no session is decided under the pairing grant, which notes no
+    /// share, and goes ahead.
     pub(super) fn order_kind(&self, frame: &ControlFrame, route: Route) -> Kind {
         match frame {
             ControlFrame::Request(request) => {
@@ -109,9 +111,8 @@ impl RemoteConnection {
                     return Kind::Blocking;
                 };
                 let kind = ordering::request_kind(Some(entry.method));
-                // A voice read is decided under the pairing grant whatever session it names, and
-                // may wait on the voice provider; it keeps its place, so the rule below holds as
-                // stated.
+                // A voice read is decided under the pairing grant whatever session it names, so it
+                // keeps its place and the rule below holds as stated.
                 if kind == Kind::Blocking || crate::voice::VoiceModule::serves(entry.method) {
                     return Kind::Blocking;
                 }
@@ -130,7 +131,7 @@ impl RemoteConnection {
                 };
                 let kind = ordering::mutation_kind(Some(entry.method));
                 let (session, grant) = mutation_subject(mutation);
-                if session.is_some_and(|named| named != route.session)
+                if session.is_none_or(|named| named != route.session)
                     || grant.is_some_and(|named| named != route.grant)
                 {
                     return Kind::Blocking;
@@ -363,7 +364,28 @@ mod tests {
         );
 
         // A read of an action alone is decided over the session its recorded route names, and
-        // one with no route is not yet decided over any.
+        // one with no route is not yet decided over any. A voice read keeps its place whatever
+        // session it names, and a route that names no session decides none.
+        let voice_context = read(
+            Method::VoiceContext,
+            &kr_protocol::voice::VoiceContextParams {
+                voice_session_id: kr_protocol::ids::VoiceSessionId::new(Uuid::from_bytes([16; 16])),
+                session_id: here,
+                selected: kr_protocol::scalars::CanonicalSet::new(),
+                delegation_id: Nullable::null(),
+            },
+        );
+        assert_eq!(kind(&voice_context), Kind::Blocking);
+        assert_eq!(
+            kind(&read(
+                Method::VoicePrepare,
+                &kr_protocol::voice::VoicePrepareParams {
+                    session_ids: [here].into_iter().collect(),
+                    selected: kr_protocol::scalars::CanonicalSet::new(),
+                },
+            )),
+            Kind::Blocking
+        );
         let action = ActionId::new(Uuid::from_bytes([13; 16]));
         let by_action = read(
             Method::ActionRead,
@@ -453,7 +475,8 @@ mod tests {
         );
         assert_eq!(
             kind(&mutation(Method::TerminalResize, None, None)),
-            Kind::Independent
+            Kind::Blocking,
+            "a mutation that names no session is refused before the worker, and keeps its place"
         );
         assert_eq!(
             kind(&mutation(Method::AttachmentViewport, Some(elsewhere), None)),

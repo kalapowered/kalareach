@@ -903,8 +903,8 @@ pub(super) fn claims_geometry(mutation: &MutationRequest) -> bool {
 
 /// The session a mutation names in its target and the grant it names in its envelope, which is
 /// what the decision of an ordinary mutation is made over ([`RemoteConnection::ask_mutation`]; a
-/// delegation is decided under the grant its parameters name, and a revocation under a share the
-/// grants select).
+/// delegation is decided under the grant its envelope names, or else the one its parameters
+/// name, and a revocation under a share the grants select).
 ///
 /// The parameters are not read: [`RemoteConnection::check_envelope`] compares them with the target
 /// only after the decision, so a decision that has noted a share has already been made by then.
