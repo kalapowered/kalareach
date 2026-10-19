@@ -1,7 +1,7 @@
 //! Revoking a device on a host this computer owns, and what each host says it did about it.
 //!
-//! A person who owns a host can take a device's pairing away from here. Two routes lead to the host,
-//! and the host a request is for decides which:
+//! A person who owns a host can take a device's pairing away from here. Two routes lead to the
+//! host, and the host a request is for decides which:
 //!
 //! * **The host on this computer** takes `device.revoke` over a connection it admits now: it
 //!   withdraws the ones it admitted before each revocation, so this computer opens another and sends
@@ -286,11 +286,48 @@ impl Drop for InFlight {
     }
 }
 
-/// A host's devices as last listed.
+/// What a host last said of its devices, and which visit said it.
 #[derive(Clone)]
 struct Listed {
-    devices: Vec<DeviceSummary>,
-    at_ms: u64,
+    /// The devices it listed and when, or none where it has refused to list them since: a refusal
+    /// stays as a mark, so that a visit that began before it and answers after it cannot bring
+    /// back what the host listed earlier.
+    devices: Option<(Vec<DeviceSummary>, u64)>,
+    /// Where the visit that wrote this began in the order of things.
+    written: u64,
+}
+
+/// Notes what the visit that began at `started` found of the host `reference` names: its list, or
+/// that it refused to list. A visit that began before the one whose finding is held says nothing
+/// new, however late its host answered.
+fn note_listing(
+    listed: &mut BTreeMap<String, Listed>,
+    reference: &str,
+    started: u64,
+    found: Option<&DeviceListResult>,
+    refused: bool,
+    now_ms: u64,
+) {
+    if listed
+        .get(reference)
+        .is_some_and(|held| held.written >= started)
+    {
+        return;
+    }
+    let devices = match found {
+        Some(list) => Some((list.devices.clone(), now_ms)),
+        // A host that will not list its devices to this computer says nothing of them, and what
+        // it listed before is no longer what it lists.
+        None if refused => None,
+        None => return,
+    };
+    listed.insert(
+        reference.to_owned(),
+        Listed {
+            devices,
+            written: started,
+        },
+    );
 }
 
 /// What the host on this computer answered to a revocation.
@@ -581,7 +618,8 @@ impl Revocations {
         self.memory.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Every host a request can be for: the one on this computer, then the hosts this computer owns.
+    /// Every host a request can be for: the one on this computer, then the hosts this computer
+    /// owns.
     fn hosts(&self, context: &Context) -> Vec<Host> {
         let mut hosts = Vec::new();
         if let Some(connection) = &context.local
@@ -741,8 +779,9 @@ impl Revocations {
                     .iter()
                     .filter(|request| request.devices.contains(&summary.device_id))
                     .collect();
-                // A request of this computer's own that the feed holds and the host has not refused,
-                // or a device the host on this computer, which answered just now, lists as revoked.
+                // A request of this computer's own that the feed holds and the host has not
+                // refused, or a device the host on this computer, which answered just now, lists as
+                // revoked.
                 let listed_revoked = summary.revoked
                     && reading.list.is_some()
                     && matches!(reading.host, Host::Local(_));
@@ -933,8 +972,13 @@ impl Revocations {
             }
         }
         if !asked_again {
-            self.confirmed(&format!("Revoke {} on {}", chosen.name, host_now.name))
-                .await?;
+            // The dialog says it in a sentence: the host on this computer is not named as the
+            // screen titles it.
+            let reason = match &found {
+                Host::Local(_) => format!("Revoke {} on this computer", chosen.name),
+                Host::Paired(_) => format!("Revoke {} on {}", chosen.name, host_now.name),
+            };
+            self.confirmed(&reason).await?;
         }
         // What can fail without a request having left is done first, so that nothing after the
         // hold is known not to have left.
