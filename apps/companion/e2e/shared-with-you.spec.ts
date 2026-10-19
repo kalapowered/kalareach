@@ -180,7 +180,10 @@ for (const surface of ['ios', 'android'] as const) {
   for (const size of SIZES) {
     for (const face of FACES) {
       test.describe(`what is shared with a phone on ${surface} at the ${size.name} text size${face.suffix}`, () => {
+        // The words that say when a share ends depend on the day, so the clock stands where this says.
+        test.use({ timezoneId: 'UTC' })
         test.beforeEach(async ({ page }) => {
+          await withClockAt(page, CLOCKS[0].at)
           await withSystemTextScale(page, size.ratio)
           await withFace(page, face.css)
           await page.setViewportSize({ width: 320, height: 720 })
