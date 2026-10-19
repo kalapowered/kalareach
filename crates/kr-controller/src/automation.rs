@@ -789,14 +789,18 @@ fn node_digest(
 /// has been decided.
 ///
 /// It answers the last moment the session's process may be created, in milliseconds of the machine's
-/// continuous clock since boot: the moment the engine stops waiting or the moment the grant ends,
-/// whichever is first. Each is the moment it ends read now and never a duration added to a later
-/// reading, so a delay between this answer and the process's creation counts against it.
+/// continuous clock since boot, when it has one. The grant's end bounds every session; the moment
+/// the engine stops waiting bounds a command as well, because the node's result is the command's
+/// and nobody is waiting for it after that. A session a `create_session` node makes is the node's
+/// output and outlives its wait, so only the grant bounds it. Each is the moment it ends read now
+/// and never a duration added to a later reading, so a delay between this answer and the process's
+/// creation counts against it.
 fn node_admission(
     controller: &Arc<Controller>,
     held: &Arc<HeldGrant>,
     wait_until_ms: u64,
     task: &Arc<NodeTask>,
+    bounded_by_the_wait: bool,
 ) -> crate::service::WorkflowAdmission {
     let held = Arc::clone(held);
     let task = Arc::clone(task);
@@ -823,8 +827,11 @@ fn node_admission(
                 )),
             );
         }
-        let wait_ends = boot_ms.saturating_add(wait_until_ms - now_ms);
-        Ok(grant_ends.map_or(wait_ends, |grant_ends| grant_ends.min(wait_ends)))
+        let wait_ends = bounded_by_the_wait.then(|| boot_ms.saturating_add(wait_until_ms - now_ms));
+        Ok(grant_ends
+            .into_iter()
+            .chain(wait_ends)
+            .min())
     })
 }
 
@@ -878,7 +885,7 @@ async fn create_session_node(
         digest: node_digest(&held.definition, &held.node),
         create,
         command: None,
-        admit: node_admission(&controller, &held, context.wait_until_ms, &entry.task),
+        admit: node_admission(&controller, &held, context.wait_until_ms, &entry.task, false),
     };
     let (sender, receiver) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -1293,7 +1300,7 @@ async fn drive_command(
         Ok(controller) => controller,
         Err(error) => return Driven::nothing_was_made(Err(error)),
     };
-    let admit = node_admission(&controller, held, context.wait_until_ms, task);
+    let admit = node_admission(&controller, held, context.wait_until_ms, task, true);
     let create = kr_protocol::session::SessionCreateParams {
         environment_id: context.changesets.environment_id(),
         presentation: kr_protocol::session::Presentation::Invisible,

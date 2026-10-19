@@ -318,7 +318,7 @@ impl Controller {
                 match (launch.admit)(&registry) {
                     // The last moment the worker may create the process, decided now, with the
                     // grant as it stands, and handed to the worker in its specification.
-                    Ok(moment) => start_not_after = Some(moment),
+                    Ok(moment) => start_not_after = moment,
                     Err(refusal) => {
                         let failed = registry.fail_if_spawned(claim.reservation_id)?;
                         drop(registry);

@@ -49,8 +49,8 @@ const CLOSE_TTL_MS: u64 = 30_000;
 /// What keeps a workflow node's right to start its session true: asked under the registry guard at
 /// the launch transition and again at the worker's claim. An admission answers the last moment, in
 /// milliseconds of the machine's continuous clock since boot, at which the session's process may
-/// be created: the claim hands it to the worker.
-pub(crate) type WorkflowAdmission = Arc<dyn Fn(&Registry) -> Result<u64> + Send + Sync>;
+/// be created, when there is one: the claim hands it to the worker.
+pub(crate) type WorkflowAdmission = Arc<dyn Fn(&Registry) -> Result<Option<u64>> + Send + Sync>;
 
 /// What a workflow node asks the daemon to create.
 pub(crate) struct WorkflowCreate {
@@ -300,14 +300,14 @@ impl Controller {
     ///
     /// It first asks whether this host owes a fence it could not raise, and then `check`, which
     /// the caller supplies: the node's grant on both clocks, the moment its wait ends and whether
-    /// its run was cancelled, and which answers the last moment the process may be created. It is asked at the launch transition and again at the worker's
+    /// its run was cancelled, and which answers the last moment the process may be created, if any. It is asked at the launch transition and again at the worker's
     /// claim, both under the guard, and holds the daemon weakly, so a create that outlives it
     /// asks nothing. The decision reads the grant and policy stores, so it runs where the runtime
     /// may block, and the other tasks of the thread move to its peers meanwhile; the guard is
     /// held across it, which is what keeps a revocation from completing in between.
     pub(crate) fn workflow_admission(
         self: &Arc<Self>,
-        check: impl Fn() -> Result<u64> + Send + Sync + 'static,
+        check: impl Fn() -> Result<Option<u64>> + Send + Sync + 'static,
     ) -> WorkflowAdmission {
         let daemon = Arc::downgrade(self);
         Arc::new(move |_registry: &Registry| {

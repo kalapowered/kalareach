@@ -5034,18 +5034,18 @@ async fn a_command_a_stopped_daemon_left_running_is_closed_and_released_by_the_n
     host.clients.abort();
 }
 
-/// KR-REQ-19.04 and KR-REQ-25.14: a command is held to its grant's own end where its process is
-/// created, whatever its wait still allows. The grant ends while the worker's rendezvous is held
-/// after its claim, which the grant still stood at, and the worker, going on, creates no process:
-/// the command leaves no mark and its reservation fails. The control is a grant with no end, whose
-/// command starts through the same hold.
+/// KR-REQ-19.04 and KR-REQ-25.14: a session a workflow starts is held to its grant's own end where
+/// its process is created, whatever the node's wait still allows. The grant ends while the worker's
+/// rendezvous is held after its claim, which the grant still stood at, and the worker, going on,
+/// creates no process: a command leaves no mark, a shell a `create_session` node names starts none,
+/// and the reservation fails. The control is a grant with no end, whose command starts through the
+/// same hold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_command_does_not_start_after_its_grants_end_though_its_wait_has_time_left() {
+async fn a_session_does_not_start_after_its_grants_end_though_its_wait_has_time_left() {
     let host = working_host().await;
     let mut control = client(&host).await;
-    let marker = host.work().join("a-command-ran");
     let local = kr_protocol::ids::DeviceId::new(host.environment_id.get());
-    for (number, ends) in [(50_u8, true), (51, false)] {
+    for (number, ends, shell) in [(50_u8, true, false), (51, false, false), (55, true, true)] {
         let ends_at = kr_ipc::now_ms().get() + 20_000;
         issue_grant(
             &host,
@@ -5060,12 +5060,13 @@ async fn a_command_does_not_start_after_its_grants_end_though_its_wait_has_time_
                 GrantExpiry::Never
             },
         );
-        let mut document = definition(
-            workflow_id(number),
-            grant_id(number),
-            "a command",
-            command_node(&host, "command", &format!("touch {}", marker.display())),
-        );
+        let marker = host.work().join(format!("a-command-ran-{number}"));
+        let node = if shell {
+            create_session_node(&host, Some("/bin/sh"))
+        } else {
+            command_node(&host, "command", &format!("touch {}", marker.display()))
+        };
+        let mut document = definition(workflow_id(number), grant_id(number), "a node", node);
         document.deadlines = WorkflowDeadlines {
             run_deadline_ms: U64::new(600_000),
             action_wait_ms: U64::new(300_000),
@@ -5096,6 +5097,13 @@ async fn a_command_does_not_start_after_its_grants_end_though_its_wait_has_time_
             assert!(
                 !marker.exists(),
                 "no process was created after the grant's end"
+            );
+            assert!(
+                all_sessions(&mut control)
+                    .await
+                    .iter()
+                    .all(|session| session.closure.0.is_some()),
+                "no session is live"
             );
         } else {
             let sessions = all_sessions(&mut control).await;

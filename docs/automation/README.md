@@ -163,11 +163,12 @@ engine stops waiting for the node are checked at the launch transition under the
 where the session comes into being, and again when the worker claims its launch, which is when the
 program is released to start: a grant withdrawn, a wait that ended, or a run cancelled, in between
 starts nothing. The claim also decides the moment after which the session's process may not be
-created, the earlier of the node's wait and the grant's own end (its expiry, an organisation lease,
-a bounded offline validity), each read as the moment it ends on the machine's continuous clock, and
-the worker checks it where the process is created, after everything it prepares. A shell a
-`create_session` node names is held to that moment as a command is. The chain's session allowance
-is spent for each node that creates a session, a command's included.
+created, each end read as the moment it ends on the machine's continuous clock, and the worker
+checks it where the process is created, after everything it prepares. For a command it is the
+earlier of the node's wait and the grant's own end (its expiry, an organisation lease, a bounded
+offline validity); the session a `create_session` node makes outlives the node's wait, so only the
+grant's end bounds it, and that holds for the shell it names as it does for a command. The chain's
+session allowance is spent for each node that creates a session, a command's included.
 
 A `create_session` node creates a session through `session.create`'s own parameters and leaves it
 running; the session is the node's output and belongs to whoever uses it afterwards. The create
