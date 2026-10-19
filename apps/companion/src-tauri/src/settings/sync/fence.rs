@@ -1,18 +1,21 @@
 //! The record of revocations this computer sent that the membership has not taken in yet, and the
 //! gate it makes for everything settings sync sends.
 //!
-//! A revocation this computer sent is known here before the membership has recorded it, and a step
-//! may be in hand, waiting on the network, when it is. The membership cannot record it then: the
-//! step holds the membership for as long as it waits. From the moment the revocation is known,
-//! nothing more may be sealed under a key the device holds, so it is written down first, before
-//! anything that can wait or fail, and forgotten once the membership has it.
+//! A revocation this computer sends is written down before the request leaves, and a request whose
+//! record cannot be written is not sent. A step may be in hand, waiting on the network, when the
+//! person revokes, and the membership cannot take the revocation in then: the step holds the
+//! membership for as long as it waits. From the moment the request leaves, nothing more may be
+//! sealed under a key the device holds, so the record comes first and is forgotten once the
+//! membership has taken the revocation in.
 //!
 //! The record is a file beside the other records of settings sync, so it is kept across a restart
 //! and seen by a second companion over the same data directory: each step takes in what it finds
-//! there before it does anything else, whoever wrote it. Settings and drafts both ask [`Fence`],
-//! as a [`PublishGate`], before they read and seal what they send, so a send it refuses leaves no
-//! record and no sealed bytes behind. A send that has passed the gate is on its way and cannot be
-//! called back.
+//! there, whoever wrote it, before it reconciles. Settings and drafts both ask [`Fence`], as a
+//! [`PublishGate`], before they read and seal what they send, so a send it refuses leaves no record
+//! and no sealed bytes behind. A send that has passed the gate is on its way and cannot be called
+//! back. A device that a host lists as revoked without this computer having sent the request is
+//! written down when this computer reads that list; a record that cannot be written then holds this
+//! process only, until it can be.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -103,12 +106,13 @@ impl Fence {
     }
 
     /// Holds everything sent until `devices` are recorded as revoked. Nothing here can undo it
-    /// except [`Self::lift`]: a record that cannot be written leaves this process holding its own.
+    /// except [`Self::lift`]: a record that cannot be written leaves this process holding its own,
+    /// and the error says so.
     ///
     /// # Errors
     ///
     /// Returns why the record could not be written.
-    pub(super) fn raise(&self, devices: &[AuthorisationKey]) -> Result<()> {
+    pub fn raise(&self, devices: &[AuthorisationKey]) -> Result<()> {
         self.held().extend(devices.iter().copied());
         self.change(|kept| kept.extend(devices.iter().copied()))
     }
@@ -118,7 +122,7 @@ impl Fence {
     /// # Errors
     ///
     /// Returns why the record could not be written; the devices stay held.
-    pub(super) fn lift(&self, devices: &[AuthorisationKey]) -> Result<()> {
+    pub fn lift(&self, devices: &[AuthorisationKey]) -> Result<()> {
         self.change(|kept| {
             for device in devices {
                 kept.remove(device);
@@ -129,6 +133,14 @@ impl Fence {
             held.remove(device);
         }
         Ok(())
+    }
+
+    /// Writes down what this process holds and the file does not, as far as the file allows.
+    pub(super) fn keep_held(&self) {
+        let held: Vec<AuthorisationKey> = self.held().iter().copied().collect();
+        if !held.is_empty() {
+            let _ = self.change(|kept| kept.extend(held.iter().copied()));
+        }
     }
 
     /// The devices held, by this process or by the file.

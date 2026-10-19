@@ -758,8 +758,8 @@ async fn the_host_on_this_computer_takes_the_revocation_itself_and_its_answer_is
     assert_eq!(phone_state(&done, "direct"), "done", "{done}");
     assert_eq!(rig.publications(), 0, "no feed was involved");
     assert_eq!(rig.ceremony.reasons().len(), 1);
-    // The host's own answer is told to settings sync, which takes the device out of the settings
-    // it shares: the connection it would ask the host over is the one the revocation withdrew.
+    // Settings sync is told, and takes the device out of the settings it shares: the connection it
+    // would ask the host over is the one the revocation withdrew.
     rig.settings_sync_hears_of(&rig.phone).await;
     let again = rig
         .revoke(
@@ -768,6 +768,85 @@ async fn the_host_on_this_computer_takes_the_revocation_itself_and_its_answer_is
         )
         .expect_err("it is revoked");
     assert_eq!(again["code"], "PERMISSION_DENIED", "{again}");
+}
+
+/// Settings sync holds everything it sends before a revocation leaves, so a revocation whose hold
+/// cannot be written down is not sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_whose_hold_on_settings_sync_cannot_be_written_down_is_not_sent() {
+    let rig = Rig::start().await;
+    rig.with_settings_sync().await;
+    let view = rig.view().await;
+    let host = host_by(&view, "feed");
+    let phone = the_phone(&host);
+    // A directory where the record would be, so that it can be neither read nor written.
+    std::fs::create_dir(rig.data.path().join("settings-sync").join("revoking.json"))
+        .expect("the obstacle");
+
+    let refused = rig
+        .revoke(
+            host["reference"].as_str().expect("a reference"),
+            phone["reference"].as_str().expect("a reference"),
+        )
+        .expect_err("nothing leaves unless settings sync is held back first");
+    assert_eq!(refused["code"], "RESOURCE_UNAVAILABLE", "{refused}");
+    assert_eq!(rig.publications(), 0, "no request was published");
+    assert_eq!(
+        phone_state(&rig.view().await, "feed"),
+        "active",
+        "and nothing is said to have been asked"
+    );
+}
+
+/// The host on this computer takes a revocation and answers, and the view that follows cannot list
+/// the host: settings sync was told when the host answered, not at the end of that view.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_direct_revocation_is_told_to_settings_sync_though_the_view_after_it_cannot_list_the_host()
+ {
+    let rig = Rig::start().await;
+    rig.with_settings_sync().await;
+    rig.view().await;
+    rig.host_polls().await;
+    let endpoint = rig.host.endpoint().clone();
+    // The connection can be replaced once, for the revocation, and not again.
+    let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reopen: companion_tauri::connection::Reopen = Arc::new({
+        let endpoint = endpoint.clone();
+        move || {
+            let endpoint = endpoint.clone();
+            let first = opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if first {
+                    local_connection(&endpoint).await
+                } else {
+                    Err(companion_tauri::error::CommandError::unavailable(
+                        "the host did not answer",
+                    ))
+                }
+            })
+        }
+    });
+    let connection = local_connection(&endpoint)
+        .await
+        .expect("connects to the control endpoint")
+        .reopening(reopen);
+    rig.app.app.state::<AppState>().connected(connection);
+    let view = rig.view().await;
+    let local = host_by(&view, "direct");
+    let phone = the_phone(&local);
+
+    let after = rig
+        .revoke(
+            local["reference"].as_str().expect("a reference"),
+            phone["reference"].as_str().expect("a reference"),
+        )
+        .expect("the host on this computer revokes the device");
+    assert_eq!(
+        host_by(&after, "direct")["contact"],
+        "silent",
+        "the view after it could not list the host: {after}"
+    );
+    rig.settings_sync_hears_of(&rig.phone).await;
 }
 
 /// Whoever revokes a device at the host on this computer, and whether or not the host's answer

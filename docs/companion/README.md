@@ -463,13 +463,15 @@ nothing is published for it. A host that does not answer keeps the device list i
 this application asked, for as long as the application runs, shown with the time of that list, and a
 revocation is still published for it.
 
-A revocation this computer sent is told to settings sync, whether it went through a host's feed or
-the host on this computer lists the device as revoked. Settings sync writes it down at once, before
-any host has acknowledged the request, and holds back everything it sends until the device is out of
-the shared settings. That includes a step already under way: nothing written after the revocation is
-sealed under a key the device holds, and what was held back is sent once the device is out, under
-the key that follows its removal. The record is kept across a restart, and the next step of any
-companion over the same data takes the device out. A send already on its way cannot be called back.
+A revocation this computer sends is written down in settings sync before the request leaves, and a
+request whose record cannot be written is not sent. From then on settings sync holds back everything
+it sends until the device is out of the shared settings, a step already under way included: nothing
+written after the revocation is sealed under a key the device holds, and what was held back is sent
+once the device is out, under the key that follows its removal. The record is kept across a restart,
+and the next step of any companion over the same data takes the device out. A device that a view
+finds revoked by this computer's own signature in a host's feed, or that the host on this computer
+lists as revoked, whoever revoked it, is written down the same way. A send already on its way cannot
+be called back.
 
 ## Sharing a session
 

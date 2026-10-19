@@ -36,15 +36,15 @@
 //!
 //! # Taking a device out
 //!
-//! A revocation this computer sent is told to settings sync ([`SettingsSync::revocations_sent`]),
-//! which writes it down in a record beside the others before it does anything that can wait or
-//! fail ([`Fence`]). The membership cannot take it in while a step holds it, and a step holds it for
-//! as long as it waits on the hosts or the service. While the record holds a device, no step starts
-//! to publish, and settings and drafts both ask the record before they read and seal what they
-//! send, so a send it refuses leaves no record and no sealed bytes behind. Each step takes in what
-//! the record holds before it does anything else, whichever companion wrote it, and the same step
-//! takes the device out. What was held back is sent afterwards, under the key that follows the
-//! removal. A send already on its way cannot be called back.
+//! A revocation this computer sends is written down in a record beside the others before the
+//! request leaves ([`Fence`], [`SettingsSync::hold_for_revocation`]), and a request whose record
+//! cannot be written is not sent. The membership cannot take the revocation in while a step holds
+//! it, and a step holds it for as long as it waits on the hosts or the service. While the record
+//! holds a device, no step starts to publish, and settings and drafts both ask the record before
+//! they read and seal what they send, so a send it refuses leaves no record and no sealed bytes
+//! behind. Each step takes in what the record holds before it reconciles, whichever companion wrote
+//! it, and the same step takes the device out. What was held back is sent afterwards, under the key
+//! that follows the removal. A send already on its way cannot be called back.
 //!
 //! # Agreeing with the service
 //!
@@ -684,14 +684,17 @@ impl SettingsSync {
         let now_ms = now();
         let ask = self.ask_for(service, ask)?;
         let mut membership = self.membership_asking(service, ask)?;
-        // What this computer was told to take out comes first, whoever was told and whatever the
-        // step does next.
-        self.take_in_revocations(&mut membership)?;
+        // What this computer was told to take out is taken in before the reconciliation, whoever
+        // was told, and let go of after it: the membership holds it from the first, and a record
+        // that cannot be let go of holds this process the longer.
+        let taken = self.take_in_revocations(&mut membership)?;
         let reconciled = membership.reconcile(now_ms).await.map_err(member_failure);
+        let lifted = self.fence.lift(&taken);
         // What the membership holds is shown whatever the reconciliation could do.
         self.note_devices(&membership);
         self.told.tell();
         reconciled?;
+        lifted?;
         // A revocation that arrived while this step waited holds what is sent before the
         // membership can record it, which it cannot while this step holds it.
         if self.fence.is_raised() || !membership.publishes().map_err(member_failure)? {

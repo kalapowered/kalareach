@@ -39,14 +39,14 @@
 //!
 //! # Settings sync
 //!
-//! A revocation this computer sent is told to settings sync, which writes it down at once, before
-//! any host has acknowledged the request, holds everything it sends until the device is out of the
-//! shared settings, and takes it out in a step of its own. For a host reached through its feed the
-//! proof is this computer's own signature on a request addressed to that host; for the host on this
-//! computer it is that host's list, which names the device as revoked, whoever revoked it. What
-//! settings sync was sending when it was told is held too, a step already under way included, so
-//! nothing written after the revocation is sealed under a key the device holds. A send already on
-//! its way cannot be called back.
+//! Before a revocation leaves, settings sync is told to hold everything it sends until the device
+//! is out of the shared settings, and a revocation whose hold cannot be written down is not sent.
+//! Once the request has left, settings sync takes the device out in a step of its own, without
+//! waiting for any host to acknowledge it. What settings sync was sending is held too, a step
+//! already under way included, so nothing written after the revocation is sealed under a key the
+//! device holds. A device that a view finds revoked by this computer's own signature in a host's
+//! feed, or listed as revoked by the host on this computer, whoever revoked it, is passed to
+//! settings sync the same way. A send already on its way cannot be called back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -497,10 +497,12 @@ impl Revocations {
         }
     }
 
-    /// Passes the devices of the revocations this computer sent to settings sync, which holds
-    /// what it sends at once and takes the devices out of the shared settings in a step of its own,
-    /// without waiting for a host to confirm. All the devices of one view go in one call. It runs on
-    /// its own, so that a service that is slow to answer does not hold the screen.
+    /// Passes the devices of revocations to settings sync, which holds what it sends at once and
+    /// takes the devices out of the shared settings in a step of its own, without waiting for a
+    /// host to confirm: the devices a request just sent names, and those a view finds this computer
+    /// sent or a host on this computer lists as revoked. All the devices of one view go in one
+    /// call. It runs on its own, so that a service that is slow to answer does not hold the
+    /// screen.
     fn tell(&self, context: &Context, told: Vec<AuthorisationKey>) {
         let Some(settings) = &context.settings else {
             return;
@@ -527,8 +529,8 @@ impl Revocations {
         });
     }
 
-    /// One host's view. The keys of the devices this computer sent revocations for that settings
-    /// sync has not heard of go in `told`.
+    /// One host's view. The keys of the devices that settings sync has not heard of, and that this
+    /// computer sent a request for or the host on this computer lists as revoked, go in `told`.
     fn host_view(&self, reading: &Reading, told: &mut Vec<AuthorisationKey>) -> HostView {
         let reference = reading.host.reference();
         let (devices, listed_at_ms, direct, fed) = {
@@ -723,7 +725,44 @@ impl Revocations {
             self.confirmed(&format!("Revoke {} on {}", chosen.name, host_now.name))
                 .await?;
         }
-        match &found {
+        // Settings sync holds everything it sends before the request leaves, so that nothing is
+        // sealed under a key the device holds from the moment the host acts. A record that cannot
+        // be written sends nothing.
+        let keys: Vec<AuthorisationKey> = summary
+            .keys
+            .0
+            .iter()
+            .map(|keys| keys.authorisation)
+            .collect();
+        let settings = context.settings.as_ref().filter(|_| !keys.is_empty());
+        if let Some(settings) = settings {
+            settings.hold_for_revocation(&keys).map_err(|error| {
+                CommandError::local_failure(format!(
+                    "nothing was sent, because this computer could not hold its settings back \
+                     first: {}",
+                    error.message
+                ))
+            })?;
+        }
+        let sent = self.send(&found, context, &summary).await;
+        match (&sent, settings) {
+            // Told at once, and not at the end of the view that follows, which waits for every
+            // host and every feed.
+            (Ok(()), Some(_)) => self.tell(context, keys),
+            // Nothing is known to have left. If the host acted all the same, the next view finds
+            // the device listed as revoked and tells settings sync then.
+            (Err(_), Some(settings)) => {
+                let _ = settings.release_revocation(&keys);
+            }
+            _ => {}
+        }
+        sent?;
+        Ok(self.view(context).await)
+    }
+
+    /// Sends the request for `device` to `host`.
+    async fn send(&self, host: &Host, context: &Context, device: &DeviceSummary) -> Result<()> {
+        match host {
             Host::Local(connection) => {
                 // The host withdraws the connections it admitted before each revocation, and the
                 // person took their time: the revocation goes over one it admits now.
@@ -732,16 +771,15 @@ impl Revocations {
                     Ok(Ok(fresh)) => fresh,
                     _ => connection.clone(),
                 };
-                self.revoke_direct(&over, &summary).await?;
+                self.revoke_direct(&over, device).await
             }
             Host::Paired(paired) => {
                 let origin = context.origin.as_ref().ok_or_else(|| {
                     CommandError::refused("this computer has no sync service to publish at")
                 })?;
-                self.publish(origin, paired, &summary).await?;
+                self.publish(origin, paired, device).await
             }
         }
-        Ok(self.view(context).await)
     }
 
     /// Asks the person through the platform's ceremony, with `reason` as what the dialog says.

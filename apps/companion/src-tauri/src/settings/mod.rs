@@ -572,14 +572,46 @@ impl Settings {
         Ok(self.view())
     }
 
-    /// Records that revocations of `devices`, sent from this computer, are known here, so that
-    /// settings sync holds publication at once and takes the devices out of the shared settings.
-    /// Says whether settings sync recorded them: a computer that shares no settings has none to
-    /// record them in.
+    /// Holds everything settings sync sends until `devices` are taken out of the shared settings.
+    /// A revocation this computer is about to send calls this first and sends nothing when it
+    /// fails. A computer that shares no settings has nothing to hold.
     ///
     /// # Errors
     ///
-    /// Returns what stopped it: the membership could not be used.
+    /// Returns why the record could not be written; this process holds the devices all the same.
+    pub fn hold_for_revocation(
+        &self,
+        devices: &[kr_protocol::scalars::AuthorisationKey],
+    ) -> Result<()> {
+        match self.sync.get() {
+            Some(sync) => sync.hold_for_revocation(devices),
+            None => Ok(()),
+        }
+    }
+
+    /// Lets go of devices held for a revocation that was not sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the record could not be written; the devices stay held.
+    pub fn release_revocation(
+        &self,
+        devices: &[kr_protocol::scalars::AuthorisationKey],
+    ) -> Result<()> {
+        match self.sync.get() {
+            Some(sync) => sync.release_revocation(devices),
+            None => Ok(()),
+        }
+    }
+
+    /// Tells settings sync that revocations of `devices` are known here, so that it takes them out
+    /// of the shared settings. Says whether it did: a computer that shares no settings has none to
+    /// take them out of.
+    ///
+    /// # Errors
+    ///
+    /// Returns what stopped it before it could try: the step's lock or the record of the
+    /// collection could not be used. The devices stay held.
     pub async fn revocations_sent(
         &self,
         devices: &[kr_protocol::scalars::AuthorisationKey],

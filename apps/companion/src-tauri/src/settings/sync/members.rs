@@ -648,24 +648,46 @@ impl SettingsSync {
             .map(|_| ())
     }
 
-    /// Records that revocations of `devices`, sent from this computer, are known here, and carries
-    /// out the removals they require as far as the hosts and the service allow.
+    /// Holds everything settings sync sends until `devices` are taken out, and says whether it
+    /// could write that down. A revocation this computer is about to send calls this first and
+    /// sends nothing when it fails.
     ///
-    /// Everything settings sync sends is held before anything else is done: a step in hand may be
-    /// waiting on the network and holds the membership meanwhile, so the devices are written down
-    /// first ([`super::Fence`]) and the membership takes them in under a step of its own, after it. One
-    /// call for all the devices of one view makes one removal step. A call that is dropped, or
-    /// fails, leaves them written down, and the next step of any companion takes them in.
+    /// # Errors
+    ///
+    /// Returns why the record could not be written; this process holds the devices all the same.
+    pub fn hold_for_revocation(&self, devices: &[AuthorisationKey]) -> Result<()> {
+        self.fence.raise(devices)
+    }
+
+    /// Lets go of devices held for a revocation that was not sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the record could not be written; the devices stay held.
+    pub fn release_revocation(&self, devices: &[AuthorisationKey]) -> Result<()> {
+        self.fence.lift(devices)
+    }
+
+    /// Records that revocations of `devices` are known here, and carries out the removals they
+    /// require as far as the hosts and the service allow.
+    ///
+    /// The devices are held before anything else is done ([`Self::hold_for_revocation`], again
+    /// here for a device found revoked at a host): a step in hand may be waiting on the network and
+    /// holds the membership meanwhile, so the membership takes them in under a step of its own,
+    /// after it. One call for all the devices of one view makes one removal step. A call that is
+    /// dropped, or fails, leaves them held, and the next step of any companion takes them in.
     ///
     /// Says whether the membership took them in: a computer that shares no settings has none to
     /// take them in.
     ///
     /// # Errors
     ///
-    /// Returns why the devices could not be written down, with publication held in this process
-    /// all the same.
+    /// Returns what stopped the step before it could try: the step's lock or the record of the
+    /// collection could not be used, with the devices held all the same.
     pub async fn revocations_sent(&self, devices: &[AuthorisationKey]) -> Result<bool> {
-        self.fence.raise(devices)?;
+        // A record that cannot be written holds this process, and the step takes the devices in
+        // from memory.
+        let _ = self.fence.raise(devices);
         let _step = self.step().await?;
         let Some(mut record) = self.record()? else {
             self.fence.lift(devices)?;
@@ -689,20 +711,22 @@ impl SettingsSync {
         Ok(self.fence.holds_none_of(devices))
     }
 
-    /// Takes the revocations the fence holds into `membership`, under the step in hand, and lets
-    /// the fence go of each. A computer with no collection has nothing to take them out of.
-    pub(super) fn take_in_revocations(&self, membership: &mut SyncMembership) -> Result<()> {
+    /// Takes the revocations the fence holds into `membership`, under the step in hand, and says
+    /// which it took in; the step lets the fence go of them after it reconciles. A computer with no
+    /// collection has nothing to take them out of.
+    pub(super) fn take_in_revocations(
+        &self,
+        membership: &mut SyncMembership,
+    ) -> Result<Vec<AuthorisationKey>> {
+        self.fence.keep_held();
         let devices = self.fence.pending()?;
-        if devices.is_empty() {
-            return Ok(());
-        }
         for device in &devices {
             match membership.feed_revocation(device) {
                 Ok(()) | Err(MembershipError::NoMembership) => {}
                 Err(error) => return Err(member_failure(error)),
             }
         }
-        self.fence.lift(&devices)
+        Ok(devices)
     }
 
     /// Joins the collection `reference` names, once the person confirms it here.
