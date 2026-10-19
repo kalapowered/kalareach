@@ -427,86 +427,112 @@ because that connection would close the endpoint the answer goes over.
 
 ## Revoking a device on a host you own
 
-A computer that owns a host can revoke the devices paired with it. `src-tauri/src/revocation.rs`
-asks each host it owns for its devices and reads each host's authority feed at the same time, so one
-host that is asleep holds up the list once and not once per host. The page names a host and a device
-by references native code gave it. It holds no key and no identifier, and it cannot send
-`device.revoke`: the table of page commands refuses that method, and the one command that revokes
-performs it in native code.
+Revocation of other devices happens on the hosts that the local computer owns: it can revoke the
+devices paired with a host it owns. This happens in native code, in `src-tauri/src/revocation.rs`.
+Native code asks each host for a list of devices and, at the same time, reads its authority feed, so
+a host that is asleep holds up the list once, even if the local computer owns multiple hosts, and
+not once per host. The page just names a host and a device by the references that native code gives
+it. It doesn't actually know any keys or identifiers, and it can't send `device.revoke`, as the
+table of page commands won't allow that method. Instead, the one command that revokes performs the
+revocation in native code.
 
-Two routes lead to a host, and the host decides which. The host on this computer takes
-`device.revoke` from native code, and its answer, with the state of its dispatch barrier, is its
-acknowledgement. The host withdraws the connections it admitted before each revocation, so the
-revocation goes over a connection the host admits then. Any other host this computer owns is reached
-through its authority feed. Native code signs a revocation request with this computer's
-authorisation key and publishes it at the sync service. The host reads the feed when a device
-connects and every 30 seconds, carries the request out, and acknowledges it in the same feed. A
-paired device cannot send `device.revoke` to a host, so the feed is the only way to a host that is
-not the one on this computer, reachable or not. Each revocation asks the person through the
-platform's ceremony first, and a computer with no ceremony revokes nothing.
+There are two different ways of sending a revocation to a host, and it is up to the host to choose
+which to use. If the host is running on the local computer, it will receive the `device.revoke`
+method from native code. It will reply with an acknowledgement containing the state of its dispatch
+barrier. The host will withdraw the connections it admitted before each revocation, so that the
+revocation is sent over a connection it admits then. If the host is any other host that the local
+computer owns, it will receive the revocation over the authority feed. Native code signs a request
+using the local computer's authorisation key and publishes it to the sync service. The host reads
+the authority feed when a device connects and then again every 30 seconds. When it reads the
+revocation request, it performs the revocation and publishes an acknowledgement to the authority
+feed. A paired device can't send `device.revoke` to the host. So the authority feed is the only way
+of reaching a host that is not the one on the local computer, whether it is reachable or not. All
+revocations require first asking the person through the platform's ceremony. If the computer does
+not have a ceremony, no revocations will be performed.
 
-A revocation is done only once the host's acknowledgement has been read. A request in the feed that
-its host has not acknowledged is shown as sent, and nothing more. One the host acknowledged while
-some of its session workers have not confirmed the revocation yet is shown as acknowledged, with the
-number that have not. An acknowledgement the host's own list does not bear out is shown the same
-way: the feed says the host finished, and the host, answering just now, does not list the device as
-revoked. A request the host refused is shown as refused, with the reason. The acknowledgements are
-read from the feed, which stores them and judges nothing, so they are the service's word for what
-the host answered and not something this computer can check.
+The revocation is completed only once the host's acknowledgement has been read. If the local
+computer has published a revocation request to the authority feed and the host has not yet
+acknowledged the revocation, the UI shows that the request has been sent, and nothing more. If the
+host has acknowledged the revocation but it hasn't been confirmed by all of the session workers, the
+UI shows that the revocation has been acknowledged by the host and how many session workers have not
+confirmed the revocation. The same is shown if the feed says that the host finished but the host,
+answering just now, does not list the device as revoked when it lists its devices. If the host
+refuses to perform the revocation, the UI shows that the revocation was refused and the reason.
+Acknowledgements are read from the authority feed. The authority feed stores the acknowledgements,
+but does not interpret them, so they are the service's word for what the host answered, and not
+something this computer can check.
 
-No answer a host gives names the service it reads its revocations from, because that is a setting of
-the host's own (`authority.origin`). This computer therefore publishes every request at the sync
-service it is set to use, and the screen names that service. A host that reads another service never
-sees the request and never acknowledges it, so the request stays sent and cannot be mistaken for a
-success. A host whose feed answers that it was removed is listed as not reachable by feed, and
-nothing is published for it. A host that does not answer keeps the device list it gave the last time
-this application asked, for as long as the application runs, shown with the time of that list, and a
-revocation is still published for it.
+No answer a host gives says which sync service it reads its revocations from, as the host chooses
+which to use with its own `authority.origin` setting. As the local computer doesn't know which sync
+service the host is using, it publishes every revocation request at the sync service that it is set
+to use. The sync service that the revocations are published to is shown on the screen. If the host
+is using a different sync service, it will not see the revocation request and so it will not
+acknowledge the revocation. The revocation request will remain in a sent state, so it cannot be
+mistaken for a success. If the authority feed says that the host has been removed, the UI shows that
+the host is not reachable by authority feed and the request is not published to any sync service. If
+the host does not reply at all, the list of devices it previously sent will continue to be shown for
+as long as the application is running. The time that the host last sent the list of devices is also
+shown. Revocation requests will still be published to the sync service for these hosts.
 
-A revocation this computer sends is written down before the request leaves, whether or not settings
-sync started, and a request whose record cannot be written is not sent. From then on settings sync
-holds back everything it sends until the device is out of the shared settings, a step already under
-way included: nothing written after the revocation is sealed under a key the device holds, and what
-was held back is sent once the device is out, under the key that follows its removal. The record is
-kept across a restart, and the next step of any companion over the same data takes the device out.
-Nothing takes the record back. A request that fails may have reached its host all the same, with
-only the reply lost, so the device is taken out of the shared settings whatever became of the
-request, and the person is told so where settings are shared. That exclusion is for good on this
-computer: the device is out of the collection for every device that shares it, if another member
-adds it back this computer takes it out again, and pairing the device anew does not undo it.
-Revoking it again finishes the job. A device that a view finds revoked by this computer's own
-signature in a host's feed, or that the host on this computer lists as revoked, whoever revoked it,
-is taken out the same way. A send already on its way cannot be called back.
+When this computer sends a revocation, regardless of whether settings sync has started yet, the
+revocation is written down before the request leaves. If it cannot be written down, the request is
+not sent. Once the revocation has been written down, settings sync stops sending anything until the
+device is removed from the shared settings, a step already under way included. From that point on,
+nothing written after the revocation is sealed under a key the device holds. Once the device has
+been removed, the previously unsent requests are sent, sealed under the key that follows its
+removal. This record persists across restarts of this computer. The next step of any companion over
+the same data takes the device out of the shared settings. Nothing takes the record back. Note that
+the revocation request might have reached the host even if the computer receives no answer.
+Therefore the device will be removed from the shared settings in any case. In the case that settings
+are shared with other devices, the person is told that the device was removed. That exclusion is for
+good on this computer: a device revoked on this computer is out of the collection for every device
+that shares it. If another member of the collection adds the device again, this computer takes it
+out again. Even pairing the device again will not add it to the collection again. Revoking the
+device again finishes the job. If a view finds that a device is revoked, either because a host's
+feed contains a revocation signed by this computer or because the host on this computer lists it as
+revoked (regardless of who revoked it), the device is taken out as described above. Note that there
+is no way to stop a request that is already being sent.
 
-The Devices screen sits after Hosts in the desktop navigation and shows one card for each host, the
-one on this computer first. A card says how requests reach its host. For a host reached through its
-feed it also says what the feed holds: when the host last acknowledged a request, how many requests
-wait for it, when it last read its feed, and whether the feed removed it. Each device has a row that
-says in words where its revocation stands, with a badge for sent, acknowledged, revoked or refused.
-A request that has not been acknowledged is never called revoked, and a revocation counts as done
-only when the host has acknowledged it and every session has confirmed it. An acknowledgement that
-the host's own list does not bear out is shown as acknowledged, and the row tells the person to
-revoke the device at the host. When this computer cannot read a host's feed, a row keeps the
-standing the feed gave the last time this application read it, and says when that was.
+The Devices screen, which appears after the Hosts screen in the desktop navigation, shows one card
+for each host with the card for the local host (that is, the host which is on this computer) first.
+Each card contains information about how requests reach the host and, if they do so via a feed, what
+is currently in that feed including when the host most recently acknowledged requests, how many
+requests are waiting to be acknowledged, when the host most recently read its feed and whether the
+feed has removed the host. In each card is a row for each device showing the device’s revocation
+standing in words, along with a status badge indicating whether the status is sent, acknowledged,
+revoked or refused. A request which hasn’t been acknowledged yet is never called revoked, and a
+revocation is not considered done until the host has acknowledged it and every session has confirmed
+it. A request which appears to have been acknowledged but whose device doesn’t actually appear in
+the host’s own list of revoked devices is considered acknowledged, but the status text will
+additionally say that the device needs to be revoked at the host. If the host’s feed is currently
+unavailable to this computer, the device’s status will be whatever it was when the application most
+recently read the feed, along with when that was.
 
-The control is named for this computer's ceremony: "Revoke with Touch ID", "Revoke with your
-password" or "Revoke with Windows Hello". The row asks no second question, because the system's
-dialog names the device and the host and is the confirmation. A computer with no ceremony shows no
-control and says so. A host the feed removed, a host whose feed this computer could not read, and
-the host on this computer while it does not answer show no control either, and the card says why. A
-request the host refused can be revoked again only when it was refused because an earlier revocation
-covers it; a refusal for lack of owner authority tells the person to revoke the device at the host.
-When a revocation does not go through, the row says why and the screen looks again, because a
-request that failed may still have reached its host. Focus returns to the control, or to the row's
-words if that look finds the request sent.
+In each device’s row is a button labelled “Revoke with Touch ID”, “Revoke with your password” or
+“Revoke with Windows Hello” as appropriate, asking the user to perform the local computer’s ceremony
+in order to revoke that device. There’s no need for a second confirmation (“Are you sure?”) because
+the operating system’s dialog box will state which device is being revoked and on which host. If the
+local computer doesn’t have a ceremony, no button will appear and the screen will say so. If the
+feed has removed the host, or if the host’s feed is currently unavailable to this computer, or if
+this is the local host and it’s not currently responding, no button will appear either and the card
+will explain why. If a revocation request has been refused by the host, it’s possible to revoke it
+again, but only if it was refused because an earlier revocation covers it; if it was refused for
+lack of owner authority, the row will tell the person to revoke the device at the host instead. If a
+revocation doesn’t go through, the row will say why and the screen will look again (since it’s
+possible that the request still reached its host despite the failure). Focus then goes back to the
+revoke button, unless that look finds the request sent, in which case focus will be set to the
+status text for that request instead.
 
-While a request waits for its host, the screen looks again ten seconds after the last answer. It
-makes one look at a time, so a slow host is waited for and its answer is shown. Each look connects
-to the hosts it lists, which read their feeds when a device connects. A hidden screen waits until it
-is shown. The host on this computer answers each revocation as it is asked, so the screen does not
-look for it, and its row offers "Check again". What changes is said in a live region, and once a
-request is sent, focus goes to the words that say where it stands. Nothing on the screen moves. This
-screen is the desktop's: a phone has no ceremony to confirm with, so it revokes nothing.
+The screen will automatically look again ten seconds after the last answer, but only while a request
+has been sent to a host and not yet acknowledged by it. (The screen only makes one look at a time,
+in order to allow for hosts which may be slow to respond, and their answers are shown.) Each look
+will connect to all the hosts that it lists, since a host reads its feed when a device connects. A
+hidden screen will not look again until it has been shown. Since the local host answers each
+revocation request as it is asked, there is no need for the screen to look for it; instead, the
+device’s row offers “Check again”. Any status changes on the screen will be announced via a live
+region, and when a revocation request is sent focus will be set to the status text for that request.
+Nothing on the screen moves. This screen does not exist on phones, since a phone has no ceremony to
+confirm with and so revokes nothing.
 
 ## Sharing a session
 
