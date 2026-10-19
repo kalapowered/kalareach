@@ -30,6 +30,9 @@
 //! | A host that is forgotten, a host that is changed and a device the host revokes each end the call | `forgetting_the_host_ends_the_call_and_owes_the_revocation`, `choosing_another_host_ends_the_call`, `a_device_the_host_revokes_loses_the_call_it_holds` |
 //! | A call the host cannot be told about is closed at the service over its own route | `a_call_the_host_cannot_be_told_about_is_closed_at_the_service_over_its_own_route` |
 //! | An owner that fails ends the call it held, in full | `an_owner_that_fails_ends_the_call_it_held_in_full` |
+//! | A file of what a call left owed that the system refuses to read at first is read again when the host is reached, and is not written over before | `a_record_the_system_refused_to_read_is_read_again_when_the_host_is_reached`, `a_record_the_system_refused_to_read_is_not_written_over_and_is_taken_up_with_what_this_launch_added` |
+//! | What a launch owes and forgets while the record cannot be read is taken up after what the file held, and the file's note is forgotten when this launch's control attached | `a_record_the_system_refused_to_read_is_taken_up_in_order_with_what_this_launch_owes_and_forgot` |
+//! | A named stop that finds the host revoked the grant settles the entry a file held that was unread until the unlock | `a_named_stop_after_the_unlock_settles_the_entry_the_file_held` |
 //! | A page that is loaded again finds the call and can end it | `a_page_that_is_loaded_again_finds_the_call_and_ends_it` |
 //! | Native code that stops answering the signs of life ends the call | `native_code_that_stops_answering_ends_the_call` |
 //! | A sign-out during the call ends it | `signing_out_during_a_call_ends_it` |
@@ -2458,5 +2461,417 @@ async fn only_a_host_that_revokes_the_grant_settles_what_it_was_owed() {
             .is_some_and(|words| words.starts_with("The host refused the stop: ")),
         "{owed_for_live}"
     );
+    scene.stop_host().await;
+}
+
+/// Makes the kept file one the system refuses to read, as a phone's is before its first unlock: the
+/// file is put aside, and a link that leads back to itself stands where it was, which cannot be
+/// opened by anyone.
+#[cfg(unix)]
+fn lock_the_kept_file(directory: &std::path::Path) {
+    let file = directory.join("voice-kept.json");
+    std::fs::rename(&file, directory.join("voice-kept.locked")).expect("the file is put aside");
+    std::os::unix::fs::symlink(&file, &file).expect("a link stands where the file was");
+}
+
+/// The unlock: the file can be read again. What stood where it was must still be the link, or the
+/// file that could not be read was written over.
+#[cfg(unix)]
+fn unlock_the_kept_file(directory: &std::path::Path) {
+    let file = directory.join("voice-kept.json");
+    assert!(
+        std::fs::symlink_metadata(&file)
+            .expect("the file is there")
+            .file_type()
+            .is_symlink(),
+        "the file that could not be read was written over"
+    );
+    std::fs::remove_file(&file).expect("the link goes");
+    std::fs::rename(directory.join("voice-kept.locked"), &file).expect("the file is back");
+}
+
+/// What this device owes the host `host`, for the voice session `voice_session_id`.
+#[cfg(unix)]
+fn owed_to(
+    host: (kr_protocol::ids::DeviceId, kr_protocol::ids::EnvironmentId),
+    voice_session_id: kr_protocol::ids::VoiceSessionId,
+) -> companion_tauri::voice::OwedView {
+    companion_tauri::voice::OwedView {
+        kind: "revocation".to_owned(),
+        words: "The host did not answer.".to_owned(),
+        action_id: None,
+        voice_session_id: Some(voice_session_id.to_string()),
+        until_ms: now_ms() + 1_800_000,
+        host_reference: "a-host".to_owned(),
+        host_name: "A host".to_owned(),
+        host: Some(host),
+    }
+}
+
+/// A phone that iOS starts before its first unlock cannot read the file of what a call left owed,
+/// and a file that cannot be read is not an empty one. The device says nothing is owed only until
+/// the file can be read; when the host is reached after the unlock it reads the file again first,
+/// and asks the host for what it holds, without another launch.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_the_system_refused_to_read_is_read_again_when_the_host_is_reached() {
+    let mut scene = scene().await;
+    scene.stand_in.end_the_control_when_a_call_is_closed();
+    let started = scene.start().await;
+    let live: kr_protocol::ids::VoiceSessionId = started["value"]["outcome"]["started"]["session"]
+        ["voice_session_id"]
+        .as_str()
+        .expect("a voice session")
+        .parse()
+        .expect("an identifier");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    let connection = scene
+        .phone
+        .companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .connection()
+        .expect("the phone is connected");
+    let companion_tauri::connection::Standing::Paired { host, .. } = connection.standing() else {
+        panic!("the phone is a paired device");
+    };
+    let this_host = (host.host_device_id, connection.environment_id());
+    // Two revocations are owed to the host: one for a voice session it does not hold, which stays
+    // owed, and one for the call it holds, which its revocation settles.
+    let unknown = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
+    let directory = scene.phone.data.path().join("relaunch-locked");
+    Kept::at(&directory)
+        .write(&companion_tauri::voice::KeptVoice {
+            owed: vec![owed_to(this_host, unknown), owed_to(this_host, live)],
+            note: None,
+        })
+        .expect("the file is written");
+    lock_the_kept_file(&directory);
+
+    let relaunched = Calls::on_phone(
+        ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
+        service_at(scene.stand_in.origin()),
+        quick(),
+        Kept::at(&directory),
+    );
+    assert!(
+        relaunched.state(None).owed.is_empty(),
+        "nothing can be told of a file that cannot be read"
+    );
+
+    unlock_the_kept_file(&directory);
+    relaunched.host_reached(
+        host.host_device_id,
+        connection.environment_id(),
+        connection.session(),
+    );
+
+    // The host was asked for what the file held, and revoked the grant of the call it holds.
+    scene
+        .state_where("the call the host revoked, ended", |state| {
+            state["running"] == false && state["ended"].is_object()
+        })
+        .await;
+    let file = kept_file_where(&directory, |file| {
+        file["owed"].as_array().is_some_and(|owed| owed.len() == 1)
+    })
+    .await;
+    assert_eq!(file["owed"][0]["voice_session_id"], unknown.to_string());
+    scene.stop_host().await;
+}
+
+/// What this launch owes or notes while the file cannot be read is kept in memory, not written over
+/// the file; once the file can be read, what it holds comes first, a note this launch made is the
+/// newer and stands, and the whole is written back, so that nothing an earlier launch left owed is
+/// lost to a write that came first.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_the_system_refused_to_read_is_not_written_over_and_is_taken_up_with_what_this_launch_added()
+ {
+    let mut scene = scene().await;
+    scene.stand_in.treat_as_another_account(PHONE_TOKEN);
+    let prepared = scene.prepared().await;
+    let connection = scene
+        .phone
+        .companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .connection()
+        .expect("the phone is connected");
+    let companion_tauri::connection::Standing::Paired { host, .. } = connection.standing() else {
+        panic!("the phone is a paired device");
+    };
+    let this_host = (host.host_device_id, connection.environment_id());
+    let earlier = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
+    let directory = scene.phone.data.path().join("relaunch-locked-written");
+    Kept::at(&directory)
+        .write(&companion_tauri::voice::KeptVoice {
+            owed: vec![owed_to(this_host, earlier)],
+            note: None,
+        })
+        .expect("the file is written");
+    lock_the_kept_file(&directory);
+
+    let relaunched = Calls::on_phone(
+        Arc::clone(&scene.platform) as Arc<dyn companion_platform::call::CallPlatform>,
+        service_at(scene.stand_in.origin()),
+        quick(),
+        Kept::at(&directory),
+    );
+    // This launch's call finds the service has no such call for the account, which it notes, and
+    // which is written to the file as the call ends.
+    let reach = Arc::new(companion_tauri::voice::AppReach::new(
+        scene.phone.companion.app.handle().clone(),
+    )) as Arc<dyn companion_tauri::voice::HostReach>;
+    relaunched
+        .start(
+            request_of(&scene, &prepared),
+            reach,
+            Arc::clone(&scene.tokens),
+        )
+        .await
+        .expect("a call starts");
+    let generation = match scene.tokens.status() {
+        Ok(kr_client::services::account::AccountStatus::SignedIn { generation, .. }) => {
+            Some(generation)
+        }
+        other => panic!("the phone is signed in: {other:?}"),
+    };
+    let key = relaunched.note_key(Some(scene.host().environment_id.to_string()), generation);
+    let ended = tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let state = relaunched.state(key.as_ref());
+            if state
+                .ended
+                .as_ref()
+                .is_some_and(|ended| ended.cause == "no_such_call")
+                && !state.setting_up
+            {
+                return state;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the call ended with the note");
+    assert!(ended.warning.is_some(), "the note stands in memory");
+    assert!(
+        ended.owed.is_empty(),
+        "nothing is told of a file that cannot be read"
+    );
+
+    // The unlock checks that nothing was written over the file; the next use reads it.
+    unlock_the_kept_file(&directory);
+    let state = relaunched.state(key.as_ref());
+    assert_eq!(state.owed.len(), 1, "{state:?}");
+    assert_eq!(
+        state.owed[0].voice_session_id.as_deref(),
+        Some(earlier.to_string().as_str())
+    );
+    assert!(state.warning.is_some(), "the note this launch made stands");
+    let file = kept_file_where(&directory, |file| {
+        file["owed"].as_array().is_some_and(|owed| owed.len() == 1) && !file["note"].is_null()
+    })
+    .await;
+    assert_eq!(file["owed"][0]["voice_session_id"], earlier.to_string());
+    scene.stop_host().await;
+}
+
+/// What this launch owes while the file cannot be read comes after what the file held, and is
+/// written with it; a note the file holds is forgotten when this launch's control attached, which
+/// is newer than the file: the earlier launch's note does not come back with the unlock.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_the_system_refused_to_read_is_taken_up_in_order_with_what_this_launch_owes_and_forgot()
+ {
+    let timings = Timings {
+        host_within: Duration::from_secs(3),
+        ..quick()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    let prepared = scene.prepared().await;
+    let connection = scene
+        .phone
+        .companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .connection()
+        .expect("the phone is connected");
+    let companion_tauri::connection::Standing::Paired { host, .. } = connection.standing() else {
+        panic!("the phone is a paired device");
+    };
+    let this_host = (host.host_device_id, connection.environment_id());
+    let generation = match scene.tokens.status() {
+        Ok(kr_client::services::account::AccountStatus::SignedIn { generation, .. }) => {
+            Some(generation)
+        }
+        other => panic!("the phone is signed in: {other:?}"),
+    };
+    let environment = Some(scene.host().environment_id.to_string());
+    let key = Calls::on_phone(
+        ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
+        service_at(scene.stand_in.origin()),
+        quick(),
+        Kept::nowhere(),
+    )
+    .note_key(environment, generation)
+    .expect("a key");
+
+    // An earlier launch left a revocation owed and a note that the service had no such call.
+    let earlier = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
+    let directory = scene.phone.data.path().join("relaunch-locked-order");
+    Kept::at(&directory)
+        .write(&companion_tauri::voice::KeptVoice {
+            owed: vec![owed_to(this_host, earlier)],
+            note: Some(key.clone()),
+        })
+        .expect("the file is written");
+    lock_the_kept_file(&directory);
+
+    let relaunched = Calls::on_phone(
+        Arc::clone(&scene.platform) as Arc<dyn companion_platform::call::CallPlatform>,
+        service_at(scene.stand_in.origin()),
+        timings,
+        Kept::at(&directory),
+    );
+    let reach = Arc::new(companion_tauri::voice::AppReach::new(
+        scene.phone.companion.app.handle().clone(),
+    )) as Arc<dyn companion_tauri::voice::HostReach>;
+    relaunched
+        .start(
+            request_of(&scene, &prepared),
+            Arc::clone(&reach),
+            Arc::clone(&scene.tokens),
+        )
+        .await
+        .expect("a call starts");
+    let running = tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let state = relaunched.state(Some(&key));
+            if state.control == "connected" {
+                return state;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the control attached");
+    let this_call = running
+        .session
+        .as_ref()
+        .expect("a call runs")
+        .voice_session_id
+        .to_string();
+
+    // The host goes away, so the end of the call cannot tell it: the revocation is owed.
+    scene.stop_host().await;
+    let closed = relaunched
+        .stop(None, reach.as_ref())
+        .await
+        .expect("the call is stopped");
+    assert!(
+        matches!(closed.host, companion_tauri::voice::HostEnd::NotTold { .. }),
+        "{closed:?}"
+    );
+    let locked = relaunched.state(Some(&key));
+    // What this launch owes is told at once; what the file holds is not known yet.
+    assert_eq!(locked.owed.len(), 1, "{locked:?}");
+    assert_eq!(
+        locked.owed[0].voice_session_id.as_deref(),
+        Some(this_call.as_str())
+    );
+    assert!(locked.warning.is_none(), "the file's note is not read yet");
+
+    unlock_the_kept_file(&directory);
+    let state = relaunched.state(Some(&key));
+    let owed: Vec<_> = state
+        .owed
+        .iter()
+        .map(|each| each.voice_session_id.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        owed,
+        vec![earlier.to_string(), this_call.clone()],
+        "what the file held, then what this launch owes"
+    );
+    assert!(
+        state.warning.is_none(),
+        "the control that attached since forgot the note the file held"
+    );
+    let file = kept_file_where(&directory, |file| {
+        file["owed"].as_array().is_some_and(|owed| owed.len() == 2) && file["note"].is_null()
+    })
+    .await;
+    assert_eq!(file["owed"][0]["voice_session_id"], earlier.to_string());
+    assert_eq!(file["owed"][1]["voice_session_id"], this_call);
+}
+
+/// A stop that names a voice session the host holds, made after the file's unlock and before anything
+/// else reads the record, settles the entry the file held for it: the entry is taken up first, and
+/// then removed, in memory and in the file.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_named_stop_after_the_unlock_settles_the_entry_the_file_held() {
+    let mut scene = scene().await;
+    scene.stand_in.end_the_control_when_a_call_is_closed();
+    let started = scene.start().await;
+    let live: kr_protocol::ids::VoiceSessionId = started["value"]["outcome"]["started"]["session"]
+        ["voice_session_id"]
+        .as_str()
+        .expect("a voice session")
+        .parse()
+        .expect("an identifier");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    let connection = scene
+        .phone
+        .companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .connection()
+        .expect("the phone is connected");
+    let companion_tauri::connection::Standing::Paired { host, .. } = connection.standing() else {
+        panic!("the phone is a paired device");
+    };
+    let this_host = (host.host_device_id, connection.environment_id());
+    let directory = scene.phone.data.path().join("relaunch-locked-named");
+    Kept::at(&directory)
+        .write(&companion_tauri::voice::KeptVoice {
+            owed: vec![owed_to(this_host, live)],
+            note: None,
+        })
+        .expect("the file is written");
+    lock_the_kept_file(&directory);
+    let relaunched = Calls::on_phone(
+        ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
+        service_at(scene.stand_in.origin()),
+        quick(),
+        Kept::at(&directory),
+    );
+    unlock_the_kept_file(&directory);
+    let reach = companion_tauri::voice::AppReach::new(scene.phone.companion.app.handle().clone());
+
+    // Nothing has read the record since the launch: the stop is the first use.
+    let closed = relaunched
+        .stop(Some(live), &reach)
+        .await
+        .expect("the host is asked");
+
+    assert!(
+        matches!(closed.host, companion_tauri::voice::HostEnd::Revoked { .. }),
+        "{closed:?}"
+    );
+    kept_file_where(&directory, |file| {
+        file["owed"].as_array().is_some_and(Vec::is_empty)
+    })
+    .await;
+    assert!(relaunched.state(None).owed.is_empty());
     scene.stop_host().await;
 }

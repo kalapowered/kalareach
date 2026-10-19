@@ -213,6 +213,14 @@ pub(crate) struct Shared {
     emergency: Mutex<Option<(u64, Emergency)>>,
     /// Where what outlives a launch is kept.
     kept: Kept,
+    /// Whether what the launches before this one kept could not be read when it was tried, so that
+    /// it is read again at the next use. A phone started before its first unlock cannot read its
+    /// files, and a file it cannot read is not one that holds nothing: the view says nothing is
+    /// owed only until the file can be read, and nothing is written over the file meanwhile.
+    unread: std::sync::atomic::AtomicBool,
+    /// Whether the note was remembered or forgotten since the read that failed, so that what is
+    /// read later is older than the note and does not replace it.
+    note_changed: std::sync::atomic::AtomicBool,
     /// Held from the moment what is kept is copied until it is written, so that what is written
     /// last is what was copied last: a copy taken earlier never replaces a later one.
     keeping: Mutex<()>,
@@ -229,19 +237,25 @@ impl Shared {
     }
 
     pub(crate) fn clear_note(&self) {
-        let had = self
-            .note
-            .lock()
-            .expect("the note lock is not poisoned")
-            .take()
-            .is_some();
+        self.read_again();
+        let had = {
+            let mut note = self.note.lock().expect("the note lock is not poisoned");
+            self.note_changed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            note.take().is_some()
+        };
         if had {
             self.keep();
         }
     }
 
     pub(crate) fn remember_no_such_call(&self, key: NoteKey) {
-        *self.note.lock().expect("the note lock is not poisoned") = Some(key);
+        {
+            let mut note = self.note.lock().expect("the note lock is not poisoned");
+            self.note_changed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            *note = Some(key);
+        }
         self.keep();
     }
 
@@ -254,14 +268,78 @@ impl Shared {
         self.keep();
     }
 
+    /// Reads what the launches before this one kept again, when the first read was refused, and
+    /// takes it up: what it holds comes before what was owed since, and a note remembered or
+    /// forgotten since is newer than the file's and stands. It is written back whole when anything
+    /// was owed or noted meanwhile, so that nothing owed in this launch waits for the next one.
+    /// Every use of the record starts here.
+    pub(crate) fn read_again(&self) {
+        if !self.unread.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let _ordered = self
+            .keeping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.take_up_unread() == Some(true) {
+            self.write_kept();
+        }
+    }
+
+    /// Takes up what the file holds, if it can be read now. `None` while it cannot, and otherwise
+    /// whether anything was owed or noted since the read that failed. Called with `keeping` held.
+    fn take_up_unread(&self) -> Option<bool> {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        if !self.unread.load(SeqCst) {
+            return Some(false);
+        }
+        let now = now_ms();
+        let Ok(before) = self.kept.read(now) else {
+            return None;
+        };
+        let mut changed = false;
+        {
+            let mut view = self.view.lock().expect("the view lock is not poisoned");
+            let since = std::mem::take(&mut view.owed);
+            changed |= !since.is_empty();
+            view.owed = before.owed;
+            for owed in since {
+                view.owe(now, owed);
+            }
+        }
+        {
+            let mut note = self.note.lock().expect("the note lock is not poisoned");
+            if self.note_changed.load(SeqCst) {
+                changed = true;
+            } else {
+                *note = before.note;
+            }
+        }
+        self.unread.store(false, SeqCst);
+        Some(changed)
+    }
+
     /// Writes what outlives a launch: what is owed, and the note. A write that fails is logged and
     /// leaves the record in memory, which is what the screen reads: ending a call is never stopped
-    /// by a file.
+    /// by a file. A file that could not be read is not written over: it may hold what an earlier
+    /// launch left owed, and the write waits until it has been read.
     pub(crate) fn keep(&self) {
         let _ordered = self
             .keeping
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.take_up_unread().is_none() {
+            tracing::warn!(
+                "what a voice call left owed was not kept: what an earlier launch kept cannot be read yet"
+            );
+            return;
+        }
+        self.write_kept();
+    }
+
+    /// Writes the record as it is in memory. Called with `keeping` held and nothing unread.
+    fn write_kept(&self) {
         let owed = self
             .view
             .lock()
@@ -287,6 +365,7 @@ impl Shared {
         environment: kr_protocol::ids::EnvironmentId,
         voice_session_id: &str,
     ) {
+        self.read_again();
         let removed = {
             let mut view = self.view.lock().expect("the view lock is not poisoned");
             let before = view.owed.len();
@@ -596,7 +675,9 @@ impl Calls {
     }
 
     /// The calls of a phone, made through `platform` and controlled at `service`, taking up what
-    /// the calls before this launch left in `kept`: what is still owed, and the note.
+    /// the calls before this launch left in `kept`: what is still owed, and the note. A file the
+    /// system refuses to read is read again at the next use of the record, and until then it says
+    /// nothing is owed and is not written over.
     #[must_use]
     pub fn on_phone(
         platform: Arc<dyn CallPlatform>,
@@ -604,7 +685,16 @@ impl Calls {
         timings: Timings,
         kept: Kept,
     ) -> Self {
-        let before = kept.read(now_ms());
+        let (before, unread) = match kept.read(now_ms()) {
+            Ok(before) => (before, false),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "what a voice call left owed could not be read, so it is read again before it is next used"
+                );
+                (KeptVoice::default(), true)
+            }
+        };
         let mut view = VoiceCallState::no_call();
         view.owed = before.owed;
         Self {
@@ -618,6 +708,8 @@ impl Calls {
                 note: Mutex::new(before.note),
                 emergency: Mutex::new(None),
                 kept,
+                unread: std::sync::atomic::AtomicBool::new(unread),
+                note_changed: std::sync::atomic::AtomicBool::new(false),
                 keeping: Mutex::new(()),
             })),
         }
@@ -637,6 +729,9 @@ impl Calls {
         let Some(shared) = self.shared.clone() else {
             return;
         };
+        // What an earlier launch left owed this host is asked once the file can be read, which is
+        // each time the host is reached until it can.
+        shared.read_again();
         let owed: Vec<(VoiceSessionId, u64)> = shared
             .view
             .lock()
@@ -849,6 +944,7 @@ impl Calls {
         let Some(shared) = &self.shared else {
             return VoiceCallState::no_call();
         };
+        shared.read_again();
         // The slot is the one record of whether this device is busy with a call: a call that is
         // being made or given up holds it from the moment the start is taken until it is over,
         // before any descriptor exists to name it. It is read first: a call writes its end and

@@ -559,6 +559,10 @@ right. The record names the service the bundle is kept at, so choosing another s
 does not move the bundle; the kit still points at the service it was made for, and the Account
 sheet says so. A phone shows the setting and offers no recovery.
 
+## What a phone reads once
+
+A record the start reads once from a file is marked unread when the system refuses the read, never taken for an empty one. It is read again at its next use, and nothing is written over it before.
+
 ## The design system
 
 The design system is Newsprint, with light, dark and system modes. `src/styles/tokens.css` holds

@@ -86,13 +86,20 @@ impl Kept {
         }
     }
 
-    /// What is kept, without what has lapsed by `now_ms`. A file that is missing, cannot be read or
-    /// is not this layout is nothing kept, and says so in the log: a record that cannot be read
-    /// must not stop a call from starting.
-    #[must_use]
-    pub fn read(&self, now_ms: u64) -> KeptVoice {
+    /// What is kept, without what has lapsed by `now_ms`. A file that is missing, or is not this
+    /// layout, is nothing kept, and a file that is not this layout says so in the log: a record that
+    /// is not there must not stop a call from starting.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the system refused the read. A file that cannot be read is not a file that is not
+    /// there: what it holds is not known, and a phone started before its first unlock cannot read
+    /// the files of its own directory. A caller that gets this reads again before it uses what is
+    /// kept, and writes nothing over the file until it has. Every error but a missing file counts:
+    /// the kinds a platform gives for a file it keeps locked differ, and the next read decides.
+    pub fn read(&self, now_ms: u64) -> std::io::Result<KeptVoice> {
         let Some(directory) = &self.directory else {
-            return KeptVoice::default();
+            return Ok(KeptVoice::default());
         };
         // A file staged by a process that ended before it was put in place is one nothing will
         // finish: this process is the file's only writer, and it has not written yet.
@@ -110,12 +117,9 @@ impl Kept {
         let bytes = match std::fs::read(directory.join(FILE)) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return KeptVoice::default();
+                return Ok(KeptVoice::default());
             }
-            Err(error) => {
-                tracing::warn!(%error, "what a voice call left owed could not be read");
-                return KeptVoice::default();
-            }
+            Err(error) => return Err(error),
         };
         let document = match serde_json::from_slice::<Document>(&bytes) {
             Ok(document) if document.version == VERSION => document,
@@ -123,10 +127,10 @@ impl Kept {
                 tracing::warn!(
                     "the record of what a voice call left owed is not one this build reads"
                 );
-                return KeptVoice::default();
+                return Ok(KeptVoice::default());
             }
         };
-        KeptVoice {
+        Ok(KeptVoice {
             owed: document
                 .owed
                 .into_iter()
@@ -143,7 +147,7 @@ impl Kept {
                 })
                 .collect(),
             note: document.note,
-        }
+        })
     }
 
     /// Replaces what is kept with `kept`.
@@ -202,4 +206,41 @@ impl Kept {
 /// The name a file is staged under before it is put in place.
 fn staged_name(file: &Path, count: u64) -> PathBuf {
     file.with_extension(format!("staged-{}-{count}", std::process::id()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file the system refuses to read is not a file that is not there: the first is read again,
+    /// the second holds nothing, and so does one that is not this layout.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_the_system_refuses_to_read_is_told_apart_from_one_that_is_not_there() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let kept = Kept::at(directory.path());
+        assert!(
+            kept.read(0)
+                .expect("a file that is not there is nothing kept")
+                .owed
+                .is_empty()
+        );
+
+        // A link that leads back to itself cannot be opened by anyone.
+        let file = directory.path().join(FILE);
+        std::os::unix::fs::symlink(&file, &file).expect("a link");
+        let refused = kept
+            .read(0)
+            .expect_err("a refused read is not nothing kept");
+        assert_ne!(refused.kind(), std::io::ErrorKind::NotFound);
+
+        std::fs::remove_file(&file).expect("the link goes");
+        std::fs::write(&file, b"not a record").expect("a file");
+        assert!(
+            kept.read(0)
+                .expect("a file that is not this layout is nothing kept")
+                .owed
+                .is_empty()
+        );
+    }
 }
