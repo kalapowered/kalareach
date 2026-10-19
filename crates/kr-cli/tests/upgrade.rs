@@ -2003,8 +2003,8 @@ async fn a_share_with_the_live_screen_of_the_session_of_the_release_before_is_is
 
 /// KR-REQ-26.10, KR-REQ-26.08: a rollback to the release before reads every session archived under
 /// this release. The journal of a closed session whose root was a command holds the session's
-/// summary in the form the release before reads, so the shell, the directory and the start time it
-/// recorded are what that release shows; the word that says the root was a command is kept in a
+/// summary in the form the release before reads, so the shell and the directory it recorded are
+/// what that release shows; the word that says the root was a command is kept in a
 /// row of its own, which that release does not read.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_release_before_reads_the_journal_of_a_command_session_this_release_wrote() {
@@ -2062,6 +2062,7 @@ async fn the_release_before_reads_the_journal_of_a_command_session_this_release_
     );
     let read: Value = serde_json::from_slice(&read.stdout).expect("a document");
     assert_eq!(read["session_id"], session_now.to_string(), "{read}");
+    assert_eq!(read["shell"], recorded.shell_path, "{read}");
     assert_eq!(
         read["cwd"], recorded.cwd,
         "the directory the journal recorded is shown, not a summary rebuilt from the closure: {read}"

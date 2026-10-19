@@ -5017,6 +5017,13 @@ async fn a_command_a_stopped_daemon_left_running_is_closed_and_released_by_the_n
         worker_of_the_row().is_some(),
         "the dispatch wrote its session's worker down"
     );
+    let boot: Option<String> = ledger
+        .query_row("SELECT boot FROM owned", [], |row| row.get(0))
+        .expect("reads the row");
+    assert!(
+        boot.is_some(),
+        "the dispatch wrote the boot it began in down"
+    );
     ledger
         .execute("UPDATE owned SET worker_process = NULL", [])
         .expect("the row loses its worker");
@@ -5120,6 +5127,13 @@ async fn a_session_does_not_start_after_its_grants_end_though_its_wait_has_time_
                 reservation_phases(&host, grant_id(number)) == ["failed"]
             })
             .await;
+            let settled = node_statuses(&host);
+            assert!(
+                settled.last().is_some_and(|status| {
+                    status != NodeStatus::Success.as_str() && status != NodeStatus::Running.as_str()
+                }),
+                "the node did not succeed in a session that did not start: {settled:?}"
+            );
             assert!(
                 !marker.exists(),
                 "no process was created after the grant's end"
@@ -5317,9 +5331,10 @@ async fn a_run_cancelled_while_its_node_writes_down_what_it_owns_leaves_nothing_
         .execute_batch("COMMIT")
         .expect("the other writer finishes");
 
-    until("the node's task to have written its row and released it", || {
-        released_rows(&host) == 1
-    })
+    until(
+        "the node's task to have written its row and released it",
+        || released_rows(&host) == 1,
+    )
     .await;
     assert_eq!(owed_rows(&host), 0, "nothing stays owed");
     assert!(!marker.exists(), "the command never ran");
@@ -5330,5 +5345,62 @@ async fn a_run_cancelled_while_its_node_writes_down_what_it_owns_leaves_nothing_
             .all(|session| session.closure.0.is_some()),
         "no session is live"
     );
+    host.clients.abort();
+}
+
+/// KR-REQ-25.14 and KR-REQ-25.19: a close that finds no worker to ask is asked again. A worker
+/// that was claimed and then reported itself after its create had given up (the node settled
+/// unknown) is not in the directory while the sweep first looks; the sweep must not take that look
+/// for a close, and must close the session once the worker has reported. The command runs far
+/// longer than the case, so only a close ends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_session_whose_worker_reports_after_its_node_gave_up_is_closed_by_the_sweep() {
+    let host = working_host().await;
+    let mut control = client(&host).await;
+    host.issue(grant_id(56), &COMMAND_RIGHTS);
+    let document = definition(
+        workflow_id(56),
+        grant_id(56),
+        "a long command",
+        command_node(&host, "long", "sleep 600"),
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+
+    let (claimed, resume) = host.controller.pause_rendezvous_after_claim();
+    let running = run_from_another_task(&host, &document, "evt-late-worker");
+    tokio::time::timeout(std::time::Duration::from_secs(60), claimed)
+        .await
+        .expect("the worker claimed its launch")
+        .expect("the worker's claim was committed");
+    // The create gives up on a worker that does not report, and the node settles unknown.
+    until("the dispatch to give up waiting for the worker", || {
+        node_statuses(&host) == [NodeStatus::Unknown.as_str()]
+    })
+    .await;
+    // The sweep looks while the worker has not reported: nobody is in the directory to ask.
+    let looked = host.controller.automation().sweep_passes();
+    until("the sweep to look twice after the node settled", || {
+        host.controller.automation().sweep_passes() >= looked + 2
+    })
+    .await;
+    let session_id = all_sessions(&mut control)
+        .await
+        .first()
+        .expect("the session the node left")
+        .session_id;
+    resume.send(()).expect("the worker goes on and reports");
+    let _ = running.await;
+
+    let closed = closed_session(&mut control, session_id).await;
+    assert_eq!(
+        closed.closure.0.expect("closed").reason,
+        kr_protocol::session::ClosureReason::CloseRequested,
+        "the sweep closed it once the worker had reported"
+    );
+    until("the sweep to release what the command owned", || {
+        owed_rows(&host) == 0
+    })
+    .await;
     host.clients.abort();
 }
