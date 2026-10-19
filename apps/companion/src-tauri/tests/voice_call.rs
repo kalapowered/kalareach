@@ -21,6 +21,7 @@
 //! | A delegation is answered to the model that nothing was done, once | `a_delegation_is_answered_to_the_model_that_nothing_was_done_once` |
 //! | A mute silences the microphone here and is told to the service | `muting_the_microphone_silences_it_here_and_tells_the_service` |
 //! | A host that names another voice service gets no token | `a_host_that_names_another_voice_service_gets_no_token` |
+//! | The native session ending revokes the call's grant in the host's store before the service finalises the call | `ending_the_native_session_revokes_the_voice_grant_before_the_service_finalises_the_call` |
 //! | A stop that never returns does not hold the host's revocation | `a_stop_native_code_never_returns_does_not_hold_the_revocation` |
 //! | The host's revocation does not wait for native code's stop | `the_hosts_revocation_does_not_wait_for_native_code_to_stop_the_media` |
 //! | A stop that names the call during its setup reaches its owner | `a_stop_that_names_the_call_during_its_setup_ends_that_call` |
@@ -664,6 +665,71 @@ async fn the_notifications_stop_ends_the_call_with_no_page() {
             state["ended"]["broker"] == "closed"
         })
         .await;
+    scene.stop_host().await;
+}
+
+/// KR-REQ-15.14: ending the native session revokes the call's voice grant at once, in the host's own
+/// store, whatever the voice service has done about the call. Native code ends the call by itself.
+/// The service holds both ways the call is closed at it: the host's close over HTTP and the phone's
+/// close over its control, and answers neither. The grant is revoked by the time the host's close
+/// has reached the service, so nothing of the call has been finalised when the authority ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ending_the_native_session_revokes_the_voice_grant_before_the_service_finalises_the_call() {
+    let mut scene = scene().await;
+    let started = scene.start().await;
+    let grant_id: kr_protocol::ids::GrantId = serde_json::from_value(
+        started["value"]["outcome"]["started"]["session"]["grant_id"].clone(),
+    )
+    .expect("the grant the call runs under");
+    let revoked_in_the_hosts_store = |scene: &Scene| {
+        scene
+            .host()
+            .controller()
+            .sharing()
+            .grants()
+            .record(grant_id)
+            .expect("the store answers")
+            .expect("the record is there")
+            .revoked_at_ms
+            .is_some()
+    };
+    scene
+        .state_where("a running call", |state| state["running"] == true)
+        .await;
+    assert!(
+        !revoked_in_the_hosts_store(&scene),
+        "the call's grant stands while the call runs"
+    );
+
+    scene.stand_in.hold_closes();
+    scene.stand_in.control().hold_closures(true);
+    scene.platform.tell(CallEvent::Ended);
+
+    // The host has told the service the call is over, with its own token, and the service holds
+    // that close; the control's closure is held too, so nothing has been finalised. The grant is
+    // revoked all the same.
+    let hosts_token = format!("Bearer {}", voice_support::HOST_TOKEN);
+    tokio::time::timeout(WATCHDOG, async {
+        while !scene.stand_in.seen().iter().any(|request| {
+            request.path == "/api/voice/sessions/call-1/close"
+                && request.authorization.as_deref() == Some(hosts_token.as_str())
+        }) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the host told the service the call ended");
+    assert!(
+        revoked_in_the_hosts_store(&scene),
+        "the grant is revoked in the host's store while the service has answered neither close"
+    );
+
+    scene.stand_in.control().hold_closures(false);
+    scene.stand_in.release_closes();
+    let ended = scene
+        .state_where("the end", |state| state["ended"]["cause"] == "native_ended")
+        .await;
+    assert_eq!(ended["running"], false);
     scene.stop_host().await;
 }
 

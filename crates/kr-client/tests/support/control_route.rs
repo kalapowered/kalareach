@@ -109,6 +109,7 @@ struct State {
     drop_unread: bool,
     drop_after_ready: bool,
     closure_delay: Option<Duration>,
+    closure_held: bool,
     admissions_twice: bool,
     announced: Vec<String>,
     ready_call: String,
@@ -184,6 +185,7 @@ impl ControlRoute {
                 drop_unread: false,
                 drop_after_ready: false,
                 closure_delay: None,
+                closure_held: false,
                 admissions_twice: false,
                 announced: Vec::new(),
                 ready_call: CALL.to_owned(),
@@ -306,6 +308,11 @@ impl ControlRoute {
     /// service does: the closure is read at once and confirmed late.
     pub fn confirm_closures_after(&self, delay: Duration) {
         self.edit(|state| state.closure_delay = Some(delay));
+    }
+
+    /// Holds the service's answer to a closure, once it has read the request, until told not to.
+    pub fn hold_closures(&self, hold: bool) {
+        self.edit(|state| state.closure_held = hold);
     }
 
     /// Sends the provider's admission of every request twice, as a socket opened just before the
@@ -499,6 +506,18 @@ where
                     .filter(|_| text.contains(r#""command":"close""#));
                 if let Some(delay) = late {
                     tokio::time::sleep(delay).await;
+                }
+                if text.contains(r#""command":"close""#) {
+                    loop {
+                        let changed = shared.changed.notified();
+                        tokio::pin!(changed);
+                        // Registered before the flag is read, so a release between the two is not lost.
+                        changed.as_mut().enable();
+                        if !shared.state.lock().expect("the route's state").closure_held {
+                            break;
+                        }
+                        changed.await;
+                    }
                 }
                 let answered = !answers.is_empty();
                 for answer in answers {
