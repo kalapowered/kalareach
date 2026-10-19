@@ -122,6 +122,15 @@ function codeWords(
           "The host could not be reached. Check that this device is on the host's network, or that the host is online.",
         action: 'try_again'
       }
+    case 'relay_capacity':
+      return {
+        // The managed relay is the product's own, so the failure is not the host's, and it is said
+        // to be neither. The alternatives are the ones the service names: this device on the host's
+        // own network, or a direct invitation.
+        sentence:
+          "The managed relay could not take this pairing now. Try again shortly, or bring this device onto the host's network and use a direct invitation.",
+        action: 'try_again'
+      }
     case 'host_mismatch':
       return {
         sentence: 'The host did not match its invitation, so KalaReach stopped before pairing.',

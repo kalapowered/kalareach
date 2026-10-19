@@ -219,6 +219,30 @@ describe('pairing with a host', () => {
     expect((await screen.findByTestId('failure-action')).textContent).toBe('Paste again')
   })
 
+  // KR-REQ-10.54: a managed relay that has no free capacity to admit a device is not a host that
+  // cannot be reached, and the page says which it is, on both ways of pairing.
+  it('tells a relay without free capacity from a host that is not there, for a code and for an invitation', async () => {
+    const { controls } = start()
+    await screen.findByLabelText('Pairing code')
+
+    attempt(controls, ended('relay_capacity', null))
+    const code = (await screen.findByTestId('failure-sentence')).textContent ?? ''
+    expect(code).toMatch(/managed relay/)
+    expect(code).not.toMatch(/could not be reached/)
+    expect(screen.getByTestId('failure-action').textContent).toBe('Try again')
+
+    attempt(controls, {
+      state: 'ended',
+      failure: { kind: 'relay_capacity', tries_left: null },
+      mode: 'direct',
+      service: null
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('failure-action').textContent).toBe('Paste again')
+    })
+    expect(screen.getByTestId('failure-sentence').textContent).toMatch(/managed relay/)
+  })
+
   it('names an unknown failure kind only as not finished, with the generic action', async () => {
     const { controls } = start()
     await screen.findByLabelText('Pairing code')

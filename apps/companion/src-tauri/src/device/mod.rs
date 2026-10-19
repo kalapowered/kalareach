@@ -31,6 +31,7 @@ use kr_client::pairing::invitation::{Invitation, InvitationSummary, origin_host,
 use kr_client::pairing::link::{EndpointPool, HostLink, IrohLink};
 use kr_client::pairing::paired::{PairedHost, PairedHosts};
 use kr_client::pairing::room::RoomConnector;
+use kr_client::services::{ManagedPairingAdmission, PairingAdmissions, ServiceHttp};
 use kr_crypto::store::SecretStore;
 use kr_pairing::budget::DurableClientBudgetStore;
 use kr_pairing::code::EnteredCode;
@@ -164,6 +165,18 @@ pub struct Parts {
     /// What this computer's own way of reaching a host is put behind, when it is put behind
     /// anything: a test holds or refuses the connections it is asked for.
     pub link: Option<LinkWrap>,
+    /// The managed service this computer asks for an admission to reach a host through one of the
+    /// service's relays before it has paired with it, when it asks any.
+    pub managed: Option<ManagedService>,
+}
+
+/// The managed service a device asks to admit it through a relay, and how it reaches it.
+#[derive(Clone)]
+pub struct ManagedService {
+    /// The origin the service answers as, which is also the origin its relays are named under.
+    pub origin: kr_protocol::service::GatewayOrigin,
+    /// How this computer reaches it.
+    pub http: Arc<dyn ServiceHttp>,
 }
 
 impl Parts {
@@ -181,12 +194,29 @@ impl Parts {
                 "the pairing service's TLS could not be set: {error}"
             ))
         })?;
+        let origin =
+            kr_protocol::service::GatewayOrigin::new(kr_client::services::account::ACCOUNT_ORIGIN)
+                .map_err(|error| CommandError::local_failure(error.to_string()))?;
+        let http = kr_client::services::HttpService::with(
+            origin.clone(),
+            kr_client::services::HttpDeadlines::default(),
+            kr_client::services::managed_response_limits(),
+        )
+        .map_err(|error| {
+            CommandError::local_failure(format!(
+                "this computer cannot reach the managed service: {error}"
+            ))
+        })?;
         Ok(Self {
             secrets,
             room: Arc::new(room),
             bind: None,
             clock: Arc::new(clock),
             link: None,
+            managed: Some(ManagedService {
+                origin,
+                http: Arc::new(http),
+            }),
         })
     }
 }
@@ -231,7 +261,28 @@ impl Device {
             clock: parts.clock,
             room: parts.room,
             link: {
-                let own: Arc<dyn HostLink> = Arc::new(IrohLink::new(Arc::new(pool)));
+                let link = IrohLink::new(Arc::new(pool));
+                // A relay of the managed service carries a pairing only for a device it has been
+                // told to admit, so this computer asks it as it dials; a relay of any other
+                // service is never named to it.
+                let link = match parts.managed {
+                    Some(managed) => {
+                        let signer = Arc::new(crate::recovery::DeviceSigner::new(
+                            identity.keys.authorisation.clone(),
+                        ));
+                        let admit = ManagedPairingAdmission::new(
+                            managed.origin.clone(),
+                            managed.http,
+                            signer,
+                        );
+                        let admissions =
+                            PairingAdmissions::new(Arc::new(admit), &managed.origin)
+                                .map_err(|error| CommandError::local_failure(error.to_string()))?;
+                        link.admitted_by(Arc::new(admissions))
+                    }
+                    None => link,
+                };
+                let own: Arc<dyn HostLink> = Arc::new(link);
                 match parts.link {
                     Some(behind) => behind(own),
                     None => own,

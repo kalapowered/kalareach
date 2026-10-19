@@ -491,6 +491,7 @@ export type FailureKind =
   | 'host_restarted'
   | 'another_device_waiting'
   | 'host_unreachable'
+  | 'relay_capacity'
   | 'host_mismatch'
   | 'already_paired'
   | 'not_an_invitation'
