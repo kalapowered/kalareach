@@ -436,14 +436,14 @@ it. It doesn't actually know any keys or identifiers, and it can't send `device.
 table of page commands won't allow that method. Instead, the one command that revokes performs the
 revocation in native code.
 
-There are two different ways of sending a revocation to a host, and it is up to the host to choose
-which to use. If the host is running on the local computer, it will receive the `device.revoke`
-method from native code. It will reply with an acknowledgement containing the state of its dispatch
-barrier. The host will withdraw the connections it admitted before each revocation, so that the
-revocation is sent over a connection it admits then. If the host is any other host that the local
-computer owns, it will receive the revocation over the authority feed. Native code signs a request
-using the local computer's authorisation key and publishes it to the sync service. The host reads
-the authority feed when a device connects and then again every 30 seconds. When it reads the
+There are two different ways of sending a revocation to a host, and the host that a request is for
+decides which to use. If the host is running on the local computer, it will receive the
+`device.revoke` method from native code. It will reply with an acknowledgement containing the state
+of its dispatch barrier. The host will withdraw the connections it admitted before each revocation,
+so the revocation is sent over a connection it admits then. If the host is any other host that the
+local computer owns, it will receive the revocation over the authority feed. Native code signs a
+request using the local computer's authorisation key and publishes it to the sync service. The host
+reads the authority feed when a device connects and then again every 30 seconds. When it reads the
 revocation request, it performs the revocation and publishes an acknowledgement to the authority
 feed. A paired device can't send `device.revoke` to the host. So the authority feed is the only way
 of reaching a host that is not the one on the local computer, whether it is reachable or not. All
@@ -491,7 +491,7 @@ out again. Even pairing the device again will not add it to the collection again
 device again finishes the job. If a view finds that a device is revoked, either because a host's
 feed contains a revocation signed by this computer or because the host on this computer lists it as
 revoked (regardless of who revoked it), the device is taken out as described above. Note that there
-is no way to stop a request that is already being sent.
+is no way to stop a settings send that is already on its way.
 
 The Devices screen, which appears after the Hosts screen in the desktop navigation, shows one card
 for each host with the card for the local host (that is, the host which is on this computer) first.
@@ -508,7 +508,7 @@ additionally say that the device needs to be revoked at the host. If the host’
 unavailable to this computer, the device’s status will be whatever it was when the application most
 recently read the feed, along with when that was.
 
-In each device’s row is a button labelled “Revoke with Touch ID”, “Revoke with your password” or
+The button in a device’s row is labelled “Revoke with Touch ID”, “Revoke with your password” or
 “Revoke with Windows Hello” as appropriate, asking the user to perform the local computer’s ceremony
 in order to revoke that device. There’s no need for a second confirmation (“Are you sure?”) because
 the operating system’s dialog box will state which device is being revoked and on which host. If the
@@ -524,15 +524,16 @@ revoke button, unless that look finds the request sent, in which case focus will
 status text for that request instead.
 
 The screen will automatically look again ten seconds after the last answer, but only while a request
-has been sent to a host and not yet acknowledged by it. (The screen only makes one look at a time,
-in order to allow for hosts which may be slow to respond, and their answers are shown.) Each look
-will connect to all the hosts that it lists, since a host reads its feed when a device connects. A
-hidden screen will not look again until it has been shown. Since the local host answers each
-revocation request as it is asked, there is no need for the screen to look for it; instead, the
-device’s row offers “Check again”. Any status changes on the screen will be announced via a live
-region, and when a revocation request is sent focus will be set to the status text for that request.
-Nothing on the screen moves. This screen does not exist on phones, since a phone has no ceremony to
-confirm with and so revokes nothing.
+waits for its host: one that has been sent and not yet acknowledged, or one that a host reached
+through its feed has acknowledged and not finished. (The screen only makes one look at a time, in
+order to allow for hosts which may be slow to respond, and their answers are shown.) Each look will
+connect to all the hosts that it lists, since a host reads its feed when a device connects. A hidden
+screen will not look again until it has been shown. Since the local host answers each revocation
+request as it is asked, there is no need for the screen to look for it; instead, the row of a device
+that the host has acknowledged but not finished offers “Check again”. Any status changes on the
+screen will be announced via a live region, and when a revocation request is sent focus will be set
+to the status text for that request. Nothing on the screen moves. This screen does not exist on
+phones, since a phone has no ceremony to confirm with and so revokes nothing.
 
 ## Sharing a session
 

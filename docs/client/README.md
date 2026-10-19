@@ -405,8 +405,8 @@ in one `sync::SyncStore`.
   down or the copy here was pruned, is named in `exported` as deletable, and
   `SyncClient::drop_kept_copy` drops it when the person asks for exactly that. None of this sends
   content, so privacy mode does not stop it.
-- `SyncClient::gated` and `DraftSync::gated` give the client a `sync::PublishGate`, which the host
-  closes while it must hold back everything the client sends. This is what a host does while a
+- `SyncClient::gated` and `DraftSync::gated` give the client a `sync::PublishGate`, which the caller
+  closes while it must hold back everything the client sends. This is what a caller does while a
   device is being taken out of a shared collection. The client checks the gate before reading or
   sealing any content, as well as before recording anything, so a refusal leaves no account and no
   held bytes behind. Once a send has passed the gate, it is on its way and the gate cannot call it
