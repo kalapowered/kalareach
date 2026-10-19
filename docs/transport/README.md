@@ -560,11 +560,16 @@ answer does not lose it, and why membership comes from the registry's durable ro
 whichever workers a daemon has reached. Nothing in either half ends a process to make a revocation
 complete.
 
-What the lease enforces today is the deadline: the daemon takes it at the moment it forwards and
-bounds the deadline it gives the worker by whatever the lease has left, and the worker checks that
-deadline in its serial path. The lease's own identity, generation and revision do not travel to the
-worker, because a remote device's mutation does not yet reach one. That is the remaining half, and
-it belongs with the path that carries such a mutation.
+The daemon takes the lease when forwarding a paired device's mutation, not when the request arrived.
+The deadline the daemon sets on the worker is bounded by the remaining time on the lease. The daemon
+includes the lease (identity, controller generation, authority revision, end time) when sending the
+mutation to the worker. The worker holds the lease for at most five seconds. It will check the lease
+during the serial path just before writing the dispatch marker. It will refuse to run an action if
+its lease is not for a generation that it is accepting actions for, or if its lease is not for a
+revision that it has acknowledged for that generation and installed, or if its lease has ended. A
+stop of owned execution (`session.close`) and a local caller's action need no lease. Workers from
+the previous release cannot read a lease; the daemon does not send them one, and the daemon alone
+holds the lease for them.
 
 ## Performance targets
 
