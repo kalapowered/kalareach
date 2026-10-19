@@ -1149,6 +1149,83 @@ async fn a_device_at_the_door_of_the_updated_host_meets_the_worker_of_the_releas
     assert!(closed.closure.0.is_some(), "{closed:?}");
 }
 
+/// KR-REQ-09.10, KR-REQ-26.06: a mutation a paired device makes, which the daemon of this release
+/// takes a remote dispatch lease for, is performed by the worker of the release before.
+///
+/// That worker reads no lease and holds the daemon's deadline and the revision its grant was
+/// checked at, so the daemon sends it the frame it read before this release and not the lease: a
+/// frame that carried one is refused by name at that level and nothing is sent. The device attaches
+/// to the session through the updated daemon, and the worker, which is the process it was
+/// throughout, admits the attachment.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mutation_of_a_paired_device_is_performed_by_the_worker_of_the_release_before_through_the_daemon_of_this_release()
+ {
+    use kr_protocol::attachment::{
+        AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
+    };
+    use kr_protocol::scalars::CanonicalSet;
+    use kr_protocol::session::Dimensions;
+
+    let updated = Updated::on_the_network().await;
+    let host = &updated.host;
+    let owner = door::Door::pair_the_first_owner(
+        &host
+            .tree
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint"),
+        host.tree.environment_id(),
+    )
+    .await;
+    let session_id = updated.session_id;
+
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    let settled = owner
+        .session
+        .mutate(
+            Method::SessionAttach,
+            kr_protocol::envelope::ActionTarget {
+                environment_id: host.tree.environment_id(),
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            None,
+            &Empty {},
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(Dimensions::new(80, 24)),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested,
+            },
+            kr_protocol::scalars::DurationMs::new(120_000),
+        )
+        .await
+        .expect("the worker of the release before admits the device's attach");
+    let attached: SessionAttachResult = settled
+        .to_typed()
+        .expect("the worker answers with the attachment it made");
+    assert!(
+        attached
+            .attachment
+            .granted
+            .contains(&AttachmentCapability::ObserveTerminal),
+        "the attachment observes the terminal: {attached:?}"
+    );
+
+    // The worker is the process it was, and runs the release before. The session is closed with
+    // this release's own `kr`, which reaches the daemon's local socket, and nothing is read over the
+    // device's connection after the worker ends: its link to the worker ends with it.
+    updated.the_worker_is_as_it_was().await;
+    host.close(&updated.kr_now(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+    drop(owner);
+}
+
 /// A terminal running `program` with the arguments, as a person's does on this host.
 fn terminal_for(host: &Host, program: &Path, arguments: &[&str]) -> terminal::Terminal {
     let mut command = portable_pty::CommandBuilder::new(program);
