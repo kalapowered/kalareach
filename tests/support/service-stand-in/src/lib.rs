@@ -93,6 +93,8 @@
 //! | A lease is signed as sponsored by its authorisation when that authorisation was not the caller's default when the lease was issued, and every revision of the lease keeps the role it was issued with | source only | `relay/lease.ts` `issueNew`, `payerOfRow` | `a_new_sign_in_leaves_a_running_lease_under_the_authorisation_it_was_asked_for`: the role is kept; the stand-in signs it through the protocol's own lease type |
 //! | A new lease is installed on the relay instance the service selects when it is issued (the stand-in sets it with `name_relay_url`, and has one instance at a time), and every answer about the lease names that instance: a refill keeps the instance it was issued on | source only | `relay/lease.ts` `issueNew`, `refillExisting`; `relay/instances.ts` `selectInstance`, `readSelectable` | `a_pairs_traffic_crosses_the_relay_its_lease_is_installed_on`, `a_host_keeps_its_leases_on_the_relay_new_leases_land_on` |
 //! | Withdrawing an authorisation revokes the leases issued under it | source only | `relay/index.ts` `withdraw`; `relay/lease.ts` `fenceAuthorisation` | `a_withdrawn_authorisation_ends_the_leases_and_the_owner_is_told_to_sign_in` |
+//! | A pairing admission request is proven by the same credential as a lease request, over the canonical body (`{ host_endpoint_key, candidate_endpoint_key, relay_url }`, domain `kr-relay-admission-request/1`); a relay URL the service does not carry is `state: not_managed` and spends nothing; the service's free budget being spent is `state: unavailable` with the paths that still work and no relay is asked; a pair that holds a live lease at that relay is `state: not_needed`; otherwise it is `state: admitted` with 600 seconds and 512 KiB | source only | `relay/admission.ts` `issueAdmission`, `relay/instances.ts` `findInstanceByUrl`; `relay/index.ts` `admission` | `a_device_pairs_through_the_managed_relay_while_the_host_holds_a_lease` |
+//! | The per-network rate in front of anonymous admission, the relay's own refusals of an admission (a pair that holds a lease, an allowance that ran out, a replay, a start-up refusal) and the counting of a failure toward the operations alert | not modelled: the stand-in limits no route and always finds the relay willing | `billing/client.ts` `admitAnonymous`, `relay/admission.ts` | `Moment::Refuse`, `carry_relay` |
 //! | The relay installing the lease, the relay's own counting and the settlement's evidence | not modelled: the stand-in answers that the lease is installed and counts the bytes a test says the relay counted | `relay/install.ts`, `relay/settlement.ts` | none |
 //! | Uploads the service has lost answer `NOT_FOUND` | source only | `storage/upload.ts:607` | `Moment::UploadsLost`; the daemon's `an_upload_the_service_lost_or_closed_is_made_again` |
 //! | Storage not confirming the write of a part answers `INTERNAL` and closes the upload | source only | `storage/index.ts:830`, `storage/upload.ts:577` | `Moment::PartWriteFails`; the daemon's `an_upload_the_service_lost_or_closed_is_made_again` |
@@ -122,7 +124,9 @@ mod sync;
 mod web;
 
 pub use http::{Served, serve};
-pub use relay::{RelayAuthorisationView, RelayLeaseView};
+pub use relay::{
+    ADMISSION_BYTES, AdmissionBehaviour, RelayAdmissionView, RelayAuthorisationView, RelayLeaseView,
+};
 pub use web::{
     ACCOUNT, Arrived, BACKUP_RESTORE_SCOPE, BACKUP_WRITE_SCOPE, Handled, IN_PROCESS_ORIGIN,
     MAX_GENERATIONS, Moment, PART, RESTORE_TOKEN, ServiceWeb, StaleRefusal, TOKEN, document_of,

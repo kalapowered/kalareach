@@ -63,7 +63,10 @@ impl Pairing {
                 .dial(&payload.network_config, &payload.endpoint_id),
         )
         .await
-        .map_err(|error| reached(&error))?;
+        .map_err(|error| {
+            self.capacity_failure(&error, &payload.network_config, &payload.endpoint_id)
+                .unwrap_or_else(|| reached(&error))
+        })?;
         let peer = ConnectionPeer::of(&connection);
         if peer.endpoint() != payload.endpoint_id {
             return Err(PairingFailure::new(

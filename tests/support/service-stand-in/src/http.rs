@@ -137,6 +137,20 @@ async fn connection(mut socket: TcpStream, web: Arc<ServiceWeb>) {
             web.held_until_released(epoch).await;
             Handled::Answer(answer)
         }
+        Handled::Gated(epoch) => {
+            web.held_until_released(epoch).await;
+            // Handled as if it had just arrived, without being recorded or counted again.
+            match serde_json::from_slice::<serde_json::Value>(&received.body) {
+                Ok(document) => Handled::Answer(web.answer(
+                    &received.path,
+                    &document,
+                    token.as_deref(),
+                    carries_content.then_some(received.body.as_slice()),
+                    false,
+                )),
+                Err(_) => Handled::Lost,
+            }
+        }
         other => other,
     };
     match handled {
@@ -160,7 +174,7 @@ async fn connection(mut socket: TcpStream, web: Arc<ServiceWeb>) {
         // The connection ends with no answer, as one does that the network lost.
         Handled::Lost => {}
         Handled::Held(epoch) => web.held_until_released(epoch).await,
-        Handled::Slow(..) => {}
+        Handled::Slow(..) | Handled::Gated(..) => {}
     }
 }
 

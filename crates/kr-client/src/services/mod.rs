@@ -110,6 +110,7 @@
 //! service words it for a write and what the person needs is what it means for their request.
 
 pub mod account;
+pub mod admission;
 pub mod authority;
 pub mod backup;
 pub mod http;
@@ -138,6 +139,10 @@ use crate::error::{ClientError, Result};
 pub use account::{
     AccountHttp, AccountMark, AccountService, AccountToken, AccountTokenSource,
     ManagedAccountService, SignedInAccount,
+};
+pub use admission::{
+    AdmissionAnswer, AdmissionClock, AdmissionRequest, ManagedPairingAdmission,
+    PairingAdmissionService, PairingAdmissions,
 };
 pub use authority::{
     AnnouncementOutcome, AnnouncementPlacement, AuthorityFeedClient, AuthorityFeedRecord,

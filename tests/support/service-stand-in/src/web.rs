@@ -79,6 +79,10 @@ pub enum Moment {
     /// The service holds the request open and answers nothing, until [`ServiceWeb::release_held`]
     /// lets the connection go. It acts on nothing.
     Hold,
+    /// The service holds the request open before it acts on it, and when [`ServiceWeb::release_held`]
+    /// is called handles it as if it had just arrived and answers it: a request the service is
+    /// slow to begin on, which is how a test decides when a request takes effect.
+    Gate,
     /// The service acts on the request and answers `504 OUTCOME_UNKNOWN`, as a service does whose
     /// feed stored the change and did not answer in time. The caller is told it is not known
     /// whether the change took effect, and it did.
@@ -271,6 +275,9 @@ pub enum Handled {
     /// The service holds the request open and answers nothing until it is released. The count is
     /// the number of releases so far, which [`ServiceWeb::held_until_released`] waits past.
     Held(u64),
+    /// The service has not begun on the request: it does when it is released, and answers then.
+    /// The count is as for [`Handled::Held`].
+    Gated(u64),
     /// The service acted on the request and gives its answer when it is released.
     Slow(u64, ServiceHttpAnswer),
 }
@@ -556,6 +563,37 @@ impl ServiceWeb {
     #[must_use]
     pub fn relay_sign_ins(&self) -> Vec<crate::relay::RelayAuthorisationView> {
         self.state.lock().expect("the state").relay.sign_ins()
+    }
+
+    /// The service carries a relay at `url`, and answers a request for a pairing admission there as
+    /// `behaviour` says. A relay that leases are installed on, or that
+    /// [`ServiceWeb::name_relay_url`] names, is carried and admits unless this says otherwise; a URL
+    /// that is none of those is `not_managed`.
+    pub fn carry_relay(&self, url: &str, behaviour: crate::relay::AdmissionBehaviour) {
+        self.state
+            .lock()
+            .expect("the state")
+            .relay
+            .carry_relay(url, behaviour);
+    }
+
+    /// The service's free budget for pairing admissions is spent for the day, or is not.
+    pub fn spend_admission_budget(&self, spent: bool) {
+        self.state
+            .lock()
+            .expect("the state")
+            .relay
+            .spend_admission_budget(spent);
+    }
+
+    /// Every request for a pairing admission that proved its credential, in order.
+    #[must_use]
+    pub fn relay_admission_requests(&self) -> Vec<crate::relay::RelayAdmissionView> {
+        self.state
+            .lock()
+            .expect("the state")
+            .relay
+            .admission_requests()
     }
 
     /// The relay allowance of every account is spent, or is not.
@@ -935,6 +973,7 @@ impl ServiceWeb {
         match moment {
             Some(Moment::Before) => return Handled::Lost,
             Some(Moment::Hold) => return Handled::Held(*self.released.borrow()),
+            Some(Moment::Gate) => return Handled::Gated(*self.released.borrow()),
             Some(Moment::Refuse {
                 status,
                 code,
@@ -986,7 +1025,7 @@ impl ServiceWeb {
     }
 
     /// What the service answers one request that reached it.
-    fn answer(
+    pub(crate) fn answer(
         &self,
         path: &str,
         document: &serde_json::Value,
@@ -1003,6 +1042,10 @@ impl ServiceWeb {
             } else {
                 crate::relay::revoke(&mut state.relay, &self.origin, document, now_ms())
             };
+        }
+        if path == "/api/relay/admission" {
+            let mut state = self.state.lock().expect("the state");
+            return crate::relay::admit(&mut state.relay, &self.origin, document, now_ms());
         }
         if path == "/api/relay/payer-authorisation/sign-in" {
             let mut state = self.state.lock().expect("the state");
@@ -1176,10 +1219,12 @@ impl ServiceWeb {
     fn delivered(handled: Handled) -> kr_client::Result<ServiceHttpAnswer> {
         match handled {
             Handled::Answer(answer) | Handled::Slow(_, answer) => Ok(answer),
-            Handled::Lost | Handled::Held(_) => Err(ClientError::Host(ProtocolError::new(
-                ErrorCode::UpstreamUnavailable,
-                "the connection dropped".to_owned(),
-            ))),
+            Handled::Lost | Handled::Held(_) | Handled::Gated(_) => {
+                Err(ClientError::Host(ProtocolError::new(
+                    ErrorCode::UpstreamUnavailable,
+                    "the connection dropped".to_owned(),
+                )))
+            }
         }
     }
 }

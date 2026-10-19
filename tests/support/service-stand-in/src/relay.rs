@@ -32,6 +32,13 @@ use crate::web::{answered, refusal};
 /// The domain a lease request's body digest covers.
 const LEASE_REQUEST_DOMAIN: &str = "kr-relay-lease-request/1";
 
+/// The domain an admission request's body digest covers.
+const ADMISSION_REQUEST_DOMAIN: &str = "kr-relay-admission-request/1";
+
+/// The bytes one pairing admission allows, and how long it lasts, as the Worker issues one.
+pub const ADMISSION_BYTES: u64 = 512 * 1024;
+const ADMISSION_SECONDS: u64 = 600;
+
 /// The domain a revocation request's body digest covers.
 const LEASE_REVOKE_DOMAIN: &str = "kr-relay-lease-revoke/1";
 
@@ -159,6 +166,29 @@ pub struct RelayLeaseView {
     pub ended_for: Option<&'static str>,
 }
 
+/// What the service answers a request for an admission at one relay it carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionBehaviour {
+    /// It issues and installs one.
+    Admit,
+    /// It cannot admit now, and says so with the paths that still work.
+    Unavailable {
+        /// The seconds it asks the caller to wait, when it asks.
+        retry_after_seconds: Option<u64>,
+    },
+}
+
+/// A request for an admission that proved its credential, as a test reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayAdmissionView {
+    /// The endpoint being paired with.
+    pub host: EndpointKey,
+    /// The endpoint that is pairing.
+    pub candidate: EndpointKey,
+    /// The relay the request named, as it was written.
+    pub relay_url: String,
+}
+
 /// An authorisation a sign-in opened, as a test reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RelayAuthorisationView {
@@ -203,6 +233,13 @@ pub(crate) struct Relay {
     seen_ms: u64,
     counter: u64,
     issuer: AuthorisationKeyPair,
+    /// What each relay the service carries answers a request for an admission with, by URL.
+    /// A relay the lease path installs on is carried too, and admits unless a test says otherwise.
+    admission_relays: BTreeMap<String, AdmissionBehaviour>,
+    /// The service's free budget for admissions is spent for the day.
+    admission_budget_spent: bool,
+    /// Every request for an admission that proved its credential.
+    admissions: Vec<RelayAdmissionView>,
 }
 
 impl Default for Relay {
@@ -223,6 +260,9 @@ impl Default for Relay {
             seen_ms: 0,
             counter: 0,
             issuer: AuthorisationKeyPair::generate().expect("an admission key"),
+            admission_relays: BTreeMap::new(),
+            admission_budget_spent: false,
+            admissions: Vec::new(),
         }
     }
 }
@@ -335,6 +375,22 @@ impl Relay {
         url.clone_into(&mut self.relay_url);
     }
 
+    /// The service carries a relay at `url`, and answers a request for an admission there as
+    /// `behaviour` says.
+    pub(crate) fn carry_relay(&mut self, url: &str, behaviour: AdmissionBehaviour) {
+        self.admission_relays.insert(same_relay(url), behaviour);
+    }
+
+    /// The service's free budget for admissions is spent, or is not.
+    pub(crate) const fn spend_admission_budget(&mut self, spent: bool) {
+        self.admission_budget_spent = spent;
+    }
+
+    /// Every request for an admission that proved its credential, in order.
+    pub(crate) fn admission_requests(&self) -> Vec<RelayAdmissionView> {
+        self.admissions.clone()
+    }
+
     /// The warnings an answer carries.
     fn warnings(&self) -> Value {
         self.warning.map_or_else(
@@ -424,6 +480,11 @@ fn text_of<T: Serialize>(value: &T) -> String {
         .to_owned()
 }
 
+/// A relay's URL as the Worker's registry compares it: no trailing slash, in lower case.
+fn same_relay(url: &str) -> String {
+    url.trim_end_matches('/').to_ascii_lowercase()
+}
+
 fn key_of(text: &str) -> EndpointKey {
     serde_json::from_value(Value::String(text.to_owned())).expect("an endpoint key")
 }
@@ -453,6 +514,15 @@ enum Payer {
         account_id: String,
         authorisation_id: String,
     },
+}
+
+/// The body of an admission request, as the contract reads it and the client writes it.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionBody {
+    host_endpoint_key: EndpointKey,
+    candidate_endpoint_key: EndpointKey,
+    relay_url: String,
 }
 
 /// The body of a revocation request.
@@ -575,6 +645,109 @@ fn check_credential(
     }
     Ok(Proof { key, signer })
 }
+
+/// `relay.admission.issue`: the admission a device that holds no lease asks for before it pairs.
+///
+/// The Worker proves the credential, finds the relay the request names among the instances it
+/// carries (a URL it does not carry is `not_managed`, and nothing is spent finding that out), takes
+/// the free budget's debit, signs the admission and installs it. A relay that is asked to carry
+/// the pair of a lease answers that the lease decides it alone. What the relay then does with the
+/// admission is the relay's own: this answers what the service says.
+pub(crate) fn admit(
+    relay: &mut Relay,
+    origin: &str,
+    document: &Value,
+    now_ms: u64,
+) -> ServiceHttpAnswer {
+    relay.seen_ms = now_ms;
+    let Ok(body) = serde_json::from_value::<AdmissionBody>(document["body"].clone()) else {
+        return invalid("That admission request is not one this service reads.");
+    };
+    let canonical = kr_cbor::encode(&kr_cbor::signing_value(
+        ADMISSION_REQUEST_DOMAIN,
+        vec![kr_cbor::to_canonical_value(&body).expect("a canonical body")],
+    ));
+    if let Err(refused) = check_credential(
+        relay,
+        origin,
+        "relay.admission.issue",
+        document,
+        &canonical,
+        now_ms,
+    ) {
+        return refused;
+    }
+    if body.host_endpoint_key == body.candidate_endpoint_key {
+        return invalid("An admission names two different endpoints.");
+    }
+    relay.admissions.push(RelayAdmissionView {
+        host: body.host_endpoint_key,
+        candidate: body.candidate_endpoint_key,
+        relay_url: body.relay_url.clone(),
+    });
+
+    let url = same_relay(&body.relay_url);
+    let carried = relay.admission_relays.get(&url).copied().or_else(|| {
+        let leased = relay
+            .leases
+            .values()
+            .any(|lease| same_relay(&lease.relay_url) == url);
+        (same_relay(&relay.relay_url) == url || leased).then_some(AdmissionBehaviour::Admit)
+    });
+    let Some(behaviour) = carried else {
+        return answered(json!({ "state": "not_managed" }));
+    };
+    if relay.admission_budget_spent {
+        return answered(json!({
+            "state": "unavailable",
+            "message": "The anonymous budget for today is spent.",
+            "alternatives": ALTERNATIVES,
+        }));
+    }
+    let service_now = relay.service_now(now_ms);
+    let (host, candidate) = (
+        text_of(&body.host_endpoint_key),
+        text_of(&body.candidate_endpoint_key),
+    );
+    let holds_a_lease = relay.leases.values().any(|lease| {
+        lease.state == LeaseState::Installed
+            && lease.expires_at_ms > service_now
+            && same_relay(&lease.relay_url) == url
+            && ((lease.source == host && lease.destination == candidate)
+                || (lease.source == candidate && lease.destination == host))
+    });
+    if holds_a_lease {
+        return answered(json!({ "state": "not_needed" }));
+    }
+    match behaviour {
+        AdmissionBehaviour::Unavailable {
+            retry_after_seconds,
+        } => {
+            let mut answer = json!({
+                "state": "unavailable",
+                "message": "The relay would not take that admission.",
+                "alternatives": ALTERNATIVES,
+            });
+            if let Some(seconds) = retry_after_seconds {
+                answer["retry_after_seconds"] = json!(seconds);
+            }
+            answered(answer)
+        }
+        AdmissionBehaviour::Admit => answered(json!({
+            "state": "admitted",
+            "relay_url": body.relay_url,
+            "relay_instance_id": "44444444-4444-4444-4444-444444444444",
+            "expires_in_seconds": ADMISSION_SECONDS,
+            "byte_ceiling": ADMISSION_BYTES.to_string(),
+        })),
+    }
+}
+
+/// The paths that still work, as the service names them.
+const ALTERNATIVES: [&str; 2] = [
+    "A direct connection between the devices, which needs no managed relay.",
+    "A self-hosted relay configured in the service settings.",
+];
 
 /// `relay.lease.issue`: opens a lease for a pair, or refills the one the pair holds.
 pub(crate) fn issue(

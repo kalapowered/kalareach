@@ -43,6 +43,7 @@ use tokio::sync::{Mutex, watch};
 
 use super::BoxFuture;
 use super::paired::PairedHost;
+use crate::services::PairingAdmissions;
 use crate::session::Session;
 use crate::shown::{Said, Shown};
 use crate::transport::{ControlTransport, NetworkTransport};
@@ -184,6 +185,17 @@ pub trait HostLink: Send + Sync {
         &'a self,
         network: &'a NetworkConfig,
     ) -> BoxFuture<'a, Result<EndpointHold, LinkError>>;
+
+    /// Whether a dial to `endpoint` that failed was held back by the managed service having no free
+    /// capacity to admit this device through the relay the dial addresses.
+    ///
+    /// A device that holds no lease with the host asks the managed service for an admission as it
+    /// dials, and a service that has none to give is a reason a person acts on differently from a
+    /// host that is not there. It is asked after a dial has ended, and a link that asks no service
+    /// answers no.
+    fn relay_capacity_refused(&self, _network: &NetworkConfig, _endpoint: &EndpointKey) -> bool {
+        false
+    }
 }
 
 /// The live peer of a connection, as kr-pairing checks it.
@@ -259,6 +271,11 @@ pub struct EndpointHold {
 pub struct EndpointPool {
     transport: TransportIdentityKeyPair,
     bind: Option<SocketAddr>,
+    /// Extra trust anchors for a relay's HTTPS certificate, as DER certificates, beside the ones
+    /// the platform trusts.
+    relay_roots: Vec<Vec<u8>>,
+    /// Whether every endpoint reaches hosts through relays only.
+    relay_only: bool,
     endpoints: Mutex<Endpoints>,
     /// How many endpoints the pool has begun to bind, which its tests read without the lock.
     #[cfg(test)]
@@ -356,6 +373,8 @@ impl EndpointPool {
         Self {
             transport,
             bind: None,
+            relay_roots: Vec::new(),
+            relay_only: false,
             endpoints: Mutex::new(Endpoints::default()),
             #[cfg(test)]
             binds: std::sync::atomic::AtomicUsize::new(0),
@@ -367,6 +386,24 @@ impl EndpointPool {
     #[must_use]
     pub const fn bound_to(mut self, address: SocketAddr) -> Self {
         self.bind = Some(address);
+        self
+    }
+
+    /// The same pool, with every endpoint reaching hosts through relays only and never on a direct
+    /// path, as a device on a network that blocks them does. It is the setting a host's own
+    /// configuration calls `network.relay_only`.
+    #[must_use]
+    pub const fn through_relays_only(mut self) -> Self {
+        self.relay_only = true;
+        self
+    }
+
+    /// The same pool, trusting `roots` as well as the platform's anchors for a relay's certificate:
+    /// a relay run under a private authority is reached with that authority pinned, which adds
+    /// trust and never replaces it. A test pins the certificate its own relay generated.
+    #[must_use]
+    pub fn trusting_relays(mut self, roots: Vec<Vec<u8>>) -> Self {
+        self.relay_roots = roots;
         self
     }
 
@@ -475,6 +512,8 @@ impl EndpointPool {
         let mut config = EndpointConfig::from_network_config(network)?;
         config.discovery.pkarr_publisher_url = None;
         config.bind_addr = self.bind;
+        config.relay_ca_roots.clone_from(&self.relay_roots);
+        config.relay_only = self.relay_only;
         Ok(config)
     }
 }
@@ -483,13 +522,25 @@ impl EndpointPool {
 #[derive(Debug)]
 pub struct IrohLink {
     pool: Arc<EndpointPool>,
+    admissions: Option<Arc<PairingAdmissions>>,
 }
 
 impl IrohLink {
     /// A link over `pool`.
     #[must_use]
     pub const fn new(pool: Arc<EndpointPool>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            admissions: None,
+        }
+    }
+
+    /// The same link, asking the managed service for an admission to reach a host through a relay
+    /// of its own before the device has paired with it.
+    #[must_use]
+    pub fn admitted_by(mut self, admissions: Arc<PairingAdmissions>) -> Self {
+        self.admissions = Some(admissions);
+        self
     }
 
     /// The pool this link dials through.
@@ -508,10 +559,32 @@ impl HostLink for IrohLink {
         Box::pin(async move {
             let address = EndpointConfig::from_network_config(network)?.peer_addr(endpoint)?;
             let local = self.pool.endpoint(network).await?;
-            local.connect(address, ALPN).await.map_err(|_| {
+            if let Some(admissions) = &self.admissions {
+                // The request goes as the dial starts, and the dial does not wait for it past a
+                // short bound: the relay drops what an unadmitted pair sends until the admission
+                // lands, and the transport sends again.
+                admissions
+                    .before_dial(
+                        network,
+                        endpoint,
+                        EndpointKey::from_bytes(*local.id().as_bytes()),
+                    )
+                    .await;
+            }
+            let connection = local.connect(address, ALPN).await.map_err(|_| {
                 LinkError::lost(Shown::said("the connection could not be established"))
-            })
+            })?;
+            if let Some(admissions) = &self.admissions {
+                admissions.dial_succeeded(network, endpoint);
+            }
+            Ok(connection)
         })
+    }
+
+    fn relay_capacity_refused(&self, network: &NetworkConfig, endpoint: &EndpointKey) -> bool {
+        self.admissions
+            .as_ref()
+            .is_some_and(|admissions| admissions.capacity_refused(network, endpoint))
     }
 
     fn open_unpaired<'a>(

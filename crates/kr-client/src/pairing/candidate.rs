@@ -49,8 +49,8 @@ use kr_protocol::invitation::RendezvousMessage;
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{
     BundleDirection, BundleMessageType, ClientBundle, DeviceName, DevicePlatform,
-    INVITATION_LIFETIME_MS, Locator, MAX_CLIENT_ATTEMPTS, PairStatus, RendezvousOrigin,
-    group_verification_value,
+    INVITATION_LIFETIME_MS, Locator, MAX_CLIENT_ATTEMPTS, NetworkConfig, PairStatus,
+    RendezvousOrigin, group_verification_value,
 };
 use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
 use kr_protocol::rendezvous::{
@@ -400,6 +400,28 @@ impl std::fmt::Debug for Pairing {
 }
 
 impl Pairing {
+    /// What a first dial that was lost means when the managed service had no free capacity to admit
+    /// this device through the relay the dial addresses, and none otherwise.
+    ///
+    /// Only a dial that was lost is asked, and only about the dial itself: a failure after it, on
+    /// the connection, is never a reason to blame the service. The route's own deadline ending a dial
+    /// counts as lost, which is the usual way a relay that drops what an unadmitted device sends
+    /// ends one.
+    pub(super) fn capacity_failure(
+        &self,
+        error: &LinkError,
+        network: &NetworkConfig,
+        host: &EndpointKey,
+    ) -> Option<PairingFailure> {
+        (matches!(error, LinkError::Lost(_)) && self.link.relay_capacity_refused(network, host))
+            .then(|| {
+                PairingFailure::new(
+                    FailureKind::RelayCapacity,
+                    "the managed relay has no free capacity to admit this device now",
+                )
+            })
+    }
+
     /// Pairs by a short code through the room at `origin`.
     ///
     /// `origin` is the origin this device is set to use, or the one a scanned code names once the
@@ -633,7 +655,12 @@ impl Pairing {
             self.link.dial(&bundle.network_config, &bundle.endpoint_id),
         )
         .await
-        .map_err(|error| link_failed(&error, tries))?;
+        .map_err(|error| {
+            match self.capacity_failure(&error, &bundle.network_config, &bundle.endpoint_id) {
+                Some(failure) => failure.with_tries(tries),
+                None => link_failed(&error, tries),
+            }
+        })?;
         // The live peer is the connection's own. kr-pairing refuses one that is not the bundle's
         // endpoint before this device offers anything on the connection.
         let request = attempt

@@ -811,7 +811,7 @@ impl ManagedRelayLeaseService {
 
     /// Sends one signed request and returns the `data` of its envelope. A request for something an
     /// account owns carries that account's token beside the credential.
-    async fn call<T: Serialize>(
+    pub(crate) async fn call<T: Serialize>(
         &self,
         path: &str,
         method: &str,
@@ -1078,7 +1078,7 @@ fn repeat_is_safe(method: &str) -> bool {
 /// which it can say after passing the request on. Any other fault or a rate limit is transient.
 /// Anything else without an envelope never reached this service's own routes, which is a
 /// configuration between here and it rather than a value this caller chose.
-fn unreadable(status: u16, what: impl Into<Shown>) -> ClientError {
+pub(crate) fn unreadable(status: u16, what: impl Into<Shown>) -> ClientError {
     let code = if (200..300).contains(&status) || status == 502 || status == 504 {
         ErrorCode::OutcomeUnknown
     } else if status >= 500 || status == 408 || status == 429 {

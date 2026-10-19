@@ -51,6 +51,9 @@ pub enum FailureKind {
     AnotherDeviceWaiting,
     /// The host could not be reached over the network.
     HostUnreachable,
+    /// The relay this device would reach the host through is the managed service's, and the service
+    /// has no free capacity to admit this device through it now: not a failure of the host.
+    RelayCapacity,
     /// The host did not match its invitation, so nothing was sent to it.
     HostMismatch,
     /// This device is already paired with the host the invitation is for.
@@ -86,6 +89,7 @@ impl Said for FailureKind {
             Self::HostRestarted => "HostRestarted",
             Self::AnotherDeviceWaiting => "AnotherDeviceWaiting",
             Self::HostUnreachable => "HostUnreachable",
+            Self::RelayCapacity => "RelayCapacity",
             Self::HostMismatch => "HostMismatch",
             Self::AlreadyPaired => "AlreadyPaired",
             Self::NotAnInvitation => "NotAnInvitation",
