@@ -73,40 +73,32 @@ impl Previous {
             the_root(),
         );
         assembled.manifest.commit = CommitId::new(self.commit.clone()).expect("a commit");
-        // The stores the release declares it reads are its own, and not this build's: a registry
-        // this build brought to a newer schema is one the release before refuses, and a rollback
-        // to it has to be refused by what the release says it reads, not left to a daemon that
-        // cannot open it.
-        let schema = registry_schema_of(&self.commit);
-        let registry = assembled
-            .manifest
-            .stores
-            .iter_mut()
-            .find(|store| store.store == "registry")
-            .expect("the registry is a store of every release");
-        registry.version = schema;
-        registry.migrates_from = registry.migrates_from.min(schema);
+        // The stores the release declares it reads are its own, and not this build's: a store this
+        // build raised or added is one the release before refuses or does not name, and a rollback
+        // to it has to be decided by what the release says it reads, not left to a daemon that
+        // cannot open it. They are the entries of the release's own stored-formats lock.
+        assembled.manifest.stores = stores_of_the_release_at(&self.commit);
         assembled
     }
 }
 
-/// The version of the registry's schema the release at `commit` writes, as its own source states
-/// it. A release reads the registry up to that version and no newer.
-fn registry_schema_of(commit: &str) -> u32 {
-    let path = cache_root()
-        .join(commit)
-        .join("tree/crates/kr-controller/src/registry.rs");
-    let source = std::fs::read_to_string(&path)
+/// The stores the release at `commit` declares it reads: the entries of the stored-formats lock
+/// that release was built with.
+fn stores_of_the_release_at(commit: &str) -> Vec<ReleaseStore> {
+    let path = cache_root().join(commit).join("tree/stored-formats.lock");
+    let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-    source
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("pub const SCHEMA_VERSION: i64 = ")?
-                .strip_suffix(';')?
-                .parse()
-                .ok()
+    let lock: Value =
+        serde_json::from_str(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    lock["stores"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{} lists no stores", path.display()))
+        .iter()
+        .map(|store| {
+            serde_json::from_value(store["entry"].clone())
+                .unwrap_or_else(|error| panic!("{}: a store entry: {error}", path.display()))
         })
-        .unwrap_or_else(|| panic!("{} states no SCHEMA_VERSION", path.display()))
+        .collect()
 }
 
 /// A line `name=value` of the record of a release.
