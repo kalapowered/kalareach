@@ -1956,6 +1956,22 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         },
     },
     IgnoredRun {
+        package: "kr-hook",
+        target: "--test channel",
+        cases: &["record_the_approval_the_channel_relays"],
+        runs: Runs::ByHand {
+            why: "it records a release's channel frame for its cut, and is run by hand in that release's tree",
+        },
+    },
+    IgnoredRun {
+        package: "kr-hook",
+        target: "--test listener",
+        cases: &["record_the_hello_the_forwarder_presents"],
+        runs: Runs::ByHand {
+            why: "it records a release's hello for its cut, and is run by hand in that release's tree",
+        },
+    },
+    IgnoredRun {
         package: "kr-cli",
         target: "--test backup_setup",
         cases: &[],
