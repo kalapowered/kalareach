@@ -27,8 +27,12 @@
 //! requires a causal budget to survive a restart and a reboot, and a runtime directory does not
 //! survive a reboot on every platform this host runs on.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
+use kr_automation::resources::{Owned, OwnedState, ResourceLedger, session_principal};
 use kr_automation::{
     ActionKey, ActionOutcome, ActionRunner, Answer as Recorded, AuthoritySource, AutomationService,
     Dispatch, Host, Submitted, WorkflowStore,
@@ -301,11 +305,13 @@ impl AuthoritySource for HostGrants {
 
 /// The actions this host carries out for a workflow node.
 ///
-/// The two change-set kinds are real: they reach the environment's change-set service, and the
-/// version each one produces records the run that asked for it, so the evidence a later node reads
-/// is bound to the execution that made it rather than to a claim about it. The node's grant is
-/// held in force around every transaction that commits the effect (`HeldGrant`), the way a
-/// caller's admission is held around a change-set method's own.
+/// The two change-set kinds reach the environment's change-set service, and the version each one
+/// produces records the run that asked for it, so the evidence a later node reads is bound to the
+/// execution that made it rather than to a claim about it. The node's grant is held in force
+/// around every transaction that commits the effect (`HeldGrant`), the way a caller's admission is
+/// held around a change-set method's own. A node that creates a session, or runs a command as the
+/// root of one, goes through the daemon's own create path, with the same grant asked where the
+/// session comes into being.
 ///
 /// Every other registered kind is refused by name. A refusal is not an uncertain outcome: nothing
 /// was dispatched, so the node failed and its dependants see a failure rather than a result
@@ -315,6 +321,57 @@ pub struct HostActions {
     authority: Arc<dyn AuthoritySource>,
     daemon: Arc<Daemon>,
     environment_id: EnvironmentId,
+    /// What each dispatch that runs a command owns, written before it allocates.
+    ledger: Arc<ResourceLedger>,
+    /// Where a command that declared no workspace runs, one private directory per node.
+    scratch_root: PathBuf,
+    /// The dispatches this daemon is running now.
+    live: Arc<LiveNodes>,
+}
+
+/// The node dispatches this daemon is running, each with the flag its cancellation sets.
+///
+/// A dispatch owns its ledger row while it is in here, and the sweep takes none of those: the
+/// sweep is for what no task of this daemon owns.
+#[derive(Debug, Default)]
+struct LiveNodes {
+    nodes: std::sync::Mutex<HashMap<kr_protocol::ids::ActionId, Arc<NodeTask>>>,
+    /// Told when a dispatch ends or begins, so the sweep looks again.
+    changed: tokio::sync::Notify,
+}
+
+/// One running dispatch, as the engine's cancellation sees it.
+#[derive(Debug, Default)]
+struct NodeTask {
+    cancelled: AtomicBool,
+}
+
+impl LiveNodes {
+    fn begin(&self, action_id: kr_protocol::ids::ActionId) -> Arc<NodeTask> {
+        let task = Arc::new(NodeTask::default());
+        self.nodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(action_id, Arc::clone(&task));
+        self.changed.notify_one();
+        task
+    }
+
+    fn get(&self, action_id: kr_protocol::ids::ActionId) -> Option<Arc<NodeTask>> {
+        self.nodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&action_id)
+            .cloned()
+    }
+
+    fn end(&self, action_id: kr_protocol::ids::ActionId) {
+        self.nodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&action_id);
+        self.changed.notify_one();
+    }
 }
 
 impl std::fmt::Debug for HostActions {
@@ -327,10 +384,21 @@ impl std::fmt::Debug for HostActions {
 }
 
 impl ActionRunner for HostActions {
+    /// A command's session is closed when its dispatch is asked to stop: the dispatch sees the
+    /// flag, closes the session, and releases what it owned once the closure is recorded.
+    /// Nothing is claimed about what the command did before it stopped.
+    ///
     /// Neither change-set kind can be stopped once it has begun: the change-set service offers no
-    /// point inside a capture or a materialisation to stop at. An action that outlives its wait
-    /// is therefore left unknown, and its dependants pause for review.
-    fn cancel(&self, _dispatch: &Dispatch<'_>) -> kr_automation::Cancellation {
+    /// point inside a capture or a materialisation to stop at. A session that was created for
+    /// the node and is its output stays, and so is not stopped either. An action that outlives its
+    /// wait and cannot be stopped is left unknown, and its dependants pause for review.
+    fn cancel(&self, dispatch: &Dispatch<'_>) -> kr_automation::Cancellation {
+        if kr_automation::definition::runs_a_command(dispatch.node.action_kind)
+            && let Some(task) = self.live.get(dispatch.action_id)
+        {
+            task.cancelled.store(true, Ordering::SeqCst);
+            return kr_automation::Cancellation::Requested;
+        }
         kr_automation::Cancellation::Unsupported
     }
 
@@ -350,6 +418,16 @@ impl ActionRunner for HostActions {
             refused: std::sync::Mutex::new(None),
         };
         let run_id = dispatch.run_id;
+        let node_context = NodeContext {
+            daemon: Arc::clone(&self.daemon),
+            changesets: Arc::clone(&self.changesets),
+            ledger: Arc::clone(&self.ledger),
+            scratch_root: self.scratch_root.clone(),
+            live: Arc::clone(&self.live),
+            run_id,
+            action_id: dispatch.action_id,
+            wait_until_ms: dispatch.wait_until_ms,
+        };
         Box::pin(async move {
             match held.node.action_kind {
                 WorkflowActionKind::CaptureChangeset => {
@@ -377,6 +455,14 @@ impl ActionRunner for HostActions {
                         materialise_version(&changesets, &asked, &held)
                     })
                     .await
+                }
+                WorkflowActionKind::CreateSession => {
+                    create_session_node(node_context, Arc::new(held)).await
+                }
+                // A command runs through a POSIX shell as the root of a session, which this
+                // platform has not.
+                WorkflowActionKind::ShellCommand if !cfg!(windows) => {
+                    command_node(node_context, Arc::new(held)).await
                 }
                 other => {
                     Err(kr_automation::AutomationError::ActionUnavailable { action_kind: other })
@@ -488,6 +574,673 @@ impl kr_changeset::store::StillAdmitted for HeldGrant {
                 }))
             }
         }
+    }
+}
+
+impl HeldGrant {
+    /// Records why a hold refused, in the engine's terms, and answers the refusal the daemon's
+    /// create path is given.
+    ///
+    /// The create reads the refusal as the authority it stood on being gone, and the dispatch
+    /// that asked for it reads the engine's own term back out, so the node pauses as it would
+    /// have if the engine's check had refused it a moment earlier.
+    fn refuse_session(&self, refusal: kr_automation::AutomationError) -> ControllerError {
+        let detail = refusal.to_string();
+        *self
+            .refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(refusal);
+        ControllerError::PermissionDenied { detail }
+    }
+
+    /// The refusal a hold recorded, once.
+    fn take_refusal(&self) -> Option<kr_automation::AutomationError> {
+        self.refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+/// What a dispatch that creates a session needs beside its grant.
+#[derive(Clone)]
+struct NodeContext {
+    daemon: Arc<Daemon>,
+    changesets: Arc<ChangeSetService>,
+    ledger: Arc<ResourceLedger>,
+    scratch_root: PathBuf,
+    live: Arc<LiveNodes>,
+    run_id: kr_protocol::ids::WorkflowRunId,
+    action_id: kr_protocol::ids::ActionId,
+    /// The moment the engine stops waiting for this dispatch, on automation's clock.
+    wait_until_ms: u64,
+}
+
+/// The principal a workflow's sessions are created under: stable, scoped to the definition's
+/// grant, and the same for every run of it.
+fn workflow_principal(grant: GrantId) -> kr_automation::Result<ActorId> {
+    ActorId::new(session_principal(grant)).map_err(|error| {
+        kr_automation::AutomationError::InvalidArgument(format!(
+            "the principal for grant {grant} is not an identifier: {error}"
+        ))
+    })
+}
+
+/// The digest of what a node's create token stands for: the workflow, its revision, the node and
+/// what the node asks for. Nothing in it changes between a run's attempts, so a retry of the same
+/// node after a restart is the same create and never an identifier reused for another one.
+fn node_digest(
+    definition: &WorkflowDefinition,
+    node: &WorkflowNode,
+) -> kr_protocol::scalars::Digest256 {
+    let text = format!(
+        "{}\n{}\n{}\n{}\n{}\n{:?}",
+        definition.workflow_id,
+        definition.revision.get(),
+        node.node_id,
+        node.action_kind.as_str(),
+        node.action_params,
+        node.declared_environment.0,
+    );
+    kr_protocol::scalars::Digest256::from_bytes(kr_cbor::sha256(text.as_bytes()))
+}
+
+/// The admission a node's session stands on, as the daemon's create path asks it under its
+/// registry guard: the node's grant, read as it stands now on both clocks, and then the moment the
+/// engine stops waiting for the node, read after the grant has been decided.
+fn node_admission(
+    controller: &Arc<Controller>,
+    held: &Arc<HeldGrant>,
+    wait_until_ms: u64,
+) -> Arc<dyn Fn(&crate::registry::Registry) -> Result<()> + Send + Sync> {
+    let held = Arc::clone(held);
+    controller.workflow_admission(move || {
+        held.still_authorised()
+            .map_err(|refusal| held.refuse_session(refusal))?;
+        if held.daemon.now_ms() >= wait_until_ms {
+            return Err(
+                held.refuse_session(kr_automation::AutomationError::AuthorityUnavailable(
+                    "the wait for this node ended before its session could start".to_owned(),
+                )),
+            );
+        }
+        Ok(())
+    })
+}
+
+/// What a create that did not produce a session comes to for its node.
+///
+/// A refusal of the authority the create stood on pauses the node, with nothing claimed; a launch
+/// that may still complete is unknown; anything else is a failure of the node, with nothing left
+/// behind to release.
+fn creation_failed(
+    held: &HeldGrant,
+    error: ControllerError,
+) -> kr_automation::Result<ActionOutcome> {
+    if let Some(refusal) = held.take_refusal() {
+        return Err(refusal);
+    }
+    match error {
+        ControllerError::PermissionDenied { detail } => {
+            Err(kr_automation::AutomationError::PermissionDenied(detail))
+        }
+        ControllerError::WindowExpired { detail } => {
+            Err(kr_automation::AutomationError::AuthorityUnavailable(detail))
+        }
+        ControllerError::Uncertain { detail } => Ok(ActionOutcome::Unknown {
+            detail: kr_project::git::redact(&detail),
+        }),
+        other => Ok(ActionOutcome::Failed {
+            error: kr_project::git::redact(&other.to_string()),
+        }),
+    }
+}
+
+/// Creates the session a `create_session` node asks for and leaves it running.
+///
+/// The session is the node's output and belongs to whoever uses it afterwards; the dispatch owns
+/// nothing to release, so it writes no ledger row.
+async fn create_session_node(
+    context: NodeContext,
+    held: Arc<HeldGrant>,
+) -> kr_automation::Result<ActionOutcome> {
+    let controller = context.daemon.get()?;
+    let create: kr_protocol::session::SessionCreateParams =
+        serde_json::from_str(&held.node.action_params)?;
+    let order = crate::service::WorkflowCreate {
+        actor_id: workflow_principal(held.definition.grant_reference)?,
+        token: context.action_id,
+        digest: node_digest(&held.definition, &held.node),
+        create,
+        root: None,
+        admit: node_admission(&controller, &held, context.wait_until_ms),
+    };
+    match controller.workflow_session_create(order).await {
+        Ok(created) => Ok(ActionOutcome::Success {
+            output: NodeOutput::CreateSession {
+                session_id: created.session.session_id,
+            },
+        }),
+        Err(error) => creation_failed(&held, error),
+    }
+}
+
+/// The interpreter a command runs through: a POSIX shell given the command line.
+const COMMAND_INTERPRETER: &str = "/bin/sh";
+
+/// How often a dispatch asks whether its session has closed.
+const CLOSURE_POLL: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// How long a dispatch that was asked to stop waits for its session's closure before it leaves the
+/// rest to the sweep.
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Runs a `shell_command` node: the command is the root of a session of its own, and the node's
+/// result is how that root ended.
+///
+/// What the dispatch will own is written to the ledger before any of it is made. The work then
+/// runs on a task of the daemon's own, so the engine dropping the wait for it, at a deadline or a
+/// cancellation, cannot drop a session in the middle of being created: the task finishes what it
+/// began, closes the session if it was asked to stop, and releases what it owned.
+async fn command_node(
+    context: NodeContext,
+    held: Arc<HeldGrant>,
+) -> kr_automation::Result<ActionOutcome> {
+    let controller = context.daemon.get()?;
+    let params: kr_protocol::automation::ShellCommandParams =
+        serde_json::from_str(&held.node.action_params)?;
+    // Where it runs: the workspace the definition names, which may be a shared checkout because
+    // the definition named it, or a private directory made for this node alone.
+    let workspace_id = held.definition.resource_scope.workspace_id.0;
+    let scratch = match workspace_id {
+        Some(_) => None,
+        None => Some(
+            context
+                .scratch_root
+                .join(context.action_id.get().to_string()),
+        ),
+    };
+    let cwd = match (workspace_id, scratch.as_ref()) {
+        (Some(workspace_id), _) => {
+            let changesets = Arc::clone(&context.changesets);
+            let resolved = blocking(move || changesets.resolve(workspace_id))
+                .await
+                .map_err(|error| {
+                    kr_automation::AutomationError::PermissionDenied(format!(
+                        "the workspace this command runs in cannot be resolved: {}",
+                        kr_project::git::redact(&error.to_string())
+                    ))
+                })?;
+            resolved.path.display().to_string()
+        }
+        (None, Some(scratch)) => scratch.display().to_string(),
+        (None, None) => unreachable!("a command with no workspace has a scratch directory"),
+    };
+    // Registered before anything is written down or made, so no sweep takes the row of a
+    // dispatch that is still running.
+    let task = context.live.begin(context.action_id);
+    let owned = Owned {
+        action_id: context.action_id,
+        run_id: context.run_id,
+        node_id: held.node.node_id.clone(),
+        kind: held.node.action_kind,
+        grant_id: held.definition.grant_reference,
+        owns_session: true,
+        materialisation_id: None,
+        scratch: scratch.as_ref().map(|path| path.display().to_string()),
+        workspace_id,
+        session_id: None,
+        state: OwnedState::Open,
+    };
+    let began = {
+        let ledger = Arc::clone(&context.ledger);
+        let now = context.daemon.now_ms();
+        blocking(move || ledger.begin(&owned, now)).await
+    };
+    if let Err(error) = began {
+        context.live.end(context.action_id);
+        return Err(error);
+    }
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let action_id = context.action_id;
+        let live = Arc::clone(&context.live);
+        let outcome = drive_command(
+            &context,
+            &held,
+            &controller,
+            &task,
+            Command {
+                text: params.command,
+                cwd,
+                scratch,
+                workspace_id,
+            },
+        )
+        .await;
+        live.end(action_id);
+        let _ = sender.send(outcome);
+    });
+    receiver.await.unwrap_or_else(|_| {
+        Ok(ActionOutcome::Unknown {
+            detail: "the task that ran this command ended without saying how it came out"
+                .to_owned(),
+        })
+    })
+}
+
+/// What a command node runs and where.
+struct Command {
+    text: String,
+    cwd: String,
+    scratch: Option<PathBuf>,
+    workspace_id: Option<kr_protocol::ids::WorkspaceId>,
+}
+
+/// Makes the session a command runs as the root of, waits for it to close, and releases what the
+/// dispatch owned.
+async fn drive_command(
+    context: &NodeContext,
+    held: &Arc<HeldGrant>,
+    controller: &Arc<Controller>,
+    task: &Arc<NodeTask>,
+    command: Command,
+) -> kr_automation::Result<ActionOutcome> {
+    let actor_id = workflow_principal(held.definition.grant_reference)?;
+    // The place it runs in exists before the session is asked for.
+    if let Some(scratch) = command.scratch.clone() {
+        let root = context.scratch_root.clone();
+        blocking(move || kr_ipc::paths::create_private_tree(&root, &scratch))
+            .await
+            .map_err(|error| {
+                kr_automation::AutomationError::InvalidArgument(format!(
+                    "the directory this command runs in could not be made: {error}"
+                ))
+            })?;
+    }
+    // A run holds the workspace its node runs in, so a removal waits for it.
+    if let Some(workspace_id) = command.workspace_id {
+        let changesets = Arc::clone(&context.changesets);
+        let run_id = context.run_id;
+        blocking(move || changesets.project().bind_run(workspace_id, run_id, true))
+            .await
+            .map_err(|error| {
+                kr_automation::AutomationError::PermissionDenied(format!(
+                    "the workspace this command runs in cannot be held for the run: {}",
+                    kr_project::git::redact(&error.to_string())
+                ))
+            })?;
+    }
+    let admit = node_admission(controller, held, context.wait_until_ms);
+    // The command may start no later than the moment the engine stops waiting for the node,
+    // expressed on the clock the worker reads too.
+    let remaining = context
+        .wait_until_ms
+        .saturating_sub(context.daemon.now_ms());
+    let not_after = controller.boot_elapsed_ms().saturating_add(remaining);
+    let create = kr_protocol::session::SessionCreateParams {
+        environment_id: context.changesets.environment_id(),
+        presentation: kr_protocol::session::Presentation::Invisible,
+        shell: Nullable::null(),
+        shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+        cwd: Nullable::some(command.cwd),
+        dimensions: Nullable::null(),
+        worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+        environment_snapshot: Vec::new(),
+        palette: Nullable::null(),
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
+        terminal: Nullable::null(),
+    };
+    let order = crate::service::WorkflowCreate {
+        actor_id: actor_id.clone(),
+        token: context.action_id,
+        digest: node_digest(&held.definition, &held.node),
+        create,
+        root: Some(crate::service::HeldRoot {
+            command: kr_protocol::worker::RootCommand {
+                interpreter: COMMAND_INTERPRETER.to_owned(),
+                command: command.text,
+                not_after_boot_ms: kr_protocol::scalars::U64::new(not_after),
+            },
+            workflow: kr_protocol::worker::WorkflowSession {
+                workflow_run_id: context.run_id,
+                node_id: held.node.node_id.clone(),
+            },
+            admit: Arc::clone(&admit),
+        }),
+        admit,
+    };
+    let created = match controller.workflow_session_create(order).await {
+        Ok(created) => created,
+        Err(error) => {
+            // Nothing was made, so there is nothing to wait for; what the dispatch wrote down is
+            // released by the sweep, which finds no session and releases the rest.
+            return creation_failed(held, error);
+        }
+    };
+    let session_id = created.session.session_id;
+    // The session is written down at once and bound to the workspace it runs in: a live session
+    // is a writer there, which a capture that wants the workspace held still has to count.
+    {
+        let ledger = Arc::clone(&context.ledger);
+        let changesets = Arc::clone(&context.changesets);
+        let action_id = context.action_id;
+        let workspace_id = command.workspace_id;
+        let noted = blocking(move || -> kr_automation::Result<()> {
+            ledger.note_session(action_id, session_id)?;
+            if let Some(workspace_id) = workspace_id {
+                changesets
+                    .project()
+                    .bind_session(workspace_id, session_id, true)
+                    .map_err(|error| {
+                        kr_automation::AutomationError::InvalidArgument(format!(
+                            "the session was not bound to its workspace: {}",
+                            kr_project::git::redact(&error.to_string())
+                        ))
+                    })?;
+            }
+            Ok(())
+        })
+        .await;
+        if let Err(error) = noted {
+            eprintln!(
+                "kr-controller: the session of workflow node {} was not written down: {error}",
+                context.action_id.get()
+            );
+        }
+    }
+    let closure = wait_for_closure(context, controller, task, &actor_id, session_id).await;
+    let outcome = match &closure {
+        Some(closure) => command_outcome(closure),
+        None => ActionOutcome::Unknown {
+            detail: "the session this command ran in had not closed when the dispatch stopped \
+                     waiting, so how the command came out is not established"
+                .to_owned(),
+        },
+    };
+    // What the dispatch owned is released once the session's closure accounts for its worker.
+    // Otherwise the row stays open and the sweep keeps looking.
+    if closure
+        .as_ref()
+        .is_some_and(|closure| !left_unaccounted(closure))
+    {
+        release_row(
+            Arc::clone(&context.changesets),
+            Arc::clone(&context.ledger),
+            context.scratch_root.clone(),
+            context.action_id,
+        )
+        .await;
+    }
+    Ok(outcome)
+}
+
+/// Whether a closure could not account for the session's own worker, which may then still write
+/// where the session ran.
+fn left_unaccounted(closure: &kr_protocol::session::ClosureRecord) -> bool {
+    closure
+        .surviving
+        .iter()
+        .any(|resource| resource.kind == crate::archive::UNACCOUNTED_WORKER)
+}
+
+/// Waits for a session's closure, closing the session when its dispatch is asked to stop.
+///
+/// Nothing records a root's exit by itself, so each look asks whether the session's worker has
+/// gone. A dispatch asked to stop closes the session once and then waits a bounded time for the
+/// closure; one that is not recorded in that time is left to the sweep.
+async fn wait_for_closure(
+    context: &NodeContext,
+    controller: &Arc<Controller>,
+    task: &Arc<NodeTask>,
+    actor_id: &ActorId,
+    session_id: kr_protocol::ids::SessionId,
+) -> Option<kr_protocol::session::ClosureRecord> {
+    let mut stop_by: Option<tokio::time::Instant> = None;
+    loop {
+        if stop_by.is_none() && task.cancelled.load(Ordering::SeqCst) {
+            stop_by = Some(tokio::time::Instant::now() + STOP_WAIT);
+            let closed = controller
+                .workflow_session_close(crate::service::WorkflowClose {
+                    actor_id,
+                    run_id: context.run_id,
+                    session_id,
+                    node_action: context.action_id,
+                })
+                .await;
+            if let Err(error) = closed {
+                eprintln!(
+                    "kr-controller: the session of workflow node {} was not closed when its \
+                     dispatch was asked to stop: {error}",
+                    context.action_id.get()
+                );
+            }
+        }
+        match controller.workflow_session_closure(session_id).await {
+            Ok(Some(closure)) => return Some(closure),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!(
+                    "kr-controller: the closure of workflow node {}'s session was not read: \
+                     {error}",
+                    context.action_id.get()
+                );
+            }
+        }
+        if stop_by.is_some_and(|by| tokio::time::Instant::now() >= by) {
+            return None;
+        }
+        tokio::time::sleep(CLOSURE_POLL).await;
+    }
+}
+
+/// What a command node comes to from how its session closed.
+///
+/// A node succeeds only when the command's own root exited normally with status zero. A session
+/// that was closed for another reason, by a request, a crash or the host's shutdown, says nothing
+/// reliable about the command, whatever status it shows.
+fn command_outcome(closure: &kr_protocol::session::ClosureRecord) -> ActionOutcome {
+    use kr_protocol::session::ClosureReason;
+
+    let session_id = closure.session_id;
+    match closure.reason {
+        ClosureReason::RootExit => match closure.root_exit_code.0.map(|code| code.get()) {
+            Some(0) => ActionOutcome::Success {
+                output: NodeOutput::ShellCommand { session_id },
+            },
+            Some(code) => ActionOutcome::Failed {
+                error: format!("the command exited with status {code}"),
+            },
+            None => ActionOutcome::Unknown {
+                detail: "the command's session closed with no exit status recorded".to_owned(),
+            },
+        },
+        ClosureReason::RootSignal => ActionOutcome::Failed {
+            error: match closure.root_signal.0.as_deref() {
+                Some(signal) => format!("the command was ended by signal {signal}"),
+                None => "the command was ended by a signal".to_owned(),
+            },
+        },
+        ClosureReason::RootLaunchFailed => ActionOutcome::Failed {
+            error: "the command could not be started".to_owned(),
+        },
+        reason @ (ClosureReason::CloseRequested
+        | ClosureReason::WorkerCrash
+        | ClosureReason::DesktopLost
+        | ClosureReason::HostShutdown) => ActionOutcome::Unknown {
+            detail: format!(
+                "the command's session closed with reason {}, so how the command came out is not \
+                 established",
+                reason.as_str()
+            ),
+        },
+    }
+}
+
+/// Releases what a dispatch owned and marks its row released: the directory it ran in, and the
+/// run's hold on the workspace it ran in.
+async fn release_row(
+    changesets: Arc<ChangeSetService>,
+    ledger: Arc<ResourceLedger>,
+    scratch_root: PathBuf,
+    action_id: kr_protocol::ids::ActionId,
+) {
+    let released = blocking(move || -> kr_automation::Result<()> {
+        let Some(row) = ledger.get(action_id)? else {
+            return Ok(());
+        };
+        if let Some(scratch) = row.scratch.as_ref() {
+            let path = PathBuf::from(scratch);
+            // Only a directory under the one this host makes them in is removed.
+            if path.starts_with(&scratch_root) {
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(kr_automation::AutomationError::InvalidArgument(format!(
+                            "the directory a command ran in was not removed: {error}"
+                        )));
+                    }
+                }
+            }
+        }
+        if let (Some(workspace_id), Some(session_id)) = (row.workspace_id, row.session_id)
+            && let Err(error) = changesets
+                .project()
+                .bind_session(workspace_id, session_id, false)
+        {
+            return Err(kr_automation::AutomationError::InvalidArgument(format!(
+                "the session's binding to its workspace was not ended: {}",
+                kr_project::git::redact(&error.to_string())
+            )));
+        }
+        if let Some(workspace_id) = row.workspace_id {
+            // The run's hold ends with this node's: a paused run does not keep a workspace.
+            if let Err(error) = changesets
+                .project()
+                .bind_run(workspace_id, row.run_id, false)
+            {
+                return Err(kr_automation::AutomationError::InvalidArgument(format!(
+                    "the run's hold on its workspace was not ended: {}",
+                    kr_project::git::redact(&error.to_string())
+                )));
+            }
+        }
+        ledger.release(action_id)
+    })
+    .await;
+    if let Err(error) = released {
+        eprintln!(
+            "kr-controller: what a workflow command owned was not released, and the sweep will \
+             try again: {error}"
+        );
+    }
+}
+
+impl HostActions {
+    /// Closes and releases what no dispatch of this daemon owns any longer, and answers how many
+    /// dispatches' resources are still owed their release.
+    ///
+    /// A row belongs to its dispatch while the dispatch is running here. After a restart there
+    /// are none, so every row is taken: a session whose command outlived its node is closed, and
+    /// once its closure accounts for its worker the directory, the hold and the row go. A row
+    /// whose session was never made is released. Nothing here waits for the run to end, only for
+    /// the session's closure.
+    pub(crate) async fn sweep(&self, service: &AutomationService) -> usize {
+        let Ok(controller) = self.daemon.get() else {
+            return 0;
+        };
+        let ledger = Arc::clone(&self.ledger);
+        let rows = match blocking(move || ledger.open_rows()).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                eprintln!("kr-controller: the workflow resource ledger was not read: {error}");
+                return 1;
+            }
+        };
+        let mut owed = 0;
+        for row in rows {
+            if self.live.get(row.action_id).is_some() {
+                owed += 1;
+                continue;
+            }
+            let store = Arc::clone(service.store());
+            let (run_id, node_id) = (row.run_id, row.node_id.clone());
+            let running = matches!(
+                blocking(move || store.node_status(run_id, &node_id)).await,
+                Ok(Some(kr_protocol::automation::NodeStatus::Running))
+            );
+            if running {
+                owed += 1;
+                continue;
+            }
+            let Ok(actor_id) = workflow_principal(row.grant_id) else {
+                owed += 1;
+                continue;
+            };
+            let session = if row.owns_session {
+                controller
+                    .workflow_session_of(&actor_id, row.action_id)
+                    .await
+            } else {
+                Ok(None)
+            };
+            match session {
+                Ok(Some(session_id)) => {
+                    match controller.workflow_session_closure(session_id).await {
+                        Ok(Some(closure)) if !left_unaccounted(&closure) => {}
+                        Ok(Some(_)) => {
+                            owed += 1;
+                            continue;
+                        }
+                        Ok(None) => {
+                            // Closed once, with the same request every time, so a close that was
+                            // sent before is answered from its receipt.
+                            let closed = controller
+                                .workflow_session_close(crate::service::WorkflowClose {
+                                    actor_id: &actor_id,
+                                    run_id: row.run_id,
+                                    session_id,
+                                    node_action: row.action_id,
+                                })
+                                .await;
+                            if let Err(error) = closed {
+                                eprintln!(
+                                    "kr-controller: a workflow session its node left behind was \
+                                     not closed: {error}"
+                                );
+                            }
+                            owed += 1;
+                            continue;
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "kr-controller: the closure of a workflow session its node left \
+                                 behind was not read: {error}"
+                            );
+                            owed += 1;
+                            continue;
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!(
+                        "kr-controller: a workflow node's session could not be looked up: {error}"
+                    );
+                    owed += 1;
+                    continue;
+                }
+            }
+            release_row(
+                Arc::clone(&self.changesets),
+                Arc::clone(&self.ledger),
+                self.scratch_root.clone(),
+                row.action_id,
+            )
+            .await;
+        }
+        owed
     }
 }
 
@@ -764,10 +1517,14 @@ pub struct AutomationModule {
     service: Arc<AutomationService>,
     /// The daemon every grant is decided under and every change-set write is held under.
     daemon: Arc<Daemon>,
+    /// The actions the service's runs carry out, held here for the sweep of what they leave.
+    actions: Arc<HostActions>,
     /// The runs recovery resumed, held until execution starts.
     resumed: std::sync::Mutex<Option<Vec<kr_automation::StartedRun>>>,
     /// The trigger dispatcher, once execution has started.
     dispatcher: std::sync::OnceLock<tokio::task::JoinHandle<()>>,
+    /// The sweep of what node dispatches left behind, once execution has started.
+    sweeper: std::sync::OnceLock<tokio::task::JoinHandle<()>>,
     /// How many passes the dispatcher has finished.
     passes: PassCount,
 }
@@ -776,6 +1533,32 @@ impl Drop for AutomationModule {
     fn drop(&mut self) {
         if let Some(dispatcher) = self.dispatcher.get() {
             dispatcher.abort();
+        }
+        if let Some(sweeper) = self.sweeper.get() {
+            sweeper.abort();
+        }
+    }
+}
+
+/// How long the sweep waits before it looks again at resources that are still owed their release.
+const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Releases what node dispatches left behind, for as long as the daemon holds the service.
+///
+/// It looks once when execution starts, which is how a command a stopped daemon left running is
+/// found, and again whenever a dispatch begins or ends. While resources are still owed it looks
+/// again every [`SWEEP_INTERVAL`], so a session that is slow to close is not forgotten; when
+/// nothing is owed it waits for a dispatch and keeps no timer.
+async fn sweep_loop(actions: Arc<HostActions>, service: Arc<AutomationService>) {
+    loop {
+        let owed = actions.sweep(&service).await;
+        if owed == 0 {
+            actions.live.changed.notified().await;
+        } else {
+            tokio::select! {
+                () = actions.live.changed.notified() => {}
+                () = tokio::time::sleep(SWEEP_INTERVAL) => {}
+            }
         }
     }
 }
@@ -939,14 +1722,32 @@ impl AutomationModule {
         let grants: Arc<dyn AuthoritySource> = Arc::new(HostGrants {
             daemon: Arc::clone(&daemon),
         });
+        // What the commands the workflows run own is written down in a ledger of its own, beside
+        // the journal and not in it: the journal's stored format is read by the release before
+        // this one, which a ledger table in it would stop reading.
+        let ledger = {
+            let state_dir = state_dir.clone();
+            tokio::task::spawn_blocking(move || ResourceLedger::open(&state_dir))
+                .await
+                .map_err(|_| ControllerError::RegistryUnavailable {
+                    detail: "the workflow resource ledger could not be opened".to_owned(),
+                })?
+                .map_err(|error| ControllerError::RegistryUnavailable {
+                    detail: kr_project::git::redact(&error.to_string()),
+                })?
+        };
+        let actions = Arc::new(HostActions {
+            changesets,
+            authority: Arc::clone(&grants),
+            daemon: Arc::clone(&daemon),
+            environment_id,
+            ledger: Arc::new(ledger),
+            scratch_root: state_dir.join("workflow-scratch"),
+            live: Arc::new(LiveNodes::default()),
+        });
         let host = Host {
             environment_id,
-            runner: Arc::new(HostActions {
-                changesets,
-                authority: Arc::clone(&grants),
-                daemon: Arc::clone(&daemon),
-                environment_id,
-            }),
+            runner: Arc::clone(&actions) as Arc<dyn ActionRunner>,
             authority: grants,
             clock: Arc::new(DaemonClock(Arc::clone(&daemon))),
             ceilings: Arc::new(DaemonCeilings(Arc::clone(&daemon))),
@@ -980,8 +1781,10 @@ impl AutomationModule {
         Ok(Self {
             service,
             daemon,
+            actions,
             resumed: std::sync::Mutex::new(Some(resumed)),
             dispatcher: std::sync::OnceLock::new(),
+            sweeper: std::sync::OnceLock::new(),
             passes: PassCount::default(),
         })
     }
@@ -1002,6 +1805,12 @@ impl AutomationModule {
     /// has to be up before anything is dispatched. A start that fails before this point has
     /// executed nothing a stopped daemon left behind. Calling it again starts nothing further.
     pub fn start(&self) {
+        self.sweeper.get_or_init(|| {
+            tokio::spawn(sweep_loop(
+                Arc::clone(&self.actions),
+                Arc::clone(&self.service),
+            ))
+        });
         self.dispatcher.get_or_init(|| {
             let resumed = self
                 .resumed

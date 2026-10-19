@@ -14,6 +14,7 @@
 #![cfg(not(windows))]
 
 mod organisation_support;
+mod teardown;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -68,11 +69,14 @@ impl WorkerSupervisor for RefusingSupervisor {
 }
 
 struct Host {
-    _temp: kr_ipc::testing::TempHost,
+    /// The host tree. Whatever workers its daemon started are ended before it goes.
+    _temp: teardown::Tree,
     controller: Arc<Controller>,
     environment_id: EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
+    /// The rendezvous of a daemon that starts workers.
+    rendezvous: Option<tokio::task::JoinHandle<kr_controller::error::Result<()>>>,
     work: tempfile::TempDir,
 }
 
@@ -135,7 +139,7 @@ async fn host() -> Host {
 
 /// A daemon on the clocks the test gives it.
 async fn host_on(clocks: Clocks) -> Host {
-    let temp = kr_ipc::testing::TempHost::create();
+    let temp = teardown::Tree::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let controller = start_daemon(&environment, environment_id, clocks)
@@ -150,6 +154,60 @@ async fn host_on(clocks: Clocks) -> Host {
         environment_id,
         endpoint,
         clients,
+        rendezvous: None,
+        work: tempfile::TempDir::new().expect("a working directory on the internal disk"),
+    }
+}
+
+/// The program `name` built beside this test, which the workspace's own test run builds.
+fn beside_this_test(name: &str) -> PathBuf {
+    let mut directory = std::env::current_exe().expect("the test binary");
+    directory.pop();
+    if directory.file_name().is_some_and(|name| name == "deps") {
+        directory.pop();
+    }
+    let program = directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        program.is_file(),
+        "this test starts {name} and there is none at {}; build it with `cargo build -p {name}`, \
+         or run the whole workspace's tests, which build it",
+        program.display()
+    );
+    program
+}
+
+/// A daemon whose sessions are real: the worker program is the one built beside this test, placed
+/// on the internal disk and started by the platform's own supervisor, and the daemon serves the
+/// rendezvous its workers connect to.
+async fn working_host() -> Host {
+    let temp = teardown::Tree::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let worker = temp.root().join("kr-worker");
+    kr_ipc::testing::place_and_start_once(&beside_this_test("kr-worker"), &worker, &["--version"]);
+    let supervisor = temp.supervisor(kr_controller::supervision::detect());
+    let controller = start_daemon_with(
+        &environment,
+        environment_id,
+        Clocks::system(),
+        supervisor,
+        worker,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+    let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
+    let rendezvous = Listener::bind(&environment.rendezvous_endpoint().expect("an endpoint"))
+        .expect("binds the rendezvous");
+    let rendezvous = tokio::spawn(Arc::clone(&controller).serve_rendezvous(rendezvous));
+    Host {
+        _temp: temp,
+        controller,
+        environment_id,
+        endpoint,
+        clients,
+        rendezvous: Some(rendezvous),
         work: tempfile::TempDir::new().expect("a working directory on the internal disk"),
     }
 }
@@ -161,6 +219,25 @@ async fn start_daemon(
     environment_id: EnvironmentId,
     clocks: Clocks,
 ) -> kr_controller::error::Result<Arc<Controller>> {
+    start_daemon_with(
+        environment,
+        environment_id,
+        clocks,
+        Box::new(RefusingSupervisor),
+        PathBuf::from("/nonexistent/kr-worker"),
+    )
+    .await
+}
+
+/// Starts a daemon on an environment, on `clocks`, launching workers through `supervisor`.
+async fn start_daemon_with(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    environment_id: EnvironmentId,
+    clocks: Clocks,
+    supervisor: Box<dyn WorkerSupervisor>,
+    worker_program: PathBuf,
+) -> kr_controller::error::Result<Arc<Controller>> {
+    let supervisor = std::sync::Mutex::new(Some(supervisor));
     kr_controller::testing::taken_over(|| {
         let secrets = environment.secrets_dir();
         kr_controller::testing::with_git_read_bound(
@@ -179,8 +256,12 @@ async fn start_daemon(
                     }),
                     secret_store: StoreSelection::File,
                     boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-                    supervisor: Box::new(RefusingSupervisor),
-                    worker_program: PathBuf::from("/nonexistent/kr-worker"),
+                    supervisor: supervisor
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                        .unwrap_or_else(|| Box::new(RefusingSupervisor)),
+                    worker_program: worker_program.clone(),
                     build_id: build(),
                     release: "0".to_owned(),
                     shell_packages: None,
@@ -715,22 +796,41 @@ async fn a_revoked_grant_runs_no_workflow() {
     host.clients.abort();
 }
 
+/// The complete parameters of a review node: the reviewer, the version it reads and what it is
+/// asked.
+fn review_params() -> String {
+    serde_json::to_string(&kr_protocol::automation::RequestReviewParams {
+        reviewer_id: kr_protocol::ids::PluginId::new("kalareach/reviewer").expect("a plugin"),
+        version: kr_protocol::changeset::VersionRef {
+            change_set_id: kr_protocol::ids::ChangeSetId::new(Uuid::from_bytes([0x5d; 16])),
+            version: kr_protocol::ids::ChangeSetVersion::new(1),
+        },
+        workspace: WorkspaceKind::Isolated,
+        instructions: kr_protocol::agent::PromptText::new("review this").expect("a prompt"),
+    })
+    .expect("a review node's typed parameters")
+}
+
 /// A node whose kind this host cannot carry out fails. It never reports success for work nobody
-/// did, and it never reports an outcome nobody can establish either: nothing was dispatched.
+/// did, and it never reports an outcome nobody can establish either: nothing was dispatched, and
+/// nothing was made on the way to refusing it, no session and no materialisation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_this_host_cannot_carry_out_fails_rather_than_succeeding() {
     let host = host().await;
     let mut control = client(&host).await;
 
-    host.issue(grant_id(3), &[ActionRight::TerminalInput]);
+    host.issue(
+        grant_id(3),
+        &[ActionRight::AgentPrompt, ActionRight::SessionView],
+    );
     let document = definition(
         workflow_id(3),
         grant_id(3),
-        "tests-on-completion",
+        "review-on-completion",
         WorkflowNode {
-            node_id: "tests".to_owned(),
-            action_kind: WorkflowActionKind::RunTests,
-            action_params: tests_params(),
+            node_id: "review".to_owned(),
+            action_kind: WorkflowActionKind::RequestReview,
+            action_params: review_params(),
             declared_environment: Nullable::null(),
         },
     );
@@ -3700,5 +3800,298 @@ async fn a_workflow_grant_whose_end_could_not_be_written_is_not_answered_as_expi
         "{refused}"
     );
 
+    host.clients.abort();
+}
+
+/// The rights a node that runs a command needs: it types into a shell account, creates its
+/// session, closes it when it settles, and (for a test run) writes a version out.
+const COMMAND_RIGHTS: [ActionRight; 4] = [
+    ActionRight::TerminalInput,
+    ActionRight::SessionCreate,
+    ActionRight::SessionClose,
+    ActionRight::WorkspaceManage,
+];
+
+/// A `shell_command` node that runs `command` in this host's own environment.
+fn command_node(host: &Host, node_id: &str, command: &str) -> WorkflowNode {
+    WorkflowNode {
+        node_id: node_id.to_owned(),
+        action_kind: WorkflowActionKind::ShellCommand,
+        action_params: serde_json::to_string(&kr_protocol::automation::ShellCommandParams {
+            command: command.to_owned(),
+        })
+        .expect("a command node's typed parameters"),
+        declared_environment: Nullable::some(host.environment_id),
+    }
+}
+
+/// A `create_session` node asking for an invisible session in this host's own environment.
+fn create_session_node(host: &Host) -> WorkflowNode {
+    let params = kr_protocol::session::SessionCreateParams {
+        environment_id: host.environment_id,
+        presentation: kr_protocol::session::Presentation::Invisible,
+        shell: Nullable::null(),
+        shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+        cwd: Nullable::some(host.work().display().to_string()),
+        dimensions: Nullable::null(),
+        worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+        environment_snapshot: Vec::new(),
+        palette: Nullable::null(),
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
+        terminal: Nullable::null(),
+    };
+    WorkflowNode {
+        node_id: "session".to_owned(),
+        action_kind: WorkflowActionKind::CreateSession,
+        action_params: serde_json::to_string(&params).expect("a create node's typed parameters"),
+        declared_environment: Nullable::null(),
+    }
+}
+
+/// The node receipts of one run.
+async fn receipts_of(
+    control: &mut LocalClient,
+    document: &WorkflowDefinition,
+    run_id: kr_protocol::ids::WorkflowRunId,
+) -> Vec<kr_protocol::automation::NodeReceiptSummary> {
+    let read: WorkflowReadResult = typed(
+        &control
+            .request(
+                Method::WorkflowRead,
+                &WorkflowReadParams {
+                    workflow_id: Nullable::some(document.workflow_id),
+                    revision: Nullable::some(document.revision),
+                    run_id: Nullable::some(run_id),
+                    causal_root_id: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workflow.read succeeds"),
+    );
+    read.node_receipts
+}
+
+/// Every session the daemon lists, closed ones included.
+async fn all_sessions(control: &mut LocalClient) -> Vec<kr_protocol::session::SessionSummary> {
+    let listed: kr_protocol::session::SessionListResult = typed(
+        &control
+            .request(
+                Method::SessionList,
+                &kr_protocol::session::SessionListParams {
+                    environment_id: Nullable::null(),
+                    include_closed: true,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("session.list succeeds"),
+    );
+    listed.sessions
+}
+
+/// A session, once it has closed.
+async fn closed_session(
+    control: &mut LocalClient,
+    session_id: kr_protocol::ids::SessionId,
+) -> kr_protocol::session::SessionSummary {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if let Some(session) = all_sessions(control)
+            .await
+            .into_iter()
+            .find(|session| session.session_id == session_id && session.closure.0.is_some())
+        {
+            return session;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "session {session_id} has not closed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// The rows of the resource ledger that are still owed their release.
+fn owed_rows(host: &Host) -> i64 {
+    let ledger = rusqlite::Connection::open(
+        host._temp
+            .environment()
+            .state_dir()
+            .join(kr_automation::resources::RESOURCES_DB_NAME),
+    )
+    .expect("opens the resource ledger");
+    ledger
+        .query_row(
+            "SELECT COUNT(*) FROM owned WHERE state = 'open'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("counts the open rows")
+}
+
+/// KR-REQ-25.14 and KR-REQ-18.04: a `shell_command` node runs its command as the root of a session
+/// of its own and reports how that root ended, as the host observed it. A command that exits zero
+/// succeeds and names its session; one that exits with a status fails and says which; and the
+/// session of each closed with that status, labelled as a command's, with nothing left behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_shell_command_node_reports_how_its_command_ended() {
+    let host = working_host().await;
+    let mut control = client(&host).await;
+    host.issue(grant_id(21), &COMMAND_RIGHTS);
+
+    let mut ended = Vec::new();
+    for (number, command) in [(22_u8, "exit 0"), (23, "exit 3")] {
+        let document = definition(
+            workflow_id(number),
+            grant_id(21),
+            "a command",
+            command_node(&host, "command", command),
+        );
+        install(&mut control, &host, &document).await;
+        enable(&mut control, &host, &document).await;
+        let run: WorkflowRunResult = typed(
+            &start(&mut control, &host, &document, "evt-1")
+                .await
+                .expect("the run is admitted"),
+        );
+        let receipts = receipts_of(&mut control, &document, run.run_id).await;
+        ended.push((run.status, receipts));
+    }
+
+    let (status, receipts) = &ended[0];
+    assert_eq!(*status, WorkflowRunStatus::Completed);
+    assert_eq!(receipts[0].status, NodeStatus::Success);
+    let Some(kr_protocol::automation::NodeOutput::ShellCommand { session_id }) =
+        receipts[0].output.0.clone()
+    else {
+        panic!("a command that succeeded names its session: {receipts:?}");
+    };
+    let session = closed_session(&mut control, session_id).await;
+    let closure = session.closure.0.expect("a closed session has its closure");
+    assert_eq!(
+        closure.reason,
+        kr_protocol::session::ClosureReason::RootExit
+    );
+    assert_eq!(closure.root_exit_code.0, Some(U64::new(0)));
+    assert_eq!(
+        session.root,
+        Some(kr_protocol::session::SessionRoot::Command),
+        "a session whose root is a command says so"
+    );
+
+    let (status, receipts) = &ended[1];
+    assert_eq!(*status, WorkflowRunStatus::Failed);
+    assert_eq!(receipts[0].status, NodeStatus::Failed);
+    assert!(receipts[0].output.0.is_none());
+    let sessions = all_sessions(&mut control).await;
+    assert_eq!(sessions.len(), 2, "one session for each command");
+    let failed = sessions
+        .iter()
+        .find(|session| session.session_id != session_id)
+        .expect("the second command's session");
+    let closure = failed.closure.0.clone().expect("it closed");
+    assert_eq!(closure.root_exit_code.0, Some(U64::new(3)));
+
+    assert_eq!(
+        owed_rows(&host),
+        0,
+        "what each dispatch owned has been released"
+    );
+    let scratch = host
+        ._temp
+        .environment()
+        .state_dir()
+        .join("workflow-scratch");
+    assert!(
+        std::fs::read_dir(&scratch).map_or(true, |mut entries| entries.next().is_none()),
+        "the directories the commands ran in are gone"
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-25.15: a `create_session` node creates a session through the daemon's own create path
+/// and leaves it running; the session is the node's output and nothing closes it afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_create_session_node_creates_a_session_that_outlives_its_node() {
+    let host = working_host().await;
+    let mut control = client(&host).await;
+    host.issue(grant_id(24), &[ActionRight::SessionCreate]);
+    let document = definition(
+        workflow_id(24),
+        grant_id(24),
+        "a session",
+        create_session_node(&host),
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+
+    let run: WorkflowRunResult = typed(
+        &start(&mut control, &host, &document, "evt-1")
+            .await
+            .expect("the run is admitted"),
+    );
+    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+    let receipts = receipts_of(&mut control, &document, run.run_id).await;
+    let Some(kr_protocol::automation::NodeOutput::CreateSession { session_id }) =
+        receipts[0].output.0.clone()
+    else {
+        panic!("the node names the session it created: {receipts:?}");
+    };
+
+    // The session is there, running, and a node's end did not close it.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let sessions = all_sessions(&mut control).await;
+    let session = sessions
+        .iter()
+        .find(|session| session.session_id == session_id)
+        .expect("the session is listed");
+    assert!(session.closure.0.is_none(), "{session:?}");
+    assert_eq!(session.root, None, "an ordinary session's root is a shell");
+    assert_eq!(owed_rows(&host), 0, "the node owns nothing to release");
+    host.clients.abort();
+}
+
+/// KR-REQ-25.14 and KR-REQ-25.19: a command that outlives the node's wait is asked to stop, and
+/// its session is closed; nothing is claimed about what it did. A `create_session` node asked to
+/// stop cannot be, so its session survives and the node is left unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_command_that_outlives_its_wait_is_stopped_and_a_created_session_is_not() {
+    let host = working_host().await;
+    let mut control = client(&host).await;
+    host.issue(grant_id(25), &COMMAND_RIGHTS);
+    let mut document = definition(
+        workflow_id(25),
+        grant_id(25),
+        "a long command",
+        command_node(&host, "long", "sleep 120"),
+    );
+    document.deadlines = WorkflowDeadlines {
+        run_deadline_ms: U64::new(60_000),
+        action_wait_ms: U64::new(2_000),
+    };
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+    let run: WorkflowRunResult = typed(
+        &start(&mut control, &host, &document, "evt-1")
+            .await
+            .expect("the run is admitted"),
+    );
+    let receipts = receipts_of(&mut control, &document, run.run_id).await;
+    assert_eq!(receipts[0].status, NodeStatus::Cancelled, "{receipts:?}");
+
+    let sessions = all_sessions(&mut control).await;
+    assert_eq!(sessions.len(), 1);
+    let closed = closed_session(&mut control, sessions[0].session_id).await;
+    assert_eq!(
+        closed.closure.0.expect("closed").reason,
+        kr_protocol::session::ClosureReason::CloseRequested,
+        "the session was closed because the node was asked to stop"
+    );
+    assert_eq!(
+        owed_rows(&host),
+        0,
+        "once the closure was recorded what the dispatch owned was released"
+    );
     host.clients.abort();
 }

@@ -120,13 +120,23 @@ it dispatches and once more where the node's effect begins.
   store is seen there and nothing is written; one that begins while the write commits finishes
   after it. A refusal at any of these points pauses the node and its run exactly as a refusal a
   moment earlier would have, because the effect did not happen.
-* **Each node needs the right its effect needs.** A `shell_command` or `run_tests` node needs
-  `terminal.input`, `create_session` needs `session.create`, `request_review` needs
+* **Each node needs every right its effect needs.** A `shell_command` node creates a session,
+  types into a shell account and closes its session when it settles, so it needs `terminal.input`,
+  `session.create` and `session.close`; a `run_tests` node adds `workspace.manage`, because it
+  writes the version it tests out; `create_session` needs `session.create`, `request_review` needs
   `agent.prompt` and `session.view`, `capture_changeset` needs `changeset.create`,
   `materialize_changeset` needs `workspace.manage`, and `apply_diff` needs `files.apply_diff`.
-  These are the rights the methods that perform the same effects require, so a workflow is not a
-  way around the method a person would otherwise have called, and a view-only invitation cannot
-  obtain terminal input through one.
+  These are the rights the methods that perform the same effects require, and a composite effect
+  needs the rights of all of them, so a workflow is not a way around the method a person would
+  otherwise have called, and a view-only invitation cannot obtain terminal input through one. A
+  definition that was installed under fewer rights pauses at its next dispatch with the refusal
+  naming the right its grant lacks; the grant is never enlarged.
+* **A broad shell grant selects every session.** A node that runs a command does it in a session
+  it creates inside the selected environment, so its grant has to select every session there, at
+  install and at each dispatch: a grant that selects one named session, or none, does not.
+  Definitions installed under such a grant stop at their next dispatch with that refusal. A
+  `create_session` node that names the shell its session runs is held to the same grant, because a
+  named shell runs a program the definition chose.
 * **A device's workflow gets what its grant carries.** Because the grant is held inside the
   change-set service's own transactions, a workflow under a paired device's grant runs the
   change-set nodes that grant's rights allow, under the same hold, and nothing more.
@@ -142,6 +152,45 @@ it dispatches and once more where the node's effect begins.
 
 ## What a node actually does
 
+A node that runs a command, or creates a session, goes through the daemon's own create path, as
+a connection's `session.create` does: the registry's reservation, the environment's session limit,
+the update handover gate, the supervisor. It is not a connection, so it stands on its grant. The
+principal it is attributed to is stable and scoped to the definition's grant, not to the run; the
+create token is the node's journalled action identifier, so a retry after a restart finds the
+session its first attempt made and is never a second one; and the digest that token stands for
+covers only what stays the same for the node. The grant, with the rights above, and the moment the
+engine stops waiting for the node are checked at the launch transition under the registry guard,
+where the session comes into being, and again when the worker claims its launch, which is when the
+command is released to start: a grant withdrawn, or a wait that ended, in between starts nothing.
+The chain's session allowance is spent for each node that creates a session, a command's included.
+
+A `create_session` node creates a session through `session.create`'s own parameters and leaves it
+running; the session is the node's output and belongs to whoever uses it afterwards. A node asked
+to stop cannot stop it, so it is left unknown.
+
+A `shell_command` node runs its command as the root of a session of its own: the worker runs the
+command line through `/bin/sh -c`, with no login or interactive startup and with `SHELL` naming
+that interpreter, in the workspace the definition's scope names (a shared checkout only because
+the definition named it) or in a private directory made for the node. Standard input is the
+session's terminal, so a command that reads it waits for a person or for the node's wait. The
+result is how the root ended, as this host recorded it: a command that exits zero succeeds; one
+that exits with another status, or is ended by a signal, fails and says which; a session that was
+closed for any other reason, by a request, a crash or the host's shutdown, says nothing reliable
+about the command and leaves the node unknown. The session is a session like any other while it
+lives (it is listed, and a person can attach to it), and says in its summary that its root is a
+command. An update that closes sessions closes a running command too. Commands are offered where
+the host has a POSIX shell: a definition that holds one is refused at install on Windows.
+
+When the node's wait or its run's deadline passes, or its run is cancelled, the command's session
+is closed and the node settles cancelled, which says the host stopped asking and nothing about
+what the command did. Everything a command node owns outside the journal (its session, its
+directory, the run's hold on its workspace) is written down in a ledger of its own before any of
+it is made, and released once the session's closure accounts for its worker. A dispatch owns its
+row while it runs; after a restart, or when a dispatch ends without releasing, a sweep closes the
+session, removes the directory, ends the hold and releases the row, without waiting for the run to
+end. The ledger is a store of its own beside the journal, so a release that does not know it reads
+the journal as before.
+
 The host carries out the change-set nodes against the environment's own change-set service. A
 `capture_changeset` node's parameters are the `changeset.capture` method's own typed parameters,
 and a `materialize_changeset` node's are `changeset.materialize`'s, so a node asks for exactly
@@ -150,9 +199,11 @@ records the run that asked for it, whatever the document said, so evidence a lat
 bound to the execution that made it. The node's receipt carries the captured version, or the
 version and the materialisation that holds it.
 
-Every other registered action kind is refused by name. A refusal is not an uncertain outcome:
-nothing was dispatched, so the node failed and its dependants see a failure rather than a result
-nobody produced.
+Every registered action kind this host does not carry out yet (`run_tests`, `request_review`,
+`attention_notice` and `apply_diff`, and the command kinds on a platform without a POSIX shell) is
+refused by name. A refusal is not an uncertain outcome: nothing was dispatched and nothing was
+made on the way to refusing it, so the node failed and its dependants see a failure rather than a
+result nobody produced.
 
 A node that succeeds records its kind's typed output, and a runner that reports an output of
 another kind has not reported this node's success: what its action did is not established, so the
@@ -184,7 +235,7 @@ Install-time validation enforces:
 
 | Kind | Parameters | Output |
 | --- | --- | --- |
-| `shell_command` | `command`, 1 to 16 KiB, run in the node's declared execution environment | the session it ran in |
+| `shell_command` | `command`, 1 to 16 KiB, run in this host's own environment, which the node declares | the session it ran in |
 | `run_tests` | `suite`, 1 to 256 bytes, and the immutable `version` the result binds to | the suite and the version it passed against |
 | `request_review` | the reviewer agent (`reviewer_id`), the immutable `version`, the `workspace` kind of the separate reviewer session, and the `instructions` | the version, the reviewer session and the turn that carried the result |
 | `create_session` | `session.create`'s own parameters, naming this host's environment | the session |
