@@ -120,6 +120,7 @@ fn session() -> SessionSummary {
             closed_at_ms: TimestampMs::new(9_000),
         }),
         environment_sources: None,
+        root: None,
     }
 }
 

@@ -410,6 +410,15 @@ pub struct ForwardedMutation {
     /// [`FORWARDED_SCREEN_BASIS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen_basis: Option<ScreenBasis>,
+    /// The workflow run a `session.close` from a workflow acts for.
+    ///
+    /// A worker admits a close under the workflow ingress only for a session whose launch
+    /// provenance names this run, and admits the field under no other method or ingress.
+    ///
+    /// It is absent from the wire when it is absent, so a mutation without one is byte for byte
+    /// what a worker built before workflows closed their own sessions reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_run_id: Option<crate::ids::WorkflowRunId>,
 }
 
 /// The rights beside a forwarded mutation, as they are encoded and decoded: a set that holds
@@ -675,6 +684,7 @@ mod tests {
                 accepted_deadline_boot_ms: U64::new(5),
                 history: None,
                 screen_basis: None,
+                workflow_run_id: None,
             }))
         };
 
@@ -843,6 +853,7 @@ mod tests {
             accepted_deadline_boot_ms: U64::new(5),
             history,
             screen_basis: None,
+            workflow_run_id: None,
         };
         let limits = kr_cbor::Limits::DEFAULT;
 
@@ -862,9 +873,25 @@ mod tests {
             "an earlier daemon's frame reads as unscoped"
         );
 
+        // A workflow's close names the run it acts for, and a worker of an earlier release cannot
+        // read a frame that does: it is sent only to the worker that started the session.
+        let for_a_run = super::ForwardedMutation {
+            workflow_run_id: Some(crate::ids::WorkflowRunId::new(Uuid::from_bytes([6; 16]))),
+            ..mutation(None)
+        };
+        let bytes = kr_cbor::to_canonical_vec(&for_a_run).expect("encodes");
+        let decoded: super::ForwardedMutation =
+            kr_cbor::from_canonical_slice(&bytes, &limits).expect("decodes");
+        assert_eq!(decoded, for_a_run);
+        assert!(
+            kr_cbor::from_canonical_slice::<Earlier>(&bytes, &limits).is_err(),
+            "an earlier worker cannot read a frame that names a workflow run"
+        );
+
         for basis in [super::ScreenBasis::Pairing, super::ScreenBasis::Share] {
             let based = super::ForwardedMutation {
                 screen_basis: Some(basis),
+                workflow_run_id: None,
                 ..mutation(None)
             };
             let bytes = kr_cbor::to_canonical_vec(&based).expect("encodes");

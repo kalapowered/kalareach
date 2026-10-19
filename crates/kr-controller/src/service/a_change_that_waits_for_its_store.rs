@@ -251,6 +251,7 @@ fn summary(environment_id: EnvironmentId) -> SessionSummary {
         root_process: Nullable::null(),
         closure: Nullable::null(),
         environment_sources: None,
+        root: None,
     }
 }
 

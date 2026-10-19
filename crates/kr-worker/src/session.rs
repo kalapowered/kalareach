@@ -347,6 +347,9 @@ pub struct Session {
     /// Where the variables the root shell is started with came from, which the worker that built
     /// them says before it starts the shell.
     environment_sources: Option<kr_protocol::session::SessionEnvironmentSources>,
+    /// What the root process is, where it is not an interactive shell: a command the host
+    /// started the session to run.
+    root: Option<kr_protocol::session::SessionRoot>,
     owned: Option<OwnedProcesses>,
     /// Writes what the session owns to the journal, off this session's lock, where the journal is
     /// a file.
@@ -629,6 +632,7 @@ impl Session {
             closing_reason: None,
             created_at_ms: kr_ipc::now_ms(),
             environment_sources: None,
+            root: None,
             owned: None,
             owned_writer: None,
             root_exit: None,
@@ -1492,6 +1496,7 @@ impl Session {
             root_process: Nullable(self.root_identity()),
             closure: Nullable(self.closure.clone()),
             environment_sources: self.environment_sources,
+            root: self.root,
         }
     }
 
@@ -1924,6 +1929,12 @@ impl Session {
         sources: kr_protocol::session::SessionEnvironmentSources,
     ) {
         self.environment_sources = Some(sources);
+    }
+
+    /// Says that the root process is a command the host started the session to run, which a
+    /// summary of the session then carries.
+    pub const fn set_root(&mut self, root: kr_protocol::session::SessionRoot) {
+        self.root = Some(root);
     }
 
     /// Where the session's palette came from.

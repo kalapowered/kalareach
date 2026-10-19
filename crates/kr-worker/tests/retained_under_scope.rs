@@ -313,6 +313,7 @@ async fn forward<T: serde::Serialize>(
         accepted_deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms() + 120_000),
         history: grant.history.clone(),
         screen_basis: None,
+        workflow_run_id: None,
     }));
     exchange(daemon, frame, request_id).await
 }

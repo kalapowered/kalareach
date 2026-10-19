@@ -304,6 +304,7 @@ mod tests {
             accepted_deadline_boot_ms: U64::new(1),
             history: None,
             screen_basis: None,
+            workflow_run_id: None,
         }))
     }
 

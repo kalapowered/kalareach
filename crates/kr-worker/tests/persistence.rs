@@ -1191,6 +1191,7 @@ fn summary_with_root(
         root_process: Nullable(root),
         closure: Nullable::null(),
         environment_sources: None,
+        root: None,
     }
 }
 

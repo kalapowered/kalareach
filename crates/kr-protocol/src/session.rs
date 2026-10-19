@@ -720,6 +720,24 @@ pub struct SessionSummary {
     /// running and no journal row of one is still read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_sources: Option<SessionEnvironmentSources>,
+    /// What the session's root process is, when it is not an interactive shell.
+    ///
+    /// Absent from the wire for the shell every ordinary session starts, so a summary of one is
+    /// byte for byte what a release that wrote no such member reads. A workflow node that runs a
+    /// command makes its session's root that command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<SessionRoot>,
+}
+
+/// What a session's root process is, where it is not an interactive shell.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRoot {
+    /// A command line the host started in a shell run non-interactively. The session closes when
+    /// the command ends, and its closure record carries the command's own exit status.
+    Command,
 }
 
 /// Where each of the three things a shell reads first came from, as the worker built its
@@ -1459,6 +1477,7 @@ mod tests {
             root_process: Nullable::null(),
             closure: Nullable::null(),
             environment_sources: None,
+            root: None,
         }
     }
 

@@ -845,6 +845,51 @@ impl<C: Codec> Client<C> {
         grant_rights: &kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>,
         accepted_deadline_boot_ms: kr_protocol::scalars::U64,
     ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
+        self.forward_for(
+            mutation,
+            actor,
+            grant_rights,
+            accepted_deadline_boot_ms,
+            None,
+        )
+        .await
+    }
+
+    /// Passes a workflow's `session.close` of a session it started to the worker that owns it.
+    ///
+    /// The mutation carries the run it acts for, which the worker compares with the run named in
+    /// the session's launch provenance. The actor is the workflow's principal, scoped to its
+    /// grant; the envelope names no grant, because the daemon decided the grant before it sent
+    /// this and a worker holds none.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's error, or a transport failure.
+    pub async fn forward_for_workflow(
+        &mut self,
+        mutation: &MutationRequest,
+        actor: &kr_protocol::actor::ActorEnvelope,
+        workflow_run_id: kr_protocol::ids::WorkflowRunId,
+        accepted_deadline_boot_ms: kr_protocol::scalars::U64,
+    ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
+        self.forward_for(
+            mutation,
+            actor,
+            &kr_protocol::scalars::CanonicalSet::new(),
+            accepted_deadline_boot_ms,
+            Some(workflow_run_id),
+        )
+        .await
+    }
+
+    async fn forward_for(
+        &mut self,
+        mutation: &MutationRequest,
+        actor: &kr_protocol::actor::ActorEnvelope,
+        grant_rights: &kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>,
+        accepted_deadline_boot_ms: kr_protocol::scalars::U64,
+        workflow_run_id: Option<kr_protocol::ids::WorkflowRunId>,
+    ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
         if !kr_protocol::local::may_travel_to_a_worker(grant_rights) {
             return Err(IpcError::RightNotForwarded(
                 kr_protocol::rights::ActionRight::VoiceUse,
@@ -859,6 +904,7 @@ impl<C: Codec> Client<C> {
                 accepted_deadline_boot_ms,
                 history: None,
                 screen_basis: None,
+                workflow_run_id,
             },
         )))
         .await?;

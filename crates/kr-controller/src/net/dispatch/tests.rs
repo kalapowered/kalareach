@@ -309,6 +309,7 @@ async fn no_frame_a_worker_receives_carries_a_voice_right() {
                 accepted_deadline_boot_ms: kr_protocol::scalars::U64::new(u64::MAX),
                 history: None,
                 screen_basis: None,
+                workflow_run_id: None,
             })))
             .await;
         assert!(

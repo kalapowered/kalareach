@@ -892,6 +892,7 @@ mod tests {
             root_process: kr_protocol::scalars::Nullable::null(),
             closure: kr_protocol::scalars::Nullable::null(),
             environment_sources: None,
+            root: None,
         }
     }
 

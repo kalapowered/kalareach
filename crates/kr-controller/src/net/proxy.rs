@@ -353,6 +353,7 @@ impl WorkerProxy {
             accepted_deadline_boot_ms,
             history: vouched.history.cloned(),
             screen_basis,
+            workflow_run_id: None,
         }));
         self.call(request_id, &frame).await
     }

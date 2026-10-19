@@ -792,6 +792,7 @@ impl Viewer {
                     accepted_deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000),
                     history: None,
                     screen_basis: None,
+                    workflow_run_id: None,
                 }));
                 self.call(frame, request_id)
                     .await

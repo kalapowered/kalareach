@@ -1871,6 +1871,7 @@ async fn a_worker_that_withholds_its_attachments(host: &Standalone, session_id: 
             root_process: Nullable::null(),
             closure: Nullable::null(),
             environment_sources: None,
+            root: None,
         },
         endpoint: Nullable::some(endpoint_text.clone()),
         launch_profile: Nullable::null(),

@@ -540,6 +540,7 @@ async fn forwarded_mutation<T: serde::Serialize>(
         accepted_deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000),
         history: None,
         screen_basis: None,
+        workflow_run_id: None,
     }));
     within("the worker's answer", async {
         daemon.send(&mutation).await.expect("writes the mutation");

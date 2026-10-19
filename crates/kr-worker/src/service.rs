@@ -200,6 +200,9 @@ pub struct WorkerService {
     authority: Mutex<Authority>,
     /// What this session's local owner may do, as the control daemon last told this worker.
     gate: Arc<crate::local_gate::LocalGate>,
+    /// The workflow run this session was started for, when a workflow started it. A close under
+    /// the workflow ingress is admitted for this run and no other.
+    workflow_run: std::sync::OnceLock<kr_protocol::ids::WorkflowRunId>,
     /// The serial boundary every mutation and every authority change passes through.
     ///
     /// Checking authority and then acting on it are two operations, and between them a replacement
@@ -567,6 +570,7 @@ impl WorkerService {
             time,
             controller_public_key: binding.controller_public_key,
             gate,
+            workflow_run: std::sync::OnceLock::new(),
             authority: Mutex::new(Authority {
                 accepted_generation: Some(binding.controller_generation),
                 bound_connection: None,
@@ -646,6 +650,14 @@ impl WorkerService {
     pub const fn with_keepalive(mut self, period: std::time::Duration) -> Self {
         self.keepalive = period;
         self
+    }
+
+    /// Records the workflow run this session was started for, from its launch specification.
+    ///
+    /// A forwarded `session.close` under the workflow ingress is admitted only for this run.
+    /// Recorded once: a second call changes nothing.
+    pub fn started_for_workflow(&self, run: kr_protocol::ids::WorkflowRunId) {
+        let _ = self.workflow_run.set(run);
     }
 
     /// Holds the plugin admissions, and the connectors they carry, that this worker read before it
@@ -5163,6 +5175,51 @@ impl WorkerService {
         Ok(())
     }
 
+    /// Why a forwarded mutation's ingress is not one this endpoint serves, when it is not.
+    ///
+    /// The local and paired-device ingresses are served. The workflow ingress is served for one
+    /// method, `session.close`, and only for a session a workflow started: the frame names the run
+    /// it closes for, the run has to be the one in the session's launch provenance, the daemon's
+    /// authenticated controller connection (not a proxy) has to carry it, and it carries no grant,
+    /// because the daemon decided the grant before it forwarded and this worker holds none. The
+    /// workflow is not the local owner and not remote: it is a third kind of caller, and it is
+    /// given nothing beyond closing the session it was started for. The run is a field of no other
+    /// ingress.
+    fn workflow_ingress_refusal(
+        &self,
+        state: &ConnectionState,
+        forwarded: &kr_protocol::local::ForwardedMutation,
+    ) -> Option<ProtocolError> {
+        let refuse = |message: &str| Some(ProtocolError::new(ErrorCode::PermissionDenied, message));
+        match forwarded.actor.ingress {
+            ActorIngress::LocalIpc | ActorIngress::PairedDevice => {
+                if forwarded.workflow_run_id.is_some() {
+                    return refuse("a workflow run is named only by a workflow's own close");
+                }
+                None
+            }
+            ActorIngress::Workflow => {
+                if forwarded.mutation.method != Method::SessionClose.into() {
+                    return refuse(
+                        "a workflow closes the session it started and does nothing else here",
+                    );
+                }
+                if forwarded.actor.grant_id.is_present() || forwarded.mutation.grant_id.is_present()
+                {
+                    return refuse("a workflow's close names no grant: the daemon decided it");
+                }
+                if state.facts.controller_role == ControllerConnectionRole::Proxy {
+                    return refuse("a workflow's close does not travel over a proxy link");
+                }
+                match (forwarded.workflow_run_id, self.workflow_run.get()) {
+                    (Some(named), Some(started_for)) if named == *started_for => None,
+                    _ => refuse("this session was not started for the run that asks to close it"),
+                }
+            }
+            _ => refuse("this endpoint serves the local, paired-device and workflow ingresses"),
+        }
+    }
+
     /// Performs a mutation the control daemon admitted for somebody else.
     ///
     /// The mutation arrives unchanged, so its digest is the caller's, and it is recorded under the
@@ -5206,17 +5263,8 @@ impl WorkerService {
         // serves, because the daemon is the only thing that can authenticate one: an unpaired peer
         // reaches the pairing surface and nothing else, and a plugin, a workflow or a service
         // credential is not something this endpoint admits at all.
-        if !matches!(
-            forwarded.actor.ingress,
-            ActorIngress::LocalIpc | ActorIngress::PairedDevice
-        ) {
-            return failure(
-                forwarded.mutation.request_id,
-                &ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    "this endpoint serves the local and paired-device ingresses",
-                ),
-            );
+        if let Some(refusal) = self.workflow_ingress_refusal(state, forwarded) {
+            return failure(forwarded.mutation.request_id, &refusal);
         }
         // A device envelope names the device, which is what makes the receipt attributable. One
         // that does not is malformed rather than merely unusual.

@@ -164,6 +164,7 @@ fn closed(display: u64) -> SessionSummary {
         closure: Nullable::some(closure(session_id())),
         // An export does not read where the environment came from.
         environment_sources: None,
+        root: None,
     }
 }
 

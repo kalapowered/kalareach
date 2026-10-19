@@ -838,6 +838,8 @@ fn specification(entries: Vec<CommandIntegration>) -> kr_protocol::worker::Worke
         environment_origin: kr_protocol::worker::EnvironmentOrigin::CreatorSnapshot,
         environment_additions: Vec::new(),
         holds_local_access: false,
+        root_command: None,
+        workflow: None,
     }
 }
 

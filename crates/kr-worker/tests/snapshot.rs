@@ -3032,6 +3032,7 @@ async fn forwarded_outcome_for_device<T: serde::Serialize>(
         ),
         history: None,
         screen_basis: basis,
+        workflow_run_id: None,
     }));
     client.send(&frame).await.expect("writes the request");
     loop {

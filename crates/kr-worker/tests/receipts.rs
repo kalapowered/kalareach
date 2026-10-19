@@ -1085,6 +1085,7 @@ async fn a_forwarded_close_sent_again_is_marked_retained_only_on_a_link_that_dec
             accepted_deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms() + 120_000),
             history: None,
             screen_basis: None,
+            workflow_run_id: None,
         }))
     };
 
@@ -1104,6 +1105,130 @@ async fn a_forwarded_close_sent_again_is_marked_retained_only_on_a_link_that_dec
     assert_eq!(retained.outcome, Outcome::Ok(accepted));
 
     // The acceptance is delivered and the closure runs to its end, so the host stops cleanly.
+    authority
+        .confirm_delivery(mutation.action_id)
+        .await
+        .expect("the delivery is confirmed");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        host.service.runtime().wait_closed(),
+    )
+    .await
+    .expect("the closure finishes");
+}
+
+/// A workflow closes the session its run started, and nothing else.
+///
+/// The worker serves the local and paired-device ingresses, and the workflow ingress for one
+/// method, `session.close`, for the run named in the session's launch provenance. The controls come
+/// first, each a close the worker must not do: another run's, one that names no run, one under
+/// another method, one that carries a grant, one from a link that declared itself a proxy, and a
+/// run named by an ingress that is not a workflow's. None of them closes the session; the close of
+/// the right run does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workflow_closes_the_session_its_run_started_and_nothing_else() {
+    let host = host().await;
+    let run = kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([0x21; 16]));
+    host.service.started_for_workflow(run);
+    let mut authority = controller_client(&host).await;
+    let mut proxy = controller_client_declaring(&host, Some(ControllerConnectionRole::Proxy)).await;
+    let mutation = close_mutation(
+        &authority,
+        &host,
+        DEFAULT_MUTATION_TTL.get(),
+        ParamsValue::empty(),
+    );
+    let forwarded = |ingress: kr_protocol::actor::ActorIngress,
+                     named: Option<kr_protocol::ids::WorkflowRunId>,
+                     grant: Option<kr_protocol::ids::GrantId>,
+                     mutation: &MutationRequest| {
+        ControlFrame::Forwarded(Box::new(kr_protocol::local::ForwardedMutation {
+            mutation: mutation.clone(),
+            actor: kr_protocol::actor::ActorEnvelope {
+                actor_id: actor("workflow:grant"),
+                ingress,
+                device_id: Nullable::null(),
+                grant_id: Nullable(grant),
+                grant_revision: Nullable::null(),
+                controller_generation: ControllerGeneration::new(1),
+                connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([8; 16])),
+            },
+            grant_rights: kr_protocol::scalars::CanonicalSet::new(),
+            accepted_deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms() + 120_000),
+            history: None,
+            screen_basis: None,
+            workflow_run_id: named,
+        }))
+    };
+    let refused = |frame: ControlFrame| match frame {
+        ControlFrame::Response(response) => match response.outcome {
+            Outcome::Error(error) => error.code,
+            Outcome::Ok(_) => panic!("the close must be refused"),
+        },
+        other => panic!("a refusal is a plain response, not {other:?}"),
+    };
+    let workflow = kr_protocol::actor::ActorIngress::Workflow;
+    let other_run = kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([0x22; 16]));
+    let mut other_method = mutation.clone();
+    other_method.method = Method::TerminalResize.into();
+    let grant = Some(kr_protocol::ids::GrantId::new(Uuid::from_bytes([9; 16])));
+
+    for (what, frame) in [
+        (
+            "another run's close",
+            forwarded(workflow, Some(other_run), None, &mutation),
+        ),
+        (
+            "a close that names no run",
+            forwarded(workflow, None, None, &mutation),
+        ),
+        (
+            "another method",
+            forwarded(workflow, Some(run), None, &other_method),
+        ),
+        (
+            "a close that carries a grant",
+            forwarded(workflow, Some(run), grant, &mutation),
+        ),
+        (
+            "a run named by the local owner",
+            forwarded(
+                kr_protocol::actor::ActorIngress::LocalIpc,
+                Some(run),
+                None,
+                &mutation,
+            ),
+        ),
+    ] {
+        assert_eq!(
+            refused(answer_to(&mut authority, frame).await),
+            ErrorCode::PermissionDenied,
+            "{what}"
+        );
+    }
+    assert_eq!(
+        refused(answer_to(&mut proxy, forwarded(workflow, Some(run), None, &mutation)).await),
+        ErrorCode::PermissionDenied,
+        "a close over a proxy link"
+    );
+    assert!(
+        host.service.runtime().session().closure().is_none(),
+        "no refused close closed the session"
+    );
+
+    let ControlFrame::Response(accepted) = answer_to(
+        &mut authority,
+        forwarded(workflow, Some(run), None, &mutation),
+    )
+    .await
+    else {
+        panic!("the run that started the session closes it");
+    };
+    assert!(
+        matches!(accepted.outcome, Outcome::Ok(_)),
+        "{:?}",
+        accepted.outcome
+    );
     authority
         .confirm_delivery(mutation.action_id)
         .await
@@ -1291,6 +1416,7 @@ async fn the_host_authorises_against_current_state_and_a_relayed_envelope_grants
         accepted_deadline_boot_ms: U64::new(u64::MAX),
         history: None,
         screen_basis: None,
+        workflow_run_id: None,
     }));
     client.send(&forwarded).await.expect("writes the frame");
     let answer = loop {
@@ -3018,6 +3144,7 @@ async fn a_forwarded_retry_is_answered_after_its_deadline_and_never_first_admitt
             accepted_deadline_boot_ms: U64::new(deadline),
             history: None,
             screen_basis: None,
+            workflow_run_id: None,
         }))
     };
 

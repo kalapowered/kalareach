@@ -5035,6 +5035,7 @@ impl Proxied {
                     accepted_deadline_boot_ms: Self::deadline(),
                     history: None,
                     screen_basis: None,
+                    workflow_run_id: None,
                 },
             )))
             .await

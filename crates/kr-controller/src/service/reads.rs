@@ -530,6 +530,7 @@ fn unresolved_summary(
         closure: Nullable::null(),
         // The registry's rows do not hold where its environment came from.
         environment_sources: None,
+        root: None,
     }
 }
 
@@ -556,6 +557,7 @@ fn closed_summary(
         root_process: Nullable::null(),
         closure: Nullable::some(closure.clone()),
         environment_sources: None,
+        root: None,
     }
 }
 
