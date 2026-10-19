@@ -5261,8 +5261,9 @@ impl WorkerService {
         // The daemon vouches for where the caller entered the host, and the registry decides which
         // ingress may reach which method. A paired device is the one remote ingress a worker
         // serves, because the daemon is the only thing that can authenticate one: an unpaired peer
-        // reaches the pairing surface and nothing else, and a plugin, a workflow or a service
-        // credential is not something this endpoint admits at all.
+        // reaches the pairing surface and nothing else, and a plugin or a service credential is
+        // not something this endpoint admits at all. A workflow is admitted for one method, the
+        // close of the session its run started, and for nothing else.
         if let Some(refusal) = self.workflow_ingress_refusal(state, forwarded) {
             return failure(forwarded.mutation.request_id, &refusal);
         }
