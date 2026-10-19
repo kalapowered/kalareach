@@ -394,6 +394,9 @@ struct SessionState {
     ended: tokio::sync::watch::Sender<bool>,
     /// Raised each time the host refuses a request on the connection as not permitted.
     denied: tokio::sync::Notify,
+    /// The requests whose refusal is not raised: those a holder asks to learn whether the host
+    /// withdrew the connection, whose refusal is its answer and not a new question.
+    unsignalled: std::sync::Mutex<std::collections::BTreeSet<RequestId>>,
     outstanding: AtomicU64,
     max_outstanding: u64,
 }
@@ -482,6 +485,7 @@ impl Session {
             events,
             ended: tokio::sync::watch::channel(false).0,
             denied: tokio::sync::Notify::new(),
+            unsignalled: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             outstanding: AtomicU64::new(0),
             max_outstanding: limits.max_outstanding_mutations.get(),
         });
@@ -592,6 +596,31 @@ impl Session {
         P: Serialize + ?Sized,
         R: kr_protocol::wire::WireMessage,
     {
+        self.read_signalling(method, params, true).await
+    }
+
+    /// Reads as [`Self::read`] does, without raising [`Self::denied`] when the host refuses it as
+    /// not permitted, however late the refusal arrives.
+    ///
+    /// For a holder that asks the host whether it withdrew this connection: the question's own
+    /// refusal is its answer, and must not start the question again.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read`].
+    pub async fn read_unsignalled<P, R>(&self, method: Method, params: &P) -> Result<R>
+    where
+        P: Serialize + ?Sized,
+        R: kr_protocol::wire::WireMessage,
+    {
+        self.read_signalling(method, params, false).await
+    }
+
+    async fn read_signalling<P, R>(&self, method: Method, params: &P, signalling: bool) -> Result<R>
+    where
+        P: Serialize + ?Sized,
+        R: kr_protocol::wire::WireMessage,
+    {
         let entry = method.entry();
         if entry.effect != EffectClass::Read {
             return Err(ClientError::WrongEffect {
@@ -613,7 +642,10 @@ impl Session {
         let params = ParamsValue::from_typed(params)?;
         let mut attempts = Attempts::new();
         loop {
-            match self.send_read(method, entry.version, &params).await? {
+            match self
+                .send_read(method, entry.version, &params, signalling)
+                .await?
+            {
                 Ok(value) => return Ok(value.to_typed()?),
                 Err(error) => {
                     let decision = attempts.decide(Failure::new(error.code), class);
@@ -637,9 +669,17 @@ impl Session {
         method: Method,
         version: kr_protocol::method::MethodVersion,
         params: &ParamsValue,
+        signalling: bool,
     ) -> Result<std::result::Result<ParamsValue, kr_protocol::error::ProtocolError>> {
         let request_id = self.next_request_id();
         let waiter = self.register(request_id)?;
+        if !signalling {
+            self.state
+                .unsignalled
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(request_id);
+        }
         let request = Request {
             request_id,
             method: method.into(),
@@ -1400,8 +1440,14 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
     match frame {
         ControlFrame::Response(response) => {
             let request_id = response.request_id;
+            let unsignalled = state
+                .unsignalled
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&request_id);
             if let Outcome::Error(error) = &response.outcome
                 && error.code == kr_protocol::error::ErrorCode::PermissionDenied
+                && !unsignalled
             {
                 state.denied.notify_one();
             }

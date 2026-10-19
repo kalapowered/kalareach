@@ -553,6 +553,13 @@ fn read_payload(payload: &kr_protocol::envelope::ParamsValue) -> serde_json::Val
         .unwrap_or(serde_json::Value::Null)
 }
 
+/// Waits for the question of whether the host withdrew a connection to end, if one is out.
+async fn question_ended(asking: &mut Option<tauri::async_runtime::JoinHandle<()>>) {
+    if let Some(asking) = asking.as_mut() {
+        let _ = asking.await;
+    }
+}
+
 /// Publishes the session's events to the window until the connection ends, and then says so.
 ///
 /// Every event carries the stream it came from, so a view that is showing one session can ignore
@@ -576,8 +583,8 @@ pub async fn forward_events<R: Runtime>(
             // withdrew what the connection was admitted under refuses everything on it and does
             // not close it, so whether this is that is asked of the host, over another connection,
             // and nothing waits on the answer: events go on being forwarded meanwhile. The
-            // question is asked of one connection at a time, and what it is refused itself, and
-            // what is refused while it is out, is the same answer to it and not a new question.
+            // question is asked one at a time. Its own refusal raises no signal, and what other
+            // requests are refused while it is out is the same answer to it, not a new question.
             () = session.denied(), if asking.is_none() => {
                 let app = app.clone();
                 let session = Arc::clone(&session);
@@ -586,7 +593,7 @@ pub async fn forward_events<R: Runtime>(
                 }));
                 continue;
             }
-            _ = async { if let Some(asking) = asking.as_mut() { let _ = asking.await; } }, if asking.is_some() => {
+            () = question_ended(&mut asking), if asking.is_some() => {
                 asking = None;
                 let _ = tokio::time::timeout(std::time::Duration::ZERO, session.denied()).await;
                 continue;

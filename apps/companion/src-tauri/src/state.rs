@@ -257,8 +257,9 @@ impl AppState {
         let Some(connection) = held else {
             return;
         };
-        // Only the connection to the host on this machine is replaced: nothing replaces a paired
-        // device's, and asking a host it holds no right to manage only draws another refusal.
+        // Only the connection to the host on this machine is replaced. A host this device is paired
+        // with closes each network connection whose registration it withdrew, so the supervision
+        // already sees that end and connects again; nothing here replaces one.
         if Arc::ptr_eq(&connection.session(), session)
             && matches!(connection.standing(), Standing::Owner)
         {

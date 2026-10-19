@@ -164,16 +164,37 @@ impl Listing {
 
 /// What a host lists as its devices, asked over `session`.
 pub(crate) async fn listed(session: &Arc<Session>) -> Listing {
+    let params = DeviceListParams {
+        include_revoked: true,
+    };
     let asked = tokio::time::timeout(
         ANSWER_WITHIN,
-        session.read::<_, DeviceListResult>(
-            Method::DeviceList,
-            &DeviceListParams {
-                include_revoked: true,
-            },
-        ),
+        session.read::<_, DeviceListResult>(Method::DeviceList, &params),
     )
     .await;
+    listing_of(asked)
+}
+
+/// What the host lists of its devices, asked as a question about the connection: a refusal of it
+/// raises nothing on the session, however late it arrives, since it is the answer.
+async fn listed_unsignalled(session: &Arc<Session>) -> Listing {
+    let params = DeviceListParams {
+        include_revoked: true,
+    };
+    let asked = tokio::time::timeout(
+        ANSWER_WITHIN,
+        session.read_unsignalled::<_, DeviceListResult>(Method::DeviceList, &params),
+    )
+    .await;
+    listing_of(asked)
+}
+
+fn listing_of(
+    asked: std::result::Result<
+        std::result::Result<DeviceListResult, ClientError>,
+        tokio::time::error::Elapsed,
+    >,
+) -> Listing {
     match asked {
         Ok(Ok(list)) => Listing::Listed(list),
         Ok(Err(ClientError::Host(refused))) => Listing::of_refusal(refused.code),
@@ -197,7 +218,7 @@ pub(crate) async fn listed_replacing(connection: &Connection, replace: &Replacer
     if !matches!(connection.standing(), Standing::Owner) {
         return listed(&connection.session()).await;
     }
-    let listing = listed(&connection.session()).await;
+    let listing = listed_unsignalled(&connection.session()).await;
     if !matches!(listing, Listing::Refused | Listing::Ended) {
         return listing;
     }

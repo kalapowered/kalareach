@@ -1099,6 +1099,42 @@ async fn a_transient_refusal_of_an_idempotent_read_is_sent_again_and_never_reach
 }
 
 #[tokio::test]
+async fn a_refusal_as_not_permitted_reaches_the_holder_unless_the_read_was_the_question() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    // A read the host refuses as not permitted is raised to the holder of the session.
+    *script.refuse_reads_with.lock().await = Some((ErrorCode::PermissionDenied, 1));
+    session
+        .read::<_, SessionList>(Method::SessionList, &Empty {})
+        .await
+        .expect_err("a refusal");
+    tokio::time::timeout(std::time::Duration::from_secs(5), session.denied())
+        .await
+        .expect("the refusal was raised");
+
+    // A read made to ask whether the host withdrew the connection is refused the same way, and
+    // raises nothing: its refusal is the answer, and must not start the question again.
+    *script.refuse_reads_with.lock().await = Some((ErrorCode::PermissionDenied, 1));
+    session
+        .read_unsignalled::<_, SessionList>(Method::SessionList, &Empty {})
+        .await
+        .expect_err("a refusal");
+    assert!(
+        tokio::time::timeout(std::time::Duration::ZERO, session.denied())
+            .await
+            .is_err(),
+        "nothing was raised for the question's own refusal"
+    );
+
+    session.close();
+    serving.abort();
+}
+
+#[tokio::test]
 async fn a_refusal_that_a_retry_cannot_change_comes_straight_back_with_its_action() {
     let host = side(1, true).await;
     let client = side(2, false).await;

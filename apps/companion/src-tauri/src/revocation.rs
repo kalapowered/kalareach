@@ -334,9 +334,10 @@ struct Seen {
 ///
 /// A feed that was read is the truth, unless something was written after the visit began: a view
 /// that waited for a slow host while a revocation was sent must not take that request back, nor
-/// bring back one a later read found gone. A feed that could not be read says nothing of this computer's requests, so a device it
-/// would show as not asked about keeps the standing the feed last gave it, with the time of that
-/// read, corrected by what the host's own list says now: the screen shows a stale standing and says
+/// bring back one a later read found gone. A feed that could not be read says nothing of this
+/// computer's requests, so a device it would show as not asked about keeps the standing the feed
+/// last gave it, with the time of that read, corrected by what the host's own list says now: the
+/// screen shows a stale standing and says
 /// so, not a device nobody asked anything of.
 fn keep(
     known: &mut BTreeMap<(String, DeviceId), Known>,
@@ -1713,8 +1714,8 @@ mod tests {
     }
 
     /// The feed's own "finished" is kept as that: a kept acknowledgement with no count of workers
-    /// is a finished request that the host's list contradicted, and is shown as it is where the feed
-    /// is read, finished where the host lists the device revoked.
+    /// is a finished request that the host's list contradicted, and is shown as it is where the
+    /// feed is read, finished where the host lists the device revoked.
     #[test]
     fn a_kept_acknowledgement_with_no_count_of_workers_is_the_feeds_finished() {
         let contradicted = DeviceStanding::Acknowledged {
