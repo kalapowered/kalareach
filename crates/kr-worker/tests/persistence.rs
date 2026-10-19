@@ -1195,6 +1195,40 @@ fn summary_with_root(
     }
 }
 
+/// KR-REQ-26.10: the journal of a session whose root is a command holds the session's summary in
+/// the form a release that does not know the marker reads, and the marker in a row of its own,
+/// which this build reads back into the summary.
+#[test]
+fn a_command_sessions_marker_is_kept_apart_from_the_summary_an_earlier_release_reads() {
+    let path = journal_path("command-root");
+    let session_id = fixture_session();
+    let mut summary = summary_with_root(session_id, None);
+    summary.root = Some(kr_protocol::session::SessionRoot::Command);
+    {
+        let mut journal = Journal::open(&path).expect("opens");
+        journal.record_session(&summary).expect("records");
+        assert_eq!(
+            journal.read_session(session_id).expect("reads"),
+            Some(summary.clone()),
+            "this build reads the marker back"
+        );
+    }
+    // What the row of the summary holds is the summary without the marker, which an earlier
+    // release's reader, refusing a member it does not know, accepts.
+    let connection = rusqlite::Connection::open(&path).expect("opens the journal");
+    let stored: Vec<u8> = connection
+        .query_row("SELECT summary FROM session", [], |row| row.get(0))
+        .expect("the summary row");
+    let mut without_marker = summary.clone();
+    without_marker.root = None;
+    assert_eq!(
+        stored,
+        kr_cbor::to_canonical_vec(&without_marker).expect("encodes the summary"),
+        "the summary row is byte for byte the summary of a session whose root is a shell"
+    );
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
 /// Makes a current journal into the one a worker of the build before wrote: no record of what the
 /// session owns, and the version before.
 fn as_version_six(path: &std::path::Path) {

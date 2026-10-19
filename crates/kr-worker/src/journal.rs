@@ -3860,13 +3860,31 @@ impl Journal {
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
     pub fn record_session(&mut self, summary: &kr_protocol::session::SessionSummary) -> Result<()> {
-        let encoded = kr_cbor::to_canonical_vec(summary)
+        // The summary row is the form every release that reads this journal reads, and one of an
+        // earlier release refuses a member it does not know. What the session's root is, where it
+        // is not a shell, is therefore a row of its own, written first so that a summary is never
+        // there without it.
+        let mut stored = summary.clone();
+        let root = stored.root.take();
+        let encoded = kr_cbor::to_canonical_vec(&stored)
             .map_err(|error| unavailable_detail_owned(error.to_string()))?;
+        let session_id = summary.session_id.get();
+        if let Some(root) = root {
+            let root = kr_cbor::to_canonical_vec(&root)
+                .map_err(|error| unavailable_detail_owned(error.to_string()))?;
+            self.connection
+                .execute(
+                    "INSERT INTO session_root (session_id, root) VALUES (?1, ?2)
+                     ON CONFLICT (session_id) DO UPDATE SET root = excluded.root",
+                    params![session_id.as_bytes().as_slice(), root],
+                )
+                .map_err(|error| faulted(&self.health, error))?;
+        }
         self.connection
             .execute(
                 "INSERT INTO session (session_id, summary) VALUES (?1, ?2)
                  ON CONFLICT (session_id) DO UPDATE SET summary = excluded.summary",
-                params![summary.session_id.get().as_bytes().as_slice(), encoded],
+                params![session_id.as_bytes().as_slice(), encoded],
             )
             .map_err(|error| faulted(&self.health, error))?;
         Ok(())
@@ -3890,10 +3908,38 @@ impl Journal {
             )
             .optional()
             .map_err(|error| faulted(&self.health, error))?;
+        let Some(bytes) = encoded else {
+            return Ok(None);
+        };
+        // A record this store returned that this build cannot decode is a store whose content
+        // cannot be trusted, which the archive has to be told about.
+        let mut summary: kr_protocol::session::SessionSummary =
+            kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
+                .map_err(|_| self.corrupt("a stored record cannot be decoded"))?;
+        summary.root = self.read_session_root(session_id)?;
+        Ok(Some(summary))
+    }
+
+    /// Reads what the session's root is where it is not a shell. A journal written before the row
+    /// existed has none, and its sessions are read as they were written: with a shell as root.
+    fn read_session_root(
+        &self,
+        session_id: kr_protocol::ids::SessionId,
+    ) -> Result<Option<kr_protocol::session::SessionRoot>> {
+        if !self.has_table("session_root")? {
+            return Ok(None);
+        }
+        let encoded: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT root FROM session_root WHERE session_id = ?1",
+                params![session_id.get().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| faulted(&self.health, error))?;
         encoded
             .map(|bytes| {
-                // A record this store returned that this build cannot decode is a store whose
-                // content cannot be trusted, which the archive has to be told about.
                 kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
                     .map_err(|_| self.corrupt("a stored record cannot be decoded"))
             })
@@ -4377,6 +4423,10 @@ pub(crate) fn create_current_objects(connection: &Connection) -> rusqlite::Resul
                  CREATE TABLE IF NOT EXISTS session (
                      session_id BLOB PRIMARY KEY,
                      summary    BLOB NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS session_root (
+                     session_id BLOB PRIMARY KEY,
+                     root       BLOB NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS host_events (
                      sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
