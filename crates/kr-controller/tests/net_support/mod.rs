@@ -11,6 +11,7 @@
 
 #![allow(dead_code)]
 
+pub mod environment;
 pub mod pairing;
 pub mod room;
 pub mod worker;
