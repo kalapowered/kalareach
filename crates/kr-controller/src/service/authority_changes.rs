@@ -38,8 +38,8 @@ impl Controller {
     /// Answers an authority change this host already holds a claim on, before freshness is asked
     /// for.
     ///
-    /// Section 9 keeps a receipt readable after the window that admitted it has gone, and a retry of
-    /// a revocation that could not reach its record would otherwise be told its window is gone
+    /// Section 9 keeps a receipt readable after the window that admitted it has gone, and a retry
+    /// of a revocation that could not reach its record would otherwise be told its window is gone
     /// rather than what happened. What the answer is, for each state a claim can be in, is
     /// [`Self::recorded_authority_change`].
     pub(super) async fn retained_authority_answer(
@@ -89,8 +89,8 @@ impl Controller {
     /// Claims one authority change for this attempt, or reads what an earlier attempt's claim
     /// holds.
     ///
-    /// [`crate::grants::ActionClaim::Claimed`] is this attempt's hold: it wrote the claim and is the
-    /// one attempt that may perform the change. Anything else is answered by
+    /// [`crate::grants::ActionClaim::Claimed`] is this attempt's hold: it wrote the claim and is
+    /// the one attempt that may perform the change. Anything else is answered by
     /// [`Self::recorded_authority_change`], and nothing is performed.
     ///
     /// Every method that claims here is one of [`super::RETAINED_AUTHORITY_ANSWERS`], which the
@@ -555,15 +555,25 @@ impl Controller {
         session_id: SessionId,
     ) -> Result<Option<kr_protocol::session::DisplayNumber>> {
         let registry = self.registry.lock().await;
-        Ok(registry
-            .reservation_for_session(session_id)?
-            .filter(|reservation| {
-                !matches!(
-                    reservation.phase,
-                    crate::registry::LaunchPhase::Closed | crate::registry::LaunchPhase::Failed
-                )
-            })
-            .map(|reservation| reservation.display_number))
+        open_number(&registry, session_id)
+    }
+
+    /// The session an invitation shares, when this host holds the invitation for `device_id`.
+    fn invitation_session(
+        &self,
+        invitation_id: kr_protocol::ids::InvitationId,
+        device_id: kr_protocol::ids::DeviceId,
+    ) -> Result<Option<SessionId>> {
+        let grants = self.sharing.grants();
+        let Some(invitation) = grants
+            .invitation(invitation_id)?
+            .filter(|invitation| invitation.recipient_device_id == device_id)
+        else {
+            return Ok(None);
+        };
+        Ok(grants
+            .record(invitation.grant_id)?
+            .and_then(|record| record.session_id))
     }
 
     /// How one device's pairing stands, as this host decides it.
@@ -1252,12 +1262,12 @@ impl Controller {
     /// claimed ([`read_previews`]). A share naming nothing asks nothing.
     ///
     /// The link is taken out of its slot for the exchange and put back only once the exchange is
-    /// whole ([`super::workers::WorkerLink`]); one that fails, runs out of time or is abandoned is closed
-    /// instead, and the worker's lease stops renewing with it, since a link given back part way
-    /// through a request would be read by the next caller as its own answer. The whole of the
-    /// exchange, the wait for the link included, is bounded by
-    /// [`super::workers::WORKER_EXCHANGE`]; running out of time while another operation holds the
-    /// link leaves that operation's link, and the lease, as they were.
+    /// whole ([`super::workers::WorkerLink`]); one that fails, runs out of time or is abandoned is
+    /// closed instead, and the worker's lease stops renewing with it, since a link given back part
+    /// way through a request would be read by the next caller as its own answer. The whole of the
+    /// exchange, the wait for the link included, is bounded by [`super::workers::WORKER_EXCHANGE`];
+    /// running out of time while another operation holds the link leaves that operation's link, and
+    /// the lease, as they were.
     ///
     /// # Errors
     ///
@@ -1334,6 +1344,7 @@ impl Controller {
             });
         };
         let params: kr_protocol::sharing::GrantRedeemParams = parse(&mutation.params)?;
+        let session_id = self.invitation_session(params.invitation_id, device_id)?;
         // Written down before the decision that stands on it, so an invitation that ran out is
         // refused as expired rather than as a reading this host has not recorded.
         let now_ms = self.settled_now_ms();
@@ -1343,7 +1354,22 @@ impl Controller {
             params.invitation_id,
             device_id,
             now_ms,
-            || self.check_admission(&registry, &carried),
+            // Asked after the invitation's own state, so a withdrawn, expired or used invitation
+            // is refused in those words, and with the registry held, so a session cannot close
+            // between the question and the write. A session that is not open is one `grant.held`
+            // does not offer.
+            || {
+                self.check_admission(&registry, &carried)?;
+                match session_id {
+                    Some(session_id) if open_number(&registry, session_id)?.is_none() => {
+                        Err(ControllerError::PermissionDenied {
+                            detail: "the session this invitation shares is no longer open"
+                                .to_owned(),
+                        })
+                    }
+                    _ => Ok(()),
+                }
+            },
             Some(hold),
         );
         drop(registry);
@@ -2885,6 +2911,26 @@ pub(super) fn declaration_answer(
     }
 }
 
+/// The number of a session whose reservation is neither closed nor failed, and none for one that
+/// is not open.
+///
+/// A session this host has no reservation for is not open: it is not one it can tell a device
+/// about.
+fn open_number(
+    registry: &crate::registry::Registry,
+    session_id: SessionId,
+) -> Result<Option<kr_protocol::session::DisplayNumber>> {
+    Ok(registry
+        .reservation_for_session(session_id)?
+        .filter(|reservation| {
+            !matches!(
+                reservation.phase,
+                crate::registry::LaunchPhase::Closed | crate::registry::LaunchPhase::Failed
+            )
+        })
+        .map(|reservation| reservation.display_number))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -3162,8 +3208,9 @@ mod tests {
     }
 
     /// The device's own grant is decided on both clocks at the write: UTC passes the grant's expiry
-    /// while the continuous clock and the admission's deadline are still ahead, and the registration
-    /// is refused with both stores as they were. The control: UTC short of the expiry registers.
+    /// while the continuous clock and the admission's deadline are still ahead, and the
+    /// registration is refused with both stores as they were. The control: UTC short of the expiry
+    /// registers.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_key_registration_whose_devices_grant_ends_in_utc_while_it_waits_is_refused() {
         for lapses in [false, true] {

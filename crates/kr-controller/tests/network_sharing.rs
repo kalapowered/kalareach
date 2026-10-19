@@ -256,8 +256,8 @@ async fn kr_req_25_10_an_expired_invitation_activates_nothing() {
     host.stop().await;
 }
 
-/// KR-REQ-25.10: an invitation of a session that has ended activates nothing, and says so. The
-/// host does not offer such an invitation (`grant.held` leaves it out), so a device that asks for it
+/// KR-REQ-25.10: an invitation of a session that has ended activates nothing, and says so. The host
+/// does not offer such an invitation (`grant.held` leaves it out), so a device that asks for it
 /// anyway is refused in the host's words and not given a grant over a session nobody can reach.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_25_10_an_invitation_of_a_session_that_has_ended_activates_nothing() {

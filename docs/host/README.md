@@ -5627,7 +5627,9 @@ and none of the text the issuer was shown.
 
 An invitation that was withdrawn or has expired activates nothing. Withdrawing one is revoking the
 grant it carries with `grant.revoke`, which settles the invitation as withdrawn in the same commit,
-so cancelling is a complete answer rather than a note beside live authority.
+so cancelling is a complete answer rather than a note beside live authority. An invitation of a
+session that is no longer open activates nothing either: `grant.held` does not offer it, and
+`grant.redeem` refuses it.
 
 **Transfer of control is not a delegation.** The transferring device does not retain any of the
 control it hands over. The recipient receives an active grant over the session named in the plan,
