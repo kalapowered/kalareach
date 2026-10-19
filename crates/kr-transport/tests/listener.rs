@@ -506,3 +506,144 @@ async fn wait_until(mut condition: impl FnMut() -> bool) {
     }
     panic!("the condition never held");
 }
+
+/// A host that takes one control frame, holds its handler there until the test lets it go, and then
+/// takes the next, recording when the listener read each.
+#[derive(Debug)]
+struct SlowHandler {
+    client: PairedPeer,
+    /// When the listener read each frame the handler took, on the host's clock.
+    stamps: std::sync::Mutex<Vec<kr_transport::clock::ContinuousInstant>>,
+    /// Said by the handler once the listener has read a frame the handler has not taken.
+    queued: tokio::sync::Notify,
+    /// Waited for before the handler takes its next frame.
+    go: tokio::sync::Semaphore,
+}
+
+impl PairedDirectory for SlowHandler {
+    fn paired_peer(&self, endpoint_id: &EndpointKey) -> Option<PairedPeer> {
+        (endpoint_id == &self.client.endpoint_id).then_some(self.client)
+    }
+}
+
+impl HostHandler for SlowHandler {
+    fn principal_for(&self, device_id: &DeviceId) -> ActorId {
+        kr_transport::listener::device_principal(device_id)
+    }
+
+    fn authority_revision(&self) -> AuthorityRevision {
+        AuthorityRevision::default()
+    }
+
+    fn pairing_surface(&self) -> Option<Arc<dyn PairingSurface>> {
+        None
+    }
+
+    fn serve(self: Arc<Self>, mut session: AuthorisedSession) -> BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let mut taken = 0;
+            while let Some(received) = session.control.recv().await {
+                self.stamps
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(received.received_at());
+                taken += 1;
+                if taken == 1 {
+                    // The handler is busy. What the client writes next is read by the listener and
+                    // waits here, and this says when it does.
+                    while session.control.queued() == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    self.queued.notify_one();
+                    self.go
+                        .acquire()
+                        .await
+                        .expect("the semaphore is open")
+                        .forget();
+                }
+            }
+        })
+    }
+}
+
+/// KR-REQ-09.16: a control frame is stamped when the listener reads it from the stream, not when
+/// the handler gets to it. A frame that waits behind a handler that is busy with an earlier one has
+/// its requested lifetime measured from its receipt, so the wait spends it.
+#[tokio::test]
+async fn a_control_frame_is_stamped_when_it_is_read_and_not_when_the_handler_reaches_it() {
+    let (host, client) = paired_pair().await;
+    let handler = Arc::new(SlowHandler {
+        client: client.record,
+        stamps: std::sync::Mutex::new(Vec::new()),
+        queued: tokio::sync::Notify::new(),
+        go: tokio::sync::Semaphore::new(0),
+    });
+    let clock = kr_transport::clock::ManualClock::new();
+    let config = ListenerConfig::new(
+        EndpointConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
+            ..EndpointConfig::default()
+        },
+        epochs(),
+        ControllerGeneration::new(1),
+    );
+    let listener = kr_transport::listener::register_with_clock(
+        config,
+        Arc::clone(&host.identity),
+        &host.keys.transport,
+        Arc::clone(&handler),
+        Arc::new(clock.clone()),
+    )
+    .await
+    .expect("a listener");
+    let connection = client
+        .endpoint
+        .connect(listener_addr(&listener), ALPN)
+        .await
+        .expect("a connection");
+    let mut authorised = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect("an authorised connection");
+
+    // The first frame is read and taken, and the handler is busy with it.
+    authorised
+        .control_writer
+        .write_message(&ControlFrame::Event(ControlEvent::Keepalive))
+        .await
+        .expect("writes the first frame");
+    // The second is written at the same reading of the clock, and the listener reads it while the
+    // handler is still busy.
+    authorised
+        .control_writer
+        .write_message(&ControlFrame::Event(ControlEvent::Keepalive))
+        .await
+        .expect("writes the second frame");
+    tokio::time::timeout(Duration::from_secs(60), handler.queued.notified())
+        .await
+        .expect("the listener read the second frame while the handler was busy");
+
+    // The clock moves while the second frame waits, and the handler then takes it.
+    clock.advance(Duration::from_secs(7));
+    handler.go.add_permits(1);
+    wait_until(|| {
+        handler
+            .stamps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+            == 2
+    })
+    .await;
+    let stamps = handler
+        .stamps
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(
+        stamps[1], stamps[0],
+        "the second frame was read at the reading the first was, and not seven seconds later"
+    );
+
+    drop(authorised);
+    listener.shutdown().await;
+}

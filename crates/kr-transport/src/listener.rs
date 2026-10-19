@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::actor::ConnectionActor;
-use crate::clock::{ContinuousClock, SystemContinuousClock};
+use crate::clock::{ContinuousClock, ContinuousInstant, SystemContinuousClock};
 use crate::codec::{FrameReader, FrameWriter};
 use crate::config::EndpointConfig;
 use crate::endpoint::{KEEPALIVE, bind_listener};
@@ -238,8 +238,55 @@ pub trait HostHandler: PairedDirectory + Send + Sync + 'static {
 #[derive(Debug)]
 pub struct ControlChannel {
     writer: Arc<Mutex<FrameWriter>>,
-    frames: tokio::sync::mpsc::Receiver<ControlFrame>,
+    frames: tokio::sync::mpsc::Receiver<ReceivedFrame>,
     lost: Arc<ControlLoss>,
+}
+
+/// A control frame and when the host read it from the stream, on the host's continuous clock.
+///
+/// Section 9 measures a requested lifetime from the receipt of the request. A frame waits in the
+/// connection's queue for a handler that is answering an earlier one, and a lifetime measured from
+/// the moment the handler reaches it would hand back what that wait spent. The stamp is made by the
+/// task that reads the stream, before the frame is queued, and a handler cannot make one.
+#[derive(Debug)]
+pub struct ReceivedFrame {
+    frame: ControlFrame,
+    received_at: ContinuousInstant,
+}
+
+impl ReceivedFrame {
+    /// A frame the stream reader has just read.
+    fn read(frame: ControlFrame, clock: &dyn ContinuousClock) -> Self {
+        Self {
+            received_at: clock.now(),
+            frame,
+        }
+    }
+
+    /// A frame read at `received_at`, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn at(frame: ControlFrame, received_at: ContinuousInstant) -> Self {
+        Self { frame, received_at }
+    }
+
+    /// The frame.
+    #[must_use]
+    pub const fn frame(&self) -> &ControlFrame {
+        &self.frame
+    }
+
+    /// When the host read it, on its continuous clock.
+    #[must_use]
+    pub const fn received_at(&self) -> ContinuousInstant {
+        self.received_at
+    }
+
+    /// The frame and when it was read.
+    #[must_use]
+    pub fn into_parts(self) -> (ControlFrame, ContinuousInstant) {
+        (self.frame, self.received_at)
+    }
 }
 
 impl ControlChannel {
@@ -257,14 +304,23 @@ impl ControlChannel {
         outcome
     }
 
-    /// Returns the next control frame, or `None` once the stream has ended.
+    /// Returns the next control frame and when it was read, or `None` once the stream has ended.
     ///
     /// The stream is read by the connection itself, not by this call: a handler that is waiting on
     /// a worker must not be what decides whether the control stream is still alive. Frames are
     /// queued for the handler up to [`CONTROL_QUEUE_DEPTH`]; a handler that falls that far behind
-    /// loses the connection rather than holding the transport open.
-    pub async fn recv(&mut self) -> Option<ControlFrame> {
+    /// loses the connection rather than holding the transport open. A frame is stamped when it is
+    /// read, whatever the handler is doing then.
+    pub async fn recv(&mut self) -> Option<ReceivedFrame> {
         self.frames.recv().await
+    }
+
+    /// How many frames the reader has read and the handler has not taken yet, for this host's own
+    /// tests, which wait on that rather than on time.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.frames.len()
     }
 
     /// Returns a handle that can send without holding the channel.
@@ -671,6 +727,7 @@ async fn serve_authorised<H: HostHandler>(
         frames_in,
         connection.clone(),
         Arc::clone(&lost),
+        Arc::clone(&state.clock),
     ));
     // While this flag is set the keepalive may issue a window. The guard clears it before it
     // retires the connection, and the keepalive retires any window it issued after the flag was
@@ -821,12 +878,13 @@ pub const CONTROL_QUEUE_DEPTH: usize = 64;
 /// for a handler that is blocked on a worker.
 async fn control_read_loop(
     mut reader: FrameReader,
-    frames: tokio::sync::mpsc::Sender<ControlFrame>,
+    frames: tokio::sync::mpsc::Sender<ReceivedFrame>,
     connection: Connection,
     lost: Arc<ControlLoss>,
+    clock: Arc<dyn ContinuousClock>,
 ) {
     while let Ok(Some(frame)) = reader.read_message::<ControlFrame>().await {
-        match frames.try_send(frame) {
+        match frames.try_send(ReceivedFrame::read(frame, &*clock)) {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 connection.close(CONTROL_LOST.into(), b"the control queue overflowed");

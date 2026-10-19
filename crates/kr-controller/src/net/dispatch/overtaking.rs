@@ -43,7 +43,7 @@ use std::sync::{Arc, PoisonError};
 use kr_protocol::envelope::ControlFrame;
 use kr_protocol::ids::{GrantId, SessionId};
 use kr_protocol::ordering::{self, Judgement, Kind, Sorting};
-use kr_transport::listener::ControlChannel;
+use kr_transport::listener::{ControlChannel, ReceivedFrame};
 
 use super::RemoteConnection;
 use super::decision::Answered;
@@ -59,8 +59,9 @@ pub(super) struct Route {
 /// A key being answered: its answer is made and written, and says whether the connection goes on.
 type KeyAnswering<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 
-/// What a task of the loop reads: the frame that came next, or `None` for the end of the stream.
-type Read = Option<ControlFrame>;
+/// What a task of the loop reads: the frame that came next, with when the listener read it, or
+/// `None` for the end of the stream.
+type Read = Option<ReceivedFrame>;
 
 /// A frame being answered on a task of its own, which ends when this is dropped.
 ///
@@ -152,13 +153,13 @@ impl RemoteConnection {
         self: &Arc<Self>,
         control: &mut ControlChannel,
         backlog: &mut VecDeque<Read>,
-        frame: ControlFrame,
+        received: ReceivedFrame,
     ) -> bool {
         let route = self.fixed_route().await;
-        let overtaken =
-            route.is_some_and(|route| self.order_kind(&frame, route) == Kind::Independent);
+        let overtaken = route
+            .is_some_and(|route| self.order_kind(received.frame(), route) == Kind::Independent);
         let Some(route) = route.filter(|_| overtaken) else {
-            let Some(answer) = self.answer(frame).await else {
+            let Some(answer) = self.answer(received).await else {
                 return false;
             };
             return self.write_answer(answer).await;
@@ -166,7 +167,7 @@ impl RemoteConnection {
 
         let mut ordered = Answering(tokio::spawn({
             let connection = Arc::clone(self);
-            async move { connection.answer(frame).await }
+            async move { connection.answer(received).await }
         }));
         let mut sorting = Sorting::default();
         let mut held: VecDeque<Read> = VecDeque::new();
@@ -196,7 +197,9 @@ impl RemoteConnection {
                         None => control.recv().await,
                     }
                 }, if key.is_none() && sorting.may_read() => {
-                    let kind = next.as_ref().map(|frame| self.order_kind(frame, route));
+                    let kind = next
+                        .as_ref()
+                        .map(|received| self.order_kind(received.frame(), route));
                     match (sorting.judge(kind), next) {
                         (Judgement::Serve, Some(frame)) => {
                             key = Some(Box::pin(self.answer_and_write(frame)));
@@ -222,8 +225,8 @@ impl RemoteConnection {
     }
 
     /// Answers one frame and writes the answer, and says whether the connection goes on.
-    async fn answer_and_write(&self, frame: ControlFrame) -> bool {
-        match self.answer(frame).await {
+    async fn answer_and_write(&self, received: ReceivedFrame) -> bool {
+        match self.answer(received).await {
             Some(answer) => self.write_answer(answer).await,
             None => false,
         }

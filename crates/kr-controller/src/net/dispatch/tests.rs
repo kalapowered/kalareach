@@ -1672,7 +1672,7 @@ async fn a_replacement_daemon_settles_a_devices_retried_close_from_the_workers_r
     );
 
     let answered = connection
-        .answer(ControlFrame::Mutation(Box::new(close)))
+        .answer_now(ControlFrame::Mutation(Box::new(close)))
         .await
         .expect("the retry is answered");
     let ControlFrame::Response(Response {
@@ -1926,7 +1926,7 @@ async fn a_mutation_a_device_sends_is_forwarded_with_the_lease_the_daemon_took_a
         a_draft_holding_an_attachment(controller, world.environment_id, &actor, "lease.bin");
     let boot_before = kr_ipc::clock::boot_elapsed_ms();
     let answer = connection
-        .answer(ControlFrame::Mutation(Box::new(a_prompt_naming(
+        .answer_now(ControlFrame::Mutation(Box::new(a_prompt_naming(
             &world,
             &connection,
             Method::AgentPromptSubmit,
@@ -1981,6 +1981,86 @@ async fn a_mutation_a_device_sends_is_forwarded_with_the_lease_the_daemon_took_a
     let close = all.last().expect("the close was forwarded");
     assert_eq!(close.mutation.method, Method::SessionClose.into());
     assert_eq!(close.lease, None, "a close does not depend on the lease");
+    world.serving.abort();
+}
+
+/// KR-REQ-09.16: a mutation's requested lifetime is measured from when its frame was read from the
+/// stream, and not from when its connection's turn reached it. A close that waited behind an
+/// earlier turn for longer than it asked to live is refused and reaches no worker; the same close
+/// read just now is dispatched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mutation_that_waited_behind_an_earlier_turn_is_given_what_its_receipt_left_it() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+    use kr_transport::listener::ReceivedFrame;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let (continuous, _wall, clocks) = crate::service::net::tests::manual_clocks();
+    let script = Scripted::new();
+    let world = scripted::scripted_on(&script, Some(clocks)).await;
+    let controller = &world.controller;
+    let connection =
+        super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 61));
+    let close = || {
+        let window = connection
+            .windows
+            .issue(connection.connection_id, controller.boot_epoch)
+            .expect("a window");
+        MutationRequest {
+            action_window_id: window.action_window_id,
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+            ..fake::close_request(world.environment_id, world.session_id)
+        }
+    };
+
+    // Read at this reading of the clock, and answered thirty-one seconds later, for a lifetime of
+    // thirty.
+    let read = controller.clock.now();
+    let waiting = close();
+    continuous.advance(std::time::Duration::from_secs(31));
+    let late = connection
+        .answer(ReceivedFrame::at(
+            ControlFrame::Mutation(Box::new(waiting)),
+            read,
+        ))
+        .await
+        .expect("the close is answered");
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Error(error),
+        ..
+    }) = late.frame()
+    else {
+        panic!(
+            "a close that outlived its lifetime waiting is refused: {:?}",
+            late.frame()
+        );
+    };
+    assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
+    assert!(
+        script.forwarded().is_empty(),
+        "and it reached no worker: {:?}",
+        script.forwarded()
+    );
+
+    // The same lifetime, from a frame read now, is a close the worker takes.
+    let prompt = connection
+        .answer_now(ControlFrame::Mutation(Box::new(close())))
+        .await
+        .expect("the close is answered");
+    assert!(
+        matches!(
+            prompt.frame(),
+            ControlFrame::Response(Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        ),
+        "{:?}",
+        prompt.frame()
+    );
+    assert_eq!(script.forwarded().len(), 1);
     world.serving.abort();
 }
 
@@ -2254,7 +2334,7 @@ async fn a_prompt_naming_a_draft_puts_its_attachments_under_the_sessions_retenti
     );
     script.accepts_prompts(true);
     let answer = viewer
-        .answer(ControlFrame::Mutation(Box::new(a_prompt_naming(
+        .answer_now(ControlFrame::Mutation(Box::new(a_prompt_naming(
             &world,
             &viewer,
             Method::AgentPromptSubmit,
@@ -2271,7 +2351,7 @@ async fn a_prompt_naming_a_draft_puts_its_attachments_under_the_sessions_retenti
     let held = a_draft_holding_an_attachment(controller, world.environment_id, &actor, "held.bin");
     let (arrived, go) = script.hold_the_next_prompt();
     {
-        let answering = connection.answer(ControlFrame::Mutation(Box::new(a_prompt_naming(
+        let answering = connection.answer_now(ControlFrame::Mutation(Box::new(a_prompt_naming(
             &world,
             &connection,
             Method::AgentPromptSubmit,
@@ -2307,7 +2387,7 @@ async fn a_prompt_naming_a_draft_puts_its_attachments_under_the_sessions_retenti
     let foreign_draft = an_empty_draft(controller, world.environment_id, &actor);
     let foreign_draft = bound_to_a_draft(controller, &actor, &foreign_draft, &foreign).draft_id;
     let answer = connection
-        .answer(ControlFrame::Mutation(Box::new(a_prompt_naming(
+        .answer_now(ControlFrame::Mutation(Box::new(a_prompt_naming(
             &world,
             &connection,
             Method::AgentPromptSubmit,
@@ -2325,7 +2405,7 @@ async fn a_prompt_naming_a_draft_puts_its_attachments_under_the_sessions_retenti
         a_draft_holding_an_attachment(controller, world.environment_id, &actor, "refused.bin");
     script.accepts_prompts(false);
     let answer = connection
-        .answer(ControlFrame::Mutation(Box::new(a_prompt_naming(
+        .answer_now(ControlFrame::Mutation(Box::new(a_prompt_naming(
             &world,
             &connection,
             Method::AgentPromptSubmit,
@@ -2342,7 +2422,7 @@ async fn a_prompt_naming_a_draft_puts_its_attachments_under_the_sessions_retenti
         a_draft_holding_an_attachment(controller, world.environment_id, &actor, "queued.bin");
     script.accepts_prompts(true);
     let answer = connection
-        .answer(ControlFrame::Mutation(Box::new(a_prompt_naming(
+        .answer_now(ControlFrame::Mutation(Box::new(a_prompt_naming(
             &world,
             &connection,
             Method::AgentPromptQueue,
@@ -2374,7 +2454,7 @@ async fn a_prompt_naming_a_draft_puts_its_attachments_under_the_sessions_retenti
     // A draft this device does not hold has nothing for this host to retain, and is no failure of
     // a prompt the worker takes.
     let answer = connection
-        .answer(ControlFrame::Mutation(Box::new(a_prompt_naming(
+        .answer_now(ControlFrame::Mutation(Box::new(a_prompt_naming(
             &world,
             &connection,
             Method::AgentPromptSubmit,
@@ -3416,7 +3496,7 @@ async fn a_paired_prompt_whose_admission_lapses_before_its_draft_is_recorded_rec
         async {
             answered = Some(
                 connection
-                    .answer(ControlFrame::Mutation(Box::new(prompt)))
+                    .answer_now(ControlFrame::Mutation(Box::new(prompt)))
                     .await
                     .expect("the prompt is answered"),
             );
@@ -3508,7 +3588,7 @@ async fn a_prompt_whose_deadline_passes_before_its_draft_is_recorded_records_not
     lapsing_before_the_record(controller, past_it, async {
         answered = Some(
             connection
-                .answer(ControlFrame::Mutation(Box::new(prompt)))
+                .answer_now(ControlFrame::Mutation(Box::new(prompt)))
                 .await
                 .expect("the prompt is answered"),
         );
@@ -3730,7 +3810,7 @@ async fn kr_req_10_49_a_retried_close_is_answered_and_the_kept_answer_is_settled
     );
 
     let answered = connection
-        .answer(ControlFrame::Mutation(Box::new(close)))
+        .answer_now(ControlFrame::Mutation(Box::new(close)))
         .await
         .expect("the retry is answered");
     let ControlFrame::Response(Response {
@@ -3787,7 +3867,7 @@ async fn kr_req_10_49_a_kept_close_result_that_does_not_read_is_refused_not_pass
     ));
     script.kept(close.action_id, unreadable);
     let answered = connection
-        .answer(ControlFrame::Mutation(Box::new(close)))
+        .answer_now(ControlFrame::Mutation(Box::new(close)))
         .await
         .expect("the retry is answered");
     let error = error_of(answered.frame());
@@ -3847,7 +3927,7 @@ async fn kr_req_10_49_a_kept_result_is_not_shown_to_a_device() {
         ),
     );
     let answered = connection
-        .answer(ControlFrame::Mutation(Box::new(prompt)))
+        .answer_now(ControlFrame::Mutation(Box::new(prompt)))
         .await
         .expect("the retry is answered");
     assert!(
@@ -3910,7 +3990,7 @@ async fn kr_req_10_49_a_kept_answer_that_does_not_read_in_the_workers_level_is_r
             ),
         );
         let answered = connection
-            .answer(ControlFrame::Mutation(Box::new(prompt)))
+            .answer_now(ControlFrame::Mutation(Box::new(prompt)))
             .await
             .expect("the retry is answered");
         if readable {
@@ -3987,7 +4067,7 @@ async fn kr_req_23_34_a_close_is_made_for_a_caller_that_may_not_read_its_receipt
             );
         }
         let answered = connection
-            .answer(ControlFrame::Mutation(Box::new(close)))
+            .answer_now(ControlFrame::Mutation(Box::new(close)))
             .await
             .expect("the close is answered");
         assert_eq!(
@@ -4217,7 +4297,7 @@ async fn kr_req_23_34_an_owner_confirmation_names_no_session_at_a_paired_door() 
         let named = device_mutation(&world, &connection, method, 72, ParamsValue::empty());
         assert!(named.target.session_id.is_present());
         let answered = connection
-            .answer(ControlFrame::Mutation(Box::new(named)))
+            .answer_now(ControlFrame::Mutation(Box::new(named)))
             .await
             .expect("answered");
         let ControlFrame::Response(Response {
@@ -4326,7 +4406,7 @@ async fn kr_req_23_34_a_retry_of_an_action_other_than_a_close_is_refused_to_a_ca
         ),
     );
     let answered = connection
-        .answer(ControlFrame::Mutation(Box::new(prompt)))
+        .answer_now(ControlFrame::Mutation(Box::new(prompt)))
         .await
         .expect("the retry is answered");
     let error = error_of(answered.frame());
@@ -4550,7 +4630,7 @@ async fn a_retry_answered_from_the_workers_receipt_is_refused_when_a_fence_lands
 
     let (arrived, release) = controller.pause_retained_lookup();
     let (answered, ()) = tokio::join!(
-        connection.answer(ControlFrame::Mutation(Box::new(close))),
+        connection.answer_now(ControlFrame::Mutation(Box::new(close))),
         async {
             tokio::time::timeout(std::time::Duration::from_secs(30), arrived)
                 .await

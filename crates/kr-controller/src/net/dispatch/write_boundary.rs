@@ -1122,7 +1122,7 @@ async fn an_answer_whose_lease_ran_out_is_answered_with_its_refusal() {
             Box::new(Arc::clone(&recording)),
         );
         let answered = connection
-            .answer(ControlFrame::Request(kr_protocol::envelope::Request {
+            .answer_now(ControlFrame::Request(kr_protocol::envelope::Request {
                 request_id: kr_protocol::ids::RequestId::new(1),
                 method: Method::SessionList.into(),
                 method_version: kr_protocol::method::MethodVersion::V1,
@@ -1191,7 +1191,7 @@ async fn a_response_is_not_written_under_a_lease_installed_after_its_own_ended()
             Box::new(Arc::clone(&recording)),
         );
         let answered = connection
-            .answer(ControlFrame::Request(listing(1)))
+            .answer_now(ControlFrame::Request(listing(1)))
             .await
             .expect("an answer");
         if renewed_in_time {

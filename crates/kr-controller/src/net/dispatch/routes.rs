@@ -197,16 +197,27 @@ impl Unserved {
 }
 
 impl RemoteConnection {
-    /// Answers one frame from the device.
+    /// Answers one frame from the device, which the listener read when `received` says.
+    ///
+    /// A mutation's requested lifetime is measured from then: the frame can have waited behind
+    /// the answer to an earlier one, and section 9 measures from its receipt, not from the moment
+    /// this turn begins.
     ///
     /// Returns `None` for a frame that does not belong on this ingress, which ends the connection:
     /// the union is closed so that a receiver can name what arrived, and naming it is only worth
     /// anything if it then refuses it.
-    pub async fn answer(&self, frame: ControlFrame) -> Option<Answered> {
+    pub async fn answer(
+        &self,
+        received: kr_transport::listener::ReceivedFrame,
+    ) -> Option<Answered> {
         let mut asked = None;
+        let (frame, received_at) = received.into_parts();
         let frame = match frame {
             ControlFrame::Request(request) => self.read_decided(&request, &mut asked).await,
-            ControlFrame::Mutation(mutation) => self.mutate_decided(&mutation, &mut asked).await,
+            ControlFrame::Mutation(mutation) => {
+                self.mutate_decided(&mutation, &mut asked, received_at)
+                    .await
+            }
             // A host does not call a client, and none of the daemon's own local frames belongs on
             // a network ingress. They are named rather than swept up, so a variant added later has
             // to be decided here.
@@ -254,6 +265,17 @@ impl RemoteConnection {
             | ControlFrame::DesktopChecksAnswer(_) => return None,
         };
         Some(Answered { frame, asked })
+    }
+
+    /// Answers one frame that has just arrived, for a test that asks for no more than the answer.
+    #[cfg(test)]
+    pub(super) async fn answer_now(&self, frame: ControlFrame) -> Option<Answered> {
+        let received_at = self.controller.clock.now();
+        self.answer(kr_transport::listener::ReceivedFrame::at(
+            frame,
+            received_at,
+        ))
+        .await
     }
 
     /// Serves one read, for a test that asks for no more than the answer.
@@ -490,7 +512,8 @@ impl RemoteConnection {
     /// Serves one mutation, for a test that asks for no more than the answer.
     #[cfg(test)]
     pub(super) async fn mutate(&self, mutation: &MutationRequest) -> ControlFrame {
-        self.mutate_decided(mutation, &mut None).await
+        let received_at = self.controller.clock.now();
+        self.mutate_decided(mutation, &mut None, received_at).await
     }
 
     /// Serves one mutation, and keeps the decision it was taken under in `asked`.
@@ -498,13 +521,14 @@ impl RemoteConnection {
         &self,
         mutation: &MutationRequest,
         asked: &mut Option<Asked>,
+        received_at: kr_transport::clock::ContinuousInstant,
     ) -> ControlFrame {
-        // Section 9 measures a requested lifetime from *receipt* time, so it is read here, before
-        // the first thing that can wait. Everything between this and the envelope check can take
-        // time — the registry's lock, a retained lookup, a worker's answer about a receipt — and
-        // deriving the deadline from a reading taken after those waits would hand a request its
-        // whole lifetime back after it had already spent part of it.
-        let received_at = self.controller.clock.now();
+        // Section 9 measures a requested lifetime from *receipt* time, which is when the listener
+        // read the frame ([`kr_transport::listener::ReceivedFrame`]), before anything that can
+        // wait: the frame's wait behind an earlier turn of this connection, the registry's lock, a
+        // retained lookup, a worker's answer about a receipt. Deriving the deadline from a reading
+        // taken after those waits would hand a request its whole lifetime back after it had
+        // already spent part of it.
         let entry = match self.admit(mutation.method.as_str(), mutation.method_version) {
             Ok(entry) => entry,
             Err(error) => return failure(mutation.request_id, error),

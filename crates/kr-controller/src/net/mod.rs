@@ -639,7 +639,7 @@ impl NetworkHost {
         // What the loop has read of the device's stream and not yet served, in the order sent: the
         // frames a key went ahead of that were read while a request was answered. `None` stands for
         // the end of the stream.
-        let mut backlog: std::collections::VecDeque<Option<kr_protocol::envelope::ControlFrame>> =
+        let mut backlog: std::collections::VecDeque<Option<kr_transport::listener::ReceivedFrame>> =
             std::collections::VecDeque::new();
         loop {
             // The relay stopping ends this connection. It stops when its link to the worker went,
