@@ -11,7 +11,10 @@ name: release-checks
 # build. `clean-checkout` reads the tree and its whole history from a clone of its own: no tracked
 # file names a record kept outside the repository, every commit is one subject line, every relative
 # Markdown link resolves, and the `.gitignore`'s local workspace section ignores each assistant
-# instruction name. Each check is put through a planted fault before it is trusted with the tree.
+# instruction name. `outgoing-records` reads what a push or a pull request would send: every commit
+# of the range, so a record added in one commit and deleted in the next is still found, and every
+# file each public npm package would carry. Each check is put through a planted fault before it is
+# trusted with the tree.
 on:
   push:
     branches: ["main"]
@@ -58,6 +61,43 @@ jobs:
 
       - name: Check the commit from a clean clone
         run: bash scripts/check-clean-checkout.sh --no-steps
+
+  # KR-GOAL-32: the commits being sent and the published packages' file lists contain no local-only
+  # record, credential or build-agent instruction file. The history comes whole because a push names
+  # the commit it replaced and a pull request the branch it merges into. Packing runs the steps the
+  # real pack runs, which generate most of what the protocol package carries, so the packages'
+  # dependencies are installed first.
+  outgoing-records:
+    name: no outgoing commit or package carries a record
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the whole history
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 11.14.0
+
+      - name: Install Node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.1
+          cache: pnpm
+
+      - name: Install the packages' dependencies
+        run: pnpm install --frozen-lockfile --filter @kalareach/protocol --filter @kalareach/plugin-sdk
+
+      - name: Test the refusals
+        run: python3 scripts/check-outgoing-records.py self-test
+
+      - name: Check the commits and the packages
+        env:
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+        run: python3 scripts/check-outgoing-records.py check
 
   mobile-graph:
     name: the companion links no host crate
