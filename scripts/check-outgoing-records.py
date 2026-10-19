@@ -106,16 +106,55 @@ ALLOWED = (".env.example",)
 # Shapes that are a credential wherever they appear. Narrow on purpose: a check that guessed at what
 # a secret looks like would refuse a release for a string in a dependency.
 PEM_HEADER = re.compile(rb"-----BEGIN ((?:[A-Z0-9]+ )*)PRIVATE KEY( BLOCK)?-----")
-# What follows a private key's header: what a key written out as source text has between its lines
+# A key is told by what its body is, not by how it is laid out. The body of every unencrypted
+# private key is the base64 of a DER SEQUENCE (the bytes 0x30 and a length, which read `M` and a
+# letter from `A` to `P`), of an OpenSSH key (`b3Bl`, from "openssh-key-v1") or, for a PGP block,
+# of a packet tag (`l`); an encrypted traditional key says so in its `Proc-Type` and `DEK-Info`
+# header lines, and a PGP block may carry `Version` lines first. So the
+# text after a header is read past what a key written out as source text has between its lines
 # (white space, escaped line breaks, a backslash that continues a string, quotes, joiners, commas,
-# comment markers including `///` and `//!`) and optional `Name: value` header lines (an encrypted
-# key's `Proc-Type`), then a body: a run of base64 of 32 or more, or two runs of 16 or more with
-# only that between them, which is a key wrapped in short lines. A quoted header followed by code
-# or prose does not read as a key: the first word ends the run, and one identifier of 16 letters
-# or more is not two runs. Every item of the loop is decided by its first character, so the match
-# takes time in proportion to the window and no more; keep it so.
-_BETWEEN = rb"(?:\s|\\[rnt\\]|\\\r?\n|[\"'`+,;#*/!]|[A-Za-z-]+: [^\r\n\\]*(?:\r?\n|\\r|\\n))"
-PEM_BODY = re.compile(rb"\A" + _BETWEEN + rb"*[A-Za-z0-9+/]{16,}" + _BETWEEN + rb"*[A-Za-z0-9+/]{16,}")
+# comment markers including `///` and `//!`), and the body is that signature followed by 16
+# characters of base64 in all, wherever the source text breaks them. A quoted header followed by
+# code or prose does not read as a key. The read goes forward one item at a time and never back,
+# so its time is in proportion to the window; keep it so.
+LAYOUT = re.compile(rb"\s+|\\+(?:[rnt/]|\r?\n)|[\"'`+,;#*/!]+")
+NAME_LINE = re.compile(rb"[A-Za-z-]+: [^\r\n\\]*(?:\r?\n|\\r|\\n)")
+ENCRYPTED_LINE = re.compile(rb"(?:Proc-Type|DEK-Info): ")
+BASE64 = re.compile(rb"[A-Za-z0-9+/]+")
+BODY_START = re.compile(rb"M[A-P]|b3Bl")
+PGP_BODY_START = re.compile(rb"l")
+BODY_CHARACTERS = 16
+KEY_WINDOW = 8192
+
+
+def key_body_follows(window, pgp):
+    """Whether the text after a private key's header is the body of a key."""
+    position = 0
+    encrypted = False
+    while True:
+        item = NAME_LINE.match(window, position)
+        if item is not None:
+            encrypted = encrypted or ENCRYPTED_LINE.match(item.group()) is not None
+        else:
+            item = LAYOUT.match(window, position)
+        if item is None:
+            break
+        position = item.end()
+    start = PGP_BODY_START if pgp else BODY_START
+    if not encrypted and start.match(window, position) is None:
+        return False
+    seen = 0
+    while seen < BODY_CHARACTERS:
+        run = BASE64.match(window, position)
+        if run is not None:
+            seen += len(run.group())
+            position = run.end()
+            continue
+        item = LAYOUT.match(window, position)
+        if item is None:
+            break
+        position = item.end()
+    return seen >= BODY_CHARACTERS
 LIVE_KEY = re.compile(rb"\bsk_live_[0-9A-Za-z]{20,}")
 WEBHOOK_SECRET = re.compile(rb"\bwhsec_[0-9A-Za-z]{20,}")
 
@@ -157,7 +196,8 @@ def refused_contents(data):
     """What a file holds that is a credential, one description each."""
     found = []
     for header in PEM_HEADER.finditer(data):
-        if PEM_BODY.match(data[header.end() : header.end() + 8192]):
+        pgp = b"PGP" in (header.group(1) or b"")
+        if key_body_follows(data[header.end() : header.end() + KEY_WINDOW], pgp):
             found.append("a private key")
             break
     if LIVE_KEY.search(data):
@@ -699,6 +739,13 @@ def cases(scratch, expect):
         + "\n".join(key_body[i : i + 16] for i in range(0, len(key_body), 16))
         + "\n",
         "src/encrypted.pem.txt": f"{header}\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123456789ABCDEF\n\n{key_body}\n",
+        "src/eight.js": f'const K = "{header}\\n" + "{key_body[:8]}" + "{key_body[8:]}";\n',
+        "src/uneven.js": f'const K = "{header}\\n" +\n  "{key_body[:24]}" +\n  "{key_body[24:32]}" +\n  "{key_body[32:]}\\n";\n',
+        "src/commented-short.rs": f"// {header}\n" + "".join(f"// {key_body[i : i + 24]}\n" for i in range(0, len(key_body), 24)),
+        "src/php.json": '{"k":"' + header + "\\n" + key_body[:10] + "\\/" + key_body[10:] + '\\n"}\n',
+        "src/openssh.txt": planted("-----", "BEGIN OPENSSH PRIVATE KEY", "-----") + "\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB\n",
+        "src/pgp.asc": planted("-----", "BEGIN PGP PRIVATE KEY BLOCK", "-----") + "\n\nlQOYBGPexampleexampleexampleexampleexample\n",
+        "src/pgp-version.asc": planted("-----", "BEGIN PGP PRIVATE KEY BLOCK", "-----") + "\nVersion: Example 1.0\n\nlQOYBGPexampleexampleexampleexampleexample\n",
     }
     fx = Fixture(scratch)
     for path, text in shapes.items():
@@ -720,7 +767,11 @@ def cases(scratch, expect):
     fx.write("docs/prose.md", f"The file starts with {header} and then carries the base64 text.\n")
     fx.write("src/call.js", f'const marker = "{header}";\nvalidatePrivateKey(marker);\n')
     fx.write("src/name.js", f"const marker = '{header}\\n' + base64PrivateKey;\n")
-    fx.write("docs/long.md", f"Quoting {header} in internationalization notes is not a key.\n")
+    fx.write("docs/long.md", f"Quoting {header} internationalization notes is not a key.\n")
+    fx.write("docs/note.md", f"{header}\nNote: the internationalization of the notes follows here\ninternationalizationofthenotes\n")
+    fx.write("src/bang.js", f'const marker = "{header}";\n!validatePrivateKeyAndCertificateChain(marker);\n')
+    fx.write("src/digest.rs", f'const H: &str = "{header}"; const D: &str = "{"a1" * 32}";\n')
+    fx.write("src/table.rs", f'let x = "{header}"; MAPPINGTABLE.get(1);\n')
     head = fx.commit("Quote a header")
     status, output = fx.run("--range", f"{fx.base}..{head}")
     expect("a private key header with no body after it, quoted or in prose, is not a key", status == 0, output)
