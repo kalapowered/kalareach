@@ -3426,6 +3426,31 @@ mod tests {
         )
     }
 
+    /// A directory a node's earlier attempt left is reused while it is empty, and has the identity
+    /// it was made with; one with entries in it is not this node's to use and is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_leftover_directory_is_reused_only_while_it_is_empty() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("a root");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("the root is private");
+        let scratch = root.path().join("node");
+
+        let first = make_scratch(environment(), root.path(), &scratch).expect("it is made");
+        let again =
+            make_scratch(environment(), root.path(), &scratch).expect("an empty one is reused");
+        assert_eq!(again, first, "the leftover is the directory that was made");
+
+        std::fs::write(scratch.join("file"), b"x").expect("a file in it");
+        assert!(
+            make_scratch(environment(), root.path(), &scratch).is_err(),
+            "a leftover with entries is refused"
+        );
+        assert!(scratch.join("file").exists(), "and left as it is");
+    }
+
     /// The directory a command ran in is removed with what is in it only while it still has the
     /// identity written down for it. Another directory at its path, private as the made one was, is
     /// left alone, and one that was never identified is removed only when it is empty, through the
