@@ -247,6 +247,82 @@ async fn losing_only_the_control_stream_revokes_its_data_streams() {
     listener.shutdown().await;
 }
 
+/// KR-ACC-026: no data stream survives the failure of its control stream. With the connection
+/// itself left open, the end of the control stream takes every data stream with it: the host's
+/// side of each is revoked, the peer's own stream carries no more data, the host ends the
+/// connection, and the connection takes no new data stream.
+#[tokio::test]
+async fn no_data_stream_survives_the_failure_of_its_control_stream() {
+    let (host, client) = paired_pair().await;
+    let handler = Arc::new(TestHandler::new(client.record));
+    let listener = start(&host, Arc::clone(&handler)).await;
+    let addr = listener_addr(&listener);
+
+    let connection = client
+        .endpoint
+        .connect(addr, ALPN)
+        .await
+        .expect("a connection");
+    let mut authorised = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect("an authorised connection");
+    let registry = Arc::new(StreamRegistry::new(
+        authorised.connection_id,
+        Arc::new(kr_transport::scheduler::StreamBudget::new(
+            SendLimits::default(),
+        )),
+        None,
+    ));
+    let mut stream = registry
+        .open(&connection, terminal_header(authorised.connection_id))
+        .await
+        .expect("a data stream");
+    wait_until(|| handler.accepted.load(Ordering::Acquire) == 1).await;
+
+    // Only the control stream fails.
+    authorised.control_writer.reset();
+    wait_until(|| handler.lost.load(Ordering::Acquire) == 1).await;
+
+    // The host's side of the data stream is revoked.
+    {
+        let handles = handler.streams.lock().await;
+        assert_eq!(handles.len(), 1);
+        assert!(
+            handles
+                .iter()
+                .all(kr_transport::streams::StreamHandle::is_revoked),
+            "the data stream the control stream authorised was revoked"
+        );
+    }
+    // The peer's own stream carries nothing more, and is not left waiting.
+    match tokio::time::timeout(Duration::from_secs(10), stream.read_payload()).await {
+        Ok(Ok(None)) | Ok(Err(_)) => {}
+        Ok(Ok(Some(_))) => {
+            panic!("a data stream delivered a frame after its control stream failed")
+        }
+        Err(_) => panic!("a data stream left the peer waiting after its control stream failed"),
+    }
+    // The host ended the connection, so there is nothing to open a new data stream on.
+    tokio::time::timeout(Duration::from_secs(10), connection.closed())
+        .await
+        .expect("the host ended the connection when its control stream failed");
+    assert!(
+        registry
+            .open(&connection, terminal_header(authorised.connection_id))
+            .await
+            .is_err(),
+        "a new data stream was opened after the control stream failed"
+    );
+    assert_eq!(
+        handler.accepted.load(Ordering::Acquire),
+        1,
+        "and the host accepted no other"
+    );
+
+    drop(authorised);
+    listener.shutdown().await;
+}
+
 /// KR-REQ-23.18: nothing sent as 0-RTT early data reaches an authorised connection.
 #[tokio::test]
 async fn early_data_never_reaches_an_authorised_connection() {

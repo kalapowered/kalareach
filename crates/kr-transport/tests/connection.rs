@@ -494,6 +494,109 @@ async fn a_peer_that_cannot_prove_the_paired_key_is_refused() {
     assert!(admitted.is_err(), "the host refused the proof");
 }
 
+/// KR-ACC-026: the proofs of a hello are made with two keys, and holding one of them is not
+/// holding the pair. A peer on the paired transport key that signs with another authorisation key
+/// is refused by the host; a peer that signs with the paired authorisation key from another
+/// transport key is a candidate, never authorised; and a host whose proof is not made with the
+/// authorisation key the client paired with is not trusted by the client, whatever the host
+/// accepted.
+#[tokio::test]
+async fn the_holder_of_one_key_of_a_pair_is_never_the_authorised_identity_from_either_end() {
+    let (host, client) = paired_pair().await;
+    let build = BuildId::new("kr/0.1.0+test").expect("a build identity");
+
+    // The paired transport key with another authorisation key.
+    let other_authorisation = kr_crypto::keys::DeviceKeys::generate().expect("device keys");
+    let wrong_authorisation = handshake::LocalIdentity::new(
+        client.record.device_id,
+        client.record.device_key_revision,
+        client.record.endpoint_id,
+        other_authorisation.authorisation.clone(),
+        build.clone(),
+    );
+    let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let error = handshake::connect(&connection, &wrong_authorisation, &host.record)
+        .await
+        .expect_err("the host refuses a proof made with another authorisation key");
+    let TransportError::Refused(error) = error else {
+        panic!("a proof the paired key did not make is the host's refusal, not {error}");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied);
+    let (_connection, admitted) = accepting.await.expect("the host task");
+    assert!(admitted.is_err(), "the host did not authorise it");
+
+    // The paired authorisation key from another transport key, claiming the paired device. The
+    // host finds its record by the endpoint the connection came from, not by the device the offer
+    // names, so this endpoint is a candidate that reaches the pairing surface and no proof
+    // exchange: whatever it signs is never read, and the connection is never authorised.
+    let config = EndpointConfig {
+        bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
+        ..EndpointConfig::default()
+    };
+    // It claims the paired client's device identity: `paired_pair` gives the client device byte 2.
+    let stranger = support::side_with(
+        &config,
+        kr_crypto::keys::DeviceKeys::generate().expect("device keys"),
+        2,
+        false,
+    )
+    .await;
+    assert_eq!(stranger.record.device_id, client.record.device_id);
+    let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+    let connection = stranger
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let host_endpoint_id = EndpointKey::from_bytes(*connection.remote_id().as_bytes());
+    let (mut writer, mut reader) = control_streams(&connection).await;
+    let claim = offer(&stranger);
+    writer.write_message(&claim).await.expect("sent");
+    let HelloReply::Selected(selection) = read_frame::<HelloReply>(&mut reader).await else {
+        panic!("a hello is answered with a selection whoever sent it");
+    };
+    let proof = ConnectProof {
+        signature: sign_connect(
+            &client.keys.authorisation,
+            &claim,
+            &selection,
+            &stranger.record.endpoint_id,
+            &host_endpoint_id,
+        )
+        .expect("a proof"),
+    };
+    let _ = writer.write_message(&proof).await;
+    let (_connection, admitted) = accepting.await.expect("the host task");
+    assert!(
+        matches!(admitted, Ok(Admitted::Unpaired(_))),
+        "the paired authorisation key on an unpaired endpoint is not an authorised connection"
+    );
+
+    // A host that proves with another authorisation key than the one the client paired with.
+    let stale_host_record = PairedPeer {
+        authorisation: *other_authorisation.authorisation.public(),
+        ..host.record
+    };
+    let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let refused = handshake::connect(&connection, &client.identity, &stale_host_record).await;
+    assert!(
+        matches!(refused, Err(TransportError::Crypto(_))),
+        "the client enabled no authorised stream for a host that is not who it paired with: {:?}",
+        refused.map(|_| ())
+    );
+    let _ = accepting.await.expect("the host task");
+}
+
 /// KR-REQ-23.16: a proof replayed on another connection answers a challenge that connection never
 /// issued, and is refused.
 #[tokio::test]
