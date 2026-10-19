@@ -41,6 +41,7 @@ every one and pass the near misses.
 """
 
 import argparse
+import binascii
 import glob
 import json
 import os
@@ -106,25 +107,67 @@ ALLOWED = (".env.example",)
 # Shapes that are a credential wherever they appear. Narrow on purpose: a check that guessed at what
 # a secret looks like would refuse a release for a string in a dependency.
 PEM_HEADER = re.compile(rb"-----BEGIN ((?:[A-Z0-9]+ )*)PRIVATE KEY( BLOCK)?-----")
-# A key is told by what its body is, not by how it is laid out. The body of every unencrypted
-# private key is the base64 of a DER SEQUENCE (the bytes 0x30 and a length, which read `M` and a
-# letter from `A` to `P`), of an OpenSSH key (`b3Bl`, from "openssh-key-v1") or, for a PGP block,
-# of a packet tag (`l`); an encrypted traditional key says so in its `Proc-Type` and `DEK-Info`
-# header lines, and a PGP block may carry `Version` lines first. So the
-# text after a header is read past what a key written out as source text has between its lines
-# (white space, escaped line breaks, a backslash that continues a string, quotes, joiners, commas,
-# comment markers including `///` and `//!`), and the body is that signature followed by 16
-# characters of base64 in all, wherever the source text breaks them. A quoted header followed by
-# code or prose does not read as a key. The read goes forward one item at a time and never back,
-# so its time is in proportion to the window; keep it so.
-LAYOUT = re.compile(rb"\s+|\\+(?:[rnt/]|\r?\n)|[\"'`+,;#*/!]+")
-NAME_LINE = re.compile(rb"[A-Za-z-]+: [^\r\n\\]*(?:\r?\n|\\r|\\n)")
+# A key is told by what its body is, not by how it is laid out. The body of an unencrypted private
+# key is the base64 of a structure that begins the same way every time: a DER SEQUENCE whose first
+# element is the INTEGER version (PKCS#8, PKCS#1, SEC1, DSA) or an algorithm SEQUENCE and its OID
+# (encrypted PKCS#8); the bytes `openssh-key-v1` of an OpenSSH key; or, in a PGP block, a secret key
+# packet in either header format with a version from 3 to 6. An encrypted traditional key says so
+# in its `Proc-Type` and `DEK-Info` lines, and its body is ciphertext. So the text after a header
+# is read past what a key written out as source text has between its lines (white space, escaped
+# line breaks of any depth, a backslash that continues a string, a PowerShell `n, quotes and string
+# prefixes, joiners, commas, margins, comment markers including `///` and `//!`), and the first 32
+# characters of base64, taken wherever the source text breaks them, have to begin with that
+# structure, so a placeholder that keeps only the first line of a key is not one.
+# A quoted header followed by code or prose does not decode to one. The read goes forward one item
+# at a time and never back, so its time is in proportion to the window; keep it so.
+STRING_PREFIX = rb"(?:u8|[bBrRuUfFL]{1,2})(?=[\"'])"
+LAYOUT = re.compile(
+    rb"\s+|\\+(?:[rnt/]|\r?\n)|`[rnt]|" + STRING_PREFIX + rb"|[\"'`+,;#*/!@|]+"
+)
+STRING_PREFIX = re.compile(STRING_PREFIX)
+NAME_LINE = re.compile(rb"[A-Za-z-]+: [^\r\n\\`]*(?:\r?\n|\\r|\\n|`[rn])")
 ENCRYPTED_LINE = re.compile(rb"(?:Proc-Type|DEK-Info): ")
 BASE64 = re.compile(rb"[A-Za-z0-9+/]+")
-BODY_START = re.compile(rb"M[A-P]|b3Bl")
-PGP_BODY_START = re.compile(rb"l")
-BODY_CHARACTERS = 16
+BODY_CHARACTERS = 32
 KEY_WINDOW = 8192
+
+
+def after_der_length(raw, index):
+    """Where the content of a DER element begins, given where its length starts."""
+    if index >= len(raw):
+        return None
+    if raw[index] < 0x80:
+        return index + 1
+    count = raw[index] & 0x7F
+    return index + 1 + count if 1 <= count <= 4 else None
+
+
+def der_private_key(raw):
+    if raw[:1] != b"\x30":
+        return False
+    inner = after_der_length(raw, 1)
+    if inner is None:
+        return False
+    if raw[inner : inner + 2] == b"\x02\x01":
+        return True
+    if raw[inner : inner + 1] == b"\x30":
+        algorithm = after_der_length(raw, inner + 1)
+        return algorithm is not None and raw[algorithm : algorithm + 1] == b"\x06"
+    return False
+
+
+def pgp_private_key(raw):
+    tag = raw[0]
+    if not tag & 0x80:
+        return False
+    if tag & 0x40:
+        kind = tag & 0x3F
+        first = raw[1] if len(raw) > 1 else 0
+        version = 2 if first < 192 else 3 if first < 224 else 6 if first == 255 else None
+    else:
+        kind = (tag >> 2) & 0x0F
+        version = (2, 3, 5)[tag & 3] if tag & 3 < 3 else None
+    return kind in (5, 7) and version is not None and raw[version : version + 1] in (b"\x03", b"\x04", b"\x05", b"\x06")
 
 
 def key_body_follows(window, pgp):
@@ -140,21 +183,29 @@ def key_body_follows(window, pgp):
         if item is None:
             break
         position = item.end()
-    start = PGP_BODY_START if pgp else BODY_START
-    if not encrypted and start.match(window, position) is None:
-        return False
-    seen = 0
-    while seen < BODY_CHARACTERS:
+    taken = bytearray()
+    while len(taken) < BODY_CHARACTERS:
+        item = STRING_PREFIX.match(window, position)
+        if item is not None:
+            position = item.end()
+            continue
         run = BASE64.match(window, position)
         if run is not None:
-            seen += len(run.group())
+            taken += run.group()[: BODY_CHARACTERS - len(taken)]
             position = run.end()
             continue
         item = LAYOUT.match(window, position)
         if item is None:
             break
         position = item.end()
-    return seen >= BODY_CHARACTERS
+    if len(taken) < BODY_CHARACTERS:
+        return False
+    if encrypted:
+        return True
+    raw = binascii.a2b_base64(bytes(taken))
+    return pgp_private_key(raw) if pgp else der_private_key(raw) or raw[:12] == b"openssh-key-"
+
+
 LIVE_KEY = re.compile(rb"\bsk_live_[0-9A-Za-z]{20,}")
 WEBHOOK_SECRET = re.compile(rb"\bwhsec_[0-9A-Za-z]{20,}")
 
@@ -195,9 +246,13 @@ def refused_name(path):
 def refused_contents(data):
     """What a file holds that is a credential, one description each."""
     found = []
-    for header in PEM_HEADER.finditer(data):
-        pgp = b"PGP" in (header.group(1) or b"")
-        if key_body_follows(data[header.end() : header.end() + KEY_WINDOW], pgp):
+    headers = list(PEM_HEADER.finditer(data))
+    for index, header in enumerate(headers):
+        # A window ends where the next header starts: no key body holds a header, and a file of
+        # headers would otherwise be read once for each.
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(data)
+        window = data[header.end() : min(end, header.end() + KEY_WINDOW)]
+        if key_body_follows(window, b"PGP" in (header.group(1) or b"")):
             found.append("a private key")
             break
     if LIVE_KEY.search(data):
@@ -740,6 +795,16 @@ def cases(scratch, expect):
         + "\n",
         "src/encrypted.pem.txt": f"{header}\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123456789ABCDEF\n\n{key_body}\n",
         "src/eight.js": f'const K = "{header}\\n" + "{key_body[:8]}" + "{key_body[8:]}";\n',
+        "src/newpgp.asc": planted("-----", "BEGIN PGP PRIVATE KEY BLOCK", "-----") + "\n\nxVsEZexampleexampleexampleexample\n",
+        "src/powershell.ps1": f'$k = "{header}`n{key_body}`n"\n',
+        "src/ed25519.rs": f'const K: &str = "{header}\\n" + "MC4CAQAwBQYDK2VwBCIEIGexampleexampleexampleexample";\n',
+        "src/sec1.rs": f'const K: &str = "{header}\\n" + "MHcCAQEEIexampleexampleexampleexampleexample";\n',
+        "src/python.py": f'K = (b"{header}\\n"\n     b"{key_body[:4]}"\n     b"{key_body[4:8]}"\n     b"{key_body[8:32]}"\n     b"{key_body[32:]}")\n',
+        "src/ps-encrypted.ps1": f'$k = "{header}`nProc-Type: 4,ENCRYPTED`nDEK-Info: AES-128-CBC,0123456789ABCDEF`n`nq83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJ"\n',
+        "src/margin.kt": f'val k = """\n    |{header}\n    |{key_body}\n""".trimMargin()\n',
+        "src/wide.cc": f'const wchar_t* k = L"{header}\\n" L"{key_body}";\n',
+        "src/enc-pkcs8.pem.txt": planted("-----", "BEGIN ENCRYPTED PRIVATE KEY", "-----") + "\nMIIFHDBOBgkqhkiG9w0BBQ0wQTApBgkqhkiG9w0BBQwwHAQIexampleexampleexample\n",
+        "src/encrypted-ciphertext.pem.txt": f"{header}\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123456789ABCDEF\n\nq83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJ\n",
         "src/uneven.js": f'const K = "{header}\\n" +\n  "{key_body[:24]}" +\n  "{key_body[24:32]}" +\n  "{key_body[32:]}\\n";\n',
         "src/commented-short.rs": f"// {header}\n" + "".join(f"// {key_body[i : i + 24]}\n" for i in range(0, len(key_body), 24)),
         "src/php.json": '{"k":"' + header + "\\n" + key_body[:10] + "\\/" + key_body[10:] + '\\n"}\n',
@@ -768,9 +833,15 @@ def cases(scratch, expect):
     fx.write("src/call.js", f'const marker = "{header}";\nvalidatePrivateKey(marker);\n')
     fx.write("src/name.js", f"const marker = '{header}\\n' + base64PrivateKey;\n")
     fx.write("docs/long.md", f"Quoting {header} internationalization notes is not a key.\n")
-    fx.write("docs/note.md", f"{header}\nNote: the internationalization of the notes follows here\ninternationalizationofthenotes\n")
+    fx.write("docs/note.md", f"{header}\nNote: the internationalization of the notes follows here\ninternationalizationofthenotesfollowhere\n")
     fx.write("src/bang.js", f'const marker = "{header}";\n!validatePrivateKeyAndCertificateChain(marker);\n')
-    fx.write("src/digest.rs", f'const H: &str = "{header}"; const D: &str = "{"a1" * 32}";\n')
+    fx.write("src/digest.rs", f'const H: &str = "{header}\\n{"a1" * 32}";\n')
+    fx.write("src/words.md", f"{header} MAKE SURE THE HEADER IS PRESENT, MAY be followed by lines, MIME types and MCPServerConfiguration.load(H).\n")
+    fx.write("src/length.js", f'const marker = "{header}";\nMAXPASSWORDLENGTH.toString();\n')
+    fx.write("docs/placeholder.md", f"{header}\nMIIEpAIBAAKCAQEA...\n-----END\n")
+    pgp_header = planted("-----", "BEGIN PGP PRIVATE KEY BLOCK", "-----")
+    fx.write("src/armour.js", f'const ARMOR = "{pgp_header}";\nlet armoredSecretKey = await readKey(ARMOR);\n')
+    fx.write("docs/lines.md", f"{pgp_header} lines up the armour headers first, then the packets.\n")
     fx.write("src/table.rs", f'let x = "{header}"; MAPPINGTABLE.get(1);\n')
     head = fx.commit("Quote a header")
     status, output = fx.run("--range", f"{fx.base}..{head}")
