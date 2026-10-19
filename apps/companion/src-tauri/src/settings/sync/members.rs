@@ -651,48 +651,58 @@ impl SettingsSync {
     /// Records that revocations of `devices`, sent from this computer, are known here, and carries
     /// out the removals they require as far as the hosts and the service allow.
     ///
-    /// Publication stops before anything else is done: a step in hand may be waiting on the network
-    /// and holds the membership meanwhile, so the record is made under a step of its own, after it,
-    /// and that step publishes nothing more once the revocation is known. One call for all the
-    /// devices of one view makes one removal step.
+    /// Everything settings sync sends is held before anything else is done: a step in hand may be
+    /// waiting on the network and holds the membership meanwhile, so the devices are written down
+    /// first ([`super::Fence`]) and the membership takes them in under a step of its own, after it. One
+    /// call for all the devices of one view makes one removal step. A call that is dropped, or
+    /// fails, leaves them written down, and the next step of any companion takes them in.
     ///
-    /// Says whether the membership recorded them: a computer that shares no settings has none to
-    /// record them in.
+    /// Says whether the membership took them in: a computer that shares no settings has none to
+    /// take them in.
     ///
     /// # Errors
     ///
-    /// Returns what stopped the recording, with publication still held: the next call for the same
-    /// devices tries again. A service that cannot be reached afterwards is not a failure of it: the
-    /// next step carries the removal out, and the page says what stopped.
+    /// Returns why the devices could not be written down, with publication held in this process
+    /// all the same.
     pub async fn revocations_sent(&self, devices: &[AuthorisationKey]) -> Result<bool> {
-        self.fence.raise(devices);
+        self.fence.raise(devices)?;
         let _step = self.step().await?;
         let Some(mut record) = self.record()? else {
-            self.fence.lift(devices);
+            self.fence.lift(devices)?;
             return Ok(false);
         };
         let service = self.managed(&record.origin()?)?;
-        let mut membership = self.membership_asking(&service, Ask::Never)?;
-        for device in devices {
-            match membership.feed_revocation(device) {
-                Ok(()) => {}
-                Err(MembershipError::NoMembership) => {
-                    self.fence.lift(devices);
-                    return Ok(false);
-                }
-                Err(error) => return Err(member_failure(error)),
-            }
+        if self
+            .membership_asking(&service, Ask::Never)?
+            .members()
+            .map_err(member_failure)?
+            .is_none()
+        {
+            self.fence.lift(devices)?;
+            return Ok(false);
         }
-        self.fence.lift(devices);
-        self.note_devices(&membership);
-        drop(membership);
-        self.told.tell();
         let settled = self
             .settle(&mut record, &service, Ask::Now)
             .await
             .map(|_| ());
         self.finished(&settled);
-        Ok(true)
+        Ok(self.fence.holds_none_of(devices))
+    }
+
+    /// Takes the revocations the fence holds into `membership`, under the step in hand, and lets
+    /// the fence go of each. A computer with no collection has nothing to take them out of.
+    pub(super) fn take_in_revocations(&self, membership: &mut SyncMembership) -> Result<()> {
+        let devices = self.fence.pending()?;
+        if devices.is_empty() {
+            return Ok(());
+        }
+        for device in &devices {
+            match membership.feed_revocation(device) {
+                Ok(()) | Err(MembershipError::NoMembership) => {}
+                Err(error) => return Err(member_failure(error)),
+            }
+        }
+        self.fence.lift(&devices)
     }
 
     /// Joins the collection `reference` names, once the person confirms it here.

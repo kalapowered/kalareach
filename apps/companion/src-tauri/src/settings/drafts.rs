@@ -255,6 +255,8 @@ pub struct DraftsSync {
     /// What the last pass found.
     last: Mutex<Last>,
     arrivals: std::sync::atomic::AtomicU64,
+    /// Asked before a draft is read and sealed to leave.
+    gate: Arc<dyn kr_client::sync::PublishGate>,
 }
 
 #[derive(Default)]
@@ -281,8 +283,6 @@ pub struct Collection<'a> {
     pub floor: u64,
     /// Where the collection's keys are.
     pub keys: Arc<dyn CollectionKeys>,
-    /// Holds what leaves while a device whose revocation was sent is taken out.
-    pub fence: Arc<super::sync::Fence>,
 }
 
 /// The store a host's drafts leave through, and the client that fences it.
@@ -510,6 +510,7 @@ impl DraftsSync {
         desk: Arc<DraftDesk>,
         hosts: Arc<dyn Hosts>,
         told: Arc<Told>,
+        gate: Arc<dyn kr_client::sync::PublishGate>,
     ) -> Result<Self> {
         let directory = settings_sync.join(DIRECTORY);
         create_private_directory(&directory)
@@ -529,6 +530,7 @@ impl DraftsSync {
             records: Mutex::new(()),
             last: Mutex::new(Last::default()),
             arrivals: std::sync::atomic::AtomicU64::new(0),
+            gate,
         })
     }
 
@@ -619,10 +621,7 @@ impl DraftsSync {
                 .believing_from(on.floor),
         );
         let sealer: Arc<dyn DraftSealer> = Arc::new(shared.sealer(Arc::clone(&on.keys)));
-        let service: Arc<dyn SyncBackupService> = Arc::new(super::sync::Fenced::new(
-            Arc::clone(&shared) as _,
-            Arc::clone(&on.fence),
-        ));
+        let service: Arc<dyn SyncBackupService> = Arc::clone(&shared) as _;
         let store = self.desk.store()?;
         // The removals owed are read before the drafts are listed. A removal takes its entry
         // before it takes the draft, under the lock this read takes, so an entry read here is of a
@@ -807,7 +806,8 @@ impl DraftsSync {
             gate,
             Arc::clone(sealer),
             SyncStore::open(&directory).map_err(super::sync::sync_failure)?,
-        );
+        )
+        .gated(Arc::clone(&self.gate));
         // Work that left without an answer is asked about first, as a cleanup would.
         drafts
             .reconcile_unsettled(store, now())

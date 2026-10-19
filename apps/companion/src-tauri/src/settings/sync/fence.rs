@@ -1,159 +1,163 @@
-//! The fence that holds publication while a device is taken out.
+//! The record of revocations this computer sent that the membership has not taken in yet, and the
+//! gate it makes for everything settings sync sends.
 //!
 //! A revocation this computer sent is known here before the membership has recorded it, and a step
 //! may be in hand, waiting on the network, when it is. The membership cannot record it then: the
 //! step holds the membership for as long as it waits. From the moment the revocation is known,
-//! nothing more may be sent that the device could read, so the fence is raised first, before
-//! anything that can wait or fail, and lifted once the membership has recorded the revocation.
+//! nothing more may be sealed under a key the device holds, so it is written down first, before
+//! anything that can wait or fail, and forgotten once the membership has it.
 //!
-//! The fence is held where it cannot be missed. Every send of content, settings and drafts alike,
-//! goes through [`Fenced`], which refuses it while the fence is raised, at the moment it would
-//! leave. A check made earlier in a step cannot stand for that: the content a step sends is read
-//! and sealed after awaits of its own, and the revocation can arrive in any of them.
+//! The record is a file beside the other records of settings sync, so it is kept across a restart
+//! and seen by a second companion over the same data directory: each step takes in what it finds
+//! there before it does anything else, whoever wrote it. Settings and drafts both ask [`Fence`],
+//! as a [`PublishGate`], before they read and seal what they send, so a send it refuses leaves no
+//! record and no sealed bytes behind. A send that has passed the gate is on its way and cannot be
+//! called back.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
-use kr_client::services::{
-    ServiceFuture, SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRequestFence,
-    SyncRequestStatus,
-};
-use kr_client::{ClientError, Shown};
-use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::SyncConflictId;
-use kr_protocol::scalars::{AuthorisationKey, Uuid};
+use kr_client::sync::PublishGate;
+use kr_ipc::paths::{read_owner_only_file, write_owner_only_file};
+use kr_protocol::scalars::AuthorisationKey;
+
+use crate::error::{CommandError, Result};
+
+/// The file the revocations not yet recorded are kept in.
+const FILE: &str = "revoking.json";
+
+/// The file whose lock makes a change to [`FILE`] one act across companions.
+const LOCK: &str = "revoking.lock";
+
+/// The most bytes of [`FILE`] that are read: far more than this computer's devices come to.
+const LIMIT: u64 = 1 << 20;
 
 /// The devices whose revocation this computer sent and the membership has not recorded yet.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Fence {
-    raised: Mutex<BTreeSet<AuthorisationKey>>,
+    directory: PathBuf,
+    /// The same devices as this process knows them, so that a record that cannot be written down
+    /// still holds this process's sends.
+    held: Mutex<BTreeSet<AuthorisationKey>>,
 }
 
 impl Fence {
-    /// Holds publication until `devices` are recorded as revoked.
-    pub(super) fn raise(&self, devices: &[AuthorisationKey]) {
-        self.raised
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(devices.iter().copied());
-    }
-
-    /// Lets go of `devices`, whose revocation the membership recorded.
-    pub(super) fn lift(&self, devices: &[AuthorisationKey]) {
-        let mut raised = self.raised.lock().unwrap_or_else(PoisonError::into_inner);
-        for device in devices {
-            raised.remove(device);
+    /// The record kept in `directory`.
+    #[must_use]
+    pub fn in_directory(directory: &Path) -> Self {
+        Self {
+            directory: directory.to_path_buf(),
+            held: Mutex::new(BTreeSet::new()),
         }
     }
 
-    /// Whether publication is held.
-    #[must_use]
-    pub fn is_raised(&self) -> bool {
-        !self
-            .raised
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_empty()
+    fn held(&self) -> std::sync::MutexGuard<'_, BTreeSet<AuthorisationKey>> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
-}
 
-/// A service whose writes of content wait while a [`Fence`] is raised.
-///
-/// A write refused here never leaves this computer. It ends the way any write that got no answer
-/// ends: the next step asks the service about it, learns that it never ran, and sends the content
-/// again once the device is out.
-pub struct Fenced {
-    inner: Arc<dyn SyncBackupService>,
-    fence: Arc<Fence>,
-}
-
-impl Fenced {
-    /// `inner`, held by `fence`.
-    #[must_use]
-    pub fn new(inner: Arc<dyn SyncBackupService>, fence: Arc<Fence>) -> Self {
-        Self { inner, fence }
+    /// What the file holds.
+    fn on_disk(&self) -> Result<BTreeSet<AuthorisationKey>> {
+        let path = self.directory.join(FILE);
+        let bytes = read_owner_only_file(&path, LIMIT).map_err(|error| {
+            CommandError::local_failure(format!(
+                "this computer's record of revocations not yet taken in could not be read: {error}"
+            ))
+        })?;
+        match bytes {
+            None => Ok(BTreeSet::new()),
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+                CommandError::local_failure(format!(
+                    "this computer's record of revocations not yet taken in is not one it can \
+                     read: {error}"
+                ))
+            }),
+        }
     }
-}
 
-impl std::fmt::Debug for Fenced {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("Fenced").finish_non_exhaustive()
-    }
-}
-
-/// What a write is refused with while a device is being taken out.
-fn withheld() -> ClientError {
-    ClientError::refusal(
-        ErrorCode::ResourceUnavailable,
-        Shown::said(
-            "a device is being taken out of the shared settings, so nothing is sent until it is",
-        ),
-    )
-}
-
-impl SyncBackupService for Fenced {
-    fn compare_exchange<'a>(
-        &'a self,
-        collection: &'a str,
-        request_id: Uuid,
-        signed_at_ms: u64,
-        expected: Option<SyncPosition>,
-        ciphertext: &'a [u8],
-    ) -> ServiceFuture<'a, SyncExchanged> {
-        Box::pin(async move {
-            if self.fence.is_raised() {
-                return Err(withheld());
-            }
-            self.inner
-                .compare_exchange(collection, request_id, signed_at_ms, expected, ciphertext)
-                .await
+    /// Changes the file under its lock.
+    fn change(&self, change: impl FnOnce(&mut BTreeSet<AuthorisationKey>)) -> Result<()> {
+        let _lock = crate::settings::locked_file(&self.directory.join(LOCK)).map_err(|error| {
+            CommandError::local_failure(format!(
+                "this computer's record of revocations not yet taken in could not be locked: \
+                 {error}"
+            ))
+        })?;
+        let mut devices = self.on_disk()?;
+        let before = devices.clone();
+        change(&mut devices);
+        if devices == before {
+            return Ok(());
+        }
+        let text = serde_json::to_vec(&devices).map_err(|error| {
+            CommandError::local_failure(format!(
+                "this computer's record of revocations not yet taken in could not be written: \
+                 {error}"
+            ))
+        })?;
+        write_owner_only_file(&self.directory.join(FILE), &text).map_err(|error| {
+            CommandError::local_failure(format!(
+                "this computer's record of revocations not yet taken in could not be kept: {error}"
+            ))
         })
     }
 
-    // A removal carries no content, and a draft thrown away leaves when the person asks.
-    fn compare_remove<'a>(
-        &'a self,
-        collection: &'a str,
-        request_id: Uuid,
-        signed_at_ms: u64,
-        expected: Option<SyncPosition>,
-    ) -> ServiceFuture<'a, SyncExchanged> {
-        self.inner
-            .compare_remove(collection, request_id, signed_at_ms, expected)
+    /// Holds everything sent until `devices` are recorded as revoked. Nothing here can undo it
+    /// except [`Self::lift`]: a record that cannot be written leaves this process holding its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the record could not be written.
+    pub(super) fn raise(&self, devices: &[AuthorisationKey]) -> Result<()> {
+        self.held().extend(devices.iter().copied());
+        self.change(|kept| kept.extend(devices.iter().copied()))
     }
 
-    fn request_status<'a>(
-        &'a self,
-        collection: &'a str,
-        request_id: Uuid,
-    ) -> ServiceFuture<'a, SyncRequestStatus> {
-        self.inner.request_status(collection, request_id)
+    /// Lets go of `devices`, whose revocation the membership has recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the record could not be written; the devices stay held.
+    pub(super) fn lift(&self, devices: &[AuthorisationKey]) -> Result<()> {
+        self.change(|kept| {
+            for device in devices {
+                kept.remove(device);
+            }
+        })?;
+        let mut held = self.held();
+        for device in devices {
+            held.remove(device);
+        }
+        Ok(())
     }
 
-    fn fence_request<'a>(
-        &'a self,
-        collection: &'a str,
-        request_id: Uuid,
-        first_signed_at_ms: u64,
-        last_signed_at_ms: u64,
-    ) -> ServiceFuture<'a, SyncRequestFence> {
-        self.inner.fence_request(
-            collection,
-            request_id,
-            first_signed_at_ms,
-            last_signed_at_ms,
-        )
+    /// The devices held, by this process or by the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the file could not be read.
+    pub(super) fn pending(&self) -> Result<Vec<AuthorisationKey>> {
+        let mut devices = self.on_disk()?;
+        devices.extend(self.held().iter().copied());
+        Ok(devices.into_iter().collect())
     }
 
-    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, SyncFetched> {
-        self.inner.fetch(collection)
+    /// Whether anything is held. A record that cannot be read holds everything: nothing is sent
+    /// that a record this computer cannot read might forbid.
+    #[must_use]
+    pub fn is_raised(&self) -> bool {
+        !self.held().is_empty() || self.on_disk().map_or(true, |devices| !devices.is_empty())
     }
 
-    fn resolve<'a>(
-        &'a self,
-        collection: &'a str,
-        retained: SyncConflictId,
-    ) -> ServiceFuture<'a, bool> {
-        self.inner.resolve(collection, retained)
+    /// Whether none of `devices` is held.
+    pub(super) fn holds_none_of(&self, devices: &[AuthorisationKey]) -> bool {
+        self.pending()
+            .is_ok_and(|held| !devices.iter().any(|device| held.contains(device)))
+    }
+}
+
+impl PublishGate for Fence {
+    fn is_open(&self) -> bool {
+        !self.is_raised()
     }
 }

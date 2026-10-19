@@ -37,13 +37,14 @@
 //! # Taking a device out
 //!
 //! A revocation this computer sent is told to settings sync ([`SettingsSync::revocations_sent`]),
-//! which raises the [`Fence`] before it does anything that can wait or fail. The membership cannot
-//! record the revocation while a step holds it, and a step holds it for as long as it waits on the
-//! hosts or the service. While the fence is raised no step starts to publish, and every send of
-//! settings or drafts is refused at the moment it would leave, whatever the step in hand has read or
-//! sealed since it began. The revocation is recorded under a step of its own, after the one in hand,
-//! the fence is lifted when it is, and the same step takes the device out. What the refused sends
-//! held is sent afterwards, under the key that follows the removal.
+//! which writes it down in a record beside the others before it does anything that can wait or
+//! fail ([`Fence`]). The membership cannot take it in while a step holds it, and a step holds it for
+//! as long as it waits on the hosts or the service. While the record holds a device, no step starts
+//! to publish, and settings and drafts both ask the record before they read and seal what they
+//! send, so a send it refuses leaves no record and no sealed bytes behind. Each step takes in what
+//! the record holds before it does anything else, whichever companion wrote it, and the same step
+//! takes the device out. What was held back is sent afterwards, under the key that follows the
+//! removal. A send already on its way cannot be called back.
 //!
 //! # Agreeing with the service
 //!
@@ -98,7 +99,7 @@ use serde::{Deserialize, Serialize};
 mod fence;
 mod members;
 
-pub use fence::{Fence, Fenced};
+pub use fence::Fence;
 use members::{Ask, Listed};
 pub use members::{Candidate as DeviceCandidate, DevicesView, Happened, Member, Offer};
 
@@ -387,8 +388,8 @@ pub struct SettingsSync {
     offered: Mutex<Vec<CollectionRef>>,
     /// Whether the settings the service holds are sealed under keys this computer has not been given.
     waiting: std::sync::atomic::AtomicBool,
-    /// Holds every send of settings and drafts while a device whose revocation this computer sent
-    /// is not yet recorded as taken out.
+    /// The revocations this computer sent that the membership has not recorded, which hold back
+    /// everything sent.
     fence: Arc<Fence>,
 }
 
@@ -439,11 +440,13 @@ impl SettingsSync {
                     "the directory settings sync keeps its records in could not be made: {error}"
                 ))
             })?;
+        let fence = Arc::new(Fence::in_directory(&directory));
         let drafts = Arc::new(super::drafts::DraftsSync::open(
             &directory,
             Arc::clone(&desk),
             Arc::clone(&hosts),
             Arc::clone(&told),
+            Arc::clone(&fence) as Arc<dyn kr_client::sync::PublishGate>,
         )?);
         desk.watched_by(Arc::clone(&drafts) as Arc<dyn crate::drafts::DraftWatch>);
         Ok(Self {
@@ -460,7 +463,7 @@ impl SettingsSync {
             listed: Arc::new(Listed::default()),
             offered: Mutex::new(Vec::new()),
             waiting: std::sync::atomic::AtomicBool::new(false),
-            fence: Arc::new(Fence::default()),
+            fence,
         })
     }
 
@@ -681,13 +684,16 @@ impl SettingsSync {
         let now_ms = now();
         let ask = self.ask_for(service, ask)?;
         let mut membership = self.membership_asking(service, ask)?;
+        // What this computer was told to take out comes first, whoever was told and whatever the
+        // step does next.
+        self.take_in_revocations(&mut membership)?;
         let reconciled = membership.reconcile(now_ms).await.map_err(member_failure);
         // What the membership holds is shown whatever the reconciliation could do.
         self.note_devices(&membership);
         self.told.tell();
         reconciled?;
-        // A revocation that arrived while this step waited holds publication before the membership
-        // can record it, which it cannot while this step holds it.
+        // A revocation that arrived while this step waited holds what is sent before the
+        // membership can record it, which it cannot while this step holds it.
         if self.fence.is_raised() || !membership.publishes().map_err(member_failure)? {
             return Ok(Progress::Starting);
         }
@@ -729,7 +735,6 @@ impl SettingsSync {
                 epoch,
                 floor: record.floor,
                 keys: Arc::new(self.keys()),
-                fence: Arc::clone(&self.fence),
             })
             .await;
         Ok(Progress::Agreed)
@@ -1476,13 +1481,11 @@ impl SettingsSync {
         );
         let sealer = shared.sealer(Arc::new(self.keys()) as Arc<dyn CollectionKeys>);
         let client = SyncClient::new(
-            Arc::new(Fenced::new(
-                Arc::clone(&shared) as Arc<dyn SyncBackupService>,
-                Arc::clone(&self.fence),
-            )),
+            Arc::clone(&shared) as Arc<dyn SyncBackupService>,
             Arc::new(sealer),
             self.store()?,
-        );
+        )
+        .gated(Arc::clone(&self.fence) as Arc<dyn kr_client::sync::PublishGate>);
         Ok((client, shared))
     }
 }

@@ -1052,6 +1052,19 @@ impl Elsewhere {
             .and_then(|held| held.epoch)
     }
 
+    /// The bytes the service stores for `object`, as sealed, or none when it holds none.
+    async fn ciphertext_of(&self, object: Uuid) -> Option<Vec<u8>> {
+        self.service
+            .compare_shared(&self.collection, &[], false, None)
+            .await
+            .expect("a comparison")
+            .expect("a member")
+            .objects
+            .iter()
+            .find(|held| held.object_id.get() == object)
+            .map(|held| held.ciphertext.clone())
+    }
+
     /// What the service holds of a draft, as the bytes it stores.
     async fn draft_stored(&self, draft: DraftId) -> Option<Vec<u8>> {
         match self
@@ -3477,8 +3490,82 @@ async fn a_draft_saved_after_a_revocation_is_not_sent_under_the_key_the_removed_
             .epoch_of(draft.get())
             .await
             .is_some_and(|epoch| epoch > before),
-        "the draft is sealed under the key that follows the removal"
+        "the draft is named for the epoch that follows the removal"
     );
+    // The bytes themselves are what the epoch's key sealed: the key the phone holds does not open
+    // them, and the one that follows its removal does.
+    let sealed = elsewhere
+        .ciphertext_of(draft.get())
+        .await
+        .expect("the service holds the draft");
+    this.elsewhere_at(2)
+        .sealer
+        .open(&sealed)
+        .expect("the key that follows the removal opens the draft");
+    this.elsewhere_at(1)
+        .sealer
+        .open(&sealed)
+        .expect_err("the key the removed device holds does not");
+    // Nothing is left outstanding by the send that was held back.
+    let view = page.sync_now();
+    assert_eq!(view["sync"]["outstanding"], 0, "{view}");
+}
+
+/// A revocation that a second companion over the same data directory wrote down, and then went no
+/// further with, holds what the first companion sends, and the first companion's next step takes
+/// the device out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revocation_written_down_by_another_companion_holds_this_ones_sends_and_is_taken_in_by_its_next_step()
+ {
+    let (this, other) = two_computers().await;
+    let (environment, studio) = host(1, "studio");
+    this.hosts
+        .say(environment, HostPrivacy::Off { generation: 1 });
+    let (page, _phone) = two_computers_sharing(&this, &other).await;
+    page.drafts_on(true).expect("drafts sync is on");
+    let phone_key = *other.identity().keys.authorisation.public();
+    let elsewhere = this.elsewhere();
+    let second = this.start();
+
+    // The first companion's step has asked for the key records and is waiting for the settings.
+    let web = this.served.web();
+    let asked = sync_requests(&this);
+    web.fail(SYNC_PATH, 2, Moment::Slow);
+    let settings = page.app.state::<AppState>().settings().expect("settings");
+    let step = tokio::spawn({
+        let settings = Arc::clone(&settings);
+        async move { settings.sync_now().await }
+    });
+    web.requests_reach(SYNC_PATH, asked + 2).await;
+
+    // The second companion is told of the revocation, writes it down and waits for the step lock.
+    let revoked = [phone_key];
+    let (draft, _) = {
+        let second_settings = second.app.state::<AppState>().settings().expect("settings");
+        let mut revoking = std::pin::pin!(second_settings.revocations_sent(&revoked));
+        assert!(
+            polled_once(&mut revoking).await.is_pending(),
+            "it waits for the step the first companion has in hand"
+        );
+        let saved = page.write_draft(Some(&studio), "written after the revocation");
+        web.release_held();
+        step.await.expect("the step ran").expect("the step ended");
+        assert_eq!(
+            elsewhere.draft_at(saved.0).await,
+            None,
+            "the first companion sent nothing after the second wrote the revocation down"
+        );
+        saved
+        // The second companion goes no further: its call is dropped here.
+    };
+
+    // The first companion's next step takes the device out and sends the draft once.
+    page.sync_now();
+    assert_eq!(
+        page.devices()["members"].as_array().expect("members").len(),
+        1
+    );
+    assert_eq!(elsewhere.draft_at(draft).await, Some(1));
 }
 
 /// A computer the person does not confirm on joins nothing: the offer stays, and the settings the
