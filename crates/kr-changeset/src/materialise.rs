@@ -81,9 +81,38 @@ pub fn materialise(
     label: &str,
     admitted: Option<&dyn crate::store::StillAdmitted>,
 ) -> Result<MaterialisationRecord> {
+    materialise_as(
+        service,
+        MaterialisationId::new(kr_ipc::new_uuid()),
+        version,
+        purpose,
+        label,
+        admitted,
+    )
+}
+
+/// Writes one exact version into a private directory like [`materialise`], under an identifier
+/// the caller chose.
+///
+/// A caller that must be able to find what it allocated after a crash writes the identifier down
+/// before it calls, and finds the materialisation, the directory or nothing from that identifier
+/// alone ([`release`] and [`discard_unrecorded`]). The directory is made, not opened, so an
+/// identifier that was already used is refused.
+///
+/// # Errors
+///
+/// As [`materialise`], and [`ChangeSetError::StorageUnavailable`] when the directory for the
+/// identifier already exists.
+pub fn materialise_as(
+    service: &ChangeSetService,
+    materialisation_id: MaterialisationId,
+    version: VersionRef,
+    purpose: MaterialisationPurpose,
+    label: &str,
+    admitted: Option<&dyn crate::store::StillAdmitted>,
+) -> Result<MaterialisationRecord> {
     let record = service.record(version.change_set_id, Some(version.version))?;
     let manifest = service.manifest(version.change_set_id, version.version)?;
-    let materialisation_id = MaterialisationId::new(kr_ipc::new_uuid());
     let parent = service
         .root()
         .subdirectory(&RelativeName::parse(MATERIALISATIONS_DIRECTORY)?)?;
@@ -319,6 +348,26 @@ pub fn reread(
     service: &ChangeSetService,
     materialisation_id: MaterialisationId,
 ) -> Result<(MaterialisationRow, Reread, Vec<ObservedPath>)> {
+    let (row, state, observed, _) = reread_with(service, materialisation_id, &Outputs::none())?;
+    Ok((row, state, observed))
+}
+
+/// Re-reads one materialisation like [`reread`], leaving out the paths a run is declared to write
+/// and recording each as an [`OutputReference`].
+///
+/// # Errors
+///
+/// As [`reread`].
+pub fn reread_with(
+    service: &ChangeSetService,
+    materialisation_id: MaterialisationId,
+    outputs: &Outputs,
+) -> Result<(
+    MaterialisationRow,
+    Reread,
+    Vec<ObservedPath>,
+    Vec<OutputReference>,
+)> {
     let row = service
         .locked()?
         .materialisation(materialisation_id)?
@@ -339,6 +388,7 @@ pub fn reread(
                 Reread::Indeterminate(format!(
                     "this host could not open the materialisation it made: {error}"
                 )),
+                Vec::new(),
                 Vec::new(),
             ));
         }
@@ -362,6 +412,7 @@ pub fn reread(
                         .to_owned(),
                 ),
                 Vec::new(),
+                Vec::new(),
             ));
         }
     }
@@ -375,6 +426,7 @@ pub fn reread(
         entries: crate::capture::MAX_WALK_ENTRIES,
     };
     let mut observed = Vec::new();
+    let mut references = Vec::new();
     if let Err(detail) = walk(
         service,
         &directory,
@@ -384,18 +436,147 @@ pub fn reread(
         &mut found,
         &mut budget,
         &mut observed,
+        outputs,
+        &mut references,
         0,
     )? {
-        return Ok((row, Reread::Indeterminate(detail), observed));
+        return Ok((row, Reread::Indeterminate(detail), observed, references));
     }
     found.canonicalise();
     if same_content(&original, &found)
         && same_objects(&held.observed, &observed, directory.identity().device)
     {
-        Ok((row, Reread::Unmodified, observed))
+        Ok((row, Reread::Unmodified, observed, references))
     } else {
-        Ok((row, Reread::Modified(found), observed))
+        Ok((row, Reread::Modified(found), observed, references))
     }
+}
+
+/// The paths a run is declared to write besides the source it was given: build directories and
+/// the like.
+///
+/// A re-read leaves them out of its comparison and records each as one [`OutputReference`], so a
+/// run that wrote only there still attests the version it ran against. Everything else keeps the
+/// rules it has: a path beside a declared output that the run added makes the source
+/// indeterminate, an ancestor of an output is entered only to reach it, and a declaration that
+/// the version's own paths contradict is refused before anything runs ([`Outputs::new`]).
+#[derive(Clone, Debug, Default)]
+pub struct Outputs {
+    /// The declared paths, relative and normalised.
+    declared: std::collections::BTreeSet<String>,
+    /// Every proper ancestor of a declared path.
+    ancestors: std::collections::BTreeSet<String>,
+}
+
+/// The most paths a suite may declare.
+pub const MAX_DECLARED_OUTPUTS: usize = kr_protocol::hostinfo::configuration::MAX_SUITE_OUTPUTS;
+
+/// The most bytes of an output file this host reads to digest it; a larger file is recorded as
+/// such, with the digest of the part read and its whole length.
+pub const MAX_OUTPUT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The most entries of an output directory this host lists; a larger directory is recorded as a
+/// truncated listing, which is never a reason to call the source indeterminate.
+pub const MAX_OUTPUT_ENTRIES: usize = 50_000;
+
+impl Outputs {
+    /// No declared output: every path is source.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Checks a suite's declarations against the version it runs on.
+    ///
+    /// A declaration is a relative path of names this host can carry, with no `.` or `..`, no
+    /// empty name and no trailing separator, spelled as the version spells it (the comparison is
+    /// exact, with case). No declaration holds another, and none holds, or is held by, a path the
+    /// version has: an output the version already contains is source, and a run that writes it
+    /// has changed the source.
+    ///
+    /// # Errors
+    ///
+    /// Returns what is wrong with the declarations, in words for the person who configured them.
+    pub fn new(declared: &[String], version: &Manifest) -> std::result::Result<Self, String> {
+        if declared.len() > MAX_DECLARED_OUTPUTS {
+            return Err(format!(
+                "a suite declares at most {MAX_DECLARED_OUTPUTS} output paths, and this one declares {}",
+                declared.len()
+            ));
+        }
+        let mut outputs = Self::none();
+        for path in declared {
+            if path.is_empty() || path.starts_with('/') || path.ends_with('/') {
+                return Err(format!(
+                    "the output path {} is not a relative path of names",
+                    kr_project::git::redact(path)
+                ));
+            }
+            for component in path.split('/') {
+                if component == "." || component == ".." || RelativeName::parse(component).is_err()
+                {
+                    return Err(format!(
+                        "the output path {} holds a name this host does not carry",
+                        kr_project::git::redact(path)
+                    ));
+                }
+            }
+            if !outputs.declared.insert(path.clone()) {
+                return Err(format!(
+                    "the output path {} is declared twice",
+                    kr_project::git::redact(path)
+                ));
+            }
+        }
+        let held = |outer: &str, inner: &str| inner.starts_with(&format!("{outer}/"));
+        for first in &outputs.declared {
+            for second in &outputs.declared {
+                if first != second && held(first, second) {
+                    return Err(format!(
+                        "the output path {} holds the output path {}",
+                        kr_project::git::redact(first),
+                        kr_project::git::redact(second)
+                    ));
+                }
+            }
+            for path in manifest_paths(version) {
+                if path == *first || held(first, path) {
+                    return Err(format!(
+                        "the version holds {}, which is in the output path {}, so a run that \
+                         writes there changes the source",
+                        kr_project::git::redact(path),
+                        kr_project::git::redact(first)
+                    ));
+                }
+            }
+            let mut ancestor = String::new();
+            let mut names = first.split('/').peekable();
+            while let Some(name) = names.next() {
+                if names.peek().is_none() {
+                    break;
+                }
+                if !ancestor.is_empty() {
+                    ancestor.push('/');
+                }
+                ancestor.push_str(name);
+                outputs.ancestors.insert(ancestor.clone());
+            }
+        }
+        Ok(outputs)
+    }
+
+    fn declares(&self, path: &str) -> bool {
+        self.declared.contains(path)
+    }
+
+    fn reaches(&self, path: &str) -> bool {
+        self.ancestors.contains(path)
+    }
+}
+
+/// The paths of a manifest.
+fn manifest_paths(manifest: &Manifest) -> impl Iterator<Item = &str> {
+    manifest.paths.iter().map(|entry| entry.path.as_str())
 }
 
 /// How much of a re-read's budget is left.
@@ -457,6 +638,8 @@ fn walk(
     found: &mut Manifest,
     budget: &mut Budget,
     observed: &mut Vec<ObservedPath>,
+    outputs: &Outputs,
+    references: &mut Vec<OutputReference>,
     depth: usize,
 ) -> Result<std::result::Result<(), String>> {
     if depth >= crate::capture::MAX_WALK_DEPTH {
@@ -492,6 +675,13 @@ fn walk(
                 kr_project::git::redact(&component)
             )));
         };
+        // A declared output is matched by its name before anything else is asked of it: a link,
+        // a great number of entries or a name a rule keeps out is exactly what build output
+        // trips, and none of them is a reason to doubt the source.
+        if outputs.declares(&path) {
+            references.push(describe_output(directory, &name, &path));
+            continue;
+        }
         // What kind of thing it is is decided **before** the grant, so an unsupported object at a
         // name a rule would have kept out is still seen. A version that left it out quietly would
         // say the run used a tree that did not hold it.
@@ -521,7 +711,9 @@ fn walk(
         }
         budget.entries -= 1;
         if kind == ObjectKind::Directory {
-            if !crate::grant::may_traverse(grant, &path) {
+            // The ancestor of an output is entered to reach it, whatever a rule says of its name;
+            // everything else beside the output keeps every rule.
+            if !outputs.reaches(&path) && !crate::grant::may_traverse(grant, &path) {
                 // A directory a rule keeps out is one a capture of this change set would not have
                 // read either, and something under it is an input this host cannot account for.
                 return Ok(Err(format!(
@@ -545,6 +737,8 @@ fn walk(
                 found,
                 budget,
                 observed,
+                outputs,
+                references,
                 depth + 1,
             )? {
                 return Ok(Err(detail));
@@ -709,6 +903,182 @@ fn walk(
     Ok(Ok(()))
 }
 
+/// What one declared output holds, as a reference and never as a failure.
+///
+/// A file is digested up to [`MAX_OUTPUT_FILE_BYTES`]; a directory is listed (path, length and
+/// instant last written of every entry beneath it, links included and never followed) up to
+/// [`MAX_OUTPUT_ENTRIES`], and its reference digests that sorted listing; a link, or anything
+/// that is not a file or a directory, is recorded as what it is. Nothing here enters the content
+/// store. The reference of a directory carries the sum of the lengths it listed.
+fn describe_output(
+    directory: &AuthorisedDirectory,
+    name: &RelativeName,
+    path: &str,
+) -> OutputReference {
+    let reference = |kind: &str, bytes: &[u8], byte_len: u64| OutputReference {
+        label: path.to_owned(),
+        digest: crate::objects::digest_of(bytes),
+        byte_len: U64::new(byte_len),
+        kind: kind.to_owned(),
+    };
+    match directory.probe(name) {
+        Ok(ObjectKind::File) => match directory.open_read(name, ObjectPolicy::ReadableFile) {
+            Ok(mut file) => {
+                let length = file.byte_len();
+                let mut head = Vec::new();
+                let mut bounded = file.handle_mut().take(MAX_OUTPUT_FILE_BYTES);
+                if bounded.read_to_end(&mut head).is_err() {
+                    return reference("unreadable output", b"", length);
+                }
+                let kind = if length > MAX_OUTPUT_FILE_BYTES {
+                    "file over the byte bound"
+                } else {
+                    "file"
+                };
+                reference(kind, &head, length)
+            }
+            Err(_) => reference("unreadable output", b"", 0),
+        },
+        Ok(ObjectKind::Directory) => match directory.subdirectory(name) {
+            Ok(child) => {
+                let mut listed = Vec::new();
+                let complete = list_output(child.handle(), "", &mut listed, 0);
+                listed.sort();
+                let mut text = String::new();
+                let mut total = 0_u64;
+                for entry in &listed {
+                    total = total.saturating_add(entry.length);
+                    text.push_str(&format!(
+                        "{}\t{}\t{}\t{}\n",
+                        entry.kind,
+                        entry.path,
+                        entry.length,
+                        entry
+                            .written_at_nanos
+                            .map_or_else(|| "-".to_owned(), |nanos| nanos.to_string())
+                    ));
+                }
+                let kind = if complete {
+                    "directory listing"
+                } else {
+                    "truncated directory listing"
+                };
+                reference(kind, text.as_bytes(), total)
+            }
+            Err(_) => reference("unreadable output", b"", 0),
+        },
+        Ok(ObjectKind::Link) => reference("link", b"", 0),
+        Ok(_) => reference("not a file or a directory", b"", 0),
+        Err(_) => reference("unreadable output", b"", 0),
+    }
+}
+
+/// One entry of an output directory's listing.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Listed {
+    path: String,
+    kind: &'static str,
+    length: u64,
+    written_at_nanos: Option<u64>,
+}
+
+/// Lists every entry beneath `directory` into `listed`, recursing into real directories only.
+/// Answers false when the listing stopped at a bound.
+fn list_output(
+    directory: &cap_std::fs::Dir,
+    prefix: &str,
+    listed: &mut Vec<Listed>,
+    depth: usize,
+) -> bool {
+    if depth >= crate::capture::MAX_WALK_DEPTH {
+        return false;
+    }
+    let Ok(entries) = directory.entries() else {
+        listed.push(Listed {
+            path: prefix.to_owned(),
+            kind: "unreadable",
+            length: 0,
+            written_at_nanos: None,
+        });
+        return true;
+    };
+    let mut complete = true;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            listed.push(Listed {
+                path: format!("{prefix}/?"),
+                kind: "unreadable",
+                length: 0,
+                written_at_nanos: None,
+            });
+            continue;
+        };
+        if listed.len() >= MAX_OUTPUT_ENTRIES {
+            return false;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let Ok(metadata) = directory.symlink_metadata(entry.file_name()) else {
+            listed.push(Listed {
+                path,
+                kind: "unreadable",
+                length: 0,
+                written_at_nanos: None,
+            });
+            continue;
+        };
+        let written = metadata
+            .modified()
+            .ok()
+            .and_then(|at| at.into_std().duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|since| u64::try_from(since.as_nanos()).ok());
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
+            listed.push(Listed {
+                path: path.clone(),
+                kind: "directory",
+                length: 0,
+                written_at_nanos: written,
+            });
+            match directory.open_dir(entry.file_name()) {
+                Ok(child) => {
+                    if !list_output(&child, &path, listed, depth + 1) {
+                        complete = false;
+                    }
+                }
+                Err(_) => listed.push(Listed {
+                    path: format!("{path}/?"),
+                    kind: "unreadable",
+                    length: 0,
+                    written_at_nanos: None,
+                }),
+            }
+        } else {
+            listed.push(Listed {
+                path,
+                kind: if file_type.is_symlink() {
+                    "link"
+                } else if file_type.is_file() {
+                    "file"
+                } else {
+                    "other"
+                },
+                length: if file_type.is_file() {
+                    metadata.len()
+                } else {
+                    0
+                },
+                written_at_nanos: written,
+            });
+        }
+    }
+    complete
+}
+
 /// Returns true when a materialised file is executable.
 #[cfg(unix)]
 fn is_executable(file: &kr_transfer::AuthorisedFile) -> bool {
@@ -749,7 +1119,23 @@ pub fn record_result(
     materialisation_id: MaterialisationId,
     report: &RunReport,
 ) -> Result<MaterialisationResult> {
-    let (row, state, observed) = reread(service, materialisation_id)?;
+    record_result_with(service, materialisation_id, report, &Outputs::none())
+}
+
+/// Records one result like [`record_result`] for a run that is declared to write `outputs`: those
+/// paths are left out of the comparison with the version, and the result records a reference to
+/// each beside the outputs the report names.
+///
+/// # Errors
+///
+/// As [`record_result`].
+pub fn record_result_with(
+    service: &ChangeSetService,
+    materialisation_id: MaterialisationId,
+    report: &RunReport,
+    outputs: &Outputs,
+) -> Result<MaterialisationResult> {
+    let (row, state, observed, found) = reread_with(service, materialisation_id, outputs)?;
     let input_version = VersionRef {
         change_set_id: row.change_set_id,
         version: row.version,
@@ -829,7 +1215,7 @@ pub fn record_result(
         environment_id: service.environment_id(),
         tool: report.tool.clone(),
         receipt: report.receipt.clone(),
-        outputs: report.outputs.clone(),
+        outputs: report.outputs.iter().cloned().chain(found).collect(),
         attestation,
         recorded_at_ms: kr_ipc::now_ms(),
     };
@@ -907,6 +1293,46 @@ fn derive_from(
         // whose authority could be asked for. The method that does reach it carries its own.
         None,
     )
+}
+
+/// Takes away the empty directory a materialisation made before its record was written, when a
+/// stop between the two left it.
+///
+/// A materialisation made under an identifier the caller chose is found again from that
+/// identifier: [`release`] takes it away when it has a record, and this takes away what the stop
+/// left when it has none. A directory with something in it is not removed, since nothing is
+/// written into one before its record is.
+///
+/// # Errors
+///
+/// Returns [`ChangeSetError::StorageUnavailable`] when the directory could not be taken away.
+pub fn discard_unrecorded(
+    service: &ChangeSetService,
+    materialisation_id: MaterialisationId,
+) -> Result<()> {
+    if service
+        .locked()?
+        .materialisation(materialisation_id)?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let parent = service
+        .root()
+        .subdirectory(&RelativeName::parse(MATERIALISATIONS_DIRECTORY)?)?;
+    let name = materialisation_id.to_string();
+    match parent.handle().remove_dir(&name) {
+        Ok(()) => Ok(parent.sync(kr_flush::NameKind::Directory)?),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(ChangeSetError::storage(error)),
+    }
 }
 
 /// Takes one materialisation's directory away and records that it is released.

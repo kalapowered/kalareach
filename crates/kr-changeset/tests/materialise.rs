@@ -776,3 +776,221 @@ fn an_authority_withdrawn_after_the_claim_writes_no_materialisation() {
     .expect("a materialisation under authority that holds");
     assert!(Path::new(&made.directory_path).is_dir());
 }
+
+/// A materialisation of the fixture's captured version, ready for a run that writes in it.
+fn a_copy_to_run_in(
+    fixture: &Fixture,
+    name: &str,
+) -> (
+    kr_protocol::changeset::ChangeSetVersionRecord,
+    kr_protocol::changeset::MaterialisationRecord,
+) {
+    ordinary_repository(fixture.work(), name);
+    let workspace = fixture.workspace(name);
+    let record = fixture.capture(workspace, &include_everything());
+    let made = materialise::materialise(
+        fixture.service(),
+        reference(&record),
+        MaterialisationPurpose::Test,
+        "the test copy",
+        None,
+    )
+    .expect("the version is materialised");
+    (record, made)
+}
+
+/// The declarations of one suite, checked against the version the fixture captured.
+fn declared(
+    fixture: &Fixture,
+    record: &kr_protocol::changeset::ChangeSetVersionRecord,
+    paths: &[&str],
+) -> Result<materialise::Outputs, String> {
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("the manifest reads");
+    let paths: Vec<String> = paths.iter().map(|path| (*path).to_owned()).collect();
+    materialise::Outputs::new(&paths, &manifest)
+}
+
+/// KR-REQ-25.20: a run that wrote only where its suite declares output attests the version it ran
+/// against. The directory it wrote is recorded as one reference that names its listing, and
+/// nothing beneath it is read into the content store. A link inside it, and a file the listing
+/// cannot read, are entries and not failures. The control is the same run without the declaration,
+/// which cannot attest the version.
+#[test]
+fn a_run_that_wrote_only_its_declared_output_attests_the_version() {
+    let fixture = Fixture::create();
+    let (record, made) = a_copy_to_run_in(&fixture, "built");
+    let directory = Path::new(&made.directory_path);
+    write(directory, "build/output/artefact.bin", "built things\n");
+    write(directory, "build/output/logs/run.log", "a log\n");
+    std::os::unix::fs::symlink("/no/such/place", directory.join("build/output/link"))
+        .expect("a link in the output");
+
+    let outputs = declared(&fixture, &record, &["build/output"]).expect("the declaration is fine");
+    let result = materialise::record_result_with(
+        fixture.service(),
+        made.materialisation_id,
+        &report(),
+        &outputs,
+    )
+    .expect("the result is recorded");
+    assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
+    assert_eq!(result.tested_version, Nullable(Some(reference(&record))));
+    let listing = result
+        .outputs
+        .iter()
+        .find(|output| output.label == "build/output")
+        .expect("the declared output is recorded as a reference");
+    assert_eq!(listing.kind, "directory listing");
+    assert_eq!(
+        listing.byte_len.get(),
+        b"built things\n".len() as u64 + b"a log\n".len() as u64,
+        "a listing's length is the sum of the lengths it lists"
+    );
+    assert!(
+        result.outputs.iter().any(|output| output.kind == "log"),
+        "the outputs the report names are kept beside it"
+    );
+
+    // The control: the same directory without the declaration is source the run added.
+    let (_, undeclared) = a_copy_to_run_in(&fixture, "built-undeclared");
+    let directory = Path::new(&undeclared.directory_path);
+    write(directory, "build/output/artefact.bin", "built things\n");
+    let result =
+        materialise::record_result(fixture.service(), undeclared.materialisation_id, &report())
+            .expect("the result is recorded");
+    assert_eq!(result.tested_source, TestedSource::Indeterminate);
+}
+
+/// KR-REQ-25.20: only the declared path is left out. A path the run added beside it makes the
+/// source indeterminate, as it would without any declaration, and the reading is recorded as a
+/// derived version. A declared output that is a file over the byte bound, or a link, is a
+/// reference of its own kind and not a failure.
+#[test]
+fn a_path_beside_a_declared_output_still_changes_the_source() {
+    let fixture = Fixture::create();
+    let (record, made) = a_copy_to_run_in(&fixture, "beside");
+    let directory = Path::new(&made.directory_path);
+    write(directory, "build/output/artefact.bin", "built things\n");
+    write(directory, "build/input", "the run added this\n");
+    let outputs = declared(&fixture, &record, &["build/output"]).expect("the declaration is fine");
+    let result = materialise::record_result_with(
+        fixture.service(),
+        made.materialisation_id,
+        &report(),
+        &outputs,
+    )
+    .expect("the result is recorded");
+    assert_eq!(result.tested_source, TestedSource::Indeterminate);
+    assert!(
+        result.derived_output_version.0.is_some(),
+        "what the directory held is recorded as a version"
+    );
+
+    let (record, made) = a_copy_to_run_in(&fixture, "links");
+    let directory = Path::new(&made.directory_path);
+    std::os::unix::fs::symlink("/no/such/place", directory.join("report"))
+        .expect("an output that is a link");
+    let outputs = declared(&fixture, &record, &["report"]).expect("the declaration is fine");
+    let result = materialise::record_result_with(
+        fixture.service(),
+        made.materialisation_id,
+        &report(),
+        &outputs,
+    )
+    .expect("the result is recorded");
+    assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
+    assert!(
+        result
+            .outputs
+            .iter()
+            .any(|output| output.label == "report" && output.kind == "link"),
+        "a link as an output is recorded as one: {:?}",
+        result.outputs
+    );
+}
+
+/// KR-REQ-25.20: declarations that contradict each other or the version are refused before a run
+/// begins, in words for the person who wrote them.
+#[test]
+fn declarations_that_the_version_or_each_other_contradict_are_refused() {
+    let fixture = Fixture::create();
+    let (record, _) = a_copy_to_run_in(&fixture, "declarations");
+    for (paths, says) in [
+        (&["/build"][..], "relative"),
+        (&["build/"][..], "relative"),
+        (&["build/../etc"][..], "name"),
+        (&["build", "build"][..], "twice"),
+        (&["build", "build/output"][..], "holds"),
+        (&["src"][..], "version holds"),
+        (&["src/lib.rs"][..], "version holds"),
+        (&[""][..], "relative"),
+    ] {
+        let refusal = declared(&fixture, &record, paths).expect_err("the declaration is refused");
+        assert!(refusal.contains(says), "{paths:?}: {refusal}");
+    }
+    let many: Vec<String> = (0..=materialise::MAX_DECLARED_OUTPUTS)
+        .map(|number| format!("out{number}"))
+        .collect();
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("the manifest reads");
+    materialise::Outputs::new(&many, &manifest).expect_err("too many declarations");
+    declared(&fixture, &record, &["build", "dist/assets"]).expect("two separate outputs are fine");
+}
+
+/// KR-REQ-25.14: a materialisation made under an identifier its caller chose is found again from
+/// that identifier alone. A stop between the directory and its record leaves an empty directory,
+/// which is taken away by that identifier and by nothing else; a recorded materialisation is
+/// released the ordinary way, and a directory with something in it is never removed.
+#[test]
+fn a_materialisation_under_a_chosen_identifier_is_found_again_from_it() {
+    let fixture = Fixture::create();
+    ordinary_repository(fixture.work(), "chosen");
+    let workspace = fixture.workspace("chosen");
+    let record = fixture.capture(workspace, &include_everything());
+
+    let id = kr_protocol::ids::MaterialisationId::new(kr_ipc::new_uuid());
+    let made = materialise::materialise_as(
+        fixture.service(),
+        id,
+        reference(&record),
+        MaterialisationPurpose::Test,
+        "a chosen identifier",
+        None,
+    )
+    .expect("the materialisation is made");
+    assert_eq!(made.materialisation_id, id);
+    materialise::materialise_as(
+        fixture.service(),
+        id,
+        reference(&record),
+        MaterialisationPurpose::Test,
+        "the same identifier again",
+        None,
+    )
+    .expect_err("an identifier that was used is refused");
+    // A recorded materialisation is not an orphan: this leaves it alone.
+    materialise::discard_unrecorded(fixture.service(), id).expect("nothing to discard");
+    assert!(Path::new(&made.directory_path).is_dir());
+    materialise::release(fixture.service(), id).expect("the ordinary release");
+    assert!(!Path::new(&made.directory_path).exists());
+
+    // The stop between the directory and its record: an empty directory with the identifier's name.
+    let orphan = kr_protocol::ids::MaterialisationId::new(kr_ipc::new_uuid());
+    let beside = Path::new(&made.directory_path)
+        .parent()
+        .expect("the directory of materialisations")
+        .join(orphan.to_string());
+    std::fs::create_dir(&beside).expect("the leftover of a stop");
+    materialise::discard_unrecorded(fixture.service(), orphan).expect("the leftover is taken away");
+    assert!(!beside.exists());
+    // Something in a directory nobody recorded is not this host's to remove.
+    std::fs::create_dir(&beside).expect("a directory");
+    std::fs::write(beside.join("not ours"), b"x").expect("a file");
+    materialise::discard_unrecorded(fixture.service(), orphan).expect("left alone");
+    assert!(beside.join("not ours").exists());
+}
