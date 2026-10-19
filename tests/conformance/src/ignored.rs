@@ -7,16 +7,16 @@
 //! entry's command is still where the entry says, so a test cannot become ignored, or lose the
 //! command that runs it, without the map saying so.
 //!
-//! The commands are not read for what they mean. An entry names the words one command holds, and
-//! the check is that the file still has a line with all of them (the continuations of a line
-//! joined, what a comment holds left out, and a line that only says something, such as one that
-//! begins with `echo`, not a command), so that the words of two commands never stand in for one. A
-//! command that selects tests with `--exact` has to name each test the entry covers on that line,
-//! or, for an entry that says a call passes the names, on a line that begins with the call's words.
-//! The command has to run them: a `--skip` filter, `--list`, `--no-run` or a filter that selects by
-//! a part of the names may not leave one out. A step of the report's own plan is found in the plan,
-//! not in text. Whether control reaches a command, and what the script does with its result, are
-//! not read.
+//! The commands are not read for what they mean. An entry gives every word of one command, up to the
+//! test names, and the check is that the file still has a line with exactly those words as a run
+//! (the continuations of a line joined, what a comment holds left out, a line that only says
+//! something, such as one that begins with `echo`, not a command), followed by nothing but the tests
+//! the entry covers, when the words select by name with `--exact`, and the end of the command. A
+//! word added, changed or taken out of the command, a flag, a filter, an option or a second
+//! separator, is a command the entry does not name, so none can narrow a run unseen. An entry whose
+//! test names a call passes finds them on lines that begin with the call's words. A step of the
+//! report's own plan is found in the plan, not in text. Whether control reaches a command, and what
+//! the script does with its result, are not read.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -93,15 +93,13 @@ pub fn check(map: &Map, root: &Path, runs: &[IgnoredRun]) -> Findings {
             }
         }
         let problem = match run.runs {
-            Runs::Command { file, fragments } => {
-                missing_command(root, file, fragments, None, matched)
-            }
+            Runs::Command { file, command } => missing_command(root, file, command, None, matched),
             Runs::Supplied {
                 file,
-                fragments,
+                command,
                 names_with,
-            } => missing_command(root, file, fragments, Some(names_with), matched),
-            Runs::Plan { fragments } => missing_step(&plan, fragments, matched),
+            } => missing_command(root, file, command, Some(names_with), matched),
+            Runs::Plan { command } => missing_step(&plan, command, matched),
             Runs::Helper { file } => missing_helper(root, file, matched),
             Runs::ByHand { why } => {
                 unrun_notes.push(format!("{name} is run by hand: {why}"));
@@ -170,17 +168,22 @@ fn case_matches(case: &str, name: &str) -> bool {
     case == name || (case.ends_with("::") && name.starts_with(case))
 }
 
-/// Why `file` holds no command with all of `fragments` that names the tests it selects and leaves
-/// none of them out, or `None` when it holds one.
+/// The words that may stand before a command and leave it running as written.
+const BEFORE: [&str; 11] = [
+    "run:", "-", "!", "if", "then", "do", "else", "&&", "||", ";", "{",
+];
+
+/// Why `file` holds no command with exactly the words `command` that names `covered` and nothing
+/// else, or `None` when it holds one.
 ///
-/// A command that selects tests with `--exact` names each of `covered` on its own line, or, when
-/// `names_with` is given, on a line that begins with the first of those words and holds the rest
-/// (the call that passes the name to the command). A command leaves a test out when [`narrowed`]
-/// says so.
+/// A command whose words include `--exact` is followed by each of `covered`, in any order, and by
+/// nothing but the end of the command; when `names_with` is given, the tests are named instead on
+/// lines that begin with the first of those words and hold the rest (the call that passes the name
+/// to the command).
 fn missing_command(
     root: &Path,
     file: &str,
-    fragments: &[&str],
+    command: &[&str],
     names_with: Option<&[&str]>,
     covered: &BTreeSet<String>,
 ) -> Option<String> {
@@ -188,188 +191,177 @@ fn missing_command(
         Ok(text) => text,
         Err(error) => return Some(format!("{file} cannot be read: {error}")),
     };
+    if let Some(wrong) = leaves_out(command, covered) {
+        return Some(format!("its command {wrong}"));
+    }
     let lines: Vec<String> = commands(&text).collect();
-    let wrong = |line: &String| {
-        let exact = contains_token(line, "--exact");
-        narrowed(line, covered, exact).or_else(|| {
-            if !exact {
-                return None;
-            }
-            covered
-                .iter()
-                .find(|name| match names_with {
-                    None => !contains_token(line, name),
-                    Some(words) => !lines.iter().any(|other| {
-                        begins_with(other, words)
-                            && holds_all(other, words)
-                            && contains_token(other, name)
-                    }),
-                })
-                .map(|name| format!("does not name {name}"))
-        })
-    };
+    let names_after = names_with.is_none() && command.contains(&"--exact");
     let found: Vec<Option<String>> = lines
         .iter()
-        .filter(|line| holds_all(line, fragments))
-        .map(wrong)
+        .flat_map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            starts(&words, command)
+                .into_iter()
+                .map(|start| run_problem(&words, start, command.len(), names_after, covered))
+                .collect::<Vec<_>>()
+        })
         .collect();
-    if found.iter().any(Option::is_none) {
-        return None;
+    if found.is_empty() {
+        return Some(format!("{file} holds no command with {}", quoted(command)));
     }
-    Some(match found.into_iter().next() {
-        Some(Some(wrong)) => format!("{file} {wrong}"),
-        _ => format!("{file} holds no command with {}", quoted(fragments)),
-    })
+    if found.iter().any(Option::is_none) {
+        return names_with.and_then(|with| {
+            covered
+                .iter()
+                .find(|name| {
+                    !lines.iter().any(|other| {
+                        begins_with(other, with)
+                            && holds_all(other, with)
+                            && contains_token(other, name)
+                    })
+                })
+                .map(|name| format!("{file} does not name {name}"))
+        });
+    }
+    found
+        .into_iter()
+        .next()
+        .flatten()
+        .map(|wrong| format!("{file} {wrong}"))
 }
 
-/// The options of the test program that take their value as the next word.
-const VALUE_OPTIONS: [&str; 6] = [
-    "--test-threads",
-    "--color",
-    "--format",
-    "--logfile",
-    "--shuffle-seed",
-    "--report-time",
-];
+/// Where in `words` the run `command` starts.
+fn starts(words: &[&str], command: &[&str]) -> Vec<usize> {
+    (0..words.len())
+        .filter(|&at| words[at..].starts_with(command))
+        .collect()
+}
 
-/// The flags of `cargo test` that leave every test of the target to run.
-const CARGO_FLAGS: [&str; 8] = [
-    "--locked",
-    "--release",
-    "--workspace",
-    "--no-fail-fast",
-    "--lib",
-    "--offline",
-    "--frozen",
-    "--all-features",
-];
-
-/// The flags of the test program that leave every test it is asked for to run.
-const PROGRAM_FLAGS: [&str; 5] = [
-    "--ignored",
-    "--include-ignored",
-    "--exact",
-    "--nocapture",
-    "--show-output",
-];
-
-/// The options of `cargo test` that take their value as the next word.
-const CARGO_VALUE_OPTIONS: [&str; 19] = [
-    "-p",
-    "--package",
-    "--test",
-    "--bench",
-    "--bin",
-    "--example",
-    "--features",
-    "-F",
-    "--target",
-    "--target-dir",
-    "--manifest-path",
-    "-j",
-    "--jobs",
-    "--profile",
-    "--message-format",
-    "--color",
-    "--config",
-    "-Z",
-    "--exclude",
-];
-
-/// Why a command, as the words of one line, runs fewer tests than `covered` or none, or `None`
-/// when it does not: it does not run them (`--list`, `--no-run`, `--help`, or the test program's
-/// `--bench` mode), a `--skip` filter (as `--skip FILTER` or `--skip=FILTER`) selects one of them,
-/// or a filter that names tests by a part of their names, before or after the `--` that ends
-/// Cargo's own arguments, instead of `--exact`, leaves one of them out. A filter selects a test
-/// whose name contains it. A flag of `cargo test` that the map does not know leaves every test
-/// running is refused, so that a flag it has not heard of cannot narrow a run unseen.
-fn narrowed(command: &str, covered: &BTreeSet<String>, exact: bool) -> Option<String> {
-    let words: Vec<&str> = command
-        .split_whitespace()
-        .map(|word| word.trim_matches(['"', '\'']))
-        .collect();
-    // The command is what follows `cargo test`, up to the first shell operator; a test program
-    // started on its own has only the test program's arguments.
-    let cargo = words.windows(2).position(|pair| pair == ["cargo", "test"]);
-    let mut skips = Vec::new();
-    let mut filters = Vec::new();
-    let mut program = cargo.is_none();
-    let mut at = cargo.map_or(0, |at| at + 2);
-    while at < words.len() {
-        let word = words[at];
-        if word.contains(['|', '&', ';', '<', '>', '(', ')']) {
-            break;
-        }
-        match word {
-            "--list" | "--no-run" | "--help" | "-h" => {
-                return Some(format!("does not run the tests, with `{word}`"));
-            }
-            "--bench" if program => {
-                return Some("runs benchmarks and not the tests, with `--bench`".to_owned());
-            }
-            "--" => program = true,
-            "--skip" => {
-                skips.extend(words.get(at + 1));
-                at += 1;
-            }
-            _ if word.starts_with("--skip=") => skips.push(&word["--skip=".len()..]),
-            _ if (program && VALUE_OPTIONS.contains(&word))
-                || (!program && CARGO_VALUE_OPTIONS.contains(&word)) =>
-            {
-                at += 1;
-            }
-            _ if word.starts_with('-') => {
-                let known = if program {
-                    PROGRAM_FLAGS.contains(&word) || word.starts_with("--test-threads=")
-                } else {
-                    CARGO_FLAGS.contains(&word)
-                };
-                if cargo.is_some() && !known {
-                    return Some(format!(
-                        "has `{word}`, which the map does not know to leave every test running"
-                    ));
-                }
-            }
-            _ if word.contains('$') || cargo.is_none() => {}
-            _ => filters.push(word),
-        }
-        at += 1;
-    }
-    for skip in skips {
-        if let Some(name) = covered.iter().find(|name| name.contains(skip)) {
-            return Some(format!("skips {name} with `--skip {skip}`"));
-        }
-    }
-    if !exact
-        && !filters.is_empty()
-        && let Some(name) = covered
-            .iter()
-            .find(|name| !filters.iter().any(|filter| name.contains(filter)))
+/// Why the command that starts at `start` in `words` is not the command as written, or `None`:
+/// something that changes how it runs stands before it, a test it should name is missing, or a
+/// word follows that the entry does not name.
+fn run_problem(
+    words: &[&str],
+    start: usize,
+    length: usize,
+    names_after: bool,
+    covered: &BTreeSet<String>,
+) -> Option<String> {
+    if let Some(before) = start.checked_sub(1).map(|at| words[at])
+        && !BEFORE.contains(&before)
     {
         return Some(format!(
-            "selects only {}, which leaves out {name}",
-            filters.join(" ")
+            "has `{before}` before the command, which may change how it runs"
         ));
+    }
+    let mut rest = &words[start + length..];
+    if names_after {
+        let mut named = BTreeSet::new();
+        while let Some(name) = rest.first().filter(|word| covered.contains(**word)) {
+            named.insert(*name);
+            rest = &rest[1..];
+        }
+        if let Some(name) = covered.iter().find(|name| !named.contains(name.as_str())) {
+            return Some(format!("does not name {name}"));
+        }
+    }
+    after_command(rest)
+}
+
+/// Why `rest`, the words after a command, is more than its end, or `None`: a redirection (with its
+/// target) goes on to the end, and a pipe, a list operator or the end of a substitution ends it.
+fn after_command(rest: &[&str]) -> Option<String> {
+    let mut at = 0;
+    while let Some(word) = rest.get(at) {
+        match redirection(word) {
+            Some(Redirection::Whole) => {}
+            Some(Redirection::NeedsTarget) => at += 1,
+            Some(Redirection::Ends) => return None,
+            None if word.starts_with(['|', '&', ';', ')', '}']) => return None,
+            None => {
+                return Some(format!(
+                    "has `{word}` after the command that the entry does not name"
+                ));
+            }
+        }
+        at += 1;
     }
     None
 }
 
-/// Why no step of the report's own plan has all of `fragments`, or does not name a test the step
-/// selects with `--exact`, or `None` when it does both.
-fn missing_step(plan: &[String], fragments: &[&str], covered: &BTreeSet<String>) -> Option<String> {
-    let Some(step) = plan.iter().find(|step| holds_all(step, fragments)) else {
-        return Some(format!(
-            "the report's plan has no step with {}",
-            quoted(fragments)
-        ));
-    };
-    if let Some(narrowed) = narrowed(step, covered, contains_token(step, "--exact")) {
-        return Some(format!("its step {narrowed}"));
+/// What a word is when it is a redirection.
+enum Redirection {
+    /// All of the word: `2>&1`, `>file`.
+    Whole,
+    /// The operator alone: its target is the next word.
+    NeedsTarget,
+    /// A redirection that the end of the command follows in the same word: `2>&1)";`.
+    Ends,
+}
+
+/// Reads `word` as a redirection, or `None`.
+fn redirection(word: &str) -> Option<Redirection> {
+    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    let rest = rest.strip_prefix(['>', '<'])?;
+    let rest = rest.trim_start_matches(['>', '<']);
+    if rest.is_empty() {
+        return Some(Redirection::NeedsTarget);
     }
-    if contains_token(step, "--exact") {
+    let target_end = rest.strip_prefix('&').map_or(rest, |duplicate| {
+        duplicate.trim_start_matches(|c: char| c.is_ascii_digit() || c == '-')
+    });
+    let target = target_end
+        .find(['|', '&', ';', ')'])
+        .map_or(target_end.len(), |at| at);
+    if target < target_end.len() {
+        Some(Redirection::Ends)
+    } else {
+        Some(Redirection::Whole)
+    }
+}
+
+/// Why `command` leaves a test of `covered` out, or `None`: it only lists them or builds them, or a
+/// `--skip` filter in it selects one of them. The words are the entry's own, so this holds the table
+/// to the tests it says it covers.
+fn leaves_out(command: &[&str], covered: &BTreeSet<String>) -> Option<String> {
+    if let Some(word) = command
+        .iter()
+        .find(|word| matches!(**word, "--list" | "--no-run"))
+    {
+        return Some(format!("does not run the tests, with `{word}`"));
+    }
+    command.iter().enumerate().find_map(|(at, word)| {
+        let skip = word.strip_prefix("--skip=").or_else(|| {
+            (*word == "--skip")
+                .then(|| command.get(at + 1).copied())
+                .flatten()
+        })?;
+        covered
+            .iter()
+            .find(|name| name.contains(skip))
+            .map(|name| format!("skips {name} with `--skip {skip}`"))
+    })
+}
+
+/// Why no step of the report's own plan has exactly the words `command`, or does not name a test
+/// the step selects with `--exact`, or `None` when it does both.
+fn missing_step(plan: &[String], command: &[&str], covered: &BTreeSet<String>) -> Option<String> {
+    if let Some(wrong) = leaves_out(command, covered) {
+        return Some(format!("its step {wrong}"));
+    }
+    if !plan
+        .iter()
+        .any(|step| step.split_whitespace().eq(command.iter().copied()))
+    {
+        return Some(format!(
+            "the report's plan has no step with the words {}",
+            quoted(command)
+        ));
+    }
+    if command.contains(&"--exact") {
         return covered
             .iter()
-            .find(|name| !contains_token(step, name))
+            .find(|name| !command.contains(&name.as_str()))
             .map(|name| format!("its step does not name {name}"));
     }
     None
@@ -476,12 +468,8 @@ fn contains_token(text: &str, word: &str) -> bool {
     })
 }
 
-fn quoted(fragments: &[&str]) -> String {
-    fragments
-        .iter()
-        .map(|fragment| format!("`{fragment}`"))
-        .collect::<Vec<_>>()
-        .join(" and ")
+fn quoted(words: &[&str]) -> String {
+    format!("`{}`", words.join(" "))
 }
 
 /// Every step of the report's plan on Linux, each as the words of its command.
