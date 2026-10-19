@@ -629,7 +629,7 @@ impl HeldGrant {
     /// when it has no end.
     ///
     /// The clock is read before the decision, and the time the grant has left once the decision is
-    /// made, credited as continuous time is, is added to that reading, so the moment is never
+    /// made, credited as a bound is, is added to that reading, so the moment is never
     /// later than the grant's end: whatever the decision took comes off the grant and is never
     /// added to it.
     fn standing(&self) -> kr_automation::Result<Option<u64>> {
@@ -761,14 +761,25 @@ struct NodeContext {
     wait_until_ms: u64,
 }
 
+/// What `elapsed_ms` of continuous time is held to be worth when a bound is worked out from it:
+/// all of it less the rate allowance ([`kr_ipc::clock::RATE_ALLOWANCE_PPM`]), the deduction rounded
+/// up. [`kr_ipc::clock::credited`] rounds the deduction down, which is right for time a projection
+/// credits and wrong for a bound, which must never fall after the end it stands on.
+fn credited_for_a_bound(elapsed_ms: u64) -> u64 {
+    elapsed_ms.saturating_sub(
+        elapsed_ms
+            .saturating_mul(kr_ipc::clock::RATE_ALLOWANCE_PPM)
+            .div_ceil(1_000_000),
+    )
+}
+
 /// The moment a grant stands until, on the machine's continuous clock, from a reading taken before
 /// it was decided and the time the decision says it has left.
 ///
 /// The reading comes first and the left-over time is added to it, never to a reading taken
 /// afterwards, so a decision that is slow shortens the moment and never lengthens it. The time is
-/// credited as continuous time is credited everywhere a duration is turned into a moment (the
-/// platform's time service can slow the clock the worker reads, and a bound must not outlast the
-/// grant because of it).
+/// credited as a bound is ([`credited_for_a_bound`]): the platform's time service can slow the
+/// clock the worker reads, and the moment must not outlast the grant because of it.
 fn grant_end_on_the_boot_clock(
     read_boot_ms: impl FnOnce() -> u64,
     decide: impl FnOnce() -> kr_automation::Result<Option<std::time::Duration>>,
@@ -776,7 +787,7 @@ fn grant_end_on_the_boot_clock(
     let read_at = read_boot_ms();
     Ok(decide()?.map(|ends_in| {
         let ends_in_ms = u64::try_from(ends_in.as_millis()).unwrap_or(u64::MAX);
-        read_at.saturating_add(kr_ipc::clock::credited(ends_in_ms))
+        read_at.saturating_add(credited_for_a_bound(ends_in_ms))
     }))
 }
 
@@ -854,7 +865,7 @@ fn node_admission(
             );
         }
         let wait_ends = bounded_by_the_wait
-            .then(|| boot_ms.saturating_add(kr_ipc::clock::credited(wait_until_ms - now_ms)));
+            .then(|| boot_ms.saturating_add(credited_for_a_bound(wait_until_ms - now_ms)));
         Ok(grant_ends.into_iter().chain(wait_ends).min())
     })
 }
@@ -3452,26 +3463,30 @@ mod tests {
 
     /// The moment a grant stands until is measured from a reading taken before the grant was
     /// decided: a decision that takes five seconds shortens the moment by five seconds and never
-    /// lengthens it. The time left is credited as continuous time is.
+    /// lengthens it. The time left is credited as a bound is, with the deduction rounded up: a
+    /// grant with 9,999 ms left stands until 9,998 ms after the reading, not 9,999, because 100 ppm
+    /// of 9,999 ms is a fraction of a millisecond the clock the worker reads may lose.
     #[test]
     fn a_slow_decision_shortens_the_moment_a_grant_stands_until() {
         use std::time::Duration;
 
-        let clock = std::cell::Cell::new(1_000_u64);
-        let ends_at = grant_end_on_the_boot_clock(
-            || clock.get(),
-            || {
-                // The decision takes five seconds and finds ten seconds left.
-                clock.set(6_000);
-                Ok(Some(Duration::from_secs(10)))
-            },
-        )
-        .expect("decided");
-        assert_eq!(
-            ends_at,
-            Some(1_000 + kr_ipc::clock::credited(10_000)),
-            "the reading before the decision, not the one after it"
-        );
+        for (left, credited) in [(10_000_u64, 9_999_u64), (9_999, 9_998), (1, 0), (0, 0)] {
+            let clock = std::cell::Cell::new(1_000_u64);
+            let ends_at = grant_end_on_the_boot_clock(
+                || clock.get(),
+                || {
+                    // The decision takes five seconds and finds `left` milliseconds left.
+                    clock.set(6_000);
+                    Ok(Some(Duration::from_millis(left)))
+                },
+            )
+            .expect("decided");
+            assert_eq!(
+                ends_at,
+                Some(1_000 + credited),
+                "{left} ms left, from the reading before the decision and not the one after it"
+            );
+        }
         let unbounded = grant_end_on_the_boot_clock(|| 1_000, || Ok(None)).expect("decided");
         assert_eq!(unbounded, None, "a grant with no end has no moment");
     }
