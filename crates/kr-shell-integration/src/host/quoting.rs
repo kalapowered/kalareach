@@ -55,12 +55,13 @@ const fn is_powershell_quote(character: char) -> bool {
 
 /// Returns true for a character that needs no quoting in this shell.
 ///
-/// The set is the same everywhere but for `@`, which PowerShell reads at the start of a word as
-/// splatting: `@payload` there is the contents of `$payload` rather than the two-character word
-/// the person typed, and a word that is not preserved literally is not the argument vector the
-/// caller named.
+/// The set is the same everywhere but for two characters in PowerShell. `@` at the start of a word
+/// is splatting: `@payload` there is the contents of `$payload` rather than the two-character word
+/// the person typed. `,` is the array operator: `a,b` there is a list of two words, and a path
+/// with a comma in it is two arguments, or a command name cut short. A word that is not preserved
+/// literally is not the argument vector the caller named.
 const fn is_bare(kind: ShellKind, character: char) -> bool {
-    if matches!(kind, ShellKind::PowerShell) && character == '@' {
+    if matches!(kind, ShellKind::PowerShell) && matches!(character, '@' | ',') {
         return false;
     }
     character.is_ascii_alphanumeric()
@@ -148,9 +149,15 @@ mod tests {
     fn powershell_quotes_a_word_it_would_otherwise_expand() {
         assert_eq!(quote(ShellKind::PowerShell, "@payload"), "'@payload'");
         assert_eq!(quote(ShellKind::PowerShell, "a@b"), "'a@b'");
-        // The other three read `@` as an ordinary character, so nothing about them changes.
+        // And so is a word PowerShell would read as a list.
+        assert_eq!(
+            quote(ShellKind::PowerShell, "/Users/a,b/x.ps1"),
+            "'/Users/a,b/x.ps1'"
+        );
+        // The other three read `@` and `,` as ordinary characters, so nothing about them changes.
         for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
             assert_eq!(quote(kind, "@payload"), "@payload");
+            assert_eq!(quote(kind, "a,b"), "a,b");
         }
     }
 
