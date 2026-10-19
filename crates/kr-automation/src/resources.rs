@@ -83,9 +83,10 @@ pub struct Owned {
     pub materialisation_id: Option<MaterialisationId>,
     /// The scratch directory the node's command runs in, when it declared no workspace.
     pub scratch: Option<String>,
-    /// The identity of that directory (device and inode, as text), written down once it exists
-    /// and before the command can start. A directory is removed only when it still has this
-    /// identity; one that was never identified is removed only when it is empty.
+    /// The identity of that directory (device, inode and the filesystem it is on, as text),
+    /// written down once it exists and before the command can start. A directory is removed only
+    /// when it still has this identity; one that was never identified is removed only when it is
+    /// empty.
     pub scratch_identity: Option<String>,
     /// The workspace the run is bound to for this node, when the definition names one.
     pub workspace_id: Option<WorkspaceId>,

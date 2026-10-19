@@ -5403,3 +5403,47 @@ async fn a_session_whose_worker_reports_after_its_node_gave_up_is_closed_by_the_
     .await;
     host.clients.abort();
 }
+
+/// KR-REQ-25.14: a tree the removal will not take does not keep its row owed. A command that
+/// leaves a chain of directories deeper than the removal holds handles for ends normally; its
+/// node succeeds, the row is released, and the tree stays where it is, to be looked at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_tree_the_removal_will_not_take_leaves_its_row_released() {
+    let host = working_host().await;
+    let mut control = client(&host).await;
+    host.issue(grant_id(57), &COMMAND_RIGHTS);
+    let document = definition(
+        workflow_id(57),
+        grant_id(57),
+        "a deep tree",
+        command_node(
+            &host,
+            "deep",
+            &format!("mkdir -p {}", vec!["a"; 140].join("/")),
+        ),
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+    let run: WorkflowRunResult = typed(
+        &start(&mut control, &host, &document, "evt-deep")
+            .await
+            .expect("the run is admitted"),
+    );
+    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+
+    until("the row to be released although its tree stays", || {
+        released_rows(&host) == 1
+    })
+    .await;
+    assert_eq!(owed_rows(&host), 0, "nothing is owed");
+    let scratch = host
+        ._temp
+        .environment()
+        .state_dir()
+        .join("workflow-scratch");
+    assert!(
+        std::fs::read_dir(&scratch).is_ok_and(|mut entries| entries.next().is_some()),
+        "the tree the removal would not take is still there"
+    );
+    host.clients.abort();
+}
