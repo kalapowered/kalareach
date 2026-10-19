@@ -3581,6 +3581,39 @@ mod tests {
         }
     }
 
+    /// A directory on another filesystem than the one it was recorded on is left alone, though its
+    /// device and inode are the recorded ones: the identity names the filesystem too. The control
+    /// is the same directory under the identity it was made with.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_on_another_filesystem_than_the_recorded_one_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("a root");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("the root is private");
+        let (scratch, identity) = made(root.path(), "node");
+        std::fs::write(scratch.join("file"), b"x").expect("a file in it");
+        let (object, _) = identity.rsplit_once(':').expect("three parts");
+        let elsewhere = format!(
+            "{object}:{}",
+            kr_transfer::FilesystemId::from_bytes([0xab; kr_transfer::FilesystemId::LEN])
+        );
+        assert_eq!(
+            remove_scratch(environment(), root.path(), &scratch, Some(&elsewhere)),
+            None
+        );
+        assert!(
+            scratch.join("file").exists(),
+            "a directory on another filesystem is not removed"
+        );
+        assert_eq!(
+            remove_scratch(environment(), root.path(), &scratch, Some(&identity)),
+            None
+        );
+        assert!(!scratch.exists(), "under its own identity it goes");
+    }
+
     /// A command that unpacks an archive loosens the mode of the directory it runs in. It is still
     /// the recorded directory, and it goes: it is made private again before it is asked whether
     /// only this account can change it.
