@@ -19,15 +19,17 @@
 //! Words are separated by a space or a tab and by nothing else, a comment begins at a `#` after a
 //! space or a tab, and a backslash and the new line after it are taken out and nothing is put in
 //! their place. Those are the shell's rules for the plain text of a command; a quote, an operator
-//! or a redirection is only a word of the line, so changing one changes the line. A line that holds
-//! a carriage return or another Unicode line break, which some readers of a script or a workflow
-//! take as the end of a line, is joined to the next, so it never stands alone. One exception: an
-//! entry whose own line is a workflow's `run:` field (it begins `run:` or `- run:`, in a `.yml` or
-//! `.yaml` file) is a plain scalar, where a backslash does not continue the line. Whether control
-//! reaches a line, what the script does with its result, the environment a step sets, what other
-//! syntax (a here-document, a quoted block over several lines, a folded scalar) makes of a line,
-//! and a filter in the line an entry itself gives are not read: the entry is taken as written, held
-//! only to the tests it covers by name, by `--skip`, `--list` and `--no-run`.
+//! or a redirection is only a word of the line, so changing one changes the line. One exception to
+//! the backslash rule: when an entry's own line is a workflow's `run:` field (it begins `run:` or
+//! `- run:`, in a `.yml` or `.yaml` file), a plain scalar where a backslash does not continue the
+//! line, no line of that file that begins that way and does not itself continue another is joined
+//! to the next. A line that holds a NUL, or a Unicode newline character other than the line feed,
+//! which some reader of a script or a workflow drops or takes as the end of a line, is never taken
+//! alone and is never a line the map matches. Whether control reaches a line, what the script does
+//! with its result, the environment a step sets, what other syntax (a here-document, a quoted
+//! block over several lines, a folded scalar) makes of a line, and a filter in the line an entry
+//! itself gives are not read: the entry is taken as written, held only to the tests it covers by
+//! name, by `--skip`, `--list` and `--no-run`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -418,15 +420,15 @@ fn plan_commands() -> Vec<String> {
 /// shell. Every line that ends in a backslash continues, in every file, with one exception: when
 /// `fields` is set, the entry's own line is a workflow's `run:` field, a plain scalar where a
 /// backslash is not a continuation, and a line that begins `run:` or `- run:` and does not itself
-/// continue another line is not joined to the next. A line that holds a character in [`BREAKS`] is
-/// joined to the next as well.
+/// continue another line is not joined to the next. A line that holds a character in [`UNREAD`] is
+/// joined to the next as well, and a command that holds one is left out.
 fn commands(text: &str, fields: bool) -> Vec<String> {
     let mut joined: Vec<String> = Vec::new();
     let mut continuing = false;
     for physical in text.split('\n') {
         let (body, goes_on) = match physical.strip_suffix('\\') {
             Some(body) if !(fields && !continuing && is_run_field(physical)) => (body, true),
-            _ => (physical, physical.contains(BREAKS)),
+            _ => (physical, physical.contains(UNREAD)),
         };
         match joined.last_mut() {
             Some(last) if continuing => last.push_str(body),
@@ -437,16 +439,20 @@ fn commands(text: &str, fields: bool) -> Vec<String> {
     joined
         .iter()
         .map(|line| words_of(without_comment(line)))
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.is_empty() && !line.contains(UNREAD))
         .collect()
 }
 
-/// The characters, other than the line feed the text is split at, that some reader of a script or a
-/// workflow takes as the end of a line: the rest of the Unicode newline characters. A reader that
-/// breaks a line at one hands the shell different lines from the ones the map splits, so a line
-/// that holds one is never taken alone. It joins the next line, and the line that results holds the
-/// character, which no entry's line does.
-const BREAKS: [char; 6] = ['\u{b}', '\u{c}', '\r', '\u{85}', '\u{2028}', '\u{2029}'];
+/// The characters that a reader of a script or a workflow does not read as the map does: a NUL,
+/// which bash drops, so that a backslash and a NUL and a new line are one continuation for the
+/// shell; and the Unicode newline characters other than the line feed the text is split at (vertical
+/// tab, form feed, carriage return, next line, line separator, paragraph separator), at which a
+/// reader such as a YAML parser or a CR LF file ends a line where the shell does not. A line that
+/// holds one joins the next line, and no command that holds one is a line any entry or call can
+/// match.
+const UNREAD: [char; 7] = [
+    '\0', '\u{b}', '\u{c}', '\r', '\u{85}', '\u{2028}', '\u{2029}',
+];
 
 /// Whether `line` starts a workflow's `run:` field: its first word is `run:`, or its first two are
 /// `-` and `run:`.

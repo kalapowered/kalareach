@@ -961,11 +961,14 @@ fn a_command_is_the_line_the_entry_gives_and_nothing_else() {
             );
         }
     }
-    // A reader may take a carriage return, a next line, a line or paragraph separator, a vertical
-    // tab or a form feed as the end of a line (YAML does, and so does a CR LF file), where the shell
-    // does not. A line that holds one is never taken alone: it joins the next.
+    // A reader may end a line at a carriage return, a next line, a line or paragraph separator, a
+    // vertical tab or a form feed where the shell does not (a YAML parser, a CR LF file), and bash
+    // drops a NUL, so that `\`, a NUL and a new line are one continuation. A line that holds one is
+    // never taken alone: it joins the next, and no command that holds one is a line the map matches.
     for file in ["ci.sh", "ci.yml"] {
-        for end in ['\r', '\u{85}', '\u{2028}', '\u{2029}', '\u{b}', '\u{c}'] {
+        for end in [
+            '\0', '\r', '\u{85}', '\u{2028}', '\u{2029}', '\u{b}', '\u{c}',
+        ] {
             let found = found_in_file(file, &format!("echo \\{end}\n{COMMAND}\n"), COMMAND, None);
             assert_eq!(found.len(), 1, "{file} {end:?}: {found:?}");
         }
@@ -1051,6 +1054,27 @@ fn a_command_whose_names_a_call_passes_finds_them_on_the_calls() {
             wrong[0].contains("does not name tests::is_ignored_too"),
             "{line}: {wrong:?}"
         );
+    }
+
+    // A line that holds a character the shell does not read as the map does (a carriage return, a
+    // NUL) joins the next line, and no name is found on a command that holds one: the name on the
+    // next line is the argument of another command.
+    for unread in ['\r', '\0', '\u{2028}'] {
+        for line in [
+            format!("echo {unread}\ntests::is_ignored_too"),
+            format!("call tests::is_ignored {unread}\necho tests::is_ignored_too"),
+            format!("call tests::is_ignored {unread}\n# tests::is_ignored_too"),
+        ] {
+            let script = format!(
+                "{PASSING}\ncall tests::is_ignored\n{line}\ncall tests::is_ignored_for_a_reason_over_two_lines"
+            );
+            let wrong = found(&script);
+            assert_eq!(wrong.len(), 1, "{line:?}: {wrong:?}");
+            assert!(
+                wrong[0].contains("does not name tests::is_ignored_too"),
+                "{line:?}: {wrong:?}"
+            );
+        }
     }
 
     // The command itself is still the line the entry gives and nothing else.
