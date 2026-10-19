@@ -968,6 +968,14 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
         self.own.dial(network, endpoint)
     }
 
+    fn relay_capacity_refused(
+        &self,
+        network: &kr_protocol::pairing::NetworkConfig,
+        endpoint: &kr_protocol::scalars::EndpointKey,
+    ) -> bool {
+        self.own.relay_capacity_refused(network, endpoint)
+    }
+
     fn open_unpaired<'a>(
         &'a self,
         connection: &'a iroh::endpoint::Connection,

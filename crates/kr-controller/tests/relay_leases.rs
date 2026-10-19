@@ -4798,7 +4798,7 @@ async fn shows_the_value(
     .expect("the attempt runs");
 }
 
-/// KR-REQ-10.54, KR-REQ-17.40: a device that has never paired with the host pairs with it through the
+/// KR-REQ-10.39, KR-REQ-17.40: a device that has never paired with the host pairs with it through the
 /// managed relay while the host holds a lease for another device. The relay carries a lease's pair
 /// and nothing else, so this device asks the service for the admission that lets the relay forward
 /// its pairing, as it dials, and the pairing completes for a device that has no direct path to the host.
@@ -4854,7 +4854,49 @@ async fn a_device_pairs_through_the_managed_relay_while_the_host_holds_a_lease()
     );
 }
 
-/// KR-REQ-10.54, KR-REQ-17.48: a device that is refused free capacity is told so when it could not
+/// KR-REQ-10.39: a service that takes the request for an admission and never answers does not hold a
+/// pairing up. The device asks as it dials, waits a short bound for the answer and goes on, and
+/// the relay here carries what it is given, so the pairing completes with the request still held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_service_that_never_answers_for_an_admission_does_not_stop_a_pairing() {
+    const ADMISSION: &str = "/api/relay/admission";
+
+    let relays = Relays::spawn().await;
+    let rig = Rig::start_over(
+        true,
+        8 * 1024 * 1024,
+        relays.host(),
+        Some(relays.leased.url.as_str()),
+    )
+    .await;
+    let owner = rig.owner_device();
+    rig.until("the owner's device holds a lease", || rig.holds(&owner))
+        .await;
+    rig.until_held_to(&relays.leased.url).await;
+    rig.until_homed_on(&relays.leased.url).await;
+    let (invited, text) = rig.direct_invitation().await;
+
+    rig.served.web().fail(ADMISSION, 1, Moment::Hold);
+    let device = NewDevice::start(&rig, relays.roots(), true);
+    let (attempt, mut shown) = device.redeem(&text);
+    shows_the_value(&mut shown).await;
+    rig.approves(&invited).await;
+    let paired = tokio::time::timeout(Duration::from_secs(120), attempt)
+        .await
+        .expect("the attempt ends")
+        .expect("the attempt ran")
+        .expect("the device paired with the host");
+    assert_eq!(paired.host_endpoint_id, rig.host.network().endpoint_id());
+
+    // The service was asked, and is holding the request still.
+    assert!(
+        rig.served.web().requests_to(ADMISSION) >= 1,
+        "the device never asked the service"
+    );
+    rig.served.web().release_held();
+}
+
+/// KR-REQ-10.39, KR-REQ-17.48: a device that is refused free capacity is told so when it could not
 /// pair for it, not that the host is out of reach, by a code as by an invitation. The relay here carries nothing for it, as one that
 /// has no admission for a device does, so the dial ends by its own deadline, and what the person is
 /// told turns on what the service said. With the service's budget available the same failure is the
@@ -4941,6 +4983,14 @@ impl kr_client::pairing::link::HostLink for Counting {
         Result<iroh::endpoint::Connection, kr_client::pairing::link::LinkError>,
     > {
         self.inner.dial(network, endpoint)
+    }
+
+    fn relay_capacity_refused(
+        &self,
+        network: &kr_protocol::pairing::NetworkConfig,
+        endpoint: &kr_protocol::scalars::EndpointKey,
+    ) -> bool {
+        self.inner.relay_capacity_refused(network, endpoint)
     }
 
     fn open_unpaired<'a>(
@@ -5044,7 +5094,7 @@ impl kr_client::pairing::link::Preauth for CountedAnswers {
     }
 }
 
-/// KR-REQ-10.54, KR-REQ-10.25: the ceiling an admission carries is enough for a whole attempt. A device
+/// KR-REQ-10.39, KR-REQ-17.40: the ceiling an admission carries is enough for a whole attempt. A device
 /// pairs through the relay with the owner's approval held until the host has answered it more times
 /// than one connection allows, which is when the device moves to a fresh connection, and the bytes
 /// the relay carried from the first dial to the paired connection stay under what the service signs.
@@ -5103,10 +5153,32 @@ async fn a_whole_pairing_through_a_relay_fits_in_the_admission_ceiling() {
         .expect("the device paired with the host");
     assert_eq!(paired.host_endpoint_id, rig.host.network().endpoint_id());
 
-    // The paired connection is inside the window: the device connected as what it became before the
-    // pairing call returned, and the host's lease for it is not what carried it.
-    let carried = relays.leased.forwarded() - before;
+    // The host's request for a lease for the new device has reached the stand-in's gate, so the
+    // pairing was over before it was begun on. It is released now, and the final sample is taken once
+    // the service has recorded the lease: the paired connection is inside the window, and the lease
+    // the host takes for it is what carries it from here.
+    let destination = serde_json::json!(device.endpoint());
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while !rig.served.web().arrived().iter().any(|arrived| {
+            arrived.path == ISSUE && arrived.body["destination_endpoint_key"] == destination
+        }) {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the host's request for the new device's lease reaches the service");
     rig.served.web().release_held();
+    rig.until(
+        "the service has recorded the host's lease for the new device",
+        || {
+            rig.served.web().relay_leases().iter().any(|lease| {
+                lease.source == device.endpoint() || lease.destination == device.endpoint()
+            })
+        },
+    )
+    .await;
+    let carried = relays.leased.forwarded() - before;
     assert!(
         opened.load(Ordering::SeqCst) >= 2,
         "the device moved to a fresh connection while it waited"

@@ -636,6 +636,10 @@ impl HostLink for WatchedLink {
         })
     }
 
+    fn relay_capacity_refused(&self, network: &NetworkConfig, endpoint: &EndpointKey) -> bool {
+        self.inner.relay_capacity_refused(network, endpoint)
+    }
+
     fn open_unpaired<'a>(
         &'a self,
         connection: &'a Connection,
