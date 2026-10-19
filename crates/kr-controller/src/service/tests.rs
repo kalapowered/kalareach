@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use kr_transport::clock::{ContinuousInstant, ManualClock};
 
-use super::{ContinuousClock, remaining_deadline};
+use super::{ContinuousClock, remaining_deadline, remaining_deadlines};
 
 /// Two clocks with one pause between the first reading and the second.
 ///
@@ -123,4 +123,47 @@ fn a_lease_shortens_a_forwarded_deadline_and_never_extends_it() {
     )
     .expect("some of the deadline is left");
     assert_eq!(forwarded.get(), 400);
+}
+
+/// The daemon's own clock, which moves on a millisecond each time it is read.
+#[derive(Debug)]
+struct TickingClock(ManualClock);
+
+impl ContinuousClock for TickingClock {
+    fn now(&self) -> ContinuousInstant {
+        let reading = self.0.now();
+        self.0.advance(Duration::from_millis(1));
+        reading
+    }
+}
+
+/// KR-REQ-09.10: the deadline a worker is forwarded, bounded by the lease, is never later than the
+/// lease's end that travels beside it, whatever the clocks do between the readings that convert
+/// them.
+#[test]
+fn a_forwarded_deadline_the_lease_bounds_is_never_later_than_the_lease() {
+    let clock = TickingClock(ManualClock::new());
+    let shared = kr_ipc::clock::ManualSharedClock::new();
+    let accepted = clock
+        .0
+        .now()
+        .checked_add(Duration::from_secs(30))
+        .expect("a deadline thirty seconds out");
+    let lease = clock
+        .0
+        .now()
+        .checked_add(Duration::from_secs(5))
+        .expect("a lease five seconds out");
+    let (deadline, lease_end) = remaining_deadlines(&shared, &clock, accepted, Some(lease))
+        .expect("some of the deadline and the lease is left");
+    let lease_end = lease_end.expect("the lease's end crosses with the deadline");
+    assert!(
+        deadline.get() <= lease_end.get(),
+        "the deadline {deadline:?} is later than the lease's end {lease_end:?}"
+    );
+    assert_eq!(
+        deadline.get(),
+        5_000,
+        "the lease, which ran out first, bounds the deadline"
+    );
 }

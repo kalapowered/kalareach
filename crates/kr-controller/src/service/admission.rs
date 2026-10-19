@@ -1132,12 +1132,39 @@ pub(super) fn remaining_deadline(
     accepted: kr_transport::clock::ContinuousInstant,
     lease: Option<kr_transport::clock::ContinuousInstant>,
 ) -> Option<U64> {
+    remaining_deadlines(shared, clock, accepted, lease).map(|(deadline, _)| deadline)
+}
+
+/// Returns [`remaining_deadline`] and the lease's own end on the same clock, from one pair of
+/// readings.
+///
+/// A worker is sent both: the deadline the action may run until, and the lease it may run under.
+/// Both are converted from the one pair of readings, so the deadline is never later than the
+/// lease's end it is bounded by, whatever the clocks do between the readings. `None` means the
+/// deadline or the lease has already passed.
+pub(super) fn remaining_deadlines(
+    shared: &dyn kr_ipc::clock::SharedClock,
+    clock: &dyn ContinuousClock,
+    accepted: kr_transport::clock::ContinuousInstant,
+    lease: Option<kr_transport::clock::ContinuousInstant>,
+) -> Option<(U64, Option<U64>)> {
     // The machine's clock first, the daemon's own clock second.
     let shared_now = shared.boot_elapsed_ms();
     let now = clock.now();
-    let deadline = lease.map_or(accepted, |lease| lease.min(accepted));
-    let remaining = deadline.saturating_duration_since(now);
-    kr_ipc::clock::transferred_deadline(shared_now, remaining).map(U64::new)
+    let remaining = accepted.saturating_duration_since(now);
+    let lease_remaining = lease.map(|lease| lease.saturating_duration_since(now));
+    let deadline = kr_ipc::clock::transferred_deadline(
+        shared_now,
+        lease_remaining.map_or(remaining, |lease| lease.min(remaining)),
+    )
+    .map(U64::new)?;
+    let lease = match lease_remaining {
+        Some(remaining) => {
+            Some(kr_ipc::clock::transferred_deadline(shared_now, remaining).map(U64::new)?)
+        }
+        None => None,
+    };
+    Some((deadline, lease))
 }
 
 const fn window_refusal_detail(refusal: kr_transport::window::WindowRefusal) -> &'static str {

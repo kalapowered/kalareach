@@ -1890,35 +1890,25 @@ impl Controller {
         // registration withdrawn or replaced meanwhile, and a deadline that has passed, refuse it
         // as well. A worker already holding a forwarded mutation decides it under its own lease.
         self.check_registration(&admitted)?;
-        let spent = || ControllerError::WindowExpired {
-            detail: "the deadline this action was admitted under has passed".to_owned(),
-        };
-        let deadline_boot_ms = crate::service::remaining_deadline(
+        // The deadline and the lease's own end are converted from one pair of clock readings, so the
+        // deadline is never later than the lease it is bounded by.
+        let (deadline_boot_ms, lease_end) = crate::service::remaining_deadlines(
             &*self.shared_clock,
             &*self.clock,
             accepted.deadline,
             lease.map(|lease| lease.deadline),
         )
-        .ok_or_else(spent)?;
-        let lease = lease
-            .map(|lease| {
-                // The lease's own end, on the machine's clock, which is the bound above when the
-                // lease is what ran out first.
-                crate::service::remaining_deadline(
-                    &*self.shared_clock,
-                    &*self.clock,
-                    lease.deadline,
-                    None,
-                )
-                .map(|deadline_boot_ms| kr_protocol::local::ForwardedLease {
-                    lease_id: lease.lease_id,
-                    controller_generation: lease.generation,
-                    authority_revision: lease.authority_revision,
-                    deadline_boot_ms,
-                })
-                .ok_or_else(spent)
-            })
-            .transpose()?;
+        .ok_or_else(|| ControllerError::WindowExpired {
+            detail: "the deadline this action was admitted under has passed".to_owned(),
+        })?;
+        let lease = lease.zip(lease_end).map(|(lease, deadline_boot_ms)| {
+            kr_protocol::local::ForwardedLease {
+                lease_id: lease.lease_id,
+                controller_generation: lease.generation,
+                authority_revision: lease.authority_revision,
+                deadline_boot_ms,
+            }
+        });
         Ok(ForwardedDeadline {
             deadline_boot_ms,
             lease,
