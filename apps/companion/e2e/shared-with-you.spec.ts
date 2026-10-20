@@ -719,6 +719,35 @@ test.describe('a message in passing over the card an invitation opens', () => {
     })
   }
 
+  // The message goes when its time is up, wherever it is drawn: a card that opens over it takes it in
+  // (it is drawn anew there) and does not give it a new time. The page's clock is held, and moved on
+  // by the case, so no time is waited.
+  test('goes at the time it had when a card opens over it', async ({ page }) => {
+    await page.clock.install({ time: new Date(CLOCKS[0].at) })
+    await withSystemTextScale(page, 1)
+    await page.setViewportSize({ width: 320, height: 720 })
+    await open(page, 'ios', 'attention', offers)
+    await page.clock.pauseAt(new Date(Date.parse(CLOCKS[0].at) + 1_000))
+    await page.getByRole('button', { name: /shared session 3 with you/ }).click()
+    await page.clock.runFor(1_000)
+    await page.getByTestId('accept-offer').click()
+    await page.clock.runFor(1_000)
+    const toast = page.locator('.toast')
+    await expect(toast).toContainText('Session 3 is shared with you until')
+
+    // A little over two seconds old: a card opens over it, and the message moves into the card.
+    await page.clock.runFor(1_500)
+    await page.getByRole('button', { name: /shared session 4 with you/ }).dispatchEvent('click')
+    await page.clock.runFor(1_000)
+    await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here')
+    await expect(toast).toBeVisible()
+    expect(await toast.evaluate((element) => element.closest('[role="dialog"]') !== null)).toBe(true)
+
+    // Past the shortest time a message stays, counted from when it came and not from the move.
+    await page.clock.runFor(2_000)
+    await expect(toast, 'the message is gone though it moved after it came').toHaveCount(0)
+  })
+
   // The two rules that rest the message for a person who asked for less motion are not the others'.
   test('rests above the card’s footer when the person asked for less motion', async ({ page }) => {
     await messageOverCard(page, {
