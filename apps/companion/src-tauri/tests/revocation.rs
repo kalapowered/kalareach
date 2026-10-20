@@ -1867,9 +1867,9 @@ async fn a_view_over_a_copy_of_a_connection_that_was_replaced_still_lists_the_ho
 }
 
 /// The feed's service refuses everything addressed to it, as one does that is out of reach.
-fn the_feed_cannot_be_read(rig: &Rig) {
+fn the_feed_cannot_be_read(served: &Served) {
     for nth in 1..=40 {
-        rig.served.web().fail(
+        served.web().fail(
             AUTHORITY,
             nth,
             Moment::Refuse {
@@ -1879,6 +1879,23 @@ fn the_feed_cannot_be_read(rig: &Rig) {
             },
         );
     }
+}
+
+/// A sync service this computer publishes at that the host does not read, so that a request put
+/// there waits: the host on the rig acts on what it finds in its own feed at once.
+async fn a_feed_the_host_does_not_read(rig: &Rig) -> Served {
+    let elsewhere = serve().await;
+    rig.sync_service_is(elsewhere.origin());
+    elsewhere
+}
+
+/// What the page is shown of the settings, with no look at the hosts: the devices held out are
+/// named as the last step and the requests recorded since say.
+fn the_settings_as_shown(rig: &Rig) -> Value {
+    rig.app
+        .call("settings_view", json!({}))
+        .expect("the settings view")["sync"]["devices"]
+        .clone()
 }
 
 /// Settings sync has taken the phone out of the shared settings, as it does for a device a
@@ -1916,17 +1933,20 @@ fn share_again(rig: &Rig, reference: &str) -> Result<Value, Value> {
 async fn a_device_whose_request_waits_in_a_feed_is_not_shared_with_again_after_a_restart() {
     let rig = Rig::start().await;
     rig.sharing_with_the_phone().await;
+    let elsewhere = a_feed_the_host_does_not_read(&rig).await;
     let host = host_by(&rig.view().await, "feed");
     rig.revoke(
         host["reference"].as_str().expect("a reference"),
         the_phone(&host)["reference"].as_str().expect("a reference"),
     )
     .expect("the request is published");
+    assert_eq!(published_at(&elsewhere), 1);
     the_phone_is_taken_out(&rig).await;
 
     let rig = rig.restarted().await;
+    rig.sync_service_is(elsewhere.origin());
     rig.start_settings_sync_listing_the_phone();
-    the_feed_cannot_be_read(&rig);
+    the_feed_cannot_be_read(&elsewhere);
     let devices = rig.devices();
     let reference = the_device_held_out(&devices);
     share_again(&rig, &reference)
@@ -1959,7 +1979,7 @@ async fn a_request_whose_outcome_is_unknown_keeps_its_device_from_being_shared_w
     revoke_with_the_outcome_unknown(&rig).await;
     the_phone_is_taken_out(&rig).await;
 
-    the_feed_cannot_be_read(&rig);
+    the_feed_cannot_be_read(&rig.served);
     let devices = rig.devices();
     let reference = the_device_held_out(&devices);
     share_again(&rig, &reference)
@@ -2011,13 +2031,14 @@ async fn a_request_no_feed_holds_is_let_go_when_the_feed_is_read() {
 async fn a_look_that_began_before_a_request_was_sent_does_not_let_its_device_go() {
     let rig = Rig::start().await;
     rig.sharing_with_the_phone().await;
+    let elsewhere = a_feed_the_host_does_not_read(&rig).await;
     let host = host_by(&rig.view().await, "feed");
     // The next read of the feed is answered from what the feed holds now, which is no request, and
     // reaches this computer only when the test lets it.
-    rig.served.web().fail(AUTHORITY, 1, Moment::Slow);
-    let asked_before = rig.served.web().requests_to(AUTHORITY);
+    elsewhere.web().fail(AUTHORITY, 1, Moment::Slow);
+    let asked_before = elsewhere.web().requests_to(AUTHORITY);
     let earlier_look = rig.app.start_call("revocation_view", json!({}));
-    rig.served
+    elsewhere
         .web()
         .requests_reach(AUTHORITY, asked_before + 1)
         .await;
@@ -2026,19 +2047,22 @@ async fn a_look_that_began_before_a_request_was_sent_does_not_let_its_device_go(
         the_phone(&host)["reference"].as_str().expect("a reference"),
     )
     .expect("the request is published");
-    rig.served.web().release_held();
+    the_phone_is_taken_out(&rig).await;
+    // A look after the send finds the request in the feed.
+    let devices = rig.devices();
+    the_device_held_out(&devices);
+    assert_eq!(devices["held_out"][0]["waiting"], true, "{devices}");
+
+    // The earlier look ends now, with a feed it read before there was a request in it. It is not
+    // what shows the request gone: nothing but a look that began after the send can.
+    elsewhere.web().release_held();
     tokio::time::timeout(WATCHDOG, earlier_look)
         .await
         .expect("the earlier look ends")
         .expect("the earlier look ends")
         .expect("the earlier look is answered");
-    the_phone_is_taken_out(&rig).await;
-
-    let devices = rig.devices();
-    let reference = the_device_held_out(&devices);
-    share_again(&rig, &reference)
-        .expect_err("a device a request may still revoke is not shared with");
-    assert_eq!(devices["held_out"][0]["waiting"], true, "{devices}");
+    let shown = the_settings_as_shown(&rig);
+    assert_eq!(shown["held_out"][0]["waiting"], true, "{shown}");
 }
 
 /// A host the person forgets is one whose feed this computer no longer reads, so a request it left
@@ -2047,6 +2071,7 @@ async fn a_look_that_began_before_a_request_was_sent_does_not_let_its_device_go(
 async fn a_request_in_the_feed_of_a_host_that_was_forgotten_is_not_waited_for() {
     let rig = Rig::start().await;
     rig.sharing_with_the_phone().await;
+    a_feed_the_host_does_not_read(&rig).await;
     let host = host_by(&rig.view().await, "feed");
     rig.revoke(
         host["reference"].as_str().expect("a reference"),
@@ -2085,8 +2110,10 @@ async fn a_request_sent_while_the_person_is_at_the_dialog_for_sharing_again_stop
     .await;
     the_phone_is_taken_out(&rig).await;
     let reference = the_device_held_out(&rig.devices());
+    let elsewhere = a_feed_the_host_does_not_read(&rig).await;
 
-    // The person is at the dialog for sharing again, and sends the request again meanwhile.
+    // The person is at the dialog for sharing again, and sends the request again meanwhile, to a
+    // feed the host does not read.
     let (shown, release) = rig.ceremony.hold_the_dialog();
     let sharing = rig
         .app
@@ -2100,6 +2127,7 @@ async fn a_request_sent_while_the_person_is_at_the_dialog_for_sharing_again_stop
         the_phone(&host)["reference"].as_str().expect("a reference"),
     )
     .expect("the request is published");
+    assert_eq!(published_at(&elsewhere), 1);
     release.notify_one();
 
     tokio::time::timeout(WATCHDOG, sharing)
