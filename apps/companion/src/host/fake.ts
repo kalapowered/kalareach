@@ -2338,7 +2338,8 @@ export function fakeHost(
             message:
               'RESOURCE_UNAVAILABLE: The host has not said whether it made the call. This device is still asking it, and ends the call if it did.',
             user_action: 'wait'
-          }
+          },
+          not_held: false
         })
       }
       const running = voice.call
@@ -2361,7 +2362,8 @@ export function fakeHost(
             // Native code sends a host's refusal as its code, a colon and the host's words.
             message: 'RESOURCE_UNAVAILABLE: This host cannot be contacted right now.',
             user_action: 'wait'
-          }
+          },
+          not_held: false
         })
       }
       const unreadable = voiceStopFenceUnreadable
@@ -2385,7 +2387,8 @@ export function fakeHost(
           : barrier === null
             ? { kind: 'not_owed' }
             : { kind: 'barrier', barrier },
-        host_failure: null
+        host_failure: null,
+        not_held: false
       })
     },
 

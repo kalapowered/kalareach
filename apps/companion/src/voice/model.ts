@@ -512,6 +512,11 @@ export function endedWords(
       )
       break
     }
+    case 'not_held':
+      // The host holds no call of this device by that name. That is all it knows: it says nothing
+      // of a grant, or of the workers' fence, which the host keeps to itself.
+      parts.push('The host holds no such call for this device.')
+      break
     case 'refused':
       parts.push(
         `The host did not confirm that it withdrew the call's grant: it refused the stop. ${ended.host.words}`
@@ -523,8 +528,14 @@ export function endedWords(
       // lasts as long as the grant can.
       parts.push(`The host did not confirm that it withdrew the call's grant: ${ended.host.words}`)
       break
-    default:
+    case 'not_needed':
       break
+    default: {
+      // A kind this build does not know adds nothing, and a kind it should know is a type error.
+      const unknown: never = ended.host
+      void unknown
+      break
+    }
   }
   return parts.join(' ')
 }
@@ -562,6 +573,13 @@ export function closureWords(
     : "This device could not confirm that the call's microphone stopped"
   if (closure.host_failure) {
     return `${here}. The host did not confirm that it withdrew the grant: ${failureWords(closure.host_failure)}`
+  }
+  if (closure.not_held) {
+    // The host's own sentence first: when this device held no call, the microphone caveat is the
+    // lesser news.
+    const host =
+      'The host holds no call of this device by that name, so a stop from this device can end nothing more there.'
+    return closure.closed_locally ? `${here}. ${host}` : `${host} ${here}.`
   }
   const unconfirmed = closure.fence === null ? null : fenceWords(closure.fence, names)
   if (!closure.closed_locally) {

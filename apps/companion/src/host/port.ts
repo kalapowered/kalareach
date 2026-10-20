@@ -884,6 +884,7 @@ export interface VoiceCallState {
 /** What the host did about the end of a call, kept apart from what happened on this device. */
 export type VoiceHostEnd =
   | { readonly kind: 'revoked'; readonly fence: VoiceFence; readonly broker_notified: boolean }
+  | { readonly kind: 'not_held'; readonly words: string }
   | { readonly kind: 'refused'; readonly words: string }
   | { readonly kind: 'not_told'; readonly words: string }
   | { readonly kind: 'not_needed' }
@@ -964,6 +965,11 @@ export interface VoiceClosure {
   readonly fence: VoiceFence | null
   /** Why the host could not be told or its answer not read, when it could not. */
   readonly host_failure: HostError | null
+  /**
+   * Whether the host answered that it holds no call of this device by that name. A stop from this
+   * device can end nothing more there; the answer says nothing of a grant or of the workers' fence.
+   */
+  readonly not_held: boolean
 }
 
 /** A link the backend is willing to open. */

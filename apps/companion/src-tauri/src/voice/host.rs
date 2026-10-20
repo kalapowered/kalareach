@@ -161,13 +161,15 @@ impl<R: Runtime> HostReach for AppReach<R> {
 /// Asks `host` to revoke the grant of the voice session `voice_session_id`, and says what came
 /// of it.
 ///
-/// What is kept apart is what the host answered: the stop revoked the grant, the host refused
-/// the stop, or the host was not told or did not answer in time. Only the first is a revocation
-/// done. A refusal is not: the host answers `PermissionDenied` both when it holds no such voice
-/// session (a host that restarted holds none, though its grant record stands) and before it looks
-/// at the session at all, when the device's right to stop is not admitted, when its window has
-/// expired or when its grants cannot be read, and the grant is then still live. So a refusal
-/// leaves the revocation owed, until the moment the grant ends by itself.
+/// What is kept apart is what the host answered: the stop revoked the grant, the host holds no
+/// call of this device by that name, the host refused the stop for another reason, or the host was
+/// not told or did not answer in time. The first two settle a revocation owed to the host: after
+/// the first the grant is gone, and after the second this device can end nothing more there. The
+/// host answers the unknown session with its own code. Any other refusal is not a revocation done:
+/// the host answers `PermissionDenied` before it looks at the call at all, when the device's right
+/// to stop is not admitted, when its window has expired or when its grants cannot be read, and the
+/// grant is then still live. So such a refusal leaves the revocation owed, until the moment the
+/// grant ends by itself.
 pub async fn revoke(
     session: &Arc<Session>,
     environment_id: EnvironmentId,
@@ -200,9 +202,17 @@ pub async fn revoke(
                 words: error.message,
             },
         },
-        Ok(Err(kr_client::ClientError::Host(error))) => HostEnd::Refused {
-            words: error.message,
-        },
+        Ok(Err(kr_client::ClientError::Host(error))) => {
+            if error.code == kr_protocol::error::ErrorCode::UnknownSession {
+                HostEnd::NotHeld {
+                    words: error.message,
+                }
+            } else {
+                HostEnd::Refused {
+                    words: error.message,
+                }
+            }
+        }
         Ok(Err(error)) => HostEnd::NotTold {
             words: error.to_string(),
         },

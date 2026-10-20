@@ -15,7 +15,7 @@
 //! | KR-REQ-15.11 | `a_delegation_runs_under_the_grant_the_host_already_holds`, `speech_the_daemon_does_not_read_as_a_request_is_refused_and_spends_nothing`, `a_delegation_spent_in_an_ended_call_is_not_a_new_action_later_or_after_a_restart` |
 //! | KR-REQ-15.13 | `an_unlocked_screen_action_is_refused_without_a_signed_confirmation`, `a_challenge_holds_no_claim_so_the_signed_delegation_is_admitted_under_its_identifier` |
 //! | KR-REQ-15.13, 09.12 | `a_stop_with_a_close_on_its_way_is_answered_on_the_link_that_sent_it` |
-//! | KR-REQ-15.14 | `stopping_voice_revokes_the_grant_in_the_hosts_own_store` |
+//! | KR-REQ-15.14 | `stopping_voice_revokes_the_grant_in_the_hosts_own_store`, `a_stop_for_a_voice_session_the_host_does_not_hold_is_refused_as_unknown_and_nothing_else_is` |
 //! | KR-REQ-15.17 | `an_effect_this_host_does_not_dispatch_is_reported_as_admitted` |
 //! | KR-REQ-15.19 | `a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate` |
 //! | KR-REQ-15.20 | `context_is_filtered_by_the_requesting_devices_own_history_bound` |
@@ -1684,6 +1684,205 @@ async fn a_stop_with_a_close_on_its_way_is_answered_on_the_link_that_sent_it() {
         .await
         .expect("and the link goes on serving the device");
     drop(hold);
+    host.stop().await;
+}
+
+/// KR-REQ-15.14: a stop for a voice session the host does not hold is refused as an unknown
+/// session, and nothing else is.
+///
+/// A phone that could not finish revoking a call's grant asks again when it reaches the host, and
+/// the host's answer tells it whether there is anything left to revoke. A voice session the host
+/// holds no record of (the call ended, or the host started again) is the answer "unknown session":
+/// the phone settles what it owed. Every other refusal is still `PERMISSION_DENIED` or its own
+/// code, because they say nothing of whether the grant is gone: a device with no voice grant is
+/// turned away before the host looks at the call, and a store that cannot record the revocation
+/// leaves the call known and its grant live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_for_a_voice_session_the_host_does_not_hold_is_refused_as_unknown_and_nothing_else_is()
+ {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let (_device, session) = net_support::paired_device(
+        &host,
+        &owner,
+        &[ActionRight::SessionView, ActionRight::AgentPrompt],
+    )
+    .await;
+    let environment_id = host.environment_id;
+    host.controller().voice().attach_provider(Some(
+        Arc::new(OfflineProvider::default()) as Arc<dyn ManagedVoiceService>
+    ));
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let device_id = host
+        .controller()
+        .devices()
+        .devices()
+        .expect("the device directory answers")
+        .into_iter()
+        .find(|record| {
+            let owner = host.owner.as_ref().map(|owner| owner.device_id);
+            record.is_paired() && owner != Some(record.device_id)
+        })
+        .expect("the paired device")
+        .device_id;
+    let stopping = |voice_session_id| VoiceStopParams { voice_session_id };
+    let refusal_of = |answer: std::result::Result<_, kr_client::error::ClientError>| match answer {
+        Err(kr_client::error::ClientError::Host(refusal)) => refusal,
+        other => panic!("the host refuses the stop: {other:?}"),
+    };
+
+    // A device with no voice grant is turned away before the host looks at the call, which says
+    // nothing of whether a grant is gone.
+    let unknown = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
+    let turned_away = refusal_of(
+        remote_voice(
+            &session,
+            environment_id,
+            Method::VoiceStop,
+            &stopping(unknown),
+        )
+        .await,
+    );
+    assert_eq!(
+        turned_away.code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{turned_away:?}"
+    );
+
+    let _granted = remote_voice(
+        &session,
+        environment_id,
+        Method::VoiceGrant,
+        &VoiceGrantParams {
+            device_id,
+            session_ids: [session_id].into_iter().collect(),
+            actions: Nullable::null(),
+        },
+    )
+    .await
+    .expect("the voice grant is written");
+    let start = async || {
+        let prepared: VoicePrepareResult = session
+            .read(
+                Method::VoicePrepare,
+                &VoicePrepareParams {
+                    session_ids: [session_id].into_iter().collect(),
+                    selected: CanonicalSet::from_iter([]),
+                },
+            )
+            .await
+            .expect("the host answers what a call would be");
+        let started: kr_protocol::voice::VoiceStartResult = remote_voice(
+            &session,
+            environment_id,
+            Method::VoiceStart,
+            &VoiceStartParams {
+                session_ids: [session_id].into_iter().collect(),
+                offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
+                duration_seconds: 600,
+                reasoning_budget_minor: Nullable::null(),
+                prepared: prepared.prepared,
+                expected_rate_version: Nullable::some("2026-09".to_owned()),
+            },
+        )
+        .await
+        .expect("the call is created")
+        .to_typed()
+        .expect("a start result");
+        let VoiceStartOutcome::Started { session: call } = started.outcome else {
+            panic!("the call runs: {:?}", started.outcome);
+        };
+        call
+    };
+
+    // A voice session the host never held, and the same session after the host ended it, are both
+    // an unknown session.
+    let never_held = refusal_of(
+        remote_voice(
+            &session,
+            environment_id,
+            Method::VoiceStop,
+            &stopping(unknown),
+        )
+        .await,
+    );
+    assert_eq!(
+        never_held.code,
+        kr_protocol::error::ErrorCode::UnknownSession,
+        "{never_held:?}"
+    );
+    let first = start().await;
+    let _stopped = remote_voice(
+        &session,
+        environment_id,
+        Method::VoiceStop,
+        &stopping(first.voice_session_id),
+    )
+    .await
+    .expect("the call stops");
+    let again = refusal_of(
+        remote_voice(
+            &session,
+            environment_id,
+            Method::VoiceStop,
+            &stopping(first.voice_session_id),
+        )
+        .await,
+    );
+    assert_eq!(
+        again.code,
+        kr_protocol::error::ErrorCode::UnknownSession,
+        "{again:?}"
+    );
+
+    // A store that cannot record the revocation refuses with its own code, and the call stays
+    // known with its grant live, so a stop asked again is the one that ends it.
+    let second = start().await;
+    let registry =
+        rusqlite::Connection::open(host.registry_database()).expect("opens the registry");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_to_record_a_revocation
+                 BEFORE UPDATE OF revoked_at_ms ON grants
+                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("plants the fault");
+    let unrecorded = refusal_of(
+        remote_voice(
+            &session,
+            environment_id,
+            Method::VoiceStop,
+            &stopping(second.voice_session_id),
+        )
+        .await,
+    );
+    assert_ne!(
+        unrecorded.code,
+        kr_protocol::error::ErrorCode::UnknownSession,
+        "a refusal that does not say the grant is gone is not the unknown session: {unrecorded:?}"
+    );
+    assert_eq!(
+        host.controller().voice().coordinator().live_sessions(),
+        1,
+        "the call is still known"
+    );
+    registry
+        .execute_batch("DROP TRIGGER refuse_to_record_a_revocation;")
+        .expect("lifts the fault");
+    let stopped: kr_protocol::voice::VoiceStopResult = remote_voice(
+        &session,
+        environment_id,
+        Method::VoiceStop,
+        &stopping(second.voice_session_id),
+    )
+    .await
+    .expect("the stop asked again ends the call")
+    .to_typed()
+    .expect("a stop result");
+    assert_eq!(stopped.revoked_grant_id, second.grant_id);
     host.stop().await;
 }
 

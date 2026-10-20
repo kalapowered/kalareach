@@ -4,7 +4,8 @@
     "closure": {
       "closed_locally": true,
       "fence": { "kind": "not_owed" },
-      "host_failure": null
+      "host_failure": null,
+      "not_held": false
     },
     "notice": "none"
   },
@@ -33,7 +34,8 @@
           "workers_total": "1"
         }
       },
-      "host_failure": null
+      "host_failure": null,
+      "not_held": false
     },
     "notice": "none"
   },
@@ -62,7 +64,8 @@
           "workers_total": "1"
         }
       },
-      "host_failure": null
+      "host_failure": null,
+      "not_held": false
     },
     "notice": "pending"
   },
@@ -71,8 +74,19 @@
     "closure": {
       "closed_locally": true,
       "fence": { "kind": "unreadable" },
-      "host_failure": null
+      "host_failure": null,
+      "not_held": false
     },
     "notice": "unconfirmed"
+  },
+  {
+    "name": "the host holds no call of this device",
+    "closure": {
+      "closed_locally": true,
+      "fence": null,
+      "host_failure": null,
+      "not_held": true
+    },
+    "notice": "not_held"
   }
 ]

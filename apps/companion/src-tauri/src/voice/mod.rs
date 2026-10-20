@@ -717,9 +717,9 @@ impl Calls {
 
     /// Says that the host a call left a grant at is reached, over `session`, so that what this
     /// device owes it is asked once more: each revocation owed to `host` in `environment` that has
-    /// not lapsed goes to the host again. That the host revoked the grant settles it; a refusal, or
-    /// no answer, leaves it owed until the grant lapses, because a refusal does not say the grant
-    /// is gone. It runs on a task of its own and the screen does not wait for it.
+    /// not lapsed goes to the host again. That the host revoked the grant, or holds no such
+    /// call, settles it; any other refusal, or no answer, leaves it owed until the grant lapses,
+    /// because such a refusal does not say the grant is gone. It runs on a task of its own and the screen does not wait for it.
     pub fn host_reached(
         &self,
         host: kr_protocol::ids::DeviceId,
@@ -746,6 +746,11 @@ impl Calls {
                 ))
             })
             .collect();
+        // One question for each voice session: two entries for one call (a crash between two
+        // writes can leave them) are one thing owed, and one answer settles both.
+        let mut owed = owed;
+        let mut asked = std::collections::BTreeSet::new();
+        owed.retain(|(voice_session_id, _)| asked.insert(*voice_session_id));
         if owed.is_empty() {
             return;
         }
@@ -762,9 +767,10 @@ impl Calls {
                     shared.timings.host_within,
                 )
                 .await;
-                // Only a revocation done settles it: a refusal may come from a host that did not
-                // look at the session, and the grant is then still live.
-                if matches!(end, HostEnd::Revoked { .. }) {
+                // Only a revocation done, or a host that holds no such call, settles it: another
+                // refusal may come from a host that did not look at the session, and the grant is
+                // then still live.
+                if end.settles() {
                     shared.settled(host, environment, &voice_session_id.to_string());
                 }
             }
@@ -899,8 +905,9 @@ impl Calls {
             shared.timings.host_within,
         )
         .await;
-        // A host that revoked the grant settles what this device owed it for that call.
-        if matches!(end, HostEnd::Revoked { .. }) {
+        // A host that revoked the grant, or holds no such call, settles what this device owed it
+        // for that call.
+        if end.settles() {
             shared.settled(
                 host.paired.host_device_id,
                 host.environment_id,

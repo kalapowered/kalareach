@@ -409,6 +409,7 @@ describe('what the screen says when it ends a call', () => {
     closed_locally: true,
     fence: { kind: 'not_owed' },
     host_failure: null,
+    not_held: false,
     ...over
   })
 

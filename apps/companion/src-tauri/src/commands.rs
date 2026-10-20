@@ -1916,6 +1916,10 @@ pub struct VoiceClosure {
     pub fence: Option<VoiceFence>,
     /// Why the host could not be told, or its answer not read, when it could not.
     pub host_failure: Option<CommandError>,
+    /// Whether the host answered that it holds no call of this device by that name. A stop from
+    /// this device can end nothing more there; the answer says nothing of a grant or of the
+    /// workers' fence, and the host keeps what it owes.
+    pub not_held: bool,
 }
 
 impl VoiceClosure {
@@ -1925,6 +1929,14 @@ impl VoiceClosure {
         let told = match closed.host {
             HostEnd::Revoked { fence, .. } => Ok(Some(fence)),
             HostEnd::NotNeeded => Ok(None),
+            HostEnd::NotHeld { .. } => {
+                return Self {
+                    closed_locally: closed.local,
+                    fence: None,
+                    host_failure: None,
+                    not_held: true,
+                };
+            }
             HostEnd::Refused { words } => Err(CommandError::refused(words)),
             HostEnd::NotTold { words } => Err(CommandError::unavailable(words)),
         };
@@ -1933,6 +1945,7 @@ impl VoiceClosure {
                 closed_locally: closed.local,
                 fence,
                 host_failure: None,
+                not_held: false,
             },
             Err(error) => Self::of(closed.local, Err(error)),
         }
@@ -1945,11 +1958,13 @@ impl VoiceClosure {
                 closed_locally,
                 fence: Some(fence),
                 host_failure: None,
+                not_held: false,
             },
             Err(error) => Self {
                 closed_locally,
                 fence: None,
                 host_failure: Some(error),
+                not_held: false,
             },
         }
     }
@@ -3028,7 +3043,10 @@ mod tests {
                 .map(String::as_str)
                 .collect();
             members.sort_unstable();
-            assert_eq!(members, ["closed_locally", "fence", "host_failure"]);
+            assert_eq!(
+                members,
+                ["closed_locally", "fence", "host_failure", "not_held"]
+            );
         }
     }
 
@@ -3158,7 +3176,21 @@ mod tests {
             ),
         ];
 
-        assert_eq!(cases.len(), answers.len(), "every case has an answer");
+        // A host that holds no call of this device by that name is not a stop's result: it is the
+        // refusal of the stop, read from the host's code and carried as the closure of a stop.
+        let not_held = serde_json::to_value(VoiceClosure::from_closed(crate::voice::Closed {
+            local: true,
+            host: crate::voice::HostEnd::NotHeld {
+                words: "there is no such voice session on this host".to_owned(),
+            },
+        }))
+        .expect("it encodes");
+
+        assert_eq!(
+            cases.len(),
+            answers.len() + 1,
+            "every case has an answer, and one is the host's refusal"
+        );
         for (name, answer) in answers {
             let case = cases
                 .iter()
@@ -3166,6 +3198,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("no case is named {name}"));
             assert_eq!(the_closure_for(answer), case["closure"], "{name}");
         }
+        let case = cases
+            .iter()
+            .find(|case| case["name"] == "the host holds no call of this device")
+            .expect("the case of a host that holds no such call");
+        assert_eq!(not_held, case["closure"]);
     }
 
     /// A fence names an action by the principal that submitted it, which for a call's own close is

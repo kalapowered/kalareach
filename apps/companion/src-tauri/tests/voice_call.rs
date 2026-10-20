@@ -1263,6 +1263,14 @@ async fn a_stop_that_names_another_call_ends_nothing_that_is_held() {
         .expect("the host is asked about the call it was named");
 
     assert_eq!(closure["closed_locally"], false);
+    // The host holds no call of this device by that name, and says so as that: not as a failure
+    // to stop and not as a fence.
+    assert_eq!(closure["not_held"], true, "{closure}");
+    assert_eq!(
+        closure["host_failure"],
+        serde_json::Value::Null,
+        "{closure}"
+    );
     assert_eq!(scene.state()["running"], true, "the held call goes on");
     assert_eq!(scene.platform.count("stop"), 0);
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
@@ -2379,10 +2387,23 @@ async fn a_named_stop_settles_the_entry_owed_to_the_host_that_revoked_and_no_oth
         kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
         kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
     );
+    // A voice session the host holds no record of, owed to this host too.
+    let unheld = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
+    let owed_to_for = |host: (kr_protocol::ids::DeviceId, kr_protocol::ids::EnvironmentId),
+                       id: kr_protocol::ids::VoiceSessionId| {
+        companion_tauri::voice::OwedView {
+            voice_session_id: Some(id.to_string()),
+            ..owed_to(host)
+        }
+    };
     let directory = scene.phone.data.path().join("relaunch-named");
     Kept::at(&directory)
         .write(&companion_tauri::voice::KeptVoice {
-            owed: vec![owed_to(another_host), owed_to(this_host)],
+            owed: vec![
+                owed_to(another_host),
+                owed_to(this_host),
+                owed_to_for(this_host, unheld),
+            ],
             note: None,
         })
         .expect("the file is written");
@@ -2394,7 +2415,7 @@ async fn a_named_stop_settles_the_entry_owed_to_the_host_that_revoked_and_no_oth
         quick(),
         Kept::at(&directory),
     );
-    assert_eq!(relaunched.state(None).owed.len(), 2);
+    assert_eq!(relaunched.state(None).owed.len(), 3);
     let reach = companion_tauri::voice::AppReach::new(scene.phone.companion.app.handle().clone());
 
     let closed = relaunched
@@ -2404,6 +2425,23 @@ async fn a_named_stop_settles_the_entry_owed_to_the_host_that_revoked_and_no_oth
 
     assert!(
         matches!(closed.host, companion_tauri::voice::HostEnd::Revoked { .. }),
+        "{closed:?}"
+    );
+    let left = relaunched.state(None);
+    assert_eq!(left.owed.len(), 2, "{left:?}");
+    assert!(
+        left.owed.iter().any(|owed| owed.host == Some(another_host)),
+        "{left:?}"
+    );
+
+    // A stop that names a voice session the host holds no record of is settled by the host's
+    // saying so, for this host's entry and no other's.
+    let closed = relaunched
+        .stop(Some(unheld), &reach)
+        .await
+        .expect("the host is asked");
+    assert!(
+        matches!(closed.host, companion_tauri::voice::HostEnd::NotHeld { .. }),
         "{closed:?}"
     );
     let left = relaunched.state(None);
@@ -2423,12 +2461,13 @@ async fn a_named_stop_settles_the_entry_owed_to_the_host_that_revoked_and_no_oth
     scene.stop_host().await;
 }
 
-/// A host that is reached again is asked once more for each revocation it is owed, from what the file
-/// kept of its identity, and only a host that revokes the grant settles one. A host that refuses has
-/// not said that the grant is gone: the host refuses a stop of a call it holds, too, when the stop is
-/// not admitted, so the revocation stays owed until the grant ends by itself.
+/// A host that is reached again is asked once more for each revocation it is owed, from what the
+/// file kept of its identity. A host that revokes the grant settles one, and so does a host that
+/// holds no such call: a stop from this device can end nothing more there. Another refusal has not
+/// said the grant is gone: the host refuses a stop of a call it holds, too, when the stop is not
+/// admitted, so the revocation stays owed until the grant ends by itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn only_a_host_that_revokes_the_grant_settles_what_it_was_owed() {
+async fn a_host_that_holds_no_such_call_settles_what_was_owed_to_it() {
     let mut scene = scene().await;
     scene.stand_in.end_the_control_when_a_call_is_closed();
     let started = scene.start().await;
@@ -2454,7 +2493,7 @@ async fn only_a_host_that_revokes_the_grant_settles_what_it_was_owed() {
         panic!("the phone is a paired device");
     };
     // Two revocations are owed to the host: one for a voice session it does not hold, asked first,
-    // and one for the call it holds, which only a revocation settles.
+    // and one for the call it holds, which its revocation settles.
     let unknown = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
     let owed = |id: kr_protocol::ids::VoiceSessionId| companion_tauri::voice::OwedView {
         kind: "revocation".to_owned(),
@@ -2487,47 +2526,137 @@ async fn only_a_host_that_revokes_the_grant_settles_what_it_was_owed() {
         connection.session(),
     );
 
+    // The host holds no voice session of the first identifier, so that entry is settled; the call
+    // it holds is revoked, and that entry is settled too.
+    tokio::time::timeout(WATCHDOG, async {
+        while !relaunched.state(None).owed.is_empty() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the host answered for both and both entries were settled");
+    // What was settled is settled in the file too.
+    kept_file_where(&directory, |file| {
+        file["owed"].as_array().is_some_and(Vec::is_empty)
+    })
+    .await;
+    // The call the host revoked ended with its revocation. The phone's own end then asks the host
+    // about a voice session it no longer holds, and the host says it holds none: that owes nothing.
+    let ended = scene
+        .state_where("the call the host revoked, ended", |state| {
+            state["running"] == false && state["ended"].is_object()
+        })
+        .await;
+    assert_eq!(ended["ended"]["host"]["kind"], "not_held", "{ended}");
+    assert!(
+        ended["owed"].as_array().is_some_and(|owed| owed
+            .iter()
+            .all(|each| each["voice_session_id"] != live.to_string())),
+        "nothing is owed for a call the host holds no record of: {ended}"
+    );
+    scene.stop_host().await;
+}
+
+/// A refusal that does not say the host holds no such call has not said the grant is gone, so the
+/// revocation stays owed until the host revokes the grant. The host's store cannot record the
+/// revocation here, so it refuses the stop with its own code. The device asks in the order it
+/// owes: the entry for the call the host holds is asked first and stays, and the entry after it,
+/// for a voice session the host does not hold, is asked and settled, which shows the first was asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_that_is_not_the_typed_reason_stays_owed_until_the_host_revokes() {
+    let mut scene = scene().await;
+    scene.stand_in.end_the_control_when_a_call_is_closed();
+    let started = scene.start().await;
+    let live: kr_protocol::ids::VoiceSessionId = started["value"]["outcome"]["started"]["session"]
+        ["voice_session_id"]
+        .as_str()
+        .expect("a voice session")
+        .parse()
+        .expect("an identifier");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    let connection = scene
+        .phone
+        .companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .connection()
+        .expect("the phone is connected");
+    let companion_tauri::connection::Standing::Paired { host, .. } = connection.standing() else {
+        panic!("the phone is a paired device");
+    };
+    let this_host = (host.host_device_id, connection.environment_id());
+    let unknown = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
+    let owed = |id: kr_protocol::ids::VoiceSessionId| companion_tauri::voice::OwedView {
+        kind: "revocation".to_owned(),
+        words: "The host did not answer.".to_owned(),
+        action_id: None,
+        voice_session_id: Some(id.to_string()),
+        until_ms: now_ms() + 1_800_000,
+        host_reference: "a-host".to_owned(),
+        host_name: "A host".to_owned(),
+        host: Some(this_host),
+    };
+    let directory = scene.phone.data.path().join("relaunch-refused");
+    Kept::at(&directory)
+        .write(&companion_tauri::voice::KeptVoice {
+            owed: vec![owed(live), owed(unknown)],
+            note: None,
+        })
+        .expect("the file is written");
+    let relaunched = Calls::on_phone(
+        ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
+        service_at(scene.stand_in.origin()),
+        quick(),
+        Kept::at(&directory),
+    );
+    // The host's store refuses to record any revocation, as a full disk or a locked file would.
+    let registry =
+        rusqlite::Connection::open(scene.host().registry_database()).expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_to_record_a_revocation
+                 BEFORE UPDATE OF revoked_at_ms ON grants
+                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("plants the fault");
+
+    relaunched.host_reached(this_host.0, this_host.1, connection.session());
+
     tokio::time::timeout(WATCHDOG, async {
         while relaunched.state(None).owed.len() != 1 {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("the host revoked the grant it held and the entry was settled");
+    .expect("the host was asked for both, and settled the one it holds no record of");
     let left = relaunched.state(None);
     assert_eq!(
         left.owed[0].voice_session_id.as_deref(),
-        Some(unknown.to_string().as_str()),
-        "the host that holds no such voice session did not settle its entry"
+        Some(live.to_string().as_str()),
+        "a host that refused with its own code has not said the grant is gone: {left:?}"
     );
-    // What was settled is settled in the file too.
-    let file = kept_file_where(&directory, |file| {
-        file["owed"].as_array().is_some_and(|owed| owed.len() == 1)
+    // The call is still running: nothing revoked its grant.
+    assert_eq!(scene.state()["running"], true);
+
+    // Once the host can record the revocation, the next time it is reached settles the entry.
+    registry
+        .execute_batch("DROP TRIGGER refuse_to_record_a_revocation;")
+        .expect("lifts the fault");
+    relaunched.host_reached(this_host.0, this_host.1, connection.session());
+    tokio::time::timeout(WATCHDOG, async {
+        while !relaunched.state(None).owed.is_empty() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     })
-    .await;
-    assert_eq!(file["owed"][0]["voice_session_id"], unknown.to_string());
-    // The call the host held ended with its revocation. The phone's own end then asks the host about
-    // a voice session it no longer holds and is refused, which does not say the grant is gone: the
-    // refusal is owed, with the host's own words behind a lead-in that says what happened.
-    let ended = scene
-        .state_where("the call the host revoked, ended", |state| {
-            state["running"] == false && state["ended"].is_object()
-        })
-        .await;
-    assert_eq!(ended["ended"]["host"]["kind"], "refused", "{ended}");
-    let owed_for_live = ended["owed"]
-        .as_array()
-        .and_then(|owed| {
-            owed.iter()
-                .find(|each| each["voice_session_id"] == live.to_string())
-        })
-        .unwrap_or_else(|| panic!("a refusal is owed: {ended}"));
-    assert!(
-        owed_for_live["words"]
-            .as_str()
-            .is_some_and(|words| words.starts_with("The host refused the stop: ")),
-        "{owed_for_live}"
-    );
+    .await
+    .expect("the host revoked the grant and the entry was settled");
     scene.stop_host().await;
 }
 
@@ -2607,8 +2736,8 @@ async fn a_record_the_system_refused_to_read_is_read_again_when_the_host_is_reac
         panic!("the phone is a paired device");
     };
     let this_host = (host.host_device_id, connection.environment_id());
-    // Two revocations are owed to the host: one for a voice session it does not hold, which stays
-    // owed, and one for the call it holds, which its revocation settles.
+    // Two revocations are owed to the host: one for a voice session it does not hold, which its
+    // answer settles, and one for the call it holds, which its revocation settles.
     let unknown = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
     let directory = scene.phone.data.path().join("relaunch-locked");
     Kept::at(&directory)
@@ -2643,11 +2772,11 @@ async fn a_record_the_system_refused_to_read_is_read_again_when_the_host_is_reac
             state["running"] == false && state["ended"].is_object()
         })
         .await;
-    let file = kept_file_where(&directory, |file| {
-        file["owed"].as_array().is_some_and(|owed| owed.len() == 1)
+    // Both entries are settled, and the file the system could not read says so.
+    kept_file_where(&directory, |file| {
+        file["owed"].as_array().is_some_and(Vec::is_empty)
     })
     .await;
-    assert_eq!(file["owed"][0]["voice_session_id"], unknown.to_string());
     scene.stop_host().await;
 }
 

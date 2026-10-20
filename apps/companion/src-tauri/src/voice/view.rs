@@ -134,8 +134,16 @@ impl HostEnd {
         match self {
             Self::NotTold { words } => Some(words.clone()),
             Self::Refused { words } => Some(format!("The host refused the stop: {words}")),
-            Self::Revoked { .. } | Self::NotNeeded => None,
+            Self::Revoked { .. } | Self::NotHeld { .. } | Self::NotNeeded => None,
         }
+    }
+
+    /// Whether the host's answer settles a revocation owed to it: it revoked the grant, or it
+    /// holds no call of this device by that name, so a stop from this device can end nothing more
+    /// there. A refusal that says neither leaves the revocation owed.
+    #[must_use]
+    pub const fn settles(&self) -> bool {
+        matches!(self, Self::Revoked { .. } | Self::NotHeld { .. })
     }
 }
 
@@ -204,9 +212,17 @@ pub enum HostEnd {
         /// Whether the host also told the voice service the call ended.
         broker_notified: bool,
     },
-    /// The host answered the stop with a refusal. It may hold no such call, or may not have looked
-    /// at it, and a grant it holds ends at the moment the call was to close: the revocation is
-    /// owed.
+    /// The host answered the stop with a refusal that says it holds no call of this device by that
+    /// name: it ended the call, it started again, or the call is another device's. A stop from
+    /// this device can end nothing more there. It does not say a grant is gone, or that a fence the
+    /// host owes its workers is done; the host keeps what it owes.
+    NotHeld {
+        /// What the host said.
+        words: String,
+    },
+    /// The host answered the stop with a refusal that says nothing of whether it holds the call:
+    /// it may not have looked at it, and a grant it holds ends at the moment the call was to
+    /// close. The revocation is owed.
     Refused {
         /// What the host said.
         words: String,

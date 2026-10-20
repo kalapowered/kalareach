@@ -324,7 +324,15 @@ describe('while a call is running', () => {
 
     await person.click(screen.getByRole('button', { name: 'End session' }))
 
-    if (notice === 'none') {
+    if (notice === 'not_held') {
+      // The host holds no call of this device by that name: that is what the screen says, and no
+      // grant or fence is claimed either way.
+      await waitFor(() => {
+        expect(screen.getByText(/The host holds no call of this device/)).toBeInTheDocument()
+      })
+      expect(screen.queryByText(/its grant withdrawn/)).not.toBeInTheDocument()
+      expect(screen.queryByText(/did not confirm/)).not.toBeInTheDocument()
+    } else if (notice === 'none') {
       await waitFor(() => {
         expect(stopped).toHaveBeenCalled()
       })
@@ -352,7 +360,12 @@ describe('while a call is running', () => {
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'End session' })).toBeInTheDocument()
     })
-    const unknown = { closed_locally: false, fence: { kind: 'a_status_a_later_build_adds' }, host_failure: null }
+    const unknown = {
+      closed_locally: false,
+      fence: { kind: 'a_status_a_later_build_adds' },
+      host_failure: null,
+      not_held: false
+    }
     vi.spyOn(port, 'voiceStop').mockResolvedValue(unknown as unknown as VoiceClosure)
 
     await person.click(screen.getByRole('button', { name: 'End session' }))
@@ -514,6 +527,26 @@ describe('while a call is running', () => {
     expect(screen.getByText(/did not confirm that it withdrew the call's grant: The host could not be reached\./)).toBeInTheDocument()
   })
 
+  // A host that holds no call of this device by that name is told as that, and as nothing more:
+  // not that the grant was withdrawn, and not that the stop was refused.
+  it('says a host that holds no such call holds none, and claims nothing of the grant', async () => {
+    const { controls } = start()
+    await waitForChoice()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Start voice session' }))
+    await screen.findByRole('button', { name: 'End session' })
+
+    controls.endVoiceCall({
+      words: 'The call ended on this device: from its notification.',
+      host: { kind: 'not_held', words: 'there is no such voice session on this host' }
+    })
+
+    await waitFor(() => {
+      expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
+    })
+    expect(screen.getByText(/The host holds no such call for this device\./)).toBeInTheDocument()
+    expect(screen.queryByText(/withdrew the call's grant/)).not.toBeInTheDocument()
+  })
+
   // The device is busy making a call that has no descriptor yet: a screen loaded again finds that,
   // offers no second start, and can end what the device is making without naming it.
   it('finds a device that is setting a call up and ends it without naming it', async () => {
@@ -651,7 +684,7 @@ describe('while a call is running', () => {
     // The device finishes the end it was asked for, and then says the call is over.
     controls.endVoiceCall({ cause: 'requested', words: 'You ended the call.' })
     await act(async () => {
-      finish({ closed_locally: true, fence: { kind: 'not_owed' }, host_failure: null })
+      finish({ closed_locally: true, fence: { kind: 'not_owed' }, host_failure: null, not_held: false })
       await Promise.resolve()
     })
     await waitForChoice()
@@ -883,7 +916,8 @@ describe('while a call is running', () => {
     vi.spyOn(port, 'voiceStop').mockResolvedValue({
       closed_locally: false,
       fence: null,
-      host_failure: null
+      host_failure: null,
+      not_held: false
     })
 
     await person.click(await screen.findByRole('button', { name: 'End session' }))

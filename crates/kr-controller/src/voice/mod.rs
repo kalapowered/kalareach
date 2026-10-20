@@ -408,7 +408,7 @@ impl VoiceModule {
                         .coordinator
                         .stop(device_of(actor)?, &params, now_ms)
                         .await
-                        .map_err(voice_error)?,
+                        .map_err(stop_error)?,
                 )
             }
             Method::VoiceDelegate => {
@@ -456,6 +456,24 @@ fn voice_error(error: kr_voice::VoiceError) -> ControllerError {
             detail: protocol.message,
         },
     }
+}
+
+/// The daemon error a refused stop becomes.
+///
+/// A voice session this host holds no record of (it ended, the host started again, or it is
+/// another device's) is refused as an unknown session: a device that could not finish revoking its
+/// call's grant asks again when it reaches this host, and that answer tells it there is nothing
+/// left there to stop. It says nothing of a grant or of the fence this host owes its workers, which
+/// this host keeps to itself. Every other refusal keeps its code, because none of them says the
+/// grant is gone: the door answers `PERMISSION_DENIED` before it looks at the call.
+fn stop_error(error: kr_voice::VoiceError) -> ControllerError {
+    if error.reason() == Some(kr_protocol::voice::VoiceRefusal::UnknownVoiceSession) {
+        return ControllerError::Refused {
+            code: ErrorCode::UnknownSession,
+            detail: error.to_protocol_error().message,
+        };
+    }
+    voice_error(error)
 }
 
 /// The frame one answer becomes.
