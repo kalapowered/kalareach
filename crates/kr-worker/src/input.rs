@@ -205,7 +205,8 @@ pub struct PasteFramer {
 }
 
 /// A prefix forwarded because it was held for its deadline, for this host's own tests: when it
-/// began to be held and the moment it was forwarded at. It is compiled away in every shipped build.
+/// began to be held and the moment it was found to have run out of time. It is compiled away in
+/// every shipped build.
 #[cfg(feature = "testing")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Expired {

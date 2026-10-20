@@ -3434,6 +3434,8 @@ async fn stall(rig: &mut Rig, stalled: Stalled) -> Standing {
 struct LetGo {
     done: Arc<std::sync::atomic::AtomicBool>,
     let_go: Arc<std::sync::atomic::AtomicBool>,
+    /// The moment the stall was let go, when it had to be.
+    let_go_at: Arc<std::sync::Mutex<Option<Instant>>>,
     thread: std::thread::JoinHandle<()>,
 }
 
@@ -3445,8 +3447,13 @@ impl LetGo {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         );
+        let let_go_at = Arc::new(std::sync::Mutex::new(None));
         let thread = {
-            let (done, let_go) = (Arc::clone(&done), Arc::clone(&let_go));
+            let (done, let_go, let_go_at) = (
+                Arc::clone(&done),
+                Arc::clone(&let_go),
+                Arc::clone(&let_go_at),
+            );
             std::thread::spawn(move || {
                 let began = Instant::now();
                 while began.elapsed() < after {
@@ -3456,6 +3463,9 @@ impl LetGo {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 if !done.load(Ordering::Acquire) {
+                    *let_go_at
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
                     let_go.store(true, Ordering::Release);
                     let _ = release.send(());
                 }
@@ -3464,17 +3474,28 @@ impl LetGo {
         Self {
             done,
             let_go,
+            let_go_at,
             thread,
         }
     }
 
     /// Says the stall is no longer needed, and returns whether it had to be let go.
     fn finish(self) -> bool {
+        self.finish_at().is_some()
+    }
+
+    /// Says the stall is no longer needed, and returns the moment it was let go when it had to be.
+    fn finish_at(self) -> Option<Instant> {
         use std::sync::atomic::Ordering;
 
         self.done.store(true, Ordering::Release);
         self.thread.join().expect("the watchdog ends");
-        self.let_go.load(Ordering::Acquire)
+        let at = *self
+            .let_go_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert_eq!(at.is_some(), self.let_go.load(Ordering::Acquire));
+        at
     }
 }
 
@@ -3519,8 +3540,10 @@ impl DiskWriter {
 ///
 /// What the application received is read from the file it keeps, which touches nothing of the
 /// worker's, so the observation waits for no lock of the session's. The stall is let go only after
-/// the prefix has been seen, or after `stalled_for` where a case bounds it; a prefix that arrives
-/// after the stall was let go has waited for it.
+/// the prefix has been seen, or after `stalled_for` where a case bounds it. A prefix the
+/// application read only after the stall was let go has waited for it unless the worker had written
+/// it to the terminal by then: a box too busy to run the application is not the worker holding the
+/// prefix back ([`kept_waiting_by_the_stall`]).
 async fn a_prefix_meets(
     rig: &mut Rig,
     stalled: Stalled,
@@ -3568,7 +3591,7 @@ async fn a_prefix_meets(
         }
     };
     let arrived = rig.until_everything_typed_arrived().await;
-    let had_to_be_let_go = letting_go.finish();
+    let let_go_at = letting_go.finish_at();
     let arrived = arrived.unwrap_or_else(|| {
         panic!(
             "{stalled:?}, {timing:?}: the application never received {prefix:?}: {:?}",
@@ -3577,17 +3600,60 @@ async fn a_prefix_meets(
     });
     let hold = arrived.duration_since(began);
     eprintln!("{stalled:?}, {timing:?}, {prefix:?}: received {hold:?} after the write began");
+    let written = the_write_that_completed(rig);
     assert!(
-        !had_to_be_let_go,
+        !kept_waiting_by_the_stall(rig, let_go_at),
         "{stalled:?}, {timing:?}: {prefix:?} was kept waiting by the stall until it was let go \
-         ({hold:?})"
+         ({hold:?}, written to the terminal {:?} after the write began)",
+        written.map(|written| written.saturating_duration_since(began))
     );
+    if let_go_at.is_some() {
+        eprintln!(
+            "{stalled:?}, {timing:?}, {prefix:?}: written to the terminal before the stall was let \
+             go, and read by the application {hold:?} after the write began"
+        );
+    }
 
-    standing.release.send(()).expect("lets the stall go");
+    // A stall that was let go has gone already, and nothing is left to receive a second release.
+    let released = standing.release.send(());
+    assert!(
+        released.is_ok() || let_go_at.is_some(),
+        "{stalled:?}, {timing:?}: the stall could not be let go"
+    );
     if let Some(stopped) = standing.stopped {
         let _ = stopped.await;
     }
     hold
+}
+
+/// When the worker had written everything the rig has typed to the terminal: the moment of the
+/// write that brought the lease's bytes written, counted from the start, to the length typed. None
+/// while it has not.
+///
+/// A write is recorded after it returns, so a write of an earlier step can be recorded late; that
+/// one counts toward the bytes before this step's and never reaches the length typed by this one.
+fn the_write_that_completed(rig: &Rig) -> Option<Instant> {
+    let mut written = 0;
+    rig.wired
+        .runtime
+        .input()
+        .terminal_writes()
+        .into_iter()
+        .filter(|write| write.of_a_lease)
+        .find_map(|write| {
+            written += write.bytes.len();
+            (written >= rig.typed.len()).then_some(write.at)
+        })
+}
+
+/// Whether the worker kept what was typed waiting for the stall, given the moment the stall was let
+/// go when it had to be. The application can read late on a busy box; that is not the worker holding
+/// the bytes. They were held if the worker had not written them all to the terminal by the time the
+/// stall was let go.
+fn kept_waiting_by_the_stall(rig: &Rig, let_go_at: Option<Instant>) -> bool {
+    let_go_at.is_some_and(|let_go_at| {
+        the_write_that_completed(rig).is_none_or(|written| written > let_go_at)
+    })
 }
 
 /// The case behind the first three forced cases: a lone Escape under one stall, with the stall
@@ -3662,6 +3728,11 @@ async fn a_delimiter_split_across_two_writes_meets(rig: &mut Rig, stalled: Stall
                  before its deadline",
                 expired.now.saturating_duration_since(expired.since)
             );
+            assert!(
+                !opened,
+                "{stalled:?}: a prefix that had run out of time still completed the delimiter and \
+                 opened a paste"
+            );
         } else {
             assert_eq!(
                 second.forwarded_bytes.get(),
@@ -3676,8 +3747,9 @@ async fn a_delimiter_split_across_two_writes_meets(rig: &mut Rig, stalled: Stall
             );
         }
         let arrived = rig.until_everything_typed_arrived().await;
+        let let_go_at = letting_go.finish_at();
         assert!(
-            !letting_go.finish(),
+            !kept_waiting_by_the_stall(rig, let_go_at),
             "{stalled:?}: the split delimiter was kept waiting by the stall until it was let go"
         );
         assert!(
@@ -3685,7 +3757,13 @@ async fn a_delimiter_split_across_two_writes_meets(rig: &mut Rig, stalled: Stall
             "{stalled:?}: the delimiter did not reach the application whole while the stall was in force: {:?}",
             rig.received()
         );
-        standing.release.send(()).expect("lets the stall go");
+        // A stall that was let go has gone already, and nothing is left to receive a second
+        // release.
+        let released = standing.release.send(());
+        assert!(
+            released.is_ok() || let_go_at.is_some(),
+            "{stalled:?}: the stall could not be let go"
+        );
         if let Some(stopped) = standing.stopped {
             let _ = stopped.await;
         }
