@@ -186,8 +186,8 @@ A `create_session` node creates a session using the parameters of `session.creat
 is created, it will continue to run, and the session will be the output of this node. The session
 belongs to whoever uses it afterwards. The create runs on a task of the daemon's own, so a node
 whose wait ends in the middle of it leaves no half-made reservation. If the node is asked to stop
-before its admission at the launch transition begins, the node stops and no session is made. Once
-its admission at the launch transition has begun, the node can no longer be stopped: a node whose
+before its admission at the launch transition has looked for a request to stop, the node stops and
+no session is made. Once that look has found none, the node can no longer be stopped: a node whose
 wait or run deadline passes is left unknown, and a node whose run is cancelled is recorded as
 cancelled. A request to stop that comes before the worker's claim is still held against the claim,
 which is refused, so no program will start and no session will be made. A session whose claim came
@@ -257,15 +257,16 @@ row, the daemon's sweeping procedure will close the dispatch's session, remove i
 release the workspace hold, and release the row, without waiting for the run to end. A run only
 holds a workspace once, even if multiple nodes are run in the same workspace. The hold ends with the
 last of them. If a run pauses between nodes, it does not hold the workspace while it is paused,
-unless a row of the run is still owed. When a session is closed, if it does not account for the
-command node's worker, the node's row will be kept open until the kernel indicates that the worker's
-process has ended or that the boot it ran in has ended. The node's row records the boot it began in.
-The node's row also records the process the launcher started, which the daemon's registry keeps
-after the session has closed. The daemon's sweeping procedure will look again less and less often
-while a row stays owed. What the worker could not account for stays outside the release: a process
-the command started that left the session's boundary can outlive it, and where the platform gives
-incomplete coverage of owned processes (always on macOS) the closure says so. The ledger is a store
-of its own beside the journal, so a release that does not know it reads the journal as before.
+unless a row of a command that ran in it is still owed. When a session is closed, if it does not
+account for the command node's worker, the node's row will be kept open until the kernel indicates
+that the worker's process has ended or that the boot it ran in has ended. The node's row records the
+boot it began in. The node's row also records the process the launcher started, which the daemon's
+registry keeps after the session has closed. The daemon's sweeping procedure will look again less
+and less often while a row stays owed. What the worker could not account for stays outside the
+release: a process the command started that left the session's boundary can outlive it, and where
+the platform gives incomplete coverage of owned processes (always on macOS) the closure says so. The
+ledger is a store of its own beside the journal, so a release that does not know it reads the
+journal as before.
 
 The host carries out the change-set nodes against the environment's own change-set service. A
 `capture_changeset` node's parameters are the `changeset.capture` method's own typed parameters,
@@ -404,15 +405,15 @@ each of them as it stood and two admissions that arrive together cannot both tak
   any other.
 * **Run deadline and action wait.** A definition may shorten the 30-minute run deadline and
   10-minute action wait specified in Section 17, but may not lengthen them or set one to nothing. A
-  run's deadline begins when the run starts running. While waiting for an action, the host waits at
-  most until the earlier of the action's wait and the run's deadline, reading its clock after each
-  timer wait, with the timer set for at most a quarter of a second, and then asks the action to
+  run's deadline begins when the run starts running. While waiting for an action, the host waits
+  until the earlier of the action's wait and the run's deadline has passed, reading its clock after
+  each timer wait, with the timer set for at most a quarter of a second, and then asks the action to
   stop. If the host reads a report from the action only after its clock has passed the action's
   wait, for any reason, it does not take that report. An action the host can still stop settles
   cancelled, which says the host stopped asking and not that the world is as it was; one it cannot
   stop settles unknown. A change-set node cannot be stopped after it has begun. A `create_session`
-  node cannot be stopped once its admission at the launch transition has begun. A command, test or
-  `create_session` node whose dispatch has ended cannot be stopped either.
+  node cannot be stopped once its admission at the launch transition has found no request to stop. A
+  command, test or `create_session` node whose dispatch has ended cannot be stopped either.
 * **A limit stops the run.** When a run's deadline or an action's wait passes, the run dispatches
   nothing further. In one transaction, the action it outlived settles as above, every node still
   waiting that depends on an outcome that is not known pauses for review, every other node still

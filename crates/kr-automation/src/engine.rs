@@ -83,8 +83,8 @@ pub struct Dispatch<'a> {
 pub enum Cancellation {
     /// The action was asked to stop. Nothing is claimed about what it did before it stopped.
     Requested,
-    /// The action cannot be stopped: its kind offers no point to stop at once it has begun, or its
-    /// dispatch has already ended.
+    /// The runner did not stop the action: its kind offers no point to stop at once it has begun,
+    /// it is past the point it can be stopped at, or its dispatch has already ended.
     Unsupported,
 }
 
@@ -105,14 +105,17 @@ pub trait ActionRunner: Send + Sync {
     /// Asks the action `dispatch` began to stop.
     ///
     /// The engine asks this when the action has outlived its wait or its run's deadline, and then
-    /// stops waiting for it. A kind that can be stopped settles cancelled, which says the host
-    /// stopped asking and not that the world is as it was; a kind that cannot settles unknown, and
-    /// its dependants pause for review.
+    /// stops waiting for it: `Requested` settles the node cancelled, which says the host stopped
+    /// asking and not that the world is as it was, and `Unsupported` settles it unknown, and its
+    /// dependants pause for review. The answer is the runner's, not the kind's: an action that
+    /// could be stopped a moment ago may have ended since. The engine also asks it when the run is
+    /// cancelled, and the journal has cancelled the node then, whatever the answer.
     fn cancel(&self, dispatch: &Dispatch<'_>) -> Cancellation;
 }
 
-/// How often the engine reads the host's clock while it waits for an action, so a deadline that
-/// passes during the wait is found within this long of passing.
+/// The longest the timer is set for while the engine waits for an action. The engine reads the
+/// host's clock after each timer wait, so a deadline that passes during the wait is found soon
+/// after it passes; a host that is suspended or starved reads it later.
 const DEADLINE_POLL_MS: u64 = 250;
 
 /// An output of `kind` whose identifiers name nothing, for a runner that stands in for the host.
@@ -398,7 +401,7 @@ impl WorkflowEngine {
                     // Reading its status and moving it to running is one statement, so a
                     // cancellation that arrives while an earlier node was running either gets
                     // there first and this node is never dispatched, or finds it already
-                    // running and leaves it alone.
+                    // running and cancels it as well, and its runner is then asked to stop.
                     if !self.store.claim_node_for_dispatch(run_id, &node.node_id)? {
                         let recorded = self.store.node_status(run_id, &node.node_id)?;
                         node_statuses.insert(
