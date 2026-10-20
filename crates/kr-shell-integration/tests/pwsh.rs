@@ -17,6 +17,8 @@
 
 #![cfg(unix)]
 
+#[path = "batch_launch/mod.rs"]
+mod batch_launch;
 mod shellpkg;
 
 use kr_shell_integration::contract::qualification::ShellKind;
@@ -914,4 +916,69 @@ fn a_launch_of_a_name_only_the_get_fallback_answers_is_refused() {
         "& '.\\get-krfallback' 'a'",
         "a path to the program, written with a backslash, was refused:\n{output}"
     );
+}
+
+/// A program that writes each of its first nine arguments, one `n=[word]` line each.
+const SHOW_EACH: &str = "#!/bin/sh\ni=0\n: > \"$KR_CASE_OUT\"\nfor word in \"$@\"; do\n  i=$((i + 1))\n  printf '%s=[%s]\\n' \"$i\" \"$word\" >> \"$KR_CASE_OUT\"\ndone\n";
+
+/// Writes the program a launch is made to into `directory`, in the places a launch finds it, and
+/// says where they are.
+fn write_show_each(directory: &std::path::Path) -> batch_launch::Programs {
+    use std::os::unix::fs::PermissionsExt;
+
+    let write = |program: std::path::PathBuf| {
+        std::fs::write(&program, SHOW_EACH).expect("a program that writes its arguments");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("the program can be run");
+        program.display().to_string()
+    };
+    let each = write(directory.join("show-each"));
+    let mut places = Vec::new();
+    for name in ["100%dir", "bang!dir"] {
+        let inner = directory.join(name);
+        std::fs::create_dir(&inner).expect("a directory");
+        places.push(write(inner.join("show-each")));
+    }
+    batch_launch::Programs {
+        each,
+        by_name: "show-each",
+        in_bang_directory: places.pop().expect("a place"),
+        in_percent_directory: places.pop().expect("a place"),
+    }
+}
+
+/// KR-REQ-23.54: the decision about the words of a batch program's vector, on a platform with no
+/// batch files.
+///
+/// PowerShell gives a `.cmd` or `.bat` file on Windows a line that cmd.exe reads a second time, and
+/// the module builds no line for a vector holding a word cmd.exe would change. The decision is the
+/// module's own and does not depend on cmd.exe, so the helper is told to treat the program as a
+/// batch file and the same vectors are put to it: those with a word cmd.exe reads as more than
+/// itself are refused and the program never starts, every other reaches the program as named.
+/// Windows shows the arguments a real batch file receives.
+#[test]
+#[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
+fn a_vector_for_a_batch_program_has_a_line_only_when_cmd_exe_would_read_every_word_as_named() {
+    let refused = tempfile::tempdir().expect("a temporary directory");
+    let programs = write_show_each(refused.path());
+    batch_launch::assert_nothing_is_started_that_cmd_exe_would_change(
+        refused.path(),
+        &programs,
+        true,
+    );
+
+    let carried = tempfile::tempdir().expect("a temporary directory");
+    let programs = write_show_each(carried.path());
+    batch_launch::assert_every_word_cmd_exe_reads_as_itself_arrives_as_named(
+        carried.path(),
+        &programs,
+        true,
+    );
+
+    let separators = tempfile::tempdir().expect("a temporary directory");
+    let programs = write_show_each(separators.path());
+    let words = batch_launch::SEPARATORS.to_vec();
+    let launched =
+        batch_launch::launch_all(separators.path(), &[(programs.each, words.clone())], true);
+    assert_eq!(launched[0].received(), words, "{}", launched[0].describe());
 }

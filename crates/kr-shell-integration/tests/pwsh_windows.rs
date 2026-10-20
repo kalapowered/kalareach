@@ -47,6 +47,9 @@ use kr_shell_integration::host::link::{BridgeReader, BridgeWriter, FromBridge, a
 use kr_shell_integration::host::scripted::REFERENCE_INTEGRATION_VERSION;
 use tokio::io::AsyncReadExt as _;
 
+#[path = "batch_launch/mod.rs"]
+mod batch_launch;
+
 /// The editor ABI the client declares and this worker expects.
 ///
 /// A published qualification reads this out of the installed PSReadLine. Here both halves are told
@@ -1038,5 +1041,163 @@ async fn the_module_sends_nothing_to_a_pipe_another_account_holds() {
     assert!(
         traced.contains("refused before the hello") && traced.contains(&second),
         "the trace names the account that holds the pipe: {traced}"
+    );
+}
+
+// ---- a launch of a batch program --------------------------------------------------------------------
+//
+// Windows runs a `.cmd` or `.bat` file through cmd.exe, which reads the line PowerShell builds a
+// second time. `batch_launch` holds the vectors and the checks that this platform and the others
+// share; what is here is the part only a batch file can show: the programs themselves, the words
+// `cmd.exe` splits, and a script as the control.
+
+/// A program that writes each of its first nine arguments the way a batch file reads one with
+/// `%~n`: `cmd.exe` takes the quotes off a word and splits a word at `,`, `;` and `=`.
+fn show_each_batch() -> String {
+    let mut text = String::from("@echo off\r\n");
+    for number in 1..=9 {
+        let redirect = if number == 1 { ">" } else { ">>" };
+        text.push_str(&format!(
+            "{redirect}\"%KR_CASE_OUT%\" echo {number}=[%~{number}]\r\n"
+        ));
+    }
+    text
+}
+
+/// A program that writes the whole argument text, the way a package manager's shim hands its words
+/// on with `%*`.
+const SHOW_ALL_BATCH: &str = "@echo off\r\n>\"%KR_CASE_OUT%\" echo 1=[%*]\r\n";
+
+/// A script, whose arguments PowerShell binds itself: no `cmd.exe` reads a line for it.
+const SHOW_EACH_SCRIPT: &str = "$lines = for ($i = 0; $i -lt $args.Count; $i++) {\r\n    '{0}=[{1}]' -f ($i + 1), $args[$i]\r\n}\r\n[System.IO.File]::WriteAllLines($env:KR_CASE_OUT, [string[]]@($lines))\r\n";
+
+/// Writes the programs a launch is made to into `directory`, and says where they are.
+fn write_programs(directory: &Path) -> batch_launch::Programs {
+    let path = |name: &str| directory.join(name).display().to_string();
+    std::fs::write(directory.join("show-each.cmd"), show_each_batch()).expect("a batch program");
+    std::fs::write(directory.join("show-each.bat"), show_each_batch()).expect("a batch program");
+    std::fs::write(directory.join("show-all.cmd"), SHOW_ALL_BATCH).expect("a batch program");
+    std::fs::write(directory.join("show-each-script.ps1"), SHOW_EACH_SCRIPT).expect("a script");
+    for name in ["100%dir", "bang!dir"] {
+        let inner = directory.join(name);
+        std::fs::create_dir(&inner).expect("a directory");
+        std::fs::write(inner.join("show-each.cmd"), show_each_batch()).expect("a batch program");
+    }
+    batch_launch::Programs {
+        each: path("show-each.cmd"),
+        by_name: "show-each",
+        in_percent_directory: path("100%dir\\show-each.cmd"),
+        in_bang_directory: path("bang!dir\\show-each.cmd"),
+    }
+}
+
+/// KR-REQ-23.54: a batch program is never started with a word that `cmd.exe` would read as more
+/// than that word, or not at all.
+///
+/// PowerShell drops an empty word and leaves a double quote as it is, so the words after them shift
+/// or join, and a `&`, a `|`, a `<` or a `>` in a word with no white space is a second command or a
+/// redirection. Each of these vectors is refused, as one with a first word that names no
+/// application is, and the program does not start.
+#[test]
+fn a_batch_program_is_not_started_with_a_word_cmd_exe_would_read_as_more_than_itself() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let programs = write_programs(directory.path());
+    batch_launch::assert_nothing_is_started_that_cmd_exe_would_change(
+        directory.path(),
+        &programs,
+        false,
+    );
+}
+
+/// KR-REQ-23.54: the words a batch program can read as named arrive as named: white space, a path,
+/// a dash, the characters PowerShell and the batch file's parser leave alone, and a program named
+/// without a path is found the way a typed name is.
+#[test]
+fn a_batch_program_is_given_the_words_it_can_read_as_named() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let programs = write_programs(directory.path());
+    batch_launch::assert_every_word_cmd_exe_reads_as_itself_arrives_as_named(
+        directory.path(),
+        &programs,
+        false,
+    );
+}
+
+/// KR-REQ-23.54: `=`, `,` and `;` reach a batch program whole through `%*`, which is how a package
+/// manager's shim hands its words on, and a batch file that reads `%1` to `%9` has them split.
+///
+/// They are separators between a batch file's arguments and nothing else, so the launch carries
+/// them, and each program reads them its own way.
+#[test]
+fn a_batch_program_is_given_separator_words_whole_through_the_argument_text() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let programs = write_programs(directory.path());
+    let words = batch_launch::SEPARATORS.to_vec();
+    let cases = vec![
+        (
+            directory.path().join("show-all.cmd").display().to_string(),
+            words.clone(),
+        ),
+        (programs.each, words),
+    ];
+    let launched = batch_launch::launch_all(directory.path(), &cases, false);
+    for launch in &launched {
+        assert!(!launch.refused, "{}", launch.describe());
+    }
+    assert_eq!(
+        launched[0].received(),
+        vec!["--model=x a,b c;d"],
+        "the program that reads %* is given the words whole: {}",
+        launched[0].describe()
+    );
+    assert_eq!(
+        launched[1].received(),
+        vec!["--model", "x", "a", "b", "c", "d"],
+        "the program that reads %1 to %9 has them split: {}",
+        launched[1].describe()
+    );
+}
+
+/// KR-REQ-23.54: the words a batch program is refused reach a script as named, because PowerShell
+/// binds a script's arguments itself and no `cmd.exe` reads the line.
+#[test]
+fn a_script_is_given_every_word_a_batch_program_is_refused() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    write_programs(directory.path());
+    let words = vec!["", "a\"b", "c", "a&b", "a|b", "a%b", "a!b", "a b\\", "d"];
+    let script = directory
+        .path()
+        .join("show-each-script.ps1")
+        .display()
+        .to_string();
+    let launched = batch_launch::launch_all(directory.path(), &[(script, words.clone())], false);
+    let expected: Vec<String> = words.iter().map(|word| (*word).to_owned()).collect();
+    assert!(
+        !launched[0].refused && launched[0].received() == expected,
+        "{}",
+        launched[0].describe()
+    );
+}
+
+/// KR-REQ-23.54: a `.bat` file is a batch program as a `.cmd` file is.
+#[test]
+fn a_bat_file_is_held_to_the_same_rule_as_a_cmd_file() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    write_programs(directory.path());
+    let program = directory.path().join("show-each.bat").display().to_string();
+    let cases = vec![
+        (program.clone(), vec!["", "a\"b", "c"]),
+        (program, vec!["two words", "plain"]),
+    ];
+    let launched = batch_launch::launch_all(directory.path(), &cases, false);
+    assert!(
+        launched[0].refused && !launched[0].started(),
+        "{}",
+        launched[0].describe()
+    );
+    assert!(
+        !launched[1].refused && launched[1].received() == vec!["two words", "plain"],
+        "{}",
+        launched[1].describe()
     );
 }
