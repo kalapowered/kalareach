@@ -357,12 +357,12 @@ fn table_differences(old: &WorkerSurface, new: &WorkerSurface) -> Vec<String> {
 
 /// Runs the check for the commit at `HEAD` of the checkout at `repository`: origin's tags are
 /// listed and held to this checkout's, the record of exclusions is read and held to them, and the
-/// commit is compared, or when it moves the level the cut's own check is run.
+/// commit is compared, or when it moves the level the cut's own check is run (`cut`).
 ///
 /// # Errors
 ///
 /// Whatever the check fails on.
-pub fn run(repository: &Path) -> Result<(), String> {
+pub fn run(repository: &Path, cut: bool) -> Result<(), String> {
     let commit = git_in(repository, &["rev-parse", "--verify", "HEAD^{commit}"])?
         .trim()
         .to_owned();
@@ -372,6 +372,13 @@ pub fn run(repository: &Path) -> Result<(), String> {
     exclusions.validate(repository, &release_tags)?;
     let head = Head::of_this_build(repository, &commit)?;
     match check(repository, &head, &release_tags, &exclusions)? {
+        Outcome::MovesTheLevel if !cut => {
+            println!(
+                "no release is at level {}, so {commit} moves it; its cut is not checked in this run",
+                head.level
+            );
+            Ok(())
+        }
         Outcome::MovesTheLevel => {
             println!(
                 "no release is at level {}, so {commit} moves it: running the cut's own check",

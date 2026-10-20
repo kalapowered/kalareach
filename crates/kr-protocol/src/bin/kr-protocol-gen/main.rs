@@ -14,7 +14,7 @@
 //! kr-protocol-gen --retain L --commit C           cut retained level L from the release at C
 //! kr-protocol-gen --release-commit L C            move level L's record to release C, the release before this one, if its schema is the kept one
 //! kr-protocol-gen --predecessor                   print the level, commit and tag of the release before this one, which has to be the newest retained level
-//! kr-protocol-gen --in-level                      fail unless this commit has the surface of every release at its level that is not excluded
+//! kr-protocol-gen --in-level [--without-the-cut]  fail unless this commit has the surface of every release at its level that is not excluded; a commit that moves the level runs the cut's check too, unless it is told it has been run
 //! kr-protocol-gen --public-contract               report what a client of an earlier release cannot read of this commit's schema, and fail on it once public 1.0 is frozen
 //! ```
 
@@ -129,7 +129,10 @@ fn main() -> ExitCode {
                 };
             }
             "--in-level" => {
-                return match in_level::run(&retained::repository()) {
+                // A commit that moves the level has its cut checked in the same run, unless the
+                // caller has made that check already and asks for the comparison alone.
+                let cut = !std::env::args().any(|argument| argument == "--without-the-cut");
+                return match in_level::run(&retained::repository(), cut) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(error) => {
                         eprintln!("{error}");
@@ -146,6 +149,7 @@ fn main() -> ExitCode {
                     }
                 };
             }
+            "--without-the-cut" => {}
             "--predecessor" => {
                 return match retained::release_before() {
                     Ok(line) => {
@@ -162,7 +166,7 @@ fn main() -> ExitCode {
                 println!(
                     "kr-protocol-gen [--check] [--out-dir <path>] [--fixtures-dir <path>] \
                      [--docs-dir <path>] | --retain <level> --commit <commit> | \
-                     --release-commit <level> <commit> | --predecessor | --in-level | --public-contract"
+                     --release-commit <level> <commit> | --predecessor | --in-level [--without-the-cut] | --public-contract"
                 );
                 return ExitCode::SUCCESS;
             }

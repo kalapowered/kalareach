@@ -25,20 +25,27 @@ jobs:
   release:
     name: pack and publish
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    # One tag is one release, and the refusal below cannot see a run that has not created its draft
-    # yet: two runs for the same tag would both pass it and both go on to create one. So runs for
-    # one tag are serialised here instead, and a run that has already begun is never cancelled for a
+    timeout-minutes: 90
+    # One publication at a time, across tags. Two runs for the same tag would both pass the refusal
+    # below before either had created its draft, and two runs for different tags would each check
+    # the releases of a level against an inventory the other was about to change. So publication is
+    # serialised for the whole repository, and a run that has already begun is never cancelled for a
     # later one, because it is the run that holds the draft. A duplicate that waits meets the
-    # refusal when its turn comes, which is where it belongs.
+    # refusal when its turn comes, which is where it belongs. GitHub keeps one run waiting for a
+    # group, so a third arrival takes the waiting run's place: that run is started again by hand
+    # (`docs/releases/packages.md`).
     concurrency:
-      group: package-release-${{ github.ref }}
+      group: package-release-publication
       cancel-in-progress: false
     permissions:
       contents: write
     steps:
+      # Every release tag, and the history they are in: the checks below compare this commit with
+      # the releases of its level.
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
 
       - name: Install pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
@@ -58,8 +65,31 @@ jobs:
           rustc --version
           cargo --version
 
+      # A level is one surface, so a release is made only of a commit that has the surface of every
+      # release at its level that is not excluded. The generator is built first, so that no tag can
+      # land between fetching the tags and comparing them with origin's while it compiles.
+      - name: Build the release checks
+        run: cargo build --locked -p kr-protocol --bin kr-protocol-gen
+
+      - name: A level is one surface
+        run: |
+          set -euo pipefail
+          git fetch --force --prune origin '+refs/tags/packages/v*:refs/tags/packages/v*'
+          target/debug/kr-protocol-gen --in-level
+          target/debug/kr-protocol-gen --public-contract
+
       - name: Pack the packages
         run: bash scripts/release-packages.sh --output "$RUNNER_TEMP/packages" --tag "$GITHUB_REF_NAME"
+
+      # Under the publication lock, the inventory again: a tag another run published while this one
+      # packed is a release of the level this commit has to match. A commit that moves the level has
+      # had its cut checked above, and it is not checked twice.
+      - name: The level is still one surface
+        run: |
+          set -euo pipefail
+          git fetch --force --prune origin '+refs/tags/packages/v*:refs/tags/packages/v*'
+          target/debug/kr-protocol-gen --in-level --without-the-cut
+          target/debug/kr-protocol-gen --public-contract
 
       - name: Publish the release
         env:
