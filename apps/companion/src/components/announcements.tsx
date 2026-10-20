@@ -7,6 +7,10 @@
  * it, and each banner puts its words into the nearest one. The application is a scope, and so is
  * each dialog that holds a banner, because a screen reader inside a modal dialog does not reach a
  * region outside it. The words are for a screen reader alone: what a person reads is the banner.
+ *
+ * A banner that is already on a screen when the screen first appears arrives with its region, and
+ * says nothing: a screen reader reads it as part of the screen, as it reads the rest of what is
+ * there.
  */
 
 import {

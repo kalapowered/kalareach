@@ -254,6 +254,7 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     expect(controls.sharing.sent().redeem).toBe(1)
     const attempt = await screen.findByTestId('accept-attempt')
     expect(attempt).toHaveTextContent('The host said: this invitation was withdrawn')
+    expect(attempt).toHaveTextContent(/did not confirm/)
     expect(attempt).not.toHaveTextContent('has not said')
     await waitFor(() => {
       expect(screen.queryByTestId('sheet')).toBeNull()

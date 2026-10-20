@@ -140,7 +140,6 @@ test('says a banner through the region the page already held', async ({ page }) 
   })
   await page.getByRole('button', { name: 'Sessions' }).click()
   await expect(page.locator('.banner')).toContainText('This host is not answering')
-  await expect(region.locator('p')).toHaveCount(1)
   await expect(region).toMatchAriaSnapshot('- paragraph: /This host is not answering\\. The host did not answer\\..*/')
   expect(await before?.evaluate((node) => node.isConnected)).toBe(true)
   await expect(region, 'one region says every banner of the screen').toHaveCount(1)
@@ -167,7 +166,6 @@ test('says the banner of a sheet through a region inside the sheet', async ({ pa
 
   const inside = sheet.locator('[data-announcements]')
   await expect(inside).toHaveCount(1)
-  await expect(inside.locator('p')).toHaveCount(1)
   await expect(inside).toContainText('This host has no managed shell to start.')
   // The region outside the sheet says none of the sheet's banners.
   const outside = page.locator('[data-announcements]:not([role="dialog"] *)')

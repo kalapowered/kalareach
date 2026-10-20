@@ -645,7 +645,7 @@ describe('the devices that share the settings', () => {
     expect(within(card).queryByTestId('settings-devices-held-out')).toBeNull()
   })
 
-  it('names a device whose revoke is still waiting for its host, and offers nothing to share with it', async () => {
+  it('names a device whose revoke is on record, and offers nothing to share with it', async () => {
     const { person, controls, sheet } = await openOnAccount()
     act(() => {
       controls.settings.change({
@@ -664,7 +664,7 @@ describe('the devices that share the settings', () => {
     })
     const card = await within(sheet).findByTestId('settings-devices')
     const waiting = within(card).getByTestId('settings-devices-revoke-waiting')
-    expect(waiting).toHaveTextContent(/still waiting for its host/)
+    expect(waiting).toHaveTextContent(/on record here/)
     expect(waiting.closest('li')).toHaveTextContent('the-phone')
     expect(within(card).queryByRole('button', { name: 'Share settings with the-phone again' })).toBeNull()
 

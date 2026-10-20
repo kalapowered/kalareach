@@ -392,13 +392,13 @@ export interface DeviceCandidate {
   readonly name: string
 }
 
-/** A device this computer took out when the person revoked it, that the hosts still list. */
+/** A device this computer kept out of the settings because the person revoked it, that the hosts still list. */
 export interface DeviceHeldOut {
   readonly reference: string
   readonly name: string
   /**
-   * Whether a request to revoke it that this computer sent may still be carried out by a host, as
-   * one that waits in a feed does. Sharing with it again is not offered then.
+   * Whether a revoke for it is on record on this computer: a request it published in a host's feed,
+   * which a host may carry out or may have carried out. Sharing with it again is not offered then.
    */
   readonly waiting: boolean
 }
@@ -430,7 +430,7 @@ export interface DevicesView {
   /**
    * Devices this computer took out when the person revoked them, that the hosts still list as
    * unrevoked: the revoke may not have gone through. Sharing with one again is the person's choice,
-   * and is asked for as sharing with any device is, unless a revoke is still waiting for its host.
+   * and is asked for as sharing with any device is, unless a revoke for it is on record on this computer.
    */
   readonly held_out: readonly DeviceHeldOut[]
   readonly offers: readonly DeviceOffer[]

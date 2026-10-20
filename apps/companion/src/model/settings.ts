@@ -143,8 +143,8 @@ export const DEVICES_HELP =
 export const DEVICES_HELD_OUT =
   'Kept out of your settings since you revoked them. Your hosts still list them, so a revoke may not have gone through.'
 
-/** What a device is told whose revoke a host has yet to carry out. */
-export const DEVICE_REVOKE_WAITING = 'A revoke is still waiting for its host.'
+/** What a device is told whose revoke is on record on this computer. */
+export const DEVICE_REVOKE_WAITING = 'A revoke for it is on record here, so it is not offered again.'
 
 /** The sentence a person reads first, for who shares the settings. */
 export function describeDevices(devices: DevicesView): string {

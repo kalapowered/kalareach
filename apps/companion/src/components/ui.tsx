@@ -319,8 +319,8 @@ export function Segmented<T extends string>({
 /**
  * A banner that says what is happening, without claiming more than it knows.
  *
- * Its words are said to a screen reader through the region the application keeps
- * ([`Announcements`]), and not through one of its own: a region that arrives with its words says
+ * Its words are said to a screen reader through the region of the nearest scope
+ * (`AnnouncementScope`), and not through one of its own: a region that arrives with its words says
  * nothing.
  */
 export function Banner({

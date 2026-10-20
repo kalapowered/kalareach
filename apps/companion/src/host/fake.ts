@@ -2548,7 +2548,7 @@ export function fakeHost(
       if ('waiting' in candidate && candidate.waiting) {
         refuse(
           'PERMISSION_DENIED',
-          'A request to revoke that device is still waiting for its host, so nothing was shared with it.'
+          'A revoke for that device is on record here, so nothing was shared with it.'
         )
       }
       if (!settings.sync.devices.can_confirm) {
