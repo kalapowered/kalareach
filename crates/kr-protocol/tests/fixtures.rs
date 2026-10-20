@@ -618,9 +618,9 @@ fn the_digest_ignores_request_id_but_covers_the_action_window() {
     );
 }
 
-/// KR-REQ-23.07: the mutation digest covers the method and its version, the grant, every field of
-/// the target, the preconditions, the action identifier, the freshness window and time to live,
-/// and the parameters: changing any one of them changes the digest.
+/// KR-REQ-23.07, KR-REQ-09.16: the mutation digest covers the method and its version, the grant,
+/// every field of the target, the preconditions, the action identifier, the freshness window and
+/// time to live, and the parameters: changing any one of them changes the digest.
 #[test]
 fn the_digest_covers_every_field_a_mutation_is_admitted_on() {
     let baseline = mutation_digest(&mutation_request(), &actor_id()).expect("digest");

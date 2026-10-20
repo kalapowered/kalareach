@@ -90,6 +90,16 @@ async fn host_with(
     prepare: impl FnOnce(&std::path::Path),
     time: impl FnOnce(&kr_ipc::paths::EnvironmentPaths) -> kr_worker::action::time::TimeSources,
 ) -> Host {
+    host_on(prepare, time, None).await
+}
+
+/// Starts a host as [`host_with`] does, whose action windows and deadlines are decided on `clock`
+/// when one is given, so that a test moves them by hand.
+async fn host_on(
+    prepare: impl FnOnce(&std::path::Path),
+    time: impl FnOnce(&kr_ipc::paths::EnvironmentPaths) -> kr_worker::action::time::TimeSources,
+    clock: Option<Arc<dyn kr_transport::clock::ContinuousClock>>,
+) -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -139,22 +149,24 @@ async fn host_with(
         .worker_endpoint(DisplayNumber::new(1))
         .expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
-    let service = Arc::new(
-        WorkerService::new(
-            Arc::clone(&runtime),
-            identity,
-            endpoint.clone(),
-            ServiceBinding {
-                environment_id,
-                boot_identity: boot.clone(),
-                controller_public_key: *controller.public_key(),
-                controller_generation: ControllerGeneration::new(1),
-                journal_path: Some(journal_path.clone()),
-                build_id: build(),
-            },
-        )
-        .expect("a worker service"),
-    );
+    let service = WorkerService::new(
+        Arc::clone(&runtime),
+        identity,
+        endpoint.clone(),
+        ServiceBinding {
+            environment_id,
+            boot_identity: boot.clone(),
+            controller_public_key: *controller.public_key(),
+            controller_generation: ControllerGeneration::new(1),
+            journal_path: Some(journal_path.clone()),
+            build_id: build(),
+        },
+    )
+    .expect("a worker service");
+    let service = Arc::new(match clock {
+        Some(clock) => service.on_clock(clock),
+        None => service,
+    });
     tokio::spawn(Arc::clone(&service).serve(listener));
     Host {
         _temp: temp,
@@ -3478,6 +3490,92 @@ fn bounded_mutation(client: &Client<impl Codec>, host: &Host) -> MutationRequest
             ParamsValue::empty(),
         )
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-09.15: a window that has run out admits nothing for the first time, however old it is
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-09.15: a window that has run out admits no request for the first time at the worker's
+/// endpoint, and neither does it when a whole retention period has passed on the host's continuous
+/// clock since: the request is refused and the worker records nothing for it, not even a rejected
+/// intent. Expiry is read on that clock, which this host's test moves by hand; a window the host
+/// issues after the expiry admits what the old one does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_expired_window_first_admits_nothing_at_the_endpoint_even_after_retention() {
+    use kr_transport::clock::ManualClock;
+
+    let clock = ManualClock::new();
+    let host = host_on(
+        |_| {},
+        |_| kr_worker::action::time::TimeSources::system(),
+        Some(Arc::new(clock.clone())),
+    )
+    .await;
+    let mut client = cli(&host).await;
+    let window = client.action_window().action_window_id.clone();
+    let recorded = || -> i64 {
+        rusqlite::Connection::open_with_flags(
+            &host.journal_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("opens the journal")
+        .query_row("SELECT COUNT(*) FROM receipts", [], |row| row.get(0))
+        .expect("counts the receipts")
+    };
+    let before = recorded();
+
+    // The window runs out, and a request under it is refused now and once a day across the whole
+    // retention period: retention keeps receipts, and a window is not a receipt.
+    let one_day = std::time::Duration::from_secs(24 * 60 * 60);
+    let retention = std::time::Duration::from_millis(DEDUPLICATION_RETENTION.get());
+    clock.advance(std::time::Duration::from_millis(
+        MAX_ACTION_WINDOW.get() + 1_000,
+    ));
+    let mut elapsed = std::time::Duration::ZERO;
+    loop {
+        let request = MutationRequest {
+            action_window_id: window.clone(),
+            ..close_mutation(
+                &client,
+                &host,
+                DEFAULT_MUTATION_TTL.get(),
+                ParamsValue::empty(),
+            )
+        };
+        let Outcome::Error(error) = send_mutation(&mut client, request).await else {
+            panic!("an expired window first-admitted a request {elapsed:?} after it ran out");
+        };
+        assert_eq!(error.code, ErrorCode::PermissionDenied);
+        if elapsed >= retention {
+            break;
+        }
+        clock.advance(one_day);
+        elapsed += one_day;
+    }
+    assert_eq!(
+        host.service.runtime().state().as_str(),
+        "live",
+        "nothing was done for a request that was never admitted"
+    );
+    assert_eq!(
+        recorded(),
+        before,
+        "an expired window first-admitted a request: the worker recorded an intent for it"
+    );
+
+    // The control: a window the host issued after the expiry admits the same request, and the
+    // worker records it.
+    let mut later = cli(&host).await;
+    let request = close_mutation(
+        &later,
+        &host,
+        DEFAULT_MUTATION_TTL.get(),
+        ParamsValue::empty(),
+    );
+    let admitted = send_mutation(&mut later, request).await;
+    assert!(matches!(admitted, Outcome::Ok(_)), "{admitted:?}");
+    assert_eq!(recorded(), before + 1);
 }
 
 // ---------------------------------------------------------------------------------------------

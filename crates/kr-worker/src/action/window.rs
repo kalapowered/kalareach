@@ -117,6 +117,8 @@ mod tests {
         ActionWindowIssuer::with_default_validity(Arc::new(clock.clone()))
     }
 
+    /// KR-REQ-09.16: the accepted deadline is the earliest of the requested lifetime from receipt, the
+    /// window's expiry and the authority's deadline, and the bound that decided it is named.
     #[test]
     fn the_accepted_deadline_is_the_earliest_of_the_three_bounds() {
         let clock = ManualClock::new();
@@ -208,6 +210,9 @@ mod tests {
         );
     }
 
+    /// KR-REQ-09.15: a window the host never issued, one that belongs to another connection, one from
+    /// another boot and one that has expired each admit nothing for the first time, and each says which
+    /// it is.
     #[test]
     fn a_window_that_admits_nothing_says_which_of_the_four_reasons_it_is() {
         let clock = ManualClock::new();
@@ -279,6 +284,8 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-09.15: an expired window is refused every day across the whole retention period, always
+    /// as expired.
     #[test]
     fn an_expired_window_cannot_first_admit_anything_however_long_it_is_retained() {
         // The window is expired and the request is replayed at intervals across the whole
@@ -301,7 +308,14 @@ mod tests {
                 DEFAULT_MUTATION_TTL,
                 None,
             );
-            assert!(matches!(refused, Err(WorkerError::WindowExpired { .. })));
+            assert!(
+                matches!(
+                    refused,
+                    Err(WorkerError::WindowExpired { ref detail })
+                        if detail == refusal_detail(WindowRefusal::Expired)
+                ),
+                "{refused:?}"
+            );
         }
     }
 
@@ -327,6 +341,8 @@ mod tests {
         );
     }
 
+    /// KR-REQ-09.16: a requested lifetime is measured from the time the request was received, not
+    /// from the time it is admitted.
     #[test]
     fn a_lifetime_is_measured_from_receipt_time_rather_than_from_the_admission() {
         // The request arrives, then waits: for a serial boundary, for a lock, for whatever else the
