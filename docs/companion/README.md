@@ -495,15 +495,22 @@ sharing your settings nevertheless, because the revoke request may have reached 
 a host lists it as paired and none reports it revoked, this device will be listed on the account
 sheet, separated from the devices that have never had your settings. You can select it by pressing
 the button “Share again” in its row. This runs the ceremony on the respective platform, with the
-reason “Share your settings with”, the device's name and “again”. If the ceremony succeeds, this
-computer will ask the hosts again and then, in one step, take back the membership's own record of
-the revoke and attempt to add the device again, just as if it were added for the first time. Again,
-this will succeed only if the device is still listed by at least one of its hosts and none of them
-lists it as revoked. A device that a host reports as revoked is not offered, and neither is one
-whose revocation request is still in a feed that no host has refused. If a view finds that a device
-is revoked, either because a host's feed contains a revocation signed by this computer or because
-the host on this computer lists it as revoked (regardless of who revoked it), the device is taken
-out as described above. Note that there is no way to stop a send of settings or drafts that is
+reason “Share your settings with”, the device's name and “again”. If the ceremony succeeds, the
+computer again asks its hosts and then makes one write: it records the addition of the device and
+takes back the membership’s record of the revoke. If the addition is refused, the computer leaves
+that record as it was. The computer adds the device only if at least one host still lists it and
+none lists it as revoked. A device that a host reports as revoked is not offered, and neither is a
+device whose revoke request may still be carried out. The computer records each request that it puts
+in a host’s feed before it sends it, whether or not the send succeeds, and keeps the record across a
+restart, until a read of that host’s feed, begun after the send ended, shows the request refused,
+acted on or not there. A feed that cannot be read, a host that is asleep and a restart let nothing
+go. Until then the computer names such a device on the account sheet with the words “A revoke is
+still waiting for its host” and offers no button for it, and the command to share with it again
+refuses it, a request sent while the person was at the dialog included. When the person forgets a
+host, the computer lets go of the requests it recorded for that host’s feed. If a view finds that a
+device is revoked, either because a host's feed contains a revocation signed by this computer or
+because the host on this computer lists it as revoked (regardless of who revoked it), the device is
+taken out as described above. Note that there is no way to stop a send of settings or drafts that is
 already on its way.
 
 The Devices screen, which appears after the Hosts screen in the desktop navigation, shows one card
