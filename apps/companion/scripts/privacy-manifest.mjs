@@ -13,10 +13,13 @@
 //
 // The application's executable links its Rust code and its Swift packages statically, so a use in a
 // package is a use of the executable. The executable's manifest declares every category any of
-// that code uses, whichever package it is in; a package's own manifest, which ships in a resource
-// bundle at the root of the application, covers that package's own use as well and is not read for
-// this. A framework and an extension are held to their own manifests, since Apple asks for one in
-// each bundle that holds such a binary.
+// that code uses, whichever package it is in. That is a project rule, stricter than anything Apple
+// documents: Apple asks each bundle that holds a binary to report that binary's uses, and says
+// Xcode combines the manifests of the application and its packages into one report, but it does not
+// say what its upload validation does with a package's resource-bundle manifest for code linked
+// into the application. A package's own manifest, which ships in a resource bundle at the root of
+// the application, is checked for validity and for being there, and is not used to excuse the
+// executable. A framework and an extension are held to their own manifests.
 //
 // What fails, each with the binary and the name that shows it:
 //
@@ -24,22 +27,33 @@
 //   - a category the application's manifest declares that its executable does not use;
 //   - a category declared with no reason, with a reason that is not Apple's for that category, or
 //     with a reason only a third-party SDK may give;
-//   - a manifest with a key or a value Apple does not define, or that says the application does
-//     not track while it links Apple's advertising or tracking frameworks, or that says a data
-//     type is used for tracking while it does not track;
-//   - a third-party SDK on Apple's list of SDKs that need a manifest, in a bundle or framework of
-//     its own, that ships none. A package linked statically into the executable and shipping no
-//     resource bundle has no name in the product to find it by; the report says so.
+//   - a manifest with a key or a value Apple does not define (the root, an accessed API dictionary,
+//     a collected data dictionary, a tracking domain with a path), that says a data type is used for
+//     tracking while it does not track, or that says the application does not track while it links
+//     Apple's advertising or tracking frameworks. The application's manifest must also say outright
+//     that it does not track, with an empty list of domains: Apple lets a manifest that does not
+//     track leave both keys out, and this project does not;
+//   - a third-party SDK on Apple's list of SDKs that need a manifest, in a resource bundle or
+//     framework of its own, that ships none or ships one that is not valid. A package that is linked
+//     statically and ships no resource bundle has no name in the product to find it by, and is not
+//     seen;
+//   - a bundle with no `Info.plist`, an executable the `Info.plist` names that is not there, a
+//     symbolic link, or a Mach-O file the check cannot read. Each is a problem of its own, and none
+//     is skipped.
+//
+// Every slice of a universal binary is read, and a use in any of them counts.
 //
 // The release product is what is held to the manifest. A debug build links more (an unstripped
 // debug executable keeps functions a release build drops, among them the Rust standard library's
 // calls that read the free space of a volume), so a debug product shows categories the application
 // does not ship.
 //
-// Every question here fails closed: a tool that is missing, a file that cannot be read and a layout
-// this does not understand are problems of their own, never a pass. What a binary names only at run
-// time (a symbol found with `dlsym`, a selector built from a string) is not in any table the check
-// reads, so it is not seen.
+// What the check cannot see: a name a binary builds or looks up at run time (a symbol found with
+// `dlsym`, a selector made from a string) is in no table it reads. Which attributes a call to
+// `getattrlist` asks for is not in the import either, so a declaration of file timestamps hides a
+// use of disk space through the same call; Apple lists the three `getattrlist` calls under both
+// categories, and a use of one is covered by either declaration. Every question that can fail
+// closed does.
 //
 // Usage:
 //   node scripts/privacy-manifest.mjs [KalaReach.app]
@@ -287,6 +301,9 @@ function run(command, args) {
 
 const MACH_O_MAGIC = [
   [0xcf, 0xfa, 0xed, 0xfe], // 64-bit, little endian
+  [0xce, 0xfa, 0xed, 0xfe], // 32-bit, little endian
+  [0xfe, 0xed, 0xfa, 0xcf], // 64-bit, big endian
+  [0xfe, 0xed, 0xfa, 0xce], // 32-bit, big endian
   [0xca, 0xfe, 0xba, 0xbe], // universal
   [0xca, 0xfe, 0xba, 0xbf] // universal, 64-bit offsets
 ]
@@ -303,11 +320,11 @@ function isMachO(path) {
   return MACH_O_MAGIC.some((magic) => magic.every((byte, at) => head[at] === byte))
 }
 
-/** The architecture to read: arm64 where the file has it, or else its first. */
-function architectureOf(path) {
+/** Every architecture a Mach-O file holds: one for a thin file, one for each slice of a universal one. */
+function architecturesOf(path) {
   const archs = run('lipo', ['-archs', path]).trim().split(/\s+/).filter(Boolean)
   if (archs.length === 0) throw new Error(`${path} names no architecture`)
-  return archs.includes('arm64') ? 'arm64' : archs[0]
+  return archs
 }
 
 /**
@@ -339,23 +356,30 @@ export function categoriesOfNames({ imports, selectors }) {
   return found
 }
 
-/** The imports and the selectors one Mach-O image names. */
+/**
+ * The imports, the selectors and the linked frameworks one Mach-O file names, in every slice it has:
+ * a use in any slice is a use of the file.
+ */
 export function namesIn(path) {
-  const arch = architectureOf(path)
-  const imports = run('nm', ['-arch', arch, '-u', path])
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line !== '' && !line.endsWith(':'))
-  const selectors = run('otool', ['-arch', arch, '-v', '-s', '__TEXT', '__objc_methname', path])
-    .split('\n')
-    .map((line) => /^[0-9a-f]+\s+(\S+)$/.exec(line.trim())?.[1])
-    .filter(Boolean)
-  const linked = run('otool', ['-arch', arch, '-L', path])
-    .split('\n')
-    .slice(1)
-    .map((line) => /([^/\s]+)\.framework\//.exec(line)?.[1])
-    .filter(Boolean)
-  return { imports, selectors, linked }
+  const imports = new Set()
+  const selectors = new Set()
+  const linked = new Set()
+  const archs = architecturesOf(path)
+  for (const arch of archs) {
+    for (const line of run('nm', ['-arch', arch, '-u', path]).split('\n')) {
+      const symbol = line.trim()
+      if (symbol !== '' && !symbol.endsWith(':')) imports.add(symbol)
+    }
+    for (const line of run('otool', ['-arch', arch, '-v', '-s', '__TEXT', '__objc_methname', path]).split('\n')) {
+      const selector = /^[0-9a-f]+\s+(\S+)$/.exec(line.trim())?.[1]
+      if (selector) selectors.add(selector)
+    }
+    for (const line of run('otool', ['-arch', arch, '-L', path]).split('\n').slice(1)) {
+      const framework = /([^/\s]+)\.framework\//.exec(line)?.[1]
+      if (framework) linked.add(framework)
+    }
+  }
+  return { imports: [...imports], selectors: [...selectors], linked: [...linked], archs }
 }
 
 // -- the manifests -------------------------------------------------------------------------------
@@ -370,6 +394,28 @@ function categoryOfKey(key) {
   if (typeof key !== 'string' || !key.startsWith(PREFIX)) return null
   const name = key.slice(PREFIX.length)
   return Object.hasOwn(CATEGORIES, name) ? name : null
+}
+
+/** A tracking domain as Apple asks for it: a domain name with its top-level domain, and nothing after it. */
+const DOMAIN = /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$/
+
+/** The keys of an accessed API dictionary, and of a collected data dictionary: exactly these. */
+const API_KEYS = ['NSPrivacyAccessedAPIType', 'NSPrivacyAccessedAPITypeReasons']
+const DATA_KEYS = [
+  'NSPrivacyCollectedDataType',
+  'NSPrivacyCollectedDataTypeLinked',
+  'NSPrivacyCollectedDataTypeTracking',
+  'NSPrivacyCollectedDataTypePurposes'
+]
+
+/** What is wrong with the keys of a dictionary that has to have exactly `keys`. */
+function strayKeys(entry, keys, what) {
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return [`${what} is not a dictionary`]
+  const problems = []
+  for (const key of Object.keys(entry)) {
+    if (!keys.includes(key)) problems.push(`${what} has the key ${key}, which Apple does not define there`)
+  }
+  return problems
 }
 
 const isStringArray = (value) => Array.isArray(value) && value.every((each) => typeof each === 'string')
@@ -405,8 +451,15 @@ export function readManifest(manifest, { own }) {
   if ('NSPrivacyTrackingDomains' in manifest) {
     if (!isStringArray(manifest.NSPrivacyTrackingDomains)) {
       problems.push('NSPrivacyTrackingDomains is not a list of domain names')
-    } else if (tracking === false && manifest.NSPrivacyTrackingDomains.length > 0) {
-      problems.push('it names tracking domains and says it does not track')
+    } else {
+      if (tracking === false && manifest.NSPrivacyTrackingDomains.length > 0) {
+        problems.push('it names tracking domains and says it does not track')
+      }
+      for (const domain of manifest.NSPrivacyTrackingDomains) {
+        if (!DOMAIN.test(domain)) {
+          problems.push(`the tracking domain ${JSON.stringify(domain)} is not a bare domain name (no path, query or trailing slash)`)
+        }
+      }
     }
   } else if (own) {
     problems.push('NSPrivacyTrackingDomains is missing (an application that does not track says so with an empty list)')
@@ -417,7 +470,13 @@ export function readManifest(manifest, { own }) {
   const apis = manifest.NSPrivacyAccessedAPITypes ?? []
   if (!Array.isArray(apis)) problems.push('NSPrivacyAccessedAPITypes is not a list')
   else {
+    if (own && apis.length === 0) {
+      problems.push('NSPrivacyAccessedAPITypes is an empty list, which the App Store refuses as invalid')
+    }
     for (const entry of apis) {
+      const stray = strayKeys(entry, API_KEYS, 'an accessed API entry')
+      problems.push(...stray)
+      if (stray.length > 0 && (entry === null || typeof entry !== 'object' || Array.isArray(entry))) continue
       const category = categoryOfKey(entry?.NSPrivacyAccessedAPIType)
       if (category === null) {
         problems.push(`it declares ${JSON.stringify(entry?.NSPrivacyAccessedAPIType)}, which is not one of Apple's categories`)
@@ -444,6 +503,9 @@ export function readManifest(manifest, { own }) {
   else {
     const seen = new Set()
     for (const entry of collected) {
+      const stray = strayKeys(entry, DATA_KEYS, 'a collected data entry')
+      problems.push(...stray)
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
       const type = entry?.NSPrivacyCollectedDataType
       if (!DATA_TYPES.includes(type)) {
         problems.push(`it collects ${JSON.stringify(type)}, which is not one of Apple's data types`)
@@ -470,25 +532,34 @@ export function readManifest(manifest, { own }) {
 
 // -- the bundle ----------------------------------------------------------------------------------
 
-/** Every Mach-O file under `root`, by path. */
-function machOFiles(root) {
-  const found = []
+/** What a walk of the application found: its Mach-O files, its bundles and what it could not follow. */
+function walkBundle(app) {
+  const machO = []
+  const bundles = [app]
+  const links = []
   const walk = (directory) => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name)
-      if (entry.isDirectory()) walk(path)
-      else if (entry.isFile() && statSync(path).size >= 4 && isMachO(path)) found.push(path)
+      if (entry.isSymbolicLink()) links.push(path)
+      else if (entry.isDirectory()) {
+        if (/\.(framework|appex)$/.test(entry.name)) bundles.push(path)
+        walk(path)
+      } else if (entry.isFile() && statSync(path).size >= 4 && isMachO(path)) machO.push(path)
     }
   }
-  walk(root)
-  return found.sort()
+  walk(app)
+  return { machO: machO.sort(), bundles: bundles.sort(), links: links.sort() }
 }
 
-/** The nearest enclosing bundle of a file inside `app`: the application, a framework or an extension. */
+/**
+ * The bundle a file belongs to: the nearest enclosing application, framework or extension. A
+ * bundle is told by its name, so one with no `Info.plist` is found and reported, not skipped for
+ * the bundle around it.
+ */
 function bundleOf(app, file) {
   let directory = dirname(file)
-  while (directory.length >= app.length) {
-    if (/\.(app|framework|appex)$/.test(directory) && existsSync(join(directory, 'Info.plist'))) return directory
+  while (directory !== app && directory !== dirname(directory)) {
+    if (/\.(framework|appex)$/.test(directory)) return directory
     directory = dirname(directory)
   }
   return app
@@ -512,24 +583,36 @@ export function sdkNamed(name) {
   return null
 }
 
-/** The SDK bundles and frameworks of an application that Apple names, and whether each ships a manifest. */
+/**
+ * The SDK bundles and frameworks of an application that Apple names, wherever they are in it
+ * (the application, an extension, a framework), and what each ships: no manifest, a manifest, or a
+ * manifest that cannot be read or is not valid.
+ */
 export function sdksIn(app) {
   const found = []
-  const look = (directory) => {
-    if (!existsSync(directory)) return
+  const walk = (directory) => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      if (!entry.isDirectory() || !/\.(bundle|framework)$/.test(entry.name)) continue
-      const name = sdkNamed(entry.name)
-      if (name === null) continue
-      found.push({
-        sdk: name,
-        container: entry.name,
-        ships: existsSync(join(directory, entry.name, 'PrivacyInfo.xcprivacy'))
-      })
+      if (!entry.isDirectory()) continue
+      const path = join(directory, entry.name)
+      const name = /\.(bundle|framework)$/.test(entry.name) ? sdkNamed(entry.name) : null
+      if (name !== null) {
+        const manifest = join(path, 'PrivacyInfo.xcprivacy')
+        const ships = existsSync(manifest)
+        let problems = []
+        if (ships) {
+          try {
+            if (!statSync(manifest).isFile()) throw new Error('it is not a file')
+            problems = readManifest(plistValue(manifest), { own: false }).problems
+          } catch (failure) {
+            problems = [failure.message.split('\n')[0]]
+          }
+        }
+        found.push({ sdk: name, container: relative(app, path), ships, problems })
+      }
+      walk(path)
     }
   }
-  look(app)
-  look(join(app, 'Frameworks'))
+  walk(app)
   return found.sort((a, b) => a.container.localeCompare(b.container))
 }
 
@@ -550,22 +633,50 @@ export function examine(app) {
     if (!existsSync(path)) answer = { present: false, declared: new Map(), tracking: null, problems: [] }
     else {
       try {
+        if (!statSync(path).isFile()) throw new Error('it is not a file')
         answer = { present: true, ...readManifest(plistValue(path), { own: bundle === app }) }
       } catch (failure) {
-        answer = { present: true, declared: new Map(), tracking: null, problems: [failure.message] }
+        answer = { present: true, declared: new Map(), tracking: null, problems: [failure.message.split('\n')[0]] }
       }
     }
     manifests.set(bundle, answer)
     return answer
   }
 
-  for (const file of machOFiles(app)) {
+  const found = walkBundle(app)
+  for (const link of found.links) {
+    problems.push(`${relative(app, link)} is a symbolic link, which this check does not follow`)
+  }
+  for (const file of found.machO) {
     const bundle = bundleOf(app, file)
-    const { imports, selectors, linked } = namesIn(file)
+    const { imports, selectors, linked, archs } = namesIn(file)
     const uses = categoriesOfNames({ imports, selectors })
-    binaries.push({ file, bundle, role: roleOf(app, bundle), uses, linked })
+    binaries.push({ file, bundle, role: roleOf(app, bundle), uses, linked, archs })
   }
   if (binaries.length === 0) problems.push(`${app} holds no Mach-O file`)
+
+  // Each bundle names its executable, and the executable has to be among the Mach-O files read:
+  // a bundle whose executable is elsewhere, or missing, has not been held to its manifest.
+  for (const bundle of found.bundles) {
+    const where = bundle === app ? 'the application' : relative(app, bundle)
+    const plist = join(bundle, 'Info.plist')
+    if (!existsSync(plist)) {
+      problems.push(`${where} has no Info.plist`)
+      continue
+    }
+    let executable
+    try {
+      executable = plistValue(plist).CFBundleExecutable
+    } catch (failure) {
+      problems.push(`the Info.plist of ${where} cannot be read: ${failure.message.split('\n')[0]}`)
+      continue
+    }
+    if (typeof executable !== 'string' || executable === '') {
+      problems.push(`the Info.plist of ${where} names no CFBundleExecutable`)
+    } else if (!binaries.some((each) => each.file === join(bundle, executable))) {
+      problems.push(`${where} names the executable ${executable} and it is not a Mach-O file in the bundle`)
+    }
+  }
 
   for (const bundle of new Set(binaries.map((each) => each.bundle))) {
     const where = bundle === app ? 'the application' : relative(app, bundle)
@@ -602,6 +713,7 @@ export function examine(app) {
   const sdks = sdksIn(app)
   for (const sdk of sdks) {
     if (!sdk.ships) problems.push(`${sdk.container} is ${sdk.sdk}, which Apple lists as needing a privacy manifest, and ships none`)
+    for (const problem of sdk.problems) problems.push(`the manifest in ${sdk.container}: ${problem}`)
   }
   return { binaries, declarations, sdks, problems }
 }
@@ -629,7 +741,8 @@ export function report(app, result) {
   for (const binary of result.binaries) {
     const name = relative(app, binary.file)
     const uses = [...binary.uses].map(([api, categories]) => `${api} (${categories.join(' or ')})`)
-    console.log(`  ${binary.role} binary ${name}: ${uses.length === 0 ? 'no required reason API' : uses.join(', ')}`)
+    const slices = binary.archs.length > 1 ? ` [${binary.archs.join(', ')}]` : ''
+    console.log(`  ${binary.role} binary ${name}${slices}: ${uses.length === 0 ? 'no required reason API' : uses.join(', ')}`)
   }
   for (const each of result.declarations) {
     const listed = [...each.declared].map(([category, reasons]) => `${category} ${reasons.join(', ')}`)

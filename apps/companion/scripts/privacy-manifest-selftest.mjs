@@ -15,7 +15,7 @@
 // never as passed, and the exit status says so. The cases about a manifest's own structure need
 // none of them.
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -212,6 +212,37 @@ for (const [what, value, fragment] of [
     'is used for tracking and the manifest says it does not track'
   ],
   [
+    'a tracking domain with a path',
+    { ...manifest(), NSPrivacyTracking: true, NSPrivacyTrackingDomains: ['https://ads.example/track'] },
+    'is not a bare domain name'
+  ],
+  [
+    'a key Apple does not define inside an accessed API entry',
+    manifest({ ...declares('FileTimestamp', 'C617.1'), NSPrivacyExtra: true }),
+    'an accessed API entry has the key NSPrivacyExtra'
+  ],
+  [
+    'a key Apple does not define inside a collected data entry',
+    {
+      ...manifest(),
+      NSPrivacyCollectedDataTypes: [
+        {
+          NSPrivacyCollectedDataType: 'NSPrivacyCollectedDataTypeDeviceID',
+          NSPrivacyCollectedDataTypeLinked: true,
+          NSPrivacyCollectedDataTypeTracking: false,
+          NSPrivacyCollectedDataTypePurposes: ['NSPrivacyCollectedDataTypePurposeAppFunctionality'],
+          NSPrivacyCollectedDataTypeNote: 'kept'
+        }
+      ]
+    },
+    'a collected data entry has the key NSPrivacyCollectedDataTypeNote'
+  ],
+  [
+    'an empty list of accessed APIs in the application\'s own manifest',
+    manifest(),
+    'NSPrivacyAccessedAPITypes is an empty list'
+  ],
+  [
     'a purpose Apple does not define',
     {
       ...manifest(),
@@ -381,17 +412,46 @@ if (toolchain) {
     int main(void) { struct attrlist a = {0}; char b[64]; return getattrlist("/", &a, b, sizeof b, 0); }
   `
 
-  /** Lays an application out as `tauri ios build` leaves one. Returns its path. */
-  function bundle(name, { app, framework, extension, root = [] }) {
+  /**
+   * Builds `source` for the Simulator on both architectures and joins them into one universal file,
+   * each slice from its own source: the first for arm64, the second for x86_64.
+   */
+  function universal(path, arm64Source, x86Source) {
+    const slices = []
+    for (const [arch, source] of [['arm64', arm64Source], ['x86_64', x86Source]]) {
+      const slice = `${path}.${arch}`
+      const src = written(`${slice}.m`, source)
+      const answer = spawnSync(
+        'xcrun',
+        ['--sdk', 'iphonesimulator', 'clang', '-target', `${arch}-apple-ios17.0-simulator`, '-framework', 'Foundation', '-o', slice, src],
+        { encoding: 'utf8' }
+      )
+      if (answer.status !== 0) throw new Error(`clang ${slice}: ${answer.stderr}`)
+      slices.push(slice)
+    }
+    const joined = spawnSync('lipo', ['-create', ...slices, '-output', path], { encoding: 'utf8' })
+    if (joined.status !== 0) throw new Error(`lipo ${path}: ${joined.stderr}`)
+  }
+
+  /**
+   * Lays an application out as `tauri ios build` leaves one. Returns its path. `app`, `framework`
+   * and `extension` are what each bundle's manifest says (`null`: none). Beside them, a fault can be
+   * laid in: `x86` is the source of a second slice of the application's executable, `link` makes a
+   * symbolic link, `frameworkInfo: false` leaves the framework no Info.plist, `executable: false`
+   * leaves the application's executable out of its bundle, and `root` lists SDK resource bundles.
+   */
+  function bundle(name, { app, framework, extension, root = [], x86, link, frameworkInfo = true, executable: hasExecutable = true }) {
     const dir = join(work, name, 'Fx.app')
     mkdirSync(dir, { recursive: true })
     plist(join(dir, 'Info.plist'), { CFBundleExecutable: 'Fx', CFBundleIdentifier: 'to.kala.fx' })
-    executable(join(dir, 'Fx'), MAIN)
+    if (!hasExecutable) executable(join(dir, 'Other'), MAIN)
+    else if (x86) universal(join(dir, 'Fx'), MAIN, x86)
+    else executable(join(dir, 'Fx'), MAIN)
     if (app) plist(join(dir, 'PrivacyInfo.xcprivacy'), app)
     if (framework !== undefined) {
       const fw = join(dir, 'Frameworks', 'Lib.framework')
       mkdirSync(fw, { recursive: true })
-      plist(join(fw, 'Info.plist'), { CFBundleExecutable: 'Lib', CFBundleIdentifier: 'to.kala.fx.lib' })
+      if (frameworkInfo) plist(join(fw, 'Info.plist'), { CFBundleExecutable: 'Lib', CFBundleIdentifier: 'to.kala.fx.lib' })
       library(join(fw, 'Lib'), LIB)
       if (framework) plist(join(fw, 'PrivacyInfo.xcprivacy'), framework)
     }
@@ -401,11 +461,18 @@ if (toolchain) {
       plist(join(ex, 'Info.plist'), { CFBundleExecutable: 'Ext', CFBundleIdentifier: 'to.kala.fx.ext' })
       executable(join(ex, 'Ext'), extension.source ?? EXT, extension.extra ?? [])
       if (extension.manifest) plist(join(ex, 'PrivacyInfo.xcprivacy'), extension.manifest)
+      for (const sdk of extension.root ?? []) {
+        mkdirSync(join(ex, sdk.name), { recursive: true })
+        if (sdk.raw !== undefined) writeFileSync(join(ex, sdk.name, 'PrivacyInfo.xcprivacy'), sdk.raw)
+        else if (sdk.manifest) plist(join(ex, sdk.name, 'PrivacyInfo.xcprivacy'), manifest())
+      }
     }
     for (const sdk of root) {
       mkdirSync(join(dir, sdk.name), { recursive: true })
-      if (sdk.manifest) plist(join(dir, sdk.name, 'PrivacyInfo.xcprivacy'), manifest())
+      if (sdk.raw !== undefined) writeFileSync(join(dir, sdk.name, 'PrivacyInfo.xcprivacy'), sdk.raw)
+      else if (sdk.manifest) plist(join(dir, sdk.name, 'PrivacyInfo.xcprivacy'), manifest())
     }
+    if (link) symlinkSync(join(dir, 'Fx'), join(dir, 'Alias'))
     return dir
   }
   const whole = manifest(
@@ -515,6 +582,51 @@ if (toolchain) {
       })
     ).problems,
     []
+  )
+  heldProblems(
+    'a use in the second slice of a universal executable is found',
+    examine(bundle('second-slice', { app: whole, framework: library_manifest, x86: `#include <sys/mount.h>\n#import <Foundation/Foundation.h>\n#include <sys/stat.h>\nint main(void) { struct statfs s; struct stat t; stat("/", &t); (void)[[NSProcessInfo processInfo] systemUptime]; (void)[NSUserDefaults standardUserDefaults]; return statfs("/", &s); }` })).problems,
+    ['Fx uses DiskSpace (statfs) and the manifest of the application does not declare it']
+  )
+  heldProblems(
+    'a symbolic link in the bundle is a problem, not skipped',
+    examine(bundle('link', { app: whole, framework: library_manifest, link: true })).problems,
+    ['Alias is a symbolic link']
+  )
+  heldProblems(
+    'a framework with no Info.plist is a problem, and does not inherit the application\'s manifest',
+    examine(bundle('no-info', { app: whole, framework: null, frameworkInfo: false })).problems,
+    [
+      'Frameworks/Lib.framework has no Info.plist',
+      'Lib uses DiskSpace (statfs) and the manifest of Frameworks/Lib.framework is missing'
+    ]
+  )
+  heldProblems(
+    'an application whose executable the Info.plist names is not there fails',
+    examine(bundle('no-executable', { app: whole, framework: library_manifest, executable: false })).problems,
+    ['the application names the executable Fx and it is not a Mach-O file in the bundle']
+  )
+  heldProblems(
+    'a package\'s manifest that is not a valid property list fails',
+    examine(
+      bundle('sdk-garbled', {
+        app: whole,
+        framework: library_manifest,
+        root: [{ name: 'Firebase_FirebaseCore.bundle', raw: 'this is not a property list' }]
+      })
+    ).problems,
+    ['the manifest in Firebase_FirebaseCore.bundle']
+  )
+  heldProblems(
+    'a package inside an extension that ships no manifest fails',
+    examine(
+      bundle('sdk-in-extension', {
+        app: whole,
+        framework: library_manifest,
+        extension: { root: [{ name: 'nanopb_nanopb.bundle', manifest: false }] }
+      })
+    ).problems,
+    ['PlugIns/Ext.appex/nanopb_nanopb.bundle is nanopb']
   )
 }
 

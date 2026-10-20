@@ -28,16 +28,35 @@ mkdir -p "${artefacts:?}"
 
 say() { printf '== [privacy-manifest] %s\n' "$*"; }
 
-# The build rewrites the version in a tracked property list. Put it back when it was clean.
+# The build rewrites the version in a tracked property list, and this run writes the git-ignored
+# Local.xcconfig, where a developer may keep a real Firebase configuration or signing choices. Both
+# are put back when the script ends, however it ends. A copy of the developer's file is kept in a
+# directory of its own, and the file is not touched unless the copy succeeded.
 version_list="apps/companion/src-tauri/gen/apple/companion-tauri_iOS/Info.plist"
+local_config="$apple/Local.xcconfig"
 was_clean=0
 git -C "$here" diff --quiet -- "$version_list" 2>/dev/null && was_clean=1
+backup="$(mktemp -d)" || { say "no temporary directory to keep the configuration in"; exit 2; }
+had_local=0
 wrote_local=0
-kept="$artefacts/Local.xcconfig.kept"
+# shellcheck disable=SC2329  # runs from the EXIT trap below
 restore() {
-    [ "$was_clean" = 1 ] && git -C "$here" checkout -- "$version_list" 2>/dev/null
-    [ "$wrote_local" = 1 ] || return 0
-    if [ -f "$kept" ]; then cp "$kept" "$apple/Local.xcconfig"; else rm -f "${apple:?}/Local.xcconfig"; fi
+    local failed=0
+    if [ "$was_clean" = 1 ]; then
+        git -C "$here" checkout -- "$version_list" 2>/dev/null || failed=1
+    fi
+    if [ "$wrote_local" = 1 ]; then
+        if [ "$had_local" = 1 ]; then
+            cp -p "$backup/Local.xcconfig" "$local_config" || failed=1
+        else
+            rm -f "${local_config:?}" || failed=1
+        fi
+    fi
+    if [ "$failed" = 1 ]; then
+        say "could not put everything back; the developer's Local.xcconfig, if there was one, is in $backup" >&2
+    else
+        rm -rf "${backup:?}"
+    fi
 }
 trap restore EXIT
 
@@ -57,13 +76,14 @@ PLIST
 
 say "building the release application for the simulator"
 rm -rf "${apple:?}/build"
-# The build reads the configuration's path from Local.xcconfig, which a developer may keep for a real
-# Firebase configuration or signing choices. This run writes its own and puts the developer's back.
-local_config="$apple/Local.xcconfig"
-rm -f "${kept:?}"
-[ ! -f "$local_config" ] || cp "$local_config" "$kept"
+# The build reads the configuration's path from Local.xcconfig.
+if [ -f "$local_config" ]; then
+    cp -p "$local_config" "$backup/Local.xcconfig" || { say "could not keep $local_config; nothing was changed"; exit 2; }
+    had_local=1
+fi
 wrote_local=1
-printf 'KR_GOOGLE_SERVICE_INFO = %s\n' "$artefacts/GoogleService-Info.plist" >"$local_config"
+printf 'KR_GOOGLE_SERVICE_INFO = %s\n' "$artefacts/GoogleService-Info.plist" >"$local_config" \
+    || { say "could not write $local_config"; exit 2; }
 ( cd "$companion" && pnpm tauri ios build --ci --target aarch64-sim ) >"$artefacts/build.log" 2>&1 \
     || { say "the build failed; see $artefacts/build.log"; exit 2; }
 app="$apple/build/arm64-sim/KalaReach.app"
