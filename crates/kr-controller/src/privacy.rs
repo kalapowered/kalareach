@@ -196,7 +196,7 @@ impl PrivacyState {
     }
 
     /// Returns where privacy mode stands as a report tells it: the state the last change
-    /// published, and whether a change is queued or was stopped part way.
+    /// published, and whether a change is queued or a panic stopped one part way.
     ///
     /// It never waits: a change holds the write side of the lock across the delivery exchanges it
     /// waits for, and a report that read the lock would wait as long. So it is for reports only,
@@ -323,8 +323,8 @@ impl Change<'_> {
     ///
     /// The copy a report reads takes the new state and loses this change's count in one step,
     /// before the lock does, so a report never says the new state together with this change still
-    /// under way. A change that stopped part way earlier keeps its own count, and a report says
-    /// that until the daemon starts again.
+    /// under way. A change that a panic stopped part way earlier keeps its own count, and a report
+    /// says that until the daemon starts again.
     fn publish(mut self, published: Published) {
         self.queued.settle(published);
         *self.held = published;

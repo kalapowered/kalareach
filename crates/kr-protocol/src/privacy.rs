@@ -51,7 +51,7 @@ pub struct PrivacyReport {
     pub disabled: Vec<PrivacyDisabled>,
     /// What this host keeps while privacy mode is on, and why.
     pub kept: Vec<PrivacyKept>,
-    /// What had already left this host before privacy mode was turned on.
+    /// What has left this host.
     pub exported: Vec<PrivacyExported>,
     /// Each subsystem that could not list what had left, and its reason. The list above is then
     /// incomplete, and says so here rather than by being empty.
@@ -158,7 +158,7 @@ pub struct PrivacyKept {
     pub why: String,
 }
 
-/// A copy that had already left this host before privacy mode was turned on.
+/// A copy that has left this host.
 ///
 /// It is not erased, and this host does not claim it could be: it is shown, and deleting it is an
 /// action of its own.

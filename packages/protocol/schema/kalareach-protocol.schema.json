@@ -18488,7 +18488,7 @@
       "description": "Where a host's privacy mode stands, as every paired device may read it.\n\nThis is the generation in force and whether privacy mode is on at it: what a device needs to\nkeep what it holds for this host off a service while the host is private, and nothing the\nreport `privacy.status` makes (when it changed, what is still owed, what is kept and what had\nalready left), which only a device that manages the host reads.\n\nRead-only metadata like `EnvironmentSummary`: a member added later is explicitly optional, a\nreader whose schema predates it ignores it rather than refusing the answer, and it never\nchanges what the members here mean. An extension may extend it.",
       "properties": {
         "changing": {
-          "description": "Whether the host is changing privacy mode now: a change to on is waiting for the deliveries\nin flight, or is recording its state and raising the backup fence, and has not published; a\nchange to off has recorded its state and is about to publish it; or one stopped part way and\nthe host has not restarted since. The other two\nmembers are then the last state the host published, which a reader does not rely on: it\ntreats the host as private until a later answer says otherwise.",
+          "description": "Whether the host says it is changing privacy mode: a change to on is waiting for the\ndelivery exchanges the host has already admitted to end, or is recording its state and\nraising the backup fence, and has not published; a change to off has recorded its state and\nis about to publish it; or a panic stopped a change part way and the daemon has not started\nagain since. The other two members are then the last state the host published, which a\nreader does not rely on: it treats the host as private until a later answer says otherwise.",
           "type": "boolean"
         },
         "enabled": {
@@ -21815,7 +21815,7 @@
         },
         {
           "const": "privacy.set",
-          "description": "Turn privacy mode on or off for this environment, at the host itself: a paired device reads where it stands and changes nothing about the host. The change is recorded, and the generation advanced, before any subsystem is touched; the answer says where it stands.",
+          "description": "Turn privacy mode on or off for this environment, at the host itself: a paired device reads where it stands with `privacy.status` and cannot turn it on or off. The change is recorded, and the generation advanced, before any subsystem is touched; the answer says where it stands.",
           "type": "string"
         },
         {
@@ -27854,7 +27854,7 @@
     },
     "PrivacyExported": {
       "additionalProperties": false,
-      "description": "A copy that had already left this host before privacy mode was turned on.\n\nIt is not erased, and this host does not claim it could be: it is shown, and deleting it is an\naction of its own.",
+      "description": "A copy that has left this host.\n\nIt is not erased, and this host does not claim it could be: it is shown, and deleting it is an\naction of its own.",
       "properties": {
         "deletable": {
           "description": "Whether this host holds a reference it can ask for the copy's removal through. It says\nthere is a way to ask, not that asking will succeed or that no other copy exists.",
@@ -28015,7 +28015,7 @@
           "type": "boolean"
         },
         "exported": {
-          "description": "What had already left this host before privacy mode was turned on.",
+          "description": "What has left this host.",
           "items": {
             "$ref": "#/$defs/PrivacyExported"
           },

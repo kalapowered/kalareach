@@ -371,8 +371,8 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
     // method that does. This build adds a write and a read, both in the host-and-environment group:
     // the switch changes what this host retains, so it asks for host management, and so does the
     // read, which lists what the environment kept and what had already left it. The switch is
-    // served on the local socket only, since a paired device changes nothing about the host; the
-    // read is served to a paired device too, whose grant must carry host management.
+    // served on the local socket only, since a paired device cannot turn privacy mode on or off;
+    // the read is served to a paired device too, whose grant must carry host management.
     let privacy: [(&str, EffectClass, &[ActorIngress]); 2] = [
         ("privacy.set", EffectClass::Write, &[ActorIngress::LocalIpc]),
         (

@@ -17706,12 +17706,12 @@ export interface SleepInhibitionState1 {
  */
 export interface HostPrivacyState {
   /**
-   * Whether the host is changing privacy mode now: a change to on is waiting for the deliveries
-   * in flight, or is recording its state and raising the backup fence, and has not published; a
-   * change to off has recorded its state and is about to publish it; or one stopped part way and
-   * the host has not restarted since. The other two
-   * members are then the last state the host published, which a reader does not rely on: it
-   * treats the host as private until a later answer says otherwise.
+   * Whether the host says it is changing privacy mode: a change to on is waiting for the
+   * delivery exchanges the host has already admitted to end, or is recording its state and
+   * raising the backup fence, and has not published; a change to off has recorded its state and
+   * is about to publish it; or a panic stopped a change part way and the daemon has not started
+   * again since. The other two members are then the last state the host published, which a
+   * reader does not rely on: it treats the host as private until a later answer says otherwise.
    */
   changing: boolean
   /**
@@ -21868,7 +21868,7 @@ export interface PreparedEffect {
   operation: 'upstream_submit' | 'upstream_cancel' | 'upstream_attachment' | 'terminal_text'
 }
 /**
- * A copy that had already left this host before privacy mode was turned on.
+ * A copy that has left this host.
  *
  * It is not erased, and this host does not claim it could be: it is shown, and deleting it is an
  * action of its own.
@@ -21948,7 +21948,7 @@ export interface PrivacyReport {
    */
   enabled: boolean
   /**
-   * What had already left this host before privacy mode was turned on.
+   * What has left this host.
    */
   exported: PrivacyExported[]
   /**

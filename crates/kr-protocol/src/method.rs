@@ -455,9 +455,9 @@ methods! {
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: ACTION,
     doc: "Turn privacy mode on or off for this environment, at the host itself: a paired device \
-          reads where it stands and changes nothing about the host. The change is recorded, and \
-          the generation advanced, before any subsystem is touched; the answer says where it \
-          stands.";
+          reads where it stands with `privacy.status` and cannot turn it on or off. The change is \
+          recorded, and the generation advanced, before any subsystem is touched; the answer says \
+          where it stands.";
 
     PrivacyStatus = "privacy.status", HostAndEnvironment,
     effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)],

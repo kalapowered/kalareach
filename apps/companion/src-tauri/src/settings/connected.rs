@@ -154,8 +154,8 @@ pub(crate) enum Choice {
 /// others stays closed: a host that is changing, one that did not answer, and one that tells
 /// nothing to a device that cannot ask.
 ///
-/// Goes once no retained level is below 0.77: every host then sends the member, and the branch
-/// for an answer without it, with the request it leads to, is removed.
+/// Goes once no retained level is below 0.77: every host then sends the `privacy` member, and the
+/// branch for an answer without it, with the request it leads to, is removed.
 pub(crate) fn choose(told: Result<HostInfoResult, String>, manages: bool) -> Choice {
     match told {
         Err(reason) => Choice::Unreadable(reason),
