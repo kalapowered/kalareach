@@ -31,7 +31,7 @@ use kr_pairing::host::{
     HostIdentity, HostInvitation, InvitationProposal, LockedCandidate, StatusViewer,
     recover_candidate_status,
 };
-use kr_pairing::platform::{InvitationState, LivePeer, PairingClock};
+use kr_pairing::platform::{InvitationState, LivePeer, PairingClock, RendezvousHost};
 use kr_protocol::confirmation::{
     ConfirmationDisplay, ConfirmationSubject, HostClockEstablishResult,
     OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
@@ -65,7 +65,7 @@ use super::invitations::{
     WriteAdmission, another_subject,
 };
 use super::owner::{Caller, OwnerAuthority, Resolved, refusal};
-use super::rendezvous::{Rendezvous, RoomOffer, RoomTicket, serve_room};
+use super::rendezvous::{Life, OwnerPath, Rendezvous, RoomOffer, RoomTicket, serve_room};
 use crate::error::{ControllerError, Result};
 
 /// The clock every pairing deadline on this host is measured on.
@@ -538,6 +538,9 @@ impl PairingHost {
     /// invitation is open, and after a restart is told what became of it; nothing new is issued
     /// for it. The same action with other parameters is `ID_CONFLICT`.
     ///
+    /// `life` is what the mutation has left. The rendezvous requests this makes, a reservation sent
+    /// again included, are bound by it, so none is sent for a mutation that has run out.
+    ///
     /// # Errors
     ///
     /// Returns the refusal: no answered confirmation for exactly this grant, a proposal its kind
@@ -549,6 +552,7 @@ impl PairingHost {
         action: (ActionId, Digest256),
         network_config: NetworkConfig,
         admission: &Admission,
+        life: &Life,
     ) -> Result<PairInviteResult> {
         if caller.device.is_some() {
             return Err(ControllerError::PermissionDenied {
@@ -692,7 +696,7 @@ impl PairingHost {
                     HostInvitation::issue(
                         rows,
                         self.clock.clone(),
-                        &*service,
+                        &OwnerPath::new(&*service, life),
                         InvitationProposal {
                             origin: origin.clone(),
                             host: identity,
@@ -758,7 +762,7 @@ impl PairingHost {
         });
         drop(open);
         if let Some(room) = ended_room {
-            self.release_room(&room);
+            self.release_room(&room, life);
         }
         Ok(answer)
     }
@@ -781,6 +785,7 @@ impl PairingHost {
         action: (ActionId, Digest256),
         authority_revision: AuthorityRevision,
         admission: &Admission,
+        life: &Life,
     ) -> Result<PairConfirmResult> {
         let recorded = PairingAction {
             actor: caller.actor_id.clone(),
@@ -904,7 +909,7 @@ impl PairingHost {
         *open = None;
         drop(open);
         if let Some(room) = room {
-            self.release_room(&room);
+            self.release_room(&room, life);
         }
         Ok(PairConfirmResult {
             device_id: commitment.device_id,
@@ -929,6 +934,7 @@ impl PairingHost {
         params: &PairCancelParams,
         action: (ActionId, Digest256),
         admission: &Admission,
+        life: &Life,
     ) -> Result<PairStatusResult> {
         let recorded = PairingAction {
             actor: caller.actor_id.clone(),
@@ -992,7 +998,7 @@ impl PairingHost {
         drop(open);
         // The room has nothing left to relay whatever the answer, so its locator goes either way.
         if let Some(room) = room {
-            self.release_room(&room);
+            self.release_room(&room, life);
         }
         kept?;
         answer
@@ -1570,9 +1576,15 @@ impl PairingHost {
     ///
     /// Best effort: a release that does not reach the service leaves a record that expires by
     /// itself within the invitation's five minutes, and an invitation that ended answers nobody.
-    fn release_room(&self, room: &RoomTicket) {
+    /// The owner whose request ended the invitation waits for this, so it is made once and within
+    /// what the request's mutation has left ([`OwnerPath`]); it is not sent again.
+    fn release_room(&self, room: &RoomTicket, life: &Life) {
         if let Some(service) = &self.rendezvous {
-            let _ = service.release_locator(&room.origin, &room.locator, &room.control_token);
+            let _ = OwnerPath::new(&**service, life).release_locator(
+                &room.origin,
+                &room.locator,
+                &room.control_token,
+            );
         }
     }
 

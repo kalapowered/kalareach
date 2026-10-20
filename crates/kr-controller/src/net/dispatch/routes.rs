@@ -1515,9 +1515,10 @@ impl RemoteConnection {
                     Some(validated),
                     Some(accepted.deadline),
                 );
+                let life = self.controller.pairing_life(Some(accepted.deadline));
                 match self
                     .controller
-                    .pairing_write(caller, entry.method, mutation, admission, guard)
+                    .pairing_write(caller, entry.method, mutation, admission, guard, life)
                     .await
                 {
                     Ok(value) => ControlFrame::Response(Response {

@@ -33,6 +33,7 @@ pub use super::devices::CommitFn;
 pub use super::invitations::Admission;
 use super::owner::Caller;
 use super::pairing::PairingHost;
+use super::rendezvous::Life;
 use crate::authority::AdmittedMutation;
 use crate::error::{ControllerError, Result};
 use crate::service::Controller;
@@ -89,6 +90,19 @@ impl Controller {
             deadline: Some(deadline),
         };
         Arc::new(move || controller.check_registration(&carried))
+    }
+
+    /// Returns how much of its time one mutation has left: what its accepted deadline leaves on the
+    /// continuous clock, read each time it is asked.
+    ///
+    /// A mutation that carries no freshness has none left, so nothing is sent again for it.
+    pub(crate) fn pairing_life(self: &Arc<Self>, deadline: Option<ContinuousInstant>) -> Life {
+        let controller = Arc::clone(self);
+        Arc::new(move || {
+            deadline.map_or(std::time::Duration::ZERO, |deadline| {
+                deadline.saturating_duration_since(controller.continuous_now())
+            })
+        })
     }
 
     /// Returns the guard of one mutation's commit: its registration under the revision it was
@@ -228,6 +242,7 @@ impl Controller {
         mutation: &MutationRequest,
         admission: Admission,
         guard: CommitGuard,
+        life: Life,
     ) -> Result<ParamsValue> {
         let action = (mutation.action_id, mutation_digest(mutation, &caller)?);
         match method {
@@ -405,7 +420,7 @@ impl Controller {
                     // what this host can answer for.
                     pairing.require_owner(&caller)?;
                     controller.check_organisation_proposal(&params.proposed_grant)?;
-                    pairing.invite(&caller, &params, action, network_config, &admission)
+                    pairing.invite(&caller, &params, action, network_config, &admission, &life)
                 })
                 .await
             }
@@ -415,7 +430,7 @@ impl Controller {
                 // The grant is issued at the authority revision in force when it is written.
                 let revision = self.authority_revision().await?;
                 let confirmed = blocking(move || {
-                    pairing.confirm(&caller, &params, action, revision, &admission)
+                    pairing.confirm(&caller, &params, action, revision, &admission, &life)
                 })
                 .await?;
                 // A device that now manages this host is a key the feed may be told can remove it.
@@ -427,7 +442,7 @@ impl Controller {
             Method::PairCancel => {
                 let pairing = self.pairing_service()?;
                 let params: PairCancelParams = decode(&mutation.params)?;
-                blocking(move || pairing.cancel(&caller, &params, action, &admission)).await
+                blocking(move || pairing.cancel(&caller, &params, action, &admission, &life)).await
             }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation the pairing service serves",

@@ -78,6 +78,9 @@ struct Rooms {
     records: BTreeMap<String, Record>,
     released: Vec<String>,
     release_requests: Vec<String>,
+    /// The time each reservation and each release was allowed to take in all, in order.
+    reserve_bounds: Vec<Duration>,
+    release_bounds: Vec<Duration>,
     unreachable: bool,
     /// How many frames the room has taken from a host and held back since it last began to.
     withheld: usize,
@@ -138,6 +141,18 @@ impl TestRoom {
     #[must_use]
     pub fn release_requests(&self) -> Vec<String> {
         self.rooms().release_requests.clone()
+    }
+
+    /// Returns the time each reservation was allowed to take in all, in order.
+    #[must_use]
+    pub fn reserve_bounds(&self) -> Vec<Duration> {
+        self.rooms().reserve_bounds.clone()
+    }
+
+    /// Returns the time each release was allowed to take in all, in order.
+    #[must_use]
+    pub fn release_bounds(&self) -> Vec<Duration> {
+        self.rooms().release_bounds.clone()
     }
 
     /// Waits until the host that reserved `locator` has attached to its room for the first time.
@@ -589,6 +604,36 @@ impl kr_client::pairing::candidate::CandidateRoom for TestRoom {
 }
 
 impl Rendezvous for TestRoom {
+    fn reserve_within(
+        &self,
+        origin: &RendezvousOrigin,
+        locator: &Locator,
+        invitation_id: InvitationId,
+        advertised_expires_at_ms: TimestampMs,
+        control_token_hash: Digest256,
+        within: Duration,
+    ) -> kr_pairing::Result<bool> {
+        self.rooms().reserve_bounds.push(within);
+        self.reserve_locator(
+            origin,
+            locator,
+            invitation_id,
+            advertised_expires_at_ms,
+            control_token_hash,
+        )
+    }
+
+    fn release_within(
+        &self,
+        origin: &RendezvousOrigin,
+        locator: &Locator,
+        control_token: &SymmetricKey,
+        within: Duration,
+    ) -> kr_pairing::Result<()> {
+        self.rooms().release_bounds.push(within);
+        self.release_locator(origin, locator, control_token)
+    }
+
     fn attach(
         &self,
         _origin: &RendezvousOrigin,

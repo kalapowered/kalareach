@@ -34,19 +34,39 @@ use kr_protocol::ids::{AttemptId, InvitationId};
 use kr_protocol::invitation::RendezvousMessage;
 use kr_protocol::pairing::{Locator, RendezvousOrigin};
 use kr_protocol::rendezvous::{ClientFrame, CloseReason, ServiceFrame, decode_message};
+use kr_protocol::scalars::{Digest256, TimestampMs};
 use kr_transport::listener::BoxFuture;
 use tokio::sync::watch;
 
 use super::pairing::PairingHost;
+use super::rendezvous_https::RETRY_BUDGET;
 
 /// How long the host waits before attaching to its room again after the socket ended.
 pub const REATTACH_DELAY: Duration = Duration::from_secs(1);
+
+/// How long a release made while an owner waits for the answer to a request may take.
+///
+/// It is one exchange at the longest an exchange may take, so the release is made once and never
+/// sent again: it is best effort, the invitation it releases has already ended, and the owner's
+/// answer does not wait for resends. A room it does not reach expires by itself at the end its
+/// reservation advertised.
+pub const OWNER_RELEASE: Duration = Duration::from_secs(10);
+
+/// How much of its time the mutation a call is made for has left, read when the call begins.
+///
+/// A call that sends a request again reads it before each one it makes, so the requests of one
+/// mutation spend one life between them.
+pub type Life = Arc<dyn Fn() -> Duration + Send + Sync>;
 
 /// A rendezvous service, as a host reaches it.
 ///
 /// The control requests are kr-pairing's [`RendezvousHost`]: a reservation and a release, which
 /// the invitation's own state machine makes. Attaching to the room is the host's, because it is a
 /// socket the host keeps open for as long as the invitation is on offer.
+///
+/// The control requests are also made with a bound: the time the whole call may take, any request
+/// sent again included. A call made for a mutation is bound by what the mutation has left, and the
+/// relay's own release, which nobody waits for, by the service's retry budget.
 pub trait Rendezvous: RendezvousHost + Send + Sync {
     /// Opens the host's socket in the room of `locator` at `origin`, proving possession of the
     /// reservation's control token.
@@ -56,6 +76,86 @@ pub trait Rendezvous: RendezvousHost + Send + Sync {
         locator: &Locator,
         control_token: &SymmetricKey,
     ) -> BoxFuture<'static, kr_pairing::Result<RoomSocket>>;
+
+    /// As [`RendezvousHost::reserve_locator`], taking no longer than `within` in all.
+    ///
+    /// # Errors
+    ///
+    /// As [`RendezvousHost::reserve_locator`].
+    fn reserve_within(
+        &self,
+        origin: &RendezvousOrigin,
+        locator: &Locator,
+        invitation_id: InvitationId,
+        advertised_expires_at_ms: TimestampMs,
+        control_token_hash: Digest256,
+        within: Duration,
+    ) -> kr_pairing::Result<bool>;
+
+    /// As [`RendezvousHost::release_locator`], taking no longer than `within` in all.
+    ///
+    /// # Errors
+    ///
+    /// As [`RendezvousHost::release_locator`].
+    fn release_within(
+        &self,
+        origin: &RendezvousOrigin,
+        locator: &Locator,
+        control_token: &SymmetricKey,
+        within: Duration,
+    ) -> kr_pairing::Result<()>;
+}
+
+/// The service as an owner's request reaches it: each call bound by what the request's mutation
+/// has left, and a release made once.
+///
+/// It is the host a request hands to the invitation's state machine, which makes up to four
+/// reservations for one issue; each reads the mutation's life again, so together they spend one.
+pub struct OwnerPath<'a> {
+    service: &'a dyn Rendezvous,
+    life: &'a Life,
+}
+
+impl<'a> OwnerPath<'a> {
+    /// The service as the request whose mutation has `life` left reaches it.
+    #[must_use]
+    pub fn new(service: &'a dyn Rendezvous, life: &'a Life) -> Self {
+        Self { service, life }
+    }
+}
+
+impl RendezvousHost for OwnerPath<'_> {
+    fn reserve_locator(
+        &self,
+        origin: &RendezvousOrigin,
+        locator: &Locator,
+        invitation_id: InvitationId,
+        advertised_expires_at_ms: TimestampMs,
+        control_token_hash: Digest256,
+    ) -> kr_pairing::Result<bool> {
+        self.service.reserve_within(
+            origin,
+            locator,
+            invitation_id,
+            advertised_expires_at_ms,
+            control_token_hash,
+            (self.life)(),
+        )
+    }
+
+    fn release_locator(
+        &self,
+        origin: &RendezvousOrigin,
+        locator: &Locator,
+        control_token: &SymmetricKey,
+    ) -> kr_pairing::Result<()> {
+        self.service.release_within(
+            origin,
+            locator,
+            control_token,
+            (self.life)().min(OWNER_RELEASE),
+        )
+    }
 }
 
 /// What the room relay asks of the pairing service, one invitation at a time.
@@ -444,7 +544,13 @@ async fn release(service: &Arc<dyn Rendezvous>, ticket: &RoomTicket) {
     let service = Arc::clone(service);
     let ticket = ticket.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        service.release_locator(&ticket.origin, &ticket.locator, &ticket.control_token)
+        // Nobody waits for this release, so a refusal that names a wait is waited for.
+        service.release_within(
+            &ticket.origin,
+            &ticket.locator,
+            &ticket.control_token,
+            RETRY_BUDGET,
+        )
     })
     .await;
 }
@@ -676,6 +782,8 @@ mod tests {
     struct TestService {
         capacity: usize,
         released: std::sync::Mutex<Vec<Instant>>,
+        /// The time each release was allowed to take in all.
+        release_bounds: std::sync::Mutex<Vec<Duration>>,
         attached: std::sync::Mutex<Vec<Instant>>,
         rooms: std::sync::Mutex<Vec<(mpsc::Sender<ServiceFrame>, mpsc::Receiver<ClientFrame>)>>,
         /// Whether the room answers an attach: while `false`, every attach waits.
@@ -698,6 +806,7 @@ mod tests {
             Arc::new(Self {
                 capacity,
                 released: std::sync::Mutex::new(Vec::new()),
+                release_bounds: std::sync::Mutex::new(Vec::new()),
                 attached: std::sync::Mutex::new(Vec::new()),
                 rooms: std::sync::Mutex::new(Vec::new()),
                 answering: watch::Sender::new(answering),
@@ -711,6 +820,11 @@ mod tests {
 
         fn released(&self) -> usize {
             self.released.lock().expect("the releases").len()
+        }
+
+        /// The time each release was allowed to take in all.
+        fn release_bounds(&self) -> Vec<Duration> {
+            self.release_bounds.lock().expect("the bounds").clone()
         }
 
         /// When the locator was first released.
@@ -803,6 +917,35 @@ mod tests {
     }
 
     impl Rendezvous for TestService {
+        fn reserve_within(
+            &self,
+            origin: &RendezvousOrigin,
+            locator: &Locator,
+            invitation_id: InvitationId,
+            advertised_expires_at_ms: kr_protocol::scalars::TimestampMs,
+            control_token_hash: kr_protocol::scalars::Digest256,
+            _within: Duration,
+        ) -> kr_pairing::Result<bool> {
+            self.reserve_locator(
+                origin,
+                locator,
+                invitation_id,
+                advertised_expires_at_ms,
+                control_token_hash,
+            )
+        }
+
+        fn release_within(
+            &self,
+            origin: &RendezvousOrigin,
+            locator: &Locator,
+            control_token: &SymmetricKey,
+            within: Duration,
+        ) -> kr_pairing::Result<()> {
+            self.release_bounds.lock().expect("the bounds").push(within);
+            self.release_locator(origin, locator, control_token)
+        }
+
         fn attach(
             &self,
             _origin: &RendezvousOrigin,
@@ -923,6 +1066,9 @@ mod tests {
         host.end();
         finished(relay).await;
         assert_eq!(service.released(), 1);
+        // Nobody waits for the relay's release, so it may be sent again for as long as the
+        // service's retry budget.
+        assert_eq!(service.release_bounds(), [RETRY_BUDGET]);
         let late = service.released_at().duration_since(ended);
         assert!(
             late <= EXPIRY_RECHECK + SLACK,

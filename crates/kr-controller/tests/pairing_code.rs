@@ -10,6 +10,7 @@ mod net_support;
 
 use std::sync::Arc;
 
+use kr_controller::service::net::rendezvous::OWNER_RELEASE;
 use kr_crypto::keys::DeviceKeys;
 use kr_ipc::client::LocalClient;
 use kr_protocol::confirmation::ConfirmationSubject;
@@ -558,6 +559,17 @@ async fn a_withdrawn_code_invitation_releases_its_locator() {
     // The withdrawal took the release, and the relay leaves it to the withdrawal.
     until_relay_ended(&host, idle).await;
     assert_eq!(host.room.release_requests(), vec![code[..4].to_owned()]);
+    // The owner's requests reached the service bound by what their mutations had left: the
+    // reservation by the lifetime the invitation request was given, and the release the owner
+    // waited for by the one attempt it makes.
+    let lifetime =
+        std::time::Duration::from_millis(kr_protocol::limits::DEFAULT_MUTATION_TTL.get());
+    let reserved = host.room.reserve_bounds();
+    assert!(
+        matches!(reserved[..], [bound] if !bound.is_zero() && bound <= lifetime),
+        "{reserved:?}"
+    );
+    assert_eq!(host.room.release_bounds(), [OWNER_RELEASE]);
     host.stop().await;
 }
 

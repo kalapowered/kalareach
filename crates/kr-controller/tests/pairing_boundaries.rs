@@ -13,6 +13,7 @@ use kr_controller::error::ControllerError;
 use kr_controller::service::net::invitations::Admission;
 use kr_controller::service::net::owner::Caller;
 use kr_controller::service::net::pairing::AUTHENTICATION_FAILED;
+use kr_controller::service::net::rendezvous::Life;
 use kr_crypto::keys::DeviceKeys;
 use kr_pairing::direct::redeem_proof;
 use kr_protocol::confirmation::{
@@ -37,6 +38,11 @@ use kr_protocol::sharing::{DeviceRevokeParams, RevocationResult};
 use kr_transport::handshake;
 use net_support::pairing::{self as calls, HostPeer, Signer, direct_payload, host_addr};
 use net_support::{Device, Host, connect, pair_with, proposal};
+
+/// A mutation with a whole default lifetime left.
+fn life() -> Life {
+    Arc::new(|| std::time::Duration::from_secs(120))
+}
 
 fn keys() -> DeviceKeys {
     DeviceKeys::generate().expect("keys")
@@ -270,6 +276,7 @@ async fn a_mutation_whose_admission_lapses_while_it_waits_changes_nothing() {
         ),
         host.network().network_config().expect("a configuration"),
         &lapsed,
+        &life(),
     );
     assert!(
         matches!(refused, Err(ControllerError::WindowExpired { .. })),
@@ -334,6 +341,7 @@ async fn an_admission_that_lapses_inside_the_write_writes_nothing() {
         (action, Digest256::from_bytes([2; 32])),
         host.network().network_config().expect("a configuration"),
         &lapsing,
+        &life(),
     );
     assert!(
         matches!(refused, Err(ControllerError::WindowExpired { .. })),
@@ -879,6 +887,7 @@ async fn an_issue_whose_identifier_is_spent_meanwhile_spends_no_confirmation() {
         (action, Digest256::from_bytes([1; 32])),
         host.network().network_config().expect("a configuration"),
         &racing_request(pairing, &caller, action),
+        &life(),
     );
     assert!(is_id_conflict(&refused), "{refused:?}");
     let pending = calls::pending(&mut client).await.expect("readable");
@@ -932,6 +941,7 @@ async fn a_confirmation_whose_identifier_is_spent_meanwhile_spends_no_confirmati
             ),
             host.network().network_config().expect("a configuration"),
             &admitted,
+            &life(),
         )
         .expect("an invitation");
     let device = Device::create().await;
@@ -975,6 +985,7 @@ async fn a_confirmation_whose_identifier_is_spent_meanwhile_spends_no_confirmati
         (action, Digest256::from_bytes([1; 32])),
         revision,
         &racing_request(pairing, &caller, action),
+        &life(),
     );
     assert!(is_id_conflict(&refused), "{refused:?}");
     let committed = pairing
@@ -987,6 +998,7 @@ async fn a_confirmation_whose_identifier_is_spent_meanwhile_spends_no_confirmati
             ),
             revision,
             &admitted,
+            &life(),
         )
         .expect("the next action commits the pairing with the same answer");
     assert_eq!(committed.event.invitation_id, invited.invitation_id);

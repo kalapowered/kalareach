@@ -309,6 +309,7 @@ async fn a_connection_that_goes_away_does_not_cut_the_establishment() {
         async move {
             let admission = controller.pairing_admission(connection_id, revision, deadline);
             let guard = controller.pairing_guard(connection_id, revision, deadline);
+            let life = controller.pairing_life(deadline);
             controller
                 .pairing_write(
                     caller,
@@ -316,6 +317,7 @@ async fn a_connection_that_goes_away_does_not_cut_the_establishment() {
                     &mutation,
                     admission,
                     guard,
+                    life,
                 )
                 .await
         }

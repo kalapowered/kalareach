@@ -334,8 +334,9 @@ impl Controller {
                 admitted,
                 accepted.map(|accepted| accepted.deadline),
             );
+            let life = self.pairing_life(accepted.map(|accepted| accepted.deadline));
             let outcome = self
-                .pairing_write(caller, method, mutation, admission, guard)
+                .pairing_write(caller, method, mutation, admission, guard, life)
                 .await;
             return respond(mutation.request_id, outcome);
         }
