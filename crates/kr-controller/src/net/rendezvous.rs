@@ -132,7 +132,7 @@ pub struct OwnerPath<'a> {
 impl<'a> OwnerPath<'a> {
     /// The service as the request whose mutation has `life` left reaches it.
     #[must_use]
-    pub fn new(service: &'a dyn Rendezvous, life: &'a Life) -> Self {
+    pub const fn new(service: &'a dyn Rendezvous, life: &'a Life) -> Self {
         Self { service, life }
     }
 }
