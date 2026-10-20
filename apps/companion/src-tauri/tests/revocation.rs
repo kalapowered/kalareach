@@ -1064,9 +1064,9 @@ async fn revoke_with_the_publication(rig: &Rig, moment: Moment) -> Value {
     tokio::time::timeout(WATCHDOG, shown.notified())
         .await
         .expect("the dialog is shown");
-    // The host has read its feed by now, so the next request to the feed is the publication.
-    rig.host_polls().await;
-    rig.served.web().fail(AUTHORITY, 1, moment);
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "publish", 1, moment);
     release.notify_one();
 
     let lost = tokio::time::timeout(WATCHDOG, call)
@@ -2196,12 +2196,20 @@ enum Meanwhile {
     TheOwnerRevokesIt,
 }
 
+/// What reads the feed after a request is published in it.
+enum AfterThePublication {
+    /// The view that follows the revoke and the host read it as they do.
+    TheFeedIsRead,
+    /// Nothing reads it until the service is mended: neither that view nor the host, so no refusal
+    /// is written or seen meanwhile.
+    NothingReadsTheFeed,
+}
+
 /// The person revokes the phone on the feed host, and `meanwhile` happens at the host while they
 /// are at the dialog. The request is then published in the feed the host reads. The host can read
 /// it as soon as the view that follows the revoke connects to it, and `host_polls` makes sure it
-/// has. With `unseen`, nothing reads the feed after the publication until the service is mended:
-/// not the view that follows, and not the host, so no refusal is written or seen meanwhile.
-async fn revokes_the_phone_while(rig: &Rig, meanwhile: Meanwhile, unseen: bool) {
+/// has.
+async fn revokes_the_phone_while(rig: &Rig, meanwhile: Meanwhile, after: AfterThePublication) {
     let host = host_by(&rig.view().await, "feed");
     let body = json!({
         "host": host["reference"],
@@ -2212,12 +2220,13 @@ async fn revokes_the_phone_while(rig: &Rig, meanwhile: Meanwhile, unseen: bool) 
     tokio::time::timeout(WATCHDOG, shown.notified())
         .await
         .expect("the dialog is shown");
-    if unseen {
-        // The host has read its feed by now, so the next request to it is the publication.
-        rig.host_polls().await;
-        for nth in 2..=60 {
-            rig.served.web().fail(
+    if matches!(after, AfterThePublication::NothingReadsTheFeed) {
+        // Every read of the feed fails, whoever makes it and whenever it comes; the publication,
+        // which is no read, is not met by a fault.
+        for nth in 1..=60 {
+            rig.served.web().fail_with_member(
                 AUTHORITY,
+                "read",
                 nth,
                 Moment::Refuse {
                     status: 503,
@@ -2282,7 +2291,12 @@ async fn the_hosts_reasons(rig: &Rig) -> Vec<Option<RejectionReason>> {
 async fn a_request_the_host_refuses_no_longer_keeps_its_device_from_being_shared_with_again() {
     let rig = Rig::start().await;
     rig.sharing_with_the_phone().await;
-    revokes_the_phone_while(&rig, Meanwhile::TheHostStopsAllowingIt, false).await;
+    revokes_the_phone_while(
+        &rig,
+        Meanwhile::TheHostStopsAllowingIt,
+        AfterThePublication::TheFeedIsRead,
+    )
+    .await;
     the_phone_is_taken_out(&rig).await;
 
     // The host reads its feed and refuses the request. Nothing else is read of it here: what
@@ -2326,7 +2340,12 @@ async fn a_request_the_host_refuses_no_longer_keeps_its_device_from_being_shared
 async fn a_request_the_host_refuses_as_covered_by_another_keeps_its_device_held() {
     let rig = Rig::start().await;
     rig.sharing_with_the_phone().await;
-    revokes_the_phone_while(&rig, Meanwhile::TheOwnerRevokesIt, false).await;
+    revokes_the_phone_while(
+        &rig,
+        Meanwhile::TheOwnerRevokesIt,
+        AfterThePublication::TheFeedIsRead,
+    )
+    .await;
     the_phone_is_taken_out(&rig).await;
 
     rig.host_polls().await;
@@ -2344,7 +2363,12 @@ async fn a_request_the_host_refuses_as_covered_by_another_keeps_its_device_held(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_never_shared_device_whose_request_the_host_refused_is_offered_again_by_the_refresh() {
     let rig = Rig::start().await;
-    revokes_the_phone_while(&rig, Meanwhile::TheHostStopsAllowingIt, true).await;
+    revokes_the_phone_while(
+        &rig,
+        Meanwhile::TheHostStopsAllowingIt,
+        AfterThePublication::NothingReadsTheFeed,
+    )
+    .await;
     rig.start_settings_sync_listing_the_phone();
     let settings = rig
         .app
