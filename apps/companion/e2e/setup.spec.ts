@@ -630,6 +630,24 @@ test.describe('the first-start assistant', () => {
     ).toEqual([])
   }
 
+  /** Opens the evidence of every capability on the capabilities step and waits for it to draw. */
+  async function openEveryEvidence(page: Page): Promise<void> {
+    for (const toggle of await page.locator('[data-testid^="setup-evidence-toggle-"]').all()) {
+      await toggle.click()
+    }
+    await expect(page.locator('.setup-evidence[data-open="true"]').last()).toBeVisible()
+    await expect
+      .poll(
+        async () =>
+          page
+            .locator('.setup-evidence[data-open="true"]')
+            .last()
+            .evaluate((node) => getComputedStyle(node).opacity),
+        { timeout: PRESENTATION_DEADLINE }
+      )
+      .toBe('1')
+  }
+
   // KR-REQ-03.28: the permission cards' footers say where the switch is and open its pane, and at
   // the largest text size, on a wide window and a narrow one, in the runner's face, the footer and
   // its controls stay inside the card and the window.
@@ -698,6 +716,52 @@ test.describe('the first-start assistant', () => {
         await expect(card.getByTestId('setup-model-retry')).toHaveText('Ask again')
         await footerHolds(page, 'the card while the host does not answer', card, footer, width)
         await capture(page, `setup-descriptions-footer-${size}-${width}-22.01`)
+      })
+    }
+  }
+
+  // KR-REQ-03.28, KR-REQ-03.29: a detail list keeps a value a readable measure. Beside its label
+  // it has the room for all of it on one line, and otherwise it goes under the label and has the
+  // list's width, so that no value is wrapped to a few characters a line, at the largest text size
+  // on a narrow window and in the runner's face.
+  for (const [width, height] of WINDOWS) {
+    for (const [size, ratio] of TEXT_SIZES) {
+      test(`gives the detail lists' values a readable measure at the ${size} text size, ${width} wide`, async ({
+        page
+      }) => {
+        await openSetup(page)
+        await sizeTo(page, width, height, ratio)
+        const squeezed = (): Promise<string[]> =>
+          page.evaluate(() => {
+            const found: string[] = []
+            for (const list of document.querySelectorAll('.setup-body .detail-list')) {
+              const room = list.getBoundingClientRect().width
+              if (room === 0) continue
+              for (const part of list.querySelectorAll('dt, dd')) {
+                const box = part.getBoundingClientRect()
+                if (box.width === 0 || box.height === 0) continue
+                const style = getComputedStyle(part)
+                const line = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.4
+                const lines = Math.round(box.height / line)
+                // A part that takes more than a line has most of the list's width.
+                if (lines > 1 && box.width < room * 0.8) {
+                  const words = (part.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 40)
+                  found.push(
+                    `${words}: ${String(lines)} lines in ${String(Math.round(box.width))} of ${String(Math.round(room))} px`
+                  )
+                }
+              }
+            }
+            return found
+          })
+        // The identity step's two lists.
+        expect(await squeezed(), 'the identity step').toEqual([])
+        await capture(page, `setup-detail-identity-${size}-${width}-03.28`)
+        // The desktop's list, and the evidence each capability opens.
+        await step(page, 'capabilities')
+        await openEveryEvidence(page)
+        expect(await squeezed(), 'the capabilities step').toEqual([])
+        await capture(page, `setup-detail-capabilities-${size}-${width}-03.29`)
       })
     }
   }
