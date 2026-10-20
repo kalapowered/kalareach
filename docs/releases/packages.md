@@ -32,9 +32,13 @@ rather than from this package.
 
 ## How a release is cut
 
-A release is one commit's output. Tag that commit and push the tag:
+A release is one commit's output. Fetch the release tags and run the two checks of
+[a level is one surface](#a-level-is-one-surface) on that commit, then tag it and push the tag:
 
 ```bash
+git fetch --force --prune origin '+refs/tags/packages/v*:refs/tags/packages/v*'
+cargo run --locked -p kr-protocol --bin kr-protocol-gen -- --in-level
+cargo run --locked -p kr-protocol --bin kr-protocol-gen -- --public-contract
 commit=$(git rev-parse HEAD)
 version=$(node -p "require('./packages/protocol/package.json').version")
 git tag "packages/v${version}+${commit:0:12}" "$commit"
@@ -44,7 +48,8 @@ git push origin "packages/v${version}+${commit:0:12}"
 The version comes out of the package rather than being typed, so a bump cannot leave this naming
 the version before it.
 
-`.github/workflows/package-release.yml` runs on a tag matching `packages/v*`. It packs the archives
+`.github/workflows/package-release.yml` runs on a tag matching `packages/v*`. It runs the two checks
+above first, packs the archives
 with `scripts/release-packages.sh`, refuses to go on if that tag already has a release or a draft,
 creates a draft, attaches the archives and `SHA512SUMS` to the draft that creation returned, and
 publishes it only once GitHub's record of every asset, down to the sha256 GitHub computed over the
@@ -53,14 +58,17 @@ release it just published and that the release cannot be replaced, and the last 
 asset back from the URL GitHub serves it at, holds it to the packed sha512, and writes those URLs
 into the notes.
 
-One tag is one run at a time. A second run for a tag that is already being released waits for the
-first to finish rather than running beside it, and the run already under way is never cancelled for
-the one waiting; when the waiting run's turn comes, it finds whatever the run before it made and
-refuses to go on if that is a release or a draft. A first run that failed before creating either
-leaves the tag as it found it, and the run that follows releases it. What is guaranteed is that two
-runs for one tag never overlap, not that every run gets its turn: GitHub holds one run waiting per
-tag, so a third arrival takes the waiting one's place. Nothing is lost when it does, because a run
-that has not started has created nothing.
+One publication runs at a time, whatever its tag. A second run waits for the first to finish
+rather than running beside it, and the run already under way is never cancelled for the one
+waiting; when the waiting run's turn comes, it finds whatever the run before it made and refuses to
+go on if that is a release or a draft of its own tag. A first run that failed before creating
+either leaves the tag as it found it, and the run that follows releases it. What is guaranteed is
+that two runs never overlap, not that every run gets its turn: GitHub holds one run waiting, so a
+third arrival takes the waiting one's place and cancels it. Nothing is lost when it does, because a
+run that has not started has created nothing. Start that run again by hand, with `gh run rerun`,
+once the run under way has ended. Do the same for a run that stopped at its second check
+because a tag arrived while it packed, and for a `package-npm` run that gave up waiting for its
+release, which it does after fifty minutes.
 Reading a release moments after writing to it can reach a copy of GitHub's records
 that has not caught up, so each of the three reads that follow is attempted up to five times, three
 seconds apart, before its answer is taken as the release's state. Repeating them changes nothing:
@@ -108,6 +116,100 @@ it is, and a mistake is corrected by releasing a new commit under its own tag. A
 before publishing is the other case: it leaves a draft, and once that draft is deleted the same tag
 can be released again by re-running the run that failed, because pushing a tag that is already on
 the remote produces no event at all.
+
+## A level is one surface
+
+A compatibility level is `0.<minor>` below `1.0.0` and the major number from it, and every build at
+a level reads and writes the same frames. A host's control daemon meets workers of any release at
+its own level across an update and a rollback, and `kr` and `kr-hook` talk to a worker of their
+level directly, so the first release of a level fixes what the level is. A later change to that
+surface moves the level, in the train that makes it, with its cut
+([support-window.md](support-window.md#cutting-a-release)). It is never made at the same level under
+a new tag.
+
+Every landing on main is tagged and published, so the branches that change the surface of a new
+level land in one train. Three branches that land in three trains make three releases, and the
+first of them is the level.
+
+The surface is these four things:
+
+- the types of the retained surface, `SURFACE_ROOTS` in `crates/kr-protocol/src/retained.rs`;
+- the parameters and result of each method a worker serves, the payload of each notification it
+  sends, and the frames of `kr bridge`. `crates/kr-protocol/src/worker_surface.rs` holds the first
+  two as tables: the worker refuses a method that has no row, and `kr-protocol-gen` writes the
+  tables to `crates/kr-protocol/worker-surface.json`;
+- the protocol the plugin host speaks, `PLUGIN_HOST_PROTOCOL`;
+- the table of public majors.
+
+The shell bridge's `root.*` methods are not in it, and neither are the hook's registration, its
+`kr_hello` line and its private exchange: their peers are the shell package and the forwarder that
+a session launched, which have releases of their own. Nothing checks that a hook of one release
+works with a worker of another at the same level; the upgrade suite does not drive one yet.
+
+`kr-protocol-gen --in-level` holds a commit to it. It lists the release tags on origin with `git
+ls-remote`, requires this checkout's tags to be origin's, each at the same commit, and compares the
+commit with every release at its level that the record of exclusions does not name, whether or not
+the commit's history reaches it. It fails naming the release and each difference, in the schema
+(cut over both revisions' roots, so that a root that was dropped cannot hide a change), in the
+tables of what the worker serves (renaming an event, or serving a method no longer, changes no
+definition of the schema), in the plugin host protocol and in the table of public majors. A release
+from before `worker-surface.json` is compared by schema alone, and the check says so. When no
+release is at the commit's level, the commit moves it, and the check runs
+`scripts/check-retained-release.sh` in the same run.
+
+The check fails when it cannot list origin's tags, when this checkout's tags are not origin's, when
+a release's tree cannot be read and when a source is in a form it does not read, and it never leaves
+a release out. A tag that only one side has at the commit under test is left out of the comparison,
+because a release tags a commit after it lands. Fetch the tags first with the command in the
+procedure above, which also removes a tag that origin no longer has; delete a tag that only this
+checkout has with `git tag -d`.
+
+core-ci runs the check in its `rust` job, and `package-release.yml` runs it before it packs and
+again, after a new fetch, just before it publishes. Run it before the tag too, as the procedure above
+does. A tag the check refuses stays in every list until it is deleted. Delete a refused tag that was
+never published from origin and from every clone, and tag the corrected commit.
+
+### Releases a level's contract does not cover
+
+Level 0.76 was released before its last planned change had landed. `packages/v0.76.0+d3a552aa2ea6`
+and `packages/v0.76.0+53a2e0be5111` each speak a surface without `ForwardedMutation.lease`, which the
+level has. They stay published, since a published release stays where it is, and
+`crates/kr-protocol/retained/EXCLUDED` records them as excluded. The record gives for each the tag,
+its full commit, its level, the digest of the surface its own schema has, and why. It is closed to
+these two tags. It is read and checked: each digest against the tag's own schema, each tag against
+the inventory, and an excluded release against the kept releases of its level, each of which has to
+have it in its history. A level that has no kept release is refused. Release selection, the cut's
+comparison, the in-level check and the upgrade suite skip what it names, and the public-contract
+report does not.
+
+The record is removed with every reader of it at the 0.78 cut, and `kr-protocol-gen --check` fails
+once its level is neither this build's nor a retained one. No host was built at either commit: they
+carry only the TypeScript archives. A host built at one of them drains its workers before an update
+or a rollback; see [the support window](support-window.md#a-host-built-at-an-excluded-release).
+The npm publish runs for the two tags were cancelled and nobody re-runs or approves them. npm takes
+one archive per version, and the three 0.76.0 plugin SDK archives are the same.
+
+### The public contract
+
+The package publishes every type of the schema, and a client built from one release meets a host of
+another across a level move. Until public 1.0 freezes, which happens at the first client release
+(a host, command line, desktop or mobile build published for people to install), the public
+contract may change with a level move.
+
+`kr-protocol-gen --public-contract` compares the commit's whole schema, every definition a root,
+with the releases a client may have been built from, and reports what an earlier reader cannot read.
+A definition that is new is not a difference. A member that is added is not one either when it is
+optional and the earlier release's object carries `x-kalareach-read-only-metadata`, because that
+object's reader drops a member it does not know. Every other difference is reported: a member or a
+variant added to a closed object, a member, a variant or a definition removed, and any change.
+`SessionSummary.root` is one: an earlier strict reader cannot read the summary of a command session.
+No client was released, so no shim carries it.
+
+Until `crates/kr-protocol/retained/PUBLIC_FREEZE` exists, the references are the releases at the
+commit's level, the excluded ones included, and the check reports and does not fail. That file,
+`release=<tag>`, is made at the first client release. From then the references are that release and
+every later one that shares a public major that is not retired with the commit, and a difference
+fails the check. It fails at all times when it cannot read what it compares.
 
 ## Publishing the plugin SDK to the npm registry
 
@@ -347,7 +449,10 @@ the tag and in each archive's name already tells two releases apart.
 
 A new member of an existing type takes that bump too, an optional member included. The Rust types
 refuse a member they do not know, those of a session's local path among them, so a build without
-the member cannot read a frame that carries it. The version is compiled into every host process,
+the member cannot read a frame that carries it. The exception is an object whose schema carries
+`x-kalareach-read-only-metadata`: its reader drops a member it does not know, so an optional member
+added to one changes nothing an earlier public reader can read, and the public-contract report
+accepts it. A member of a type on a level's surface moves the level whatever its kind. The version is compiled into every host process,
 which states it in its answer to a hello, and `kr attach` relies on this rule: it reads a worker's
 screens only when the worker's version has the same minor number as its own below `1.0.0`, or the
 same major number from `1.0.0`, and a patch number never decides. A member released without the
