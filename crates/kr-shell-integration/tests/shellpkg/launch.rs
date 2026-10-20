@@ -6,12 +6,13 @@
 //! angle brackets and reads the terminal for exactly that text. The echo of the installed line
 //! carries no angle brackets, so it cannot produce it.
 
-use kr_protocol::root::LaunchCommand;
+use kr_protocol::root::{EditorFence, LaunchCommand, RootEditorEnterParams};
 use kr_protocol::scalars::Uuid;
 use kr_shell_integration::contract::events::BridgeEvent;
 use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::contract::requests::{
-    BridgeAnswer, LaunchDecision, LaunchMailboxRequest, LaunchTransactionId, WorkerRequest,
+    BridgeAnswer, LaunchDecision, LaunchMailboxRequest, LaunchRejectionReason, LaunchTransactionId,
+    WorkerRequest,
 };
 
 use super::*;
@@ -30,14 +31,14 @@ fn argument_printer(session: &Session) -> PathBuf {
     program
 }
 
-/// Launches `vector` at the next fenced prompt, and returns the reader's decision.
-fn launch_vector(
+/// Launches `vector` at the fenced prompt `enter` opened, and returns the reader's decision.
+fn launch_vector_at(
     session: &mut Session,
+    enter: &RootEditorEnterParams,
+    fence: &EditorFence,
     vector: Vec<String>,
-    prompt_seed: u8,
     transaction_seed: u8,
 ) -> LaunchDecision {
-    let (enter, fence) = session.fenced_prompt(prompt_seed);
     let id = session.ask(WorkerRequest::Launch(LaunchMailboxRequest {
         session_id: session.session_id,
         transaction: LaunchTransactionId::new(Uuid::from_bytes([transaction_seed; 16])),
@@ -52,6 +53,17 @@ fn launch_vector(
         panic!("the reader answered a launch with something else")
     };
     decision
+}
+
+/// Launches `vector` at the next fenced prompt, and returns the reader's decision.
+fn launch_vector(
+    session: &mut Session,
+    vector: Vec<String>,
+    prompt_seed: u8,
+    transaction_seed: u8,
+) -> LaunchDecision {
+    let (enter, fence) = session.fenced_prompt(prompt_seed);
+    launch_vector_at(session, &enter, &fence, vector, transaction_seed)
 }
 
 /// Installs `program` with `words` as its arguments through a launch, and says that the terminal
@@ -106,5 +118,142 @@ pub fn a_launch_passes_every_word_it_is_given(kind: ShellKind) {
         &["a", "--%", "b", "--", "-", "-x:y", "--%x"],
         41,
         0x82,
+    );
+}
+
+/// Words that name a function and an alias of this shell's own, each shadowing a program the
+/// system has: `printf` is a function, and `uname` is an alias of that function. Either prints
+/// the marker, so a line that ran one of them shows it.
+const SHADOWS: &str = "function printf { Write-Output ('kr-shadow-' + 'ran') }; \
+    Set-Alias -Name uname -Value printf; \
+    function kr-only-a-function { Write-Output ('kr-function-' + 'ran') }; \
+    Write-Output ('kr-shadows-' + 'defined')";
+
+/// Defines [`SHADOWS`] in the session, as its first command, so the prompt that follows is the one
+/// the launch is made at.
+fn define_shadows(session: &mut Session) {
+    assert!(
+        session.run(SHADOWS, "kr-shadows-defined"),
+        "the shell did not take the function and the alias:\n{}",
+        session.terminal_output()
+    );
+}
+
+/// KR-REQ-23.54: a launch runs the application its first word names, and a function or an alias
+/// of that name stands in for it nowhere.
+///
+/// A quoted word at command position is still looked up as a command, so a function or an alias
+/// of the same name would run in the program's place. The line shows what runs: the application's
+/// own path.
+pub fn a_launch_runs_the_application_and_not_a_function_or_alias_of_its_name(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+    define_shadows(&mut session);
+
+    let uname = std::process::Command::new("uname")
+        .arg("-s")
+        .output()
+        .expect("the system's uname");
+    let system = String::from_utf8_lossy(&uname.stdout).trim().to_owned();
+    assert!(!system.is_empty(), "the system's uname printed nothing");
+
+    for (vector, expected, prompt_seed, transaction_seed) in [
+        (
+            vec!["printf", "%s|", "one", "two"],
+            "one|two|".to_owned(),
+            50,
+            0x91,
+        ),
+        (vec!["uname", "-s"], system, 51, 0x92),
+    ] {
+        let before_install = session.written();
+        let decision = launch_vector(
+            &mut session,
+            vector.iter().map(|word| (*word).to_owned()).collect(),
+            prompt_seed,
+            transaction_seed,
+        );
+        assert!(
+            matches!(decision, LaunchDecision::Accepted(_)),
+            "an empty fenced prompt refused a launch of {vector:?}: {decision:?}"
+        );
+        session.nudge();
+        session.expect_event("command_accepted", |event| {
+            matches!(event, BridgeEvent::CommandAccepted(_))
+        });
+        assert!(
+            session
+                .drew_after(before_install, &expected, REPLY)
+                .was_drawn(),
+            "{vector:?} did not run the application of that name; wanted {expected}:\n{}",
+            session.terminal_output()
+        );
+    }
+    assert!(
+        !session.terminal_output().contains("kr-shadow-ran"),
+        "a function or an alias ran in the place of the program:\n{}",
+        session.terminal_output()
+    );
+}
+
+/// KR-REQ-23.54: a first word that names no application is refused, and installs nothing.
+///
+/// The refusal is the reader's own for a vector it cannot build a line from. A name that is only a
+/// function of this shell's own is such a name: the launch asked for a program.
+pub fn a_launch_of_a_name_that_is_no_application_is_refused_and_installs_nothing(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+    define_shadows(&mut session);
+
+    let (enter, fence) = session.fenced_prompt(52);
+    for (name, transaction_seed) in [("kr-only-a-function", 0x93), ("kr-no-such-program", 0x94)] {
+        let decision = launch_vector_at(
+            &mut session,
+            &enter,
+            &fence,
+            vec![name.to_owned()],
+            transaction_seed,
+        );
+        assert_eq!(
+            decision.rejection(),
+            Some(LaunchRejectionReason::BufferNotEmpty),
+            "{name} is no application, so nothing should have been installed: {decision:?}"
+        );
+    }
+
+    // Nothing was installed, so the same prompt takes the next launch.
+    let before_install = session.written();
+    let decision = launch_vector_at(
+        &mut session,
+        &enter,
+        &fence,
+        ["printf", "%s|", "three", "four"]
+            .map(str::to_owned)
+            .to_vec(),
+        0x95,
+    );
+    assert!(
+        matches!(decision, LaunchDecision::Accepted(_)),
+        "the refusals left something behind: {decision:?}"
+    );
+    session.nudge();
+    session.expect_event("command_accepted", |event| {
+        matches!(event, BridgeEvent::CommandAccepted(_))
+    });
+    assert!(
+        session
+            .drew_after(before_install, "three|four|", REPLY)
+            .was_drawn(),
+        "the launch after the refusals did not run:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        !session.terminal_output().contains("kr-function-ran"),
+        "a function ran in the place of a program:\n{}",
+        session.terminal_output()
     );
 }

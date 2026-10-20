@@ -762,3 +762,17 @@ fn the_integration_stays_in_the_root_shell_and_adds_no_global_accept_line_or_mar
 fn a_launch_passes_every_word_it_is_given() {
     shellpkg::a_launch_passes_every_word_it_is_given(PWSH);
 }
+
+/// KR-REQ-23.54
+#[test]
+#[ignore = "drives this tree's built PSReadLine package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_launch_runs_the_application_and_not_a_function_or_alias_of_its_name() {
+    shellpkg::a_launch_runs_the_application_and_not_a_function_or_alias_of_its_name(PWSH);
+}
+
+/// KR-REQ-23.54
+#[test]
+#[ignore = "drives this tree's built PSReadLine package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_launch_of_a_name_that_is_no_application_is_refused_and_installs_nothing() {
+    shellpkg::a_launch_of_a_name_that_is_no_application_is_refused_and_installs_nothing(PWSH);
+}
