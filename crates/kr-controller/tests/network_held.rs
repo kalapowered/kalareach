@@ -786,6 +786,58 @@ async fn kr_req_18_14_a_session_that_closes_withdraws_the_invitations_waiting_ov
     host.stop().await;
 }
 
+/// KR-REQ-18.13: an invitation that ran out before its session closed stays run out: the close
+/// withdraws what was still waiting and leaves what had ended as it ended, so the issuer is told
+/// `expired` and a device that redeems it is told so in the host's words.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_18_13_a_session_that_closes_leaves_an_invitation_that_ran_out_as_it_ended() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let wall = MovedWall::new();
+    let host = Host::start_on_clocks(&owner, wall.clocks()).await;
+    let (device, record) = recipient(&host, &owner).await;
+    let connection = RawDevice::connect(&host, &device, &record).await;
+    let (session, _) = an_open_session(&host);
+    let short = share_with(
+        &host,
+        session,
+        record.device_id,
+        RoleSelection::plain(SessionRole::Viewer),
+        Some(60_000),
+    )
+    .await
+    .expect("a short share is written");
+    wall.advance(Duration::from_secs(5 * 60));
+
+    host.controller()
+        .retire(&closed(session))
+        .await
+        .expect("the session closes");
+
+    let ended = issued_over(&host, session).await;
+    assert_eq!(
+        ended
+            .iter()
+            .map(|summary| summary.state)
+            .collect::<Vec<_>>(),
+        [GrantState::Expired],
+        "{ended:?}"
+    );
+    let refused = connection
+        .mutate(
+            Method::GrantRedeem,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(&host),
+            &GrantRedeemParams {
+                invitation_id: short.preview.invitation_id,
+            },
+        )
+        .await
+        .expect_err("an invitation that ran out is not redeemed");
+    assert!(refused.message.contains("expired"), "{refused:?}");
+    connection.close();
+    host.stop().await;
+}
+
 /// KR-REQ-18.14: a daemon that starts and finds a session closed while it was down, with an
 /// invitation still waiting over it, withdraws the invitation before it serves, and leaves the
 /// invitation over a session that is still open.
