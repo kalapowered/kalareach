@@ -229,8 +229,9 @@ A package that has an application start the forwarder writes `{kr_hook}` where i
 host replaces that with the full path of the `kr-hook` it installed. The placeholder stands at the
 start of a JSON string. Alone, it names a program the application starts itself: a `command` with
 its `args`, or a flag whose value is a JSON document. Followed by a space, it begins a line an
-application runs through a shell, and the path is written as one word in single quotes. Only a POSIX
-shell reads that as one word, so the validator refuses the form in a package that lists Windows. The
+application runs through a shell, and the path is written as one word in single quotes. Windows'
+shells do not read single quotes that way, so the validator refuses the form in a package that
+lists Windows. The
 package validator refuses a flag that holds it anywhere else or spells it with JSON escapes, and the
 host refuses a registration file that does either. The host writes the path as the text of a JSON string,
 so a path with spaces, quotes, backslashes or non-ASCII characters is still one path. A package that

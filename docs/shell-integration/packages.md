@@ -346,16 +346,15 @@ quotes and leaves the quotes to its caller, which is a trap. And on Zsh the text
 editor's own string representation: `setline` unmetafies what it is handed, so raw bytes above 0x7f
 would change on the way in.
 
-Quoting the first word does not decide what runs. A quoted first word is still looked up as a
-command, and the shell runs what it finds. For example, if a function with that name exists, it runs
-instead of the program (this is true for Zsh, Bash and Fish). To avoid such shenanigans, the
-PowerShell module resolves the first word to an application or an external script and writes its
-full path after the call operator, so a function, an alias or a cmdlet of that name never stands in
-for the program, and the line shows what runs. If there is no application with that name, the module
-refuses the launch with `buffer_not_empty`, the reason it gives for any vector it cannot build a
-line from. If one of the arguments is exactly `--%`, the shell will not pass that argument to the
-program, wherever it stands. This is the stop-parsing token in PowerShell. To avoid this, the module
-writes it as `@('--%')`.
+Quoting the first word does not decide what runs. If the first word of the vector is quoted, it is
+still looked up as a command, and in Zsh, Bash and Fish a function or a builtin with the same name
+runs instead of the program. In PowerShell the module keeps the name as given when nothing can stand
+in for it, so that the lookup route still sees the launch, and it uses the full path of the
+application only when an alias, a function or a cmdlet has that name. If no application with that
+name can be found, the module refuses the launch with `buffer_not_empty`, the reason it gives for
+any vector it cannot build a line from. If an argument is exactly `--%`, the module writes it as
+`@('--%')`. This is the stop-parsing token in PowerShell, which the shell otherwise leaves out of
+the program's arguments, wherever it appears.
 
 Losing the bridge does not turn a managed root shell back into an ordinary one. The handshake
 leaves a mark that is never cleared, so a shell whose worker has gone holds no fence, consumes an
