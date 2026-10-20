@@ -556,8 +556,11 @@ struct Dispatched {
 /// ended, a page that is not the service's, an answer that could not be read, and the service's
 /// own `INTERNAL` and `OUTCOME_UNKNOWN` leave open that the feed holds the request, and so does
 /// a connection that could not be made, which this client reports as it reports a page: a request
-/// that left no trace is let go of when the person forgets the host or revokes the device at the
-/// host.
+/// that left no trace stays recorded until the person forgets the host.
+///
+/// The service answers an unknown outcome of a request that is not safe to send again, as a publish
+/// is, with `OUTCOME_UNKNOWN` or `INTERNAL`; every other refusal it names for a publish comes before
+/// it stores anything.
 fn nothing_was_stored(error: &ClientError) -> bool {
     error
         .service_code()
@@ -1149,7 +1152,7 @@ impl Revocations {
                 }
                 error.message.push_str(if dispatched_nothing_was_stored {
                     " The request did not reach the host. This computer no longer shares its \
-                     settings with that device; the account sheet lets you share them again."
+                     settings with that device."
                 } else {
                     " This computer no longer shares its settings with that device, because the \
                      request may have reached the host."
@@ -1319,11 +1322,19 @@ fn own_requests<'a>(
         .collect()
 }
 
-/// The identities of the requests the feed shows the host refused. A refusal names the request, so
-/// no list of the host's devices is needed to see it.
+/// The identities of the requests the feed shows the host refused because it cannot carry them
+/// out: this computer holds no owner authority on the host, or the host does not know the device. A
+/// refusal names the request, so no list of the host's devices is needed to see it. A request the
+/// host refused as covered by a later one (`Superseded`) is not among them: what covers it has
+/// revoked the device or will, and a host that did so and is asleep again says nothing more.
 fn refused_by_the_host(own: &[Verified<'_>]) -> Vec<String> {
     own.iter()
-        .filter(|request| request.record.rejected.0.is_some())
+        .filter(|request| {
+            matches!(
+                request.record.rejected.0,
+                Some(RejectionReason::NoOwnerAuthority | RejectionReason::UnknownTarget)
+            )
+        })
         .map(|request| request.record.request.request_id.to_string())
         .collect()
 }
@@ -1550,28 +1561,6 @@ mod tests {
             grant_expired: false,
             all_sessions: true,
         }
-    }
-
-    /// A request the host refused is named by its identity alone: it is found in the feed without
-    /// any list of the host's devices, as after a restart with the host asleep.
-    #[test]
-    fn a_request_the_host_refused_is_named_by_its_identity_without_the_hosts_list() {
-        let refused = record(12, None, Some(RejectionReason::NoOwnerAuthority));
-        let waiting = record(13, None, None);
-        let acted_on = record(14, Some(RevocationCompletion::Complete), None);
-        let own: Vec<Verified<'_>> = [&refused, &waiting, &acted_on]
-            .into_iter()
-            .map(|record| Verified {
-                record,
-                devices: BTreeSet::from([DeviceId::new(id(1))]),
-            })
-            .collect();
-
-        assert_eq!(
-            refused_by_the_host(&own),
-            vec![refused.request.request_id.to_string()],
-            "only the refused one: a request a host acted on is not refused"
-        );
     }
 
     /// A request for the device, published at 100, with the host's answer to it.

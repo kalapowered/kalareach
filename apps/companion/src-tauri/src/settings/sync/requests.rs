@@ -9,16 +9,20 @@
 //!
 //! **A record is let go of only by what names the request.** Each request is recorded by its own
 //! identity before it leaves. Two things release it: the service answering with a refusal it names,
-//! which it makes before it acts, and the feed showing that the host refused it. Nothing else
+//! which it makes before it acts, and the feed showing that the host refused it because this
+//! computer holds no owner authority there or the host does not know the device. Nothing else
 //! does. A feed that does not show the request, a restart, a host that is asleep, an answer that
-//! was lost and a service this computer no longer uses all leave it where it is, because none of
-//! them says the request cannot be carried out. Another request, however it ends, cannot release
-//! this one. A record that cannot be read holds every device.
+//! was lost, a host that refused it as covered by a later request and a service this computer no
+//! longer uses all leave it where it is, because none of them says the request cannot be carried
+//! out. Another request, however it ends, cannot release this one. A record that cannot be read
+//! holds every device.
 //!
-//! The one other way out is forgetting a host, which lets go of what was recorded for its feed,
-//! since this computer reads that feed no more; a look at that feed that began before it records
-//! nothing. A request found in a feed that the record does not name, as one an earlier version
-//! published, is recorded too, as far as the host's list lets the look name the device it is for.
+//! Two other ways out. A request that is not sent, because the hold on the settings could not be
+//! made durable first, is let go of at once. Forgetting a host lets go of what was recorded for its
+//! feed, since this computer reads that feed no more; a look at that feed that began before it
+//! records nothing. A request found in a feed that the record does not name, as one an earlier
+//! version published, is recorded too, as far as the host's list lets the look name the device it
+//! is for.
 //!
 //! The record is a file beside the other records of settings sync, kept across a restart and seen
 //! by a second companion over the same data directory.

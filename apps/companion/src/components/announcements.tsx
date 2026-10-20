@@ -9,8 +9,8 @@
  * region outside it. The words are for a screen reader alone: what a person reads is the banner.
  *
  * A banner that is already on a screen when the screen first appears arrives with its region, and
- * says nothing: a screen reader reads it as part of the screen, as it reads the rest of what is
- * there.
+ * says nothing: a screen reader meets it as the person moves through the screen, as it meets the
+ * rest of what is there.
  */
 
 import {

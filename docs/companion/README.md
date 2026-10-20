@@ -505,10 +505,12 @@ request out, or may have carried it out and be asleep. A device that was never s
 out in the same way. The computer records each request it publishes in a host’s feed, by the
 request’s own identity, before it sends it, and lets the record go only when the service answers
 with a refusal it names, which it makes before it acts, or when the feed shows that the host refused
-it. The computer lets nothing go in these cases: a feed that does not show the request, a restart, a
-host that is asleep, an answer from the service that was lost, or a change of the sync service this
-computer uses. The computer keeps the record when a host has acted on the request. Until the record
-goes, the account sheet names the device with the words “A revoke for it is on record here, so it is
+it because this computer has no owner authority there or the host does not know the device. The
+computer lets nothing go in these cases: a feed that does not show the request, a restart, a host
+that is asleep, an answer from the service that was lost, or a change of the sync service this
+computer uses. The computer keeps the record when a host has acted on the request or refused it as
+covered by a later one. A request that the computer cannot send, because it cannot first make its
+hold on the settings durable, is not kept. Until the record goes, the account sheet names the device with the words “A revoke for it is on record here, so it is
 not offered again” and offers no button for it, and the command to share with it again refuses it, a
 request published while the person was at the dialog for sharing again included. When the person
 forgets a host, the computer lets go of the requests it recorded for that host’s feed. If a view
