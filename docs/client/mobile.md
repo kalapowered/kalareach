@@ -323,6 +323,16 @@ pnpm -C apps/companion android:classes path/to/app-universal-debug.apk
 # layout it does not read, and which packages each form of the build command is checked against.
 pnpm -C apps/companion test:android-classes
 
+# The iOS application's privacy manifests, held to the built bundle. The script builds the release
+# application for the Simulator (a debug build links code the release drops) and reads every Mach-O
+# file in it for the categories of required reason API Apple lists; the check fails when a binary
+# uses a category its bundle's manifest does not declare, or the application's manifest declares one
+# its executable does not use. `docs/releases/app-store-privacy.md` ties the manifest to the code.
+# The test builds small binaries for the Simulator and holds the check to what they use.
+scripts/ios-privacy-manifest.sh
+pnpm -C apps/companion privacy-manifest path/to/KalaReach.app
+pnpm -C apps/companion test:privacy-manifest
+
 # The manifest the packaged application was built from.
 cat apps/companion/src-tauri/gen/android/app/build/intermediates/packaged_manifests/\
 universalDebug/processUniversalDebugManifestForPackage/AndroidManifest.xml

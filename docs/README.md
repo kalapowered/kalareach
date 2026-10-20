@@ -77,6 +77,7 @@ Releases:
 | [releases/evidence-gates.md](releases/evidence-gates.md) | The seven gates a release is made against, the evidence that closes each and the commands that produce it, and the pairing review exception |
 | [releases/support-window.md](releases/support-window.md) | The public protocol majors a host negotiates and how long each is supported, the retained levels, and how a running session keeps working across an update |
 | [releases/keys.md](releases/keys.md) | The signing keys of a release, the plugin catalogue, the relay service and each organisation: what each signs, where it is held and pinned, who rotates it and how it is recovered |
+| [releases/app-store-privacy.md](releases/app-store-privacy.md) | The answers App Store Connect's privacy questions need for the iOS companion, tied to its privacy manifest, the required reason APIs its bundle uses and the packages that ship manifests |
 
 The [repository README](../README.md) says how to build and test this repository, how it is
 released and how a host recovers.
