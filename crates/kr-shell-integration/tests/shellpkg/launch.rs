@@ -15,7 +15,7 @@ use kr_shell_integration::contract::requests::{
     WorkerRequest,
 };
 
-use super::commands::{Probes, a_session_with_probes};
+use super::commands::{Probes, a_session_with_probes_and};
 use super::*;
 
 /// Writes a program into the session's home that prints each argument it was given between angle
@@ -264,41 +264,64 @@ pub fn a_launch_of_a_name_that_is_no_application_is_refused_and_installs_nothing
 ///
 /// The handler answers for a command typed by its name, and runs a path as typed. A launch whose
 /// line carried the program's path would start it with none of what an enabled integration adds,
-/// so the case launches a program found on the search path and reads what the handler asked.
+/// so the case launches a program found on the search path and reads what the handler asked. The
+/// second launch is the same with a not-found hook in the profile that answers for the program's
+/// name: a program that is found never reaches that hook when it is typed, so a launch has to leave
+/// it unasked too, and no answer of the hook's may be taken for something that stands in for the
+/// program.
 pub fn a_launch_of_a_command_the_lookup_handler_asks_about_is_asked_about(kind: ShellKind) {
-    let package = Package::built(kind);
-    let probes = Probes::new();
-    let mut session = a_session_with_probes(&package, &probes);
+    const HOOK: &str = r#"
+$global:KrNotFoundCalls = 0
+$ExecutionContext.InvokeCommand.CommandNotFoundAction = {
+    param($CommandName, $EventArgs)
+    $global:KrNotFoundCalls++
+    if ($CommandName -eq 'kr-probe') {
+        $EventArgs.CommandScriptBlock = { Write-Output ('kr-hook-' + 'ran') }
+        $EventArgs.StopSearch = $true
+    }
+}
+"#;
+    for (hook, seed) in [("", 60), (HOOK, 62)] {
+        let package = Package::built(kind);
+        let probes = Probes::new();
+        let mut session = a_session_with_probes_and(&package, &probes, hook);
 
-    let before = session.written();
-    let decision = launch_vector(
-        &mut session,
-        ["kr-probe", "one", "two words"].map(str::to_owned).to_vec(),
-        60,
-        0xa1,
-    );
-    assert!(
-        matches!(decision, LaunchDecision::Accepted(_)),
-        "an empty fenced prompt refused a launch: {decision:?}"
-    );
-    session.nudge();
-    session.expect_event("command_accepted", |event| {
-        matches!(event, BridgeEvent::CommandAccepted(_))
-    });
-    assert!(
-        session.drew_after(before, "probe-ran", REPLY).was_drawn(),
-        "the program did not run:\n{}",
-        session.terminal_output()
-    );
-    let asked = &session.commands.resolves;
-    assert_eq!(
-        asked.len(),
-        1,
-        "a launch of a command the handler answers for was asked about {} times: {asked:?}",
-        asked.len()
-    );
-    assert_eq!(asked[0].argv, ["kr-probe", "one", "two words"]);
-    assert_eq!(asked[0].executable, told(&probes.probe()));
+        let before = session.written();
+        let decision = launch_vector(
+            &mut session,
+            ["kr-probe", "one", "two words"].map(str::to_owned).to_vec(),
+            seed,
+            0xa1,
+        );
+        assert!(
+            matches!(decision, LaunchDecision::Accepted(_)),
+            "an empty fenced prompt refused a launch: {decision:?}"
+        );
+        session.nudge();
+        session.expect_event("command_accepted", |event| {
+            matches!(event, BridgeEvent::CommandAccepted(_))
+        });
+        assert!(
+            session.drew_after(before, "probe-ran", REPLY).was_drawn(),
+            "the program did not run:\n{}",
+            session.terminal_output()
+        );
+        let asked = &session.commands.resolves;
+        assert_eq!(
+            asked.len(),
+            1,
+            "a launch of a command the handler answers for was asked about {} times with the hook \
+             {hook:?}: {asked:?}",
+            asked.len()
+        );
+        assert_eq!(asked[0].argv, ["kr-probe", "one", "two words"]);
+        assert_eq!(asked[0].executable, told(&probes.probe()));
+        assert!(
+            !session.terminal_output().contains("kr-hook-ran"),
+            "the hook's answer ran in the program's place:\n{}",
+            session.terminal_output()
+        );
+    }
 }
 
 /// A command-not-found hook of the person's own: a name it answers is run by a script block of its

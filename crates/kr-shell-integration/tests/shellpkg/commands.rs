@@ -362,12 +362,19 @@ $ExecutionContext.InvokeCommand.PreCommandLookupAction = {
 
 /// A session of this package's own with the probes on its search path, at an answering prompt.
 pub(super) fn a_session_with_probes(package: &Package, probes: &Probes) -> Session {
+    a_session_with_probes_and(package, probes, "")
+}
+
+/// [`a_session_with_probes`], with `more` run in the person's PowerShell profile after the lookup
+/// handler is installed.
+pub(super) fn a_session_with_probes_and(package: &Package, probes: &Probes, more: &str) -> Session {
+    let profile = format!("{LOOKUP_STAND_IN}\n{more}");
     let mut session = if package.kind == ShellKind::PowerShell {
         Session::start_with_environment_and_profile(
             package,
             &probes.environment(),
             Profile {
-                after_entry: LOOKUP_STAND_IN,
+                after_entry: &profile,
                 ..Profile::ORDINARY
             },
         )
