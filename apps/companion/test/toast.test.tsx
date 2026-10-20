@@ -299,13 +299,14 @@ describe('where a message is drawn', () => {
     dialog.remove()
   })
 
-  it('brings the focus to the dialog\'s first stop, which commits nothing, when the message that had it goes in a dialog', () => {
+  it('brings the focus to the control that closes the dialog when the message that had it goes in it', () => {
     const dialog = document.createElement('div')
     dialog.setAttribute('role', 'dialog')
-    const close = document.createElement('button')
-    const dock = document.createElement('div')
     const decision = document.createElement('button')
-    dialog.append(close, dock, decision)
+    const dock = document.createElement('div')
+    const close = document.createElement('button')
+    close.setAttribute('data-sheet-close', '')
+    dialog.append(decision, dock, close)
     document.body.append(dialog)
 
     render(<Toast message={MESSAGE} onDismiss={() => undefined} />)
@@ -319,7 +320,71 @@ describe('where a message is drawn', () => {
     act(() => {
       dismiss.click()
     })
-    expect(document.activeElement, 'the control that closes the dialog has it, not a decision').toBe(close)
+    expect(document.activeElement, 'the control that closes the dialog has it, not the decision').toBe(close)
+    act(() => {
+      take()
+    })
+    dialog.remove()
+  })
+
+  it('goes on to the control that closes the dialog when where the focus came from refuses it', () => {
+    const dialog = document.createElement('div')
+    dialog.setAttribute('role', 'dialog')
+    const origin = document.createElement('button')
+    const dock = document.createElement('div')
+    const close = document.createElement('button')
+    close.setAttribute('data-sheet-close', '')
+    dialog.append(origin, dock, close)
+    document.body.append(dialog)
+
+    render(<Toast message={MESSAGE} onDismiss={() => undefined} />)
+    let take: () => void = () => undefined
+    act(() => {
+      take = offerToastDock(dock)
+    })
+    const dismiss = within(dock).getByRole('button', { name: 'Dismiss' })
+    origin.focus()
+    fireEvent.focusIn(dismiss, { relatedTarget: origin })
+    dismiss.focus()
+    // The control the focus came from is not usable by the time the message goes.
+    origin.disabled = true
+    act(() => {
+      dismiss.click()
+    })
+    expect(document.activeElement, 'the focus is not left on nothing').toBe(close)
+    act(() => {
+      take()
+    })
+    dialog.remove()
+  })
+
+  it('forgets where the focus came from when it comes in again from nowhere', () => {
+    const dialog = document.createElement('div')
+    dialog.setAttribute('role', 'dialog')
+    const origin = document.createElement('button')
+    const dock = document.createElement('div')
+    const close = document.createElement('button')
+    close.setAttribute('data-sheet-close', '')
+    dialog.append(origin, dock, close)
+    document.body.append(dialog)
+
+    render(<Toast message={MESSAGE} onDismiss={() => undefined} />)
+    let take: () => void = () => undefined
+    act(() => {
+      take = offerToastDock(dock)
+    })
+    const dismiss = within(dock).getByRole('button', { name: 'Dismiss' })
+    origin.focus()
+    fireEvent.focusIn(dismiss, { relatedTarget: origin })
+    dismiss.focus()
+    dismiss.blur()
+    // It comes in again with no control to name, as a press does where the focus was on nothing.
+    fireEvent.focusIn(dismiss, { relatedTarget: null })
+    dismiss.focus()
+    act(() => {
+      dismiss.click()
+    })
+    expect(document.activeElement, 'the old origin is not given the focus').toBe(close)
     act(() => {
       take()
     })

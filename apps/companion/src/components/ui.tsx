@@ -415,17 +415,16 @@ function stopsOf(surface: HTMLElement): HTMLElement[] {
 }
 
 /**
- * Gives the focus to the first of `choices` that takes it, and says whether one did. A control that is
- * disabled, inert or hidden refuses a call to `focus()` and leaves the focus on the page's body, where
- * a keyboard would start again from behind the surface.
+ * Gives the focus to the first of `choices` that takes it. A control that is disabled, inert or
+ * hidden refuses a call to `focus()` and leaves the focus on the page's body, where a keyboard would
+ * start again from behind the surface, so each choice is tried until one has it.
  */
-function focusFirst(choices: readonly (HTMLElement | null)[]): boolean {
+function focusFirst(choices: readonly (HTMLElement | null)[]): void {
   for (const choice of choices) {
     if (choice === null || !choice.isConnected) continue
     choice.focus()
-    if (document.activeElement === choice) return true
+    if (document.activeElement === choice) return
   }
-  return false
 }
 
 /**
@@ -470,8 +469,9 @@ function HeldToast({
   // Where the focus was before it came into the card, for the card to give it back when it goes: a
   // card that goes while it has the focus would leave it on nothing, and a keyboard in a surface that
   // holds the focus would start again from the page behind it. Only a card that has the focus gives
-  // it back, to where it came from if that is still in the card's own dialog, or else to the stop
-  // beside the card in it; a press that took no focus, as one in WebKit, moves nothing.
+  // it back, to where it came from if that is still in the card's own dialog, or else to the control
+  // that closes the dialog, which commits nothing; a press that took no focus, as one in WebKit, moves
+  // nothing.
   const cameFrom = useRef<HTMLElement | null>(null)
   useEffect(() => {
     cameFrom.current = null
@@ -484,9 +484,8 @@ function HeldToast({
     if (act !== undefined || !hadFocus) return
     const dialog = dock?.closest<HTMLElement>('[role="dialog"]') ?? null
     const owned = back !== null && (dialog === null || dialog.contains(back)) ? back : null
-    // Where it came from if that is in the card's own dialog; else the dialog's first stop, which is
-    // the control that closes it and commits nothing.
-    focusFirst([owned, ...(dialog === null ? [] : stopsOf(dialog).filter((stop) => !dock?.contains(stop)).slice(0, 1))])
+    // Where it came from if that is in the card's own dialog; else the control that closes the dialog.
+    focusFirst([owned, dialog?.querySelector<HTMLElement>('[data-sheet-close]') ?? null])
   }
   const card = (
     <ToastCard
@@ -984,7 +983,7 @@ export function Sheet({
             <h2 id={titleId}>{title}</h2>
             {description ? <p className="muted">{description}</p> : null}
           </div>
-          <IconButton label={closeLabel} onClick={close}>
+          <IconButton label={closeLabel} onClick={close} data-sheet-close>
             ×
           </IconButton>
         </header>

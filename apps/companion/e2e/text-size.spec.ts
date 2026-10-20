@@ -1313,7 +1313,8 @@ test.describe('a passing message that comes while a sheet is open', () => {
   }
 
   // A sheet keeps the focus: a message that goes while it has the focus does not leave it on the page
-  // behind. The Account sheet has no footer, so nothing follows the message in it.
+  // behind. It goes back to where it came from in the sheet, and where that is gone (a press that
+  // left the focus on nothing) to the control that closes the sheet, which commits nothing.
   test('keeps the focus in the sheet when the message that has it goes', async ({ page, browserName }) => {
     await page.setViewportSize({ width: 1280, height: 720 })
     await page.goto('/harness.html')
@@ -1321,41 +1322,50 @@ test.describe('a passing message that comes while a sheet is open', () => {
     await page.getByRole('button', { name: /^Account/ }).click()
     const sheet = page.getByTestId('sheet')
     await expect(sheet).toHaveAttribute('data-presentation', 'here', { timeout: PRESENTATION_DEADLINE })
-    await page.evaluate((view) => {
-      window.krTestHost?.setConfirmations(view)
-    }, REQUEST)
+    const arrive = async (reference: string) => {
+      await page.evaluate(
+        ([view, ref]) => {
+          window.krTestHost?.setConfirmations({
+            ...view,
+            requests: [{ ...view.requests[0], reference: ref }]
+          })
+        },
+        [REQUEST, reference] as const
+      )
+      await expect(page.locator('.toast')).toContainText('needs your confirmation')
+      await page.locator('.toast').dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
+    }
     const toast = page.locator('.toast')
-    await expect(toast).toContainText('needs your confirmation')
-    await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
     const dismiss = toast.getByRole('button', { name: 'Dismiss' })
     const where = () =>
       page.evaluate(() => {
         const here = document.activeElement
         if (here === null || here === document.body) return 'nothing'
-        if (here.closest('.dialog-header') !== null) return 'the header'
+        if (here.closest('[data-sheet-close]') !== null) return 'the control that closes the sheet'
         return here.closest('[role="dialog"]') !== null ? 'the dialog' : 'the page behind'
       })
-    // Dismissed from the keyboard, with the focus in the message: it goes back to where it came from,
-    // which is in the sheet.
+
+    // From the keyboard, with the focus in the message: it goes back to the control in the sheet's
+    // body it came from, and not to the control that closes the sheet.
+    await arrive('request-1')
+    const body = page.getByRole('dialog').locator('.dialog-body').locator('button, input, select, [tabindex="0"]').first()
+    await body.focus()
+    await expect(body).toBeFocused()
     await dismiss.focus()
     await page.keyboard.press('Enter')
     await expect(toast).toHaveCount(0)
-    expect(await where(), 'the focus is in the sheet when the message has gone').not.toMatch(/nothing|page behind/)
+    await expect(body, 'the focus is back where it came from').toBeFocused()
 
-    // Dismissed by a press while the focus was on nothing (a press on text of the sheet, where the engine
-    // that gives a button the focus on a press makes the message's control the focused one): the
-    // focus goes to the control that closes the sheet and commits nothing. WebKit takes no focus on
-    // a press, so there the press moves nothing.
-    await page.evaluate((view) => {
-      window.krTestHost?.setConfirmations({ ...view, requests: [{ ...view.requests[0], reference: 'request-2' }] })
-    }, REQUEST)
-    await expect(toast).toContainText('needs your confirmation')
-    await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
+    // Dismissed by a press while the focus was on nothing (a press on text of the sheet): where the
+    // engine gives a button the focus on a press, the focus goes to the control that closes the sheet,
+    // and WebKit, which takes no focus on a press, moves nothing; neither puts it on the page behind.
+    await arrive('request-2')
     await page.getByRole('dialog').getByText('Sessions keep running while this is open.').click()
+    expect(await where(), 'the press left the focus on nothing').toBe('nothing')
     await dismiss.click()
     await expect(toast).toHaveCount(0)
     if (browserName === 'chromium') {
-      expect(await where(), 'the focus is on the control that closes the sheet').toBe('the header')
+      expect(await where(), 'the focus is on the control that closes the sheet').toBe('the control that closes the sheet')
     } else {
       expect(await where(), 'the focus is not on the page behind').not.toBe('the page behind')
     }

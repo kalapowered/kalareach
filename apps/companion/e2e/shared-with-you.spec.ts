@@ -630,10 +630,15 @@ test.describe('a message in passing over the card an invitation opens', () => {
       })
     await expect.poll(overlaps, 'where the message and the card overlap').toEqual([])
     // The footer is where it is without the message: the message moves nothing of what the card asks
-    // of the person, whether the card has room for it or not. It is read before anything is pressed,
-    // since a press can scroll a card that is fuller than its window.
+    // of the person, whether the card has room for it or not. Its place is read with the card's own
+    // scroll added back, since a press scrolls a card that is fuller than its window, and a scroll is
+    // not a move of the footer in the card.
     const footerTop = () =>
-      page.evaluate(() => document.querySelector('.sheet .dialog-footer')?.getBoundingClientRect().top ?? -1)
+      page.evaluate(() => {
+        const sheet = document.querySelector('.sheet')
+        const footer = document.querySelector('.sheet .dialog-footer')
+        return sheet === null || footer === null ? -1 : footer.getBoundingClientRect().top + sheet.scrollTop
+      })
     const withMessage = await footerTop()
     // A trial press fails where something else would take it: both actions of the card, and the
     // message's own Dismiss, which the card's body must not lie over in any engine's paint order.
