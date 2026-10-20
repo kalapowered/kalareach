@@ -1400,3 +1400,28 @@ fn literals_that_look_like_code_do_not_change_what_is_read() {
         );
     }
 }
+
+/// This tree's own `retained.rs` reads, with the reader the cut uses, as the roots and the plugin
+/// host protocol the build has, so a form the reader refuses is found in the commit that writes it
+/// and not at the next release, whose tag cannot change.
+#[test]
+fn this_trees_retained_source_reads_as_the_build_has_it() {
+    use crate::public_majors::{string_const, string_list};
+    use kr_protocol::retained::{PLUGIN_HOST_PROTOCOL, SURFACE_ROOTS};
+    let source = include_str!("../../retained.rs");
+    assert_eq!(
+        string_list(source, "SURFACE_ROOTS").expect("read"),
+        Some(
+            SURFACE_ROOTS
+                .iter()
+                .map(|root| (*root).to_owned())
+                .collect()
+        )
+    );
+    assert_eq!(
+        string_const(source, "PLUGIN_HOST_PROTOCOL")
+            .expect("read")
+            .as_deref(),
+        Some(PLUGIN_HOST_PROTOCOL)
+    );
+}
