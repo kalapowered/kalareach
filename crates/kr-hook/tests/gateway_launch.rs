@@ -77,11 +77,12 @@ fn kr_req_12_07_a_plain_launch_of_a_terminal_with_a_server_is_served_by_a_gatewa
     assert!(ended.instance.ended_at.is_present(), "{ended:?}");
 }
 
-/// KR-REQ-11.32: only the process the launch registered reaches the gateway, and an upgrade a
-/// browser could have sent does not use the admission: another process that speaks a plain upgrade
-/// to the socket, while the program has become the terminal and not yet connected, is closed
-/// without a word, and the program whose first upgrade is refused for its `Origin` header connects
-/// again and runs its whole session.
+/// KR-REQ-11.32 and KR-REQ-12.07: only the process the launch registered reaches the gateway, and
+/// an upgrade a browser could have sent does not use the admission: another process that speaks a
+/// plain upgrade to the socket, while the program has become the terminal and not yet connected, is
+/// closed without a word, and the program whose first upgrade is refused for its `Origin` header
+/// connects again and runs its whole session. The gateway's socket is bound before the launcher is
+/// told of the committed launch, so before the program runs.
 #[test]
 fn kr_req_11_32_only_the_registered_process_reaches_the_gateway() {
     let shell = Gateway::new();
@@ -228,8 +229,9 @@ fn kr_req_12_07_an_environment_that_cannot_be_presented_runs_the_program_as_type
     }
 }
 
-/// KR-REQ-07.60: a server whose record cannot be written is not left running: a daemon could not
-/// stop it after this worker, so the launch is given back and the program runs as typed.
+/// KR-REQ-07.60 and KR-REQ-12.07: a server whose record cannot be written is not left running: a
+/// daemon could not stop it after this worker, so the launch is given back and the program runs as
+/// typed.
 #[test]
 fn kr_req_07_60_a_server_whose_record_cannot_be_written_is_not_left_running() {
     let shell = Gateway::new();
@@ -547,8 +549,9 @@ fn kr_req_11_35_a_ledger_fault_in_live_traffic_keeps_the_session_and_fences_rich
     );
 }
 
-/// KR-REQ-07.60: a program that was started and never connects, as one that ran as typed does not,
-/// ends the instance and the server at the bound, and the program is left to run.
+/// KR-REQ-07.60 and KR-REQ-12.07: a program that was started and never connects, as one that ran as
+/// typed does not, ends the instance and the server at the bound, and the program is left to run.
+/// The server is started and recorded before the launch commits, and the instance is a gateway's.
 #[test]
 fn kr_req_07_60_a_program_that_never_connects_ends_its_instance_and_server_at_the_bound() {
     let shell = Gateway::new();
@@ -737,10 +740,11 @@ fn kr_req_07_60_a_close_ends_the_server_and_what_it_started_after_the_acceptance
     );
 }
 
-/// KR-REQ-07.60 and KR-REQ-07.53: a server that ignores both the end of its input and a terminate,
-/// with a command that ignores a terminate too, is ended by force with the command when the program
-/// ends, and neither is forced before five seconds after the program's end began the ending. Each
-/// is watched from the moment the program is killed, so a command forced early is seen to be.
+/// KR-REQ-07.60, KR-REQ-07.53 and KR-REQ-07.67: a server that ignores both the end of its input and
+/// a terminate, with a command that ignores a terminate too, is ended by force with the command
+/// when the program ends, and neither is forced before five seconds after the program's end began
+/// the ending. Each is watched from the moment the program is killed, so a command forced early is
+/// seen to be.
 #[test]
 fn kr_req_07_60_a_stubborn_server_and_its_command_end_by_force_with_the_program() {
     let shell = Gateway::new();
