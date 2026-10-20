@@ -136,19 +136,22 @@ pub enum StaleRefusal {
 }
 
 /// One fault a test arranged: the `nth` request to `path` from now on, counting from one, fails.
-/// When it names `matching`, only the requests whose body carries every one of its members count.
+/// When it names `matching`, only the requests whose body carries every one of its members count;
+/// when it names `member`, only the requests whose body carries a member of that name.
 #[derive(Clone, Debug)]
 struct Fault {
     path: &'static str,
     nth: u32,
     moment: Moment,
     matching: Option<serde_json::Value>,
+    member: Option<&'static str>,
 }
 
 impl Fault {
     /// Whether a request to `path` with this body is one this fault counts.
     fn counts(&self, path: &str, body: &serde_json::Value) -> bool {
         path == self.path
+            && self.member.is_none_or(|name| body.get(name).is_some())
             && self.matching.as_ref().is_none_or(|wanted| {
                 wanted.as_object().is_some_and(|members| {
                     members
@@ -774,6 +777,26 @@ impl ServiceWeb {
             nth,
             moment,
             matching: None,
+            member: None,
+        });
+    }
+
+    /// As [`Self::fail`], counting only the requests to `path` whose body carries a member called
+    /// `member`, whatever its value, so a fault meets one kind of request however many of another
+    /// kind the daemon sends (a read of a feed, say, and not the publication to it).
+    pub fn fail_with_member(
+        &self,
+        path: &'static str,
+        member: &'static str,
+        nth: u32,
+        moment: Moment,
+    ) {
+        self.faults.lock().expect("the faults").push(Fault {
+            path,
+            nth,
+            moment,
+            matching: None,
+            member: Some(member),
         });
     }
 
@@ -800,6 +823,7 @@ impl ServiceWeb {
             nth,
             moment,
             matching: Some(matching),
+            member: None,
         });
     }
 
