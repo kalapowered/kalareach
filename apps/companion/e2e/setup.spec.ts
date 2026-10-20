@@ -736,6 +736,12 @@ test.describe('the first-start assistant', () => {
         await card.getByTestId('setup-model-download').click()
         await expect(card.getByTestId('setup-model-cancel')).toHaveText('Cancel the download')
         await footerHolds(page, 'the card during a fetch', card, footer, width)
+        // The progress of the fetch is drawn in the card's body, inside the window.
+        await expect(card.getByRole('progressbar', { name: 'Download progress' })).toBeVisible()
+        expect(
+          await overrunning(page, '[data-testid="setup-model"]'),
+          'the card during a fetch draws past its box'
+        ).toEqual([])
 
         // While the host does not answer: the control that asks again.
         await page.evaluate(() => {
@@ -772,12 +778,17 @@ test.describe('the first-start assistant', () => {
                 const style = getComputedStyle(part)
                 const line = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.4
                 const lines = Math.round(box.height / line)
+                const words = (part.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 40)
                 // A part that takes more than a line has most of the list's width.
                 if (lines > 1 && box.width < room * 0.8) {
-                  const words = (part.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 40)
                   found.push(
                     `${words}: ${String(lines)} lines in ${String(Math.round(box.width))} of ${String(Math.round(room))} px`
                   )
+                }
+                // And a value that takes more than a line does not share one with its label.
+                const label = part.tagName === 'DD' ? part.previousElementSibling : null
+                if (lines > 1 && label !== null && label.getBoundingClientRect().bottom > box.top + 1) {
+                  found.push(`${words}: shares a line with its label`)
                 }
               }
             }
