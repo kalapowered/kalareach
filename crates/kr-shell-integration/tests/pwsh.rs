@@ -847,3 +847,10 @@ fn the_child_probe_starts_a_package_whose_path_holds_a_quote_and_a_space() {
         String::from_utf8_lossy(&asked.stderr)
     );
 }
+
+/// KR-REQ-12.07
+#[test]
+#[ignore = "drives this tree's built PSReadLine package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_launch_of_a_command_the_lookup_handler_asks_about_is_asked_about() {
+    shellpkg::a_launch_of_a_command_the_lookup_handler_asks_about_is_asked_about(PWSH);
+}

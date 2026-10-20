@@ -15,6 +15,7 @@ use kr_shell_integration::contract::requests::{
     WorkerRequest,
 };
 
+use super::commands::{Probes, a_session_with_probes};
 use super::*;
 
 /// Writes a program into the session's home that prints each argument it was given between angle
@@ -256,4 +257,46 @@ pub fn a_launch_of_a_name_that_is_no_application_is_refused_and_installs_nothing
         "a function ran in the place of a program:\n{}",
         session.terminal_output()
     );
+}
+
+/// KR-REQ-12.07: a launch of a command the host's lookup handler asks the worker about is asked
+/// about, as the same command typed at the prompt is.
+///
+/// The handler answers for a command typed by its name, and runs a path as typed. A launch whose
+/// line carried the program's path would start it with none of what an enabled integration adds,
+/// so the case launches a program found on the search path and reads what the handler asked.
+pub fn a_launch_of_a_command_the_lookup_handler_asks_about_is_asked_about(kind: ShellKind) {
+    let package = Package::built(kind);
+    let probes = Probes::new();
+    let mut session = a_session_with_probes(&package, &probes);
+
+    let before = session.written();
+    let decision = launch_vector(
+        &mut session,
+        ["kr-probe", "one", "two words"].map(str::to_owned).to_vec(),
+        60,
+        0xa1,
+    );
+    assert!(
+        matches!(decision, LaunchDecision::Accepted(_)),
+        "an empty fenced prompt refused a launch: {decision:?}"
+    );
+    session.nudge();
+    session.expect_event("command_accepted", |event| {
+        matches!(event, BridgeEvent::CommandAccepted(_))
+    });
+    assert!(
+        session.drew_after(before, "probe-ran", REPLY).was_drawn(),
+        "the program did not run:\n{}",
+        session.terminal_output()
+    );
+    let asked = &session.commands.resolves;
+    assert_eq!(
+        asked.len(),
+        1,
+        "a launch of a command the handler answers for was asked about {} times: {asked:?}",
+        asked.len()
+    );
+    assert_eq!(asked[0].argv, ["kr-probe", "one", "two words"]);
+    assert_eq!(asked[0].executable, told(&probes.probe()));
 }
