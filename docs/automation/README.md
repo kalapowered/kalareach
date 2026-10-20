@@ -531,30 +531,32 @@ A test result is what this host observed, and nothing a caller reports.
   build directory. Those paths are left out of the comparison and recorded as one reference each:
   a directory is a digest of its sorted listing (path, length and instant written of every entry,
   links listed and not followed) with the sum of the lengths it lists, up to 50,000 entries, 64
-  levels and 16 MiB of path text, after which it is a truncated listing; a file is a digest of its first 64 MiB with its whole length; a
-  link, or an object that is neither, is recorded as what it is. A directory in an output that is
-  a link, or a mount, or has a name this host does not carry, is an entry of the listing and is not
-  entered. Nothing in an output enters the content store, and a result that attests the version
-  names the output paths it left out of the comparison. A path the suite adds beside an output
-  still changes the source, so a tool that writes beside each source directory (a compiled-code
-  cache is the usual one) makes each run of that suite unknown and stores what it wrote as a
-  version of its own, because a declaration is an exact path and no pattern. An ancestor of an
-  output is entered only to reach it, and declarations that repeat, lie inside one another or
-  contradict a path the version holds are refused before the suite runs. So is a declaration with
-  a name this host does not carry as input (a colon, one of `< > " | ? *`, a trailing dot or
-  space, a name a Windows device has with or without an extension, a name over 255 bytes), which
-  the configuration accepts and every dispatch of that suite then refuses.
+  levels and 16 MiB of path text, after which it is a truncated listing; a file is a digest of its
+  first 64 MiB with its whole length; a link, or an object that is neither, is recorded as what it
+  is. A directory in an output that is a link, or a mount, or has a name this host does not carry,
+  is an entry of the listing and is not entered. Nothing in an output enters the content store, and
+  a result that attests the version names the output paths it left out of the comparison. A path
+  the suite adds beside an output still changes the source, so a tool that writes beside each
+  source directory (a compiled-code cache is the usual one) makes each run of that suite unknown
+  and stores what it wrote as a version of its own, because a declaration is an exact path and no
+  pattern. An ancestor of an output is entered only to reach it, and declarations that repeat, lie
+  inside one another or contradict a path the version holds are refused before the suite runs. So
+  is a declaration with a name this host does not carry as input (a colon, one of `< > " | ? *`, a
+  trailing dot or space, a name a Windows device has with or without an extension, a name over 255
+  bytes), which the configuration accepts and every dispatch of that suite then refuses.
 * **The copy's release.** A copy is taken away when its node settles, and by the sweep for a node
   that did not release it. The owner's right to change each of the copy's directories is given
   back first, so a tree a run left read-only does not hold the version, and each level is removed
   through its own handle, without following a link and without leaving the mount the copy is on.
-  Only this host's own directories change, and only those on the copy's own mount. A copy is not
-  removed, and goes on holding its version, when it has anything this account cannot take away: a
-  mount (of another filesystem, a bind mount of the same one, or a volume on another device such as
-  a subvolume), a tree deeper than 128 levels, a directory its owner cannot read, a directory
-  another account owns that holds entries (a container that ran as root leaves these), or on
-  macOS an entry with the immutable or append-only flag set or an access-control entry that denies
-  deletion. The sweep keeps trying, its log names why, and a person removes what the suite left.
+  Only this host's own directories change, and only those on the copy's own mount. A copy that
+  holds something the removal cannot take away is not removed and goes on holding its version: a
+  mount (of another filesystem, or a bind mount of the same one), a volume on another device that
+  is no mount (a btrfs subvolume), a tree deeper than 128 levels, a directory below the root that
+  its owner cannot read, a directory that another account owns and this account cannot empty (a
+  container that ran as root leaves these), on Linux a root its owner cannot search where `/proc`
+  is not mounted, or on macOS an entry with the immutable or append-only flag set or one that an
+  access-control entry forbids this account to delete. The sweep keeps trying, its log names why,
+  and a person removes what the suite left.
 * **Reviews.** A reviewer session and the attention items for review results are refused by name
   (`request_review`, `attention_notice`); no caller can register a test or review result.
 

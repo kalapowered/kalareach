@@ -1489,8 +1489,9 @@ pub fn release(
 /// on the mount of the copy's root, compared as the project's authority compares one (a mount of
 /// the same filesystem is another mount, and nothing in it is touched). The root's own mode is
 /// given back through the library's handle, which needs no right to search the directory. Only
-/// this host's own directories change. A directory whose owner cannot read it, or that another
-/// account owns, cannot be changed, so it is left and the removal that follows fails and says why.
+/// this host's own directories change. A directory below the root whose owner cannot read it, or
+/// that another account owns, cannot be changed, so it is left, and the removal that follows takes
+/// it away only if it holds nothing and otherwise fails and says why.
 #[cfg(unix)]
 fn make_removable(directory: &AuthorisedDirectory) {
     use cap_std::fs::Dir;
@@ -1554,12 +1555,7 @@ fn make_removable(directory: &AuthorisedDirectory) {
     // directory it holds; where it is a path descriptor (Linux) it is changed through the kernel's
     // name for the descriptor, which needs no right to search the directory.
     if fchmod(directory.handle(), Mode::RWXU).is_err() {
-        use std::os::fd::AsRawFd as _;
-
-        let _ = rustix::fs::chmod(
-            format!("/proc/self/fd/{}", directory.handle().as_raw_fd()),
-            Mode::RWXU,
-        );
+        give_back_through_proc(directory.handle());
     }
     let Some(mount) = directory.mount() else {
         return;
@@ -1573,6 +1569,22 @@ fn make_removable(directory: &AuthorisedDirectory) {
         repair(directory.environment_id(), &root, mount, 0);
     }
 }
+
+/// Gives the owner the right to change a directory that a path descriptor holds, through the name
+/// the kernel gives that descriptor in `/proc/self/fd`: the name leads to the object the
+/// descriptor holds and is not looked up beneath the directory, so the owner's right to search it
+/// is not needed. Where `/proc` is not mounted nothing changes and the copy stays.
+#[cfg(target_os = "linux")]
+fn give_back_through_proc(handle: &impl std::os::fd::AsRawFd) {
+    let _ = rustix::fs::chmod(
+        format!("/proc/self/fd/{}", handle.as_raw_fd()),
+        rustix::fs::Mode::RWXU,
+    );
+}
+
+/// A descriptor `fchmod` refuses is left as it is where there is no `/proc`.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn give_back_through_proc(_handle: &impl std::os::fd::AsRawFd) {}
 
 /// Nothing to give back where a directory has no owner's right to lose.
 #[cfg(not(unix))]
