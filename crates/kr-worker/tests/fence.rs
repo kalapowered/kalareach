@@ -5151,6 +5151,57 @@ async fn an_intervening_local_edit_is_a_draft_conflict() {
     wired.close().await;
 }
 
+/// KR-REQ-23.54: a command that holds a NUL is refused before the reader is asked.
+///
+/// Every shell and every exec reads a NUL as the end of a string, so the command the person would
+/// see run is not the one named. The same is refused in an argument vector and in a command the
+/// caller already quoted, and the reader is asked about neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_that_holds_a_nul_is_refused_and_the_reader_is_never_asked() {
+    for command in [
+        LaunchCommand::Arguments(vec!["ls".to_owned(), "a\0b".to_owned()]),
+        LaunchCommand::Arguments(vec!["l\0s".to_owned()]),
+        LaunchCommand::QuotedCommand("echo a\0b".to_owned()),
+    ] {
+        let mut wired = wired().await;
+        let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+        let _holder = holder_over(&mut client, &wired).await;
+        let fence = fenced(&mut wired, 1, 1).await;
+        let params = ShellLaunchParams {
+            session_id: wired.session_id,
+            command: command.clone(),
+            expected_prompt_generation: fence.prompt_generation,
+            expected_buffer_revision: EditorBufferRevision::new(1),
+        };
+        let target = wired.target();
+        let calling = tokio::spawn(async move {
+            client
+                .mutate(
+                    Method::ShellLaunch,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    target,
+                    &params,
+                )
+                .await
+        });
+        let error = tokio::time::timeout(SOON, calling)
+            .await
+            .unwrap_or_else(|_| panic!("{command:?} was not answered: it is with the reader"))
+            .expect("joins")
+            .expect("reaches the worker")
+            .expect_err("refused");
+        assert_eq!(error.code, ErrorCode::InvalidArgument, "{command:?}");
+        assert_eq!(
+            wired.runtime.session().outstanding_launches(),
+            Some(0),
+            "{command:?} was handed to the reader"
+        );
+        wired.close().await;
+    }
+}
+
 /// KR-REQ-07.83, decision A-17: a reader that never answers leaves the outcome unknown, and the
 /// held input is released rather than lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
