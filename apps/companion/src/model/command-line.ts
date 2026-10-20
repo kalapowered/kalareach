@@ -23,9 +23,10 @@ function word(argument: string, kind: ShellKind): string {
     // not, and the array expression is the one spelling that passes it on.
     if (argument === '--%') return "@('--%')"
     // `@` at the start of a word splats a variable and a comma makes a list. A word that starts with
-    // one dash is read as a parameter: one that holds a dot is cut at the dot, and one that ends in
-    // a colon waits for a value, which is a parse error where it ends the line.
-    const parameter = /^-[^-]/.test(argument) && (argument.includes('.') || argument.endsWith(':'))
+    // one dash is read as a parameter: a dot cuts it in two, and a colon makes the next word its
+    // value, which is a parse error at the end of a line and a changed argument list in the middle
+    // of a word like `-a:-b:c`.
+    const parameter = /^-[^-]/.test(argument) && /[.:]/.test(argument)
     if (PLAIN.test(argument) && !/[@,]/.test(argument) && !parameter) return argument
     return `'${argument.replace(POWERSHELL_QUOTES, '$&$&')}'`
   }

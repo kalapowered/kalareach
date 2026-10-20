@@ -50,13 +50,15 @@ describe('a command written for the shell that reads it', () => {
     for (const argument of ['-Dfoo.bar=baz', '-o.txt', '-a.b', '-v1.2']) {
       expect(commandLine(['show', argument], 'powershell')).toBe(`show '${argument}'`)
     }
-    // A word with a colon at the end waits for a value, which no later word gives it where it is
-    // the last of the line.
-    expect(commandLine(['show', 'x', '-x:'], 'powershell')).toBe("show x '-x:'")
+    // A word with a colon waits for a value: none follows it at the end of a line, and the next
+    // word or a dash inside it changes the arguments in the middle of one.
+    for (const argument of ['-x:', '-a:b', '-a:--', '-a:-b:c', '-x:--%']) {
+      expect(commandLine(['show', 'x', argument], 'powershell')).toBe(`show x '${argument}'`)
+    }
     // A word with two dashes, or none, is whole as it is.
-    expect(commandLine(['show', '--model=gpt-5.1', '--a.b', '-a:b', 'a.b'], 'powershell')).toBe(
-      'show --model=gpt-5.1 --a.b -a:b a.b'
-    )
+    expect(
+      commandLine(['show', '--model=gpt-5.1', '--a.b', '--a:--', 'a:-b:c', 'a.b'], 'powershell')
+    ).toBe('show --model=gpt-5.1 --a.b --a:-- a:-b:c a.b')
   })
 
   it('quotes a word Zsh reads as the path of a command and one Fish reads as a process number', () => {
