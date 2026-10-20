@@ -11,6 +11,7 @@
 use std::path::Path;
 
 use kr_shell_integration::contract::qualification::{DetachExclusion, ShellKind};
+use kr_shell_integration::host::quoting::quote;
 
 use super::told;
 
@@ -128,15 +129,18 @@ pub fn print_assembled(kind: ShellKind, marker: &str) -> String {
 }
 
 /// The child probe: the same package started as a child of the managed root shell.
+///
+/// The executable is one word of the shell's own, quoted the way the host quotes any path it
+/// writes for that shell, so a path with a space or a quote in it is still the one file.
 #[must_use]
 pub fn child_probe(kind: ShellKind, executable: &Path) -> String {
-    let executable = told(executable);
+    let executable = quote(kind, &told(executable));
     match kind {
         // The word the caller waits for is put together by the child out of pieces, so it reaches
         // the screen because the child ran and printed it rather than because the line that
         // started it was echoed back.
         ShellKind::PowerShell => format!(
-            "& '{executable}' -NoLogo -NoProfile -Command 'if ($env:KR_SHELL_BRIDGE) {{ \"kr-child=\" + \"[$env:KR_SHELL_BRIDGE]\" }} else {{ \"kr-child=\" + \"[unset]\" }}'"
+            "& {executable} -NoLogo -NoProfile -Command 'if ($env:KR_SHELL_BRIDGE) {{ \"kr-child=\" + \"[$env:KR_SHELL_BRIDGE]\" }} else {{ \"kr-child=\" + \"[unset]\" }}'"
         ),
         ShellKind::Fish => format!(
             "{executable} -c 'echo kr-child=[(set -q KR_SHELL_BRIDGE; and echo $KR_SHELL_BRIDGE; or echo unset)]'"
