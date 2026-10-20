@@ -865,24 +865,24 @@ fn a_launch_of_a_name_only_a_lookup_hook_answers_is_refused() {
 /// KR-REQ-23.54: a first word that no application has is refused even when PowerShell would run
 /// another program for it.
 ///
-/// A name that nothing answers is looked for once more as `get-` and the name, so a program called
-/// `get-kr-fallback` is what a typed `kr-fallback` starts. A launch names a program, and that one
-/// is not the program it named, so there is no line to install; the name `get-kr-fallback` itself
-/// is a program and has one.
+/// A name with no dash in it that nothing answers is looked for once more as `get-` and the name,
+/// so a program called `get-krfallback` is what a typed `krfallback` starts. A launch names a
+/// program, and that one is not the program it named, so there is no line to install; the name
+/// `get-krfallback` itself is a program and has one.
 #[test]
 #[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn a_launch_of_a_name_only_the_get_fallback_answers_is_refused() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let directory = tempfile::tempdir().expect("a temporary directory");
-    let program = directory.path().join("get-kr-fallback");
+    let program = directory.path().join("get-krfallback");
     std::fs::write(&program, "#!/bin/sh\necho fallback-ran\n").expect("a program");
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
         .expect("the program can be run");
     let output = in_the_package_host(&format!(
         "$env:PATH = '{}' + [System.IO.Path]::PathSeparator + $env:PATH; \
-         $asked = & $module {{ Get-KrLaunchText @{{ arguments = @('kr-fallback', 'a') }} }}; \
-         $named = & $module {{ Get-KrLaunchText @{{ arguments = @('get-kr-fallback', 'a') }} }}; \
+         $asked = & $module {{ Get-KrLaunchText @{{ arguments = @('krfallback', 'a') }} }}; \
+         $named = & $module {{ Get-KrLaunchText @{{ arguments = @('get-krfallback', 'a') }} }}; \
          Write-Output \"kr-key[asked]=[$asked]\"; Write-Output \"kr-key[named]=[$named]\"",
         shellpkg::told(directory.path())
     ));
@@ -893,7 +893,7 @@ fn a_launch_of_a_name_only_the_get_fallback_answers_is_refused() {
     );
     assert_eq!(
         said(&output, "named"),
-        "& 'get-kr-fallback' 'a'",
+        "& 'get-krfallback' 'a'",
         "the program's own name was refused:\n{output}"
     );
 }
