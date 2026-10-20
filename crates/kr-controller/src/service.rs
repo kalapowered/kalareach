@@ -1218,6 +1218,11 @@ mod a_transfer_to_a_device_revoked_since;
 #[cfg(test)]
 mod a_share_whose_recipient_ran_out_since;
 
+/// A withdrawal of the invitations over a closed session that meets an end a request found and has
+/// not written down yet.
+#[cfg(test)]
+mod a_withdrawal_that_meets_an_end_not_yet_written;
+
 /// An action an earlier build claimed in the grant store alone, as the route check finds it.
 #[cfg(test)]
 mod a_voice_receipt_from_an_earlier_build;

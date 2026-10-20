@@ -1018,6 +1018,65 @@ async fn kr_req_18_13_a_withdrawal_leaves_an_invitation_whose_end_was_found_sinc
     host.stop().await;
 }
 
+/// KR-REQ-18.13: a redeem that finds an invitation's end on the wall clock between the close's
+/// reading of the waiting invitations and its withdrawal marks the invitation as run out, and the
+/// withdrawal leaves it so: the issuer is told `expired` and not `revoked`. The wall clock is moved
+/// by hand past the end after the reading, and the withdrawal is handed the time of the reading.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_18_13_a_withdrawal_leaves_an_invitation_a_redeem_found_run_out_since_it_was_read() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let wall = MovedWall::new();
+    let host = Host::start_on_clocks(&owner, wall.clocks()).await;
+    let (device, record) = recipient(&host, &owner).await;
+    let connection = RawDevice::connect(&host, &device, &record).await;
+    let (session, _) = an_open_session(&host);
+    let short = share_with(
+        &host,
+        session,
+        record.device_id,
+        RoleSelection::plain(SessionRole::Viewer),
+        Some(60_000),
+    )
+    .await
+    .expect("a short share is written");
+    let grants = host.controller().sharing().grants();
+    let read_at = wall.now_ms();
+    let read = grants
+        .waiting_invitations(&std::collections::BTreeSet::from([session]), read_at)
+        .expect("the waiting invitations are read");
+    assert_eq!(read.len(), 1);
+    wall.advance(Duration::from_secs(5 * 60));
+    connection
+        .mutate(
+            Method::GrantRedeem,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(&host),
+            &GrantRedeemParams {
+                invitation_id: short.preview.invitation_id,
+            },
+        )
+        .await
+        .expect_err("an invitation that ran out is not redeemed");
+
+    let ids: Vec<GrantId> = read.iter().map(|record| record.grant.grant_id).collect();
+    let withdrawn = grants
+        .withdraw_waiting_grants(&ids, read_at)
+        .expect("the withdrawal runs");
+
+    assert!(withdrawn.is_empty(), "{withdrawn:?}");
+    let ended = issued_over(&host, session).await;
+    assert_eq!(
+        ended
+            .iter()
+            .map(|summary| summary.state)
+            .collect::<Vec<_>>(),
+        [GrantState::Expired],
+        "{ended:?}"
+    );
+    connection.close();
+    host.stop().await;
+}
+
 /// KR-REQ-18.14: a daemon that starts and finds a session closed while it was down, or one whose
 /// launch failed, with an invitation still waiting over it, withdraws the invitation before it
 /// serves, and leaves the invitation over a session that is still open.
