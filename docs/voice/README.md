@@ -244,7 +244,7 @@ It has its own identity and its own end. Stopping a voice session names the term
 reached and closes none of them; nothing in the coordinator can close one without an unlocked-screen
 confirmation of its own. Voice can stop while the agent keeps working.
 
-A stop is refused because it named a voice session the host holds no record of, with the code for an
+A stop that names a voice session the host holds no record of is refused with the code for an
 unknown session. This may happen because the call has ended, the host has restarted, or the call
 belongs to another device. It is also used when a phone that could not finish revoking a call's
 grant asks again; in this case, the phone wants to know whether there is anything to stop on the
