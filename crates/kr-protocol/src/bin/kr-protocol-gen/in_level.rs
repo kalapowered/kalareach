@@ -16,8 +16,8 @@
 //!   revisions' root lists, so a root one of them dropped cannot hide a difference;
 //! * the methods a worker serves and the notifications it sends, with the types they carry, from
 //!   the `worker-surface.json` each release committed: a renamed event or a method no longer
-//!   served changes no definition. A release before that file is compared by schema alone, and
-//!   the run says so;
+//!   served changes no definition. A release before that file has no tables to compare, so they
+//!   are left out for it and the run says so;
 //! * the protocol the plugin host speaks and the table of public majors.
 //!
 //! It fails closed. It cannot list origin's tags, this checkout's tags are not origin's, a release's
@@ -334,7 +334,7 @@ fn compare(
         Some(worker) => found.extend(table_differences(&worker, &head.worker)),
         None => notes.push(format!(
             "{tag} has no {WORKER_SURFACE_PATH}: its served methods and notifications are not \
-             compared, its schema is"
+             compared; its schema, plugin host protocol and table of public majors are"
         )),
     }
     Ok(found)

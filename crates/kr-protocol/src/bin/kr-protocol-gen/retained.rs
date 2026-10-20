@@ -298,7 +298,8 @@ pub fn plugin_host_in(repository: &Path, commit: &str) -> Result<String, String>
             "pub const PROTOCOL: &str = ",
         ),
     ] {
-        let Ok(source) = releases::git_in(repository, &["show", &format!("{commit}:{path}")])
+        let Some(source) = releases::file_at(repository, commit, path)
+            .map_err(|error| format!("{path} at {commit} cannot be read: {error}"))?
         else {
             continue;
         };
@@ -385,8 +386,9 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
         ));
     }
     // Every release of the level was spoken to by workers in the field, not only the newest, and
-    // the tags say which they are whether or not this checkout's history reaches them. The kept
-    // surface's own roots are the ones compared, and a root a release lacks is a difference.
+    // the tags say which they are whether or not this checkout's history reaches them. The cut
+    // covers the kept surface's roots and the ones the release declares, and a root one of them
+    // lacks is a difference.
     let peers = excluded::kept(
         &releases::inventory(&repository())?,
         retained.level,

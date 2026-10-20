@@ -1056,6 +1056,30 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
         .expect_err("refused");
     assert!(error.contains("ControlFrme"), "{error}");
 
+    // A root of the kept surface that the release's own schema does not define: removed.
+    let kept_wide =
+        Surface::cut(&kept_tree.schema, &["ControlFrame", "PeerResult"]).expect("a surface");
+    let mut narrower = kept_tree.clone();
+    narrower.schema["$defs"]
+        .as_object_mut()
+        .expect("definitions")
+        .remove("PeerResult");
+    let lacking = release_of(&narrower, "without a root the level kept", false);
+    let found = kept_release_differences(
+        &repo.directory,
+        &lacking,
+        &kept_wide,
+        majors,
+        "kr-plugin-host/2",
+    )
+    .expect("compared");
+    assert!(
+        found
+            .iter()
+            .any(|line| line.contains("PeerResult removed: a root the new surface lacks")),
+        "{found:?}"
+    );
+
     // A release on a branch the history does not reach, whose plugin host protocol differs, held
     // against a table of public majors that is not the one it has.
     let aside = Tree {
@@ -1113,6 +1137,18 @@ fn the_list_of_surface_roots_is_read_strictly() {
             source("pub const SURFACE_ROOTS: &[&str] = &[\n    \"A\",\n"),
         ),
         ("twice", format!("{good}{good}")),
+        (
+            "a line break between the name and its colon",
+            source("pub const SURFACE_ROOTS\n    : &[&str] = &[\n    \"A\",\n];"),
+        ),
+        (
+            "a comment between the name and its colon",
+            source("pub const SURFACE_ROOTS /* the roots */: &[&str] = &[\n    \"A\",\n];"),
+        ),
+        (
+            "another keyword before it",
+            source("static SURFACE_ROOTS: &[&str] = &[\n    \"A\",\n];"),
+        ),
     ] {
         assert!(surface_roots_in(&text).is_err(), "{what}");
     }
@@ -1176,6 +1212,17 @@ fn a_roots_file_that_cannot_be_read_is_not_an_absent_one() {
         surface_roots_at(&repo.directory, &without).expect("absent"),
         None
     );
+    // A file that is there and declares no list is not an absent one either.
+    repo.git(&["reset", "-q", "--hard", &commit]);
+    repo.write(
+        "crates/kr-protocol/src/retained.rs",
+        "pub const PLUGIN_HOST_PROTOCOL: &str = \"kr-plugin-host/2\";\n",
+    );
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "a file without the list"]);
+    let unlisted = repo.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    let error = surface_roots_at(&repo.directory, &unlisted).expect_err("no list");
+    assert!(error.contains("declares no SURFACE_ROOTS"), "{error}");
     // A tree where the path is a commit of another repository: listed, and not a file git can show.
     repo.git(&[
         "update-index",

@@ -256,8 +256,12 @@ pub fn surface_roots_at(repository: &Path, commit: &str) -> Result<Option<Vec<St
     else {
         return Ok(None);
     };
+    // A file that is there and declares no list is not a release from before the retained levels
+    // (which has no such file): it is a source this reader does not understand.
     surface_roots_in(&source)
-        .map_err(|error| format!("SURFACE_ROOTS at {commit} ({path}): {error}"))
+        .map_err(|error| format!("SURFACE_ROOTS at {commit} ({path}): {error}"))?
+        .map(Some)
+        .ok_or_else(|| format!("{path} at {commit} declares no SURFACE_ROOTS"))
 }
 
 /// The roots `SURFACE_ROOTS` lists in `source`; see [`surface_roots_at`].
@@ -267,53 +271,95 @@ pub fn surface_roots_at(repository: &Path, commit: &str) -> Result<Option<Vec<St
 /// When the declaration is there more than once, or is not in the shape the reader knows.
 pub fn surface_roots_in(source: &str) -> Result<Option<Vec<String>>, String> {
     const DECLARATION: &str = "pub const SURFACE_ROOTS: &[&str] = &[";
-    let mut lines = source.lines();
-    let mut found = 0;
+    // Comments are taken out first, so a name in one is neither a declaration nor a use, and a
+    // comment or a line break between the name and its colon does not hide the declaration.
+    let code = without_comments(source)?;
+    let declarations: Vec<usize> = code
+        .match_indices("SURFACE_ROOTS")
+        .map(|(at, _)| at)
+        .filter(|at| {
+            code[at + "SURFACE_ROOTS".len()..]
+                .trim_start()
+                .starts_with(':')
+        })
+        .collect();
+    let at = match declarations.as_slice() {
+        [] => return Ok(None),
+        [at] => *at,
+        _ => return Err("the list is declared more than once".to_owned()),
+    };
+    // The declaration has to be the one shape, with the keyword before it on its line.
+    let line_start = code[..at].rfind('\n').map_or(0, |newline| newline + 1);
+    if !code[line_start..].trim_start().starts_with(DECLARATION)
+        || code[line_start..at].trim() != "pub const"
+    {
+        return Err("the list is declared in a form this reader does not read".to_owned());
+    }
+    let mut lines = code[line_start..].lines();
+    lines.next();
     let mut roots = Vec::new();
-    while let Some(line) = lines.next() {
-        if line.trim() != DECLARATION {
-            if declares(line) {
-                return Err("the list is declared in a form this reader does not read".to_owned());
-            }
+    for line in lines {
+        let line = line.trim();
+        if line == "];" {
+            return Ok(Some(roots));
+        }
+        if line.is_empty() {
             continue;
         }
-        found += 1;
-        let mut ended = false;
-        for line in lines.by_ref() {
-            let line = line.trim();
-            if line == "];" {
-                ended = true;
-                break;
-            }
-            if line.is_empty() || line.starts_with("//") {
-                continue;
-            }
-            let name = line
-                .strip_prefix('"')
-                .and_then(|rest| rest.strip_suffix("\","))
-                .filter(|name| {
-                    !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_alphanumeric())
-                })
-                .ok_or_else(|| format!("a line that is not a root: {line}"))?;
-            roots.push(name.to_owned());
-        }
-        if !ended {
-            return Err("the list does not end".to_owned());
-        }
+        let name = line
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix("\","))
+            .filter(|name| {
+                !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+            .ok_or_else(|| format!("a line that is not a root: {line}"))?;
+        roots.push(name.to_owned());
     }
-    match found {
-        0 => Ok(None),
-        1 => Ok(Some(roots)),
-        _ => Err("the list is declared more than once".to_owned()),
-    }
+    Err("the list does not end".to_owned())
 }
 
-/// Whether a line of code declares the list, in whatever spacing: the name followed by a colon,
-/// where a use of the list is the name alone.
-fn declares(line: &str) -> bool {
-    if line.trim_start().starts_with("//") {
-        return false;
+/// `source` without its `//` and `/* */` comments (block comments nest). A comment is replaced by a
+/// space, or by its line break, so the lines of what is left are the lines they were.
+fn without_comments(source: &str) -> Result<String, String> {
+    let bytes = source.as_bytes();
+    let mut kept = String::with_capacity(source.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match (bytes[index], bytes.get(index + 1)) {
+            (b'/', Some(b'/')) => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            (b'/', Some(b'*')) => {
+                let mut depth = 1;
+                index += 2;
+                while depth > 0 {
+                    match (bytes.get(index), bytes.get(index + 1)) {
+                        (Some(b'/'), Some(b'*')) => {
+                            depth += 1;
+                            index += 2;
+                        }
+                        (Some(b'*'), Some(b'/')) => {
+                            depth -= 1;
+                            index += 2;
+                        }
+                        (Some(b'\n'), _) => {
+                            kept.push('\n');
+                            index += 1;
+                        }
+                        (Some(_), _) => index += 1,
+                        (None, _) => return Err("a block comment does not end".to_owned()),
+                    }
+                }
+                kept.push(' ');
+            }
+            _ => {
+                let character = source[index..].chars().next().expect("a character");
+                kept.push(character);
+                index += character.len_utf8();
+            }
+        }
     }
-    line.match_indices("SURFACE_ROOTS")
-        .any(|(at, name)| line[at + name.len()..].trim_start().starts_with(':'))
+    Ok(kept)
 }

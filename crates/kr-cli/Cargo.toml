@@ -18,7 +18,8 @@ path = "src/bin/kr-attach-guard.rs"
 
 [features]
 # The upgrade suite builds the release before this one from its commit, which takes minutes and a
-# network, so it runs only where asked: `cargo test -p kr-cli --features upgrade-suite --test upgrade`.
+# network, so it runs only where asked: `cargo test -p kr-cli --features upgrade-suite --test upgrade -- --nocapture`,
+# which also shows the release the cases inside the level chose, or that they had none.
 upgrade-suite = []
 
 [[test]]

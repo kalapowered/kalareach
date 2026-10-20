@@ -64,7 +64,7 @@ changed=$(git status --porcelain --untracked-files=all)
 if [ -n "$changed" ]; then
   echo "the record of level $level moved to $tag; these files changed:"
   git status --short
-  echo "commit them, run the upgrade suite (cargo test -p kr-cli --features upgrade-suite --test upgrade), which builds the release the record now names, and run this script again on that commit"
+  echo "commit them, run the upgrade suite (cargo test -p kr-cli --features upgrade-suite --test upgrade -- --nocapture), which builds the release the record now names, and run this script again on that commit"
   exit 1
 fi
 echo "the retained level $level holds against $tag"

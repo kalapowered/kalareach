@@ -145,6 +145,15 @@ const PREVIOUS_PROGRAMS: [&str; 6] = [
     "kr-plugin-host",
 ];
 
+/// The commit the retained level's release was built from.
+fn retained_commit() -> String {
+    let level = kr_protocol::retained::RETAINED
+        .iter()
+        .max_by_key(|level| level.level)
+        .expect("a level is retained");
+    recorded(level.release, "commit")
+}
+
 /// The release before this one, built once for the whole run.
 fn previous() -> &'static Previous {
     static PREVIOUS: OnceLock<Previous> = OnceLock::new();
@@ -239,7 +248,7 @@ impl Previous {
     /// programs in a directory of their own: two releases a run builds do not share one.
     fn built(commit: String, release: ReleaseName, level: CompatibilityLevel) -> Self {
         // Held until the programs are copied and the stores read: another run for another commit
-        // removes a tree that has not been used for a week, and never one in use.
+        // removes the trees beyond the two kept, and a tree is read only under this lock.
         let _held = cache_lock();
         let built = build_previous(&commit);
         let directory = support::command_binaries().join("previous").join(&commit);
@@ -304,7 +313,8 @@ fn cache_lock() -> std::fs::File {
 /// The commit has to be in this checkout's repository, whether or not an earlier run built it: a
 /// checkout without it fails here, and so does a build that fails. A stamp of the commit and the
 /// compiler is written once the tree is extracted, so a tree is extracted once; the build is run
-/// every time, and takes seconds when nothing changed. The three trees used most recently are kept.
+/// every time, and takes seconds when nothing changed. This commit's tree and the retained level's
+/// are kept, and when they are one, the tree used most recently besides it.
 fn build_previous(commit: &str) -> PathBuf {
     let cache = cache_root();
     let present = Command::new("git")
@@ -330,11 +340,13 @@ fn build_previous(commit: &str) -> PathBuf {
     let place = cache.join(commit);
     let tree = place.join("tree");
     let programs = place.join("target/debug");
-    // Three trees are kept, this commit's and the two used most recently (a run builds two: the
-    // retained level's release and the newest of this build's own level, and another base's run
-    // may build a different one); the rest go before anything is extracted, since a tree and its
-    // build are about 12 GB. Each use touches the tree's stamp, and a tree is read only while the
-    // cache lock is held, so none that matters is removed from under a run.
+    // Two trees are kept between runs, this commit's and the retained level's (which `previous()`
+    // reads, and which stays while its level is retained), and when they are one tree, the tree
+    // used most recently besides it; every other goes before anything is extracted, since a tree
+    // and its build are about 12 GB. A run builds two trees, the retained level's and the newest of
+    // this build's own level, so those two stay. Each use touches the tree's stamp, and a tree is
+    // read only while the cache lock is held.
+    let retained = retained_commit();
     let mut others: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(&cache).expect("the cache") {
         let path = entry.expect("an entry").path();
@@ -348,7 +360,16 @@ fn build_previous(commit: &str) -> PathBuf {
         }
     }
     others.sort_by_key(|(used, _)| std::cmp::Reverse(*used));
-    for (_, path) in others.into_iter().skip(2) {
+    // The retained level's tree stays; when it is this commit's, the newest other stays as well.
+    let mut spare = usize::from(commit == retained);
+    for (_, path) in others {
+        if path.file_name().and_then(|name| name.to_str()) == Some(retained.as_str()) {
+            continue;
+        }
+        if spare > 0 {
+            spare -= 1;
+            continue;
+        }
         std::fs::remove_dir_all(&path).expect("an old tree goes");
     }
     // The tree is the commit's, as extracted by a run with this compiler, or it is made again.
@@ -1519,6 +1540,9 @@ async fn inside_the_level_an_update_leaves_the_worker_running_and_serves_a_devic
     );
     let read: Value = serde_json::from_slice(&read.stdout).expect("a document");
     assert_eq!(read["session_id"], updated.session_id.to_string(), "{read}");
+    // Only the worker's own answer carries its attachments: a status the daemon answered in its
+    // place, as it does when the worker cannot be reached, does not.
+    assert!(read["terminal_attachments"].is_array(), "{read}");
     let typing = terminal_for(host, &updated.kr_now(), &["attach", &updated.display]);
     typing.ready().await;
     updated.the_worker_is_as_it_was().await;
@@ -1650,6 +1674,7 @@ async fn inside_the_level_a_rollback_goes_on_beside_a_worker_of_this_build_and_s
     );
     let read: Value = serde_json::from_slice(&read.stdout).expect("a document");
     assert_eq!(read["session_id"], session_now.to_string(), "{read}");
+    assert!(read["terminal_attachments"].is_array(), "{read}");
     let typing = terminal_for(host, &updated.kr_before(), &["attach", &display]);
     typing.ready().await;
     drop(typing);
