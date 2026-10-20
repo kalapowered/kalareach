@@ -1182,6 +1182,55 @@ const REQUEST = {
   ]
 }
 
+// KR-REQ-13.19: on a short screen with a tall keyboard at the largest size there is no room for the
+// message between the top bar and the keyboard. Its words give way first, down to one line, and only
+// then does the message reach up over the top bar: a message of no words says nothing.
+test.describe('a passing message on a short phone with a keyboard up', () => {
+  for (const surface of ['ios', 'android'] as const) {
+    test(`keeps a line of words and reaches over the top bar only when there is no room, on ${surface}`, async ({
+      page
+    }) => {
+      await withSystemTextScale(page, LARGEST)
+      await withWideFace(page)
+      await page.setViewportSize({ width: 320, height: 568 })
+      await page.goto(`/harness.html?surface=${surface}&session=${SESSION}`)
+      await expect(page.locator('.m-tabbar')).toBeVisible()
+      const opened = page.waitForEvent('filechooser')
+      await page.getByRole('button', { name: 'Files', exact: true }).click()
+      await (await opened).setFiles({ name: 'notes.png', mimeType: 'image/png', buffer: Buffer.from('a picked file') })
+      const toast = page.locator('.toast')
+      await expect(toast).toContainText('notes.png')
+      await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
+      await page.evaluate(() => {
+        document.documentElement.style.setProperty('--keyboard', '336px')
+      })
+      const read = () =>
+        page.evaluate(() => {
+          const message = document.querySelector('.toast')?.getBoundingClientRect()
+          const words = document.querySelector<HTMLElement>('.toast-text')
+          const bar = document.querySelector('.m-topbar')?.getBoundingClientRect()
+          if (message === undefined || words === null || bar === undefined) return null
+          const line = parseFloat(getComputedStyle(words).fontSize) * 1.4
+          return { top: message.top, bottom: message.bottom, bar: bar.bottom, words: words.clientHeight, line, window: window.innerHeight }
+        })
+      await expect
+        .poll(async () => {
+          const now = await read()
+          return now !== null && now.bottom <= now.window - 336 + 0.5
+        }, 'the message ends above the keyboard')
+        .toBe(true)
+      const now = await read()
+      expect(now?.words ?? 0, 'at least a line of the words shows').toBeGreaterThanOrEqual((now?.line ?? 0) - 1)
+      if ((now?.top ?? 0) < (now?.bar ?? 0) - 0.5) {
+        expect(now?.words ?? 0, 'it reaches over the top bar only with its words at one line').toBeLessThanOrEqual(
+          (now?.line ?? 0) + 1
+        )
+      }
+      await toast.getByRole('button', { name: 'Dismiss' }).click({ trial: true, timeout: 2_000 })
+    })
+  }
+})
+
 // KR-REQ-13.19: a message in passing that comes while a sheet is open is drawn inside it, where a
 // keyboard and a screen reader stay: its Dismiss is named, and reached after the sheet's body, and
 // focus does not go to it by itself. It goes back to the screen when the sheet goes.
@@ -1285,12 +1334,8 @@ test.describe('a passing message that comes while a sheet is open', () => {
     await page.keyboard.press('Enter')
     await expect(toast).toHaveCount(0)
     expect(await inDialog(), 'the focus is in the sheet when the message has gone').toBe(true)
-    // And where the focus was left on nothing, the next Tab brings it into the sheet.
-    await page.evaluate(() => {
-      ;(document.activeElement as HTMLElement | null)?.blur()
-    })
-    await page.keyboard.press('Tab')
-    expect(await inDialog(), 'Tab from nothing goes into the sheet').toBe(true)
+    // Not on the sheet's first control (the top of the sheet), but beside where the message was.
+    await expect(page.getByRole('dialog').locator(':focus')).toHaveCount(1)
   })
 })
 

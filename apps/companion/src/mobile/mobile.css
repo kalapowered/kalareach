@@ -1009,12 +1009,13 @@
 
 /* Its words keep to half of the screen, as everywhere, and to what the shell has between the top bar
    and the message's foot, so that a keyboard and a large text do not take it up over the bar's
-   controls. The floor is the words' own. */
+   controls. The floor is one line of the words: a message of no words says nothing, and where even
+   one line has no room (a short screen, a tall keyboard, the largest text) it reaches over the bar. */
 .m-shell > .toast .toast-text {
   max-height: min(
     12rem,
     max(
-      80px,
+      1.05rem,
       min(
         calc(49dvh - var(--toast-controls) - 24px),
         calc(100dvh - var(--topbar-room, 0px) - var(--toast-bottom) - var(--toast-controls) - 24px - var(--gap-3))

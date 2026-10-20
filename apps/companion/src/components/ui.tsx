@@ -391,6 +391,21 @@ export function Toast({
   return <HeldToast key={message.id} message={message} onDismiss={onDismiss} />
 }
 
+/** What a keyboard stops at inside a surface, in document order. */
+const STOPS =
+  'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+
+/** The stop that follows `place` in `dialog`, or else the one before it. */
+function stopBeside(dialog: HTMLElement, place: HTMLElement): HTMLElement | null {
+  const stops = Array.from(dialog.querySelectorAll<HTMLElement>(STOPS)).filter(
+    (stop) => !place.contains(stop)
+  )
+  const after = stops.find(
+    (stop) => Boolean(place.compareDocumentPosition(stop) & Node.DOCUMENT_POSITION_FOLLOWING)
+  )
+  return after ?? stops.at(-1) ?? null
+}
+
 /**
  * One message, the time it has left and what holds it.
  *
@@ -432,14 +447,25 @@ function HeldToast({
 
   // Where the focus was before it came into the card, for the card to give it back when it goes: a
   // card that goes while it has the focus would leave it on nothing, and a keyboard in a surface that
-  // holds the focus would start again from the page behind it.
+  // holds the focus would start again from the page behind it. Only a card that has the focus gives
+  // it back, to where it came from if that is still in the card's own dialog, or else to the stop
+  // beside the card in it; a press that took no focus, as one in WebKit, moves nothing.
   const cameFrom = useRef<HTMLElement | null>(null)
-  const leave = (act?: () => void) => {
+  useEffect(() => {
+    cameFrom.current = null
+  }, [dock])
+  const leave = (act: (() => void) | undefined, hadFocus: boolean) => {
     const back = cameFrom.current
     act?.()
     onDismiss()
     // The message's own action says where the focus goes, if it says.
-    if (act === undefined && back?.isConnected) back.focus()
+    if (act !== undefined || !hadFocus) return
+    const dialog = dock?.closest<HTMLElement>('[role="dialog"]') ?? null
+    if (back?.isConnected && (dialog === null || dialog.contains(back))) {
+      back.focus()
+    } else if (dialog !== null && dock !== null) {
+      stopBeside(dialog, dock)?.focus()
+    }
   }
   const card = (
     <ToastCard
@@ -466,7 +492,7 @@ function ToastCard({
 }: {
   readonly message: ToastMessage
   /** Takes the message away, after `act` where the message's own action was pressed. */
-  readonly onLeave: (act?: () => void) => void
+  readonly onLeave: (act: (() => void) | undefined, hadFocus: boolean) => void
   readonly onPointer: (on: boolean) => void
   /** Whether focus is in the card now, and where it came from when it came in. */
   readonly onFocus: (on: boolean, from: EventTarget | null) => void
@@ -490,9 +516,14 @@ function ToastCard({
     }
   }, [message.text, message.said])
 
+  const card = useRef<HTMLDivElement | null>(null)
   const { action } = message
+  const leave = (act?: () => void) => {
+    onLeave(act, card.current?.contains(document.activeElement) ?? false)
+  }
   return (
     <div
+      ref={card}
       className="toast"
       role="status"
       aria-live="polite"
@@ -538,7 +569,7 @@ function ToastCard({
         {action === undefined ? null : (
           <Button
             onClick={() => {
-              onLeave(action.act)
+              leave(action.act)
             }}
           >
             {action.label}
@@ -547,7 +578,7 @@ function ToastCard({
         <IconButton
           label="Dismiss"
           onClick={() => {
-            onLeave()
+            leave()
           }}
         >
           ×
@@ -731,11 +762,7 @@ export function Sheet({
     // the first where none is checked: the others are reached by the arrow keys, so treating each
     // as a stop would put the trap's edge where Tab never lands and let Tab out of the sheet.
     const focusable = () => {
-      const all = Array.from(
-        sheet.querySelectorAll<HTMLElement>(
-          'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
-        )
-      )
+      const all = Array.from(sheet.querySelectorAll<HTMLElement>(STOPS))
       const radios = all.filter(
         (element): element is HTMLInputElement =>
           element instanceof HTMLInputElement && element.type === 'radio' && element.name !== ''
@@ -755,13 +782,7 @@ export function Sheet({
       const first = targets[0]
       const last = targets[targets.length - 1]
       if (!first || !last) return
-      // Focus that has been left on nothing, as by a control that went away while it had it, is
-      // brought back into the surface and not left to start again from the page behind it.
-      if (document.activeElement === document.body) {
-        event.preventDefault()
-        const entry = event.shiftKey ? last : first
-        entry.focus()
-      } else if (event.shiftKey && document.activeElement === first) {
+      if (event.shiftKey && document.activeElement === first) {
         event.preventDefault()
         last.focus()
       } else if (!event.shiftKey && document.activeElement === last) {

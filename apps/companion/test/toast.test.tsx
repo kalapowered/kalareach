@@ -261,4 +261,68 @@ describe('where a message is drawn', () => {
     expect(document.activeElement).not.toBe(before)
     before.remove()
   })
+
+  it('moves no focus when it is pressed without taking the focus, and none out of the dialog it is in', () => {
+    // A press in WebKit does not focus a button. The control the person tabbed in from, on the page
+    // behind, is not given the focus when the message that moved into a dialog is pressed.
+    const behind = document.createElement('button')
+    document.body.append(behind)
+    const dialog = document.createElement('div')
+    dialog.setAttribute('role', 'dialog')
+    const inside = document.createElement('button')
+    const dock = document.createElement('div')
+    dialog.append(inside, dock)
+    document.body.append(dialog)
+
+    const dismissed = vi.fn()
+    render(<Toast message={MESSAGE} onDismiss={dismissed} />)
+    behind.focus()
+    const dismissOnPage = screen.getByRole('button', { name: 'Dismiss' })
+    fireEvent.focusIn(dismissOnPage, { relatedTarget: behind })
+    // The dialog opens over it and the message moves into it.
+    let take: () => void = () => undefined
+    act(() => {
+      take = offerToastDock(dock)
+    })
+    inside.focus()
+    const dismissInDialog = within(dock).getByRole('button', { name: 'Dismiss' })
+    act(() => {
+      dismissInDialog.click()
+    })
+    expect(dismissed).toHaveBeenCalledTimes(1)
+    expect(document.activeElement, 'the page behind is not given the focus').not.toBe(behind)
+    expect(document.activeElement, 'and the focus that was in the dialog is left where it was').toBe(inside)
+    act(() => {
+      take()
+    })
+    behind.remove()
+    dialog.remove()
+  })
+
+  it('brings the focus to the stop beside the message when the message that had it goes in a dialog', () => {
+    const dialog = document.createElement('div')
+    dialog.setAttribute('role', 'dialog')
+    const header = document.createElement('button')
+    const dock = document.createElement('div')
+    const footer = document.createElement('button')
+    dialog.append(header, dock, footer)
+    document.body.append(dialog)
+
+    render(<Toast message={MESSAGE} onDismiss={() => undefined} />)
+    let take: () => void = () => undefined
+    act(() => {
+      take = offerToastDock(dock)
+    })
+    const dismiss = within(dock).getByRole('button', { name: 'Dismiss' })
+    // It came to the message from nowhere (a pointer, or the page's own start), and has it now.
+    dismiss.focus()
+    act(() => {
+      dismiss.click()
+    })
+    expect(document.activeElement, 'the next stop in the dialog has it').toBe(footer)
+    act(() => {
+      take()
+    })
+    dialog.remove()
+  })
 })

@@ -974,10 +974,11 @@ textarea::placeholder {
  * long before the row does, so nothing lies under the message, whatever the footer, the body or the
  * window, and a message that lay over the body would lie over what the person is deciding or over a
  * control reached by the keyboard. Where the sheet is already as full as it can be (the largest text
- * on the narrowest screen, with a long title), the row gives way last, and the message rises out of
- * it over the body and the header, never over the footer: what the sheet asks of the person stays
- * where it is. The message is inside the dialog, so it is in the keyboard's path in the order the eye
- * reads it, and in what a screen reader reads of the dialog. The row takes no room with no message.
+ * on the narrowest screen, with a long title, which the sheet is without any message there), the row
+ * gives way last, down to nothing, and the message rises out of it over the body and the header,
+ * never over the footer: what the sheet asks of the person stays where it is, and does not move.
+ * The message is inside the dialog, so it is in the keyboard's path in the order the eye reads it,
+ * and in what a screen reader reads of the dialog. The row takes no room with no message.
  */
 .sheet > .dialog-body {
   /* The body gives up its room long before anything else does. */
@@ -985,13 +986,18 @@ textarea::placeholder {
 }
 
 .toast-dock {
+  /* Above the body in every engine's paint order: the body is a scroller, which some engines paint
+     over what follows it in the document, and a message the body lay over could not be pressed. */
+  position: relative;
+  z-index: 1;
   display: flex;
   flex: 0 1 auto;
   flex-direction: column;
   align-items: center;
   justify-content: flex-end;
+  /* No padding of the row's own, so that it can give way to nothing: the message keeps its margin. */
+  padding-inline: var(--gap-3);
   min-height: 0;
-  padding: var(--gap-3);
 }
 
 .toast-dock:empty {
@@ -1003,6 +1009,7 @@ textarea::placeholder {
   z-index: auto;
   flex: none;
   max-width: 100%;
+  margin-block: var(--gap-3);
   transform: none;
 }
 

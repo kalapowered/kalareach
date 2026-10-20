@@ -230,7 +230,7 @@ export function Inbox({
         description={open ? whereOf(open) : undefined}
         closeLabel="Close item"
         // The decisions are at the foot of the body, above a footer that only opens the session: a
-        // message at the foot of the body would lie over them.
+        // message in a row under the body would take its foot from view, so it is drawn above it.
         messageAt="head"
         onClose={() => {
           setOpen(null)

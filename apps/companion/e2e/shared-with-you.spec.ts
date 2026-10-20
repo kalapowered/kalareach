@@ -590,8 +590,9 @@ test.describe('a message in passing over the card an invitation opens', () => {
 
     // The message lies over nothing of the card where the card has room for it, and never over its
     // footer or either action: where the card is as full as it can be (the largest text on the
-    // narrowest screen), the row the message has gives way, and it rises over the body and the
-    // header. It is inside the screen.
+    // narrowest screen, which the card is without any message there), the body has given its room
+    // and the row the message has gives way, and the message rises over the body and the header. It
+    // is inside the screen.
     const overlaps = () =>
       page.evaluate(() => {
         const message = document.querySelector('.toast')?.getBoundingClientRect()
@@ -604,8 +605,16 @@ test.describe('a message in passing over the card an invitation opens', () => {
           box.right > message.left + 0.5 &&
           box.top < message.bottom - 0.5 &&
           box.bottom > message.top + 0.5
-        // Whether the row holds the whole message: the card had room for it.
+        // Whether the row holds the whole message: the card had room for it. Where it does not, the
+        // body has first given up all of its room but its padding.
         const room = row.height >= message.height - 0.5
+        if (!room) {
+          const body = document.querySelector<HTMLElement>('.sheet .dialog-body')
+          if (body === null) return ['no body']
+          const own = getComputedStyle(body)
+          const padding = parseFloat(own.paddingTop) + parseFloat(own.paddingBottom)
+          if (body.clientHeight > padding + 1) found.push('the row gave way before the body had given its room')
+        }
         const guarded: (readonly [string, string])[] = [
           ['the footer', '.sheet .dialog-footer'],
           ['accept-offer', '[data-testid="accept-offer"]'],
@@ -620,16 +629,26 @@ test.describe('a message in passing over the card an invitation opens', () => {
         return found
       })
     await expect.poll(overlaps, 'where the message and the card overlap').toEqual([])
-    // A trial press fails where something else would take it.
-    for (const control of [accept, notNow]) await control.click({ trial: true, timeout: 5_000 })
+    // A trial press fails where something else would take it: both actions of the card, and the
+    // message's own Dismiss, which the card's body must not lie over in any engine's paint order.
+    for (const control of [accept, notNow, toast.getByRole('button', { name: 'Dismiss' })]) {
+      await control.click({ trial: true, timeout: 5_000 })
+    }
+    // The footer is where it is without the message: the message moves nothing of what the card
+    // asks of the person, whether the card has room for it or not.
+    const footerTop = () =>
+      page.evaluate(() => document.querySelector('.sheet .dialog-footer')?.getBoundingClientRect().top ?? -1)
+    const withMessage = await footerTop()
     await page.screenshot({ path: `/tmp/kr-shared-with-you-toast-${how.shot}-${test.info().project.name}.png` })
 
     // It is the card's own: inside the dialog while the card is open, and back on the screen when the
     // card goes.
     expect(await toast.evaluate((element) => element.closest('[role="dialog"]') !== null)).toBe(true)
+    await toast.getByRole('button', { name: 'Dismiss' }).click()
+    await expect(toast).toHaveCount(0)
+    expect(await footerTop(), 'the footer is where it is without the message').toBeCloseTo(withMessage, 0)
     await notNow.click()
     await expect(page.getByTestId('sheet')).toBeHidden()
-    expect(await toast.evaluate((element) => element.closest('[role="dialog"]') !== null)).toBe(false)
   }
 
   for (const surface of ['ios', 'android'] as const) {
@@ -800,8 +819,9 @@ test.describe('a message in passing over the card an invitation opens', () => {
     })
   })
 
-  // A sheet whose decisions are in its body, above a footer that leads elsewhere, draws the message at
-  // the head of its body: a message at the foot would lie over the next request's decisions.
+  // A sheet whose decisions are in its body, above a footer that leads elsewhere, draws the message in
+  // a row above its body: a row under it would take the foot of the body, where the decisions are,
+  // out of view.
   test('draws no message over the decisions in the sheet that holds an item’s decisions', async ({ page }) => {
     await withClockAt(page, CLOCKS[0].at)
     await page.setViewportSize({ width: 320, height: 720 })
