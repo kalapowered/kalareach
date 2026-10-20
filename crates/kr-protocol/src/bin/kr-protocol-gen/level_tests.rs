@@ -327,7 +327,8 @@ fn a_change_to_a_widened_root_fails_and_a_change_outside_every_root_does_not() {
     run(&split, &outside, &record).expect("no root reaches that type");
 }
 
-/// A root the head no longer has cannot hide the difference: the release's own list is cut too.
+/// A root the head no longer has cannot hide the difference: the release's own list is cut too, and
+/// the root it named is missing from the head.
 #[test]
 fn a_root_the_head_dropped_is_a_difference() {
     let now = Tree::the_level();
@@ -336,27 +337,32 @@ fn a_root_the_head_dropped_is_a_difference() {
         (&split.early.0, &split.early.1),
         (&split.second.0, &split.second.1),
     ]);
-    let mut dropped = now.clone();
-    dropped.schema["$defs"]
-        .as_object_mut()
-        .expect("definitions")
-        .remove("PeerResult");
-    dropped.schema["$defs"]["PeerParams"]["properties"] = json!({});
-    dropped.schema["$defs"]["PeerParams"]["required"] = json!([]);
-    let mut head = split.repo.head(&dropped, &split.head);
-    head.worker = WorkerSurface::parse(
-        &json!({
-            "surface_roots": ["ControlFrame"],
-            "peer_roots": ["PeerParams"],
-            "methods": [{ "name": "session.read", "params": "PeerParams", "result": "PeerParams" }],
-            "events": [{ "name": "session.output", "payload": "PeerParams" }],
-        })
-        .to_string(),
-    )
-    .expect("a table");
+    // A release of the level, made later, that reads a root of its own.
+    let mut with_root = now.clone();
+    with_root.schema["$defs"]["OnlyThere"] = json!({
+        "type": "object",
+        "properties": {},
+        "required": [],
+    });
+    let mut table = worker("session.read", "session.output");
+    table["peer_roots"] = json!(["OnlyThere", "PeerParams", "PeerResult"]);
+    with_root.worker = Some(table);
+    let commit = split.repo.commit(&with_root, "a root of its own");
+    let tag = split.repo.release("0.76.0", &commit);
+    let head = split.repo.commit(&now, "the head without it");
     let releases = inventory(&split.repo.directory).expect("an inventory");
-    let error = check(&split.repo.directory, &head, &releases, &record).expect_err("a root went");
-    assert!(error.contains("PeerResult"), "{error}");
+    let error = check(
+        &split.repo.directory,
+        &split.repo.head(&now, &head),
+        &releases,
+        &record,
+    )
+    .expect_err("a root went");
+    assert!(error.contains(&tag), "{error}");
+    assert!(
+        error.contains("OnlyThere removed: a root the new surface lacks"),
+        "{error}"
+    );
 }
 
 /// A renamed notification and a method the worker stopped serving change no definition, and the
@@ -406,6 +412,21 @@ fn a_release_before_the_tables_is_compared_by_schema_and_the_run_says_so() {
     };
     assert_eq!(releases, std::slice::from_ref(&tag));
     assert!(notes.iter().any(|note| note.contains(&tag)), "{notes:?}");
+
+    // The head's own list of the roots a worker's peers read is what widens the cut for it.
+    let widened = Tree {
+        schema: schema(false, "integer", "string"),
+        ..old.clone()
+    };
+    let releases = inventory(&repo.directory).expect("an inventory");
+    let error = check(
+        &repo.directory,
+        &repo.head(&widened, &head),
+        &releases,
+        &Exclusions::none(),
+    )
+    .expect_err("a root the release had no list for changed");
+    assert!(error.contains("PeerParams.member"), "{error}");
 }
 
 /// The plugin host's protocol and the table of public majors are the level's too.
