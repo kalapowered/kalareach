@@ -557,6 +557,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         path: `/tmp/kr-voice-own-start-wide-${surface}-${test.info().project.name}.png`
       })
       expect(await lineCount(page, '.kr-voice__start'), 'the start label on one line').toBe(1)
+      expect(await overrunning(page, '.kr-voice__start'), 'the start label that runs past its box').toEqual([])
       await end.click()
       const ending = page.getByRole('button', { name: 'Ending…' })
       await expect(ending).toBeDisabled()

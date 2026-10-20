@@ -994,9 +994,11 @@ describe('while a call is running', () => {
 
     controls.settleVoiceBroker('not_confirmed')
 
-    await waitFor(() => {
-      expect(screen.getByText(/has not confirmed that it closed the call/)).toBeInTheDocument()
-    })
+    // What the service did not confirm is owed: it lasts until the call's own limit has passed,
+    // which is not a time by which the service has closed the call, and it was not asked of a host.
+    const notice = await screen.findByText(/has not confirmed that it closed the call/)
+    expect(notice).toHaveTextContent("after the call's own limit")
+    expect(notice).not.toHaveTextContent('It was asked of')
   })
 
   // What the voice service did about an earlier call may arrive after a later call has replaced the
