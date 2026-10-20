@@ -20,7 +20,10 @@ const LARGEST = 53 / 17
 /** A host name with no short place to break a line, as a company's own might be. */
 const LONG_HOST = 'studio.synchronisation.example-company.com'
 
-/** Everything the drafts row can say at once: three reasons, one of them a long host, and a problem. */
+/**
+ * Everything the drafts row can say at once: three reasons, one of them a long host and one of them
+ * said with each of the two details a host that cannot be read has, and a problem.
+ */
 const KEPT = {
   enabled: true,
   problem: 'The sync service could not be reached, so no draft was sent or brought down.',
@@ -30,8 +33,14 @@ const KEPT = {
     {
       host: 'laptop',
       why: 'unreadable',
-      detail: 'this computer is not connected to that host',
+      detail: 'the host is of an earlier build that answers only a device that manages it; update the host',
       drafts: 2
+    },
+    {
+      host: 'desk',
+      why: 'unreadable',
+      detail: 'the host is changing its privacy mode',
+      drafts: 3
     },
     { host: null, why: 'unknown_host', detail: null, drafts: 1 }
   ]
@@ -101,7 +110,7 @@ for (const [surface, size] of [
     await page.evaluate((kept) => {
       window.krTestHost?.settings.change({ sync: { drafts: kept } })
     }, KEPT)
-    await expect(card.getByTestId('drafts-kept-here')).toHaveCount(3)
+    await expect(card.getByTestId('drafts-kept-here')).toHaveCount(4)
     await expect(card.getByTestId('drafts-problem')).toBeVisible()
 
     expect(await overrunning(page, '[data-testid="drafts-sync"]')).toEqual([])

@@ -132,7 +132,7 @@ const HOST_IS_CHANGING: &str = "the host is changing its privacy mode";
 /// Why a host of an earlier build cannot be read by a device that does not manage it, and what to
 /// do about it.
 const EARLIER_BUILD: &str =
-    "the host is of an earlier build and tells only a device that manages it; update the host";
+    "the host is of an earlier build that answers only a device that manages it; update the host";
 
 /// What the seam does with the answer to `host.info`.
 #[derive(Debug, PartialEq, Eq)]
