@@ -1744,6 +1744,16 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         },
     },
     IgnoredRun {
+        package: "kr-changeset",
+        target: "--test filesystems",
+        cases: &[],
+        runs: Runs::Supplied {
+            file: ".github/workflows/core-ci.yml",
+            line: "cargo test --locked -p \"$package\" \"${selector[@]}\" -- --ignored --exact --color never \"$check\" 2>&1 | tee \"$log\" || ran=1",
+            names_with: &["kr-changeset filesystems"],
+        },
+    },
+    IgnoredRun {
         package: "kr-transfer",
         target: "--test authority",
         cases: &[],
