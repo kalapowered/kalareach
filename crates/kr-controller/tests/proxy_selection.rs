@@ -115,7 +115,7 @@ async fn a_host_reaches_its_rendezvous_through_the_proxy_it_selected() {
     )
     .await
     .expect("the attachment ends");
-    let refused = attached.expect_err("the proxy refuses the tunnel");
+    let refused = attached.expect_err("the proxy refuses the tunnel").error;
     assert_eq!(
         refused.code(),
         ErrorCode::RendezvousUnavailable,
@@ -179,7 +179,7 @@ async fn the_network_setup_reaches_its_rendezvous_through_the_proxy_its_document
     )
     .await
     .expect("the attachment ends");
-    let refused = attached.expect_err("the proxy refuses the tunnel");
+    let refused = attached.expect_err("the proxy refuses the tunnel").error;
     assert_eq!(
         refused.code(),
         ErrorCode::RendezvousUnavailable,
