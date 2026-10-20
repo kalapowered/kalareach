@@ -67,7 +67,7 @@ use kr_client::services::authority::{
 };
 use kr_client::services::{HttpDeadlines, HttpService, managed_response_limits};
 use kr_protocol::envelope::ActionTarget;
-use kr_protocol::error::ErrorCode;
+use kr_protocol::error::RetryCategory;
 use kr_protocol::ids::{DeviceId, RevocationRequestId};
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{DevicePlatform, KeyPurpose, RevocationCompletion, RevocationTarget};
@@ -551,14 +551,18 @@ struct Dispatched {
     stored_nothing: bool,
 }
 
-/// Whether a failure to publish a request says the request is in no feed. A service that refused
-/// it did not act on it, and a connection that could not be made sent nothing; every other end
-/// (a deadline, a connection that ended, an answer that could not be read, a service that answered
-/// that it does not know whether it acted) leaves open that the feed holds it.
+/// Whether a failure to publish a request says the request is in no feed. The protocol's own
+/// retry category for the failure says it: a failure that is not an unknown outcome is one where
+/// the service refused the request, or the request never left this computer; a deadline, a
+/// connection that ended after the request was written, an answer that could not be read and a
+/// service that answered that it does not know whether it acted are unknown outcomes, and leave
+/// open that the feed holds the request.
 fn nothing_was_stored(error: &ClientError) -> bool {
     match error {
-        ClientError::Refused { .. } => error.code() != ErrorCode::OutcomeUnknown,
-        other => other.code() == ErrorCode::UpstreamUnavailable,
+        ClientError::Host(refusal) | ClientError::Refused { error: refusal, .. } => {
+            refusal.retry != RetryCategory::OutcomeUnknown
+        }
+        _ => false,
     }
 }
 
