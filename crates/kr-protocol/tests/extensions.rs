@@ -37,6 +37,11 @@ fn host_info() -> HostInfoResult {
             )
         },
         machine: None,
+        privacy: Some(kr_protocol::hostinfo::HostPrivacyState {
+            enabled: false,
+            generation: U64::new(2),
+            changing: false,
+        }),
     }
 }
 
@@ -186,7 +191,8 @@ fn read_only_metadata_is_reachable_only_from_read_results() {
         [
             "EnvironmentListResult",
             "EnvironmentSummary",
-            "HostInfoResult"
+            "HostInfoResult",
+            "HostPrivacyState"
         ],
         "the read-only metadata types"
     );

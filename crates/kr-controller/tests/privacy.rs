@@ -77,6 +77,7 @@ use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::SessionSelector;
 use kr_protocol::hello::PROTOCOL_VERSION;
+use kr_protocol::hostinfo::{HostInfoResult, HostPrivacyState};
 use kr_protocol::identity::{
     DesktopBinding, ProcessStartIdentity, ProcessStartSource, WorkerProfile,
 };
@@ -552,6 +553,21 @@ impl Environment {
             .await
             .expect("the call reaches the daemon")
             .map(|value| value.to_typed().expect("decodes"))
+    }
+
+    /// Reads the member of `host.info` that tells where privacy mode stands, at the daemon's local
+    /// socket. A host that sends none fails the case.
+    async fn stands(&self) -> HostPrivacyState {
+        let mut client = self.host.client().await;
+        let info: HostInfoResult = client
+            .request(Method::HostInfo, &())
+            .await
+            .expect("the call reaches the daemon")
+            .expect("host.info answers")
+            .to_typed()
+            .expect("decodes");
+        info.privacy
+            .expect("host.info says where privacy mode stands")
     }
 
     /// Reads where privacy mode stands at the daemon's local socket.
@@ -1181,6 +1197,15 @@ async fn kr_req_24_28_completion_waits_for_what_is_in_flight_and_what_had_left_i
     let publication = environment.publication_on_the_wire(&producer, 1);
     let delivery = environment.delivery_on_the_wire();
 
+    // The control: host.info says off, at the generation before, until the change.
+    assert_eq!(
+        environment.stands().await,
+        HostPrivacyState {
+            enabled: false,
+            generation: U64::new(0),
+            changing: false,
+        }
+    );
     let report = environment
         .set(true)
         .await
@@ -1189,6 +1214,15 @@ async fn kr_req_24_28_completion_waits_for_what_is_in_flight_and_what_had_left_i
         matches!(report.completion, PrivacyCompletion::Reconciling { .. }),
         "{:?}",
         report.completion
+    );
+    // host.info says on from the moment the boundary is crossed, not when the cleanup is done.
+    assert_eq!(
+        environment.stands().await,
+        HostPrivacyState {
+            enabled: true,
+            generation: U64::new(1),
+            changing: false,
+        }
     );
     assert!(outstanding(&report, "backup") > 0);
     assert_eq!(outstanding(&report, "delivery"), 1);
@@ -1364,6 +1398,16 @@ async fn kr_req_24_28_a_restart_in_the_middle_finishes_the_change_and_resumes_no
     assert!(report.enabled);
     assert_eq!(report.generation.get(), 1);
     assert_eq!(environment.record().0, (1, 1));
+    // And host.info, which a device without the right to manage the host reads, says the same
+    // from the first answer: a start that did not publish would tell every viewer it is off.
+    assert_eq!(
+        environment.stands().await,
+        HostPrivacyState {
+            enabled: true,
+            generation: U64::new(1),
+            changing: false,
+        }
+    );
     let backup = environment.controller().backup();
     assert_eq!(backup.fenced_at().expect("a read"), Some(1));
     assert!(
@@ -2558,9 +2602,10 @@ async fn kr_req_23_34_a_repeated_rename_is_answered_only_under_view_authority_ov
     environment.stop().await;
 }
 
-/// KR-REQ-24.29 and section 23: a paired device whose grant carries host management reads where
-/// privacy mode stands; one whose grant does not is refused; and no device can turn it on or off,
-/// which only the host itself does.
+/// KR-REQ-24.29, KR-REQ-23.14 and section 23: a paired device whose grant carries host management
+/// reads the whole report of where privacy mode stands, and one whose grant does not reads only
+/// whether it is on and at which generation, in `host.info`, and is refused the report; and no
+/// device can turn it on or off, which only the host itself does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_24_29_a_device_reads_privacy_mode_under_host_management_and_cannot_change_it() {
     let environment = Environment::start().await;
@@ -2580,10 +2625,27 @@ async fn kr_req_24_29_a_device_reads_privacy_mode_under_host_management_and_cann
         .expect("a device with host.manage reads privacy mode");
     assert!(read.enabled);
     assert_eq!(read.generation.get(), 1);
+    let told = |info: HostInfoResult| {
+        info.privacy
+            .expect("host.info says where privacy mode stands")
+    };
+    let on = HostPrivacyState {
+        enabled: true,
+        generation: U64::new(1),
+        changing: false,
+    };
+    for device in [&manager, &viewer] {
+        let info: HostInfoResult = device
+            .read(Method::HostInfo, &())
+            .await
+            .expect("every paired device reads host.info");
+        assert_eq!(told(info), on);
+    }
+    // The control: the rest of the report stays with the right to manage the host.
     let refused = viewer
         .read::<_, PrivacyReport>(Method::PrivacyStatus, &PrivacyStatusParams {})
         .await
-        .expect_err("a device without host.manage reads nothing of it");
+        .expect_err("a device without host.manage is not given the report");
     assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
     let refused = manager
         .mutate(
@@ -2600,6 +2662,30 @@ async fn kr_req_24_29_a_device_reads_privacy_mode_under_host_management_and_cann
     assert!(
         environment.status().await.enabled,
         "privacy mode is still on"
+    );
+
+    // Once the cleanup is complete the host turns it off, and the next generation is told to a
+    // device that cannot read the report.
+    environment
+        .status_until("completion", |report| {
+            report.completion == PrivacyCompletion::Complete
+        })
+        .await;
+    environment
+        .set(false)
+        .await
+        .expect("privacy mode is turned off");
+    let info: HostInfoResult = viewer
+        .read(Method::HostInfo, &())
+        .await
+        .expect("every paired device reads host.info");
+    assert_eq!(
+        told(info),
+        HostPrivacyState {
+            enabled: false,
+            generation: U64::new(2),
+            changing: false,
+        }
     );
     manager.close();
     viewer.close();

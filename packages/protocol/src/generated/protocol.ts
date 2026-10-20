@@ -17615,6 +17615,11 @@ export interface HostInfoResult {
    */
   machine?: MachineGroup | null
   power: SleepInhibitionState1
+  /**
+   * Where this host's privacy mode stands. Absent from a host of an earlier release, which
+   * tells it only to a device that manages it, in the answer to `privacy.status`.
+   */
+  privacy?: HostPrivacyState | null
   protocol_version: ProtocolVersion7
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
@@ -17686,6 +17691,35 @@ export interface SleepInhibitionState1 {
    * Why no assertion is held although the setting is on, when that is the case.
    */
   withheld_reason: string | null
+}
+/**
+ * Where a host's privacy mode stands, as every paired device may read it.
+ *
+ * This is the generation in force and whether privacy mode is on at it: what a device needs to
+ * keep what it holds for this host off a service while the host is private, and nothing the
+ * report `privacy.status` makes (when it changed, what is still owed, what is kept and what had
+ * already left), which only a device that manages the host reads.
+ *
+ * Read-only metadata like `EnvironmentSummary`: a member added later is explicitly optional, a
+ * reader whose schema predates it ignores it rather than refusing the answer, and it never
+ * changes what the members here mean. An extension may extend it.
+ */
+export interface HostPrivacyState {
+  /**
+   * Whether the host is changing privacy mode now: a change of state has been asked for and has
+   * not been published, or one stopped part way and the host has not restarted since. The other
+   * two members are then the last state the host published, which a reader does not rely on: it
+   * treats the host as private until a later answer says otherwise.
+   */
+  changing: boolean
+  /**
+   * Whether privacy mode is on at `generation`.
+   */
+  enabled: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  generation: string
 }
 /**
  * One public protocol version.

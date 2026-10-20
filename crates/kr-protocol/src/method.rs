@@ -355,7 +355,7 @@ methods! {
     effect: Read, ingress: [LocalIpc, PairedDevice], rights: [], selectors: [Host],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,
-    doc: "Host build identity, protocol limits and configured services.";
+    doc: "Host build identity, protocol limits, configured services and where privacy mode stands.";
 
     EnvironmentList = "environment.list", HostAndEnvironment,
     effect: Read, ingress: [LocalIpc, PairedDevice], rights: [], selectors: [Host],

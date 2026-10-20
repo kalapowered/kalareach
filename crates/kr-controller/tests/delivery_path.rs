@@ -4936,6 +4936,103 @@ async fn removing_a_destination_with_a_message_on_the_wire_counts_the_attempt() 
     held.release();
 }
 
+/// What a paired device reads of where privacy mode stands, from `host.info`.
+async fn privacy_read_by(phone: &Phone) -> kr_protocol::hostinfo::HostPrivacyState {
+    let answer = phone
+        .connection
+        .read(Method::HostInfo, &())
+        .await
+        .expect("host.info is served to a paired device");
+    answer
+        .to_typed::<kr_protocol::hostinfo::HostInfoResult>()
+        .expect("decodes")
+        .privacy
+        .expect("host.info says where privacy mode stands")
+}
+
+/// KR-REQ-24.27: a privacy change that waits for a message on the wire does not hold up `host.info`,
+/// and `host.info` says the host is changing privacy mode for as long as it waits. The message is
+/// held at the destination's end; the change is asked for on a connection of its own and is proved
+/// queued by the state refusing a new reading; a paired device then reads `host.info` and is
+/// answered, off at the generation before and changing, with the message still held. The control is
+/// the answer before the change; the end is on at the next generation, not changing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn host_info_answers_while_a_privacy_change_waits_for_a_message_on_the_wire() {
+    use kr_protocol::hostinfo::HostPrivacyState;
+    use kr_protocol::scalars::U64;
+
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let grant = phone.record.grant.grant_id;
+    let held = environment.gateway.hold_before("/in/busy", 0);
+    environment
+        .configure(&webhook(
+            "busy",
+            "https://hooks.example.test/in/busy",
+            None,
+            grant,
+        ))
+        .await
+        .expect("a webhook");
+    environment._worker.ask("deploy-1", "Deploy the release?");
+    held.reached().await;
+    let off = HostPrivacyState {
+        enabled: false,
+        generation: U64::new(0),
+        changing: false,
+    };
+    assert_eq!(privacy_read_by(&phone).await, off, "the control");
+
+    let mut client = environment.host.client().await;
+    let environment_id = environment.environment_id();
+    let changing = tokio::spawn(async move {
+        net_support::pairing::mutate::<_, kr_protocol::privacy::PrivacyReport>(
+            environment_id,
+            &mut client,
+            Method::PrivacySet,
+            &kr_protocol::privacy::PrivacySetParams { enabled: true },
+        )
+        .await
+    });
+    until("the change queued behind the message", || {
+        environment
+            .controller()
+            .delivery()
+            .privacy_state()
+            .try_reading()
+            .is_none()
+    })
+    .await;
+    // A read that waited for the change would not be answered until the message is let go, so the
+    // guard here is what ends the case when `host.info` waits.
+    let during = tokio::time::timeout(Duration::from_secs(60), privacy_read_by(&phone))
+        .await
+        .expect("host.info is answered while the change waits");
+    assert_eq!(
+        during,
+        HostPrivacyState {
+            changing: true,
+            ..off
+        }
+    );
+    assert!(!changing.is_finished(), "the message is still held");
+
+    held.release();
+    let report = changing
+        .await
+        .expect("the task finishes")
+        .expect("privacy mode is turned on");
+    assert!(report.enabled);
+    assert_eq!(
+        privacy_read_by(&phone).await,
+        HostPrivacyState {
+            enabled: true,
+            generation: U64::new(1),
+            changing: false,
+        }
+    );
+}
+
 /// The authority a notice is produced under: the one the daemon's own delivery asks, so that what
 /// the test queues is judged at the send as what the daemon produced itself is.
 #[derive(Debug)]

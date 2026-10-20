@@ -566,6 +566,7 @@ fn host_info(build: &str) -> kr_protocol::hostinfo::HostInfoResult {
             )
         },
         machine: None,
+        privacy: None,
     }
 }
 

@@ -20,7 +20,7 @@
       "resource_selectors": [
         "host"
       ],
-      "summary": "Host build identity, protocol limits and configured services.",
+      "summary": "Host build identity, protocol limits, configured services and where privacy mode stands.",
       "version": 1
     },
     {

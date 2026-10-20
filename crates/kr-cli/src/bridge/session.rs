@@ -542,6 +542,7 @@ mod tests {
                     kr_protocol::desktop::PowerSource::Unknown,
                 ),
                 machine: None,
+                privacy: None,
             })
             .expect("a payload"),
         )

@@ -16,7 +16,7 @@ links to its document.
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `host.info` | read | `local_ipc`, `paired_device` | Host build identity, protocol limits and configured services. |  |
+| `host.info` | read | `local_ipc`, `paired_device` | Host build identity, protocol limits, configured services and where privacy mode stands. |  |
 | `environment.list` | read | `local_ipc`, `paired_device` | The environments this actor's grant admits. |  |
 | `environment.capabilities` | read | `local_ipc`, `paired_device` | What one environment can currently do. Capability evidence, never authority. | [Platforms: What may be done on a desktop](../host/platforms.md) |
 | `environment.capabilities.check` | write | `local_ipc` | Perform the disclosed desktop checks in a session's own worker, at the host itself: read a file the person authorised, take a screen image, find an accessible element and start an application. They run once, after the person has been shown what each one does, and the answer says that they are running. Their findings reach `environment.capabilities`, which never performs them. | [Platforms: What may be done on a desktop](../host/platforms.md) |

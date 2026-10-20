@@ -18445,6 +18445,17 @@
           "$ref": "#/$defs/SleepInhibitionState",
           "description": "What this host's sleep inhibition is doing, whether it is active or not."
         },
+        "privacy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostPrivacyState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where this host's privacy mode stands. Absent from a host of an earlier release, which\ntells it only to a device that manages it, in the answer to `privacy.status`."
+        },
         "protocol_version": {
           "$ref": "#/$defs/ProtocolVersion",
           "description": "The protocol version this build implements."
@@ -18469,6 +18480,30 @@
         "session_limit",
         "default_worker_profile",
         "power"
+      ],
+      "type": "object",
+      "x-kalareach-read-only-metadata": true
+    },
+    "HostPrivacyState": {
+      "description": "Where a host's privacy mode stands, as every paired device may read it.\n\nThis is the generation in force and whether privacy mode is on at it: what a device needs to\nkeep what it holds for this host off a service while the host is private, and nothing the\nreport `privacy.status` makes (when it changed, what is still owed, what is kept and what had\nalready left), which only a device that manages the host reads.\n\nRead-only metadata like `EnvironmentSummary`: a member added later is explicitly optional, a\nreader whose schema predates it ignores it rather than refusing the answer, and it never\nchanges what the members here mean. An extension may extend it.",
+      "properties": {
+        "changing": {
+          "description": "Whether the host is changing privacy mode now: a change of state has been asked for and has\nnot been published, or one stopped part way and the host has not restarted since. The other\ntwo members are then the last state the host published, which a reader does not rely on: it\ntreats the host as private until a later answer says otherwise.",
+          "type": "boolean"
+        },
+        "enabled": {
+          "description": "Whether privacy mode is on at `generation`.",
+          "type": "boolean"
+        },
+        "generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The privacy generation in force. Turning privacy mode on and turning it off each advance it."
+        }
+      },
+      "required": [
+        "enabled",
+        "generation",
+        "changing"
       ],
       "type": "object",
       "x-kalareach-read-only-metadata": true
@@ -21715,7 +21750,7 @@
       "oneOf": [
         {
           "const": "host.info",
-          "description": "Host build identity, protocol limits and configured services.",
+          "description": "Host build identity, protocol limits, configured services and where privacy mode stands.",
           "type": "string"
         },
         {

@@ -53,6 +53,35 @@ pub struct HostInfoResult {
     /// report: an older host, or one whose record could not be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<MachineGroup>,
+    /// Where this host's privacy mode stands. Absent from a host of an earlier release, which
+    /// tells it only to a device that manages it, in the answer to `privacy.status`.
+    // A reader built before `d7f4d2ff1` refuses a member it does not know; none is in use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy: Option<HostPrivacyState>,
+}
+
+/// Where a host's privacy mode stands, as every paired device may read it.
+///
+/// This is the generation in force and whether privacy mode is on at it: what a device needs to
+/// keep what it holds for this host off a service while the host is private, and nothing the
+/// report `privacy.status` makes (when it changed, what is still owed, what is kept and what had
+/// already left), which only a device that manages the host reads.
+///
+/// Read-only metadata like `EnvironmentSummary`: a member added later is explicitly optional, a
+/// reader whose schema predates it ignores it rather than refusing the answer, and it never
+/// changes what the members here mean. An extension may extend it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("x-kalareach-read-only-metadata" = true))]
+pub struct HostPrivacyState {
+    /// Whether privacy mode is on at `generation`.
+    pub enabled: bool,
+    /// The privacy generation in force. Turning privacy mode on and turning it off each advance it.
+    pub generation: U64,
+    /// Whether the host is changing privacy mode now: a change of state has been asked for and has
+    /// not been published, or one stopped part way and the host has not restarted since. The other
+    /// two members are then the last state the host published, which a reader does not rely on: it
+    /// treats the host as private until a later answer says otherwise.
+    pub changing: bool,
 }
 
 impl export::ForExport for HostInfoResult {
@@ -5930,6 +5959,10 @@ pub mod export {
         ),
         field("HostInfoResult", "power", ContentClass::Structure),
         field("HostInfoResult", "machine", ContentClass::Structure),
+        field("HostInfoResult", "privacy", ContentClass::Structure),
+        field("HostPrivacyState", "enabled", ContentClass::Term),
+        field("HostPrivacyState", "generation", ContentClass::Number),
+        field("HostPrivacyState", "changing", ContentClass::Term),
         field("ProtocolVersion", "major", ContentClass::Number),
         field("ProtocolVersion", "minor", ContentClass::Number),
         // `environment.list`, as a paired device reads it. The account and the directories are
@@ -7980,6 +8013,11 @@ mod tests {
                 )
             },
             machine: Some(a_machine_group()),
+            privacy: Some(HostPrivacyState {
+                enabled: true,
+                generation: U64::new(3),
+                changing: false,
+            }),
         }
     }
 

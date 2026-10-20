@@ -141,6 +141,7 @@ impl Controller {
             default_worker_profile: self.default_profile().await,
             power: self.power_state().await,
             machine: self.machine_report(),
+            privacy: None,
         })
     }
 
