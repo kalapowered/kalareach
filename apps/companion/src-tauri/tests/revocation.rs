@@ -2100,35 +2100,52 @@ async fn a_request_the_record_does_not_name_is_found_in_the_feed_and_held() {
     assert_not_shared_with_again(&rig);
 }
 
-/// A device that was never shared with, whose revoke waits in a feed, is not offered to be shared
-/// with: it is named with the devices taken out and the command refuses it.
+/// A device is revoked before settings sync has started, so no collection and no step is there to
+/// take it out and nothing holds it but the record of the request, which waits in a feed the host
+/// does not read. Settings sync then starts with no collection, lets go of its hold, and is turned
+/// on, and the hosts list the device: it is not offered to be shared with, it is named with the
+/// devices taken out as waiting for its host, and the command refuses it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_never_shared_with_whose_request_waits_is_not_offered_to_be_shared_with() {
     let rig = Rig::start().await;
-    rig.start_settings_sync_listing_the_phone();
-    rig.app
-        .app
-        .state::<AppState>()
-        .settings()
-        .expect("settings are open")
-        .sync_turn_on()
-        .await
-        .expect("settings sync is on");
     let elsewhere = a_feed_the_host_does_not_read(&rig).await;
-    assert_eq!(
-        rig.devices()["candidates"].as_array().map(Vec::len),
-        Some(1),
-        "the phone is offered before anything is revoked"
-    );
     revokes_the_phone(&rig).await;
     assert_eq!(published_at(&elsewhere), 1);
 
+    rig.start_settings_sync_listing_the_phone();
+    let settings = rig
+        .app
+        .app
+        .state::<AppState>()
+        .settings()
+        .expect("settings are open");
+    let key = *rig.phone.keys().authorisation.public();
+    assert!(
+        !settings
+            .revocations_sent(&[key])
+            .await
+            .expect("the step ends"),
+        "there is no collection to take the phone out of"
+    );
+    settings.sync_turn_on().await.expect("settings sync is on");
     let devices = rig.devices();
-    assert_eq!(devices["candidates"], json!([]), "{devices}");
+    assert_eq!(
+        devices["candidates"],
+        json!([]),
+        "the phone is not offered: {devices}"
+    );
     let reference = the_device_held_out(&devices);
     assert_eq!(devices["held_out"][0]["waiting"], true, "{devices}");
     share_again(&rig, &reference)
         .expect_err("a device a request may still revoke is not shared with");
+    assert!(
+        rig.ceremony
+            .reasons()
+            .iter()
+            .all(|reason| !reason.contains("Share your settings")),
+        "nobody is asked to confirm it: {:?}",
+        rig.ceremony.reasons()
+    );
     assert_eq!(
         rig.devices()["members"].as_array().map(Vec::len),
         Some(1),
