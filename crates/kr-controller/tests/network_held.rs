@@ -777,6 +777,7 @@ async fn kr_req_18_14_a_session_that_closes_withdraws_the_invitations_waiting_ov
         .await
         .expect_err("an invitation over a closed session is not redeemed");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(refused.message.contains("withdrawn"), "{refused:?}");
 
     // The issuer who asks for a withdrawal the close already made finds the work done, and is told
     // the revision in force and where the workers stand.
@@ -858,6 +859,54 @@ async fn kr_req_18_13_a_session_that_closes_leaves_an_invitation_that_ran_out_as
         .await
         .expect_err("an invitation that ran out is not redeemed");
     assert!(refused.message.contains("expired"), "{refused:?}");
+    connection.close();
+    host.stop().await;
+}
+
+/// KR-REQ-18.13: an invitation that ran out on the host's continuous clock, while the wall clock
+/// still reads it as running, has ended too, and a close leaves it as it ended: a device that
+/// redeems it is told it ran out and not that it was withdrawn. The continuous clock is moved by
+/// hand, past the invitation's end, and the wall clock is not moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_18_13_a_session_that_closes_leaves_an_invitation_that_ran_out_on_the_continuous_clock()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let continuous = kr_transport::clock::ManualClock::new();
+    let mut clocks = MovedWall::new().clocks();
+    clocks.continuous = std::sync::Arc::new(continuous.clone());
+    let host = Host::start_on_clocks(&owner, clocks).await;
+    let (device, record) = recipient(&host, &owner).await;
+    let (session, _) = an_open_session(&host);
+    let short = share_with(
+        &host,
+        session,
+        record.device_id,
+        RoleSelection::plain(SessionRole::Viewer),
+        Some(60_000),
+    )
+    .await
+    .expect("a short share is written");
+    continuous.advance(Duration::from_secs(5 * 60));
+
+    host.controller()
+        .retire(&closed(session))
+        .await
+        .expect("the session closes");
+
+    let connection = RawDevice::connect(&host, &device, &record).await;
+    let refused = connection
+        .mutate(
+            Method::GrantRedeem,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(&host),
+            &GrantRedeemParams {
+                invitation_id: short.preview.invitation_id,
+            },
+        )
+        .await
+        .expect_err("an invitation that ran out is not redeemed");
+    assert!(refused.message.contains("expired"), "{refused:?}");
+    assert!(!refused.message.contains("withdrawn"), "{refused:?}");
     connection.close();
     host.stop().await;
 }
