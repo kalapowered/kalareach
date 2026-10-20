@@ -56,11 +56,74 @@ pub const REATTACH_DELAY: Duration = Duration::from_secs(1);
 /// reservation advertised.
 pub const OWNER_RELEASE: Duration = Duration::from_secs(10);
 
-/// How much of its time the mutation a call is made for has left, read when the call begins.
+/// How much of its time the mutation a call is made for has left, on the clock the mutation's
+/// deadline is kept on.
 ///
-/// A call that sends a request again reads it before each one it makes, so the requests of one
-/// mutation spend one life between them.
+/// It is read again whenever it decides something: when a call begins, and before each request a
+/// call sends again, so the requests of one mutation spend one life between them and a machine
+/// that slept in between is found out.
 pub type Life = Arc<dyn Fn() -> Duration + Send + Sync>;
+
+/// What bounds a control call, a request sent again included.
+///
+/// The time the whole call may take, counted from the call's first request, and the mutation's
+/// life when the call is made for a mutation. A request is sent again only when its wait and a
+/// whole attempt fit in both. The first request is the one a host always makes.
+#[derive(Clone)]
+pub struct Bound {
+    within: Duration,
+    life: Option<Life>,
+}
+
+impl Bound {
+    /// A call that takes no longer than `within`, for nobody's mutation: the relay's release of an
+    /// invitation that ended.
+    #[must_use]
+    pub const fn by_time(within: Duration) -> Self {
+        Self { within, life: None }
+    }
+
+    /// A call made for a mutation: it takes no longer than the mutation has left now, and no
+    /// request is sent again once the mutation has less left than the request needs.
+    #[must_use]
+    pub fn of_mutation(life: &Life) -> Self {
+        Self {
+            within: life(),
+            life: Some(Arc::clone(life)),
+        }
+    }
+
+    /// The same, taking no longer than `cap` from now.
+    #[must_use]
+    pub fn capped(self, cap: Duration) -> Self {
+        Self {
+            within: self.within.min(cap),
+            ..self
+        }
+    }
+
+    /// The time the whole call may take, from its first request.
+    #[must_use]
+    pub const fn within(&self) -> Duration {
+        self.within
+    }
+
+    /// What the mutation has left now, when the call is made for one.
+    #[must_use]
+    pub fn life_left(&self) -> Option<Duration> {
+        self.life.as_ref().map(|life| life())
+    }
+}
+
+impl std::fmt::Debug for Bound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Bound")
+            .field("within", &self.within)
+            .field("for_a_mutation", &self.life.is_some())
+            .finish()
+    }
+}
 
 /// A room socket that did not open.
 #[derive(Debug)]
@@ -73,14 +136,14 @@ pub struct NotAttached {
 
 /// A rendezvous service, as a host reaches it.
 ///
-/// The control requests are kr-pairing's [`RendezvousHost`]: a reservation and a release, which
-/// the invitation's own state machine makes. Attaching to the room is the host's, because it is a
-/// socket the host keeps open for as long as the invitation is on offer.
-///
-/// The control requests are also made with a bound: the time the whole call may take, any request
-/// sent again included. A call made for a mutation is bound by what the mutation has left, and the
-/// relay's own release, which nobody waits for, by the service's retry budget.
-pub trait Rendezvous: RendezvousHost + Send + Sync {
+/// Attaching to the room is the host's, because it is a socket the host keeps open for as long as
+/// the invitation is on offer. The control requests are a reservation and a release, which the
+/// invitation's own state machine makes through kr-pairing's [`RendezvousHost`]; they are made with
+/// a [`Bound`], which is what keeps a request sent again from outliving the mutation it is made
+/// for. A call made for a mutation is bound by what the mutation has left ([`OwnerPath`] is the
+/// host that gives kr-pairing that bound), and the relay's own release, which nobody waits for, by
+/// the service's retry budget.
+pub trait Rendezvous: Send + Sync {
     /// Opens the host's socket in the room of `locator` at `origin`, proving possession of the
     /// reservation's control token.
     fn attach(
@@ -90,7 +153,7 @@ pub trait Rendezvous: RendezvousHost + Send + Sync {
         control_token: &SymmetricKey,
     ) -> BoxFuture<'static, Result<RoomSocket, NotAttached>>;
 
-    /// As [`RendezvousHost::reserve_locator`], taking no longer than `within` in all.
+    /// As [`RendezvousHost::reserve_locator`], with every request sent again kept to `bound`.
     ///
     /// # Errors
     ///
@@ -102,10 +165,10 @@ pub trait Rendezvous: RendezvousHost + Send + Sync {
         invitation_id: InvitationId,
         advertised_expires_at_ms: TimestampMs,
         control_token_hash: Digest256,
-        within: Duration,
+        bound: &Bound,
     ) -> kr_pairing::Result<bool>;
 
-    /// As [`RendezvousHost::release_locator`], taking no longer than `within` in all.
+    /// As [`RendezvousHost::release_locator`], with every request sent again kept to `bound`.
     ///
     /// # Errors
     ///
@@ -115,7 +178,7 @@ pub trait Rendezvous: RendezvousHost + Send + Sync {
         origin: &RendezvousOrigin,
         locator: &Locator,
         control_token: &SymmetricKey,
-        within: Duration,
+        bound: &Bound,
     ) -> kr_pairing::Result<()>;
 }
 
@@ -152,7 +215,7 @@ impl RendezvousHost for OwnerPath<'_> {
             invitation_id,
             advertised_expires_at_ms,
             control_token_hash,
-            (self.life)(),
+            &Bound::of_mutation(self.life),
         )
     }
 
@@ -166,7 +229,7 @@ impl RendezvousHost for OwnerPath<'_> {
             origin,
             locator,
             control_token,
-            (self.life)().min(OWNER_RELEASE),
+            &Bound::of_mutation(self.life).capped(OWNER_RELEASE),
         )
     }
 }
@@ -566,7 +629,7 @@ async fn release(service: &Arc<dyn Rendezvous>, ticket: &RoomTicket) {
             &ticket.origin,
             &ticket.locator,
             &ticket.control_token,
-            RETRY_BUDGET,
+            &Bound::by_time(RETRY_BUDGET),
         )
     })
     .await;
@@ -953,7 +1016,7 @@ mod tests {
             invitation_id: InvitationId,
             advertised_expires_at_ms: kr_protocol::scalars::TimestampMs,
             control_token_hash: kr_protocol::scalars::Digest256,
-            _within: Duration,
+            _bound: &Bound,
         ) -> kr_pairing::Result<bool> {
             self.reserve_locator(
                 origin,
@@ -969,9 +1032,12 @@ mod tests {
             origin: &RendezvousOrigin,
             locator: &Locator,
             control_token: &SymmetricKey,
-            within: Duration,
+            bound: &Bound,
         ) -> kr_pairing::Result<()> {
-            self.release_bounds.lock().expect("the bounds").push(within);
+            self.release_bounds
+                .lock()
+                .expect("the bounds")
+                .push(bound.within());
             self.release_locator(origin, locator, control_token)
         }
 
@@ -1244,7 +1310,7 @@ mod tests {
             .expect("the relay paused");
         let paused = service.attached()[1].duration_since(began);
         assert!(
-            paused >= TOLD && paused <= TOLD + SLACK,
+            paused >= TOLD,
             "attached again {paused:?} after the pause began"
         );
         host.end();

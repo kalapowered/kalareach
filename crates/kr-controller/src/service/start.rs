@@ -1341,10 +1341,18 @@ impl Controller {
         // served, so a binding for a closed session is refused from the first request.
         crate::transfer::end_the_insertions_of_closed_sessions(&controller).await?;
         // And no invitation waits over a session that has closed, so an issuer is told which
-        // are withdrawn from the first request.
-        controller
+        // are withdrawn from the first request. This is tidying: a store that cannot be read or
+        // written now is tried again at the next start, and a redeem of such an invitation is
+        // refused meanwhile.
+        if let Err(error) = controller
             .withdraw_the_invitations_of_closed_sessions()
-            .await?;
+            .await
+        {
+            eprintln!(
+                "kr-controller: the invitations waiting over closed sessions could not be \
+                 withdrawn at start: {error}"
+            );
+        }
         crate::transfer::serve(&controller)?;
         // The owner's setting is the owner's setting across a restart. A daemon that waited for a
         // client to ask before it looked would leave an enabled setting doing nothing until

@@ -728,10 +728,34 @@ async fn kr_req_18_14_a_session_that_closes_withdraws_the_invitations_waiting_ov
         [GrantState::Pending]
     );
 
+    let revision_before = host
+        .controller()
+        .authority_revision()
+        .await
+        .expect("a revision");
+
     host.controller()
         .retire(&closed(closing))
         .await
         .expect("the session closes");
+
+    // The invitation was never in force, so withdrawing it takes nothing away from anybody: the
+    // authority revision stays and no fence is owed.
+    assert_eq!(
+        host.controller()
+            .authority_revision()
+            .await
+            .expect("a revision"),
+        revision_before
+    );
+    assert!(
+        host.controller()
+            .sharing()
+            .grants()
+            .fence_owed()
+            .expect("the debt is read")
+            .is_empty()
+    );
 
     let withdrawn = issued_over(&host, closing).await;
     assert_eq!(states(&withdrawn), [GrantState::Revoked], "{withdrawn:?}");

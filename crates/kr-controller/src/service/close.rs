@@ -910,12 +910,15 @@ impl Controller {
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the grant store or the registry cannot
-    /// be read, or the store cannot be written; the start does not go on then, as it does not for
-    /// the transfer journal's closures.
+    /// be read, or the store cannot be written. The start goes on then and tries again at the next.
     pub async fn withdraw_the_invitations_of_closed_sessions(self: &Arc<Self>) -> Result<usize> {
         let owner = Arc::clone(self);
+        let now_ms = self.settled_now_ms();
         let waiting = tokio::task::spawn_blocking(move || {
-            owner.sharing.grants().sessions_with_waiting_invitations()
+            owner
+                .sharing
+                .grants()
+                .sessions_with_waiting_invitations(now_ms)
         })
         .await
         .map_err(|_| stopped_before_withdrawing())??;

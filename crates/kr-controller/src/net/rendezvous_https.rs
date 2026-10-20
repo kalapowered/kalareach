@@ -40,16 +40,19 @@
 //! The service answers a reservation or a release that its room could not carry out with 503,
 //! `SERVICE_UNAVAILABLE` and a `retryAfterSeconds` that it also serves as `Retry-After`: a deploy
 //! resets every room, and a request that arrives meanwhile is told to come back. A room that threw
-//! is answered at once, and one that is held up is answered when the service's eight seconds for it
-//! have passed, which [`CONTROL_DEADLINES`] waits for. That is the only
-//! answer sent again, and only once it names a wait. A 500, a rate limit, a refusal and a 503 from
-//! something in front of the service are not. A request is made at most [`MAX_ATTEMPTS`] times and
-//! never past [`RETRY_BUDGET`] from the first, a reservation never past the invitation's own life,
-//! and no request is made past the time the caller allows the whole call, which is what the
-//! mutation it is made for has left; a request that runs out of any of them is reported as the
-//! service being unavailable, with the answer it ended on. A repeat finds what the first did: a reservation the room made is answered
-//! as taken, which makes the host draw another locator, and a release it made is answered
-//! `FORBIDDEN`, which a release has always been reported as.
+//! is answered at once, and one that is held up is answered when the service's eight seconds for
+//! it have passed, which [`CONTROL_DEADLINES`] waits for. That is the only answer sent again, and
+//! only once it names a wait. A 500, a rate limit, a refusal and a 503 from something in front of
+//! the service are not.
+//!
+//! A request is made at most [`MAX_ATTEMPTS`] times and never past [`RETRY_BUDGET`] from the first.
+//! A reservation is not sent again past the invitation's own life. A call made for a mutation is
+//! not sent again past the time its [`Bound`] allows the whole call, nor once the mutation has less
+//! left than a wait and a whole attempt need, which is read again after the wait. A request that
+//! runs out of any of these is reported as the service being unavailable, with the answer it ended
+//! on. A repeat finds what the first did: a reservation the room made is answered as taken, which
+//! makes the host draw another locator, and a release it made is answered `FORBIDDEN`, which a
+//! release has always been reported as.
 
 use std::time::Duration;
 
@@ -61,7 +64,6 @@ use kr_client::services::http::{HttpDeadlines, HttpService, ResponseLimits};
 use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer};
 use kr_crypto::secret::SymmetricKey;
 use kr_pairing::PairingError;
-use kr_pairing::platform::RendezvousHost;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::InvitationId;
 use kr_protocol::pairing::{Locator, RendezvousOrigin};
@@ -72,7 +74,7 @@ use kr_transport::listener::BoxFuture;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use super::rendezvous::{NotAttached, OWNER_RELEASE, Rendezvous};
+use super::rendezvous::{Bound, Life, NotAttached, OWNER_RELEASE, Rendezvous};
 
 /// Where a host reserves a locator for an invitation.
 pub const RESERVE_PATH: &str = "/api/pair/locator/reserve";
@@ -108,7 +110,7 @@ pub const MAX_ATTEMPTS: u32 = 4;
 pub const RETRY_BUDGET: Duration = Duration::from_secs(30);
 
 // A release made while an owner waits is one exchange: no wait and a whole attempt fit in its time.
-const _: () = assert!(OWNER_RELEASE.as_millis() == CONTROL_DEADLINES.total.as_millis());
+const _: () = assert!(OWNER_RELEASE.as_nanos() == CONTROL_DEADLINES.total.as_nanos());
 
 /// The rendezvous service a deployed host reaches over HTTPS.
 ///
@@ -156,8 +158,8 @@ impl HttpsRendezvous {
     /// Reserves `locator` at `origin` for `invitation_id`. False when the locator is taken.
     ///
     /// Only the locator travels, never the six secret characters of the code, and the control
-    /// token only as its hash. The whole call, any request sent again included, takes no longer
-    /// than `within` once its first request is made.
+    /// token only as its hash. A request is sent again only within `bound`, as this module's note
+    /// describes.
     ///
     /// # Errors
     ///
@@ -170,7 +172,7 @@ impl HttpsRendezvous {
         invitation_id: InvitationId,
         advertised_expires_at_ms: TimestampMs,
         control_token_hash: Digest256,
-        within: Duration,
+        bound: &Bound,
     ) -> kr_pairing::Result<bool> {
         let gateway = GatewayOrigin::new(origin.as_str()).map_err(configuration)?;
         self.reserve_at(
@@ -179,7 +181,7 @@ impl HttpsRendezvous {
             invitation_id,
             advertised_expires_at_ms,
             control_token_hash,
-            within,
+            bound,
         )
         .await
     }
@@ -195,7 +197,7 @@ impl HttpsRendezvous {
         invitation_id: InvitationId,
         advertised_expires_at_ms: TimestampMs,
         control_token_hash: Digest256,
-        within: Duration,
+        bound: &Bound,
     ) -> kr_pairing::Result<bool> {
         let body = reserve_body(
             locator,
@@ -208,14 +210,21 @@ impl HttpsRendezvous {
                 .get()
                 .saturating_sub(kr_ipc::now_ms().get()),
         );
-        let until = Instant::now() + life.min(RETRY_BUDGET).min(within);
-        let answer: ReserveAnswer =
-            control(gateway, RESERVE_PATH, &body, self.proxy.as_ref(), until).await?;
+        let until = Instant::now() + life.min(RETRY_BUDGET).min(bound.within());
+        let answer: ReserveAnswer = control(
+            gateway,
+            RESERVE_PATH,
+            &body,
+            self.proxy.as_ref(),
+            until,
+            bound,
+        )
+        .await?;
         Ok(answer.reserved)
     }
 
-    /// Releases the reservation of `locator` at `origin`, taking no longer than `within` in all
-    /// once the first request is made.
+    /// Releases the reservation of `locator` at `origin`. A request is sent again only within
+    /// `bound`, as this module's note describes.
     ///
     /// # Errors
     ///
@@ -228,10 +237,10 @@ impl HttpsRendezvous {
         origin: &RendezvousOrigin,
         locator: &Locator,
         control_token: &SymmetricKey,
-        within: Duration,
+        bound: &Bound,
     ) -> kr_pairing::Result<()> {
         let gateway = GatewayOrigin::new(origin.as_str()).map_err(configuration)?;
-        self.release_at(&gateway, locator, control_token, within)
+        self.release_at(&gateway, locator, control_token, bound)
             .await
     }
 
@@ -241,12 +250,19 @@ impl HttpsRendezvous {
         gateway: &GatewayOrigin,
         locator: &Locator,
         control_token: &SymmetricKey,
-        within: Duration,
+        bound: &Bound,
     ) -> kr_pairing::Result<()> {
         let body = release_body(locator, control_token)?;
-        let until = Instant::now() + RETRY_BUDGET.min(within);
-        let _: ReleaseAnswer =
-            control(gateway, RELEASE_PATH, &body, self.proxy.as_ref(), until).await?;
+        let until = Instant::now() + RETRY_BUDGET.min(bound.within());
+        let _: ReleaseAnswer = control(
+            gateway,
+            RELEASE_PATH,
+            &body,
+            self.proxy.as_ref(),
+            until,
+            bound,
+        )
+        .await?;
         Ok(())
     }
 }
@@ -276,7 +292,7 @@ impl Rendezvous for HttpsRendezvous {
         invitation_id: InvitationId,
         advertised_expires_at_ms: TimestampMs,
         control_token_hash: Digest256,
-        within: Duration,
+        bound: &Bound,
     ) -> kr_pairing::Result<bool> {
         self.runtime.block_on(self.reserve(
             origin,
@@ -284,7 +300,7 @@ impl Rendezvous for HttpsRendezvous {
             invitation_id,
             advertised_expires_at_ms,
             control_token_hash,
-            within,
+            bound,
         ))
     }
 
@@ -293,10 +309,10 @@ impl Rendezvous for HttpsRendezvous {
         origin: &RendezvousOrigin,
         locator: &Locator,
         control_token: &SymmetricKey,
-        within: Duration,
+        bound: &Bound,
     ) -> kr_pairing::Result<()> {
         self.runtime
-            .block_on(self.release(origin, locator, control_token, within))
+            .block_on(self.release(origin, locator, control_token, bound))
     }
 }
 
@@ -327,35 +343,6 @@ fn room_failure(error: RoomError) -> PairingError {
         | RoomError::NotAnUpgrade { .. } => PairingError::RendezvousUnavailable {
             reason: error.to_string(),
         },
-    }
-}
-
-impl RendezvousHost for HttpsRendezvous {
-    fn reserve_locator(
-        &self,
-        origin: &RendezvousOrigin,
-        locator: &Locator,
-        invitation_id: InvitationId,
-        advertised_expires_at_ms: TimestampMs,
-        control_token_hash: Digest256,
-    ) -> kr_pairing::Result<bool> {
-        self.reserve_within(
-            origin,
-            locator,
-            invitation_id,
-            advertised_expires_at_ms,
-            control_token_hash,
-            RETRY_BUDGET,
-        )
-    }
-
-    fn release_locator(
-        &self,
-        origin: &RendezvousOrigin,
-        locator: &Locator,
-        control_token: &SymmetricKey,
-    ) -> kr_pairing::Result<()> {
-        self.release_within(origin, locator, control_token, RETRY_BUDGET)
     }
 }
 
@@ -459,16 +446,18 @@ fn json<T: Serialize>(body: &T) -> kr_pairing::Result<Vec<u8>> {
 ///
 /// A request the service answers that it should be sent again is sent again, after the wait the
 /// answer names, as this module's note describes. `until` is the last instant an attempt after the
-/// first may end at. Such an attempt is started only when a whole one fits before it, which is
-/// asked again after its wait, and its exchange is stopped at it. Its transport is made before the
-/// wait, so what making it costs is spent from the time the second question reads. The first
-/// attempt is the one request a host always made.
+/// first may end at on the runtime's clock, and `bound` carries the mutation's life, when the call
+/// is made for one, on the clock its deadline is kept on. Such an attempt is started only when a
+/// whole one fits in both, which is asked again after its wait, and its exchange is stopped at
+/// `until`. Its transport is made before the wait, so what making it costs is spent from the time
+/// the second question reads. The first attempt is the one request a host always made.
 async fn control<T: Answer>(
     gateway: &GatewayOrigin,
     path: &str,
     body: &[u8],
     proxy: Option<&ProxyUrl>,
     until: Instant,
+    bound: &Bound,
 ) -> kr_pairing::Result<T> {
     let mut transport = transport_to(gateway, proxy)?;
     let mut attempt = 1;
@@ -481,7 +470,7 @@ async fn control<T: Answer>(
         let Some(wait) = failure.send_again_after else {
             return Err(failure.error);
         };
-        if attempt == MAX_ATTEMPTS || !fits(until, wait) {
+        if attempt == MAX_ATTEMPTS || !fits(until, bound, wait) {
             return Err(failure.error);
         }
         attempt += 1;
@@ -490,9 +479,10 @@ async fn control<T: Answer>(
         };
         transport = next;
         tokio::time::sleep(wait).await;
-        // The wait can end later than it was set for, and another attempt is made only if all of
-        // it still fits.
-        if !fits(until, Duration::ZERO) {
+        // The wait can end later than it was set for, and the machine can have slept through it
+        // without the runtime's clock counting that, so another attempt is made only if all of it
+        // still fits, in the time left on both clocks.
+        if !fits(until, bound, Duration::ZERO) {
             return Err(failure.error);
         }
         result = match tokio::time::timeout_at(until, exchange(&transport, path, body)).await {
@@ -502,12 +492,15 @@ async fn control<T: Answer>(
     }
 }
 
-/// Whether a wait of `wait` and a whole attempt after it end by `until`.
+/// Whether a wait of `wait` and a whole attempt after it end by `until`, and inside what the
+/// mutation has left when the call is made for one.
 ///
 /// The wait is the service's figure, which can be any number, so it is compared with the time left
 /// and never added to an instant.
-fn fits(until: Instant, wait: Duration) -> bool {
-    wait.saturating_add(CONTROL_DEADLINES.total) <= until.saturating_duration_since(Instant::now())
+fn fits(until: Instant, bound: &Bound, wait: Duration) -> bool {
+    let needed = wait.saturating_add(CONTROL_DEADLINES.total);
+    needed <= until.saturating_duration_since(Instant::now())
+        && bound.life_left().is_none_or(|left| needed <= left)
 }
 
 /// An exchange that did not give the answer asked for, and whether the service said to send the
@@ -953,7 +946,7 @@ mod tests {
                 InvitationId::new(Uuid::from_bytes([1; 16])),
                 TimestampMs::new(1_764_003_600_000),
                 Digest256::from_bytes([2; 32]),
-                ENOUGH,
+                &Bound::by_time(ENOUGH),
             )
             .await
             .expect_err("the certificate is not trusted");
@@ -980,10 +973,11 @@ mod tests {
         let origin = RendezvousOrigin::new(format!("https://{UNANSWERED}")).expect("an origin");
         let rendezvous = HttpsRendezvous::new(None).expect("a client");
         let released = tokio::task::spawn_blocking(move || {
-            rendezvous.release_locator(
+            rendezvous.release_within(
                 &origin,
                 &Locator::new("abcd").expect("a locator"),
                 &SymmetricKey::from_bytes([3; 32]),
+                &Bound::by_time(RETRY_BUDGET),
             )
         })
         .await
@@ -1141,15 +1135,14 @@ mod tests {
 
     /// A reservation for an invitation that has `life` left.
     async fn reserve_for(service: &Scripted, life: Duration) -> kr_pairing::Result<bool> {
-        reserve_within_for(service, life, ENOUGH).await
+        reserve_bound_for(service, life, &Bound::by_time(ENOUGH)).await
     }
 
-    /// A reservation for an invitation that has `life` left, for a caller that allows the whole
-    /// call `within`.
-    async fn reserve_within_for(
+    /// A reservation for an invitation that has `life` left, for a caller bound by `bound`.
+    async fn reserve_bound_for(
         service: &Scripted,
         life: Duration,
-        within: Duration,
+        bound: &Bound,
     ) -> kr_pairing::Result<bool> {
         let expires = kr_ipc::now_ms().get() + u64::try_from(life.as_millis()).expect("a life");
         tokio::time::timeout(
@@ -1160,22 +1153,22 @@ mod tests {
                 InvitationId::new(Uuid::from_bytes([1; 16])),
                 TimestampMs::new(expires),
                 Digest256::from_bytes([2; 32]),
-                within,
+                bound,
             ),
         )
         .await
         .expect("the reservation ends")
     }
 
-    /// A release for a caller that allows the whole call `within`.
-    async fn release_within_for(service: &Scripted, within: Duration) -> kr_pairing::Result<()> {
+    /// A release for a caller bound by `bound`.
+    async fn release_bound_for(service: &Scripted, bound: &Bound) -> kr_pairing::Result<()> {
         tokio::time::timeout(
             WATCHDOG,
             HttpsRendezvous::new(None).expect("a client").release_at(
                 &service.gateway,
                 &Locator::new("abcd").expect("a locator"),
                 &SymmetricKey::from_bytes([3; 32]),
-                within,
+                bound,
             ),
         )
         .await
@@ -1246,7 +1239,7 @@ mod tests {
     async fn a_release_the_service_said_to_send_again_is_sent_again() {
         let service = Scripted::answering(&[(503, BUSY_NOW), (200, RELEASED)]).await;
 
-        let released = release_within_for(&service, ENOUGH).await;
+        let released = release_bound_for(&service, &Bound::by_time(ENOUGH)).await;
 
         released.expect("the second attempt is answered");
         assert_eq!(service.requests(), 2);
@@ -1309,44 +1302,89 @@ mod tests {
     }
 
     /// A mutation is given a time to live, and a request sent again for it must not be sent past
-    /// it: a caller that allows less than a wait and a whole attempt takes one request, and one
-    /// that allows enough takes the second. A reservation's invitation has plenty of life left in
-    /// every case here.
+    /// it. A call whose mutation has less left than a wait and a whole attempt takes one request,
+    /// and one that has enough takes the second. A reservation's invitation has plenty of life
+    /// left in every case here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_reservation_is_not_sent_again_past_the_time_its_caller_allows() {
+    async fn a_reservation_is_not_sent_again_past_the_life_of_its_mutation() {
         let wait = r#"{"ok":false,"error":{"code":"SERVICE_UNAVAILABLE","message":"Later.","retryAfterSeconds":1}}"#;
+        let life = |left: Duration| -> Life { Arc::new(move || left) };
         let tight = Scripted::answering(&[(503, wait), (200, RESERVED)]).await;
 
-        // The wait and a whole attempt do not fit in five seconds.
-        let short =
-            reserve_within_for(&tight, Duration::from_secs(300), Duration::from_secs(5)).await;
+        // The wait and a whole attempt do not fit in the five seconds the mutation has left.
+        let short = reserve_bound_for(
+            &tight,
+            Duration::from_secs(300),
+            &Bound::of_mutation(&life(Duration::from_secs(5))),
+        )
+        .await;
 
         assert_eq!(code(short), ErrorCode::RendezvousUnavailable);
         assert_eq!(tight.requests(), 1);
 
-        // The same answers, to a caller that allows the second request, which is made.
+        // The same answers, to a call whose mutation has the time, which makes the second request.
         let roomy = Scripted::answering(&[(503, wait), (200, RESERVED)]).await;
 
-        let long = reserve_within_for(&roomy, Duration::from_secs(300), ENOUGH).await;
+        let long = reserve_bound_for(
+            &roomy,
+            Duration::from_secs(300),
+            &Bound::of_mutation(&life(Duration::from_secs(300))),
+        )
+        .await;
 
         assert!(long.expect("the second request is answered"));
         assert_eq!(roomy.requests(), 2);
+    }
+
+    /// The machine can sleep through a wait without the runtime's clock counting it, and the
+    /// mutation's deadline is kept on a clock that does. So the mutation's life is read again after
+    /// the wait, and a request is not sent for a mutation that ran out during it. The mutation's
+    /// clock here runs six hundred times faster than the wait: it has all the time it needs when
+    /// the wait begins and none when the wait ends. The control is the same call on a clock that
+    /// does not move.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reservation_is_not_sent_for_a_mutation_that_ran_out_during_the_wait() {
+        let wait = r#"{"ok":false,"error":{"code":"SERVICE_UNAVAILABLE","message":"Later.","retryAfterSeconds":1}}"#;
+        let began = std::time::Instant::now();
+        let fast: Life =
+            Arc::new(move || Duration::from_secs(600).saturating_sub(began.elapsed() * 600));
+        let slept = Scripted::answering(&[(503, wait), (200, RESERVED)]).await;
+
+        let ran_out =
+            reserve_bound_for(&slept, Duration::from_secs(300), &Bound::of_mutation(&fast)).await;
+
+        assert_eq!(code(ran_out), ErrorCode::RendezvousUnavailable);
+        assert_eq!(slept.requests(), 1);
+
+        let awake: Life = Arc::new(|| Duration::from_secs(600));
+        let kept = Scripted::answering(&[(503, wait), (200, RESERVED)]).await;
+
+        let reserved =
+            reserve_bound_for(&kept, Duration::from_secs(300), &Bound::of_mutation(&awake)).await;
+
+        assert!(reserved.expect("the second request is answered"));
+        assert_eq!(kept.requests(), 2);
     }
 
     /// A release made while an owner waits for its answer is made once, and one nobody waits for is
     /// sent again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_an_owner_waits_for_is_made_once() {
+        let life: Life = Arc::new(|| Duration::from_secs(120));
         let owner_waits = Scripted::answering(&[(503, BUSY_NOW), (200, RELEASED)]).await;
 
-        let once = release_within_for(&owner_waits, OWNER_RELEASE).await;
+        let once = release_bound_for(
+            &owner_waits,
+            &Bound::of_mutation(&life).capped(OWNER_RELEASE),
+        )
+        .await;
 
         assert_eq!(code(once), ErrorCode::RendezvousUnavailable);
         assert_eq!(owner_waits.requests(), 1);
 
         let nobody_waits = Scripted::answering(&[(503, BUSY_NOW), (200, RELEASED)]).await;
 
-        let again = release_within_for(&nobody_waits, RETRY_BUDGET).await;
+        let again = release_bound_for(&nobody_waits, &Bound::by_time(RETRY_BUDGET)).await;
 
         again.expect("the second request is answered");
         assert_eq!(nobody_waits.requests(), 2);
@@ -1607,6 +1645,41 @@ mod tests {
             attached.expect_err("refused").error.code(),
             ErrorCode::RendezvousUnavailable
         );
+    }
+
+    /// A room that refuses the upgrade with 503 and names a wait is not attached to, and the host
+    /// is told the wait it names, which the relay waits out before it attaches again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_room_that_refuses_the_upgrade_and_names_a_wait_says_so() {
+        let authority = Authority::new("rendezvous test authority");
+        let room = LoopbackRoom::start(&authority).await;
+        let client = authority.trusted_by();
+        let (attached, ()) = tokio::time::timeout(WATCHDOG, async {
+            tokio::join!(
+                client.attach(&room.origin, &locator(), &SymmetricKey::from_bytes([5; 32])),
+                async {
+                    let (stream, _) = room.listener.accept().await.expect("a connection");
+                    let mut stream = room.acceptor.accept(stream).await.expect("TLS");
+                    let mut head = Vec::new();
+                    while !head.ends_with(b"\r\n\r\n") {
+                        head.push(stream.read_u8().await.expect("the request"));
+                    }
+                    let body = r#"{"ok":false,"error":{"code":"SERVICE_UNAVAILABLE","message":"Later.","retryAfterSeconds":2}}"#;
+                    let answer = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nretry-after: 2\r\n\
+                         content-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(answer.as_bytes()).await.expect("answered");
+                    let _ = stream.shutdown().await;
+                }
+            )
+        })
+        .await
+        .expect("the attempt ends");
+        let refused = attached.expect_err("refused");
+        assert_eq!(refused.error.code(), ErrorCode::RendezvousUnavailable);
+        assert_eq!(refused.retry_after, Some(Duration::from_secs(2)));
     }
 
     /// KR-REQ-10.19: a room socket that did not open is the service being unavailable to the

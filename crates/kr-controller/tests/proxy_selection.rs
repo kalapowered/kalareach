@@ -20,7 +20,7 @@ use kr_client::services::account::{AccountToken, IssuedGrant, RefreshToken};
 use kr_controller::config::Outbound;
 use kr_controller::push::transport::{DeliveryTransports, ManagedTransports};
 use kr_controller::service::net::NetworkSetup;
-use kr_controller::service::net::rendezvous::Rendezvous;
+use kr_controller::service::net::rendezvous::{Bound, Rendezvous};
 use kr_controller::service::net::rendezvous_https::{HttpsRendezvous, RETRY_BUDGET};
 use kr_crypto::secret::SymmetricKey;
 use kr_delivery::destination::{DestinationKind, ExternalDestination, Idempotency};
@@ -97,7 +97,7 @@ async fn a_host_reaches_its_rendezvous_through_the_proxy_it_selected() {
             InvitationId::new(Uuid::from_bytes([1; 16])),
             TimestampMs::new(1_764_003_600_000),
             Digest256::from_bytes([2; 32]),
-            RETRY_BUDGET,
+            &Bound::by_time(RETRY_BUDGET),
         ),
     )
     .await
@@ -154,12 +154,13 @@ async fn the_network_setup_reaches_its_rendezvous_through_the_proxy_its_document
     let reserved = tokio::time::timeout(
         WATCHDOG,
         tokio::task::spawn_blocking(move || {
-            reserving.reserve_locator(
+            reserving.reserve_within(
                 &at,
                 &named,
                 InvitationId::new(Uuid::from_bytes([1; 16])),
                 TimestampMs::new(1_764_003_600_000),
                 Digest256::from_bytes([2; 32]),
+                &Bound::by_time(RETRY_BUDGET),
             )
         }),
     )

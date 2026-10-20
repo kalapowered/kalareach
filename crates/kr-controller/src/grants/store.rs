@@ -1238,22 +1238,23 @@ impl GrantDirectory {
         })
     }
 
-    /// The sessions an invitation is waiting over: one nobody has redeemed or withdrawn, whose
-    /// grant authorises nothing yet.
+    /// The sessions an invitation is waiting over at `now_ms`: one nobody has redeemed or
+    /// withdrawn, whose end has not come, and whose grant authorises nothing yet.
     ///
     /// # Errors
     ///
     /// Returns an error when the rows cannot be read.
-    pub fn sessions_with_waiting_invitations(&self) -> Result<BTreeSet<SessionId>> {
+    pub fn sessions_with_waiting_invitations(&self, now_ms: u64) -> Result<BTreeSet<SessionId>> {
+        let now = i64::try_from(now_ms).unwrap_or(i64::MAX);
         let sessions: Vec<Vec<u8>> = self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT DISTINCT g.session_id
                  FROM session_invitations i JOIN grants g ON g.grant_id = i.grant_id
-                 WHERE i.state = 'open' AND g.session_id IS NOT NULL
+                 WHERE i.state = 'open' AND i.expires_at_ms > ?1 AND g.session_id IS NOT NULL
                    AND g.revoked_at_ms IS NULL AND g.activated_at_ms IS NULL",
             )?;
             let sessions = statement
-                .query_map([], |row| row.get(0))?
+                .query_map(params![now], |row| row.get(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(sessions)
         })?;
@@ -1264,14 +1265,19 @@ impl GrantDirectory {
             .collect())
     }
 
-    /// Withdraws every invitation waiting over one of `sessions`, and returns the grants it
-    /// withdrew.
+    /// Withdraws every invitation waiting over one of `sessions` at `now_ms`, and returns the
+    /// grants it withdrew.
     ///
     /// An invitation over a session that has closed can never be redeemed, so it is withdrawn as
     /// its issuer would withdraw it: the grant is revoked and the invitation says it was
-    /// withdrawn. Nothing of it was ever in force, so there is nothing to fence and no revision
-    /// to advance. One transaction for the whole set, and idempotent: what is already withdrawn
-    /// is left as it was, and a repeat finds nothing.
+    /// withdrawn. An invitation whose end has come, or whose grant's has, ended by itself and is
+    /// left as it ended, so the host keeps telling a device that redeems it that it ran out.
+    /// Nothing of a waiting invitation was ever in force, so there is nothing to fence and no
+    /// revision to advance, and no grant is delegated from one that is not yet in force, so the
+    /// grant is the whole of what is withdrawn and nothing else in the store is read.
+    ///
+    /// One transaction for the whole set, and idempotent: what is already withdrawn is left as it
+    /// was, and a repeat finds nothing.
     ///
     /// # Errors
     ///
@@ -1281,6 +1287,7 @@ impl GrantDirectory {
         sessions: &BTreeSet<SessionId>,
         now_ms: u64,
     ) -> Result<Vec<GrantId>> {
+        let now = i64::try_from(now_ms).unwrap_or(i64::MAX);
         self.in_transaction(|connection| {
             let mut waiting = Vec::new();
             for session_id in sessions {
@@ -1288,14 +1295,15 @@ impl GrantDirectory {
                     .prepare(
                         "SELECT g.grant_id
                          FROM session_invitations i JOIN grants g ON g.grant_id = i.grant_id
-                         WHERE i.state = 'open' AND g.session_id = ?1
+                         WHERE i.state = 'open' AND i.expires_at_ms > ?2 AND g.session_id = ?1
                            AND g.revoked_at_ms IS NULL AND g.activated_at_ms IS NULL",
                     )
                     .map_err(ControllerError::registry)?;
                 let found = statement
-                    .query_map(params![session_id.get().as_bytes().as_slice()], |row| {
-                        row.get::<_, Vec<u8>>(0)
-                    })
+                    .query_map(
+                        params![session_id.get().as_bytes().as_slice(), now],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
                     .map_err(ControllerError::registry)?
                     .collect::<rusqlite::Result<Vec<_>>>()
                     .map_err(ControllerError::registry)?;
@@ -1306,17 +1314,22 @@ impl GrantDirectory {
                         .map(GrantId::new),
                 );
             }
-            let now_ms = next_moment(connection, now_ms)?;
+            let moment = next_moment(connection, now_ms)?;
             let held = self.held_closes();
             let mut debt = None;
             let mut withdrawn = Vec::new();
             for grant_id in waiting {
-                let subtree = Self::subtree_to_revoke(connection, grant_id)?;
+                let Some(record) = read_one(connection, grant_id)? else {
+                    continue;
+                };
+                if !record.grant.expiry.is_valid_at(now_ms) {
+                    continue;
+                }
                 let one = Self::revoke_subtree(
                     connection,
                     grant_id,
-                    &subtree,
-                    now_ms,
+                    &[record],
+                    moment,
                     &mut debt,
                     "the withdrawal of the invitations over a closed session",
                     &held,

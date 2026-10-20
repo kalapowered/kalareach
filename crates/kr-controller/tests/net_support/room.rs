@@ -15,7 +15,7 @@ use std::time::Duration;
 use iroh::EndpointAddr;
 use kr_client::pairing::room::RoomSocket;
 use kr_controller::service::net::pairing::HostPairingClock;
-use kr_controller::service::net::rendezvous::{NotAttached, Rendezvous};
+use kr_controller::service::net::rendezvous::{Bound, NotAttached, Rendezvous};
 use kr_crypto::secret::SymmetricKey;
 use kr_pairing::PairingError;
 use kr_pairing::bundles::BundleFrame;
@@ -611,9 +611,9 @@ impl Rendezvous for TestRoom {
         invitation_id: InvitationId,
         advertised_expires_at_ms: TimestampMs,
         control_token_hash: Digest256,
-        within: Duration,
+        bound: &Bound,
     ) -> kr_pairing::Result<bool> {
-        self.rooms().reserve_bounds.push(within);
+        self.rooms().reserve_bounds.push(bound.within());
         self.reserve_locator(
             origin,
             locator,
@@ -628,9 +628,9 @@ impl Rendezvous for TestRoom {
         origin: &RendezvousOrigin,
         locator: &Locator,
         control_token: &SymmetricKey,
-        within: Duration,
+        bound: &Bound,
     ) -> kr_pairing::Result<()> {
-        self.rooms().release_bounds.push(within);
+        self.rooms().release_bounds.push(bound.within());
         self.release_locator(origin, locator, control_token)
     }
 

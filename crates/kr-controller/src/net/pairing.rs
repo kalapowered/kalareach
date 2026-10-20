@@ -538,8 +538,9 @@ impl PairingHost {
     /// invitation is open, and after a restart is told what became of it; nothing new is issued
     /// for it. The same action with other parameters is `ID_CONFLICT`.
     ///
-    /// `life` is what the mutation has left. The rendezvous requests this makes, a reservation sent
-    /// again included, are bound by it, so none is sent for a mutation that has run out.
+    /// `life` is what the mutation has left. The rendezvous requests this makes are bound by it: the
+    /// first request of each is always made, and none is sent again once the mutation has less left
+    /// than a wait and a whole attempt need.
     ///
     /// # Errors
     ///
