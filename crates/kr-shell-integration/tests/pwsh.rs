@@ -918,6 +918,71 @@ fn a_launch_of_a_name_only_the_get_fallback_answers_is_refused() {
     );
 }
 
+/// The argument vectors a PowerShell launch is given, each with the line that is installed for
+/// it. The companion shows a stock PowerShell session the same lines, and reads the same table.
+const POWERSHELL_LAUNCH_LINES: &str =
+    include_str!("../../../fixtures/shells/powershell-launch-lines.json");
+
+/// KR-REQ-23.54, KR-REQ-07.21: the line the module installs for a launch is the line the table
+/// lists for its vector.
+///
+/// Every word is one quoted string, the call operator comes first, and the one word PowerShell
+/// reads as its stop-parsing token is written in the form that passes it on. A person who is shown
+/// the table's line for a stock session types what a managed launch would have run. The module
+/// refuses a first word that no application has, so the case makes each first word a program: a
+/// name on the search path, or a path under the directory the host starts in.
+#[test]
+#[ignore = "drives this tree's built PSReadLine package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_launch_installs_the_line_the_table_lists_for_its_vector() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let table: serde_json::Value =
+        serde_json::from_str(POWERSHELL_LAUNCH_LINES).expect("the table of lines");
+    let cases = table["cases"].as_array().expect("the table's cases");
+    let programs = tempfile::tempdir().expect("a temporary directory");
+    for case in cases {
+        let Some(program) = case["vector"][0].as_str() else {
+            continue;
+        };
+        let file = programs.path().join(program);
+        std::fs::create_dir_all(file.parent().expect("a directory for the program"))
+            .expect("the program's directory");
+        std::fs::write(&file, "#!/bin/sh\n").expect("a program");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
+            .expect("the program can be run");
+    }
+    let listed = tempfile::tempdir().expect("a temporary directory");
+    let path = listed.path().join("powershell-launch-lines.json");
+    std::fs::write(&path, POWERSHELL_LAUNCH_LINES).expect("the table");
+
+    let here = shellpkg::told(programs.path());
+    let output = in_the_package_host(&format!(
+        "$env:PATH = '{here}' + [System.IO.Path]::PathSeparator + $env:PATH; \
+         Set-Location '{here}'; \
+         $cases = (Get-Content -Raw -Encoding utf8 '{table}' | ConvertFrom-Json).cases; \
+         $index = 0; \
+         foreach ($case in $cases) {{ \
+             $line = & $module {{ param($vector) Get-KrLaunchText @{{ arguments = $vector }} }} ([object[]]@($case.vector)); \
+             if ($null -eq $line) {{ Write-Output \"kr-refused[$index]\" }} \
+             else {{ Write-Output \"kr-key[$index]=[$line]\" }}; \
+             $index++ \
+         }}",
+        table = shellpkg::told(&path)
+    ));
+    for (index, case) in cases.iter().enumerate() {
+        let name = case["name"].as_str().expect("the case's name");
+        assert!(
+            !output.contains(&format!("kr-refused[{index}]")),
+            "the module built no line for {name}:\n{output}"
+        );
+        assert_eq!(
+            said(&output, &index.to_string()),
+            case["line"].as_str().expect("the case's line"),
+            "the line installed for {name} is not the table's:\n{output}"
+        );
+    }
+}
+
 /// A program that writes each of its first nine arguments, one `n=[word]` line each.
 const SHOW_EACH: &str = "#!/bin/sh\ni=0\n: > \"$KR_CASE_OUT\"\nfor word in \"$@\"; do\n  i=$((i + 1))\n  printf '%s=[%s]\\n' \"$i\" \"$word\" >> \"$KR_CASE_OUT\"\ndone\n";
 

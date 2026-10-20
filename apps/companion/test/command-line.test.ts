@@ -8,6 +8,7 @@
 
 import { describe, expect, it } from 'vitest'
 
+import powershellLines from '../../../fixtures/shells/powershell-launch-lines.json'
 import { commandLine } from '../src/model/command-line'
 import type { ShellKind } from '../src/model/pending'
 
@@ -15,8 +16,8 @@ import type { ShellKind } from '../src/model/pending'
 const POSIX: readonly ShellKind[] = ['sh', 'zsh', 'bash']
 
 describe('a command written for the shell that reads it', () => {
-  it('leaves a command made only of plain words as it is, in every shell', () => {
-    for (const kind of ['sh', 'zsh', 'bash', 'fish', 'powershell'] as const) {
+  it('leaves a command made only of plain words as it is, in every shell that reads one so', () => {
+    for (const kind of ['sh', 'zsh', 'bash', 'fish'] as const) {
       expect(commandLine(['pnpm', 'test', '--filter=app', './a/b.sh'], kind)).toBe(
         'pnpm test --filter=app ./a/b.sh'
       )
@@ -37,28 +38,12 @@ describe('a command written for the shell that reads it', () => {
     )
   })
 
-  it('doubles every quote PowerShell reads, and calls a program it had to quote', () => {
-    // The ASCII quote and the four typographic ones all end a string in PowerShell.
-    expect(commandLine(['C:\\Program Files\\Git\\git.exe', 'it\u2019s', "o'k", '\u2018\u201A\u201B'], 'powershell')).toBe(
-      "& 'C:\\Program Files\\Git\\git.exe' 'it\u2019\u2019s' 'o''k' '\u2018\u2018\u201A\u201A\u201B\u201B'"
-    )
-    // A program that needed no quotes needs no call operator.
-    expect(commandLine(['git', 'status'], 'powershell')).toBe('git status')
-  })
-
-  it('quotes a PowerShell word that starts with one dash and holds a dot, which it cuts at the dot', () => {
-    for (const argument of ['-Dfoo.bar=baz', '-o.txt', '-a.b', '-v1.2']) {
-      expect(commandLine(['show', argument], 'powershell')).toBe(`show '${argument}'`)
-    }
-    // A word with a colon waits for a value: none follows it at the end of a line, and the next
-    // word or a dash inside it changes the arguments in the middle of one.
-    for (const argument of ['-x:', '-a:b', '-a:--', '-a:-b:c', '-x:--%']) {
-      expect(commandLine(['show', 'x', argument], 'powershell')).toBe(`show x '${argument}'`)
-    }
-    // A word with two dashes, or none, is whole as it is.
-    expect(
-      commandLine(['show', '--model=gpt-5.1', '--a.b', '--a:--', 'a:-b:c', 'a.b'], 'powershell')
-    ).toBe('show --model=gpt-5.1 --a.b --a:-- a:-b:c a.b')
+  // PowerShell's line is the one the shell integration installs for a launch, word for word: the
+  // call operator, then every word as one quoted string, and the one word PowerShell reads as its
+  // stop-parsing token in the form that passes it on. The vectors are the ones the module's own
+  // line is checked against in a real PowerShell.
+  it.each(powershellLines.cases)('writes the line the shell integration installs: $name', (row) => {
+    expect(commandLine(row.vector, 'powershell')).toBe(row.line)
   })
 
   it('quotes a word Zsh reads as the path of a command and one Fish reads as a process number', () => {
@@ -67,17 +52,11 @@ describe('a command written for the shell that reads it', () => {
     expect(commandLine(['show', '%self'], 'fish')).toBe("show '%self'")
   })
 
-  it('quotes the words PowerShell would take for splatting or a list, which no other shell does', () => {
-    expect(commandLine(['show', '@payload', 'a,b'], 'powershell')).toBe("show '@payload' 'a,b'")
+  it('leaves the words PowerShell would take for splatting, a list or its stop-parsing token as they are in the other shells', () => {
     for (const kind of ['sh', 'zsh', 'bash', 'fish'] as const) {
-      expect(commandLine(['show', '@payload', 'a,b'], kind)).toBe('show @payload a,b')
-    }
-  })
-
-  it('writes the argument PowerShell reads as its stop-parsing token in the one form that keeps it', () => {
-    expect(commandLine(['show', '--%', 'after'], 'powershell')).toBe("show @('--%') after")
-    for (const kind of ['sh', 'zsh', 'bash', 'fish'] as const) {
-      expect(commandLine(['show', '--%', 'after'], kind)).toBe('show --% after')
+      expect(commandLine(['show', '@payload', 'a,b', '--%', '-a.b'], kind)).toBe(
+        'show @payload a,b --% -a.b'
+      )
     }
   })
 })

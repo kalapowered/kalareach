@@ -20,7 +20,7 @@ const LARGEST = 53 / 17
 
 /** What a PowerShell prompt is shown for the fake host's longest saved command. */
 const POWERSHELL_COMMAND =
-  "& '/Users/rs/My Notes/open-notes' --title 'It’’s a draft' '--note=don''t' '--tags=a,b' '@today'"
+  "& '/Users/rs/My Notes/open-notes' '--title' 'It’’s a draft' '--note=don''t' '--tags=a,b' '@today'"
 
 /** The stock shell's launch instructions, with the longest saved command chosen. */
 async function openInstructions(page: Page, shell: string): Promise<void> {

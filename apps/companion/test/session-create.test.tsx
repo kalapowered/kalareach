@@ -214,7 +214,7 @@ describe('creating a session (KR-REQ-07.21)', () => {
     ],
     [
       'powershell',
-      "& '/Users/rs/My Notes/open-notes' --title 'It’’s a draft' '--note=don''t' '--tags=a,b' '@today'"
+      "& '/Users/rs/My Notes/open-notes' '--title' 'It’’s a draft' '--note=don''t' '--tags=a,b' '@today'"
     ]
   ] as const)(
     'shows a stock %s session’s command in that shell’s own quoting',

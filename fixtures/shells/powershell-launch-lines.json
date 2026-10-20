@@ -1,0 +1,77 @@
+{
+  "id": "powershell-launch-lines",
+  "purpose": "The line PowerShell is given for an argument vector: the call operator, then every word as one single-quoted string with each character PowerShell reads as a single quote doubled, and the one word PowerShell reads as its stop-parsing token in the array form that passes it on. The module installs this line for a launch, and the companion shows the same line for a stock shell, so each reads this table.",
+  "covers": [
+    "KR-REQ-07.21",
+    "KR-REQ-23.54"
+  ],
+  "quotes": [
+    "U+0027",
+    "U+2018",
+    "U+2019",
+    "U+201A",
+    "U+201B"
+  ],
+  "cases": [
+    {
+      "name": "a program named by digits",
+      "vector": ["123"],
+      "line": "& '123'"
+    },
+    {
+      "name": "a program named by digits, with words",
+      "vector": ["123", "one", "two words"],
+      "line": "& '123' 'one' 'two words'"
+    },
+    {
+      "name": "plain words are quoted too",
+      "vector": ["pnpm", "test", "--filter=app", "./a/b.sh"],
+      "line": "& 'pnpm' 'test' '--filter=app' './a/b.sh'"
+    },
+    {
+      "name": "a program in a directory with a space in its name",
+      "vector": ["./My Notes/open-notes", "--title", "A draft"],
+      "line": "& './My Notes/open-notes' '--title' 'A draft'"
+    },
+    {
+      "name": "the stop-parsing token",
+      "vector": ["show", "a", "--%", "b", "--%x", "-%-"],
+      "line": "& 'show' 'a' @('--%') 'b' '--%x' '-%-'"
+    },
+    {
+      "name": "a word with each character PowerShell reads as a single quote",
+      "vector": ["show", "a'b", "a‘b", "a’b", "a‚b", "a‛b"],
+      "line": "& 'show' 'a''b' 'a‘‘b' 'a’’b' 'a‚‚b' 'a‛‛b'"
+    },
+    {
+      "name": "words made of nothing but those characters",
+      "vector": ["show", "'", "‘’‚‛"],
+      "line": "& 'show' '''' '‘‘’’‚‚‛‛'"
+    },
+    {
+      "name": "a word that starts like a splat or holds a list",
+      "vector": ["show", "@today", "a,b", "@(1)", "a;b"],
+      "line": "& 'show' '@today' 'a,b' '@(1)' 'a;b'"
+    },
+    {
+      "name": "a word that starts like a parameter",
+      "vector": ["show", "-a.b", "-x:", "-a:-b:c", "--model=gpt-5.1"],
+      "line": "& 'show' '-a.b' '-x:' '-a:-b:c' '--model=gpt-5.1'"
+    },
+    {
+      "name": "words that are syntax in the shell",
+      "vector": ["show", "$HOME", "$(date)", "`n", "a|b", "a&b", "(x)", "{x}", "#c", "<in", "a\"b"],
+      "line": "& 'show' '$HOME' '$(date)' '`n' 'a|b' 'a&b' '(x)' '{x}' '#c' '<in' 'a\"b'"
+    },
+    {
+      "name": "an empty word and a word of spaces",
+      "vector": ["show", "", "  "],
+      "line": "& 'show' '' '  '"
+    },
+    {
+      "name": "no words",
+      "vector": [],
+      "line": ""
+    }
+  ]
+}

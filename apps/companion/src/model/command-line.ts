@@ -3,33 +3,39 @@
  *
  * The page never types into a stock shell, so it shows the command for the person to type. Each
  * shell reads quotes its own way, and text quoted for another shell runs as something else in this
- * one, so the vector is quoted for the shell the session runs. The rules are the ones the product
- * applies to a command it installs itself: a word that holds only characters no shell treats as
- * more than themselves is written as it is, and any other word is one quoted string.
+ * one, so the vector is quoted for the shell the session runs.
+ *
+ * Most shells write a word as it is when it holds only characters no shell treats as more than
+ * themselves, and as one quoted string otherwise. PowerShell reads more as syntax (a leading `@`,
+ * `-` or `$`, a comma, a bare number), so every word of its line is one quoted string. That line
+ * is the one the shell integration installs when it launches the same vector, so a person who types
+ * it runs what a launch would have run. The page cannot see which alias, function or cmdlet that
+ * shell finds before the program, so the program is shown as it was named, where a launch writes
+ * the program's full path if something else would stand in for it.
  */
 
 import type { ShellKind } from './pending'
 
-/** Characters every shell here reads as themselves. */
+/** Characters every other shell here reads as themselves. */
 const PLAIN = /^[\w@%+=:,./-]+$/
 
-/** The four characters PowerShell reads as a single quote besides the ASCII one. */
+/** The five characters PowerShell reads as a single quote: the ASCII one and four typographic ones. */
 const POWERSHELL_QUOTES = /['\u2018\u2019\u201A\u201B]/g
 
-/** One argument as a single word of the shell `kind`. */
-function word(argument: string, kind: ShellKind): string {
-  if (kind === 'powershell') {
-    // Its stop-parsing token is left out of a program's arguments wherever it is written, quoted or
-    // not, and the array expression is the one spelling that passes it on.
-    if (argument === '--%') return "@('--%')"
-    // `@` at the start of a word splats a variable and a comma makes a list. A word that starts with
-    // one dash is read as a parameter: a dot cuts it in two, and a colon makes the next word its
-    // value, which is a parse error at the end of a line and a changed argument list in the middle
-    // of a word like `-a:-b:c`.
-    const parameter = /^-[^-]/.test(argument) && /[.:]/.test(argument)
-    if (PLAIN.test(argument) && !/[@,]/.test(argument) && !parameter) return argument
-    return `'${argument.replace(POWERSHELL_QUOTES, '$&$&')}'`
-  }
+/** One string of PowerShell: the word in single quotes, each quote character written twice. */
+function powershellString(argument: string): string {
+  return `'${argument.replace(POWERSHELL_QUOTES, '$&$&')}'`
+}
+
+/** One argument after the program, as a word of PowerShell. */
+function powershellWord(argument: string): string {
+  // Its stop-parsing token is left out of a program's arguments wherever it is written, quoted or
+  // not, and the array expression is the one spelling that passes it on.
+  return argument === '--%' ? "@('--%')" : powershellString(argument)
+}
+
+/** One argument as a single word of a shell other than PowerShell. */
+function word(argument: string, kind: Exclude<ShellKind, 'powershell'>): string {
   // Zsh reads a word that starts with `=` as the path of a command, and Fish reads `%self` as a
   // process number, so neither is left bare.
   const bare = PLAIN.test(argument) && !argument.startsWith('=') && !argument.startsWith('%')
@@ -40,9 +46,12 @@ function word(argument: string, kind: ShellKind): string {
 
 /** The vector `argv` as one line for the shell `kind`. */
 export function commandLine(argv: readonly string[], kind: ShellKind): string {
-  const words = argv.map((argument) => word(argument, kind))
-  // PowerShell reads a quoted word at the start of a line as a string to print. The call operator
-  // is what runs it, and it is needed exactly when the program's name had to be quoted.
-  if (kind === 'powershell' && words[0]?.startsWith("'")) words[0] = `& ${words[0]}`
-  return words.join(' ')
+  if (kind === 'powershell') {
+    if (argv.length === 0) return ''
+    // A quoted word at the start of a line is a string to print, and the call operator is what
+    // runs it, so the operator comes first and the program is quoted like the words after it.
+    const [program, ...rest] = argv
+    return ['&', powershellString(program), ...rest.map(powershellWord)].join(' ')
+  }
+  return argv.map((argument) => word(argument, kind)).join(' ')
 }
