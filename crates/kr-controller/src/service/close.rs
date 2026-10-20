@@ -900,7 +900,10 @@ impl Controller {
         let now_ms = self.settled_now_ms();
         let grants = self.sharing.grants();
         // An invitation whose end has come on either clock ended by itself, and is left as it
-        // ended: the host keeps telling a device that redeems it that it ran out.
+        // ended: the host keeps telling a device that redeems it that it ran out. So is one the
+        // host cannot show in force now, because its clock is not trusted or an end is owed its
+        // record; the next start looks at it again. The store asks again, inside the transaction
+        // that withdraws, whether a request has found its end since.
         let mut in_force = Vec::new();
         for record in grants.waiting_invitations(sessions, now_ms)? {
             if matches!(

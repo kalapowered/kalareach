@@ -1316,8 +1316,11 @@ impl GrantDirectory {
     /// Withdraws the waiting grants `grants` name, as their issuer would withdraw them: each grant
     /// is revoked and its invitation says it was withdrawn. Returns the grants it withdrew.
     ///
-    /// A grant that was redeemed or revoked since it was read is left as it is, and so is one
-    /// this host no longer holds. Nothing of a grant that is not yet in force was ever in force, so
+    /// A grant that was redeemed, revoked or found to have run out since it was read is left as it
+    /// is, and so is one whose invitation is no longer open or whose end has come on the wall
+    /// clock, and one this host no longer holds: a request that found its end and answered that it
+    /// had ended is not made to have been withdrawn. Nothing of a grant that is not yet in force
+    /// was ever in force, so
     /// there is nothing to fence and no revision to advance, and no grant is delegated from one
     /// that is not yet in force, so the grant is the whole of what is withdrawn and nothing else in
     /// the store is read. One transaction for the whole set, and idempotent.
@@ -1335,7 +1338,11 @@ impl GrantDirectory {
                 let Some(record) = read_one(connection, *grant_id)? else {
                     continue;
                 };
-                if record.is_active() || record.revoked_at_ms.is_some() {
+                if record.is_active()
+                    || record.revoked_at_ms.is_some()
+                    || !record.grant.expiry.is_valid_at(now_ms)
+                    || !Self::waits_still(connection, *grant_id, now_ms)?
+                {
                     continue;
                 }
                 let one = Self::revoke_subtree(
@@ -1351,6 +1358,25 @@ impl GrantDirectory {
             }
             Ok(withdrawn)
         })
+    }
+
+    /// Whether the invitation of `grant_id` is still waiting inside the caller's transaction: still
+    /// open, not ended on the wall clock, and its grant not recorded as run out.
+    fn waits_still(connection: &Connection, grant_id: GrantId, now_ms: u64) -> Result<bool> {
+        connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM session_invitations i JOIN grants g ON g.grant_id = i.grant_id
+                 WHERE g.grant_id = ?1 AND i.state = 'open' AND i.expires_at_ms > ?2
+                   AND g.expired_at_ms IS NULL",
+                params![
+                    grant_id.get().as_bytes().as_slice(),
+                    i64::try_from(now_ms).unwrap_or(i64::MAX),
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count > 0)
+            .map_err(ControllerError::registry)
     }
 
     /// One revocation, inside a transaction the caller is already holding.
