@@ -36,6 +36,11 @@ pub struct NetworkSettings {
     pub send_limits: SendLimits,
     /// What an unpaired connection may do.
     pub preauth_limits: PreAuthLimits,
+    /// How long an action window lasts, when this host's windows are shorter than the five minutes
+    /// the transport gives them (a longer time is taken as five minutes). A window is renewed at
+    /// half its validity, so a suite that needs a connection to be renewed gives a short one. No
+    /// document key reaches it.
+    pub action_window_validity: Option<std::time::Duration>,
 }
 
 impl NetworkSettings {

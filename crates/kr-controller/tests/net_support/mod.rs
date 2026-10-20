@@ -1326,16 +1326,37 @@ fn paired_dial_by(host: &Host, device: &Device, record: &DeviceRecord) -> Paired
 /// A client library allocates an action identity for every mutation, which is exactly right for a
 /// client and no use at all to a suite that has to submit *the same* action twice. This connects
 /// the same authorised transport and puts the frames on it directly.
+///
+/// A task reads the control stream from the moment of the connection, as a client's session does,
+/// so a window the host renews to is the one the next mutation is presented under.
 pub struct RawDevice {
     transport: Arc<NetworkTransport>,
-    action_window_id: kr_protocol::ids::ActionWindowId,
+    /// The action window the connection started with.
+    first_window: kr_protocol::ids::ActionWindowId,
+    windows: Arc<Windows>,
     next_request: std::sync::atomic::AtomicU64,
-    /// What a task reading the control stream has found, once [`Self::next_frame`] has started it.
-    heard: tokio::sync::Mutex<Option<Heard>>,
+    /// The frames the reading task has found, in the order they arrived.
+    heard: tokio::sync::Mutex<Heard>,
+    reading: tokio::task::JoinHandle<()>,
 }
 
 /// The frames a task reading a control stream passes on, in the order they arrived.
 type Heard = tokio::sync::mpsc::UnboundedReceiver<kr_protocol::envelope::ControlFrame>;
+
+/// The action windows the host has given one connection: the one it started with, and then each
+/// one the host renewed it to.
+struct Windows {
+    current: std::sync::Mutex<kr_protocol::ids::ActionWindowId>,
+    /// How many times the host has renewed the window.
+    renewals: tokio::sync::watch::Sender<usize>,
+}
+
+impl Drop for RawDevice {
+    fn drop(&mut self) {
+        // The reading task holds the transport, so it ends with the device.
+        self.reading.abort();
+    }
+}
 
 impl RawDevice {
     /// Connects a paired device and claims the receive side of its control stream.
@@ -1358,16 +1379,75 @@ impl RawDevice {
         record: &DeviceRecord,
     ) -> std::result::Result<Self, kr_client::ClientError> {
         let transport = paired_dial(host, device, record).try_dial().await?;
-        let action_window_id = {
+        let first = {
             use kr_client::transport::ControlTransport as _;
             transport.initial_action_window().action_window_id.clone()
         };
+        let transport = Arc::new(transport);
+        let windows = Arc::new(Windows {
+            current: std::sync::Mutex::new(first.clone()),
+            renewals: tokio::sync::watch::channel(0).0,
+        });
+        let (found, heard) = tokio::sync::mpsc::unbounded_channel();
+        let reading = tokio::spawn({
+            use kr_client::transport::ControlTransport as _;
+            use kr_protocol::envelope::{ControlEvent, ControlFrame};
+
+            let transport = Arc::clone(&transport);
+            let windows = Arc::clone(&windows);
+            async move {
+                while let Ok(Some(frame)) = transport.recv().await {
+                    if let ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)) = &frame {
+                        *windows
+                            .current
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            window.action_window_id.clone();
+                        windows.renewals.send_modify(|renewals| *renewals += 1);
+                    }
+                    if found.send(frame).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
         Ok(Self {
-            transport: Arc::new(transport),
-            action_window_id,
+            transport,
+            first_window: first,
+            windows,
             next_request: std::sync::atomic::AtomicU64::new(1),
-            heard: tokio::sync::Mutex::new(None),
+            heard: tokio::sync::Mutex::new(heard),
+            reading,
         })
+    }
+
+    /// The next frame the host sent that nothing has read, or `None` when the control stream has
+    /// ended.
+    async fn heard_next(&self) -> Option<kr_protocol::envelope::ControlFrame> {
+        self.heard.lock().await.recv().await
+    }
+
+    /// The action window this connection started with, which the host's renewals leave behind.
+    pub fn first_action_window_id(&self) -> kr_protocol::ids::ActionWindowId {
+        self.first_window.clone()
+    }
+
+    /// Waits until the host has renewed this connection's action window `times` times since the
+    /// connection began. The host renews at half the window's validity, so each renewal comes at
+    /// least that long after the one before it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when it has not within two minutes, which only a host that renews no more ends.
+    pub async fn until_renewed(&self, times: usize) {
+        let mut renewals = self.windows.renewals.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            renewals.wait_for(|renewed| *renewed >= times),
+        )
+        .await
+        .expect("the host renews the window in time")
+        .expect("the connection still holds its windows");
     }
 
     /// Submits one mutation under the action identity given, and returns what the host answered.
@@ -1383,14 +1463,8 @@ impl RawDevice {
         target: kr_protocol::envelope::ActionTarget,
         params: &P,
     ) -> std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError> {
-        self.mutate_in(
-            self.action_window_id.clone(),
-            method,
-            action_id,
-            target,
-            params,
-        )
-        .await
+        self.mutate_in(self.action_window_id(), method, action_id, target, params)
+            .await
     }
 
     /// Submits one mutation as [`Self::mutate`] does, and returns `None` when the host ended the
@@ -1403,19 +1477,18 @@ impl RawDevice {
         target: kr_protocol::envelope::ActionTarget,
         params: &P,
     ) -> Option<std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError>> {
-        self.try_mutate_in(
-            self.action_window_id.clone(),
-            method,
-            action_id,
-            target,
-            params,
-        )
-        .await
+        self.try_mutate_in(self.action_window_id(), method, action_id, target, params)
+            .await
     }
 
-    /// The action window this connection was given.
+    /// The action window this connection holds: the one it was given, or the last one the host
+    /// renewed it to.
     pub fn action_window_id(&self) -> kr_protocol::ids::ActionWindowId {
-        self.action_window_id.clone()
+        self.windows
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The frame that submits one mutation, and the request it is.
@@ -1461,13 +1534,8 @@ impl RawDevice {
     ) -> kr_protocol::ids::RequestId {
         use kr_client::transport::ControlTransport as _;
 
-        let (request_id, frame) = self.mutation_frame(
-            self.action_window_id.clone(),
-            method,
-            action_id,
-            target,
-            params,
-        );
+        let (request_id, frame) =
+            self.mutation_frame(self.action_window_id(), method, action_id, target, params);
         self.transport
             .send(&frame)
             .await
@@ -1485,20 +1553,17 @@ impl RawDevice {
         request: kr_protocol::ids::RequestId,
         patience: Duration,
     ) -> Option<bool> {
-        use kr_client::transport::ControlTransport as _;
         use kr_protocol::envelope::ControlFrame;
 
         let deadline = tokio::time::Instant::now() + patience;
         loop {
-            match tokio::time::timeout_at(deadline, self.transport.recv()).await {
+            match tokio::time::timeout_at(deadline, self.heard_next()).await {
                 Err(_) => return None,
-                Ok(Ok(Some(ControlFrame::Response(response))))
-                    if response.request_id == request =>
-                {
+                Ok(Some(ControlFrame::Response(response))) if response.request_id == request => {
                     return Some(true);
                 }
-                Ok(Ok(Some(_))) => {}
-                Ok(Ok(None) | Err(_)) => return Some(false),
+                Ok(Some(_)) => {}
+                Ok(None) => return Some(false),
             }
         }
     }
@@ -1537,10 +1602,10 @@ impl RawDevice {
         }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         loop {
-            let frame = tokio::time::timeout_at(deadline, self.transport.recv())
+            let frame = tokio::time::timeout_at(deadline, self.heard_next())
                 .await
                 .expect("the host answers in time");
-            let Ok(Some(frame)) = frame else {
+            let Some(frame) = frame else {
                 return None;
             };
             if let ControlFrame::Response(response) = frame
@@ -1594,32 +1659,17 @@ impl RawDevice {
         request_id
     }
 
-    /// The next frame the host sends, or `None` when `within` passes first or the control stream
-    /// ends.
+    /// The next frame the host sends that nothing has read, or `None` when `within` passes first or
+    /// the control stream ends.
     ///
-    /// A task reads the stream from the first call on, so a call that gives up loses nothing: a
-    /// read of the stream that is dropped part way through a frame cannot be resumed. A device that
-    /// is read this way is not read by [`Self::read`] or [`Self::mutate`] afterwards.
+    /// A task reads the stream, so a call that gives up loses nothing: a read of the stream that is
+    /// dropped part way through a frame cannot be resumed. A frame read here is gone for
+    /// [`Self::read`] and [`Self::mutate`], which look for the answer to their own request.
     pub async fn next_frame(
         &self,
         within: Duration,
     ) -> Option<kr_protocol::envelope::ControlFrame> {
-        use kr_client::transport::ControlTransport as _;
-
-        let mut held = self.heard.lock().await;
-        let heard = held.get_or_insert_with(|| {
-            let (found, heard) = tokio::sync::mpsc::unbounded_channel();
-            let transport = Arc::clone(&self.transport);
-            tokio::spawn(async move {
-                while let Ok(Some(frame)) = transport.recv().await {
-                    if found.send(frame).is_err() {
-                        break;
-                    }
-                }
-            });
-            heard
-        });
-        tokio::time::timeout(within, heard.recv()).await.ok()?
+        tokio::time::timeout(within, self.heard_next()).await.ok()?
     }
 
     /// The next answer the host sends, to whichever request, or `None` when `within` passes first
@@ -1667,10 +1717,10 @@ impl RawDevice {
         }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         loop {
-            let frame = tokio::time::timeout_at(deadline, self.transport.recv())
+            let frame = tokio::time::timeout_at(deadline, self.heard_next())
                 .await
                 .expect("the host answers in time");
-            let Ok(Some(frame)) = frame else {
+            let Some(frame) = frame else {
                 return None;
             };
             if let ControlFrame::Response(response) = frame

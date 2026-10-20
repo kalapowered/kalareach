@@ -7,6 +7,9 @@
 
 mod net_support;
 
+use std::time::Duration;
+
+use kr_controller::service::net::config::NetworkSettings;
 use kr_controller::service::net::dispatch::GRANT_WATCH;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -180,6 +183,60 @@ async fn kr_req_18_03_a_device_delegates_a_narrower_grant_and_revokes_what_it_de
         .await
         .expect("a repeat of the action is answered");
     assert_eq!(again, revoked);
+    host.stop().await;
+}
+
+/// The host renews a connection's action window at half its validity, and a window it has issued
+/// is retired once its validity is over, so a device that acts long after it connected is admitted
+/// only under a window the host gave it lately. The host here gives windows of ten seconds, renewed
+/// every five: by the third renewal the window the connection started with is past its validity,
+/// and a delegation presented under it is refused, while the same delegation is admitted under the
+/// window the connection holds now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_acts_after_its_window_was_renewed_acts_under_the_window_it_holds_now() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start_with_settings(
+        &owner,
+        NetworkSettings {
+            endpoint: net_support::loopback(),
+            action_window_validity: Some(Duration::from_secs(10)),
+            ..NetworkSettings::default()
+        },
+    )
+    .await;
+    let (boss, boss_record) = recipient(&host, &owner).await;
+    let (_friend, friend_record) = recipient(&host, &owner).await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let (above, boss_connection) = owned_by(&host, session_id, &boss, &boss_record).await;
+    let started_with = boss_connection.first_action_window_id();
+    let params = delegation(
+        session_id,
+        friend_record.device_id,
+        Some(above.grant.grant_id),
+        RoleSelection::plain(SessionRole::Viewer),
+        600_000,
+    );
+
+    // Each renewal comes half a validity after the one before it, so the third comes at least a
+    // validity and a half after the connection began: past the first window's validity with room to
+    // spare, however long the connection took to make.
+    boss_connection.until_renewed(3).await;
+    let refused = boss_connection
+        .mutate_in(
+            started_with,
+            Method::GrantCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_session(&host, session_id),
+            &params,
+        )
+        .await
+        .expect_err("the window the connection started with is past its validity");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+
+    let created = create(&host, &boss_connection, &params)
+        .await
+        .expect("the device delegates under the window the host renewed it to");
+    assert_eq!(created.grant.issuer_device_id, boss_record.device_id);
     host.stop().await;
 }
 

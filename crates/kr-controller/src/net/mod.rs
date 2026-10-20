@@ -1422,6 +1422,9 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     );
     config.send_limits = setup.settings.send_limits;
     config.preauth_limits = setup.settings.preauth_limits;
+    if let Some(validity) = setup.settings.action_window_validity {
+        config.action_window_validity = validity.min(kr_transport::window::MAX_WINDOW_VALIDITY);
+    }
     let listener = kr_transport::listener::register_with_clock(
         config,
         identity,
