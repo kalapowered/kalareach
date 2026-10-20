@@ -861,10 +861,15 @@ enum Label {
     Crash,
     OwnerRemove(Dev),
     OwnerAdd(Dev),
+    /// The owner shares again with a device a recorded revocation keeps out.
+    OwnerShareAgain(Dev),
     Join,
     Other(ModelRecord),
     Revoke(Dev),
     Feed(Dev),
+    /// D is told to take a device out that no host revokes and no feed holds: the request that was to
+    /// revoke it did not go through.
+    Told(Dev),
     /// A host does not answer.
     Silence,
     /// The host answers again.
@@ -1246,6 +1251,34 @@ fn transitions(world: &World) -> Vec<Transition> {
                     writes: ran.writes,
                 });
             }
+            // A device only a recorded revocation keeps out: the answers D recorded have no host
+            // revoking it or leaving it out. The owner's confirmation takes the record back in the
+            // write that adds it.
+            for member in DEVICES {
+                let recorded = &world.facts.answers;
+                let kept_out = recorded.verified & bit(member) != 0
+                    && (recorded.hosts | recorded.unlisted) & bit(member) == 0;
+                if !kept_out
+                    || installed_members & bit(member) != 0
+                    || addition & bit(member) != 0
+                    || removals & bit(member) != 0
+                {
+                    continue;
+                }
+                let ran = run(world, false, |reconciler| {
+                    reconciler.add(member, collection(), epoch, Some(member))
+                });
+                ran.value
+                    .unwrap_or_else(|error| panic!("a model re-share failed: {error}"));
+                let mut next = ran.world;
+                use_budget(&mut next, OWNER);
+                out.push(Transition {
+                    label: Label::OwnerShareAgain(member),
+                    world: next,
+                    sent: None,
+                    writes: ran.writes,
+                });
+            }
         }
     } else if has(world, JOIN)
         && world
@@ -1361,6 +1394,25 @@ fn transitions(world: &World) -> Vec<Transition> {
             use_budget(&mut next, FEED);
             out.push(Transition {
                 label: Label::Feed(member),
+                world: next,
+                sent: None,
+                writes: ran.writes,
+            });
+        }
+        for member in DEVICES {
+            if world.verified & bit(member) != 0 || world.facts.answers.verified & bit(member) != 0
+            {
+                continue;
+            }
+            let ran = run(world, false, |reconciler| {
+                reconciler.feed_revocation(member)
+            });
+            ran.value
+                .unwrap_or_else(|error| panic!("a model recorded revocation failed: {error}"));
+            let mut next = ran.world;
+            use_budget(&mut next, FEED);
+            out.push(Transition {
+                label: Label::Told(member),
                 world: next,
                 sent: None,
                 writes: ran.writes,
@@ -1947,7 +1999,7 @@ fn check_step(before: &World, transition: &Transition) -> Result<(), Violation> 
         .copied()
         .collect();
     let mut expected = ended.len();
-    if let Label::OwnerAdd(member) = label
+    if let Label::OwnerAdd(member) | Label::OwnerShareAgain(member) = label
         && how.get(&Change::Addition(member)) == Some(&Ended::Refused)
         && !ended.contains(&Change::Addition(member))
     {
