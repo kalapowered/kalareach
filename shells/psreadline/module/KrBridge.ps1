@@ -981,21 +981,30 @@ function Get-KrLaunchWord {
 # and the command-lookup handler that asks the worker about a typed name asks about it. Where it
 # is anything else, the word is the full path of the application or script, which nothing can
 # stand in for. A name no application or script has is refused, because what the line would run is
-# not the program asked for. A name is taken as it is (no wildcard in it is expanded), and what a
-# profile's lookup hook puts in the answer is not taken for an application.
+# not the program asked for: that includes a name the engine answers only by looking for `get-`
+# and the name, which is another command. A name is taken as it is (no wildcard in it is
+# expanded), and what a profile's lookup hook answers with a script block is not taken for an
+# application.
 function Get-KrLaunchProgram {
     param([string]$Name)
     try {
+        $leaf = [System.IO.Path]::GetFileName($Name)
+        $isGetFallback = {
+            param($Command)
+            $Command.Name.StartsWith('get-', [System.StringComparison]::OrdinalIgnoreCase) -and
+                -not $leaf.StartsWith('get-', [System.StringComparison]::OrdinalIgnoreCase)
+        }
         $first = $ExecutionContext.InvokeCommand.GetCommand($Name, [System.Management.Automation.CommandTypes]::All)
+        if ($null -eq $first -or (& $isGetFallback $first)) { return $null }
         if ($first -is [System.Management.Automation.ApplicationInfo] -or
             $first -is [System.Management.Automation.ExternalScriptInfo]) {
             return $Name
         }
-        if ($null -eq $first) { return $null }
         $programs = [System.Management.Automation.CommandTypes]'Application, ExternalScript'
         $found = $ExecutionContext.InvokeCommand.GetCommand($Name, $programs)
-        if ($found -is [System.Management.Automation.ApplicationInfo] -or
-            $found -is [System.Management.Automation.ExternalScriptInfo]) {
+        if (($found -is [System.Management.Automation.ApplicationInfo] -or
+                $found -is [System.Management.Automation.ExternalScriptInfo]) -and
+            -not (& $isGetFallback $found)) {
             return [string]$found.Path
         }
         $null
@@ -1007,11 +1016,11 @@ function Get-KrLaunchProgram {
 # The line the reader installs: an argument vector quoted for this shell, or a command the caller
 # already quoted. Nothing is assembled by interpolation.
 #
-# The first word of an argument vector is the program it names: the name as given where nothing but
-# that program has it, and the program's full path where an alias, a function or a cmdlet has the
-# name too, so that what runs is what was named. A vector whose first word names no application
-# has no line, and the caller is told what it is told for any vector this shell cannot build one
-# from.
+# The first word of an argument vector is the program it names: the name as given where a typed
+# name finds that program, and the program's full path where an alias, a function or a cmdlet
+# would be found first, so that what runs is what was named. A vector whose first word names no
+# application has no line, and the caller is told what it is told for any vector this shell cannot
+# build one from.
 function Get-KrLaunchText {
     param($Command)
     $variant = Get-KrVariant $Command
