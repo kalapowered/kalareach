@@ -356,6 +356,22 @@ any vector it cannot build a line from. If an argument is exactly `--%`, the mod
 `@('--%')`. This is the stop-parsing token in PowerShell, which the shell otherwise leaves out of
 the program's arguments, wherever it appears.
 
+When running a `.cmd` or `.bat` file from PowerShell on Windows, the file will be run in a `cmd.exe`
+instance which will read the argument line again. However, PowerShell will remove a word if it is
+empty, will not escape a double quote, and will only quote a word if it contains a white space
+character. These differences can cause words to be modified or to be interpreted as commands when
+they reach the `.bat` or `.cmd` file. If the argument vector would cause this to happen, this module
+will not construct an argument line and will refuse the launch with `buffer_not_empty` before
+anything runs. A vector will cause this to happen if it contains an empty word, a word containing a
+control character, a word containing `"`, `%`, `!`, `^`, `&`, `|`, `<`, `>`, `(` or `)`, or a word
+containing a white space character and ending in `\` (PowerShell will write `\` twice), or if the
+path to the program contains `%` or `!` (`cmd.exe` will try to expand it). For any other argument
+vector, the same argument line will be constructed as for any other program.
+
+A `=`, a `,` and a `;` can be passed, but they do not perform injection and will be passed intact
+through `%*` (used by package manager shims) but will split the word if read using `%1` through `%9`
+as in any other case. However, scripts are not batch files and will receive every word as named.
+
 Losing the bridge does not turn a managed root shell back into an ordinary one. The handshake
 leaves a mark that is never cleared, so a shell whose worker has gone holds no fence, consumes an
 eligible gesture with the hint, and does not end itself on an empty-prompt Ctrl-D.

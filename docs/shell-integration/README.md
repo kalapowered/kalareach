@@ -473,7 +473,8 @@ named. The reason decides what the caller is told:
 | `session_closing` | `SESSION_CLOSED` |
 
 The PowerShell reader also gives `buffer_not_empty` for an argument vector whose first word names no
-application, because it has no line to install.
+application, or that gives a batch program a word `cmd.exe` would change, because it has no line to
+install.
 
 Section 23 lists the preconditions of `shell.launch` as `terminal.input`, the current input lease, a
 qualified root editor, an empty prompt and fence, the working-directory revision and the launch
