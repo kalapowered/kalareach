@@ -289,6 +289,11 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
       async (page) => {
         await page.getByRole('button', { name: 'Settings' }).click()
         await expect(page.getByRole('dialog')).toBeVisible()
+        // The sheet arrives over a count of animation frames, and a control that is moving is not
+        // one a touch can reach yet: the controls are tried once the sheet has settled.
+        await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here', {
+          timeout: PRESENTATION_DEADLINE
+        })
       }
     ]
   ]
