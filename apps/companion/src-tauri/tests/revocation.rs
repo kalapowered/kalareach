@@ -2153,6 +2153,85 @@ async fn a_device_never_shared_with_whose_request_waits_is_not_offered_to_be_sha
     );
 }
 
+/// The host's configuration leaves no grant a right to manage the host, so the host refuses what
+/// this computer asks of it from now on, and will not list its devices to it.
+async fn the_host_leaves_this_computer_no_right_to_manage_it(rig: &Rig) {
+    let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    document.revision = 2;
+    document.authority.origin = Nullable::some(rig.served.origin().to_owned());
+    document.ceilings.grant_rights =
+        Nullable::some(vec![ActionRight::SessionView.as_str().to_owned()]);
+    let path = kr_worker::config::document_path(&rig.host.tree().environment());
+    kr_ipc::paths::write_owner_only_file(
+        &path,
+        kr_protocol::hostinfo::configuration::contents(&document).as_bytes(),
+    )
+    .expect("the document is written");
+    let effective = rig.host.controller().effective_configuration().await;
+    assert!(
+        effective.not_in_force.0.is_none(),
+        "the host puts the document in force: {:?}",
+        effective.not_in_force
+    );
+}
+
+/// A request in the host's own feed that the host refuses, because by then this computer has no
+/// right to manage it, can revoke nothing: the feed shows the refusal, and the person may share
+/// the settings with the device again. This is the usual path, with the host reading the feed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_the_host_refuses_no_longer_keeps_its_device_from_being_shared_with_again() {
+    let rig = Rig::start().await;
+    rig.sharing_with_the_phone().await;
+    let host = host_by(&rig.view().await, "feed");
+    let body = json!({
+        "host": host["reference"],
+        "device": the_phone(&host)["reference"],
+    });
+    // The person is at the dialog when the host stops allowing this computer to manage it.
+    let (shown, release) = rig.ceremony.hold_the_dialog();
+    let revoking = rig.app.start_call("revocation_revoke", body);
+    tokio::time::timeout(WATCHDOG, shown.notified())
+        .await
+        .expect("the dialog is shown");
+    the_host_leaves_this_computer_no_right_to_manage_it(&rig).await;
+    release.notify_one();
+    tokio::time::timeout(WATCHDOG, revoking)
+        .await
+        .expect("the call ends")
+        .expect("the call ends")
+        .expect("the request is published: the service stores what any key publishes");
+    assert_eq!(rig.publications(), 1);
+    the_phone_is_taken_out(&rig).await;
+
+    // The host reads its feed and refuses the request. Nothing else is read of it here: what
+    // lets the device go is what the feed shows of the request's own identity.
+    rig.host_polls().await;
+    let devices = rig.devices();
+    let reference = the_device_held_out(&devices);
+    assert_eq!(
+        devices["held_out"][0]["waiting"], false,
+        "the feed shows the host refused the request, which can revoke nothing now: {devices}"
+    );
+    assert_eq!(
+        host_by(&rig.view().await, "feed")["contact"],
+        "refused",
+        "the host no longer lists its devices to this computer"
+    );
+    share_again(&rig, &reference).expect("nothing waits for a host that refused the request");
+    assert_eq!(
+        rig.devices()["members"].as_array().map(Vec::len),
+        Some(2),
+        "the phone holds the key again"
+    );
+    assert!(
+        rig.ceremony
+            .reasons()
+            .contains(&"Share your settings with the-phone again".to_owned()),
+        "{:?}",
+        rig.ceremony.reasons()
+    );
+}
+
 /// A request the host carried out holds its device while the host sleeps: the hosts settings sync
 /// asks list the device unrevoked (here a second host does), and the feed that showed the host's
 /// acknowledgement is not what lets the device go.
