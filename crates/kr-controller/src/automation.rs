@@ -1586,10 +1586,11 @@ async fn note_node_session(
 /// Nothing is made before the suite is found in the configuration the daemon accepted, the version
 /// is found inside the workflow's scope and the suite's declared outputs are found to agree with
 /// the version. The copy is then made under the identifier the ledger row already names, so a stop
-/// at any point leaves something the sweep finds from the row. When the session has closed, the
-/// copy is read back and the version it still holds, or what it holds instead, is recorded with
-/// the command's exit status as evidence against the version; the copy is released after that when
-/// the session has closed and its worker is accounted for.
+/// at any point leaves something the sweep finds from the row. When the session has closed after the
+/// suite ran to an end of its own (it exited with a status, or a signal ended it), the copy is read
+/// back and the version it still holds, or what it holds instead, is recorded as evidence against
+/// the version, with the command's exit status when it has one; the copy is released after that
+/// when the session has closed and its worker is accounted for.
 async fn run_tests(
     context: &NodeContext,
     held: &Arc<HeldGrant>,
@@ -1765,7 +1766,8 @@ struct TestRun<'a> {
 /// exits zero against a copy that was changed, or that cannot be read back, has passed nothing this
 /// host can name, and the node is left unknown. A non-zero status or a signal fails the node
 /// whatever the copy holds, once what was observed is recorded; when that cannot be recorded the
-/// node is left unknown.
+/// node is left unknown. A node the engine has already settled as cancelled stays cancelled, and
+/// the answer is discarded.
 async fn observe_tests(
     context: &NodeContext,
     held: &HeldGrant,

@@ -462,7 +462,7 @@ pub fn reread_with(
 ///
 /// A re-read leaves them out of its comparison and records each as one [`OutputReference`], so a
 /// run that wrote only there still attests the version it ran against. Everything else keeps the
-/// rules it has: a file beside a declared output that the run added changes the source, an
+/// rules it has: a file beside a declared output that the run added is part of the comparison, an
 /// ancestor of an output is entered to reach it and its other entries keep every rule, and a
 /// declaration that is, or contains, a path of the version is refused before anything runs
 /// ([`Outputs::new`]).
