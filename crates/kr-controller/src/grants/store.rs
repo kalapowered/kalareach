@@ -1318,12 +1318,15 @@ impl GrantDirectory {
     ///
     /// A grant that was redeemed, revoked or found to have run out since it was read is left as it
     /// is, and so is one whose invitation is no longer open or whose end has come on the wall
-    /// clock, and one this host no longer holds: a request that found its end and answered that it
-    /// had ended is not made to have been withdrawn. Nothing of a grant that is not yet in force
-    /// was ever in force, so
-    /// there is nothing to fence and no revision to advance, and no grant is delegated from one
-    /// that is not yet in force, so the grant is the whole of what is withdrawn and nothing else in
-    /// the store is read. One transaction for the whole set, and idempotent.
+    /// clock, and one this host no longer holds. A request that found a grant's end on the
+    /// continuous clock owes the end its record until its own transaction is over, and the
+    /// withdrawal leaves that grant too: a request that found the end and answered that it had
+    /// ended is not made to have been withdrawn.
+    ///
+    /// Nothing of a grant that is not yet in force was ever in force, so there is nothing to fence
+    /// and no revision to advance, and no grant is delegated from one that is not yet in force, so
+    /// the grant is the whole of what is withdrawn and nothing else in the store is read. One
+    /// transaction for the whole set, and idempotent.
     ///
     /// # Errors
     ///
@@ -1341,6 +1344,7 @@ impl GrantDirectory {
                 if record.is_active()
                     || record.revoked_at_ms.is_some()
                     || !record.grant.expiry.is_valid_at(now_ms)
+                    || self.tombstone_owed(Some(*grant_id))
                     || !Self::waits_still(connection, *grant_id, now_ms)?
                 {
                     continue;

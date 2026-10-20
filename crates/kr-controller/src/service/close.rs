@@ -903,7 +903,7 @@ impl Controller {
         // ended: the host keeps telling a device that redeems it that it ran out. So is one the
         // host cannot show in force now, because its clock is not trusted or an end is owed its
         // record; the next start looks at it again. The store asks again, inside the transaction
-        // that withdraws, whether a request has found its end since.
+        // that withdraws, whether a request has found its end since, written down or owed.
         let mut in_force = Vec::new();
         for record in grants.waiting_invitations(sessions, now_ms)? {
             if matches!(
