@@ -23,9 +23,8 @@
 //! and was told the request failed finds it on the account sheet, apart from the devices never
 //! shared with, as long as a host still lists it as unrevoked, and shares with it again there: the
 //! confirmation takes back what the membership recorded, and the hosts' answers decide the device
-//! from then on. Not while a request for it may still be carried out: one put in a host's feed is
-//! recorded apart ([`super::Requests`]) until a read of that feed shows it settled, and the device
-//! is named on the sheet with the reason and not offered.
+//! from then on. Not while a revoke for it is on record: a request published in a host's feed is
+//! recorded apart ([`super::Requests`]), and the device is named on the sheet and not offered.
 //!
 //! The record is a file beside the other records of settings sync, so it is kept across a restart
 //! and seen by a second companion over the same data directory: each step takes in what it finds

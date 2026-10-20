@@ -4454,35 +4454,43 @@ pub async fn settings_drafts_set(
     state.settings()?.drafts_set(enabled).await
 }
 
-/// Looks at the hosts and their feeds first, when `needed`: a request of this computer's that a
-/// feed holds is found there and recorded, so that a device it may revoke is not offered to be
-/// shared with again, and one a host has refused is let go of.
-async fn looked_at_for_requests(state: &State<'_, AppState>, needed: bool) {
-    if needed && let Ok(revocations) = state.revocations() {
+/// Looks at the hosts and their feeds: a request of this computer's that a feed holds is found
+/// there and recorded, so that a device it may revoke is not offered to be shared with again, and
+/// one the feed shows a host refused is let go of.
+async fn looked_at_the_feeds(state: &State<'_, AppState>) {
+    if let Ok(revocations) = state.revocations() {
         revocations.view(&state.revocation_context()).await;
     }
 }
 
 /// Asks every host who it lists, brings this computer and the sync service to the same settings, and
-/// on a computer that shares none, looks for collections other devices share with it.
+/// on a computer that shares none, looks for collections other devices share with it. When the
+/// sheet then shows a device kept out because it was revoked, the feeds are looked at, so that what
+/// they hold of this computer's requests says whether it is offered.
 #[tauri::command]
 pub async fn settings_devices_refresh(
     state: State<'_, AppState>,
 ) -> Result<crate::settings::SettingsView> {
     let settings = state.settings()?;
-    looked_at_for_requests(&state, settings.shows_held_out()).await;
-    settings.devices_refresh().await
+    let view = settings.devices_refresh().await?;
+    if !settings.shows_held_out() {
+        return Ok(view);
+    }
+    looked_at_the_feeds(&state).await;
+    Ok(settings.view())
 }
 
 /// A device the person's hosts list is given the settings' key, once the person confirms it on this
 /// computer with the platform's ceremony. The page names the device by the reference it was shown.
+/// The feeds are looked at first: a request of this computer's for the device that a feed holds
+/// keeps it from being given the key.
 #[tauri::command]
 pub async fn settings_device_share(
     state: State<'_, AppState>,
     reference: String,
 ) -> Result<crate::settings::SettingsView> {
     let settings = state.settings()?;
-    looked_at_for_requests(&state, settings.names_held_out(&reference)).await;
+    looked_at_the_feeds(&state).await;
     settings.device_share(&reference).await
 }
 

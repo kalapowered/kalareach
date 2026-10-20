@@ -51,9 +51,10 @@
 //!
 //! A request in a host's feed can still revoke its device, and one a host carried out is revoked at
 //! a host that may be asleep, so each is recorded by its own identity before it is sent
-//! ([`crate::settings::sync::Requests`]). It is let go of only when the service answers that it refused the request or
-//! that nothing was sent, or when the feed shows the host refused it: never because a feed does not
-//! show it. A device whose request is recorded is not offered to be shared with again.
+//! ([`crate::settings::sync::Requests`]). It is let go of only when the service answers that it
+//! refused the request or that nothing was sent, or when the feed shows the host refused it: never
+//! because a feed does not show it. A device whose request is recorded is not offered to be shared
+//! with again.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -67,7 +68,6 @@ use kr_client::services::authority::{
 };
 use kr_client::services::{HttpDeadlines, HttpService, managed_response_limits};
 use kr_protocol::envelope::ActionTarget;
-use kr_protocol::error::RetryCategory;
 use kr_protocol::ids::{DeviceId, RevocationRequestId};
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{DevicePlatform, KeyPurpose, RevocationCompletion, RevocationTarget};
@@ -551,19 +551,17 @@ struct Dispatched {
     stored_nothing: bool,
 }
 
-/// Whether a failure to publish a request says the request is in no feed. The protocol's own
-/// retry category for the failure says it: a failure that is not an unknown outcome is one where
-/// the service refused the request, or the request never left this computer; a deadline, a
-/// connection that ended after the request was written, an answer that could not be read and a
-/// service that answered that it does not know whether it acted are unknown outcomes, and leave
-/// open that the feed holds the request.
+/// Whether a failure to publish a request says the request is in no feed: the service named a
+/// refusal, which it makes before it acts. Nothing else says it. A deadline, a connection that
+/// ended, a page that is not the service's, an answer that could not be read, and the service's
+/// own `INTERNAL` and `OUTCOME_UNKNOWN` leave open that the feed holds the request, and so does
+/// a connection that could not be made, which this client reports as it reports a page: a request
+/// that left no trace is let go of when the person forgets the host or revokes the device at the
+/// host.
 fn nothing_was_stored(error: &ClientError) -> bool {
-    match error {
-        ClientError::Host(refusal) | ClientError::Refused { error: refusal, .. } => {
-            refusal.retry != RetryCategory::OutcomeUnknown
-        }
-        _ => false,
-    }
+    error
+        .service_code()
+        .is_some_and(|code| !matches!(code, "INTERNAL" | "OUTCOME_UNKNOWN"))
 }
 
 /// What a digest of `parts` is called to the page: its first twelve bytes in hexadecimal.
@@ -753,7 +751,7 @@ impl Revocations {
         // spawned: a device with a request recorded is not offered to be shared with again.
         if let (Some(settings), Some(began)) = (&context.settings, began) {
             for visit in requested {
-                settings.requests().found(began, &visit.host, &visit.held);
+                settings.requests().found(&began, &visit.host, &visit.held);
                 settings.requests().release(&visit.host, &visit.refused);
             }
         }
@@ -827,10 +825,12 @@ impl Revocations {
             (devices, at_ms, memory.direct.clone())
         };
         let own = self.verified(reading);
+        // The requests the feed shows the host refused need no list of the host's devices to be
+        // named: they are named by their own identity.
         let mut asked = Requested {
             host: reference.clone(),
             held: Vec::new(),
-            refused: Vec::new(),
+            refused: refused_by_the_host(&own),
         };
         let this_computer = match &reading.host {
             Host::Paired(host) => Some(host.device_id),
@@ -865,11 +865,11 @@ impl Revocations {
                     reading.contact == Contact::Answered,
                 );
                 for request in &named {
-                    let id = request.record.request.request_id.to_string();
-                    match (request.record.rejected.0, summary.keys.0) {
-                        (Some(_), _) => asked.refused.push(id),
-                        (None, Some(keys)) => asked.held.push((keys.authorisation, id)),
-                        (None, None) => {}
+                    if let (None, Some(keys)) = (request.record.rejected.0, summary.keys.0) {
+                        asked.held.push((
+                            keys.authorisation,
+                            request.record.request.request_id.to_string(),
+                        ));
                     }
                 }
                 let (standing, stale_since_ms) = match &reading.feed {
@@ -1086,14 +1086,20 @@ impl Revocations {
                     ))
                 })?;
         }
-        if let Some(settings) = settings {
-            settings.hold_for_revocation(&keys).map_err(|error| {
-                CommandError::local_failure(format!(
-                    "nothing was sent, because the hold on this computer's settings could not be \
-                     made durable first: {}",
-                    error.message
-                ))
-            })?;
+        if let Some(settings) = settings
+            && let Err(error) = settings.hold_for_revocation(&keys)
+        {
+            // Nothing is sent, so the request just recorded is in no feed.
+            if let Some(request) = &request_id {
+                settings
+                    .requests()
+                    .release(&host_now.reference, std::slice::from_ref(request));
+            }
+            return Err(CommandError::local_failure(format!(
+                "nothing was sent, because the hold on this computer's settings could not be made \
+                 durable first: {}",
+                error.message
+            )));
         }
         // Whether there are settings the device is taken out of, to say so truthfully.
         let shared = settings.is_some_and(|settings| settings.shares_settings());
@@ -1107,6 +1113,7 @@ impl Revocations {
                 .requests()
                 .release(&host_now.reference, std::slice::from_ref(request));
         }
+        let dispatched_nothing_was_stored = dispatched.stored_nothing;
         let sent = dispatched.result;
         // A request that left is marked as sent before anything else runs, so that the view that
         // follows, and a view that reads a feed it cannot read then, still show it. The mark goes
@@ -1140,10 +1147,13 @@ impl Revocations {
                 if !error.message.ends_with('.') {
                     error.message.push('.');
                 }
-                error.message.push_str(
+                error.message.push_str(if dispatched_nothing_was_stored {
+                    " The request did not reach the host. This computer no longer shares its \
+                     settings with that device; the account sheet lets you share them again."
+                } else {
                     " This computer no longer shares its settings with that device, because the \
-                     request may have reached the host.",
-                );
+                     request may have reached the host."
+                });
                 Err(error)
             }
             Err(error) => Err(error),
@@ -1306,6 +1316,15 @@ fn own_requests<'a>(
             }),
             RevocationTarget::Grants { .. } => None,
         })
+        .collect()
+}
+
+/// The identities of the requests the feed shows the host refused. A refusal names the request, so
+/// no list of the host's devices is needed to see it.
+fn refused_by_the_host(own: &[Verified<'_>]) -> Vec<String> {
+    own.iter()
+        .filter(|request| request.record.rejected.0.is_some())
+        .map(|request| request.record.request.request_id.to_string())
         .collect()
 }
 
@@ -1531,6 +1550,28 @@ mod tests {
             grant_expired: false,
             all_sessions: true,
         }
+    }
+
+    /// A request the host refused is named by its identity alone: it is found in the feed without
+    /// any list of the host's devices, as after a restart with the host asleep.
+    #[test]
+    fn a_request_the_host_refused_is_named_by_its_identity_without_the_hosts_list() {
+        let refused = record(12, None, Some(RejectionReason::NoOwnerAuthority));
+        let waiting = record(13, None, None);
+        let acted_on = record(14, Some(RevocationCompletion::Complete), None);
+        let own: Vec<Verified<'_>> = [&refused, &waiting, &acted_on]
+            .into_iter()
+            .map(|record| Verified {
+                record,
+                devices: BTreeSet::from([DeviceId::new(id(1))]),
+            })
+            .collect();
+
+        assert_eq!(
+            refused_by_the_host(&own),
+            vec![refused.request.request_id.to_string()],
+            "only the refused one: a request a host acted on is not refused"
+        );
     }
 
     /// A request for the device, published at 100, with the host's answer to it.

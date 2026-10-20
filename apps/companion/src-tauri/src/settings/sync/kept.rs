@@ -114,6 +114,14 @@ impl Kept {
                 self.what
             )))
         })?;
+        // A record this build would not read back is not written: it would hold everything and
+        // could not be changed again.
+        if u64::try_from(text.len()).map_or(true, |bytes| bytes > LIMIT) {
+            return Err(before_the_write(CommandError::local_failure(format!(
+                "{} is as large as it may be",
+                self.what
+            ))));
+        }
         write_owner_only_file(&self.directory.join(self.file), &text).map_err(|error| {
             // The file is renamed into place and then its directory is flushed, so a failure can
             // come after the record already names the change. A record that cannot be read to say

@@ -618,14 +618,6 @@ impl Settings {
         &self.requests
     }
 
-    /// Whether the page was shown the device `reference` names as taken out by a revoke.
-    #[must_use]
-    pub fn names_held_out(&self, reference: &str) -> bool {
-        self.sync
-            .get()
-            .is_some_and(|sync| sync.names_held_out(reference))
-    }
-
     /// Whether the page was shown a device taken out by a revoke.
     #[must_use]
     pub fn shows_held_out(&self) -> bool {

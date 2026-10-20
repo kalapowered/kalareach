@@ -104,6 +104,9 @@ pub struct Candidate {
     pub reference: String,
     /// What it is called.
     pub name: String,
+    /// The key the device is known by, which decides whether a revoke for it is on record.
+    #[serde(skip)]
+    key: AuthorisationKey,
 }
 
 /// A device this computer took out when the person revoked it, that the hosts still list.
@@ -113,9 +116,10 @@ pub struct HeldOut {
     pub reference: String,
     /// What it is called.
     pub name: String,
-    /// Whether a request of this computer's to revoke it may still be carried out by a host: one in
-    /// a feed no read has shown refused, acted on or gone. Sharing with it again is not offered
-    /// then, and not known to be allowed either: a request not known to be settled is in force.
+    /// Whether a revoke for it is on record here, so that it is not offered: a request this
+    /// computer published in a host's feed, which a host may carry out or may have carried out, or
+    /// a revocation not yet taken in. What is not known is on record: a record this computer cannot
+    /// read holds every device.
     pub waiting: bool,
     /// The key the device is known by, which decides whether a request is in force for it.
     #[serde(skip)]
@@ -147,8 +151,7 @@ pub struct Happened {
 /// with, because the revoke may still be carried out.
 fn revoke_waiting() -> CommandError {
     CommandError::refused(
-        "a request to revoke that device is still waiting for its host, so nothing was shared with \
-         it",
+        "a revoke for that device is on record here, so nothing was shared with it",
     )
 }
 
@@ -357,6 +360,18 @@ impl SettingsSync {
         for held in &mut view.held_out {
             held.waiting = self.revoke_may_be_carried_out(&held.key);
         }
+        // A device never shared with whose revoke is on record is kept out as one taken out is.
+        let (kept_out, offered): (Vec<_>, Vec<_>) = std::mem::take(&mut view.candidates)
+            .into_iter()
+            .partition(|candidate| self.revoke_may_be_carried_out(&candidate.key));
+        view.candidates = offered;
+        view.held_out
+            .extend(kept_out.into_iter().map(|candidate| HeldOut {
+                reference: candidate.reference,
+                name: candidate.name,
+                waiting: true,
+                key: candidate.key,
+            }));
         view
     }
 
@@ -417,6 +432,7 @@ impl SettingsSync {
             .map(|device| Candidate {
                 reference: installation_id_of(device),
                 name: name(device),
+                key: device.authorisation,
             })
             .collect();
         let held_out = membership
@@ -596,6 +612,9 @@ impl SettingsSync {
         // when the person names it, here, and a revocation still on its way is not forgotten.
         let sharing_again = candidate.is_none();
         let device = match candidate {
+            Some(device) if self.revoke_may_be_carried_out(&device.authorisation) => {
+                return Err(revoke_waiting());
+            }
             Some(device) => device,
             None => membership
                 .held_out()
@@ -652,7 +671,7 @@ impl SettingsSync {
             Err(error) => Err(member_failure(error)),
         };
         // A request may have been sent while the person was at the dialog.
-        if sharing_again && self.revoke_may_be_carried_out(&device.authorisation) {
+        if self.revoke_may_be_carried_out(&device.authorisation) {
             membership.cancel(&plan);
             return Err(revoke_waiting());
         }
@@ -736,16 +755,6 @@ impl SettingsSync {
         self.settle(&mut record, &service, Ask::Now)
             .await
             .map(|_| ())
-    }
-
-    /// Whether the device `reference` names is one the page was shown as taken out by a revoke.
-    pub fn names_held_out(&self, reference: &str) -> bool {
-        self.devices
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .held_out
-            .iter()
-            .any(|held| held.reference == reference)
     }
 
     /// Whether the page was shown a device taken out by a revoke.

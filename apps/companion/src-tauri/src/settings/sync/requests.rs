@@ -8,23 +8,22 @@
 //! it, so a request the host carried out holds the device as well.
 //!
 //! **A record is let go of only by what names the request.** Each request is recorded by its own
-//! identity before it leaves. Two things release it: the service answering that it refused the
-//! request or that nothing was sent, which says the request is in no feed, and the feed showing
-//! that the host refused it. Nothing else does. A feed that does not show the request, a restart, a
-//! host that is asleep, an answer that was lost and a service this computer no longer uses all
-//! leave it where it is, because none of them says the request cannot be carried out. Another
-//! request, however it ends, cannot release this one. A record that cannot be read holds every
-//! device.
+//! identity before it leaves. Two things release it: the service answering with a refusal it names,
+//! which it makes before it acts, and the feed showing that the host refused it. Nothing else
+//! does. A feed that does not show the request, a restart, a host that is asleep, an answer that
+//! was lost and a service this computer no longer uses all leave it where it is, because none of
+//! them says the request cannot be carried out. Another request, however it ends, cannot release
+//! this one. A record that cannot be read holds every device.
 //!
-//! A request found in a feed that the record does not name, as one an earlier version published, is
-//! recorded too. Forgetting a host lets go of what was recorded for its feed, since this computer
-//! reads that feed no more, and a look at the feeds that began before the host was forgotten
-//! records nothing.
+//! The one other way out is forgetting a host, which lets go of what was recorded for its feed,
+//! since this computer reads that feed no more; a look at that feed that began before it records
+//! nothing. A request found in a feed that the record does not name, as one an earlier version
+//! published, is recorded too, as far as the host's list lets the look name the device it is for.
 //!
 //! The record is a file beside the other records of settings sync, kept across a restart and seen
 //! by a second companion over the same data directory.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -49,9 +48,13 @@ struct Known {
     /// The same requests as this process knows them, so that a record that cannot be written down
     /// still holds this process's sends.
     held: BTreeSet<Request>,
-    /// How many times a host was forgotten: a look that began before one has not seen it.
-    forgotten: u64,
+    /// How many times each host was forgotten: a look that began before one has not seen it.
+    forgotten: BTreeMap<String, u64>,
 }
+
+/// Where a look at the feeds began: what had been forgotten by then.
+#[derive(Clone, Debug)]
+pub struct Look(BTreeMap<String, u64>);
 
 /// The requests this computer has published in hosts' feeds.
 #[derive(Debug)]
@@ -81,8 +84,8 @@ impl Requests {
 
     /// Where a look at the feeds begins, to be given back to [`Self::found`].
     #[must_use]
-    pub fn look_begins(&self) -> u64 {
-        self.known().forgotten
+    pub fn look_begins(&self) -> Look {
+        Look(self.known().forgotten.clone())
     }
 
     /// Records the request `request` published in the feed of `host` for the device `device`. The
@@ -119,13 +122,13 @@ impl Requests {
     /// Records requests a look at the feed of `host` found there that the record does not name, as
     /// far as the file allows: this process holds them from memory when it cannot be written. A
     /// look that began before a host was forgotten records nothing.
-    pub fn found(&self, began: u64, host: &str, requests: &[(AuthorisationKey, String)]) {
+    pub fn found(&self, began: &Look, host: &str, requests: &[(AuthorisationKey, String)]) {
         // Every look at every host comes here, and most find nothing: no lock, no flush for that.
         if requests.is_empty() {
             return;
         }
         let mut known = self.known();
-        if known.forgotten != began {
+        if known.forgotten.get(host) != began.0.get(host) {
             return;
         }
         let found: Vec<Request> = requests
@@ -159,7 +162,7 @@ impl Requests {
     /// nothing could ever say they are settled. A record that cannot be written lets go of nothing.
     pub fn forget_host(&self, host: &str) {
         let mut known = self.known();
-        known.forgotten += 1;
+        *known.forgotten.entry(host.to_owned()).or_default() += 1;
         let written = self.kept.change(
             |kept: &mut BTreeSet<Request>| kept.retain(|request| request.0 != host),
             |_| false,
@@ -207,8 +210,8 @@ mod tests {
         assert!(!restarted.holds(&key(8)));
     }
 
-    /// A request is let go of by its own identity alone: a second request for the device in the same
-    /// feed is still held, and a request of another host's feed is not released by one of this
+    /// A request is let go of by its own identity alone: a second request for the device in the
+    /// same feed is still held, and a request of another host's feed is not released by one of this
     /// feed's.
     #[test]
     fn a_request_is_let_go_of_by_its_own_identity_only() {
@@ -258,10 +261,10 @@ mod tests {
         let began = requests.look_begins();
         requests.forget_host("host-a");
 
-        requests.found(began, "host-a", &[(key(7), "one".to_owned())]);
+        requests.found(&began, "host-a", &[(key(7), "one".to_owned())]);
         assert!(!requests.holds(&key(7)));
         requests.found(
-            requests.look_begins(),
+            &requests.look_begins(),
             "host-a",
             &[(key(7), "one".to_owned())],
         );
@@ -269,5 +272,11 @@ mod tests {
             requests.holds(&key(7)),
             "a look that began after it records what it finds"
         );
+
+        // Forgetting another host does not stop a look from recording what a feed it reads holds.
+        let began = requests.look_begins();
+        requests.forget_host("host-b");
+        requests.found(&began, "host-a", &[(key(8), "two".to_owned())]);
+        assert!(requests.holds(&key(8)));
     }
 }
