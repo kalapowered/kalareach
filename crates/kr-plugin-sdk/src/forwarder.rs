@@ -256,6 +256,28 @@ mod tests {
         serde_json::from_str(json).expect("the expansion is JSON")
     }
 
+    /// The line form is the placeholder followed by a space, in whatever spelling the application
+    /// decodes to it.
+    #[test]
+    fn the_line_form_is_a_placeholder_followed_by_a_space() {
+        for line in [
+            r#"{"command": "{kr_hook} app hook"}"#,
+            r#"{"command": "\u007bkr_hook} app hook"}"#,
+            r#"{"command": "{kr_hook}\u0020app hook"}"#,
+            r#"{"command": "{kr_hook}", "args": ["{kr_hook} x"]}"#,
+        ] {
+            assert!(holds_shell_form(line), "{line}");
+        }
+        for program in [
+            r#"{"command": "{kr_hook}", "args": ["app", "hook"]}"#,
+            r#"--hook={kr_hook}"#,
+            r#"{"command": "kr-hook app hook"}"#,
+            "",
+        ] {
+            assert!(!holds_shell_form(program), "{program}");
+        }
+    }
+
     #[test]
     fn a_command_written_whole_decodes_to_the_path() {
         for path in PATHS {

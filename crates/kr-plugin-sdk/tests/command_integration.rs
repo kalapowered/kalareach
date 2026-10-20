@@ -289,6 +289,43 @@ fn manifests_under(root: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// KR-REQ-12.07: a command integration's flag that writes the forwarder as a line a POSIX shell runs
+/// is refused in a package that lists Windows, and the program form is not.
+#[test]
+fn kr_req_12_07_a_flag_that_writes_the_forwarder_as_a_posix_line_is_refused_with_windows_listed() {
+    let flag =
+        |command: &str| format!(r#"{{"hooks":[{{"type":"command","command":"{command}"}}]}}"#);
+    let line = declaration(
+        "claude",
+        &["--settings", &flag("{kr_hook} claude hook")],
+        &[],
+    );
+    let program = declaration("claude", &["--settings", &flag("{kr_hook}")], &[]);
+
+    let refused = validate(&manifest_with("claude", &line, true));
+    assert!(
+        refused.report.findings.iter().any(|finding| {
+            finding.code == FindingCode::IntegrationInvalid && finding.detail.contains("Windows")
+        }),
+        "{:?}",
+        refused.report.findings
+    );
+    let accepted = validate(&manifest_with("claude", &program, true));
+    assert!(accepted.report.is_valid(), "{:?}", accepted.report.findings);
+    // Where Windows is not listed the same line is the form a POSIX shell runs.
+    let mut manifest = manifest_with("claude", &line, true);
+    manifest["platforms"]
+        .as_array_mut()
+        .expect("the manifest lists platforms")
+        .retain(|platform| platform["os"] != "windows");
+    let elsewhere = validate(&manifest);
+    assert!(
+        elsewhere.report.is_valid(),
+        "{:?}",
+        elsewhere.report.findings
+    );
+}
+
 /// KR-REQ-11.42: an owner reads a native bridge's own words beside the host's reading of a command
 /// integration, told apart by the label the host writes before its reading, so a bridge whose
 /// words hold that label is refused. The control is the same bridge with other words.
