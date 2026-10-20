@@ -558,9 +558,9 @@ struct Dispatched {
 /// a connection that could not be made, which this client reports as it reports a page: a request
 /// that left no trace stays recorded until the person forgets the host.
 ///
-/// The service answers an unknown outcome of a request that is not safe to send again, as a publish
-/// is, with `OUTCOME_UNKNOWN` or `INTERNAL`; every other refusal it names for a publish comes before
-/// it stores anything.
+/// The service answers an unknown outcome of a request that is not safe to send again, as a
+/// publish is, with `OUTCOME_UNKNOWN` or `INTERNAL`; every other refusal it names for a publish
+/// comes before it stores anything.
 fn nothing_was_stored(error: &ClientError) -> bool {
     error
         .service_code()
