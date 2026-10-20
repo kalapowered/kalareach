@@ -4454,13 +4454,11 @@ pub async fn settings_drafts_set(
     state.settings()?.drafts_set(enabled).await
 }
 
-/// Looks at the hosts and their feeds before the settings are read, when a request of this
-/// computer's to revoke a device may still be waiting in one: a request a host has since refused,
-/// or that is gone, then no longer keeps a device from being offered to be shared with again.
-async fn looked_at_for_requests(state: &State<'_, AppState>, settings: &crate::settings::Settings) {
-    if settings.requests().any()
-        && let Ok(revocations) = state.revocations()
-    {
+/// Looks at the hosts and their feeds first, when `needed`: a request of this computer's that a
+/// feed holds is found there and recorded, so that a device it may revoke is not offered to be
+/// shared with again, and one a host has refused is let go of.
+async fn looked_at_for_requests(state: &State<'_, AppState>, needed: bool) {
+    if needed && let Ok(revocations) = state.revocations() {
         revocations.view(&state.revocation_context()).await;
     }
 }
@@ -4472,7 +4470,7 @@ pub async fn settings_devices_refresh(
     state: State<'_, AppState>,
 ) -> Result<crate::settings::SettingsView> {
     let settings = state.settings()?;
-    looked_at_for_requests(&state, &settings).await;
+    looked_at_for_requests(&state, settings.shows_held_out()).await;
     settings.devices_refresh().await
 }
 
@@ -4484,7 +4482,7 @@ pub async fn settings_device_share(
     reference: String,
 ) -> Result<crate::settings::SettingsView> {
     let settings = state.settings()?;
-    looked_at_for_requests(&state, &settings).await;
+    looked_at_for_requests(&state, settings.names_held_out(&reference)).await;
     settings.device_share(&reference).await
 }
 

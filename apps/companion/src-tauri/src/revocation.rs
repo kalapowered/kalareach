@@ -49,15 +49,17 @@
 //! revoked by the host on this computer, whoever revoked it, is passed to settings sync the same
 //! way. A send already on its way cannot be called back.
 //!
-//! A request in a host's feed can still revoke its device, so each is recorded before it is sent
-//! ([`Requests`]), whatever becomes of the send, and let go of only when a read of that host's
-//! feed, begun after the send ended, shows the request refused, acted on or not there. A device
-//! whose request is recorded is not offered to be shared with again.
+//! A request in a host's feed can still revoke its device, and one a host carried out is revoked at
+//! a host that may be asleep, so each is recorded by its own identity before it is sent
+//! ([`crate::settings::sync::Requests`]). It is let go of only when the service answers that it refused the request or
+//! that nothing was sent, or when the feed shows the host refused it: never because a feed does not
+//! show it. A device whose request is recorded is not offered to be shared with again.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use kr_client::ClientError;
 use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome, shown, shown_host};
 use kr_client::pairing::paired::PairedHost;
 use kr_client::services::authority::{
@@ -65,6 +67,7 @@ use kr_client::services::authority::{
 };
 use kr_client::services::{HttpDeadlines, HttpService, managed_response_limits};
 use kr_protocol::envelope::ActionTarget;
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{DeviceId, RevocationRequestId};
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{DevicePlatform, KeyPurpose, RevocationCompletion, RevocationTarget};
@@ -80,7 +83,6 @@ use crate::device::Device;
 use crate::error::{CommandError, Result};
 use crate::recovery::{DeviceSigner, now};
 use crate::settings::Settings;
-use crate::settings::sync::Requests;
 use crate::settings::connected::{ANSWER_WITHIN, Listing, listed, listed_replacing};
 use crate::sync_service::host_of;
 
@@ -274,43 +276,6 @@ struct Memory {
     /// The revocations being asked for, by host and device reference, so that a second call for one
     /// of them waits for neither the ceremony nor the request and sends nothing.
     revoking: BTreeSet<String>,
-    /// Where in the order of things each request this process sent for a feed ended, by host and
-    /// device, or [`u64::MAX`] while it is on its way. A read of the feed that began before that
-    /// can say nothing of the request, however late it ends.
-    sent: BTreeMap<(String, AuthorisationKey), u64>,
-}
-
-/// Requests being sent to a feed, which are ended when this goes, however the call ends.
-struct Sending {
-    memory: Arc<Mutex<Memory>>,
-    host: String,
-    devices: Vec<AuthorisationKey>,
-}
-
-impl Sending {
-    /// The requests for `devices` in the feed of `host` are on their way.
-    fn begin(memory: &Arc<Mutex<Memory>>, host: &str, devices: &[AuthorisationKey]) -> Self {
-        let mut held = memory.lock().unwrap_or_else(PoisonError::into_inner);
-        for device in devices {
-            held.sent.insert((host.to_owned(), *device), u64::MAX);
-        }
-        Self {
-            memory: Arc::clone(memory),
-            host: host.to_owned(),
-            devices: devices.to_vec(),
-        }
-    }
-}
-
-impl Drop for Sending {
-    fn drop(&mut self) {
-        let mut held = self.memory.lock().unwrap_or_else(PoisonError::into_inner);
-        held.order += 1;
-        let ended = held.order;
-        for device in &self.devices {
-            held.sent.insert((self.host.clone(), *device), ended);
-        }
-    }
 }
 
 /// A revocation being asked for, which stops being so when this goes, however the call ends.
@@ -579,6 +544,24 @@ enum Prepared {
     },
 }
 
+/// How sending a request ended.
+struct Dispatched {
+    result: Result<()>,
+    /// Whether the service said the request is in no feed: it refused it, or nothing was sent.
+    stored_nothing: bool,
+}
+
+/// Whether a failure to publish a request says the request is in no feed. A service that refused
+/// it did not act on it, and a connection that could not be made sent nothing; every other end
+/// (a deadline, a connection that ended, an answer that could not be read, a service that answered
+/// that it does not know whether it acted) leaves open that the feed holds it.
+fn nothing_was_stored(error: &ClientError) -> bool {
+    match error {
+        ClientError::Refused { .. } => error.code() != ErrorCode::OutcomeUnknown,
+        other => other.code() == ErrorCode::UpstreamUnavailable,
+    }
+}
+
 /// What a digest of `parts` is called to the page: its first twelve bytes in hexadecimal.
 fn digest(parts: &[&[u8]]) -> String {
     let mut hash = sha2::Sha256::new();
@@ -621,16 +604,11 @@ struct Reading {
 /// What one visit to a host that is reached through its feed found of this computer's requests.
 struct Requested {
     host: String,
-    /// Where the visit began in the order of things.
-    started: u64,
-    /// Whether the feed was read.
-    feed_read: bool,
-    /// Whether the host listed its devices just now.
-    answered: bool,
-    /// The devices a request is in force for: sent and not acted on.
-    in_force: Vec<AuthorisationKey>,
-    /// The devices the host lists, as far as this process knows: just now, or when it last did.
-    listed: BTreeSet<AuthorisationKey>,
+    /// The requests the feed holds that the host has not refused, by the device they name: those a
+    /// host acted on and those it has not.
+    held: Vec<(AuthorisationKey, String)>,
+    /// The requests the feed shows the host refused.
+    refused: Vec<String>,
 }
 
 /// What a feed holds for one host, as its publisher reads it.
@@ -756,6 +734,10 @@ impl Revocations {
 
     /// What the screen is shown. Every host is asked, and so is every feed.
     pub async fn view(&self, context: &Context) -> RevocationView {
+        let began = context
+            .settings
+            .as_ref()
+            .map(|settings| settings.requests().look_begins());
         let readings = self.read(self.hosts(context), context).await;
         let mut told = Vec::new();
         let mut requested = Vec::new();
@@ -764,54 +746,18 @@ impl Revocations {
             .map(|reading| self.host_view(&reading, &mut told, &mut requested))
             .collect();
         // What the feeds hold of this computer's requests is said at once, before anything is
-        // spawned: a device with a request that may still be carried out is not offered to be
-        // shared with again.
-        if let Some(settings) = &context.settings {
-            self.settle_requests(settings.requests(), requested);
+        // spawned: a device with a request recorded is not offered to be shared with again.
+        if let (Some(settings), Some(began)) = (&context.settings, began) {
+            for visit in requested {
+                settings.requests().found(began, &visit.host, &visit.held);
+                settings.requests().release(&visit.host, &visit.refused);
+            }
         }
         self.tell(context, told);
         RevocationView {
             ceremony: self.ceremony.kind(),
             feed_origin: context.origin.as_ref().map(host_of),
             hosts,
-        }
-    }
-
-    /// Records the requests the feeds of a visit hold, and lets go of those a feed read after the
-    /// request was sent shows are not in force: refused, acted on, or not there.
-    ///
-    /// A request is let go of only on the word of a feed that was read, by a read that began after
-    /// this process finished sending it, and for a device the visit could tell the host lists or
-    /// that the host, answering just now, no longer lists. What cannot be told is left in force.
-    fn settle_requests(&self, requests: &Requests, visits: Vec<Requested>) {
-        for visit in visits {
-            requests.found(&visit.host, &visit.in_force);
-            if !visit.feed_read {
-                continue;
-            }
-            let gone: Vec<AuthorisationKey> = {
-                let memory = self.memory();
-                requests
-                    .of(&visit.host)
-                    .into_iter()
-                    .filter(|device| !visit.in_force.contains(device))
-                    .filter(|device| visit.answered || visit.listed.contains(device))
-                    .filter(|device| {
-                        memory
-                            .sent
-                            .get(&(visit.host.clone(), *device))
-                            .is_none_or(|ended| *ended < visit.started)
-                    })
-                    .collect()
-            };
-            if gone.is_empty() {
-                continue;
-            }
-            requests.release(&visit.host, &gone);
-            let mut memory = self.memory();
-            for device in &gone {
-                memory.sent.remove(&(visit.host.clone(), *device));
-            }
         }
     }
 
@@ -879,11 +825,8 @@ impl Revocations {
         let own = self.verified(reading);
         let mut asked = Requested {
             host: reference.clone(),
-            started: reading.started,
-            feed_read: matches!(reading.feed, Some(Ok(_))),
-            answered: reading.contact == Contact::Answered,
-            in_force: Vec::new(),
-            listed: BTreeSet::new(),
+            held: Vec::new(),
+            refused: Vec::new(),
         };
         let this_computer = match &reading.host {
             Host::Paired(host) => Some(host.device_id),
@@ -917,19 +860,12 @@ impl Revocations {
                     reading.host.route(),
                     reading.contact == Contact::Answered,
                 );
-                if let Some(keys) = summary.keys.0 {
-                    asked.listed.insert(keys.authorisation);
-                    // A request the host has not acted on, or that it says it finished and its
-                    // list does not bear out, can still revoke the device.
-                    if matches!(
-                        read,
-                        DeviceStanding::Sent { .. }
-                            | DeviceStanding::Acknowledged {
-                                host_lists_revoked: false,
-                                ..
-                            }
-                    ) {
-                        asked.in_force.push(keys.authorisation);
+                for request in &named {
+                    let id = request.record.request.request_id.to_string();
+                    match (request.record.rejected.0, summary.keys.0) {
+                        (Some(_), _) => asked.refused.push(id),
+                        (None, Some(keys)) => asked.held.push((keys.authorisation, id)),
+                        (None, None) => {}
                     }
                 }
                 let (standing, stale_since_ms) = match &reading.feed {
@@ -1127,26 +1063,25 @@ impl Revocations {
             .map(|keys| keys.authorisation)
             .collect();
         let settings = context.settings.as_ref().filter(|_| !keys.is_empty());
-        // A request for a feed is recorded before it leaves and kept whatever becomes of the send,
-        // so that a device it may revoke is not offered to be shared with again on the strength of
-        // not knowing. A record that cannot be written sends nothing.
-        let sending = match settings {
-            Some(settings) if found.route() == Route::Feed => {
-                let sending = Sending::begin(&self.memory, &host_now.reference, &keys);
-                settings
-                    .requests()
-                    .raise(&host_now.reference, &keys)
-                    .map_err(|error| {
-                        CommandError::local_failure(format!(
-                            "nothing was sent, because this computer's record of its requests \
-                             could not be made durable first: {}",
-                            error.message
-                        ))
-                    })?;
-                Some(sending)
-            }
-            _ => None,
+        // A request for a feed is recorded by its identity before it leaves, so that a device it
+        // may revoke is not offered to be shared with again on the strength of not knowing. A
+        // record that cannot be written sends nothing.
+        let request_id = match &prepared {
+            Prepared::Feed { request, .. } => Some(request.request_id.to_string()),
+            Prepared::Direct(_) => None,
         };
+        if let (Some(settings), Some(request), Some(key)) = (settings, &request_id, keys.first()) {
+            settings
+                .requests()
+                .raise(&host_now.reference, *key, request)
+                .map_err(|error| {
+                    CommandError::local_failure(format!(
+                        "nothing was sent, because this computer's record of its requests could \
+                         not be made durable first: {}",
+                        error.message
+                    ))
+                })?;
+        }
         if let Some(settings) = settings {
             settings.hold_for_revocation(&keys).map_err(|error| {
                 CommandError::local_failure(format!(
@@ -1158,7 +1093,17 @@ impl Revocations {
         }
         // Whether there are settings the device is taken out of, to say so truthfully.
         let shared = settings.is_some_and(|settings| settings.shares_settings());
-        let sent = self.dispatch(prepared, &summary).await;
+        let dispatched = self.dispatch(prepared, &summary).await;
+        // A request the service refused, or that never left, is in no feed: its record goes, and
+        // nothing waits for a host. Any other end leaves it recorded.
+        if dispatched.stored_nothing
+            && let (Some(settings), Some(request)) = (settings, &request_id)
+        {
+            settings
+                .requests()
+                .release(&host_now.reference, std::slice::from_ref(request));
+        }
+        let sent = dispatched.result;
         // A request that left is marked as sent before anything else runs, so that the view that
         // follows, and a view that reads a feed it cannot read then, still show it. The mark goes
         // first as a view's own does.
@@ -1179,8 +1124,6 @@ impl Revocations {
                 },
             );
         }
-        // The request has ended, whatever became of it: a read that begins from here can say.
-        drop(sending);
         // Told at once, and not at the end of the view that follows, which waits for every host and
         // every feed. A request that failed may have reached its host all the same, a reply being
         // lost, so it is told as one that left: the device is out of the shared settings.
@@ -1247,21 +1190,27 @@ impl Revocations {
     }
 
     /// Sends what [`Self::prepare`] made ready. From here a failure says nothing of whether the
-    /// request left.
-    async fn dispatch(&self, prepared: Prepared, device: &DeviceSummary) -> Result<()> {
+    /// request left, except where the service says it did not store it.
+    async fn dispatch(&self, prepared: Prepared, device: &DeviceSummary) -> Dispatched {
         match prepared {
-            Prepared::Direct(over) => self.revoke_direct(&over, device).await,
+            Prepared::Direct(over) => Dispatched {
+                result: self.revoke_direct(&over, device).await,
+                stored_nothing: false,
+            },
             Prepared::Feed {
                 client,
                 feed,
                 request,
-            } => {
-                client
-                    .publish(feed, &request, None)
-                    .await
-                    .map_err(CommandError::from)?;
-                Ok(())
-            }
+            } => match client.publish(feed, &request, None).await {
+                Ok(_) => Dispatched {
+                    result: Ok(()),
+                    stored_nothing: false,
+                },
+                Err(error) => Dispatched {
+                    stored_nothing: nothing_was_stored(&error),
+                    result: Err(CommandError::from(error)),
+                },
+            },
         }
     }
 

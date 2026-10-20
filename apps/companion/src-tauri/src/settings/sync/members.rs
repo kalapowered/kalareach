@@ -352,10 +352,10 @@ impl SettingsSync {
             .clone();
         view.can_confirm = self.ceremony.kind() != CeremonyKind::None;
         view.waiting = self.waiting.load(std::sync::atomic::Ordering::Relaxed);
-        // A request in a feed is let go of, or put there, between two steps: what it says of a
-        // device is read when the view is asked for, not when the step noted the devices.
+        // A request is recorded, or let go of, between two steps: what it says of a device is read
+        // when the view is asked for, not when the step noted the devices.
         for held in &mut view.held_out {
-            held.waiting = self.requests.holds(&held.key);
+            held.waiting = self.revoke_may_be_carried_out(&held.key);
         }
         view
     }
@@ -738,9 +738,29 @@ impl SettingsSync {
             .map(|_| ())
     }
 
-    /// Whether a request of this computer's to revoke `device` may still be carried out: it was
-    /// sent and the hosts have not been seen to settle it, or the revocation is not yet recorded
-    /// here.
+    /// Whether the device `reference` names is one the page was shown as taken out by a revoke.
+    pub fn names_held_out(&self, reference: &str) -> bool {
+        self.devices
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .held_out
+            .iter()
+            .any(|held| held.reference == reference)
+    }
+
+    /// Whether the page was shown a device taken out by a revoke.
+    pub fn shows_held_out(&self) -> bool {
+        !self
+            .devices
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .held_out
+            .is_empty()
+    }
+
+    /// Whether a request of this computer's to revoke `device` may still be carried out: the
+    /// revocation is not yet taken in here, or a request for it is recorded, whatever became of it
+    /// ([`super::Requests`]).
     fn revoke_may_be_carried_out(&self, device: &AuthorisationKey) -> bool {
         !self.fence.holds_none_of(&[*device]) || self.requests.holds(device)
     }

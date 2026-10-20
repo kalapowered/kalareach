@@ -39,8 +39,8 @@ use kr_protocol::ids::{DeviceId, EnvironmentId, GrantId, SessionId};
 use kr_protocol::pairing::DevicePublicKeys;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{AuthorisationKey, Nullable, Signature64, TimestampMs, Uuid};
-use kr_protocol::sharing::{DeviceListResult, DeviceSummary};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
+use kr_protocol::sharing::{DeviceListResult, DeviceSummary};
 use kr_service_stand_in::{Moment, Served, serve};
 use net_support::{Device, Host, pair_with, proposal};
 use serde_json::{Value, json};
@@ -400,10 +400,7 @@ impl Rig {
         self.app
             .call("settings_device_share", json!({ "reference": candidate }))
             .expect("the person shares with the phone");
-        let members = self.devices()["members"]
-            .as_array()
-            .expect("members")
-            .len();
+        let members = self.devices()["members"].as_array().expect("members").len();
         assert_eq!(members, 2, "the phone holds the key now");
     }
 
@@ -1889,25 +1886,20 @@ async fn a_feed_the_host_does_not_read(rig: &Rig) -> Served {
     elsewhere
 }
 
-/// What the page is shown of the settings, with no look at the hosts: the devices held out are
-/// named as the last step and the requests recorded since say.
-fn the_settings_as_shown(rig: &Rig) -> Value {
-    rig.app
-        .call("settings_view", json!({}))
-        .expect("the settings view")["sync"]["devices"]
-        .clone()
-}
-
 /// Settings sync has taken the phone out of the shared settings, as it does for a device a
-/// revocation request names.
+/// revocation request names: this waits for the step that does it, and asks nothing of the hosts.
 async fn the_phone_is_taken_out(rig: &Rig) {
-    tokio::time::timeout(WATCHDOG, async {
-        while rig.devices()["members"].as_array().map(Vec::len) != Some(1) {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("the phone is taken out of the shared settings");
+    let key = *rig.phone.keys().authorisation.public();
+    let taken_in = rig
+        .app
+        .app
+        .state::<AppState>()
+        .settings()
+        .expect("settings are open")
+        .revocations_sent(&[key])
+        .await
+        .expect("the step ends");
+    assert!(taken_in, "the membership took the revocation in");
 }
 
 /// The reference the sheet names the device taken out by a revoke with, when it names one.
@@ -1926,30 +1918,16 @@ fn share_again(rig: &Rig, reference: &str) -> Result<Value, Value> {
         .call("settings_device_share", json!({ "reference": reference }))
 }
 
-/// A request this computer put in a host's feed, that the host has not acted on, can still revoke
-/// the device: sharing the settings with the device again is not offered across a restart, and
-/// not while the feed cannot be read to say the request is gone.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_whose_request_waits_in_a_feed_is_not_shared_with_again_after_a_restart() {
-    let rig = Rig::start().await;
-    rig.sharing_with_the_phone().await;
-    let elsewhere = a_feed_the_host_does_not_read(&rig).await;
-    let host = host_by(&rig.view().await, "feed");
-    rig.revoke(
-        host["reference"].as_str().expect("a reference"),
-        the_phone(&host)["reference"].as_str().expect("a reference"),
-    )
-    .expect("the request is published");
-    assert_eq!(published_at(&elsewhere), 1);
-    the_phone_is_taken_out(&rig).await;
-
-    let rig = rig.restarted().await;
-    rig.sync_service_is(elsewhere.origin());
-    rig.start_settings_sync_listing_the_phone();
-    the_feed_cannot_be_read(&elsewhere);
+/// The sheet names the device as waiting for its host, offers nothing to share with it, and the
+/// command refuses it without asking the person to confirm.
+fn assert_not_shared_with_again(rig: &Rig) {
     let devices = rig.devices();
     let reference = the_device_held_out(&devices);
-    share_again(&rig, &reference)
+    assert_eq!(
+        devices["held_out"][0]["waiting"], true,
+        "the sheet says a revoke waits for its host: {devices}"
+    );
+    share_again(rig, &reference)
         .expect_err("a device a request may still revoke is not shared with");
     assert!(
         rig.ceremony
@@ -1964,14 +1942,39 @@ async fn a_device_whose_request_waits_in_a_feed_is_not_shared_with_again_after_a
         Some(1),
         "the phone holds no key"
     );
-    assert_eq!(
-        devices["held_out"][0]["waiting"], true,
-        "the sheet says a revoke waits for its host: {devices}"
-    );
+}
+
+/// The person revokes the phone on the feed host.
+async fn revokes_the_phone(rig: &Rig) {
+    let host = host_by(&rig.view().await, "feed");
+    rig.revoke(
+        host["reference"].as_str().expect("a reference"),
+        the_phone(&host)["reference"].as_str().expect("a reference"),
+    )
+    .expect("the request is published");
+}
+
+/// A request this computer put in a host's feed, that the host has not acted on, can still revoke
+/// the device: sharing the settings with the device again is not offered across a restart, whether
+/// the feed can be read or not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_whose_request_waits_in_a_feed_is_not_shared_with_again_after_a_restart() {
+    let rig = Rig::start().await;
+    rig.sharing_with_the_phone().await;
+    let elsewhere = a_feed_the_host_does_not_read(&rig).await;
+    revokes_the_phone(&rig).await;
+    assert_eq!(published_at(&elsewhere), 1);
+    the_phone_is_taken_out(&rig).await;
+
+    let rig = rig.restarted().await;
+    rig.sync_service_is(elsewhere.origin());
+    rig.start_settings_sync_listing_the_phone();
+    the_feed_cannot_be_read(&elsewhere);
+    assert_not_shared_with_again(&rig);
 }
 
 /// A request the service stored and could not say it took effect is in a feed that no read has
-/// since been able to show: the device stays off the sheet's offers until one does.
+/// since been able to show: the device stays off the sheet's offers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_whose_outcome_is_unknown_keeps_its_device_from_being_shared_with_again() {
     let rig = Rig::start().await;
@@ -1980,22 +1983,50 @@ async fn a_request_whose_outcome_is_unknown_keeps_its_device_from_being_shared_w
     the_phone_is_taken_out(&rig).await;
 
     the_feed_cannot_be_read(&rig.served);
-    let devices = rig.devices();
-    let reference = the_device_held_out(&devices);
-    share_again(&rig, &reference)
-        .expect_err("a device a request may still revoke is not shared with");
-    assert_eq!(
-        rig.devices()["members"].as_array().map(Vec::len),
-        Some(1),
-        "the phone holds no key"
-    );
-    assert_eq!(devices["held_out"][0]["waiting"], true, "{devices}");
+    assert_not_shared_with_again(&rig);
 }
 
-/// A request that never reached the feed does not keep its device from being shared with again
-/// once a read of the feed shows nothing there.
+/// A request that never reached the feed, but of which nothing could be said (the connection was
+/// held open and ended with no answer), may still be stored by the service: a feed that shows
+/// nothing is not the feed saying it will never hold it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_request_no_feed_holds_is_let_go_when_the_feed_is_read() {
+async fn a_request_that_may_be_stored_late_is_not_let_go_of_by_a_feed_that_shows_none() {
+    let rig = Rig::start().await;
+    rig.sharing_with_the_phone().await;
+    let elsewhere = a_feed_the_host_does_not_read(&rig).await;
+    let host = host_by(&rig.view().await, "feed");
+    let body = json!({
+        "host": host["reference"],
+        "device": the_phone(&host)["reference"],
+    });
+    elsewhere.web().fail(AUTHORITY, 1, Moment::Hold);
+    let asked_before = elsewhere.web().requests_to(AUTHORITY);
+    let revoking = rig.app.start_call("revocation_revoke", body);
+    elsewhere
+        .web()
+        .requests_reach(AUTHORITY, asked_before + 1)
+        .await;
+    elsewhere.web().release_held();
+    tokio::time::timeout(WATCHDOG, revoking)
+        .await
+        .expect("the call ends")
+        .expect("the call ends")
+        .expect_err("nothing was answered");
+    assert_eq!(
+        published_at(&elsewhere),
+        0,
+        "the service stored nothing, as far as this computer could see"
+    );
+    the_phone_is_taken_out(&rig).await;
+
+    // A look at the feeds, which show nothing of the request, does not let it go.
+    rig.view().await;
+    assert_not_shared_with_again(&rig);
+}
+
+/// A request the service refused is in no feed, and the person may share with the device again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_the_service_refused_does_not_keep_its_device_from_being_shared_with_again() {
     let rig = Rig::start().await;
     rig.sharing_with_the_phone().await;
     revoke_with_the_publication(
@@ -2010,7 +2041,8 @@ async fn a_request_no_feed_holds_is_let_go_when_the_feed_is_read() {
     the_phone_is_taken_out(&rig).await;
 
     let reference = the_device_held_out(&rig.devices());
-    share_again(&rig, &reference).expect("the feed holds no request, so the person may share again");
+    share_again(&rig, &reference)
+        .expect("the service holds no request, so the person may share again");
     assert_eq!(
         rig.devices()["members"].as_array().map(Vec::len),
         Some(2),
@@ -2025,44 +2057,42 @@ async fn a_request_no_feed_holds_is_let_go_when_the_feed_is_read() {
     );
 }
 
-/// A look at the hosts that began before a request was sent cannot say the request is not there,
-/// however late it ends.
+/// A request waits in the feed at one service, and the sync service this computer uses is changed:
+/// the feed at the new service shows nothing of it, which is not the request gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_look_that_began_before_a_request_was_sent_does_not_let_its_device_go() {
+async fn a_change_of_sync_service_does_not_let_a_waiting_request_go() {
     let rig = Rig::start().await;
     rig.sharing_with_the_phone().await;
-    let elsewhere = a_feed_the_host_does_not_read(&rig).await;
-    let host = host_by(&rig.view().await, "feed");
-    // The next read of the feed is answered from what the feed holds now, which is no request, and
-    // reaches this computer only when the test lets it.
-    elsewhere.web().fail(AUTHORITY, 1, Moment::Slow);
-    let asked_before = elsewhere.web().requests_to(AUTHORITY);
-    let earlier_look = rig.app.start_call("revocation_view", json!({}));
-    elsewhere
-        .web()
-        .requests_reach(AUTHORITY, asked_before + 1)
-        .await;
-    rig.revoke(
-        host["reference"].as_str().expect("a reference"),
-        the_phone(&host)["reference"].as_str().expect("a reference"),
-    )
-    .expect("the request is published");
+    let first = a_feed_the_host_does_not_read(&rig).await;
+    revokes_the_phone(&rig).await;
+    assert_eq!(published_at(&first), 1);
     the_phone_is_taken_out(&rig).await;
-    // A look after the send finds the request in the feed.
-    let devices = rig.devices();
-    the_device_held_out(&devices);
-    assert_eq!(devices["held_out"][0]["waiting"], true, "{devices}");
 
-    // The earlier look ends now, with a feed it read before there was a request in it. It is not
-    // what shows the request gone: nothing but a look that began after the send can.
-    elsewhere.web().release_held();
-    tokio::time::timeout(WATCHDOG, earlier_look)
-        .await
-        .expect("the earlier look ends")
-        .expect("the earlier look ends")
-        .expect("the earlier look is answered");
-    let shown = the_settings_as_shown(&rig);
-    assert_eq!(shown["held_out"][0]["waiting"], true, "{shown}");
+    let second = serve().await;
+    rig.sync_service_is(second.origin());
+    rig.view().await;
+    assert_not_shared_with_again(&rig);
+}
+
+/// A request the host carried out holds its device while the host sleeps: the hosts settings sync
+/// asks list the device unrevoked (here a second host does), and the feed that showed the host's
+/// acknowledgement is not what lets the device go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_a_host_carried_out_keeps_its_device_from_being_shared_with_again() {
+    let rig = Rig::start().await;
+    rig.sharing_with_the_phone().await;
+    revokes_the_phone(&rig).await;
+    rig.host_polls().await;
+    let done = rig
+        .view_until("the host's acknowledgement", |view| {
+            phone_state(view, "feed") == "done"
+        })
+        .await;
+    assert_eq!(phone_state(&done, "feed"), "done");
+    the_phone_is_taken_out(&rig).await;
+
+    rig.view().await;
+    assert_not_shared_with_again(&rig);
 }
 
 /// A host the person forgets is one whose feed this computer no longer reads, so a request it left
@@ -2073,11 +2103,7 @@ async fn a_request_in_the_feed_of_a_host_that_was_forgotten_is_not_waited_for() 
     rig.sharing_with_the_phone().await;
     let _elsewhere = a_feed_the_host_does_not_read(&rig).await;
     let host = host_by(&rig.view().await, "feed");
-    rig.revoke(
-        host["reference"].as_str().expect("a reference"),
-        the_phone(&host)["reference"].as_str().expect("a reference"),
-    )
-    .expect("the request is published");
+    revokes_the_phone(&rig).await;
     the_phone_is_taken_out(&rig).await;
     let devices = rig.devices();
     the_device_held_out(&devices);
@@ -2121,12 +2147,7 @@ async fn a_request_sent_while_the_person_is_at_the_dialog_for_sharing_again_stop
     tokio::time::timeout(WATCHDOG, shown.notified())
         .await
         .expect("the dialog is shown");
-    let host = host_by(&rig.view().await, "feed");
-    rig.revoke(
-        host["reference"].as_str().expect("a reference"),
-        the_phone(&host)["reference"].as_str().expect("a reference"),
-    )
-    .expect("the request is published");
+    revokes_the_phone(&rig).await;
     assert_eq!(published_at(&elsewhere), 1);
     release.notify_one();
 

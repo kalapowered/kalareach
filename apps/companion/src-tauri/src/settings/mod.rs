@@ -612,11 +612,24 @@ impl Settings {
         self.fence.raise(devices)
     }
 
-    /// The revocation requests this computer has in hosts' feeds that may still be carried out
-    /// ([`sync::Requests`]).
+    /// The revocation requests this computer published in hosts' feeds ([`sync::Requests`]).
     #[must_use]
     pub fn requests(&self) -> &sync::Requests {
         &self.requests
+    }
+
+    /// Whether the page was shown the device `reference` names as taken out by a revoke.
+    #[must_use]
+    pub fn names_held_out(&self, reference: &str) -> bool {
+        self.sync
+            .get()
+            .is_some_and(|sync| sync.names_held_out(reference))
+    }
+
+    /// Whether the page was shown a device taken out by a revoke.
+    #[must_use]
+    pub fn shows_held_out(&self) -> bool {
+        self.sync.get().is_some_and(SettingsSync::shows_held_out)
     }
 
     /// Tells settings sync that revocations of `devices` are known here, so that it takes them out
