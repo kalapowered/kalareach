@@ -261,6 +261,20 @@ for (const [what, value, fragment] of [
   heldProblems(`${what} is a problem`, readManifest(value, { own: true }).problems, [fragment])
 }
 
+held(
+  'an empty list of accessed APIs in a package\'s manifest is a note, and not a failure',
+  '0 problems, 1 note',
+  (() => {
+    const read = readManifest(manifest(), { own: false })
+    return `${read.problems.length} problems, ${read.notes.length} note`
+  })()
+)
+held(
+  'a manifest with no list of accessed APIs at all is not an empty list',
+  '0 notes',
+  `${readManifest({ NSPrivacyTracking: false, NSPrivacyTrackingDomains: [] }, { own: false }).notes.length} notes`
+)
+
 // -- the names a real toolchain writes -------------------------------------------------------------
 
 const C_SOURCE = `
@@ -440,10 +454,13 @@ if (toolchain) {
    * symbolic link, `frameworkInfo: false` leaves the framework no Info.plist, `executable: false`
    * leaves the application's executable out of its bundle, and `root` lists SDK resource bundles.
    */
-  function bundle(name, { app, framework, extension, root = [], x86, link, frameworkInfo = true, executable: hasExecutable = true }) {
+  function bundle(
+    name,
+    { app, framework, extension, root = [], x86, link, frameworkInfo = true, executable: hasExecutable = true, nested, named = 'Fx' }
+  ) {
     const dir = join(work, name, 'Fx.app')
     mkdirSync(dir, { recursive: true })
-    plist(join(dir, 'Info.plist'), { CFBundleExecutable: 'Fx', CFBundleIdentifier: 'to.kala.fx' })
+    plist(join(dir, 'Info.plist'), { CFBundleExecutable: named, CFBundleIdentifier: 'to.kala.fx' })
     if (!hasExecutable) executable(join(dir, 'Other'), MAIN)
     else if (x86) universal(join(dir, 'Fx'), MAIN, x86)
     else executable(join(dir, 'Fx'), MAIN)
@@ -471,6 +488,13 @@ if (toolchain) {
       mkdirSync(join(dir, sdk.name), { recursive: true })
       if (sdk.raw !== undefined) writeFileSync(join(dir, sdk.name, 'PrivacyInfo.xcprivacy'), sdk.raw)
       else if (sdk.manifest) plist(join(dir, sdk.name, 'PrivacyInfo.xcprivacy'), manifest())
+    }
+    if (nested) {
+      const inner = join(dir, 'Watch', 'W.app')
+      mkdirSync(inner, { recursive: true })
+      plist(join(inner, 'Info.plist'), { CFBundleExecutable: 'W', CFBundleIdentifier: 'to.kala.fx.watch' })
+      executable(join(inner, 'W'), MAIN)
+      if (nested.manifest) plist(join(inner, 'PrivacyInfo.xcprivacy'), nested.manifest)
     }
     if (link) symlinkSync(join(dir, 'Fx'), join(dir, 'Alias'))
     return dir
@@ -604,7 +628,7 @@ if (toolchain) {
   heldProblems(
     'an application whose executable the Info.plist names is not there fails',
     examine(bundle('no-executable', { app: whole, framework: library_manifest, executable: false })).problems,
-    ['the application names the executable Fx and it is not a Mach-O file in the bundle']
+    ['the application names the executable Fx and it is not a Mach-O file of that bundle']
   )
   heldProblems(
     'a package\'s manifest that is not a valid property list fails',
@@ -616,6 +640,39 @@ if (toolchain) {
       })
     ).problems,
     ['the manifest in Firebase_FirebaseCore.bundle']
+  )
+  heldProblems(
+    'a nested application is held to a manifest of its own, not the outer application\'s',
+    examine(bundle('nested', { app: whole, framework: library_manifest, nested: {} })).problems,
+    ['Watch/W.app/W uses FileTimestamp (stat) and the manifest of Watch/W.app is missing']
+  )
+  heldProblems(
+    'a nested application that declares what it uses passes',
+    examine(bundle('nested-ok', { app: whole, framework: library_manifest, nested: { manifest: whole } })).problems,
+    []
+  )
+  heldProblems(
+    'an Info.plist that names another bundle\'s binary as its executable fails',
+    examine(
+      bundle('executable-elsewhere', {
+        app: whole,
+        framework: library_manifest,
+        executable: false,
+        named: 'Frameworks/Lib.framework/Lib'
+      })
+    ).problems,
+    ['the application names the executable Frameworks/Lib.framework/Lib and it is not a Mach-O file of that bundle']
+  )
+  heldProblems(
+    'a manifest that is not valid fails in a bundle that is not on Apple\'s list',
+    examine(
+      bundle('other-garbled', {
+        app: whole,
+        framework: library_manifest,
+        root: [{ name: 'Other.bundle', raw: 'this is not a property list' }]
+      })
+    ).problems,
+    ['the manifest in Other.bundle']
   )
   heldProblems(
     'a package inside an extension that ships no manifest fails',

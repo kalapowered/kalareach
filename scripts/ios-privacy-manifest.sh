@@ -54,9 +54,9 @@ restore() {
     fi
     if [ "$failed" = 1 ]; then
         say "could not put everything back; the developer's Local.xcconfig, if there was one, is in $backup" >&2
-    else
-        rm -rf "${backup:?}"
+        exit 2
     fi
+    rm -rf "${backup:?}"
 }
 trap restore EXIT
 

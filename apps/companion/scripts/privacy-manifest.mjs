@@ -37,9 +37,14 @@
 //     framework of its own, that ships none or ships one that is not valid. A package that is linked
 //     statically and ships no resource bundle has no name in the product to find it by, and is not
 //     seen;
-//   - a bundle with no `Info.plist`, an executable the `Info.plist` names that is not there, a
-//     symbolic link, or a Mach-O file the check cannot read. Each is a problem of its own, and none
-//     is skipped.
+//   - a bundle with no `Info.plist`, an executable its `Info.plist` names that is not a Mach-O file
+//     of that bundle, or a symbolic link. Each is a problem of its own, and none is skipped. A
+//     file that cannot be read at all stops the run, with exit 2;
+//   - a `PrivacyInfo.xcprivacy` anywhere in the bundle that is not a valid manifest.
+//
+// One kind of invalid manifest is a note and not a failure: a package's manifest with an empty list
+// of accessed APIs. Apple's TN3181 lists an empty list as invalid and Google ships several, which
+// applications upload with; the application's own manifest is held to the rule.
 //
 // Every slice of a universal binary is read, and a use in any of them counts.
 //
@@ -428,10 +433,11 @@ const isStringArray = (value) => Array.isArray(value) && value.every((each) => t
  */
 export function readManifest(manifest, { own }) {
   const problems = []
+  const notes = []
   const declared = new Map()
   let tracking = null
   if (manifest === null || typeof manifest !== 'object' || Array.isArray(manifest)) {
-    return { declared, problems: ['it is not a dictionary'], tracking }
+    return { declared, problems: ['it is not a dictionary'], notes, tracking }
   }
   for (const key of Object.keys(manifest)) {
     if (
@@ -470,8 +476,10 @@ export function readManifest(manifest, { own }) {
   const apis = manifest.NSPrivacyAccessedAPITypes ?? []
   if (!Array.isArray(apis)) problems.push('NSPrivacyAccessedAPITypes is not a list')
   else {
-    if (own && apis.length === 0) {
-      problems.push('NSPrivacyAccessedAPITypes is an empty list, which the App Store refuses as invalid')
+    if ('NSPrivacyAccessedAPITypes' in manifest && apis.length === 0) {
+      const empty = 'NSPrivacyAccessedAPITypes is an empty list, which Apple\'s TN3181 lists as invalid'
+      if (own) problems.push(empty)
+      else notes.push(empty)
     }
     for (const entry of apis) {
       const stray = strayKeys(entry, API_KEYS, 'an accessed API entry')
@@ -527,28 +535,34 @@ export function readManifest(manifest, { own }) {
       }
     }
   }
-  return { declared, problems, tracking }
+  return { declared, problems, notes, tracking }
 }
 
 // -- the bundle ----------------------------------------------------------------------------------
 
-/** What a walk of the application found: its Mach-O files, its bundles and what it could not follow. */
+/**
+ * What a walk of the application found: its Mach-O files, its bundles (the application, each
+ * framework, extension and nested application), every `PrivacyInfo.xcprivacy` and what it could
+ * not follow.
+ */
 function walkBundle(app) {
   const machO = []
   const bundles = [app]
+  const manifests = []
   const links = []
   const walk = (directory) => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name)
       if (entry.isSymbolicLink()) links.push(path)
+      else if (entry.name === 'PrivacyInfo.xcprivacy') manifests.push(path)
       else if (entry.isDirectory()) {
-        if (/\.(framework|appex)$/.test(entry.name)) bundles.push(path)
+        if (/\.(app|framework|appex)$/.test(entry.name)) bundles.push(path)
         walk(path)
       } else if (entry.isFile() && statSync(path).size >= 4 && isMachO(path)) machO.push(path)
     }
   }
   walk(app)
-  return { machO: machO.sort(), bundles: bundles.sort(), links: links.sort() }
+  return { machO: machO.sort(), bundles: bundles.sort(), manifests: manifests.sort(), links: links.sort() }
 }
 
 /**
@@ -559,7 +573,7 @@ function walkBundle(app) {
 function bundleOf(app, file) {
   let directory = dirname(file)
   while (directory !== app && directory !== dirname(directory)) {
-    if (/\.(framework|appex)$/.test(directory)) return directory
+    if (/\.(app|framework|appex)$/.test(directory)) return directory
     directory = dirname(directory)
   }
   return app
@@ -568,6 +582,7 @@ function bundleOf(app, file) {
 /** The role a bundle plays in the product, for the report. */
 function roleOf(app, bundle) {
   if (bundle === app) return 'application'
+  if (bundle.endsWith('.app')) return 'nested application'
   return bundle.endsWith('.appex') ? 'extension' : 'framework'
 }
 
@@ -584,9 +599,9 @@ export function sdkNamed(name) {
 }
 
 /**
- * The SDK bundles and frameworks of an application that Apple names, wherever they are in it
- * (the application, an extension, a framework), and what each ships: no manifest, a manifest, or a
- * manifest that cannot be read or is not valid.
+ * The SDK bundles and frameworks of an application that Apple names, wherever they are in it (the
+ * application, an extension, a framework), and whether each ships a manifest. Whether a manifest is
+ * valid is asked of every manifest in the bundle, not only of these.
  */
 export function sdksIn(app) {
   const found = []
@@ -596,18 +611,11 @@ export function sdksIn(app) {
       const path = join(directory, entry.name)
       const name = /\.(bundle|framework)$/.test(entry.name) ? sdkNamed(entry.name) : null
       if (name !== null) {
-        const manifest = join(path, 'PrivacyInfo.xcprivacy')
-        const ships = existsSync(manifest)
-        let problems = []
-        if (ships) {
-          try {
-            if (!statSync(manifest).isFile()) throw new Error('it is not a file')
-            problems = readManifest(plistValue(manifest), { own: false }).problems
-          } catch (failure) {
-            problems = [failure.message.split('\n')[0]]
-          }
-        }
-        found.push({ sdk: name, container: relative(app, path), ships, problems })
+        found.push({
+          sdk: name,
+          container: relative(app, path),
+          ships: existsSync(join(path, 'PrivacyInfo.xcprivacy'))
+        })
       }
       walk(path)
     }
@@ -623,6 +631,7 @@ export function sdksIn(app) {
  */
 export function examine(app) {
   const problems = []
+  const notes = []
   const binaries = []
   const declarations = []
   const manifests = new Map()
@@ -630,13 +639,13 @@ export function examine(app) {
     if (manifests.has(bundle)) return manifests.get(bundle)
     const path = join(bundle, 'PrivacyInfo.xcprivacy')
     let answer
-    if (!existsSync(path)) answer = { present: false, declared: new Map(), tracking: null, problems: [] }
+    if (!existsSync(path)) answer = { present: false, declared: new Map(), tracking: null, problems: [], notes: [] }
     else {
       try {
         if (!statSync(path).isFile()) throw new Error('it is not a file')
         answer = { present: true, ...readManifest(plistValue(path), { own: bundle === app }) }
       } catch (failure) {
-        answer = { present: true, declared: new Map(), tracking: null, problems: [failure.message.split('\n')[0]] }
+        answer = { present: true, declared: new Map(), tracking: null, problems: [failure.message.split('\n')[0]], notes: [] }
       }
     }
     manifests.set(bundle, answer)
@@ -673,8 +682,11 @@ export function examine(app) {
     }
     if (typeof executable !== 'string' || executable === '') {
       problems.push(`the Info.plist of ${where} names no CFBundleExecutable`)
-    } else if (!binaries.some((each) => each.file === join(bundle, executable))) {
-      problems.push(`${where} names the executable ${executable} and it is not a Mach-O file in the bundle`)
+    } else if (
+      basename(executable) !== executable ||
+      !binaries.some((each) => each.file === join(bundle, executable) && each.bundle === bundle)
+    ) {
+      problems.push(`${where} names the executable ${executable} and it is not a Mach-O file of that bundle`)
     }
   }
 
@@ -683,6 +695,7 @@ export function examine(app) {
     const manifest = manifestOf(bundle)
     declarations.push({ where, present: manifest.present, declared: manifest.declared, tracking: manifest.tracking })
     for (const problem of manifest.problems) problems.push(`the manifest of ${where}: ${problem}`)
+    for (const note of manifest.notes) notes.push(`the manifest of ${where}: ${note}`)
     const used = new Set()
     for (const binary of binaries.filter((each) => each.bundle === bundle)) {
       const name = relative(app, binary.file)
@@ -710,12 +723,27 @@ export function examine(app) {
     }
   }
 
+  // Every other manifest in the bundle (a package's, in a resource bundle): it has to be valid
+  // wherever it is, whether or not the package is one Apple names.
+  const examined = new Set(binaries.map((each) => join(each.bundle, 'PrivacyInfo.xcprivacy')))
+  for (const path of found.manifests) {
+    if (examined.has(path)) continue
+    const where = relative(app, dirname(path))
+    try {
+      if (!statSync(path).isFile()) throw new Error('it is not a file')
+      const read = readManifest(plistValue(path), { own: false })
+      for (const problem of read.problems) problems.push(`the manifest in ${where}: ${problem}`)
+      for (const note of read.notes) notes.push(`the manifest in ${where}: ${note}`)
+    } catch (failure) {
+      problems.push(`the manifest in ${where}: ${failure.message.split('\n')[0]}`)
+    }
+  }
+
   const sdks = sdksIn(app)
   for (const sdk of sdks) {
     if (!sdk.ships) problems.push(`${sdk.container} is ${sdk.sdk}, which Apple lists as needing a privacy manifest, and ships none`)
-    for (const problem of sdk.problems) problems.push(`the manifest in ${sdk.container}: ${problem}`)
   }
-  return { binaries, declarations, sdks, problems }
+  return { binaries, declarations, sdks, notes, problems }
 }
 
 // -- the command ---------------------------------------------------------------------------------
@@ -752,6 +780,10 @@ export function report(app, result) {
   }
   for (const sdk of result.sdks) {
     console.log(`  SDK on Apple's list: ${sdk.sdk} in ${sdk.container}, ${sdk.ships ? 'ships a manifest' : 'ships NO manifest'}`)
+  }
+  if (result.notes.length > 0) {
+    console.log(`${result.notes.length} note${result.notes.length === 1 ? '' : 's'} (not failures):`)
+    for (const note of result.notes) console.log(`  ${note}`)
   }
   if (result.problems.length === 0) {
     console.log('every category the product uses is declared, and every declaration is used')
