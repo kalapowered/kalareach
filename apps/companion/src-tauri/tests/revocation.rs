@@ -28,7 +28,7 @@ use companion_tauri::settings::{Holds, HostLists, HostPrivacy, Hosts};
 use kr_client::ipc::IpcTransport;
 use kr_client::pairing::BoxFuture;
 use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome};
-use kr_client::services::authority::AuthorityFeedClient;
+use kr_client::services::authority::{AuthorityFeedClient, RejectionReason};
 use kr_client::services::{HttpDeadlines, HttpService, ServiceSigner, managed_response_limits};
 use kr_controller::service::Clocks;
 use kr_controller::testing::HeldTimer;
@@ -1022,6 +1022,17 @@ async fn a_revocation_whose_hold_on_settings_sync_cannot_be_written_down_is_not_
         .expect_err("nothing leaves unless settings sync is held back first");
     assert_eq!(refused["code"], "RESOURCE_UNAVAILABLE", "{refused}");
     assert_eq!(rig.publications(), 0, "no request was published");
+    let key = *rig.phone.keys().authorisation.public();
+    assert!(
+        !rig.app
+            .app
+            .state::<AppState>()
+            .settings()
+            .expect("settings are open")
+            .requests()
+            .holds(&key),
+        "the request recorded before the hold failed never left, so it is let go of"
+    );
     std::fs::remove_dir(&held).expect("the obstacle goes");
 
     rig.revoke(
@@ -1918,14 +1929,14 @@ fn share_again(rig: &Rig, reference: &str) -> Result<Value, Value> {
         .call("settings_device_share", json!({ "reference": reference }))
 }
 
-/// The sheet names the device as waiting for its host, offers nothing to share with it, and the
-/// command refuses it without asking the person to confirm.
+/// The sheet names the device as kept out with a revoke on record, offers nothing to share with it,
+/// and the command refuses it without asking the person to confirm.
 fn assert_not_shared_with_again(rig: &Rig) {
     let devices = rig.devices();
     let reference = the_device_held_out(&devices);
     assert_eq!(
         devices["held_out"][0]["waiting"], true,
-        "the sheet says a revoke waits for its host: {devices}"
+        "the sheet says a revoke is on record: {devices}"
     );
     share_again(rig, &reference)
         .expect_err("a device a request may still revoke is not shared with");
@@ -2104,7 +2115,7 @@ async fn a_request_the_record_does_not_name_is_found_in_the_feed_and_held() {
 /// take it out and nothing holds it but the record of the request, which waits in a feed the host
 /// does not read. Settings sync then starts with no collection, lets go of its hold, and is turned
 /// on, and the hosts list the device: it is not offered to be shared with, it is named with the
-/// devices taken out as waiting for its host, and the command refuses it.
+/// devices taken out with its revoke on record, and the command refuses it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_never_shared_with_whose_request_waits_is_not_offered_to_be_shared_with() {
     let rig = Rig::start().await;
@@ -2128,6 +2139,8 @@ async fn a_device_never_shared_with_whose_request_waits_is_not_offered_to_be_sha
         "there is no collection to take the phone out of"
     );
     settings.sync_turn_on().await.expect("settings sync is on");
+    // The looks that follow tell settings sync nothing, so nothing but the record holds the phone.
+    the_feed_cannot_be_read(&elsewhere);
     let devices = rig.devices();
     assert_eq!(
         devices["candidates"],
@@ -2175,25 +2188,36 @@ async fn the_host_leaves_this_computer_no_right_to_manage_it(rig: &Rig) {
     );
 }
 
-/// A request in the host's own feed that the host refuses, because by then this computer has no
-/// right to manage it, can revoke nothing: the feed shows the refusal, and the person may share
-/// the settings with the device again. This is the usual path, with the host reading the feed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_request_the_host_refuses_no_longer_keeps_its_device_from_being_shared_with_again() {
-    let rig = Rig::start().await;
-    rig.sharing_with_the_phone().await;
+/// What happens at the host while the person is at the dialog of a revoke.
+enum Meanwhile {
+    /// The host's configuration stops allowing this computer to manage it.
+    TheHostStopsAllowingIt,
+    /// The owner at the host's machine revokes the device.
+    TheOwnerRevokesIt,
+}
+
+/// The person revokes the phone on the feed host, and `meanwhile` happens at the host while they
+/// are at the dialog. The request is then published in the feed the host reads; it waits there
+/// until the host reads it, which it does when `host_polls` says so.
+async fn revokes_the_phone_while(rig: &Rig, meanwhile: Meanwhile) {
     let host = host_by(&rig.view().await, "feed");
     let body = json!({
         "host": host["reference"],
         "device": the_phone(&host)["reference"],
     });
-    // The person is at the dialog when the host stops allowing this computer to manage it.
     let (shown, release) = rig.ceremony.hold_the_dialog();
     let revoking = rig.app.start_call("revocation_revoke", body);
     tokio::time::timeout(WATCHDOG, shown.notified())
         .await
         .expect("the dialog is shown");
-    the_host_leaves_this_computer_no_right_to_manage_it(&rig).await;
+    match meanwhile {
+        Meanwhile::TheHostStopsAllowingIt => {
+            the_host_leaves_this_computer_no_right_to_manage_it(rig).await
+        }
+        Meanwhile::TheOwnerRevokesIt => {
+            the_owner_at_the_machine_revokes_the_paired_device(rig).await
+        }
+    }
     release.notify_one();
     tokio::time::timeout(WATCHDOG, revoking)
         .await
@@ -2201,11 +2225,56 @@ async fn a_request_the_host_refuses_no_longer_keeps_its_device_from_being_shared
         .expect("the call ends")
         .expect("the request is published: the service stores what any key publishes");
     assert_eq!(rig.publications(), 1);
+}
+
+/// What the host wrote against each request in its feed, as the host's owner reads the feed: the
+/// reason it refused the request, or none.
+async fn the_hosts_reasons(rig: &Rig) -> Vec<Option<RejectionReason>> {
+    let origin = GatewayOrigin::new(rig.served.origin()).expect("an origin");
+    let http = HttpService::with(
+        origin.clone(),
+        HttpDeadlines::default(),
+        managed_response_limits(),
+    )
+    .expect("a transport");
+    let remote = AuthorityFeedClient::new(
+        origin,
+        Arc::new(http),
+        Arc::new(Installation(rig.owner.authorisation.clone())),
+    );
+    let feed = rig
+        .host
+        .controller()
+        .feed_runtime()
+        .expect("a carrier")
+        .feed();
+    let page = remote
+        .read(feed, None, false)
+        .await
+        .expect("the owner reads the feed");
+    page.records
+        .iter()
+        .map(|record| record.rejected.0)
+        .collect()
+}
+
+/// A request in the host's own feed that the host refuses, because by then this computer has no
+/// right to manage it, can revoke nothing: the feed shows the refusal, and the person may share
+/// the settings with the device again. This is the usual path, with the host reading the feed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_the_host_refuses_no_longer_keeps_its_device_from_being_shared_with_again() {
+    let rig = Rig::start().await;
+    rig.sharing_with_the_phone().await;
+    revokes_the_phone_while(&rig, Meanwhile::TheHostStopsAllowingIt).await;
     the_phone_is_taken_out(&rig).await;
 
     // The host reads its feed and refuses the request. Nothing else is read of it here: what
     // lets the device go is what the feed shows of the request's own identity.
     rig.host_polls().await;
+    assert_eq!(
+        the_hosts_reasons(&rig).await,
+        vec![Some(RejectionReason::NoOwnerAuthority)]
+    );
     let devices = rig.devices();
     let reference = the_device_held_out(&devices);
     assert_eq!(
@@ -2229,6 +2298,116 @@ async fn a_request_the_host_refuses_no_longer_keeps_its_device_from_being_shared
             .contains(&"Share your settings with the-phone again".to_owned()),
         "{:?}",
         rig.ceremony.reasons()
+    );
+}
+
+/// A request the host refuses as covered by another is not one that can revoke nothing: what covers
+/// it has revoked the device, at a host that may sleep again and say nothing more, so the device
+/// stays held. Here the owner at the host's machine revokes the phone while the person is at the
+/// dialog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_the_host_refuses_as_covered_by_another_keeps_its_device_held() {
+    let rig = Rig::start().await;
+    rig.sharing_with_the_phone().await;
+    revokes_the_phone_while(&rig, Meanwhile::TheOwnerRevokesIt).await;
+    the_phone_is_taken_out(&rig).await;
+
+    rig.host_polls().await;
+    assert_eq!(
+        the_hosts_reasons(&rig).await,
+        vec![Some(RejectionReason::Superseded)],
+        "the host refuses what the owner at its machine already withdrew"
+    );
+    assert_not_shared_with_again(&rig);
+}
+
+/// A device never shared with whose request the host refused is offered again by the sheet's own
+/// refresh: the refresh looks at the feeds when the sheet keeps a device out because of a revoke on
+/// record, though that device was never taken out of the settings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_never_shared_device_whose_request_the_host_refused_is_offered_again_by_the_refresh() {
+    let rig = Rig::start().await;
+    revokes_the_phone_while(&rig, Meanwhile::TheHostStopsAllowingIt).await;
+    rig.start_settings_sync_listing_the_phone();
+    let settings = rig
+        .app
+        .app
+        .state::<AppState>()
+        .settings()
+        .expect("settings are open");
+    let key = *rig.phone.keys().authorisation.public();
+    assert!(
+        settings.requests().holds(&key),
+        "the view that followed the revoke did not yet see the host's refusal"
+    );
+    assert!(
+        !settings
+            .revocations_sent(&[key])
+            .await
+            .expect("the step ends"),
+        "there is no collection to take the phone out of"
+    );
+    settings.sync_turn_on().await.expect("settings sync is on");
+    rig.host_polls().await;
+    assert_eq!(
+        the_hosts_reasons(&rig).await,
+        vec![Some(RejectionReason::NoOwnerAuthority)]
+    );
+
+    let devices = rig.devices();
+    assert_eq!(devices["held_out"], json!([]), "{devices}");
+    let reference = devices["candidates"][0]["reference"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the phone is offered again: {devices}"))
+        .to_owned();
+    share_again(&rig, &reference).expect("nothing waits for a host that refused the request");
+    assert_eq!(
+        rig.devices()["members"].as_array().map(Vec::len),
+        Some(2),
+        "the phone holds the key"
+    );
+}
+
+/// A request sent while the person is at the dialog for sharing with a device that was never shared
+/// with is a request in force by the time they confirm: the device is not given the key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_sent_while_the_person_is_at_the_dialog_for_sharing_with_a_new_device_stops_it() {
+    let rig = Rig::start().await;
+    rig.start_settings_sync_listing_the_phone();
+    rig.app
+        .app
+        .state::<AppState>()
+        .settings()
+        .expect("settings are open")
+        .sync_turn_on()
+        .await
+        .expect("settings sync is on");
+    let devices = rig.devices();
+    let candidate = devices["candidates"][0]["reference"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the phone is offered: {devices}"))
+        .to_owned();
+    let (shown, release) = rig.ceremony.hold_the_dialog();
+    let sharing = rig
+        .app
+        .start_call("settings_device_share", json!({ "reference": candidate }));
+    tokio::time::timeout(WATCHDOG, shown.notified())
+        .await
+        .expect("the dialog is shown");
+    let elsewhere = a_feed_the_host_does_not_read(&rig).await;
+    revokes_the_phone(&rig).await;
+    assert_eq!(published_at(&elsewhere), 1);
+    release.notify_one();
+
+    tokio::time::timeout(WATCHDOG, sharing)
+        .await
+        .expect("the call ends")
+        .expect("the call ends")
+        .expect_err("a request is in force now, so the device is not given the key");
+    assert_eq!(
+        rig.devices()["members"].as_array().map(Vec::len),
+        Some(1),
+        "the phone holds no key"
     );
 }
 
@@ -2262,6 +2441,8 @@ async fn a_page_that_is_not_the_services_does_not_let_a_stored_request_go() {
     revoke_with_the_publication(&rig, Moment::ActedAndPage { status: 500 }).await;
     the_phone_is_taken_out(&rig).await;
 
+    // No look can find the request again, so only the record made before the send holds it.
+    the_feed_cannot_be_read(&rig.served);
     assert_not_shared_with_again(&rig);
 }
 
