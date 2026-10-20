@@ -944,11 +944,25 @@ mod tests {
         seen: Arc<std::sync::atomic::AtomicUsize>,
         /// When each request was accepted.
         arrivals: Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+        /// How many requests the service has read to their end.
+        read: Arc<watch::Sender<usize>>,
+        /// What the first answer waits for, when the service holds it.
+        gate: Arc<tokio::sync::Semaphore>,
         serving: tokio::task::JoinHandle<()>,
     }
 
     impl Scripted {
         async fn answering(answers: &[(u16, &str)]) -> Self {
+            Self::serving(answers, false).await
+        }
+
+        /// As [`Self::answering`], with the first answer held back until [`Self::let_go`], as a room
+        /// that is held up holds it.
+        async fn holding_the_first(answers: &[(u16, &str)]) -> Self {
+            Self::serving(answers, true).await
+        }
+
+        async fn serving(answers: &[(u16, &str)], holding: bool) -> Self {
             let answers: Vec<(u16, String)> = answers
                 .iter()
                 .map(|(status, body)| (*status, (*body).to_owned()))
@@ -961,6 +975,9 @@ mod tests {
             let counted = Arc::clone(&seen);
             let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
             let arrived = Arc::clone(&arrivals);
+            let read = Arc::new(watch::channel(0).0);
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let (reading, gated) = (Arc::clone(&read), Arc::clone(&gate));
             let serving = tokio::spawn(async move {
                 loop {
                     let Ok((mut stream, _)) = listener.accept().await else {
@@ -972,6 +989,7 @@ mod tests {
                         .push(std::time::Instant::now());
                     let nth = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let (status, body) = answers[nth.min(answers.len() - 1)].clone();
+                    let (reading, gated) = (Arc::clone(&reading), Arc::clone(&gated));
                     tokio::spawn(async move {
                         // The request is read to the end of its head and its body, so the client
                         // has finished writing before it is answered.
@@ -993,6 +1011,13 @@ mod tests {
                         if stream.read_exact(&mut request).await.is_err() {
                             return;
                         }
+                        reading.send_modify(|read| *read += 1);
+                        if holding && nth == 0 {
+                            match gated.acquire().await {
+                                Ok(permit) => permit.forget(),
+                                Err(_) => return,
+                            }
+                        }
                         let answer = format!(
                             "HTTP/1.1 {status} Answer\r\nContent-Type: application/json\r\n\
                              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1008,8 +1033,24 @@ mod tests {
                     .expect("a loopback origin"),
                 seen,
                 arrivals,
+                read,
+                gate,
                 serving,
             }
+        }
+
+        /// Lets the held first answer go.
+        fn let_go(&self) {
+            self.gate.add_permits(1);
+        }
+
+        /// Waits until the service has read `count` requests to their end.
+        async fn until_read(&self, count: usize) {
+            self.read
+                .subscribe()
+                .wait_for(|read| *read >= count)
+                .await
+                .expect("the service runs");
         }
 
         fn requests(&self) -> usize {
@@ -1057,6 +1098,40 @@ mod tests {
         let reserved = reserve_for(&service, Duration::from_secs(300)).await;
 
         assert!(reserved.expect("the second attempt is answered"));
+        assert_eq!(service.requests(), 2);
+    }
+
+    /// KR-REQ-10.19: a room that is held up answers only when the route's own deadline passes,
+    /// after the time the host once waited, and the host reads that refusal and sends the request
+    /// again. The clock is moved by hand, to a moment past the time the host once waited and inside
+    /// the time it waits now, while the service holds the answer.
+    #[tokio::test]
+    async fn the_refusal_of_a_room_that_is_held_up_is_read_and_the_request_is_sent_again() {
+        /// Longer than the five seconds the host once waited for an answer to begin, and shorter
+        /// than the route's own eight.
+        const HELD_UP_FOR: Duration = Duration::from_secs(6);
+
+        let service = Scripted::holding_the_first(&[(503, BUSY_NOW), (200, RESERVED)]).await;
+        let call = reserve_for(&service, Duration::from_secs(300));
+        tokio::pin!(call);
+
+        // Under the ordinary clock until the service has the whole request, so that what the host
+        // gives up on is an answer it is waiting for.
+        tokio::select! {
+            biased;
+            () = service.until_read(1) => {}
+            outcome = &mut call => panic!("the host gave up before the service had the request: {outcome:?}"),
+        }
+        tokio::time::pause();
+        tokio::time::advance(HELD_UP_FOR).await;
+        tokio::time::resume();
+        service.let_go();
+
+        let reserved = call.await;
+
+        assert!(
+            reserved.expect("the held-up room's refusal is read and the second attempt answered")
+        );
         assert_eq!(service.requests(), 2);
     }
 
