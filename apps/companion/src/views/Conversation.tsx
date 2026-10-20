@@ -1410,6 +1410,7 @@ function LaunchSurfaceView({
             <CommitButton
               key={profile.profile_id}
               data-profile={profile.profile_id}
+              data-wraps
               disabled={stale || missing}
               title={
                 stale
@@ -1439,8 +1440,11 @@ function LaunchSurfaceView({
                   })
               }}
             >
-              {profile.label}
-              {profile.user_defined ? <span className="faint small"> · yours</span> : null}
+              {/* One piece of text, so that a label that has to wrap wraps as a line does. */}
+              <span>
+                {profile.label}
+                {profile.user_defined ? <span className="faint small"> · yours</span> : null}
+              </span>
             </CommitButton>
           )
         })}

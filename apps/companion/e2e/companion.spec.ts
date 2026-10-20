@@ -131,6 +131,30 @@ async function withSystemTextScale(page: Page, ratio: number): Promise<void> {
   }, ratio)
 }
 
+/**
+ * Sets the page's face to one as wide as the Linux runner draws with, from the page's first frame:
+ * DejaVu Sans sets the same text about a tenth wider across a line than a phone's or a Mac's face
+ * does, and Verdana is as wide and every Mac has it.
+ */
+async function withWideFace(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const css = ':root { --font-ui: Verdana, "DejaVu Sans", sans-serif !important; }'
+    const apply = (): boolean => {
+      const root = document.documentElement as HTMLElement | null
+      if (root === null) return false
+      const style = document.createElement('style')
+      style.textContent = css
+      root.append(style)
+      return true
+    }
+    if (!apply()) {
+      new MutationObserver((_, observer) => {
+        if (apply()) observer.disconnect()
+      }).observe(document, { childList: true })
+    }
+  })
+}
+
 /** Where the focus is, as the element's tag and id, or `body` where nothing holds it. */
 async function focusedNow(page: Page): Promise<string> {
   return page.evaluate(() =>
@@ -508,6 +532,58 @@ test.describe('the semantic view', () => {
     await expect(page.getByRole('status')).toContainText('docs.example.org')
     expect(page.url()).toContain('/harness.html')
   })
+
+  // KR-REQ-13.11: the buttons that start something at a verified prompt name their program, and the
+  // person's own are named at any length. At the largest text size on a window as narrow as a phone's
+  // each label wraps inside its button and each button lies inside the window; none is cut off.
+  for (const [width, height] of [
+    [1280, 720],
+    [390, 844]
+  ] as const) {
+    for (const [size, ratio] of [
+      ['default', 1],
+      ['largest', 53 / 17]
+    ] as const) {
+      test(`keeps each launch button whole at the ${size} text size, ${width} px wide`, async ({ page }) => {
+        await withSystemTextScale(page, ratio)
+        await withWideFace(page)
+        // The window is opened at the desktop's own size, which has the navigation the session is
+        // reached through, and made the size under test once the session is on it.
+        await openSession(page)
+        await page.setViewportSize({ width, height })
+        const surface = page.getByTestId('launch-surface')
+        await expect(surface).toBeVisible()
+        await surface.scrollIntoViewIfNeeded()
+
+        const buttons = await surface.getByRole('button').evaluateAll((all) =>
+          all.map((button) => {
+            const box = button.getBoundingClientRect()
+            return {
+              name: (button.textContent ?? '').trim(),
+              right: box.right,
+              left: box.left,
+              // A label wider than its button, whether it is drawn past it or cut off by it.
+              spill: button.scrollWidth - button.clientWidth
+            }
+          })
+        )
+        expect(buttons.map((each) => each.name)).toContain('Run the test suite · yours')
+        for (const each of buttons) {
+          expect(each.right, `${each.name} ends inside the window`).toBeLessThanOrEqual(width + 0.5)
+          expect(each.left, `${each.name} starts inside the window`).toBeGreaterThanOrEqual(-0.5)
+          expect(each.spill, `${each.name} holds its whole label`).toBeLessThanOrEqual(1)
+        }
+        expect(await overrunning(page, '[data-testid="launch-surface"]')).toEqual([])
+        // The window is made tall enough to hold the section rather than the capture being stitched
+        // together, which would draw the window's own floating parts where they never are.
+        const held = Math.ceil((await surface.boundingBox())?.height ?? 0)
+        await page.setViewportSize({ width, height: height + held })
+        await surface.screenshot({
+          path: shot(`launch-buttons-${size}-${width}-${test.info().project.name}`)
+        })
+      })
+    }
+  }
 
   test('draws the six profiles and disables them when the prompt moves', async ({ page }) => {
     await openSession(page)
