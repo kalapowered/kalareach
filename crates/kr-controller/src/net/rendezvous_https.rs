@@ -44,9 +44,10 @@
 //! have passed, which [`CONTROL_DEADLINES`] waits for. That is the only
 //! answer sent again, and only once it names a wait. A 500, a rate limit, a refusal and a 503 from
 //! something in front of the service are not. A request is made at most [`MAX_ATTEMPTS`] times and
-//! never past [`RETRY_BUDGET`] from the first, and a reservation never past the invitation's own
-//! life; a request that runs out of either is reported as the service being unavailable, with the
-//! answer it ended on. A repeat finds what the first did: a reservation the room made is answered
+//! never past [`RETRY_BUDGET`] from the first, a reservation never past the invitation's own life,
+//! and no request is made past the time the caller allows the whole call, which is what the
+//! mutation it is made for has left; a request that runs out of any of them is reported as the
+//! service being unavailable, with the answer it ended on. A repeat finds what the first did: a reservation the room made is answered
 //! as taken, which makes the host draw another locator, and a release it made is answered
 //! `FORBIDDEN`, which a release has always been reported as.
 
@@ -196,7 +197,6 @@ impl HttpsRendezvous {
         control_token_hash: Digest256,
         within: Duration,
     ) -> kr_pairing::Result<bool> {
-        let _ = within;
         let body = reserve_body(
             locator,
             invitation_id,
@@ -208,7 +208,7 @@ impl HttpsRendezvous {
                 .get()
                 .saturating_sub(kr_ipc::now_ms().get()),
         );
-        let until = Instant::now() + life.min(RETRY_BUDGET);
+        let until = Instant::now() + life.min(RETRY_BUDGET).min(within);
         let answer: ReserveAnswer =
             control(gateway, RESERVE_PATH, &body, self.proxy.as_ref(), until).await?;
         Ok(answer.reserved)
@@ -243,9 +243,8 @@ impl HttpsRendezvous {
         control_token: &SymmetricKey,
         within: Duration,
     ) -> kr_pairing::Result<()> {
-        let _ = within;
         let body = release_body(locator, control_token)?;
-        let until = Instant::now() + RETRY_BUDGET;
+        let until = Instant::now() + RETRY_BUDGET.min(within);
         let _: ReleaseAnswer =
             control(gateway, RELEASE_PATH, &body, self.proxy.as_ref(), until).await?;
         Ok(())
