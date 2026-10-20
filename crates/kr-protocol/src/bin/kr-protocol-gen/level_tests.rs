@@ -1316,7 +1316,8 @@ fn a_roots_file_that_cannot_be_read_is_not_an_absent_one() {
 /// What looks like code inside a literal is not code, whichever literal it is in: a raw string of
 /// any form that holds a whole declaration and a stray quote does not hide the real one (it is
 /// refused, since the reader does not read raw strings), and a character literal that is a quote, or
-/// is not ASCII, neither opens a string nor moves the offsets of what follows.
+/// is not ASCII, neither opens a string (a comment after it is still a comment) nor moves the
+/// offsets of what follows.
 #[test]
 fn literals_that_look_like_code_do_not_change_what_is_read() {
     use crate::public_majors::{string_const, string_list};
@@ -1355,7 +1356,8 @@ fn literals_that_look_like_code_do_not_change_what_is_read() {
         ("a double quote", "'\"'"),
     ] {
         let source = format!(
-            "const C: char = {literal};\npub const PLUGIN_HOST_PROTOCOL: &str = \"kr-plugin-host/2\";\n\
+            "const C: char = {literal};\n// pub const SURFACE_ROOTS: &[&str] = &[\"Decoy\"];\n\
+             pub const PLUGIN_HOST_PROTOCOL: &str = \"kr-plugin-host/2\";\n\
              pub const SURFACE_ROOTS: &[&str] = &[\"A\"];\n"
         );
         assert_eq!(
