@@ -951,11 +951,16 @@ async fn a_delivery_confirmed_over_a_link_that_takes_it_keeps_the_link_and_the_l
 
 /// KR-REQ-09.12: a link the notice cannot be written to is given up with the lease, and the next
 /// caller opens a link of its own.
+///
+/// The daemon has the worker on record as one its publisher sends no statement of what the host's
+/// local owner may do, before it lists the worker. A worker not yet reached is one the publisher
+/// goes to by itself, and it would take the link over and tell the worker again while this case
+/// has the worker end its side: the write that fails would then be the publisher's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delivery_that_cannot_be_written_gives_up_its_link() {
     let close = Arc::new(tokio::sync::watch::channel(false).0);
     let ended = Arc::new(AtomicUsize::new(0));
-    let silent = world::fake_world(closing(Arc::clone(&close), Arc::clone(&ended))).await;
+    let silent = world::fake_world_reached(closing(Arc::clone(&close), Arc::clone(&ended))).await;
     world::acknowledged(&silent.controller, silent.session_id);
     let controller = &silent.controller;
     let mut link = controller
