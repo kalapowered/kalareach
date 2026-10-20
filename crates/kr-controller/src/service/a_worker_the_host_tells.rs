@@ -124,6 +124,16 @@ async fn with(behaviour: Behaviour) -> (Silent, Heard) {
     (silent, recorded)
 }
 
+/// A daemon with one recording worker in its directory, which it already has on record as one it
+/// cannot tell, so that its publisher sends the worker nothing by itself. A worker the daemon has
+/// not reached is one the publisher goes to on its own, and a statement it sent while a case was
+/// looking at what the worker heard would be a statement the case did not send.
+async fn with_the_worker_not_told(behaviour: Behaviour) -> (Silent, Heard) {
+    let recorded: Heard = Arc::default();
+    let silent = world::fake_world_reached(recording(behaviour, Arc::clone(&recorded))).await;
+    (silent, recorded)
+}
+
 /// The frames the worker has been sent, in arrival order.
 fn heard(recorded: &Heard) -> Vec<ControlFrame> {
     heard_on(recorded)
@@ -242,7 +252,7 @@ async fn a_barrier_tells_a_worker_what_its_local_owner_may_do_before_it_announce
 /// enablement of exclusive management refuses to pass over.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_whose_level_cannot_read_the_statement_is_sent_none_and_its_link_goes_on() {
-    let (silent, recorded) = with(Behaviour {
+    let (silent, recorded) = with_the_worker_not_told(Behaviour {
         fails_the_first_statement: false,
     })
     .await;
