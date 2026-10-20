@@ -2071,7 +2071,7 @@ async fn a_look_that_began_before_a_request_was_sent_does_not_let_its_device_go(
 async fn a_request_in_the_feed_of_a_host_that_was_forgotten_is_not_waited_for() {
     let rig = Rig::start().await;
     rig.sharing_with_the_phone().await;
-    a_feed_the_host_does_not_read(&rig).await;
+    let _elsewhere = a_feed_the_host_does_not_read(&rig).await;
     let host = host_by(&rig.view().await, "feed");
     rig.revoke(
         host["reference"].as_str().expect("a reference"),

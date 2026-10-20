@@ -1159,6 +1159,26 @@ impl Revocations {
         // Whether there are settings the device is taken out of, to say so truthfully.
         let shared = settings.is_some_and(|settings| settings.shares_settings());
         let sent = self.dispatch(prepared, &summary).await;
+        // A request that left is marked as sent before anything else runs, so that the view that
+        // follows, and a view that reads a feed it cannot read then, still show it. The mark goes
+        // first as a view's own does.
+        if sent.is_ok() && found.route() == Route::Feed {
+            let at_ms = now().get();
+            let mut memory = self.memory();
+            memory.order += 1;
+            let written = memory.order;
+            memory.known.insert(
+                (host_now.reference.clone(), summary.device_id),
+                Known {
+                    standing: Some(DeviceStanding::Sent {
+                        at_ms,
+                        host_lists_revoked: false,
+                    }),
+                    at_ms,
+                    written,
+                },
+            );
+        }
         // The request has ended, whatever became of it: a read that begins from here can say.
         drop(sending);
         // Told at once, and not at the end of the view that follows, which waits for every host and
@@ -1168,28 +1188,7 @@ impl Revocations {
             self.tell(context, keys.clone());
         }
         match sent {
-            Ok(()) => {
-                // The view that follows reads the feed again, and a feed that cannot be read then
-                // must still show that this request was sent.
-                if found.route() == Route::Feed {
-                    let at_ms = now().get();
-                    let mut memory = self.memory();
-                    memory.order += 1;
-                    let written = memory.order;
-                    memory.known.insert(
-                        (host_now.reference.clone(), summary.device_id),
-                        Known {
-                            standing: Some(DeviceStanding::Sent {
-                                at_ms,
-                                host_lists_revoked: false,
-                            }),
-                            at_ms,
-                            written,
-                        },
-                    );
-                }
-                Ok(self.view(context).await)
-            }
+            Ok(()) => Ok(self.view(context).await),
             Err(mut error) if shared => {
                 if !error.message.ends_with('.') {
                     error.message.push('.');
