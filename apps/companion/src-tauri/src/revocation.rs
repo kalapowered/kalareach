@@ -699,11 +699,20 @@ impl Revocations {
     /// What the screen is shown. Every host is asked, and so is every feed.
     pub async fn view(&self, context: &Context) -> RevocationView {
         let readings = self.read(self.hosts(context), context).await;
+        let complete = readings.iter().all(|reading| {
+            reading.contact == Contact::Answered
+                && reading.feed.as_ref().is_none_or(std::result::Result::is_ok)
+        });
         let mut told = Vec::new();
         let hosts = readings
             .into_iter()
             .map(|reading| self.host_view(&reading, &mut told))
             .collect();
+        // Which devices a request is in force for is said at once, before anything is spawned: a
+        // device in that set is not offered to be shared with again.
+        if let Some(settings) = &context.settings {
+            settings.requests_in_force(&told, complete);
+        }
         self.tell(context, told);
         RevocationView {
             ceremony: self.ceremony.kind(),
@@ -744,11 +753,11 @@ impl Revocations {
         });
     }
 
-    /// One host's view. The keys of the devices that settings sync has not heard of, and that this
-    /// computer sent a request for or the host on this computer lists as revoked, go in `told`.
+    /// One host's view. The keys of the devices that this computer sent a request for, which no host
+    /// has refused, or that the host on this computer lists as revoked, go in `told`.
     fn host_view(&self, reading: &Reading, told: &mut Vec<AuthorisationKey>) -> HostView {
         let reference = reading.host.reference();
-        let (devices, listed_at_ms, direct, fed) = {
+        let (devices, listed_at_ms, direct) = {
             let mut memory = self.memory();
             note_listing(
                 &mut memory.listed,
@@ -765,7 +774,7 @@ impl Revocations {
                 .map_or((Vec::new(), None), |(devices, at_ms)| {
                     (devices.clone(), Some(*at_ms))
                 });
-            (devices, at_ms, memory.direct.clone(), memory.fed.clone())
+            (devices, at_ms, memory.direct.clone())
         };
         let own = self.verified(reading);
         let this_computer = match &reading.host {
@@ -786,7 +795,6 @@ impl Revocations {
                     && reading.list.is_some()
                     && matches!(reading.host, Host::Local(_));
                 if let Some(keys) = summary.keys.0
-                    && !fed.contains(&keys.authorisation)
                     && (listed_revoked
                         || named
                             .iter()
@@ -1009,13 +1017,18 @@ impl Revocations {
         // every feed. A request that failed may have reached its host all the same, a reply being
         // lost, so it is told as one that left: the device is out of the shared settings.
         if settings.is_some() {
-            self.tell(context, keys);
+            self.tell(context, keys.clone());
         }
         match sent {
             Ok(()) => {
                 // The view that follows reads the feed again, and a feed that cannot be read then
                 // must still show that this request was sent.
                 if found.route() == Route::Feed {
+                    // The request is in a feed and a host may yet act on it: the device is not
+                    // offered to be shared with again while it is.
+                    if let Some(settings) = settings {
+                        settings.requests_in_force(&keys, false);
+                    }
                     let at_ms = now().get();
                     let mut memory = self.memory();
                     memory.order += 1;

@@ -147,6 +147,10 @@ pub(super) struct Listed {
     /// The devices a host lists on a platform that has no ceremony to join with: a phone, or a
     /// Linux computer. Settings are not shared with one, because it could never join them.
     cannot_join: Mutex<BTreeSet<AuthorisationKey>>,
+    /// The devices a revocation request of this computer's is known to be in force for, in a feed
+    /// that no host has refused: a device kept out by one that may yet take effect is not offered
+    /// to be shared with again.
+    in_force: Mutex<BTreeSet<AuthorisationKey>>,
     last: Mutex<Option<(Instant, HostAnswers)>>,
 }
 
@@ -171,6 +175,13 @@ impl Listed {
 
     fn cannot_join(&self, device: &AuthorisationKey) -> bool {
         self.cannot_join
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(device)
+    }
+
+    fn in_force(&self, device: &AuthorisationKey) -> bool {
+        self.in_force
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .contains(device)
@@ -394,6 +405,7 @@ impl SettingsSync {
             .filter(|device| {
                 !self.listed.is_disputed(&device.authorisation)
                     && !self.listed.cannot_join(&device.authorisation)
+                    && !self.listed.in_force(&device.authorisation)
             })
             .map(|device| Candidate {
                 reference: installation_id_of(device),
@@ -568,7 +580,10 @@ impl SettingsSync {
                 .map_err(member_failure)?
                 .into_iter()
                 .find(|device| installation_id_of(device) == reference)
-                .filter(|device| self.fence.holds_none_of(&[device.authorisation]))
+                .filter(|device| {
+                    self.fence.holds_none_of(&[device.authorisation])
+                        && !self.listed.in_force(&device.authorisation)
+                })
                 .ok_or_else(|| CommandError::refused("no host lists that device any more"))?,
         };
         if self.listed.is_disputed(&device.authorisation) {
@@ -691,6 +706,32 @@ impl SettingsSync {
         self.settle(&mut record, &service, Ask::Now)
             .await
             .map(|_| ())
+    }
+
+    /// Says which devices a revocation request of this computer's is in force for: those no host
+    /// has refused, which a feed holds for a host that has not acted on it yet. `complete` says that
+    /// every host and feed was read, so that a device absent from `devices` has none; otherwise the
+    /// devices named are added to what is known and nothing is let go.
+    pub fn requests_in_force(&self, devices: &[AuthorisationKey], complete: bool) {
+        let mut held = self
+            .listed
+            .in_force
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if complete {
+            held.clear();
+        }
+        held.extend(devices.iter().copied());
+    }
+
+    /// Whether the device `reference` names is one the page was shown as taken out by a revoke.
+    pub fn names_held_out(&self, reference: &str) -> bool {
+        self.devices
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .held_out
+            .iter()
+            .any(|held| held.reference == reference)
     }
 
     /// Takes devices whose revocation is known here out of the shared settings, as far as the hosts

@@ -606,6 +606,26 @@ impl Settings {
         self.fence.raise(devices)
     }
 
+    /// Says which devices a revocation request of this computer's is in force for, as far as the
+    /// last look at the hosts and their feeds showed ([`SettingsSync::requests_in_force`]).
+    pub fn requests_in_force(
+        &self,
+        devices: &[kr_protocol::scalars::AuthorisationKey],
+        complete: bool,
+    ) {
+        if let Some(sync) = self.sync.get() {
+            sync.requests_in_force(devices, complete);
+        }
+    }
+
+    /// Whether the page was shown the device `reference` names as taken out by a revoke.
+    #[must_use]
+    pub fn names_held_out(&self, reference: &str) -> bool {
+        self.sync
+            .get()
+            .is_some_and(|sync| sync.names_held_out(reference))
+    }
+
     /// Tells settings sync that revocations of `devices` are known here, so that it takes them out
     /// of the shared settings. Says whether it did: a computer that shares no settings has none to
     /// take them out of.
