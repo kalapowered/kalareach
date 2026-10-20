@@ -1078,7 +1078,7 @@ fn write_programs(directory: &Path) -> batch_launch::Programs {
     std::fs::write(directory.join("show-each.bat"), show_each_batch()).expect("a batch program");
     std::fs::write(directory.join("show-all.cmd"), SHOW_ALL_BATCH).expect("a batch program");
     std::fs::write(directory.join("show-each-script.ps1"), SHOW_EACH_SCRIPT).expect("a script");
-    for name in ["100%dir", "bang!dir"] {
+    for name in ["100%dir", "bang!dir", "a&b^c (x86)"] {
         let inner = directory.join(name);
         std::fs::create_dir(&inner).expect("a directory");
         std::fs::write(inner.join("show-each.cmd"), show_each_batch()).expect("a batch program");
@@ -1088,6 +1088,7 @@ fn write_programs(directory: &Path) -> batch_launch::Programs {
         by_name: "show-each",
         in_percent_directory: path("100%dir\\show-each.cmd"),
         in_bang_directory: path("bang!dir\\show-each.cmd"),
+        in_syntax_directory: path("a&b^c (x86)\\show-each.cmd"),
     }
 }
 

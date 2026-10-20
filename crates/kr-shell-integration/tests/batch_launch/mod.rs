@@ -32,6 +32,9 @@ pub struct Programs {
     pub in_percent_directory: String,
     /// By a full path through a directory whose name holds a `!`.
     pub in_bang_directory: String,
+    /// By a full path through a directory whose name holds white space and the characters
+    /// cmd.exe reads as syntax only outside a quoted word.
+    pub in_syntax_directory: String,
 }
 
 /// Vectors with a word that cmd.exe would read as more than that word, or not at all, and what
@@ -263,8 +266,8 @@ pub fn assert_nothing_is_started_that_cmd_exe_would_change(
     );
 }
 
-/// Launches every vector that [`CARRIED`] lists, and one at a program found by its name, and fails
-/// with what happened when any was refused or reached the program as other than named.
+/// Launches every vector that [`CARRIED`] lists, one at a program found by its name and one at a
+/// program in a directory whose name holds syntax, and fails with what happened when any was refused or reached the program as other than named.
 pub fn assert_every_word_cmd_exe_reads_as_itself_arrives_as_named(
     directory: &Path,
     programs: &Programs,
@@ -275,6 +278,7 @@ pub fn assert_every_word_cmd_exe_reads_as_itself_arrives_as_named(
         .map(|words| (programs.each.clone(), words.to_vec()))
         .collect();
     cases.push((programs.by_name.to_owned(), vec!["found by its name", "b"]));
+    cases.push((programs.in_syntax_directory.clone(), vec!["two words", "b"]));
     let launched = launch_all(directory, &cases, as_batch);
     let wrong: Vec<String> = cases
         .iter()

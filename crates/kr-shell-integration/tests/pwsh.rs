@@ -934,7 +934,7 @@ fn write_show_each(directory: &std::path::Path) -> batch_launch::Programs {
     };
     let each = write(directory.join("show-each"));
     let mut places = Vec::new();
-    for name in ["100%dir", "bang!dir"] {
+    for name in ["100%dir", "bang!dir", "a&b^c (x86)"] {
         let inner = directory.join(name);
         std::fs::create_dir(&inner).expect("a directory");
         places.push(write(inner.join("show-each")));
@@ -942,6 +942,7 @@ fn write_show_each(directory: &std::path::Path) -> batch_launch::Programs {
     batch_launch::Programs {
         each,
         by_name: "show-each",
+        in_syntax_directory: places.pop().expect("a place"),
         in_bang_directory: places.pop().expect("a place"),
         in_percent_directory: places.pop().expect("a place"),
     }
