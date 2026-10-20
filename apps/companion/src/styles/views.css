@@ -116,7 +116,7 @@
 .approval-source .code-block {
   max-height: 240px;
   overflow: auto;
-  white-space: break-spaces;
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
   font: 0.6875rem/1.6 var(--font-mono);
 }
@@ -161,7 +161,7 @@
   border: 1px solid var(--line);
   border-radius: 6px;
   font: inherit;
-  white-space: break-spaces;
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
@@ -223,7 +223,7 @@
 }
 
 .question-context {
-  white-space: break-spaces;
+  white-space: pre-wrap;
 }
 
 .question-choices {
@@ -635,7 +635,7 @@
 
 /* An entry of a kind the conversation has no drawing for is its text, as the agent wrote it. */
 .entry-text {
-  white-space: break-spaces;
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
@@ -671,7 +671,7 @@
 .output-page {
   margin: 0;
   font: 0.75rem/1.55 var(--font-mono);
-  white-space: break-spaces;
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
@@ -706,8 +706,9 @@
   border-radius: 7px;
   background: var(--bg);
   color: var(--text);
-  /* The command is typed as it is shown, so a run of spaces in a word is kept, and the size is the
-     labels' rather than the smaller one a line of small text gives code. */
+  /* The command is typed as it is shown, so a run of spaces in a word is kept, and a space that
+     ends a line wraps with the rest instead of hanging past the box. The size is the message text's
+     rather than the smaller one a line of small text gives code. */
   font-size: 0.8125rem;
   white-space: break-spaces;
   overflow-wrap: anywhere;
@@ -1652,7 +1653,7 @@
 .confirmation-fact dd {
   margin: 0;
   overflow-wrap: anywhere;
-  white-space: break-spaces;
+  white-space: pre-wrap;
   user-select: text;
 }
 
@@ -1690,7 +1691,7 @@
   padding-left: var(--gap-3);
   border-left: 2px solid var(--warning-line);
   overflow-wrap: anywhere;
-  white-space: break-spaces;
+  white-space: pre-wrap;
   user-select: text;
 }
 
@@ -1746,7 +1747,7 @@
   margin: 6px 0;
   user-select: text;
   overflow-wrap: anywhere;
-  white-space: break-spaces;
+  white-space: pre-wrap;
 }
 
 /* The picture of an attached image: small, inside its chip, and never wider than the chip. */
