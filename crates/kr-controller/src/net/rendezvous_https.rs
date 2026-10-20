@@ -39,7 +39,9 @@
 //!
 //! The service answers a reservation or a release that its room could not carry out with 503,
 //! `SERVICE_UNAVAILABLE` and a `retryAfterSeconds` that it also serves as `Retry-After`: a deploy
-//! resets every room, and a request that arrives meanwhile is told to come back. That is the only
+//! resets every room, and a request that arrives meanwhile is told to come back. A room that threw
+//! is answered at once, and one that is held up is answered when the service's eight seconds for it
+//! have passed, which [`CONTROL_DEADLINES`] waits for. That is the only
 //! answer sent again, and only once it names a wait. A 500, a rate limit, a refusal and a 503 from
 //! something in front of the service are not. A request is made at most [`MAX_ATTEMPTS`] times and
 //! never past [`RETRY_BUDGET`] from the first, and a reservation never past the invitation's own
@@ -81,9 +83,15 @@ pub const RELEASE_PATH: &str = "/api/pair/locator/release";
 ///
 /// A reservation runs while the owner waits for the invitation and while the invitation's lock is
 /// held, so the whole exchange is bounded well inside the transport's own defaults.
+///
+/// The answer may begin as late as the service's own refusal of a room that is held up: the
+/// service gives a room eight seconds from the moment it has read the request and then answers
+/// `SERVICE_UNAVAILABLE` with a wait. The host waits ten, as the transport does by default, which
+/// leaves two for the connection, the network and the service's own start. A shorter wait would end
+/// the call before that refusal could arrive, and only a room that throws would be sent again.
 pub const CONTROL_DEADLINES: HttpDeadlines = HttpDeadlines {
     connect: Duration::from_secs(5),
-    read: Duration::from_secs(5),
+    read: Duration::from_secs(10),
     total: Duration::from_secs(10),
 };
 
