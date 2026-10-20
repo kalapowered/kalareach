@@ -265,10 +265,12 @@ records the run that asked for it, whatever the document said, so evidence a lat
 bound to the execution that made it. The node's receipt carries the captured version, or the
 version and the materialisation that holds it.
 
-`request_review`, `attention_notice` and `apply_diff`, and the command kinds on a platform without a
-POSIX shell, are refused by name. A refusal is not an uncertain outcome: nothing was dispatched and
-nothing was made on the way to refusing it. Since no work is done, the node is failed, and any node
-depending on it will see a failure rather than a result nobody produced.
+`request_review`, `attention_notice` and `apply_diff` are refused by name when a node of that kind
+is dispatched. A refusal is not an uncertain outcome: nothing was dispatched and nothing was made on
+the way to refusing it. Since no work is done, the node is failed, and any node depending on it will
+see a failure rather than a result nobody produced. On a platform without a POSIX shell, a
+definition with a node of a command kind (`shell_command` or `run_tests`) is refused when it is
+installed, so none of its nodes runs.
 
 A node that succeeds records its kind's typed output, and a runner that reports an output of
 another kind has not reported this node's success: what its action did is not established, so the
@@ -509,57 +511,67 @@ A test result is what this host observed, and nothing a caller reports.
   own, under an identifier its ledger row already names, so a stop at any point leaves something the
   sweep finds from the row. The command runs in that copy as the root of a session, as a
   `shell_command` node's does. An edit a person makes in the main workspace after the capture
-  changes nothing the suite reads; it is a later version, and the evidence stays against the earlier
-  one.
+  changes neither the version nor the copy of it; it is a later version, and the evidence stays
+  against the earlier one.
 * **What is recorded.** When the session has closed after a suite ran to an end of its own (it
   exited with a status, or a signal ended it), the host will read the copy back and record the
-  result against the version. The exit status will be recorded; a signal is a suite something
-  stopped, with no status, and its detail and the line of evidence name the signal. The times the
-  suite began and ended, the session, workflow run and node it observed, and the digest of the
-  command the suite's configuration gave (never the command) will also be recorded. One line of
-  evidence says how the suite ended and whether the copy still held the version. A suite that never
-  started, or that a stop of its node or of its session ended, has no result to record, and the
-  node's answer says how its session closed. The node succeeds only when the suite exited with
-  status zero and the copy still holds exactly the version. If the suite exited with a non-zero exit
-  status or was stopped by a signal, the node will fail. If the suite exited with status zero
-  against a copy that was changed, or that cannot be read back, it attests no version, so the node
-  is left unknown. When the copy was changed, what it held is stored as a version of its own, which
-  is a reading and not an attestation, up to the bounds of a capture. When the copy cannot be read
-  back, or something wrote into it after the session closed, no version is stored (the files a
-  reading did store stay in the content store). The host will read the copy when creating the copy
-  and when recording the result of the suite, but will not monitor the copy while the suite is
-  running.
+  result against the version, and then one line of evidence beside it. If the result or its line of
+  evidence cannot be recorded, the node is left unknown, whatever the suite's status; a result can
+  be recorded without its line of evidence. The exit status will be recorded; a signal is a suite
+  something stopped, with no status, and its detail and the line of evidence name the signal. The
+  times the session was created and closed, the session, workflow run and node it observed, and the
+  digest of the command the suite's configuration gave (never the command) will also be recorded.
+  One line of evidence says how the suite ended and whether the copy still held the version. A suite
+  that never started, or that a stop of its node or of its session ended, has no result to record.
+  When the wait for its action or the run's deadline expires, the node settles as cancelled and its
+  answer says that its action was asked to stop; when its session closes in any other way, the
+  node's answer says how the session closed. A node settled as cancelled stays cancelled, whatever
+  the suite does afterwards. The node succeeds only when the suite exited with status zero and the
+  copy still holds exactly the version. If the suite exited with a non-zero exit status or was
+  stopped by a signal, the node will fail, once the host has recorded what it observed. If the suite
+  exited with status zero against a copy that was changed, or that cannot be read back, it attests
+  no version, so the node is left unknown. When the copy was changed and what it held can be read
+  completely, within the bounds of a capture and the rules for what a version may hold, that is
+  stored as a version of its own, which is a reading and not an attestation. When the copy cannot be
+  read back, or a file the reading found has a modification time later than the closure of the
+  session, no version is stored (the files a reading did store stay in the content store); a change
+  after the closure that leaves no such time, such as a deletion, cannot be told from a change the
+  suite made. The host will record what it wrote when it makes the copy and read the copy when it
+  records the result of the suite, but will not monitor the copy while the suite is running.
 * **Declared outputs.** A suite may declare paths it intends to write, other than its source, such
-  as a build directory. These paths are not compared, and are recorded in one reference each. A
-  directory is recorded as the digest of its sorted listing (the path, length and instant written of
-  every entry, links listed and not followed), with the sum of the lengths it lists. The listing
-  holds up to 50,000 entries, 64 levels and 16 MiB of path text; beyond this it is a truncated
-  listing. A file is recorded as the digest of its first 64 MiB and its whole length. A symbolic
-  link or other non-file, non-directory object is recorded as such. If a directory in an output is a
-  link, a mount, or has a name this host does not carry, it is an entry of the listing and is not
-  entered. Nothing in an output enters the content store. A result that attests the version names
-  the output paths it left out of the comparison. A path the suite adds beside an output still
-  changes the source, so a tool that writes beside each source directory (a compiled-code cache is
-  the usual one) makes each run of that suite unknown and stores what it wrote as a version of its
-  own. An output path must be exactly specified; it is not possible to use a pattern. An ancestor of
-  an output is entered only to reach it. Declarations that repeat, lie inside one another or
+  as a build directory. These paths are not compared, and each one the copy holds is recorded in one
+  reference. A directory is recorded as the digest of its sorted listing (the path, length and
+  instant written of every entry, links listed and not followed), with the sum of the lengths it
+  lists. The listing holds up to 50,000 entries, 64 levels and 16 MiB of path text; beyond this it
+  is a truncated listing. A file is recorded as the digest of its first 64 MiB and its whole length.
+  A symbolic link or other non-file, non-directory object is recorded as such. If a directory in an
+  output is a link, a mount, or has a name this host does not carry, it is an entry of the listing
+  and is not entered. Nothing in an output enters the content store. A result that attests the
+  version names the output paths it left out of the comparison. A path the suite adds beside an
+  output is not left out of the comparison and still changes the source, so a tool that writes
+  beside each source directory (a compiled-code cache is the usual one) makes a run of that suite
+  that exits with status zero unknown and, where what the copy held can be read completely, stores
+  what it wrote as a version of its own. An output path must be exactly specified; it is not
+  possible to use a pattern. An ancestor of an output is entered to reach it, and its other entries
+  follow the normal rules for the source. Declarations that repeat, lie inside one another or
   contradict a path the version holds are refused before the suite runs. So is a declaration with a
   name this host does not carry as input (a colon, one of `< > " | ? *`, a trailing dot or space, a
   name a Windows device has with or without an extension, a name over 255 bytes), which the
   configuration accepts and every dispatch of that suite then refuses.
-* **The copy's release.** A copy is taken away when its node settles, and by the sweep for a node
-  that did not release it. The owner's right to change each of the copy's directories is given back
-  first, so a tree a run left read-only does not hold the version, and each level is removed through
-  its own handle, without following a link and without leaving the mount the copy is on. Only this
-  host's own directories change, and only those on the copy's own mount. A copy that holds something
-  the removal cannot take away is not removed and goes on holding its version: a mount (of another
-  filesystem, or a bind mount of the same one), a volume on another device that is no mount (a btrfs
-  subvolume), a tree deeper than 128 levels, a directory below the root that its owner cannot read,
-  a directory that another account owns and this account cannot empty (a container that ran as root
-  leaves these), on Linux a root its owner cannot search where `/proc` is not mounted, or on macOS
-  an entry with the immutable or append-only flag set or one that an access-control entry forbids
-  this account to delete. The sweep keeps trying, its log names why, and a person removes what the
-  suite left.
+* **The copy's release.** A copy is taken away by the dispatch once the session has closed and its
+  worker is accounted for, and otherwise by the sweep; a node that settles first, such as one whose
+  action wait expired, does not release its copy by settling. The owner's right to change each of
+  the copy's directories is given back first, so a tree a run left read-only does not hold the
+  version, and each level is removed through its own handle, without following a link and without
+  leaving the mount the copy is on. Only this host's own directories change, and only those on the
+  copy's own mount. A copy that holds something the removal cannot take away is not removed and goes
+  on holding its version: a mount (of another filesystem, or a bind mount of the same one), a volume
+  on another device that is no mount (a btrfs subvolume), a tree deeper than 128 levels, a directory
+  below the root that its owner cannot read, a directory that another account owns and this account
+  cannot empty (a container that ran as root leaves these), on Linux a root its owner cannot search
+  where `/proc` is not mounted, or on macOS an entry with the immutable or append-only flag set or
+  one that an access-control entry forbids this account to delete. The sweep keeps trying, its log
+  names why, and a person removes what the suite left.
 * **Reviews.** A reviewer session and the attention items for review results are refused by name
   (`request_review`, `attention_notice`); no caller can register a test or review result.
 
@@ -568,9 +580,10 @@ A test result is what this host observed, and nothing a caller reports.
 When a run captures a change-set, the version of that change-set is bound to the run by the host,
 not by what a caller said: the provenance a capture records names the run that asked for it. A
 capture of the working tree a workflow runs asks the host to hold its workspace still, and the host
-refuses, naming why: a shared existing checkout is written by the user's own tools, a workspace live
-sessions hold is written by their shells, and this host's own writers do not yet ask for a
-reservation before they write. The capture records the per-file consistency it performs and never
-claims a quiesced tree. If the workflow includes a capture node that requires a quiesced capture,
-the node fails with the reason. An atomic snapshot, which reads the base commit's own Git objects
-rather than the working tree, is a point-in-time capture and needs no reservation.
+does not grant it. The capture records the per-file consistency it performs and never claims a
+quiesced tree, and its detail says that the workspace could not be reserved. If the workflow
+includes a capture node that requires a quiesced capture, the node fails, and its reason names which
+applies: a shared existing checkout is written by the user's own tools, a workspace live sessions
+hold is written by their shells, and this host's own writers do not ask for a reservation before
+they write. An atomic snapshot, which reads the base commit's own Git objects rather than the
+working tree, is a point-in-time capture and needs no reservation.
