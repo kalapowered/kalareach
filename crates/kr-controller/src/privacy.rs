@@ -57,6 +57,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use kr_delivery::privacy::DeliveryOutbox;
+use kr_protocol::hostinfo::HostPrivacyState;
 use kr_protocol::ids::SessionId;
 use kr_protocol::privacy::{
     PrivacyCompletion, PrivacyGenerationAck, PrivacyOutstanding, PrivacyReport, PrivacySession,
@@ -109,9 +110,27 @@ const LONGEST_RETRY_MS: u64 = 60_000;
 /// record is written until it is published, so taking it waits until every admission taken before
 /// it has ended and none is taken in between. An exchange either finished before privacy mode was
 /// turned on, and is in flight at that moment, or it is checked against the published boundary.
+///
+/// A decision about what may leave this host reads it under [`Self::reading`] or
+/// [`Self::admit_send`]. A report of it reads a copy that never waits, which only this crate takes.
 #[derive(Clone, Debug, Default)]
 pub struct PrivacyState {
     published: Arc<RwLock<Published>>,
+    /// The state as the last change published it, and how many changes are queued or unresolved.
+    /// Every copy of this state shares it with the lock, and only [`Change`] and [`Queued`] write
+    /// it.
+    observed: Arc<Mutex<Observed>>,
+}
+
+/// What [`PrivacyState::observed`] copies.
+#[derive(Debug, Default)]
+struct Observed {
+    /// The state the last change published, or the state the host started with.
+    published: Published,
+    /// How many changes have asked for the write side and not published or given up, and, after a
+    /// change stopped by a panic, one that no later change takes back: the host may have recorded
+    /// a state it did not publish, and only a start reads the record again.
+    changing: u32,
 }
 
 /// An admission to send one delivery or ask one question about a delivery, while privacy mode is
@@ -174,6 +193,24 @@ impl PrivacyState {
     #[cfg(test)]
     pub(crate) fn set(&self, published: Published) {
         self.publish(published);
+    }
+
+    /// Returns where privacy mode stands as a report tells it: the state the last change
+    /// published, and whether a change is queued or was stopped part way.
+    ///
+    /// It never waits: a change holds the write side of the lock across the delivery exchanges it
+    /// waits for, and a report that read the lock would wait as long. So it is for reports only,
+    /// and a decision about what may leave this host uses [`Self::reading`] or
+    /// [`Self::admit_send`]. While `changing` is true the other two members are the last state
+    /// published, which a reader does not rely on.
+    #[must_use]
+    pub(crate) fn observed(&self) -> HostPrivacyState {
+        let observed = self.observed.lock().unwrap_or_else(PoisonError::into_inner);
+        HostPrivacyState {
+            enabled: observed.published.private,
+            generation: U64::new(observed.published.generation.get()),
+            changing: observed.changing > 0,
+        }
     }
 
     /// Returns the state as it stands now.
@@ -257,11 +294,15 @@ impl PrivacyState {
     /// waits for something a writer holds into a stall; a new taker of this side goes under the
     /// same rule.
     fn change(&self) -> Change<'_> {
+        // Raised before the wait, so a report says a change is under way from the moment it is
+        // asked for and not only from the moment it holds the write side.
+        let queued = Queued::raise(&self.observed);
         Change {
             held: self
                 .published
                 .write()
                 .unwrap_or_else(PoisonError::into_inner),
+            queued,
         }
     }
 
@@ -274,12 +315,58 @@ impl PrivacyState {
 /// or given up.
 struct Change<'a> {
     held: std::sync::RwLockWriteGuard<'a, Published>,
+    queued: Queued<'a>,
 }
 
 impl Change<'_> {
     /// Publishes the new state, which ends the change.
+    ///
+    /// The copy a report reads takes the new state and loses this change in one step, before the
+    /// lock does, so a report never says the new state while it says a change is under way.
     fn publish(mut self, published: Published) {
+        self.queued.settle(published);
         *self.held = published;
+    }
+}
+
+/// A change that has asked for the write side and has not ended.
+///
+/// A change that is given up, because its record was refused, ends by being dropped. One that
+/// stops because the thread is unwinding does not: it may have recorded the new state, so the
+/// copy a report reads keeps saying the host is changing until the daemon starts again and reads
+/// the record.
+struct Queued<'a> {
+    observed: &'a Mutex<Observed>,
+    /// Whether this change is still counted.
+    counted: bool,
+}
+
+impl<'a> Queued<'a> {
+    fn raise(observed: &'a Mutex<Observed>) -> Self {
+        let mut held = observed.lock().unwrap_or_else(PoisonError::into_inner);
+        held.changing = held.changing.saturating_add(1);
+        drop(held);
+        Self {
+            observed,
+            counted: true,
+        }
+    }
+
+    /// Ends this change with `published` as the state, in one step.
+    fn settle(&mut self, published: Published) {
+        let mut held = self.observed.lock().unwrap_or_else(PoisonError::into_inner);
+        held.published = published;
+        held.changing = held.changing.saturating_sub(1);
+        self.counted = false;
+    }
+}
+
+impl Drop for Queued<'_> {
+    fn drop(&mut self) {
+        if self.counted && !std::thread::panicking() {
+            let mut held = self.observed.lock().unwrap_or_else(PoisonError::into_inner);
+            held.changing = held.changing.saturating_sub(1);
+        }
     }
 }
 
@@ -3679,9 +3766,23 @@ mod tests {
     /// before it is published, is refused: the check waits for the publication rather than
     /// passing between the two. A send checked after it at the new generation is refused while
     /// privacy mode is on, and one at the generation after is admitted once it is off, as before.
+    ///
+    /// A report read in that interval says the host is changing, and never says privacy mode is
+    /// off without saying so: the control is the report before the change, and it says on at the
+    /// next generation, not changing, once the change is published.
     #[test]
     fn a_send_checked_between_the_record_and_its_publication_is_refused() {
         let host = Host::open();
+        let reported = |enabled, generation, changing| HostPrivacyState {
+            enabled,
+            generation: U64::new(generation),
+            changing,
+        };
+        assert_eq!(
+            host.privacy.state().observed(),
+            reported(false, 0, false),
+            "the control"
+        );
         let (arrived, release) = host.privacy.after_record.arm();
         std::thread::scope(|scope| {
             // Owned here, so a failed assertion lets the stopped enabling go on rather than wait.
@@ -3691,6 +3792,11 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("the record is written");
             let state = host.privacy.state();
+            assert_eq!(
+                state.observed(),
+                reported(false, 0, true),
+                "the record says on and the report says the host is changing"
+            );
             let (checked_tx, checked_rx) = std::sync::mpsc::channel();
             scope.spawn(move || {
                 // The admission is dropped at once, so nothing here holds the publication back.
@@ -3715,6 +3821,7 @@ mod tests {
         });
 
         let state = host.privacy.state();
+        assert_eq!(state.observed(), reported(true, 1, false));
         assert!(
             state.admit_send(PrivacyGeneration::new(1)).is_none(),
             "refused while privacy mode is on"
@@ -3722,10 +3829,48 @@ mod tests {
         host.privacy
             .disable(at(20), &standing)
             .expect("privacy mode is turned off");
+        assert_eq!(state.observed(), reported(false, 2, false));
         assert!(
             state.admit_send(PrivacyGeneration::new(2)).is_some(),
             "admitted at the generation after"
         );
+    }
+
+    /// A change that stops because its thread is unwinding may have recorded the new state, so a
+    /// report keeps saying the host is changing, through a later change that publishes, until the
+    /// daemon starts again. A change that is dropped as given up lowers what it raised, and the
+    /// state is as it was.
+    #[test]
+    fn a_change_that_stopped_part_way_leaves_the_report_saying_the_host_is_changing() {
+        let state = PrivacyState::default();
+        assert!(!state.observed().changing);
+
+        drop(state.change());
+        assert!(
+            !state.observed().changing,
+            "the control: a change given up leaves nothing raised"
+        );
+
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _change = state.change();
+            panic!("the change stops part way");
+        }));
+        assert!(stopped.is_err());
+        assert!(
+            state.observed().changing,
+            "the report says the host is changing"
+        );
+
+        state.set(Published {
+            generation: PrivacyGeneration::new(7),
+            private: true,
+        });
+        let after = state.observed();
+        assert!(
+            after.changing,
+            "a later change that publishes does not take it back"
+        );
+        assert_eq!((after.enabled, after.generation.get()), (true, 7));
     }
 
     /// The record and the backup fence are one step for backup production. An enabling stopped

@@ -129,6 +129,8 @@ impl Controller {
         let live = registry.occupancy()?;
         let limit = registry.session_limit()?;
         drop(registry);
+        let default_worker_profile = self.default_profile().await;
+        let power = self.power_state().await;
         Ok(HostInfoResult {
             build_id: self.build_id.clone(),
             protocol_version: PROTOCOL_VERSION,
@@ -138,10 +140,13 @@ impl Controller {
             started_at_ms: self.started_at_ms,
             live_sessions: U64::new(live),
             session_limit: U64::new(limit),
-            default_worker_profile: self.default_profile().await,
-            power: self.power_state().await,
+            default_worker_profile,
+            power,
             machine: self.machine_report(),
-            privacy: None,
+            // Read last, after every wait above, so the answer is as new as this function can make
+            // it. A copy that never waits: the lock itself is held across a delivery exchange
+            // while a change of privacy mode queues.
+            privacy: Some(self.privacy.state().observed()),
         })
     }
 

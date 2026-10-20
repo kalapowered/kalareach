@@ -415,10 +415,23 @@ async fn a_privacy_change_whose_admission_lapses_while_it_waits(lapse: Lapse) {
         .execute_batch("BEGIN IMMEDIATE;")
         .expect("the record's write lock is held");
     release.send(()).expect("the change goes on");
-    tokio::time::sleep(SETTLING).await;
+    // The change holds the state's write side while it waits for the record's transaction, which
+    // is the condition that it has asked for the change and has not ended it.
+    let state = controller.privacy.state();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while state.try_reading().is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the change takes the state's write side");
     assert!(
         !changing.is_finished(),
         "the change waits for the record's transaction"
+    );
+    assert!(
+        state.observed().changing,
+        "{lapse:?}: a report says the host is changing while the change waits"
     );
     lapse.happens(&controller, &clock, connection_id);
     holder
@@ -433,6 +446,17 @@ async fn a_privacy_change_whose_admission_lapses_while_it_waits(lapse: Lapse) {
     let report = controller.privacy.status(kr_ipc::now_ms());
     assert!(!report.enabled, "{lapse:?}: privacy mode is still off");
     assert!(!controller.privacy.state().is_private());
+    // A change that was given up leaves the report as it was.
+    let observed = state.observed();
+    assert_eq!(
+        (
+            observed.enabled,
+            observed.generation.get(),
+            observed.changing
+        ),
+        (false, 0, false),
+        "{lapse:?}: a change given up leaves nothing raised"
+    );
     assert_eq!(
         controller.backup().fenced_at().expect("a read"),
         None,
