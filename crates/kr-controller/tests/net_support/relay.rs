@@ -1,30 +1,72 @@
 //! A relay server running in this process, for a suite that has to see which relay carries a pair.
 
 use std::net::Ipv4Addr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use iroh_relay::server::{
     CertConfig, QuicConfig, RelayConfig as RelayServerConfig, Server, ServerConfig, TlsConfig,
 };
 
+/// What one run of the relay server lets in, and what it has let in so far.
+#[derive(Debug, Default)]
+struct Admissions {
+    /// A test has the relay turn sessions away.
+    asked: bool,
+    /// The relay is being stopped, and lets no session in.
+    stopping: bool,
+    /// The sessions the relay let in, and the ones of those that have ended.
+    admitted: u64,
+    ended: u64,
+}
+
 /// Whether the relay turns away the endpoints that open a session with it, while it goes on
-/// answering the requests an endpoint measures it with.
+/// answering the requests an endpoint measures it with: because a test asked it to, or because it
+/// is being stopped. It also counts the sessions it lets in and the ones that end, from the moment
+/// of admission to the end of the session, which includes a session that ended before it was
+/// registered or whose task was ended with the server's.
+///
+/// Each run of the relay server has a refusal of its own, so what a stopped server's handlers
+/// decide is never changed by a server started after it.
 #[derive(Clone, Debug, Default)]
-struct Refusal(Arc<AtomicBool>);
+struct Refusal(Arc<Mutex<Admissions>>);
+
+impl Refusal {
+    fn state(&self) -> MutexGuard<'_, Admissions> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The refusal of a server started after this one: it turns sessions away as this one does
+    /// now, and has let none in.
+    fn for_a_server_started_again(&self) -> Self {
+        Self(Arc::new(Mutex::new(Admissions {
+            asked: self.state().asked,
+            ..Admissions::default()
+        })))
+    }
+}
 
 impl iroh_relay::server::AccessControl for Refusal {
     async fn on_connect(
         &self,
         _request: &iroh_relay::server::ClientRequest,
     ) -> iroh_relay::server::Access {
-        if self.0.load(Ordering::SeqCst) {
+        let mut state = self.state();
+        if state.asked || state.stopping {
             iroh_relay::server::Access::Deny {
                 reason: Some("this relay is not taking sessions".to_owned()),
             }
         } else {
+            state.admitted += 1;
             iroh_relay::server::Access::Allow
         }
+    }
+
+    fn on_disconnect(
+        &self,
+        _endpoint_id: iroh::EndpointId,
+        _connection_id: iroh_relay::server::ConnectionId,
+    ) {
+        self.state().ended += 1;
     }
 }
 
@@ -94,19 +136,51 @@ impl LocalRelay {
     /// Has the relay turn away every endpoint that opens a session with it, or take them again. It
     /// answers an endpoint's measurements of it either way.
     pub fn refuse_sessions(&self, refused: bool) {
-        self.refusal.0.store(refused, Ordering::SeqCst);
+        self.refusal.state().asked = refused;
     }
 
-    /// Stops the relay: nothing answers at its address until [`Self::start_again`].
+    /// Stops the relay: nothing answers at its address, and no endpoint is connected to it, until
+    /// [`Self::start_again`].
+    ///
+    /// The server's own shutdown ends the sessions it holds, and an endpoint whose session ended
+    /// opens another at once. A session that is past the relay's admission when the server is told
+    /// to stop is registered afterwards, and a task of its own serves it that nothing ends, so the
+    /// endpoint stays connected to a relay that has stopped. So no session is let in from the moment
+    /// the stop begins, the ones the relay holds are ended before the server is told to stop, and
+    /// the sweep goes on until every session the relay let in has ended. The relay counts those from
+    /// its admission, which the server's own counts do not.
     pub async fn stop(&mut self) {
-        if let Some(server) = self.server.take() {
+        let Some(server) = self.server.take() else {
+            return;
+        };
+        self.refusal.state().stopping = true;
+        let service = server
+            .relay_service()
+            .cloned()
+            .expect("the relay serves relayed sessions");
+        let refusal = self.refusal.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            service.clients().shutdown().await;
             server.shutdown().await.expect("the relay stops");
-        }
+            loop {
+                {
+                    let state = refusal.state();
+                    if state.admitted == state.ended {
+                        return;
+                    }
+                }
+                service.clients().shutdown().await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every session the relay let in has ended");
     }
 
     /// Starts the relay again at the address it had, with the certificate it had.
     pub async fn start_again(&mut self) {
         assert!(self.server.is_none(), "the relay is running");
+        self.refusal = self.refusal.for_a_server_started_again();
         let (server, port) = Self::serve(&self.tls, self.port, &self.refusal).await;
         assert_eq!(port, self.port, "the relay came back at its address");
         self.server = Some(server);

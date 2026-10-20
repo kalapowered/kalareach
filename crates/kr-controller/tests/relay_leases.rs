@@ -93,6 +93,20 @@ impl SignIn {
     }
 }
 
+/// How long the service asks the keeper to leave it alone in the cases that ask for the keeper to be
+/// left alone, as the time its timer counts.
+const LEFT_ALONE_FOR: Duration = Duration::from_secs(300);
+
+/// How far the timer moves to take a relay past the bound it is given to carry the endpoint: the
+/// bound and a second.
+const PAST_THE_BOUND: Duration =
+    Duration::from_secs(kr_controller::relay_leases::endpoint::REACH_BOUND.as_secs() + 1);
+
+/// How far the timer moves to take a relay that failed to carry the endpoint past the first delay
+/// it is left out of the endpoint's map for: the delay and a second.
+const PAST_THE_DELAY: Duration =
+    Duration::from_secs(kr_controller::relay_leases::endpoint::REACH_RETRY.as_secs() + 1);
+
 /// The service cannot be reached.
 const SERVICE_DOWN: Moment = Moment::Refuse {
     status: 503,
@@ -953,29 +967,106 @@ impl Rig {
             .expect("the host is on the network")
     }
 
-    /// As [`Self::until_homed_on`], while the keeper is not making a pass because the service asked
-    /// it to leave the service alone: time passes for it and its waits end, and nothing wakes it.
-    async fn quietly_until_homed_on(&self, relay: &iroh::RelayUrl) {
+    /// Waits until the endpoint is no longer connected to `relay` as a home relay.
+    ///
+    /// It is the endpoint's own connection that is waited for, and for as long as it takes: how
+    /// soon an endpoint notices that a relay has stopped is up to the machine it runs on. A test
+    /// that went wrong is stopped rather than left to hang.
+    async fn until_the_endpoint_has_left(&self, relay: &iroh::RelayUrl) {
         use iroh::Watcher;
         let mut status = self.endpoint().home_relay_status();
-        // The delay a test puts the service in is five minutes of the timer's time: the look at
-        // the relays has to get the endpoint there before it is over.
-        let homed = tokio::time::timeout(Duration::from_secs(180), async {
-            for _ in 0..50 {
-                if self.homes().contains(relay) {
+        let left = tokio::time::timeout(Duration::from_secs(180), async {
+            while self.homes().contains(relay) {
+                if status.updated().await.is_err() {
                     return;
                 }
-                self.timer.advance(Duration::from_secs(5));
-                self.timer.release_held();
-                let _ = tokio::time::timeout(Duration::from_secs(2), status.updated()).await;
             }
         })
         .await;
         assert!(
-            homed.is_ok() && self.homes().contains(relay),
-            "the endpoint never had {relay} as its home relay in time; it was at {:?}",
+            left.is_ok() && !self.homes().contains(relay),
+            "the endpoint was still connected to {relay} as its home relay; it was at {:?}",
             self.homes()
         );
+    }
+
+    /// Waits until the endpoint is connected to `relay` as its home relay.
+    async fn until_the_endpoint_is_at(&self, relay: &iroh::RelayUrl) {
+        use iroh::Watcher;
+        let mut status = self.endpoint().home_relay_status();
+        let arrived = tokio::time::timeout(Duration::from_secs(180), async {
+            while !self.homes().contains(relay) {
+                if status.updated().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            arrived.is_ok() && self.homes().contains(relay),
+            "the endpoint never had {relay} as its home relay; it was at {:?}",
+            self.homes()
+        );
+    }
+
+    /// Has the keeper take one look at the endpoint's relays while the service has asked it to
+    /// leave the service alone: the wait it is in ends, and nothing else wakes it. It returns once
+    /// the look is done.
+    async fn look_while_left_alone(&self) {
+        let mut looks = self.keeper().passes();
+        let before = *looks.borrow_and_update();
+        self.timer.release_held();
+        tokio::time::timeout(
+            Duration::from_secs(180),
+            looks.wait_for(|looked| *looked > before),
+        )
+        .await
+        .expect("the keeper takes the look")
+        .expect("the keeper is still there");
+    }
+
+    /// As [`Self::until_homed_on`] for the relay the host was held to having gone and the
+    /// configured `relay` taking its place, while the keeper is not making a pass because the
+    /// service asked it to leave the service alone.
+    ///
+    /// The look at the relays has to bring the endpoint back to `relay` while the service is still
+    /// being left alone, and that is counted in the timer's time. The timer moves only by the
+    /// bound the leased relay is given to carry the endpoint, once the keeper has seen the relay
+    /// not carry it, so what a loaded machine stretches, how long the endpoint and the keeper take,
+    /// costs real time and none of the delay. The endpoint's part is waited for where it happens.
+    async fn quietly_until_homed_on(&self, relay: &iroh::RelayUrl, gone: &iroh::RelayUrl) {
+        self.until_the_endpoint_has_left(gone).await;
+        // The keeper sees that the relay does not carry the endpoint, which is when the bound
+        // starts, and the bound passes by the next time it looks. A look that was under way when
+        // the endpoint left may not have seen it go and is counted all the same; the look after it
+        // begins after it ended, so it is the one that sees the relay not carry the endpoint, and
+        // the timer stays where it is until it has.
+        self.look_while_left_alone().await;
+        self.look_while_left_alone().await;
+        self.timer.advance(PAST_THE_BOUND);
+        let back = tokio::time::timeout(Duration::from_secs(180), async {
+            while self.invitation_relays() != vec![relay.clone()] {
+                self.look_while_left_alone().await;
+            }
+        })
+        .await;
+        assert!(
+            back.is_ok(),
+            "the keeper still named {:?} when the bound had passed and the service was still being \
+             left alone",
+            self.invitation_relays()
+        );
+        self.until_the_endpoint_is_at(relay).await;
+    }
+
+    /// As [`Self::until_held_to`], and then waits for the endpoint to connect to `relay` where it
+    /// happens and has the keeper look once more: the leased relay is the only relay the endpoint
+    /// has once it is held to it, so it connects without the keeper, and a timer that ran on while
+    /// it did would count the time against the bound the relay is given to carry the endpoint.
+    async fn until_held_and_at(&self, relay: &iroh::RelayUrl) {
+        self.until_held_to(relay).await;
+        self.until_the_endpoint_is_at(relay).await;
+        self.pass().await;
     }
 
     /// Lets the keeper look at the relays, with time passing for it, until the endpoint is held
@@ -1018,22 +1109,29 @@ impl Rig {
         assert!(settled.is_ok(), "the doctor never went back to Ok");
     }
 
-    /// Lets the keeper look at the relays, with time passing for it, until the doctor says the
-    /// leased relay is not answering.
-    async fn until_the_doctor_warns_of_the_relay(&self) {
-        use iroh::Watcher;
-        let mut report = self.endpoint().net_report();
+    /// Takes the leased relay past the bound it is given to carry the endpoint, and lets the keeper
+    /// look at the relays until the doctor says the leased relay is not answering. `gone` is the
+    /// relay the endpoint was at when it stopped, when it was at one.
+    ///
+    /// The keeper looks once when the endpoint is not at the relay, which is when the bound
+    /// starts, and the timer moves past the bound. The doctor is asked after each look from then
+    /// on, so how many looks that takes, and how long each takes on a loaded machine, is not what
+    /// the case counts.
+    async fn until_the_doctor_warns_of_the_relay(&self, gone: Option<&iroh::RelayUrl>) {
+        if let Some(gone) = gone {
+            self.until_the_endpoint_has_left(gone).await;
+        }
+        self.pass().await;
+        self.timer.advance(PAST_THE_BOUND);
         let warned = tokio::time::timeout(Duration::from_secs(180), async {
             loop {
+                self.pass().await;
                 let shown = self.check().await;
                 if shown.status == DoctorStatus::Warning
                     && shown.detail().contains("network.relay_urls")
                 {
                     return;
                 }
-                self.timer.advance(Duration::from_secs(5));
-                self.pass().await;
-                let _ = tokio::time::timeout(Duration::from_secs(2), report.updated()).await;
             }
         })
         .await;
@@ -1248,13 +1346,17 @@ async fn a_host_whose_leased_relay_stops_uses_its_configured_relays_and_goes_bac
     let owner = rig.owner_device();
     rig.until("the owner's device holds a lease", || rig.holds(&owner))
         .await;
-    rig.until_held_to(&relays.leased.url).await;
-    rig.until_homed_on(&relays.leased.url).await;
+    rig.until_held_and_at(&relays.leased.url).await;
     assert_eq!(rig.check().await.status, DoctorStatus::Ok);
 
     relays.leased.stop().await;
-    rig.until_the_doctor_warns_of_the_relay().await;
-    rig.until_homed_on(&relays.configured.url).await;
+    rig.until_the_doctor_warns_of_the_relay(Some(&relays.leased.url))
+        .await;
+    // The keeper has put the configured relays back. The endpoint connects to one on its own, and
+    // the timer stays where it is meanwhile: the leased relay is left out of the endpoint's map for
+    // a delay that the timer counts, and a timer that ran on while the endpoint connected would end
+    // that delay and have the keeper try the leased relay again before the case looked.
+    rig.until_the_endpoint_is_at(&relays.configured.url).await;
     assert!(rig.holds(&owner), "the lease stays held");
     assert_eq!(
         rig.invitation_relays(),
@@ -1262,9 +1364,11 @@ async fn a_host_whose_leased_relay_stops_uses_its_configured_relays_and_goes_bac
         "a device is invited to the relay the host is at"
     );
 
+    // The relay is back, and the keeper tries it again when the delay it was left out of the map
+    // for has passed, which the timer takes it past at once.
     relays.leased.start_again().await;
-    rig.until_held_to(&relays.leased.url).await;
-    rig.until_homed_on(&relays.leased.url).await;
+    rig.timer.advance(PAST_THE_DELAY);
+    rig.until_held_and_at(&relays.leased.url).await;
     rig.until_the_doctor_is_ok().await;
 }
 
@@ -1282,7 +1386,7 @@ async fn a_leased_relay_that_never_answered_does_not_cost_the_host_its_configure
         .await;
 
     rig.until_homed_on(&relays.configured.url).await;
-    rig.until_the_doctor_warns_of_the_relay().await;
+    rig.until_the_doctor_warns_of_the_relay(None).await;
     assert!(
         rig.homes().contains(&relays.configured.url),
         "the host stays at the relay it was configured with: {:?}",
@@ -1290,9 +1394,11 @@ async fn a_leased_relay_that_never_answered_does_not_cost_the_host_its_configure
     );
     assert!(rig.holds(&owner), "the lease stays held");
 
+    // The relay is up: the keeper has the endpoint measure its relays again once the bound has
+    // passed since it last did, which the timer takes it past at once.
     relays.leased.start_again().await;
-    rig.until_held_to(&relays.leased.url).await;
-    rig.until_homed_on(&relays.leased.url).await;
+    rig.timer.advance(PAST_THE_BOUND);
+    rig.until_held_and_at(&relays.leased.url).await;
     rig.until_the_doctor_is_ok().await;
 }
 
@@ -1306,8 +1412,7 @@ async fn a_service_that_asks_to_be_left_alone_does_not_keep_the_host_from_its_co
     let owner = rig.owner_device();
     rig.until("the owner's device holds a lease", || rig.holds(&owner))
         .await;
-    rig.until_held_to(&relays.leased.url).await;
-    rig.until_homed_on(&relays.leased.url).await;
+    rig.until_held_and_at(&relays.leased.url).await;
 
     // The next refill is turned back with a delay of five minutes.
     rig.served.web().fail(
@@ -1316,7 +1421,7 @@ async fn a_service_that_asks_to_be_left_alone_does_not_keep_the_host_from_its_co
         Moment::Refuse {
             status: 503,
             code: "SERVICE_UNAVAILABLE",
-            retry_after_seconds: Some(300),
+            retry_after_seconds: Some(LEFT_ALONE_FOR.as_secs()),
         },
     );
     rig.time_passes(
@@ -1334,7 +1439,8 @@ async fn a_service_that_asks_to_be_left_alone_does_not_keep_the_host_from_its_co
     // Within the delay, which is five minutes of the timer's time, the relay stops and the
     // configured relays come back, and the service is not asked anything meanwhile.
     relays.leased.stop().await;
-    rig.quietly_until_homed_on(&relays.configured.url).await;
+    rig.quietly_until_homed_on(&relays.configured.url, &relays.leased.url)
+        .await;
     assert_eq!(
         rig.requests(ISSUE),
         asked,
