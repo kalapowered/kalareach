@@ -7,9 +7,10 @@
 # the call's commands from an open to an end (companion-tauri's `probe`), and writes one line per
 # check beside the request. This script builds that application, starts one device, puts the
 # request where the application reads it, starts the application, and reads the lines back. It
-# claims what the lines say and nothing more: a check the application did not report is a check
-# that did not run, and any line that is not `ok=1`, or a result that never says `done=1`, fails
-# the run.
+# claims what the lines say and nothing more: each check it requires must be named in the result
+# with verdict 1 (a check the application did not report is a check that did not run), no line may
+# have another verdict, and a result that never says `done=1` fails the run. A device that is
+# already running is someone else's: the script neither uses nor stops it.
 #
 # The answer the application gives its own offer is built from the offer's sections and leads
 # nowhere, so the connection is described and applied and never carries media. What this proves is
@@ -59,24 +60,52 @@ app_id=to.kala.reach
 result_name="result-$run.txt"
 log="$artefacts/run.log"
 : >"${log:?}"
+# The emulator this script started, by its pid and its serial, and the adb that reaches it.
+emulator_pid=""
+emulator_serial=""
+emulator_adb=""
 
 say() { printf '== [voice-call-bridge] %s\n' "$*" | tee -a "$log"; }
 
+# shellcheck source=scripts/lib/voice-call-judge.sh
+. "$here/scripts/lib/voice-call-judge.sh"
+
+# Ends what this script started. The emulator is asked to stop through its serial, which the script
+# took only after it found the serial free, and is ended by its pid when it does not stop.
+finish() {
+    if [ -n "$emulator_pid" ] && kill -0 "$emulator_pid" 2>/dev/null; then
+        "$emulator_adb" -s "$emulator_serial" emu kill >/dev/null 2>&1
+        local stopped=0
+        while kill -0 "$emulator_pid" 2>/dev/null && [ "$stopped" -lt 30 ]; do
+            sleep 1
+            stopped=$((stopped + 1))
+        done
+        kill -0 "$emulator_pid" 2>/dev/null && kill "$emulator_pid" 2>/dev/null
+    fi
+}
+trap finish EXIT
+
+# The checks the bridge must have made and passed, by the names the application gives them. A
+# result with fewer is a run that stopped short, whatever it says at its end.
+required_checks=(
+    "open"
+    "a second open is refused"
+    "held before permit"
+    "offer"
+    "answer applied"
+    "the end is told"
+    "nothing held after stop"
+    "a command to an ended call is refused"
+    "an answer that is not one is refused"
+    "a call that could not use its answer ends"
+    "permit"
+    "news after permit has no gap"
+    "a muted microphone is held and never reported as capturing"
+)
+
 # Reads the lines the application wrote, and decides the run.
 judge() { # <result file>
-    local file=$1 bad=0
-    [ -s "$file" ] || { say "the application wrote no result"; return 2; }
-    grep -q "^run=$run\$" "$file" || { say "the result names another run"; return 2; }
-    while IFS= read -r line; do
-        say "$line"
-        case "$line" in
-            check=*" ok=1 "*) ;;
-            check=*) bad=1 ;;
-        esac
-    done <"$file"
-    grep -q '^done=1$' "$file" || { say "the result never says done"; return 2; }
-    [ "$bad" = 0 ] || { say "a check did not pass"; return 2; }
-    say "every check passed"
+    judge_voice_call_result "$1" "$run" "${required_checks[@]}"
 }
 
 run_ios() {
@@ -93,6 +122,11 @@ run_ios() {
     local app="$companion/src-tauri/gen/apple/build/arm64-sim/KalaReach.app"
     [ -d "$app" ] || { say "the build left no application"; return 2; }
 
+    # A simulator that is already running is someone else's: it is neither used nor shut down.
+    if xcrun simctl list devices booted | grep -q "$udid"; then
+        say "the simulator $device is already running, which is left alone"
+        return 3
+    fi
     say "starting the simulator $device"
     xcrun simctl boot "$udid" >/dev/null 2>&1
     xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1
@@ -172,17 +206,25 @@ run_android() {
     local apk="$companion/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk"
     [ -f "$apk" ] || { say "the build left no package"; return 2; }
 
+    # A device already on the serial is someone else's: it is neither used nor stopped.
+    if "$adb" devices 2>/dev/null | awk '{print $1}' | grep -qx "$serial"; then
+        say "a device is already on $serial, which is left alone"
+        return 3
+    fi
     say "starting the emulator $avd"
     "$sdk/emulator/emulator" -avd "$avd" -port "$port" -no-snapshot-save -no-boot-anim -no-window -no-audio \
         -no-metrics -gpu swiftshader_indirect -netdelay none -netspeed full >"$artefacts/emulator.log" 2>&1 &
-    local emulator=$!
+    emulator_pid=$!
+    emulator_serial=$serial
+    emulator_adb=$adb
     local booted=0
     for _ in $(seq 1 180); do
+        kill -0 "$emulator_pid" 2>/dev/null || break
         if [ "$("$adb" -s "$serial" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; then booted=1; break; fi
-        kill -0 "$emulator" 2>/dev/null || break
         sleep 2
     done
-    [ "$booted" = 1 ] || { say "the emulator did not come up"; kill "$emulator" 2>/dev/null; return 3; }
+    # The emulator this script started is the one that answered: its process is still there.
+    { [ "$booted" = 1 ] && kill -0 "$emulator_pid" 2>/dev/null; } || { say "the emulator did not come up"; return 3; }
 
     "$adb" -s "$serial" uninstall "$app_id" >/dev/null 2>&1
     "$adb" -s "$serial" install -r "$apk" >/dev/null || { say "the package did not install"; return 2; }
@@ -225,8 +267,6 @@ run_android() {
     else
         "$adb" -s "$serial" logcat -d 2>/dev/null | tail -200 >"$artefacts/logcat.log"
     fi
-    "$adb" -s "$serial" emu kill >/dev/null 2>&1
-    wait "$emulator" 2>/dev/null
     judge "$artefacts/$result_name"
 }
 

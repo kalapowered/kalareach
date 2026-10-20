@@ -57,6 +57,9 @@ emulator_adb=""
 
 say() { printf '== [voice-call-device] %s\n' "$*" | tee -a "$log"; }
 
+# shellcheck source=scripts/lib/voice-call-judge.sh
+. "$here/scripts/lib/voice-call-judge.sh"
+
 # Ends what this script started and removes what it made. The harness is asked to finish; its
 # process is ended only when it does not, and only by the pid this script recorded. The emulator is
 # asked to stop through its serial, which the script took only after it found the serial free, and
@@ -179,25 +182,7 @@ required_checks=(
 
 # Reads the lines the application wrote, and decides the run.
 judge() { # <result file>
-    local file=$1 bad=0 name
-    [ -s "$file" ] || { say "the application wrote no result"; return 2; }
-    grep -q "^run=$run\$" "$file" || { say "the result names another run"; return 2; }
-    while IFS= read -r line; do
-        say "$line"
-        # A check's name holds no "=", so its verdict is the one before its detail, whatever the
-        # detail says.
-        case "$line" in
-            check=*)
-                [ "$(printf '%s' "$line" | sed -n 's/^check=[^=]* ok=\([01]\) detail=.*/\1/p')" = 1 ] || bad=1
-                ;;
-        esac
-    done <"$file"
-    grep -q '^done=1$' "$file" || { say "the result never says done"; return 2; }
-    [ "$bad" = 0 ] || { say "a check did not pass"; return 2; }
-    for name in "${required_checks[@]}"; do
-        grep -q "^check=$name ok=1 detail=" "$file" || { say "the check '$name' was not made"; return 2; }
-    done
-    say "every check of the application passed"
+    judge_voice_call_result "$1" "$run" "${required_checks[@]}"
 }
 
 # Reads what the stand-in and the host saw, and decides whether it is what a call that ran and
