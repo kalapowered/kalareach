@@ -223,6 +223,50 @@ describe('starting a call', () => {
     expect(heading).toHaveFocus()
   })
 
+  // An earlier call still waiting on the voice service keeps the screen reading every half second,
+  // so a read can show the new call before the answer to the start has been taken up. The call
+  // screen then appears before it is known to follow the person's own start, and its heading takes
+  // focus when it is.
+  it('puts focus on the heading when a read shows the call before the start has been taken up', async () => {
+    const user = userEvent.setup()
+    const { port } = start((controls) => {
+      controls.finaliseVoice(true)
+    })
+    await waitForChoice()
+    const readState = port.voiceCallState.bind(port)
+    const startCall = port.voiceStart.bind(port)
+    let startAnswered = false
+    let releaseTheStartsRead: () => void = () => undefined
+    const theStartsRead = new Promise<void>((release) => {
+      releaseTheStartsRead = release
+    })
+    let startsReadTaken = false
+    Object.assign(port, {
+      voiceStart: async (...args: Parameters<HostPort['voiceStart']>) => {
+        const answer = await startCall(...args)
+        startAnswered = true
+        return answer
+      },
+      // The first read after the host's answer is the start's own: it comes back last.
+      voiceCallState: () => {
+        const state = readState()
+        if (!startAnswered || startsReadTaken) return state
+        startsReadTaken = true
+        return theStartsRead.then(() => state)
+      }
+    })
+
+    await user.click(screen.getByRole('button', { name: 'Start voice session' }))
+
+    const heading = await screen.findByRole('heading', { name: 'Voice session' }, { timeout: 4000 })
+    expect(startsReadTaken).toBe(true)
+    releaseTheStartsRead()
+
+    await waitFor(() => {
+      expect(heading).toHaveFocus()
+    })
+  })
+
   // A call this screen found, because it was loaded again while one ran, is not one it started: the
   // person has not pressed anything here, and focus is not taken from wherever they are.
   it('leaves focus alone for a call it found running', async () => {

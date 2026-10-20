@@ -132,27 +132,32 @@ export interface VoiceSurfaceProps {
 }
 
 /**
- * Focuses `heading` once, when the screen it heads appears, if nothing holds focus.
+ * Focuses `heading` once, the first time `enabled` is true, if nothing holds focus.
  *
  * The control that was pressed to bring this screen went with the screen before it, and focus left
  * on nothing sends a keyboard or screen-reader user back to the top of the document. Nothing holds
  * focus when it is on the page itself or on a region that holds this screen (an engine that does
  * not focus a button when it is pressed leaves it there). A person who has moved focus to some
  * other control keeps it there.
+ *
+ * The screen can appear before it is known to follow the person's own start: a read of the device
+ * that shows the call comes back before the answer to the start has been taken up. So the hook acts
+ * when `enabled` becomes true, not only when the screen mounts, and it acts once.
  */
 function useHeadingFocusWhenNothingHolds(
   heading: React.RefObject<HTMLHeadingElement | null>,
   enabled: boolean
 ): void {
-  const take = useRef(enabled)
+  const taken = useRef(false)
   useEffect(() => {
-    if (!take.current) return
+    if (!enabled || taken.current) return
+    taken.current = true
     const held = document.activeElement
     const target = heading.current
     if (target !== null && (held === null || held === document.body || held.contains(target))) {
       target.focus()
     }
-  }, [heading])
+  }, [enabled, heading])
 }
 
 /** The voice screen. */
