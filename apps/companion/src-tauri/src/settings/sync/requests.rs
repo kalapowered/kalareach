@@ -100,6 +100,10 @@ impl Requests {
     /// Records requests a read of the feed of `host` found there that the record does not name, as
     /// far as the file allows: this process holds them from memory when it cannot be written.
     pub fn found(&self, host: &str, devices: &[AuthorisationKey]) {
+        // Every view of every host comes here, and most find nothing: no lock, no flush for that.
+        if devices.is_empty() {
+            return;
+        }
         let found: Vec<Request> = devices
             .iter()
             .map(|device| (host.to_owned(), *device))
