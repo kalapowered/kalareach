@@ -41,7 +41,8 @@ use kr_worker::broker::commands::{
 use kr_worker::broker::connectors::{ConnectorSources, fixture};
 use kr_worker::persistence::JournalHealth;
 
-/// What the program writes the moment it starts, and whether it runs a hook.
+/// What the program writes the moment it starts, whether it runs a hook, and whether it stays until
+/// its test writes the file `HOLD_UNTIL` names.
 ///
 /// Each file it waits for is one its test writes, and it waits for one for at least as long as the
 /// launcher waits at a test's barrier (6000 polls, each at least 20 ms): a test that stops before
@@ -85,6 +86,7 @@ if [ -n "$HOOK" ]; then
     exec "$THEN_EXEC" -c 'printf "%s" "$HOOK_EVENT_2" | "$HOOK" claude-code hook > "$REPORT.hook2" 2>&1; echo done > "$REPORT.hooked2"; sleep 1; exit 0'
   fi
 fi
+if [ -n "$HOLD_UNTIL" ]; then await_file "$HOLD_UNTIL"; fi
 sleep "${LINGER:-0}"
 exit 0
 "#;
@@ -2643,7 +2645,15 @@ fn kr_req_12_07_a_launch_an_adoption_and_their_ends_reach_a_view_in_order() {
     let answer = shell.establish();
     let directory = Shell::directory(&answer);
     let registration = Shell::registration(&answer);
-    let child = shell.launch(&answer, "announced", &[("LINGER", "3")]);
+    // The launched program stays until the test has heard the adoption, so that its end cannot come
+    // before it however long the adoption takes.
+    let released = shell.reports.join("announced.released");
+    let released_text = released.display().to_string();
+    let child = shell.launch(
+        &answer,
+        "announced",
+        &[("HOLD_UNTIL", released_text.as_str())],
+    );
     let launched = instance_of(&shell.report("announced"));
 
     let started = shell.announcement();
@@ -2686,6 +2696,7 @@ fn kr_req_12_07_a_launch_an_adoption_and_their_ends_reach_a_view_in_order() {
     );
     assert!(adopted.sequence.get() > started.sequence.get());
 
+    std::fs::write(&released, "").expect("the launched program may end");
     let (status, said) = finish(child);
     assert!(status.success(), "{said}");
     let ended = shell.announcement();
