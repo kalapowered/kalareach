@@ -227,8 +227,8 @@ no confirmed outcome, and ends by saying that nothing was sent again.
   software keyboard, whichever reaches higher. The message is displayed for 4.2 seconds, or 8
   seconds if it offers something to do, or 0.3 seconds for each word where that is longer, but at
   most 20 seconds. A pointer on it or focus in it holds it. A screen reader is told its words once,
-  in the region of the sheet or the screen the message first appears in, and again only when they
-  change.
+  in the region of the sheet or the screen the message first appears in, and again when they change
+  or the message says them anew.
 
 ## Push, keys and audio, with no interface running
 

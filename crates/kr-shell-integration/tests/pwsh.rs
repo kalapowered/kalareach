@@ -930,7 +930,7 @@ const POWERSHELL_LAUNCH_LINES: &str =
 /// reads as its stop-parsing token is written in the form that passes it on. A person who is shown
 /// the table's line for a stock session types what a managed launch would have run. The module
 /// refuses a first word that no application has, so the case makes each first word a program: a
-/// name on the search path, or a path under the directory the host starts in.
+/// name on the search path, or a path under the directory the host moves to.
 #[test]
 #[ignore = "drives this tree's built PSReadLine package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn a_launch_installs_the_line_the_table_lists_for_its_vector() {

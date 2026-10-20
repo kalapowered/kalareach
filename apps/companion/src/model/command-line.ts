@@ -9,9 +9,12 @@
  * themselves, and as one quoted string otherwise. PowerShell reads more as syntax (a leading `@`,
  * `-` or `$`, a comma, a bare number), so every word of its line is one quoted string. That line
  * is the one the shell integration installs when it launches the same vector, so a person who types
- * it runs what a launch would have run. The page cannot see which alias, function or cmdlet that
- * shell finds before the program, so the program is shown as it was named, where a launch writes
- * the program's full path if something else would stand in for it.
+ * it runs what a launch would have run, with two limits that the page cannot see past. It does not
+ * see which alias, function or cmdlet that shell finds before the program, so it shows the program
+ * as named, where a launch writes the program's full path if something else would stand in for it.
+ * And it does not see that the program is a batch file, which Windows runs through cmd.exe: a launch
+ * builds no line for such a program when a word holds a character cmd.exe reads again, and the line
+ * shown here is the one for the words as given.
  */
 
 import type { ShellKind } from './pending'
