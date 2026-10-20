@@ -1902,6 +1902,16 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         },
     },
     IgnoredRun {
+        package: "kr-controller",
+        target: "--test distribution_endpoints",
+        cases: &["a_viewer_reaches_only_the_distribution_it_was_paired_with"],
+        runs: Runs::Supplied {
+            file: "scripts/distribution-cases.sh",
+            line: "as_installation \"$installation\" env KR_ACC_OTHER=\"$other\" cargo test -p kr-controller --test distribution_endpoints -- --ignored --exact --nocapture --test-threads 1 \"$name\" >\"$installation/case.log\" 2>&1",
+            names_with: &["run_case"],
+        },
+    },
+    IgnoredRun {
         package: "kr-perf",
         target: "--test stress",
         cases: &[],
