@@ -72,7 +72,7 @@ use kr_transport::listener::BoxFuture;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use super::rendezvous::{OWNER_RELEASE, Rendezvous};
+use super::rendezvous::{NotAttached, OWNER_RELEASE, Rendezvous};
 
 /// Where a host reserves a locator for an invitation.
 pub const RESERVE_PATH: &str = "/api/pair/locator/reserve";
@@ -257,7 +257,7 @@ impl Rendezvous for HttpsRendezvous {
         origin: &RendezvousOrigin,
         locator: &Locator,
         control_token: &SymmetricKey,
-    ) -> BoxFuture<'static, kr_pairing::Result<RoomSocket>> {
+    ) -> BoxFuture<'static, Result<RoomSocket, NotAttached>> {
         let room = self.room.clone();
         let origin = origin.clone();
         let locator = locator.clone();
@@ -265,7 +265,7 @@ impl Rendezvous for HttpsRendezvous {
         Box::pin(async move {
             room.open(&origin, &locator, RoomRole::Host(&token))
                 .await
-                .map_err(room_failure)
+                .map_err(not_attached)
         })
     }
 
@@ -297,6 +297,20 @@ impl Rendezvous for HttpsRendezvous {
     ) -> kr_pairing::Result<()> {
         self.runtime
             .block_on(self.release(origin, locator, control_token, within))
+    }
+}
+
+/// A room socket that did not open, with the wait the room named before another attempt.
+fn not_attached(error: RoomError) -> NotAttached {
+    let retry_after = match &error {
+        RoomError::Refused { retry_after, .. } => *retry_after,
+        RoomError::Configuration { .. }
+        | RoomError::Unreachable { .. }
+        | RoomError::NotAnUpgrade { .. } => None,
+    };
+    NotAttached {
+        error: room_failure(error),
+        retry_after,
     }
 }
 
@@ -1552,7 +1566,7 @@ mod tests {
         .await
         .expect("the attempt ends");
         assert_eq!(
-            attached.expect_err("not trusted").code(),
+            attached.expect_err("not trusted").error.code(),
             ErrorCode::RendezvousUnavailable
         );
         assert!(handshake_failed, "the handshake did not complete");
@@ -1590,7 +1604,7 @@ mod tests {
         .await
         .expect("the attempt ends");
         assert_eq!(
-            attached.expect_err("refused").code(),
+            attached.expect_err("refused").error.code(),
             ErrorCode::RendezvousUnavailable
         );
     }
@@ -1617,10 +1631,12 @@ mod tests {
             RoomError::Refused {
                 origin: origin.clone(),
                 status: 404,
+                retry_after: None,
             },
             RoomError::Refused {
                 origin: origin.clone(),
                 status: 200,
+                retry_after: None,
             },
             RoomError::NotAnUpgrade {
                 origin,

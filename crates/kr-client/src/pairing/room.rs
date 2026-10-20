@@ -126,6 +126,8 @@ pub enum RoomError {
         origin: String,
         /// The status it answered with.
         status: u16,
+        /// The wait before trying again that the answer named, when it named one.
+        retry_after: Option<Duration>,
     },
     /// The answer was not a WebSocket upgrade, or not one this client accepts.
     NotAnUpgrade {
@@ -149,7 +151,7 @@ impl Said for RoomError {
                 room_origin(origin),
                 room_reason(reason)
             ),
-            Self::Refused { origin, status } => crate::shown!(
+            Self::Refused { origin, status, .. } => crate::shown!(
                 "the room at {} answered the upgrade with status {}",
                 room_origin(origin),
                 *status
@@ -309,7 +311,14 @@ fn room_failure(origin: &RendezvousOrigin, failure: Failure) -> RoomError {
             reason: reason.to_owned(),
         },
         Failure::Unreachable(reason) => RoomError::Unreachable { origin, reason },
-        Failure::Refused(status) => RoomError::Refused { origin, status },
+        Failure::Refused {
+            status,
+            retry_after,
+        } => RoomError::Refused {
+            origin,
+            status,
+            retry_after,
+        },
         Failure::NotAnUpgrade(reason) => RoomError::NotAnUpgrade {
             origin,
             reason: reason.to_owned(),
@@ -478,6 +487,7 @@ mod tests {
             RoomError::Refused {
                 origin: origin.clone(),
                 status: 404,
+                retry_after: None,
             },
             RoomError::NotAnUpgrade {
                 origin: origin.clone(),
@@ -501,6 +511,7 @@ mod tests {
             RoomError::Refused {
                 origin: "https://rendezvous.example".to_owned(),
                 status: 404,
+                retry_after: None,
             }
             .to_string(),
             "the room at https://rendezvous.example answered the upgrade with status 404"

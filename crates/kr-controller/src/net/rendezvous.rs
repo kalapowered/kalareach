@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use kr_client::pairing::room::RoomSocket;
 use kr_crypto::secret::SymmetricKey;
+use kr_pairing::PairingError;
 use kr_pairing::platform::RendezvousHost;
 use kr_protocol::ids::{AttemptId, InvitationId};
 use kr_protocol::invitation::RendezvousMessage;
@@ -58,6 +59,15 @@ pub const OWNER_RELEASE: Duration = Duration::from_secs(10);
 /// mutation spend one life between them.
 pub type Life = Arc<dyn Fn() -> Duration + Send + Sync>;
 
+/// A room socket that did not open.
+#[derive(Debug)]
+pub struct NotAttached {
+    /// What the failure means for the host.
+    pub error: PairingError,
+    /// How long the service said to wait before attaching again, when it said.
+    pub retry_after: Option<Duration>,
+}
+
 /// A rendezvous service, as a host reaches it.
 ///
 /// The control requests are kr-pairing's [`RendezvousHost`]: a reservation and a release, which
@@ -75,7 +85,7 @@ pub trait Rendezvous: RendezvousHost + Send + Sync {
         origin: &RendezvousOrigin,
         locator: &Locator,
         control_token: &SymmetricKey,
-    ) -> BoxFuture<'static, kr_pairing::Result<RoomSocket>>;
+    ) -> BoxFuture<'static, Result<RoomSocket, NotAttached>>;
 
     /// As [`RendezvousHost::reserve_locator`], taking no longer than `within` in all.
     ///
@@ -308,6 +318,7 @@ async fn attend<H: RoomHost>(
     loop {
         watch.on_offer().await?;
         let attaching = service.attach(&ticket.origin, &ticket.locator, &ticket.control_token);
+        let pause = REATTACH_DELAY;
         if let Ok(socket) = watch.until(attaching).await? {
             relay(watch, socket).await?;
         }
@@ -318,7 +329,7 @@ async fn attend<H: RoomHost>(
         watch.on_offer().await?;
         #[cfg(test)]
         probe::mark(probe::Moment::PauseBegan);
-        watch.until(tokio::time::sleep(REATTACH_DELAY)).await?;
+        watch.until(tokio::time::sleep(pause)).await?;
     }
 }
 
@@ -788,6 +799,9 @@ mod tests {
         rooms: std::sync::Mutex<Vec<(mpsc::Sender<ServiceFrame>, mpsc::Receiver<ClientFrame>)>>,
         /// Whether the room answers an attach: while `false`, every attach waits.
         answering: watch::Sender<bool>,
+        /// The wait the service names when it refuses the first attach, which it does when this is
+        /// set.
+        refusing_first: std::sync::Mutex<Option<Duration>>,
     }
 
     impl TestService {
@@ -810,7 +824,16 @@ mod tests {
                 attached: std::sync::Mutex::new(Vec::new()),
                 rooms: std::sync::Mutex::new(Vec::new()),
                 answering: watch::Sender::new(answering),
+                refusing_first: std::sync::Mutex::new(None),
             })
+        }
+
+        /// A service whose room refuses the first attach, naming `wait`, and answers every one
+        /// after it.
+        fn refusing_the_first_attach(capacity: usize, wait: Duration) -> Arc<Self> {
+            let service = Self::build(capacity, true);
+            *service.refusing_first.lock().expect("the refusal") = Some(wait);
+            service
         }
 
         /// The room answers the attaches waiting for it, and every one after.
@@ -951,7 +974,7 @@ mod tests {
             _origin: &RendezvousOrigin,
             _locator: &Locator,
             _control_token: &SymmetricKey,
-        ) -> BoxFuture<'static, kr_pairing::Result<RoomSocket>> {
+        ) -> BoxFuture<'static, Result<RoomSocket, NotAttached>> {
             let (to_host, incoming) = mpsc::channel(self.capacity);
             let (outgoing, from_host) = mpsc::channel(self.capacity);
             // The attach is noted before the room, so a test that sees the room sees when.
@@ -963,8 +986,17 @@ mod tests {
                 .lock()
                 .expect("the rooms")
                 .push((to_host, from_host));
+            let refused = self.refusing_first.lock().expect("the refusal").take();
             let mut answering = self.answering.subscribe();
             Box::pin(async move {
+                if let Some(wait) = refused {
+                    return Err(NotAttached {
+                        error: PairingError::RendezvousUnavailable {
+                            reason: "the test service refused the attachment".to_owned(),
+                        },
+                        retry_after: Some(wait),
+                    });
+                }
                 // A service the test has dropped holds nothing back.
                 let _ = answering.wait_for(|answering| *answering).await;
                 Ok(RoomSocket { outgoing, incoming })
@@ -1181,6 +1213,36 @@ mod tests {
         host.end();
         finished(relay).await;
         assert_eq!(service.released(), 1);
+    }
+
+    /// A service that refuses an attachment and names a wait is waited for: the relay attaches
+    /// again no sooner than that, even where the pause it keeps otherwise is shorter. A wait never
+    /// ends early, so the lower bound is the claim.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_waits_as_the_service_told_it_before_it_attaches_again() {
+        const TOLD: Duration = Duration::from_secs(2);
+
+        let host = TestHost::new(Vec::new(), OnStep::Keeps);
+        let service = TestService::refusing_the_first_attach(8, TOLD);
+        let (relay, _stop) = relaying(&host, &service).await;
+        let task = relay.id();
+        tokio::time::timeout(WATCHDOG, async {
+            while service.attached().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the relay attaches again");
+        let began = *marked(task, Moment::PauseBegan)
+            .first()
+            .expect("the relay paused");
+        let paused = service.attached()[1].duration_since(began);
+        assert!(
+            paused >= TOLD && paused <= TOLD + SLACK,
+            "attached again {paused:?} after the pause began"
+        );
+        host.end();
+        finished(relay).await;
     }
 
     /// The pause before attaching again is one of the relay's watched waits: the owner ending the

@@ -1600,12 +1600,14 @@ async fn attach(
     )
     .await
     .map_err(|failure| match failure {
-        Failure::Refused(401) => Attempt::End(ControlEnd::NotAuthorised),
-        Failure::Refused(403 | 404) => Attempt::End(ControlEnd::NoSuchCall),
-        Failure::Refused(status) if status == 408 || status == 429 || status >= 500 => {
+        Failure::Refused { status: 401, .. } => Attempt::End(ControlEnd::NotAuthorised),
+        Failure::Refused {
+            status: 403 | 404, ..
+        } => Attempt::End(ControlEnd::NoSuchCall),
+        Failure::Refused { status, .. } if status == 408 || status == 429 || status >= 500 => {
             Attempt::Retry
         }
-        Failure::Refused(status) => Attempt::End(ControlEnd::Refused(status)),
+        Failure::Refused { status, .. } => Attempt::End(ControlEnd::Refused(status)),
         Failure::Configuration(_) => Attempt::End(ControlEnd::Misconfigured),
         Failure::Unreachable(_) | Failure::NotAnUpgrade(_) => Attempt::Retry,
     })?;

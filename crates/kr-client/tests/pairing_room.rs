@@ -624,6 +624,40 @@ async fn a_refused_upgrade_reports_its_status() {
     }
 }
 
+/// A refused upgrade that names a wait, in whole seconds, in `Retry-After` is reported with it, so
+/// that a host that attaches again can wait as it was told. A date, a fraction, a sign and a figure
+/// too large to count name none, and neither does an answer without the header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_upgrade_reports_the_wait_it_names() {
+    let authority = Authority::new("rendezvous test authority");
+    let connector = authority.trusted_by();
+    for (header, named) in [
+        ("Retry-After: 2\r\n", Some(Duration::from_secs(2))),
+        ("retry-after:\t 17 \r\n", Some(Duration::from_secs(17))),
+        ("Retry-After: 0\r\n", Some(Duration::ZERO)),
+        ("Retry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n", None),
+        ("Retry-After: 1.5\r\n", None),
+        ("Retry-After: -1\r\n", None),
+        ("Retry-After: 99999999999999999999999\r\n", None),
+        ("Retry-After:\r\n", None),
+        ("", None),
+    ] {
+        let room = LoopbackRoom::start(&authority).await;
+        let answer = format!(
+            "HTTP/1.1 503 Service Unavailable\r\n{header}content-type: text/html\r\n\
+             content-length: 0\r\n\r\n"
+        );
+        let refused = refusal_of(&connector, &room, vec![answer.into_bytes()]).await;
+        assert!(
+            matches!(
+                refused,
+                RoomError::Refused { status: 503, retry_after, .. } if retry_after == named
+            ),
+            "{header:?}: {refused:?}"
+        );
+    }
+}
+
 /// An answer to the upgrade whose head never ends is refused once it reaches its bound, as an
 /// answer that is not an upgrade, rather than held for as long as it keeps arriving until the
 /// open deadline ends the attempt as one that did not open in time. The error says which.

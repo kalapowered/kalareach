@@ -2160,6 +2160,7 @@ mod tests {
         let refused = |status| RoomError::Refused {
             origin: "https://reach.kala.to".to_owned(),
             status,
+            retry_after: None,
         };
         for status in [200, 204, 301, 302, 404, 405] {
             assert_eq!(

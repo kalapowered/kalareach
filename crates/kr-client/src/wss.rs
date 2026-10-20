@@ -123,8 +123,14 @@ pub(crate) enum Failure {
     Configuration(&'static str),
     /// The name, the connection, the proxy or TLS failed, or the socket did not open in time.
     Unreachable(String),
-    /// The upgrade was answered with a status other than switching protocols.
-    Refused(u16),
+    /// The upgrade was answered with a status other than switching protocols, and with the wait
+    /// before trying again that the answer named, when it named one.
+    Refused {
+        /// The status.
+        status: u16,
+        /// The wait, from a `Retry-After` of whole seconds.
+        retry_after: Option<Duration>,
+    },
     /// The answer was not a WebSocket upgrade, or not one this client accepts.
     NotAnUpgrade(&'static str),
 }
@@ -306,7 +312,7 @@ async fn open_now(tls: &Arc<ClientConfig>, upgrade: &Upgrade<'_>) -> Result<Sock
         .limits(Limits::default().max_payload_len(Some(upgrade.max_payload)))
         .connect_on(UpgradeGuard::new(wire))
         .await
-        .map_err(upgrade_failed)?;
+        .map_err(|error| upgrade_failed(error, None))?;
     Ok(socket)
 }
 
@@ -325,12 +331,15 @@ fn is_loopback(host: &str) -> bool {
 /// part way through, TLS included: its failures after the handshake reach this as input errors of
 /// the same kind the guard's do, so the guard's are told apart by their own type rather than by
 /// their kind.
-fn upgrade_failed(error: tokio_websockets::Error) -> Failure {
+fn upgrade_failed(error: tokio_websockets::Error, retry_after: Option<Duration>) -> Failure {
     use tokio_websockets::upgrade;
 
     match error {
         tokio_websockets::Error::Upgrade(upgrade::Error::DidNotSwitchProtocols(status)) => {
-            Failure::Refused(status)
+            Failure::Refused {
+                status,
+                retry_after,
+            }
         }
         tokio_websockets::Error::Upgrade(error) => Failure::NotAnUpgrade(match error {
             upgrade::Error::MissingHeader(_) => MISSING_HEADER,

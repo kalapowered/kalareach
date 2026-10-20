@@ -15,7 +15,7 @@ use std::time::Duration;
 use iroh::EndpointAddr;
 use kr_client::pairing::room::RoomSocket;
 use kr_controller::service::net::pairing::HostPairingClock;
-use kr_controller::service::net::rendezvous::Rendezvous;
+use kr_controller::service::net::rendezvous::{NotAttached, Rendezvous};
 use kr_crypto::secret::SymmetricKey;
 use kr_pairing::PairingError;
 use kr_pairing::bundles::BundleFrame;
@@ -639,9 +639,14 @@ impl Rendezvous for TestRoom {
         _origin: &RendezvousOrigin,
         locator: &Locator,
         control_token: &SymmetricKey,
-    ) -> BoxFuture<'static, kr_pairing::Result<RoomSocket>> {
+    ) -> BoxFuture<'static, Result<RoomSocket, NotAttached>> {
         let attached = self.attach_host(locator, control_token);
-        Box::pin(async move { attached })
+        Box::pin(async move {
+            attached.map_err(|error| NotAttached {
+                error,
+                retry_after: None,
+            })
+        })
     }
 }
 
