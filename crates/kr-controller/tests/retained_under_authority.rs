@@ -9,11 +9,6 @@
 //! What each test asserts is read from the daemon's answer to a device, and from the worker's own
 //! ledger and journal where a test says what was kept: a device is shown what its present authority
 //! reaches of what an action produced, and what the worker keeps is not changed by who reads it.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-10.49 | the `kr_req_10_49_` tests here |
-//! | KR-REQ-23.34 | the `kr_req_23_34_` tests here |
 
 mod net_support;
 

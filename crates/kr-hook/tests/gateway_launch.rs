@@ -9,18 +9,6 @@
 //! against the schemas of the release it stands for. The session is a real one, with a journal
 //! on disk, so the server is recorded as a root of what it owns. Build the stand-in before a
 //! package-scoped run (`cargo build -p kr-codex-stand-in`); a run of the workspace builds it.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-07.67 | the exit of the terminal stops its server and ends its instance |
-//! | KR-REQ-12.07 | a plain launch of an integrated terminal that has a server is served by a gateway: the server is started, recorded and bound before the program runs, the program's whole session runs through it, and the server and the instance end with the program; a launch that cannot have a server, or whose environment cannot be presented, runs the program as typed; a close ends a backend's instance before it takes down what the backend published, and a runtime directory with a space is served as any other |
-//! | KR-REQ-07.60 | a server is recorded before the launch commits, and one whose record cannot be written is not left running; a server and what it started end with the program, with the connection, at the bound for a connection, and with the session after the acceptance of its close is delivered, a stubborn one by force and a command that outlived its server included |
-//! | KR-REQ-07.61 | a process the server started is placed under the program's instance |
-//! | KR-REQ-11.32 | only the process the launch registered reaches the gateway, and a plain upgrade from another is closed without a word; a message at the connector's limit is carried both ways and one above it ends the connection and the server; a terminal that stops reading loses its connection |
-//! | KR-REQ-11.33 | the key a terminal signs in with reaches the server and is kept nowhere |
-//! | KR-REQ-11.35 | a ledger fault in live traffic keeps the session going and fences rich work |
-//! | KR-REQ-11.27 | an approval's resource is recorded before the request reaches the terminal, and the terminal's one answer resolves it once |
-//! | KR-REQ-12.13 | an approval is an opaque pending resource of the instance before the terminal answers, and its one answer resolves it once, under an identifier one side shares with the other's |
 
 #![cfg(unix)]
 
