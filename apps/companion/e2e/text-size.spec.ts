@@ -14,7 +14,11 @@ import { Buffer } from 'node:buffer'
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { PRESENTATION_DEADLINE } from './bounds'
 import { overrunning, stopWrapping } from './layout'
+
+/** The longest a passing message stays once nothing holds it, in milliseconds (the application's `TOAST_CEILING_MS`). */
+const TOAST_CEILING_MS = 20_000
 
 declare global {
   interface Window {
@@ -925,6 +929,32 @@ test.describe('a passing message', () => {
       await expect(toast).toHaveCount(0)
     })
 
+    // A message read in passing leaves by itself even when its words are too many for their box: a
+    // timer that waited for the person to read to the end would leave it on the screen for good. The
+    // page's clock is moved on by the case, past the longest a message stays, and no time is waited.
+    test(`takes a long passing message away by itself, its words overflowing, on ${surface}`, async ({ page }) => {
+      await withSystemTextScale(page, LARGEST)
+      await page.setViewportSize({ width: 320, height: 720 })
+      await page.goto(`/harness.html?surface=${surface}&session=${SESSION}`)
+      await expect(page.locator('.m-shell')).toBeVisible()
+      await page.clock.install()
+      const opened = page.waitForEvent('filechooser')
+      await page.getByRole('button', { name: 'Files', exact: true }).click()
+      await (await opened).setFiles(FILE)
+      const toast = page.locator('.toast')
+      await expect(toast).toContainText('a-long-name-for-a-file')
+      const layout = await settledToast(page)
+      expect(layout?.scrolls, 'the words overflow their box').toBe(true)
+      // The pointer that pressed Files rests where the message came up, and a pointer on a message
+      // holds it: the engines differ in whether one that is already there counts, so it is moved away.
+      await page.mouse.move(1, 1)
+
+      await page.clock.runFor(1_000)
+      await expect(toast, 'it is still there a moment later').toBeVisible()
+      await page.clock.runFor(TOAST_CEILING_MS)
+      await expect(toast, 'and gone once the longest a message stays has gone by').toHaveCount(0)
+    })
+
     test(`keeps the notice of a file with a short name on a few lines at the largest size on ${surface}`, async ({
       page
     }) => {
@@ -1029,5 +1059,221 @@ test.describe('the connection text in the top bar', () => {
         }
       })
     }
+  }
+})
+
+// KR-REQ-13.19: on the phone a message in passing rests above the tab bar and above a software
+// keyboard, whichever reaches higher: at the foot of the window it lay over the bar's controls, and
+// under a keyboard. It is held where it is, as a pointer resting on it holds it, while this measures.
+test.describe('a passing message on the phone, above the bar and the keyboard', () => {
+  for (const surface of ['ios', 'android'] as const) {
+    for (const [width, height] of [
+      [390, 844],
+      [320, 720]
+    ] as const) {
+      for (const [size, ratio] of [
+        ['default', 1],
+        ['largest', LARGEST]
+      ] as const) {
+        test(`clears the tab bar and the keyboard on ${surface}, ${width} px wide at the ${size} text size`, async ({
+          page
+        }) => {
+          await withSystemTextScale(page, ratio)
+          await withWideFace(page)
+          await page.setViewportSize({ width, height })
+          await page.goto(`/harness.html?surface=${surface}&session=${SESSION}`)
+          await expect(page.locator('.m-tabbar')).toBeVisible()
+          const opened = page.waitForEvent('filechooser')
+          await page.getByRole('button', { name: 'Files', exact: true }).click()
+          await (await opened).setFiles({ name: 'notes.png', mimeType: 'image/png', buffer: Buffer.from('a picked file') })
+          const toast = page.locator('.toast')
+          await expect(toast).toContainText('notes.png')
+          await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
+
+          const where = () =>
+            page.evaluate(() => {
+              const message = document.querySelector('.toast')?.getBoundingClientRect()
+              const bar = document.querySelector('.m-tabbar')?.getBoundingClientRect()
+              return message === undefined || bar === undefined
+                ? null
+                : { bottom: message.bottom, top: message.top, bar: bar.top, window: window.innerHeight }
+            })
+          // It comes up from below the screen, so it is read once it has come to rest.
+          await expect
+            .poll(async () => {
+              const now = await where()
+              return now !== null && now.bottom <= now.bar + 0.5
+            }, 'the message ends above the tab bar')
+            .toBe(true)
+          await toast.getByRole('button', { name: 'Dismiss' }).click({ trial: true, timeout: 2_000 })
+
+          // A software keyboard over the page: the message goes up with it, and the bar is under it.
+          const covered = 336
+          await page.evaluate((inset) => {
+            document.documentElement.style.setProperty('--keyboard', `${String(inset)}px`)
+          }, covered)
+          await expect
+            .poll(async () => {
+              const now = await where()
+              return now === null ? false : now.bottom <= now.window - covered + 0.5
+            }, 'the message ends above the keyboard')
+            .toBe(true)
+          await toast.getByRole('button', { name: 'Dismiss' }).click({ trial: true, timeout: 2_000 })
+          await page.screenshot({ path: `/tmp/kr-text-size-toast-keyboard-${surface}-${size}-${String(width)}-${test.info().project.name}.png` })
+
+          // The keyboard goes, and the message comes back down to the bar.
+          await page.evaluate(() => {
+            document.documentElement.style.setProperty('--keyboard', '0px')
+          })
+          await expect
+            .poll(async () => {
+              const now = await where()
+              return now === null ? false : now.bottom <= now.bar + 0.5 && now.bottom > now.bar - 60
+            }, 'the message rests on the bar again')
+            .toBe(true)
+        })
+      }
+    }
+  }
+})
+
+// KR-REQ-13.19: a message in passing that comes while a sheet is open is drawn inside it, where a
+// keyboard and a screen reader stay: its Dismiss is named, and reached after the sheet's body, and
+// focus does not go to it by itself. It goes back to the screen when the sheet goes.
+test.describe('a passing message that comes while a sheet is open', () => {
+  const REQUEST = {
+    ceremony: 'touch_id' as const,
+    requests: [
+      {
+        reference: 'request-1',
+        host_name: 'studio',
+        title: 'Pair a new device',
+        detail: null,
+        value: 'f3c1 46fd',
+        facts: [],
+        notice: null,
+        statement: null,
+        reading: null,
+        expires_at_ms: Date.now() + 600_000,
+        checkable: true
+      }
+    ]
+  }
+
+  for (const [size, ratio] of [
+    ['default', 1],
+    ['largest', LARGEST]
+  ] as const) {
+    test(`is inside the sheet, reached by keyboard after its body and named, at the ${size} text size`, async ({
+      page,
+      browserName
+    }) => {
+      await withSystemTextScale(page, ratio)
+      await withWideFace(page)
+      await page.setViewportSize({ width: 1280, height: 720 })
+      await page.goto('/harness.html')
+      await page.waitForSelector('.app-shell')
+      await page.getByRole('button', { name: /^Account/ }).click()
+      const sheet = page.getByTestId('sheet')
+      await expect(sheet).toHaveAttribute('data-presentation', 'here', { timeout: PRESENTATION_DEADLINE })
+      const before = await page.evaluate(() => `${document.activeElement?.tagName ?? ''}.${document.activeElement?.className ?? ''} ${document.activeElement?.getAttribute('aria-label') ?? ''}`)
+
+      await page.evaluate((view) => {
+        window.krTestHost?.setConfirmations(view)
+      }, REQUEST)
+      const toast = page.locator('.toast')
+      await expect(toast).toContainText('needs your confirmation')
+      // Inside the dialog, and named by what it does.
+      const dismiss = page.getByRole('dialog').getByRole('button', { name: 'Dismiss' })
+      await expect(dismiss, 'its Dismiss is in the dialog, named').toBeVisible()
+      await expect(page.getByRole('dialog').getByRole('button', { name: 'Review' })).toBeVisible()
+      // Focus is where it was: the message does not take it.
+      expect(await page.evaluate(() => `${document.activeElement?.tagName ?? ''}.${document.activeElement?.className ?? ''} ${document.activeElement?.getAttribute('aria-label') ?? ''}`)).toBe(before)
+      await expect(toast.locator(':focus')).toHaveCount(0)
+      // After the body, in the order of the document.
+      expect(
+        await page.evaluate(() => {
+          const body = document.querySelector('.sheet .dialog-body')
+          const message = document.querySelector('.sheet .toast')
+          return Boolean(body && message && body.compareDocumentPosition(message) & Node.DOCUMENT_POSITION_FOLLOWING)
+        }),
+        'the message follows the sheet’s body'
+      ).toBe(true)
+      // The message is the foot of what the sheet holds: nothing of the body lies under its box.
+      const clear = await page.evaluate(() => {
+        const message = document.querySelector('.sheet .toast')?.getBoundingClientRect()
+        const header = document.querySelector('.sheet .dialog-header')?.getBoundingClientRect()
+        return message !== undefined && header !== undefined && message.top >= header.bottom - 0.5
+      })
+      expect(clear, 'the message lies below the sheet’s header').toBe(true)
+
+      // Chromium takes the keyboard to every stop in turn; WebKit on macOS passes over buttons unless
+      // the system's keyboard setting asks for them, so there the order above is what holds.
+      if (browserName === 'chromium') {
+        await page.locator('.sheet .dialog-body').locator('button, input, select, [tabindex="0"]').last().focus()
+        const stops: string[] = []
+        for (let press = 0; press < 6; press += 1) {
+          await page.keyboard.press('Tab')
+          stops.push(
+            await page.evaluate(() =>
+              document.activeElement?.closest('.toast') !== null
+                ? `the message: ${document.activeElement?.getAttribute('aria-label') ?? document.activeElement?.textContent ?? ''}`
+                : 'elsewhere'
+            )
+          )
+          if (await dismiss.evaluate((element) => element === document.activeElement)) break
+        }
+        expect(stops.at(-1), `the stops after the body: ${stops.join(', ')}`).toBe('the message: Dismiss')
+      }
+
+      // The sheet goes and the message stays, on the screen again.
+      await page.keyboard.press('Escape')
+      await expect(sheet).toBeHidden({ timeout: PRESENTATION_DEADLINE })
+      await expect(toast).toBeVisible()
+      expect(await toast.evaluate((element) => element.closest('[role="dialog"]') !== null)).toBe(false)
+      await toast.getByRole('button', { name: 'Dismiss' }).click()
+      await expect(toast).toHaveCount(0)
+    })
+  }
+})
+
+// KR-REQ-13.19: a message appears and goes by a change of its opacity alone when the person asked for
+// less motion, on the screen and inside a sheet. Without that request it comes up from below, which is
+// the control: the same measure sees the travel.
+test.describe('a passing message and reduced motion', () => {
+  const travel = (page: Page): Promise<string[]> =>
+    page.evaluate(() => (window as unknown as { krToastTransitions?: string[] }).krToastTransitions ?? [])
+
+  for (const [name, reduced] of [
+    ['without', false],
+    ['with', true]
+  ] as const) {
+    test(`${reduced ? 'moves nothing' : 'comes up from below'} when it arrives, ${name} a request for less motion`, async ({
+      page
+    }) => {
+      if (reduced) await page.emulateMedia({ reducedMotion: 'reduce' })
+      await page.addInitScript(() => {
+        const seen: string[] = []
+        ;(window as unknown as { krToastTransitions?: string[] }).krToastTransitions = seen
+        document.addEventListener(
+          'transitionrun',
+          (event) => {
+            const target = event.target
+            if (target instanceof Element && target.matches('.toast')) seen.push(event.propertyName)
+          },
+          true
+        )
+      })
+      await page.setViewportSize({ width: 390, height: 844 })
+      await page.goto(`/harness.html?surface=ios&session=${SESSION}`)
+      await expect(page.locator('.m-tabbar')).toBeVisible()
+      const opened = page.waitForEvent('filechooser')
+      await page.getByRole('button', { name: 'Files', exact: true }).click()
+      await (await opened).setFiles({ name: 'notes.png', mimeType: 'image/png', buffer: Buffer.from('a picked file') })
+      await expect(page.locator('.toast')).toContainText('notes.png')
+      await expect.poll(async () => (await travel(page)).includes('opacity'), 'the message fades in').toBe(true)
+      const moved = (await travel(page)).includes('transform')
+      expect(moved, `the message ${reduced ? 'does not travel' : 'travels'} (${(await travel(page)).join(', ')})`).toBe(!reduced)
+    })
   }
 })

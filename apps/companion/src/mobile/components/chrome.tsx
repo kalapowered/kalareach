@@ -115,6 +115,22 @@ export function TabBar({
       observer.disconnect()
     }
   }, [destinations])
+  // How high the bar is, for what rests above it: a passing message clears it (`--tabbar-room`).
+  useLayoutEffect(() => {
+    const element = bar.current
+    if (element === null) return
+    const root = document.documentElement
+    const measure = () => {
+      root.style.setProperty('--tabbar-room', `${String(element.offsetHeight)}px`)
+    }
+    measure()
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure)
+    observer?.observe(element)
+    return () => {
+      observer?.disconnect()
+      root.style.removeProperty('--tabbar-room')
+    }
+  }, [])
   return (
     <nav className="m-tabbar" aria-label="Sections" ref={bar} data-form={form === 'row' ? undefined : form}>
       {destinations.map((destination) => (

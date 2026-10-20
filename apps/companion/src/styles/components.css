@@ -877,6 +877,11 @@ textarea::placeholder {
 
 /* ---- The toast ------------------------------------------------------------------------------ */
 
+/*
+ * A passing message is drawn over the foot of the screen it was said on, and while a sheet is open
+ * inside the sheet (`.toast-dock`, below), where the keyboard and a screen reader stay. On the phone
+ * it clears the tab bar and the software keyboard (`mobile.css`).
+ */
 .toast {
   position: fixed;
   z-index: 1000;
@@ -898,8 +903,7 @@ textarea::placeholder {
   box-shadow: var(--shadow);
   font-size: 0.75rem;
   opacity: 1;
-  /* It rests above the footer of a surface that is open, which says how far in `--toast-lift`. */
-  transform: translate(-50%, calc(0px - var(--toast-lift, 0px)));
+  transform: translateX(-50%);
   transition:
     transform var(--surface-in) var(--ease-out),
     opacity var(--surface-in) var(--ease-out);
@@ -922,11 +926,8 @@ textarea::placeholder {
    a whole stays under half of it whatever the words. At the largest size a long message scrolls
    inside its own box, and the controls below it are never pushed off the screen. The 80px floor
    keeps the words usable on a screen too short for half of it to hold them: the toast is then more
-   than half of that screen. Over an open surface the toast rests above its footer, by `--toast-lift`,
-   and its words give up the room that lifts it. At the largest size that leaves the words a line or
-   two: a longer message then scrolls inside its box, and a message that scrolls stays until it is
-   dismissed. Over a surface that is open, a message that would have gone by itself stays, over the
-   surface's body, and its Dismiss and the surface's actions are both clear. */
+   than half of that screen. A message whose words overflow their box still goes in its time, which
+   grows with the words (`toastDwell`), and its box takes the keyboard, which holds the message. */
 .toast {
   /* The height of the tallest control: Dismiss is a target high, and a button that names an action
      is one line of its own text, its padding and its border. */
@@ -938,7 +939,7 @@ textarea::placeholder {
 }
 
 .toast-text {
-  max-height: min(12rem, max(80px, calc(49dvh - var(--toast-lift, 0px) - var(--toast-controls) - 24px)));
+  max-height: min(12rem, max(80px, calc(49dvh - var(--toast-controls) - 24px)));
   /* Words never scroll sideways: they wrap, and what cannot wrap is cut off, not scrolled to. */
   overflow-x: hidden;
   overflow-y: auto;
@@ -966,17 +967,88 @@ textarea::placeholder {
   transform: translate(-50%, calc(100% + 40px));
 }
 
+/*
+ * Inside a sheet the message has a place of its own, which the sheet keeps: a box over the foot of
+ * the sheet's body, between the body and the footer (the head of the body where the sheet says its
+ * decisions are at the foot), as wide as the body and as tall as the room it has. The message is
+ * inside the dialog, so it is in the keyboard's path after the body and before the footer, and in what a
+ * screen reader reads of the dialog; and it rests where the footer's actions are not, whatever the
+ * footer's height, with nothing measured. The box takes no press: only the message does.
+ */
+.dialog-main {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.dialog-main > .dialog-body {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.toast-dock {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: var(--gap-3);
+  /* The words take what the dock's own height leaves, so the message never grows over the header. */
+  container-type: size;
+  pointer-events: none;
+}
+
+.dialog-main[data-message='head'] > .toast-dock {
+  align-items: flex-start;
+}
+
+.toast-dock > .toast {
+  position: static;
+  z-index: auto;
+  max-width: 100%;
+  pointer-events: auto;
+  transform: none;
+}
+
+.toast-dock .toast-text {
+  max-height: min(12rem, max(80px, calc(100cqb - var(--toast-controls) - 24px)));
+}
+
+/* Over a sheet it comes up a short way from where it rests, and does not cross the footer. */
+@starting-style {
+  .toast-dock > .toast {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
+  /* No travel: the message appears and goes by a change of its opacity alone. */
   .toast,
   .toast[data-leaving='true'] {
-    transform: translate(-50%, calc(0px - var(--toast-lift, 0px)));
+    transform: translateX(-50%);
     transition: opacity 120ms ease;
   }
 
+  .toast-dock > .toast,
+  .toast-dock > .toast[data-leaving='true'] {
+    transform: none;
+  }
+
   @starting-style {
-    .toast {
-      transform: translate(-50%, calc(0px - var(--toast-lift, 0px)));
+    .toast,
+    .toast-dock > .toast {
       opacity: 0;
+    }
+
+    .toast {
+      transform: translateX(-50%);
+    }
+
+    .toast-dock > .toast {
+      transform: none;
     }
   }
 }

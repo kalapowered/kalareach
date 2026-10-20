@@ -512,20 +512,21 @@ test.describe('a new invitation while the inbox is scrolled', () => {
   })
 })
 
-// KR-REQ-13.19, KR-REQ-18.13: a message in passing rests above the footer of the card an invitation
-// opens, and not over what accepts or puts off, at every text size and wherever the clock stands. The
-// words of a message about when a share ends are longer when it ends on another day; at the largest
-// size they are too many for the message's box, and the message then stays until it is dismissed.
+// KR-REQ-13.19, KR-REQ-18.13: a message in passing is drawn inside the card an invitation opens, above
+// the footer and not over what accepts or puts off, at every text size and wherever the clock stands,
+// and its Dismiss is in the keyboard's path between the card's body and its footer. The words of a
+// message about when a share ends are longer when it ends on another day; at the largest size they are
+// too many for the message's box, and the message still goes in its time.
 test.describe('a message in passing over the card an invitation opens', () => {
   test.use({ timezoneId: 'UTC' })
 
   /**
    * Accepts invitation 3, holds the message that says so (a `pointerover` event on it, which is what a
    * pointer resting on it does: the engines differ in whether a pointer that is already there counts,
-   * so no timer decides the case), opens invitation 4's card and says where the message rests against
-   * the card's footer and its two actions.
+   * so no timer decides the case), and opens invitation 4's card over it. The message moves into the
+   * card, where it is drawn anew, so the pointer is put on it again there.
    */
-  async function messageOverCard(
+  async function openCardOverMessage(
     page: Page,
     how: {
       surface: 'ios' | 'android'
@@ -534,11 +535,8 @@ test.describe('a message in passing over the card an invitation opens', () => {
       at: string
       reduced?: boolean
       inset?: number
-      /** An inset that comes while the card is open, as the platform's does when the device turns. */
-      insetLater?: number
-      shot: string
     }
-  ): Promise<void> {
+  ) {
     if (how.reduced === true) await page.emulateMedia({ reducedMotion: 'reduce' })
     await withClockAt(page, how.at)
     await withSystemTextScale(page, how.ratio)
@@ -563,6 +561,26 @@ test.describe('a message in passing over the card an invitation opens', () => {
     await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here')
     await expect(accept).toBeVisible()
     await expect(toast).toBeVisible()
+    await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
+    return { toast, accept, notNow }
+  }
+
+  /** Where the message rests against the card's footer and its two actions, and that it is the card's own. */
+  async function messageOverCard(
+    page: Page,
+    how: {
+      surface: 'ios' | 'android'
+      ratio: number
+      face: (typeof FACES)[number]
+      at: string
+      reduced?: boolean
+      inset?: number
+      /** An inset that comes while the card is open, as the platform's does when the device turns. */
+      insetLater?: number
+      shot: string
+    }
+  ): Promise<void> {
+    const { toast, accept, notNow } = await openCardOverMessage(page, how)
     if (how.insetLater !== undefined) {
       await page.evaluate((inset) => {
         document.documentElement.style.setProperty('--safe-bottom', `${String(inset)}px`)
@@ -594,12 +612,12 @@ test.describe('a message in passing over the card an invitation opens', () => {
     for (const control of [accept, notNow]) await control.click({ trial: true, timeout: 5_000 })
     await page.screenshot({ path: `/tmp/kr-shared-with-you-toast-${how.shot}-${test.info().project.name}.png` })
 
-    // It settles back when the card goes.
+    // It is the card's own: inside the dialog while the card is open, and back on the screen when the
+    // card goes.
+    expect(await toast.evaluate((element) => element.closest('[role="dialog"]') !== null)).toBe(true)
     await notNow.click()
     await expect(page.getByTestId('sheet')).toBeHidden()
-    await expect
-      .poll(() => page.evaluate(() => document.documentElement.style.getPropertyValue('--toast-lift')))
-      .toBe('')
+    expect(await toast.evaluate((element) => element.closest('[role="dialog"]') !== null)).toBe(false)
   }
 
   for (const surface of ['ios', 'android'] as const) {
@@ -620,6 +638,84 @@ test.describe('a message in passing over the card an invitation opens', () => {
         }
       }
     }
+  }
+
+  // The message is inside the dialog, so a keyboard reaches its Dismiss and a screen reader names it:
+  // after what the card holds and before its footer, in the order the eye reads them. Focus does not
+  // move to it by itself, when it arrives or when the card opens over it.
+  for (const size of SIZES) {
+    test(`puts Dismiss between the card's body and its footer, named, without taking the focus, at the ${size.name} text size`, async ({
+      page,
+      browserName
+    }) => {
+      const { toast, accept } = await openCardOverMessage(page, {
+        surface: 'ios',
+        ratio: size.ratio,
+        face: FACES[1],
+        at: CLOCKS[0].at
+      })
+      const dialog = page.getByRole('dialog')
+      const dismiss = dialog.getByRole('button', { name: 'Dismiss' })
+      await expect(dismiss, 'the message is in the dialog and its control is named').toBeVisible()
+      await expect(toast).not.toBeFocused()
+      await expect(dismiss, 'focus does not move to the message by itself').not.toBeFocused()
+      // The card's own control has the focus, as it had when the card opened.
+      expect(await page.evaluate(() => document.activeElement?.closest('[role="dialog"]') !== null)).toBe(true)
+
+      // Document order, which is the keyboard's: the body, then the message's Dismiss, then the footer.
+      const order = await page.evaluate(() => {
+        const sheet = document.querySelector('.sheet')
+        const body = sheet?.querySelector('.dialog-body')
+        const footer = sheet?.querySelector('.dialog-footer')
+        const message = sheet?.querySelector('.toast')
+        if (!body || !footer || !message) return null
+        const follows = (a: Element, b: Element): boolean =>
+          Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING)
+        return { afterBody: follows(body, message), beforeFooter: follows(message, footer) }
+      })
+      expect(order, 'the body, the message and the footer are in the dialog').not.toBeNull()
+      expect(order?.afterBody, 'the message follows the body').toBe(true)
+      expect(order?.beforeFooter, 'and comes before the footer').toBe(true)
+
+      // The keyboard: from the top of the card the stops come in the order of the card: its header,
+      // its body, the message (its words where they overflow their box, then its Dismiss), its footer.
+      // (WebKit on macOS passes over buttons unless the system's keyboard setting asks for them, so
+      // there the order above is what holds.)
+      if (browserName === 'chromium') {
+        await page.locator('.sheet .dialog-header button').focus()
+        const part = (): Promise<string> =>
+          page.evaluate(() => {
+            const here = document.activeElement
+            for (const [name, selector] of [
+              ['header', '.dialog-header'],
+              ['body', '.dialog-body'],
+              ['message', '.toast'],
+              ['footer', '.dialog-footer']
+            ] as const) {
+              if (here?.closest(selector)) return name
+            }
+            return 'outside'
+          })
+        const stops: string[] = [await part()]
+        for (let press = 0; press < 8 && stops.at(-1) !== 'footer'; press += 1) {
+          await page.keyboard.press('Tab')
+          stops.push(await part())
+        }
+        const rank = ['header', 'body', 'message', 'footer']
+        expect(stops.at(-1), `the stops: ${stops.join(', ')}`).toBe('footer')
+        expect(
+          stops.every((each, at) => at === 0 || rank.indexOf(each) >= rank.indexOf(stops[at - 1] ?? 'header')),
+          `the stops in the card's order: ${stops.join(', ')}`
+        ).toBe(true)
+        expect(stops, 'the message is a stop of its own').toContain('message')
+        // The footer's control is next after the message's Dismiss, and back from it is Dismiss.
+        await expect(accept).toBeFocused()
+        await page.keyboard.press('Shift+Tab')
+        await expect(dismiss).toBeFocused()
+      }
+      await dismiss.press('Enter')
+      await expect(toast).toHaveCount(0)
+    })
   }
 
   // The two rules that rest the message for a person who asked for less motion are not the others'.
@@ -660,16 +756,43 @@ test.describe('a message in passing over the card an invitation opens', () => {
     })
   })
 
-  // A sheet whose decisions are in its body, above a footer that leads elsewhere, does not lift the
-  // message: the lifted message would lie over the next request's decisions.
-  test('lifts no message over the sheet that holds an item’s decisions', async ({ page }) => {
+  // A sheet whose decisions are in its body, above a footer that leads elsewhere, draws the message at
+  // the head of its body: a message at the foot would lie over the next request's decisions.
+  test('draws no message over the decisions in the sheet that holds an item’s decisions', async ({ page }) => {
     await withClockAt(page, CLOCKS[0].at)
     await page.setViewportSize({ width: 320, height: 720 })
-    await page.goto('/harness.html?surface=ios&tab=attention')
-    await expect(page.locator('.m-shell')).toBeVisible()
+    await open(page, 'ios', 'attention', async (loaded) => {
+      // A device that may view sessions has items to act on, and an invitation to accept.
+      await loaded.evaluate(() => {
+        const host = window.krTestHost
+        if (host === undefined) throw new Error('no scripted host')
+        host.reachAsPhone({ rights: ['session.view'] })
+        host.sharing.offer({ session: '3', role: 'controller', live: true })
+      })
+      await expect(loaded.getByTestId('offers')).toBeVisible()
+    })
+    await page.getByRole('button', { name: /shared session 3 with you/ }).click()
+    await page.getByTestId('accept-offer').click()
+    await expect(page.getByTestId('sheet')).toBeHidden()
+    const toast = page.locator('.toast')
+    await expect(toast).toContainText('Session 3 is shared with you until')
+    // Held where it is, as a pointer resting on it holds it, while an item's card is opened over it.
+    await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
     await page.locator('.m-list [data-attention]').first().click()
     await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here')
-    expect(await page.evaluate(() => document.documentElement.style.getPropertyValue('--toast-lift'))).toBe('')
+    await expect(toast).toBeVisible()
+    expect(await toast.evaluate((element) => element.closest('[role="dialog"]') !== null)).toBe(true)
+    const place = await page.evaluate(() => {
+      const message = document.querySelector('.toast')?.getBoundingClientRect()
+      const body = document.querySelector('.sheet .dialog-body')?.getBoundingClientRect()
+      return message === undefined || body === undefined
+        ? null
+        : { messageTop: message.top, bodyTop: body.top, bodyBottom: body.bottom }
+    })
+    expect(place, 'the message and the body are drawn').not.toBeNull()
+    expect(place?.messageTop, 'the message is at the head of the body').toBeLessThan(
+      (place?.bodyTop ?? 0) + ((place?.bodyBottom ?? 0) - (place?.bodyTop ?? 0)) / 2
+    )
   })
 })
 

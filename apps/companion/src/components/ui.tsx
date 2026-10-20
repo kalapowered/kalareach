@@ -19,11 +19,13 @@ import {
   type ReactNode,
   type Ref
 } from 'react'
+import { createPortal } from 'react-dom'
 
 import markLight from '../assets/kala-mark.svg'
 import markDark from '../assets/kala-mark-dark.svg'
 import { AnnouncementScope, useAnnounced } from './announcements'
 import { failureMessage, type HostPort } from '../host/port'
+import { offerToastDock, toastDwell, useToastDock } from './toast'
 import { applyMode, modeApplications, shownMode, type ColourMode } from '../theme-init'
 import {
   animateSpring,
@@ -373,16 +375,6 @@ export interface ToastMessage {
   readonly said?: number
 }
 
-/**
- * How long a message stays once nothing holds it: long enough to read, and longer when it offers
- * something to do, which takes a decision as well as a reading.
- */
-const TOAST_MS = 4200
-const TOAST_WITH_ACTION_MS = 8000
-
-/** The custom property on the root that says how far an open surface lifts the toast: its footer and the room under it. */
-const TOAST_LIFT = '--toast-lift'
-
 /** Shows the newest message, and takes it away. */
 export function Toast({
   message,
@@ -392,25 +384,73 @@ export function Toast({
   readonly onDismiss: () => void
 }): ReactNode {
   if (!message) return null
-  return <ToastBody key={message.id} message={message} onDismiss={onDismiss} />
+  return <HeldToast key={message.id} message={message} onDismiss={onDismiss} />
 }
 
 /**
- * One message. It stays while the pointer rests on it or focus is inside it, so its action can
- * always be reached before it goes, and it goes its time after both have left.
+ * One message, the time it has left and what holds it.
+ *
+ * It stays while the pointer rests on it or focus is inside it, so its action can always be reached
+ * before it goes, and it goes its time after both have left (`toastDwell`). Both live here and not
+ * in the card, which is drawn in the place the newest open surface offers and is drawn anew where
+ * that changes: a message that is moved onto a surface that opens over it, or back as the surface
+ * goes, goes at the time it was going to, and it is not told again. A pointer and a focus belong to
+ * the place the card was in, and are not carried to another.
  */
-function ToastBody({
+function HeldToast({
   message,
   onDismiss
 }: {
   readonly message: ToastMessage
   readonly onDismiss: () => void
 }): ReactNode {
-  // The pointer and focus hold it apart: either one is enough.
-  const [pointer, setPointer] = useState(false)
-  const [focused, setFocused] = useState(false)
-  // Words too many for their box are read by scrolling it, which a timer cannot wait for: the
-  // message stays until the person dismisses it, and the box can be scrolled from the keyboard.
+  const dock = useToastDock()
+  const [holds, setHolds] = useState({ place: dock, pointer: false, focused: false })
+  const held = holds.place === dock && (holds.pointer || holds.focused)
+  const hasAction = message.action !== undefined
+  useEffect(() => {
+    if (held) return
+    const handle = setTimeout(onDismiss, toastDwell(message.text, hasAction))
+    return () => {
+      clearTimeout(handle)
+    }
+  }, [held, message, hasAction, onDismiss])
+
+  const hold = (change: { readonly pointer?: boolean; readonly focused?: boolean }) => {
+    setHolds((now) => ({
+      ...(now.place === dock ? now : { place: dock, pointer: false, focused: false }),
+      ...change
+    }))
+  }
+  const card = (
+    <ToastCard
+      message={message}
+      onDismiss={onDismiss}
+      onPointer={(on) => {
+        hold({ pointer: on })
+      }}
+      onFocus={(on) => {
+        hold({ focused: on })
+      }}
+    />
+  )
+  return dock === null ? card : createPortal(card, dock)
+}
+
+/** What a message looks like, and what its controls do. */
+function ToastCard({
+  message,
+  onDismiss,
+  onPointer,
+  onFocus
+}: {
+  readonly message: ToastMessage
+  readonly onDismiss: () => void
+  readonly onPointer: (on: boolean) => void
+  readonly onFocus: (on: boolean) => void
+}): ReactNode {
+  // Words too many for their box are read by scrolling it, which the keyboard can do: the box takes
+  // focus then, and focus in the message holds it.
   const words = useRef<HTMLSpanElement | null>(null)
   const [overflowing, setOverflowing] = useState(false)
   useLayoutEffect(() => {
@@ -427,17 +467,6 @@ function ToastBody({
       watching.disconnect()
     }
   }, [message.text, message.said])
-  const held = pointer || focused || overflowing
-  useEffect(() => {
-    if (held) return
-    const handle = setTimeout(
-      onDismiss,
-      message.action === undefined ? TOAST_MS : TOAST_WITH_ACTION_MS
-    )
-    return () => {
-      clearTimeout(handle)
-    }
-  }, [held, message, onDismiss])
 
   const { action } = message
   return (
@@ -447,16 +476,16 @@ function ToastBody({
       aria-live="polite"
       data-with-action={action === undefined ? undefined : ''}
       onPointerEnter={() => {
-        setPointer(true)
+        onPointer(true)
       }}
       onPointerLeave={() => {
-        setPointer(false)
+        onPointer(false)
       }}
       onFocus={() => {
-        setFocused(true)
+        onFocus(true)
       }}
       onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget)) setFocused(false)
+        if (!event.currentTarget.contains(event.relatedTarget)) onFocus(false)
       }}
     >
       <div className="toast-main">
@@ -546,7 +575,7 @@ export function Sheet({
   onClose,
   children,
   footer,
-  liftsMessage = true
+  messageAt = 'foot'
 }: {
   readonly open: boolean
   readonly title: string
@@ -557,15 +586,14 @@ export function Sheet({
   readonly children: ReactNode
   readonly footer?: ReactNode
   /**
-   * Whether a message in passing rests above this surface's footer while it is open, as it does by
-   * default: a footer holds what the surface asks of the person, and a message over it takes the
-   * touch. A surface whose decisions are at the foot of its body, above a footer that only leads
-   * elsewhere, turns it off, since the lifted message would lie over the decisions.
+   * Where a message in passing is drawn while this surface is open: it is drawn inside it, over the
+   * foot of its body, above the footer, where what the surface asks of the person is. A surface whose
+   * decisions are at the foot of its body, above a footer that only leads elsewhere, puts it at the
+   * head of its body instead, since a message at the foot would lie over the decisions.
    */
-  readonly liftsMessage?: boolean
+  readonly messageAt?: 'foot' | 'head'
 }): ReactNode {
   const sheetRef = useRef<HTMLDivElement | null>(null)
-  const footerRef = useRef<HTMLElement | null>(null)
   const scrimRef = useRef<HTMLDivElement | null>(null)
   const animation = useRef<Animation | null>(null)
   const tracker = useRef(new VelocityTracker())
@@ -581,7 +609,6 @@ export function Sheet({
   // is one piece of motion and clears it; whatever ends that motion sets it again.
   const [atRest, setAtRest] = useState(false)
   const reduced = prefersReducedMotion()
-  const hasFooter = Boolean(footer)
 
   // Opening is a render-phase adjustment rather than an effect: the surface has to exist in the
   // same commit that starts its motion, or its first frame is missing.
@@ -605,33 +632,13 @@ export function Sheet({
     onClose()
   }, [onClose])
 
-  // A message in passing rests above the footer of an open surface, where its actions are, and not
-  // over them. The room under the footer's top edge is measured from the surface's own box, since
-  // the surface pads its foot by the platform's inset, and it changes with the text size and the
-  // inset: it is handed to the toast as `--toast-lift`. It goes as the surface starts to leave, so
-  // the message settles back as the surface goes.
-  const lifts = liftsMessage && hasFooter
-  useLayoutEffect(() => {
-    const sheet = sheetRef.current
-    const footer = footerRef.current
-    if (!open || !lifts || sheet === null || footer === null) return
-    const root = document.documentElement
-    const measure = () => {
-      root.style.setProperty(TOAST_LIFT, `${String(sheet.clientHeight - footer.offsetTop)}px`)
-    }
-    measure()
-    const watching = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure)
-    // The sheet's content box changes when its padding does under its height cap, and its border box
-    // when its padding does below it: the inset under the footer is padding, and it changes with the
-    // orientation, or when a keyboard or a bar comes or goes.
-    watching?.observe(sheet)
-    watching?.observe(sheet, { box: 'border-box' })
-    watching?.observe(footer)
-    return () => {
-      watching?.disconnect()
-      root.style.removeProperty(TOAST_LIFT)
-    }
-  }, [open, lifts])
+  // A message in passing is drawn inside an open surface, in the place the surface keeps for it, and
+  // goes back to the screen as the surface starts to leave.
+  const [dock, setDock] = useState<HTMLElement | null>(null)
+  useEffect(() => {
+    if (!open || dock === null) return
+    return offerToastDock(dock)
+  }, [open, dock])
 
   useEffect(() => {
     if (!mounted) {
@@ -921,16 +928,15 @@ export function Sheet({
             ×
           </IconButton>
         </header>
-        {/* A screen reader inside a modal dialog does not reach a region outside it, so the
-            banners in the dialog say their words to a region of its own. */}
-        <div className="dialog-body">
-          <AnnouncementScope>{children}</AnnouncementScope>
+        <div className="dialog-main" data-message={messageAt}>
+          {/* A screen reader inside a modal dialog does not reach a region outside it, so the
+              banners in the dialog say their words to a region of its own. */}
+          <div className="dialog-body">
+            <AnnouncementScope>{children}</AnnouncementScope>
+          </div>
+          <div className="toast-dock" ref={setDock} />
         </div>
-        {footer ? (
-          <footer className="dialog-footer" ref={footerRef}>
-            {footer}
-          </footer>
-        ) : null}
+        {footer ? <footer className="dialog-footer">{footer}</footer> : null}
       </div>
     </>
   )

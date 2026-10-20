@@ -1,0 +1,62 @@
+/**
+ * What decides how long a passing message stays, and where it is drawn.
+ *
+ * A message is drawn over the screen it was said on. While a surface that holds the focus is open
+ * (a sheet), the message is drawn inside it, where the keyboard and a screen reader stay: a modal
+ * surface is the whole of the screen to both, and a message outside it can be neither reached nor
+ * dismissed from them. The surface offers a place for it, and the message takes the newest place on
+ * offer.
+ */
+
+import { useSyncExternalStore } from 'react'
+
+/**
+ * The time a message stays once nothing holds it, in milliseconds.
+ *
+ * A floor, so that a short message is not gone before it is seen, and a longer one where the message
+ * offers something to do, which takes a decision as well as a reading. A time for each word, so that
+ * a long message is read to its end whatever its box shows of it. And a ceiling, so that no message
+ * stays on until it is put away. A pointer resting on the message or focus inside it holds it, and
+ * it goes this long after both have left.
+ */
+export const TOAST_FLOOR_MS = 4200
+export const TOAST_FLOOR_WITH_ACTION_MS = 8000
+export const TOAST_WORD_MS = 300
+export const TOAST_CEILING_MS = 20_000
+
+/** How long `text` stays, with an action of its own or without. */
+export function toastDwell(text: string, hasAction: boolean): number {
+  const words = text.split(/\s+/).filter((word) => word !== '').length
+  const floor = hasAction ? TOAST_FLOOR_WITH_ACTION_MS : TOAST_FLOOR_MS
+  return Math.min(TOAST_CEILING_MS, Math.max(floor, words * TOAST_WORD_MS))
+}
+
+/** The places on offer, oldest first: one for each open surface that has one. */
+let docks: readonly HTMLElement[] = []
+const watchers = new Set<() => void>()
+
+function publish(): void {
+  for (const watcher of watchers) watcher()
+}
+
+/** Offers `dock` as a place for a message, until the returned function takes it back. */
+export function offerToastDock(dock: HTMLElement): () => void {
+  docks = [...docks, dock]
+  publish()
+  return () => {
+    docks = docks.filter((each) => each !== dock)
+    publish()
+  }
+}
+
+function subscribe(watcher: () => void): () => void {
+  watchers.add(watcher)
+  return () => {
+    watchers.delete(watcher)
+  }
+}
+
+/** The place the newest open surface offers, or null where none is open. */
+export function useToastDock(): HTMLElement | null {
+  return useSyncExternalStore(subscribe, () => docks.at(-1) ?? null)
+}

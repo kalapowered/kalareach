@@ -993,6 +993,18 @@
   padding-block-end: var(--safe-bottom);
 }
 
+/*
+ * A passing message on the phone rests above the tab bar and above a software keyboard, whichever of
+ * the two reaches higher. It is placed in the shell's own frame, which the keyboard's measure is in
+ * (the shell follows what the platform has panned), and not in the window's: a message at the foot
+ * of the window lies under a keyboard and over the bar's controls. The bar says how high it is
+ * (`--tabbar-room`). While a sheet is open the message is drawn inside the sheet instead.
+ */
+.m-shell > .toast {
+  position: absolute;
+  bottom: calc(max(var(--tabbar-room, 0px), var(--keyboard)) + var(--gap-3));
+}
+
 /* ---- Landscape and larger screens ------------------------------------------------------------ */
 
 @media (min-width: 40rem) {
