@@ -165,6 +165,15 @@
   app-region: drag;
 }
 
+/* The connection text is the host's own words about why there is no contact, which can be a sentence
+   or a path as long as a window is wide, and at a large text size a narrow window holds a few letters
+   of it to a line. It wraps inside the bar, and a word wider than the bar is broken, as one in a line
+   of text is: the bar never widens the page. */
+.connection {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .topbar button,
 .topbar a,
 .topbar input {

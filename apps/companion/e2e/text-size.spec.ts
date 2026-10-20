@@ -982,3 +982,52 @@ test.describe('a passing message', () => {
     })
   }
 })
+
+// KR-REQ-13.19: the desktop window's top bar says whether there is contact with the host, and when
+// there is none it says why in the host's own words, which can be a sentence or a path as long as a
+// window is wide. They wrap inside the bar, at every text size, on a window as narrow as a phone.
+test.describe('the connection text in the top bar', () => {
+  // A sentence, and a socket address of the kind a host gives: one word wider than a narrow window.
+  const REASON =
+    'The host refused the connection: unix:///Users/someone/Library/Application%20Support/KalaReach/run/host-0123456789abcdef.sock does not exist'
+
+  for (const [width, height] of [
+    [1280, 720],
+    [390, 844]
+  ] as const) {
+    for (const [size, ratio] of [
+      ['default', 1],
+      ['largest', LARGEST]
+    ] as const) {
+      test(`wraps a long reason inside the bar at the ${size} text size, ${width} px wide`, async ({ page }) => {
+        await withSystemTextScale(page, ratio)
+        await withWideFace(page)
+        await page.setViewportSize({ width, height })
+        await page.goto('/harness.html')
+        await page.waitForSelector('.app-shell')
+        await page.evaluate((reason) => {
+          window.krTestHost?.setConnected(false, reason)
+        }, REASON)
+        const bar = page.locator('.topbar')
+        await expect(bar).toContainText('does not exist')
+        await expect(page.locator('.connection')).toBeVisible()
+
+        const sideways = () =>
+          page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+        expect(await sideways(), 'the page does not scroll sideways for the reason').toBeLessThanOrEqual(0)
+        expect(await overrunning(page, '.topbar'), 'lines of the reason that run past the screen or the bar').toEqual([])
+        await page.screenshot({ path: `/tmp/kr-text-size-topbar-${size}-${width}-${test.info().project.name}.png` })
+
+        // The control: kept from wrapping, the same measure sees the reason run out of the bar. On
+        // a wide window at the default size the reason fits on one line, and there is nothing to see.
+        if (width < 1000 || ratio > 1) {
+          await stopWrapping(page, ['.topbar'])
+          expect(
+            (await sideways()) > 0 || (await overrunning(page, '.topbar')).length > 0,
+            'the measure sees a reason that cannot wrap'
+          ).toBe(true)
+        }
+      })
+    }
+  }
+})
