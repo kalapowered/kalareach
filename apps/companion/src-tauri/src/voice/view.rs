@@ -49,6 +49,21 @@ pub struct VoiceCallState {
     /// overwrite the record of the call after it.
     #[serde(skip)]
     pub owner: u64,
+    /// The owners that have ended a call and have still to say what the voice service did about
+    /// it, whose call may by now be another's record. The screen is told only whether there are
+    /// any: while there are, what the service did may still arrive as something owed, and the
+    /// screen keeps reading. It lives in the record so that every copy of the record carries it,
+    /// and is kept across a new call's start as what is owed is.
+    #[serde(rename = "finalising", serialize_with = "any_owner")]
+    pub finalising_owners: std::collections::BTreeSet<u64>,
+}
+
+/// Whether any owner is finalising, as the screen reads it.
+fn any_owner<S: serde::Serializer>(
+    owners: &std::collections::BTreeSet<u64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_bool(!owners.is_empty())
 }
 
 impl VoiceCallState {
@@ -69,6 +84,7 @@ impl VoiceCallState {
             warning: None,
             owed: Vec::new(),
             owner: 0,
+            finalising_owners: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -78,8 +94,10 @@ impl VoiceCallState {
     /// calls before it.
     pub fn begin(&mut self, owner: u64) {
         let owed = std::mem::take(&mut self.owed);
+        let finalising = std::mem::take(&mut self.finalising_owners);
         *self = Self::no_call();
         self.owed = owed;
+        self.finalising_owners = finalising;
         self.owner = owner;
     }
 
@@ -105,7 +123,8 @@ impl VoiceCallState {
 #[derive(Clone, Debug, Serialize)]
 pub struct OwedView {
     /// `revocation` when a call's grant may still be live at the host, `start_unknown` when the
-    /// host never said whether it made a call.
+    /// host never said whether it made a call, `service_close` when the voice service has not
+    /// confirmed that it closed a call.
     pub kind: String,
     /// What a person is told.
     pub words: String,
@@ -179,6 +198,26 @@ impl OwedView {
             voice_session_id: None,
             until_ms,
             ..Self::of(host)
+        }
+    }
+
+    /// A service `host` made a call for, that the voice service has not said it closed, though this
+    /// device asked: the call's own limit has not passed. The notice lapses with it, at `until_ms`,
+    /// which is when the host's reading of the call's limit and the clock allowance are over. It
+    /// does not say when the service closes the call; it may close it later than that.
+    #[must_use]
+    pub fn service_close(voice_session_id: VoiceSessionId, until_ms: u64, host: &CallHost) -> Self {
+        let base = Self::of(host);
+        Self {
+            kind: "service_close".to_owned(),
+            words: format!(
+                "The voice service has not confirmed that it closed the call that {} started.",
+                base.host_name
+            ),
+            action_id: None,
+            voice_session_id: Some(voice_session_id.to_string()),
+            until_ms,
+            ..base
         }
     }
 

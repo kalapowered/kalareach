@@ -638,6 +638,12 @@ export interface FakeHostControls {
   holdVoiceStart(): () => void
   /** Sets what the voice service did about the call that last ended, once it has said. */
   settleVoiceBroker(broker: string): void
+  /**
+   * Says that a call that ended has still to say what the voice service did about it, with no
+   * pending word in the record the screen holds: an earlier call's answer, after a later call
+   * replaced its record.
+   */
+  finaliseVoice(finalising: boolean): void
   /** Sets whether the host the call belongs to is reached: `reachable` or `lost`. */
   setVoiceHost(host: 'reachable' | 'lost'): void
   /** Sets the warning a person is told before starting, or none. */
@@ -1019,12 +1025,25 @@ export function fakeHost(
     ended: null,
     warning: null,
     owed: [],
+    finalising: false,
     brokerReachable: seed.brokerReachable,
     startRefusal: null,
     rate: { ...VOICE_TERMS.rate },
     terms: seed.terms,
     scope: 1,
     startCapture: seed.capture
+  }
+  /** What the device owes when the voice service did not confirm that it closed a call. */
+  const oweServiceClose = (): void => {
+    voice.owed.push({
+      kind: 'service_close',
+      words: 'The voice service has not confirmed that it closed the call that Your Mac started.',
+      action_id: null,
+      voice_session_id: VOICE_SESSION,
+      until_ms: Date.now() + 1_800_000,
+      host_reference: 'a-host',
+      host_name: 'Your Mac'
+    })
   }
   /** What the device owes when it could not finish ending a call, as it records it. */
   const oweRevocation = (owed: Partial<VoiceOwed> = {}): void => {
@@ -3082,6 +3101,10 @@ export function fakeHost(
         }),
         ...ended
       }
+      // As the device does: the service's answer is still to come while the word is pending, and
+      // what it did not confirm is owed.
+      voice.finalising = voice.ended.broker === 'pending'
+      if (voice.ended.broker === 'not_confirmed') oweServiceClose()
     },
     holdVoiceStart() {
       let release = () => {}
@@ -3092,6 +3115,11 @@ export function fakeHost(
     },
     settleVoiceBroker(broker) {
       if (voice.ended) voice.ended = { ...voice.ended, broker }
+      voice.finalising = false
+      if (broker === 'not_confirmed') oweServiceClose()
+    },
+    finaliseVoice(finalising) {
+      voice.finalising = finalising
     },
     settingUpAVoiceCall() {
       voice.call = null
@@ -3232,6 +3260,8 @@ interface VoiceState {
   warning: string | null
   /** What this device could not finish, which the host may still hold open. */
   owed: VoiceOwed[]
+  /** Whether a call that ended has still to say what the voice service did about it. */
+  finalising: boolean
   /** Whether the control socket to the voice service is carrying requests. */
   brokerReachable: boolean
   /** The reason a start answers `unavailable` with, when one is set. */
@@ -3285,7 +3315,8 @@ function voiceCallState(voice: VoiceState): VoiceCallState {
   const left = {
     ended: voice.ended,
     warning: voice.warning,
-    owed: voice.owed.filter((owed) => owed.until_ms > Date.now())
+    owed: voice.owed.filter((owed) => owed.until_ms > Date.now()),
+    finalising: voice.finalising
   }
   if (!running) {
     return {

@@ -59,7 +59,7 @@ use tokio::time::Instant;
 use super::cause::Cause;
 use super::host::{CallHost, HostReach, Pairing, has_ended, revoke};
 use super::view::{DelegationRow, EndedView, HostEnd, OwedView, VoiceCallState};
-use super::{Closed, Cmd, NoteKey, Shared, StartRequest, Started, now_ms};
+use super::{Closed, Cmd, NoteKey, ServiceCall, Shared, StartRequest, Started, now_ms};
 use crate::commands::{MUTATION_TTL, NoPreconditions};
 use crate::error::{CommandError, Result};
 
@@ -1472,6 +1472,11 @@ impl Owner {
                 }
                 .to_owned(),
             });
+            // What the voice service did about the call arrives after this record may be another
+            // call's, and the screen is told so until it has.
+            if needs_broker {
+                state.finalising_owners.insert(id);
+            }
         });
         // What the end owes is recorded with the host being told, in one step. The grant may be
         // live at the host until the moment the call was to close, by the host's reading of the
@@ -1498,11 +1503,17 @@ impl Owner {
 
         if needs_broker {
             let broker = self.finalise(&cause, closing, &host_end).await;
-            self.view(|state| {
-                if let Some(ended) = state.ended.as_mut().filter(|ended| ended.owner == id) {
-                    ended.broker = broker.to_owned();
-                }
-            });
+            let service =
+                self.descriptor
+                    .as_ref()
+                    .zip(self.host.as_ref())
+                    .map(|(descriptor, host)| ServiceCall {
+                        call_id: descriptor.call_id.clone(),
+                        voice_session_id: descriptor.voice_session_id,
+                        until_ms: owed_until(descriptor.closes_at_ms.get()),
+                        host: host.clone(),
+                    });
+            self.shared.record_service(id, broker, service.as_ref());
         }
         if let Some(control) = self.control.take() {
             control.stop();

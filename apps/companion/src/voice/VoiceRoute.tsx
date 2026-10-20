@@ -334,7 +334,11 @@ export function VoiceRoute({
   // The call's own state, re-read while one runs or is being set up, and while the voice service
   // has still to say whether it closed the call that ended. The native layer owns the microphone,
   // and the interruptions that matter most are the ones nothing asked for.
-  const reading = call !== null || setUp || left?.ended?.broker === 'pending'
+  // The service's answer about an earlier call may arrive as something owed after a later call has
+  // replaced that call's record, so the device's word that something is still finalising keeps the
+  // screen reading as well.
+  const reading =
+    call !== null || setUp || left?.ended?.broker === 'pending' || left?.finalising === true
   useEffect(() => {
     if (!reading) return
     let current = true
@@ -583,7 +587,8 @@ export function VoiceRoute({
                 ended: null,
                 delegations: [],
                 warning: null,
-                owed: []
+                owed: [],
+                finalising: false
               })
             )
             setLeft(null)

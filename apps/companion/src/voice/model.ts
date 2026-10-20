@@ -542,15 +542,14 @@ export function endedWords(
 
 /**
  * What the screen says of the voice service's part in a call's end, once it is known, or null when
- * there is nothing to add: the service confirmed the closure, or there was no call to close.
+ * there is nothing to add: the service confirmed the closure, there was no call to close, or the
+ * service did not confirm it, which is something owed and said with what is owed.
  *
  * It is said apart from the rest of the end, because it arrives last: the service is asked after
  * the host, and the screen does not wait for it.
  */
 export function serviceWords(ended: VoiceEnded): string | null {
   switch (ended.broker) {
-    case 'not_confirmed':
-      return 'The voice service has not confirmed that it closed the call; it closes it at its own deadline.'
     case 'unknown':
       return 'If the host made a call, the voice service holds it and closes it at its own deadline: this device cannot name it to close it.'
     default:
@@ -599,8 +598,13 @@ export function closureWords(
  * clock that is not this device's own.
  */
 export function owedWords(owed: VoiceOwed): string {
-  if (owed.kind !== 'revocation') return `${owed.words} It was asked of ${owed.host_name}.`
   const until = new Date(owed.until_ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  // The voice service has not said it closed the call. The notice lasts until the call's own limit
+  // has passed, which is not a time by which the service has closed it.
+  if (owed.kind === 'service_close') {
+    return `${owed.words} This notice stays until ${until}, after the call's own limit.`
+  }
+  if (owed.kind !== 'revocation') return `${owed.words} It was asked of ${owed.host_name}.`
   return `${owed.host_name} may still hold a grant for this call open. It ends by itself by ${until}. ${owed.words}`
 }
 

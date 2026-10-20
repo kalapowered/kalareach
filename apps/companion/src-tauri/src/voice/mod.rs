@@ -178,13 +178,24 @@ pub struct NoteKey {
     pub origin: String,
 }
 
+/// A call at the voice service, with what a notice that the service has not closed it is built from.
+#[derive(Clone)]
+pub(crate) struct ServiceCall {
+    pub(crate) call_id: String,
+    pub(crate) voice_session_id: VoiceSessionId,
+    /// The moment the notice lapses: the call's own limit by the host's reading, and the clock
+    /// allowance.
+    pub(crate) until_ms: u64,
+    pub(crate) host: CallHost,
+}
+
 /// What an owner that failed leaves for the supervisor to finish.
 struct Emergency {
     call: Option<CallId>,
     host: Option<CallHost>,
     voice_session_id: Option<VoiceSessionId>,
-    /// The call at the voice service, and the moment the host's grant for it ends by itself.
-    service_call: Option<(String, u64)>,
+    /// The call at the voice service, and what is owed if the service does not confirm it closed.
+    service_call: Option<ServiceCall>,
     /// A start the host has not been heard to answer: the action it was sent under, and the
     /// moment a call it made would end by itself.
     pending_start: Option<(ActionId, u64)>,
@@ -487,11 +498,11 @@ impl Shared {
                 call,
                 host: host.cloned(),
                 voice_session_id: descriptor.map(|descriptor| descriptor.voice_session_id),
-                service_call: descriptor.map(|descriptor| {
-                    (
-                        descriptor.call_id.clone(),
-                        owner::owed_until(descriptor.closes_at_ms.get()),
-                    )
+                service_call: descriptor.zip(host).map(|(descriptor, host)| ServiceCall {
+                    call_id: descriptor.call_id.clone(),
+                    voice_session_id: descriptor.voice_session_id,
+                    until_ms: owner::owed_until(descriptor.closes_at_ms.get()),
+                    host: host.clone(),
                 }),
                 pending_start,
                 reach: Arc::clone(reach),
@@ -685,8 +696,8 @@ impl Shared {
                     ..
                 },
             ) => "closed_by_host",
-            (Some((call_id, _)), _) => {
-                if self.close_over_http(&kept.tokens, call_id).await {
+            (Some(service), _) => {
+                if self.close_over_http(&kept.tokens, &service.call_id).await {
                     "closed_over_http"
                 } else {
                     "not_confirmed"
@@ -704,40 +715,98 @@ impl Shared {
                 view.session = None;
                 view.control = "none".to_owned();
                 view.host = "none".to_owned();
-                match view.ended.as_mut().filter(|ended| ended.owner == owner) {
-                    Some(ended) => {
-                        if ended.broker == "pending" {
-                            ended.broker = broker.to_owned();
+                // The voice service's part is recorded after the host's, with what it owes, by
+                // `record_service`: it sets the word, so the entry exists before the word changes.
+                if view.ended.as_ref().is_none_or(|ended| ended.owner != owner) {
+                    view.ended = Some(EndedView {
+                        owner,
+                        cause: "owner_failed".to_owned(),
+                        words: "This device's call stopped working, so the call was ended."
+                            .to_owned(),
+                        closed_locally,
+                        host: host_end.clone(),
+                        // A word that owes nothing is final at once; the one that owes a notice
+                        // waits for `record_service`, which adds the notice and then sets it.
+                        broker: if broker == "not_confirmed" {
+                            "pending"
+                        } else {
+                            broker
                         }
-                    }
-                    None => {
-                        view.ended = Some(EndedView {
-                            owner,
-                            cause: "owner_failed".to_owned(),
-                            words: "This device's call stopped working, so the call was ended."
-                                .to_owned(),
-                            closed_locally,
-                            host: host_end.clone(),
-                            broker: broker.to_owned(),
-                        });
-                    }
+                        .to_owned(),
+                    });
                 }
             }
-            if let (Some(words), Some((_, until_ms)), Some(id), Some(host), true) = (
+            if let (Some(words), Some(service), Some(id), Some(host), true) = (
                 host_end.owed_reason(),
                 &kept.service_call,
                 kept.voice_session_id,
                 &kept.host,
                 toward_host_asked,
             ) {
-                owed.push(OwedView::revocation(words, id, *until_ms, host));
+                owed.push(OwedView::revocation(words, id, service.until_ms, host));
             }
             if let (Some((action_id, until_ms)), Some(host)) = (kept.pending_start, &kept.host) {
                 owed.push(OwedView::start_unknown(action_id, until_ms, host));
             }
         }
         self.record_end(owner, owed);
+        self.record_service(owner, broker, kept.service_call.as_ref());
         self.release(owner);
+    }
+
+    /// Ends a call whose owner failed, and says that the owner has nothing more to say. The owner
+    /// may have failed after it told the screen it was finalising, and nothing else will say it is
+    /// done: this is the only place that ends a failed owner's call.
+    async fn after_failed_owner(&self, owner: u64) {
+        self.finish_failed_owner(owner).await;
+        self.view
+            .lock()
+            .expect("the view lock is not poisoned")
+            .finalising_owners
+            .remove(&owner);
+    }
+
+    /// Records what the voice service did about the call `owner` ended, in one step: when it did
+    /// not confirm that it closed the call, a notice that lasts until the call's own limit has
+    /// passed is owed, and then the record's word changes, so that the notice is there before the
+    /// screen reads the word. The owner is no longer finalising, and no longer needs the emergency
+    /// record. The file is written by the one rule: when it can be read and something changed.
+    pub(crate) fn record_service(
+        &self,
+        owner: u64,
+        word: &'static str,
+        service: Option<&ServiceCall>,
+    ) {
+        let _ordered = self
+            .keeping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let took = self.take_up_unread();
+        let mut added = false;
+        {
+            let mut view = self.view.lock().expect("the view lock is not poisoned");
+            if let (true, Some(service)) = (word == "not_confirmed", service) {
+                view.owe(
+                    now_ms(),
+                    OwedView::service_close(
+                        service.voice_session_id,
+                        service.until_ms,
+                        &service.host,
+                    ),
+                );
+                added = true;
+            }
+            if let Some(ended) = view
+                .ended
+                .as_mut()
+                .filter(|ended| ended.owner == owner && ended.broker == "pending")
+            {
+                ended.broker = word.to_owned();
+            }
+            view.finalising_owners.remove(&owner);
+        }
+        self.forget_emergency(owner);
+        self.persist(took, added);
     }
 }
 
@@ -924,7 +993,7 @@ impl Calls {
             if let Err(error) = task.await
                 && error.is_panic()
             {
-                watched.finish_failed_owner(owner).await;
+                watched.after_failed_owner(owner).await;
             }
         });
         answer
@@ -1066,5 +1135,89 @@ impl Calls {
             );
         }
         state
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use companion_platform::call::{Answered, CallFuture, Held, OpenedCall};
+
+    use super::*;
+
+    /// Native code that is never asked for anything.
+    struct NoNativeCode;
+
+    impl CallPlatform for NoNativeCode {
+        fn open(&self) -> CallFuture<'_, OpenedCall> {
+            Box::pin(async { unreachable!("no call is opened") })
+        }
+
+        fn offer<'a>(&'a self, _call: &'a CallId) -> CallFuture<'a, String> {
+            Box::pin(async { unreachable!("no offer is made") })
+        }
+
+        fn accept<'a>(&'a self, _call: &'a CallId, _answer: &'a str) -> CallFuture<'a, Answered> {
+            Box::pin(async { unreachable!("no answer is applied") })
+        }
+
+        fn permit<'a>(
+            &'a self,
+            _call: &'a CallId,
+            _voice_session_id: &'a str,
+            _closes_at_epoch_ms: u64,
+        ) -> CallFuture<'a, bool> {
+            Box::pin(async { unreachable!("no call is permitted") })
+        }
+
+        fn mute<'a>(&'a self, _call: &'a CallId, _what: Mute, _muted: bool) -> CallFuture<'a, ()> {
+            Box::pin(async { unreachable!("nothing is muted") })
+        }
+
+        fn stop<'a>(&'a self, _call: &'a CallId) -> CallFuture<'a, ()> {
+            Box::pin(async { unreachable!("no call is stopped") })
+        }
+
+        fn held(&self) -> CallFuture<'_, Held> {
+            Box::pin(async { unreachable!("nothing is held") })
+        }
+
+        fn alive<'a>(&'a self, _call: &'a CallId) -> CallFuture<'a, Held> {
+            Box::pin(async { unreachable!("no sign is given") })
+        }
+    }
+
+    /// An owner that ended a call and was still finalising it when it failed is no longer
+    /// finalising, whatever else has happened to the record since: a later call began and replaced
+    /// the supervisor's emergency record, so the supervisor has nothing to end, and nothing else
+    /// will say the owner is done. No integration test can make an owner fail between the moment it
+    /// frees the slot and the moment it records the service's answer: the only awaits there run in
+    /// tasks of their own.
+    #[tokio::test]
+    async fn a_failed_owner_that_was_finalising_is_not_finalising_once_its_supervisor_is_done() {
+        let calls = Calls::on_phone(
+            Arc::new(NoNativeCode),
+            Service::managed().expect("a service"),
+            Timings::default(),
+            Kept::nowhere(),
+        );
+        let shared = calls.shared.as_ref().expect("a phone holds calls");
+        {
+            let mut view = shared.view.lock().expect("the view lock");
+            // Owner 9 began after owner 7 ended its call and was finalising it.
+            view.begin(9);
+            view.finalising_owners.insert(7);
+            view.finalising_owners.insert(9);
+        }
+
+        shared.after_failed_owner(7).await;
+
+        let view = shared.view.lock().expect("the view lock");
+        assert!(!view.finalising_owners.contains(&7));
+        assert!(
+            view.finalising_owners.contains(&9),
+            "another owner's finalisation is not the failed owner's to end"
+        );
+        assert_eq!(view.owner, 9, "the later call's record is left as it is");
+        assert!(view.ended.is_none());
     }
 }

@@ -192,6 +192,11 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
             words:
               'The host did not confirm that it withdrew the grant: the host could not be reached in time.'
           })
+          window.krTestHost?.oweVoice({
+            kind: 'service_close',
+            words:
+              'The voice service has not confirmed that it closed the call that Your Mac started.'
+          })
         })
         await page.getByTestId('voice-entry').click()
         await expect(page.getByRole('status', { name: 'The last call' })).toBeVisible()
@@ -361,6 +366,11 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
           window.krTestHost?.oweVoice({
             words:
               'The host did not confirm that it withdrew the grant: the host could not be reached in time.'
+          })
+          window.krTestHost?.oweVoice({
+            kind: 'service_close',
+            words:
+              'The voice service has not confirmed that it closed the call that Your Mac started.'
           })
         })
         await page.getByTestId('voice-entry').click()

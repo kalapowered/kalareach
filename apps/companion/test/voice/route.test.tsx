@@ -906,6 +906,30 @@ describe('while a call is running', () => {
     })
   })
 
+  // What the voice service did about an earlier call may arrive after a later call has replaced the
+  // record that call left: while the device says something is still finalising the screen goes on
+  // reading, and shows the notice when it comes, with no change on the screen and no reload.
+  it('goes on reading while an earlier call is still waiting on the voice service', async () => {
+    const { controls } = start((controls) => {
+      controls.finaliseVoice(true)
+    })
+    await waitForChoice()
+    expect(screen.queryByText(/has not confirmed that it closed the call/)).not.toBeInTheDocument()
+
+    controls.oweVoice({
+      kind: 'service_close',
+      words: 'The voice service has not confirmed that it closed the call that Your Mac started.'
+    })
+    controls.finaliseVoice(false)
+
+    await waitFor(
+      () => {
+        expect(screen.getByText(/has not confirmed that it closed the call/)).toBeInTheDocument()
+      },
+      { timeout: 4000 }
+    )
+  })
+
   // The microphone is the first thing to say: a stop whose media this device could not confirm
   // stopped is not reported as a call that is closed, and the call stays on the screen.
   it('does not say the call is closed when this device could not confirm the media stopped', async () => {

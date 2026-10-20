@@ -127,6 +127,7 @@ function callState(over: Partial<VoiceCallState> = {}): VoiceCallState {
     delegations: [],
     warning: null,
     owed: [],
+    finalising: false,
     ...over
   }
 }
@@ -383,6 +384,23 @@ describe('what is owed', () => {
     })
     expect(words).toBe("The host never said whether it created the call. It was asked of Ric's Mac.")
   })
+
+  // The notice lasts until the call's own limit has passed, which is not a time by which the voice
+  // service has closed the call.
+  it('says when the notice of a close the service did not confirm ends, and not when the service closes', () => {
+    const words = owedWords({
+      kind: 'service_close',
+      words: "The voice service has not confirmed that it closed the call that Ric's Mac started.",
+      action_id: null,
+      voice_session_id: 'vs-1',
+      until_ms: Date.UTC(2026, 9, 17, 12, 30),
+      host_reference: 'ref-1',
+      host_name: "Ric's Mac"
+    })
+    expect(words).toContain('has not confirmed that it closed the call')
+    expect(words).toContain("after the call's own limit")
+    expect(words).not.toContain('It was asked of')
+  })
 })
 
 describe('what the voice service did about a call that ended', () => {
@@ -394,10 +412,12 @@ describe('what the voice service did about a call that ended', () => {
     }
   })
 
-  it('says the service has not confirmed, and that a call this device cannot name may be held', () => {
-    expect(serviceWords({ ...endedFor(), broker: 'not_confirmed' })).toContain(
-      'has not confirmed that it closed the call'
-    )
+  // What the service did not confirm is owed, and said with what is owed.
+  it('says nothing of a close the service did not confirm: that is something owed', () => {
+    expect(serviceWords({ ...endedFor(), broker: 'not_confirmed' })).toBeNull()
+  })
+
+  it('says that a call this device cannot name may be held', () => {
     expect(serviceWords({ ...endedFor(), broker: 'unknown' })).toContain(
       'cannot name it to close it'
     )

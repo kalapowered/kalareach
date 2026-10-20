@@ -185,12 +185,17 @@ fn document_naming(origin: &str) -> ConfigurationDocument {
 
 /// The voice service at `origin`, reached the way the application reaches it.
 fn service_at(origin: &str) -> Service {
+    service_with(origin, HttpDeadlines::default())
+}
+
+/// The voice service at `origin`, with the deadlines its HTTP exchanges are given.
+fn service_with(origin: &str, deadlines: HttpDeadlines) -> Service {
     Service {
         origin: origin.to_owned(),
         http: Arc::new(
             HttpService::with(
                 kr_protocol::service::GatewayOrigin::new(origin).expect("an origin"),
-                HttpDeadlines::default(),
+                deadlines,
                 managed_response_limits(),
             )
             .expect("a transport"),
@@ -290,6 +295,17 @@ async fn scene_with(
     signed_in: Option<IssuedGrant>,
     account_origin: Option<&str>,
 ) -> Scene {
+    scene_over(timings, signed_in, account_origin, HttpDeadlines::default()).await
+}
+
+/// As [`scene_with`], with the deadlines the phone's HTTP exchanges with the voice service are
+/// given.
+async fn scene_over(
+    timings: Timings,
+    signed_in: Option<IssuedGrant>,
+    account_origin: Option<&str>,
+    deadlines: HttpDeadlines,
+) -> Scene {
     let stand_in = StandIn::start().await;
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start_with_document(&owner, &document_naming(stand_in.origin())).await;
@@ -323,7 +339,10 @@ async fn scene_with(
     let data = tempfile::tempdir().expect("a directory");
     let calls = Calls::on_phone(
         Arc::clone(&platform) as Arc<dyn companion_platform::call::CallPlatform>,
-        service_at(account_origin.unwrap_or_else(|| stand_in.origin())),
+        service_with(
+            account_origin.unwrap_or_else(|| stand_in.origin()),
+            deadlines,
+        ),
         timings,
         Kept::at(data.path()),
     );
@@ -3042,6 +3061,272 @@ async fn a_call_started_while_the_record_cannot_be_read_stands_in_it_once_it_can
     scene.stop_host().await;
 }
 
+/// Timings and deadlines that leave the voice service all the time a test holds one of its
+/// answers for: the product's own bounds never decide the interleaving.
+fn waiting_on_the_service() -> (Timings, HttpDeadlines) {
+    let long = Duration::from_secs(300);
+    (
+        Timings {
+            close_within: long,
+            ..quick()
+        },
+        HttpDeadlines {
+            connect: Duration::from_secs(5),
+            read: long,
+            total: long,
+        },
+    )
+}
+
+/// A call whose close the voice service has not confirmed, though this device asked, is owed until
+/// the call's own limit has passed, and a new start inside the window in which the answer is
+/// awaited does not lose it. The device says it is still finalising while the earlier call's answer
+/// is out, however many calls came and went meanwhile, so that a screen goes on reading.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_inside_the_finalise_window_keeps_the_previous_calls_unconfirmed_close_owed() {
+    let (timings, deadlines) = waiting_on_the_service();
+    let mut scene = scene_over(
+        timings,
+        Some(phone_grant(PHONE_TOKEN, 3600)),
+        None,
+        deadlines,
+    )
+    .await;
+    let first = scene.start().await;
+    let call = &first["value"]["outcome"]["started"]["session"];
+    let first_session = call["voice_session_id"].clone();
+    let first_closes = milliseconds(&call["closes_at_ms"]);
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    // The service cannot be asked to close the call by anyone: the host's close is refused at once,
+    // the control's is refused, and the phone's own is held, then refused.
+    scene.stand_in.refuse_the_hosts_closes();
+    scene.stand_in.hold_then_refuse_the_first_phone_close();
+    scene.stand_in.control().provider_down(true);
+
+    let closure = scene
+        .call("voice_stop", json!({ "voiceSessionId": null }))
+        .expect("the stop is answered");
+    assert_eq!(
+        closure["host_failure"],
+        serde_json::Value::Null,
+        "{closure}"
+    );
+    tokio::time::timeout(WATCHDOG, async {
+        while scene.stand_in.phone_closes() == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the device asked the service to close the call over its own route");
+
+    // The window is open: a second call starts, runs, and ends with its closure confirmed by its
+    // control, while the first call's answer is still out.
+    scene.stand_in.control().provider_down(false);
+    let _second = scene.start().await;
+    scene
+        .state_where("the second call's control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    let _ = scene
+        .call("voice_stop", json!({ "voiceSessionId": null }))
+        .expect("the second stop is answered");
+    let second_over = scene
+        .state_where("the second call's closure confirmed", |state| {
+            state["ended"]["broker"] == "closed"
+        })
+        .await;
+    // The first call's answer is awaited still: the device says so, and owes nothing yet.
+    assert_eq!(second_over["finalising"], true, "{second_over}");
+    assert!(
+        second_over["owed"]
+            .as_array()
+            .is_some_and(|owed| owed.iter().all(|each| each["kind"] != "service_close")),
+        "{second_over}"
+    );
+
+    scene.stand_in.release_the_held_phone_close();
+    let owed = scene
+        .state_where("the first call's unconfirmed close owed", |state| {
+            state["owed"]
+                .as_array()
+                .is_some_and(|owed| owed.iter().any(|each| each["kind"] == "service_close"))
+        })
+        .await;
+    assert_eq!(owed["finalising"], false, "{owed}");
+    let entries: Vec<&serde_json::Value> = owed["owed"]
+        .as_array()
+        .expect("the entries")
+        .iter()
+        .filter(|each| each["kind"] == "service_close")
+        .collect();
+    assert_eq!(entries.len(), 1, "{owed}");
+    assert_eq!(entries[0]["voice_session_id"], first_session, "{owed}");
+    assert_eq!(
+        milliseconds(&entries[0]["until_ms"]),
+        first_closes + 120_000,
+        "{owed}"
+    );
+    scene.stop_host().await;
+}
+
+/// An owner that fails while the service will not close its call leaves the supervisor to end it,
+/// and the supervisor owes what the service did not confirm as the owner would have: the notice
+/// outlives the next call's start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_supervisor_that_ends_a_call_the_service_will_not_close_owes_it_after_the_next_start() {
+    let (timings, deadlines) = waiting_on_the_service();
+    let mut scene = scene_over(
+        timings,
+        Some(phone_grant(PHONE_TOKEN, 3600)),
+        None,
+        deadlines,
+    )
+    .await;
+    let prepared = scene.prepared().await;
+    let reach = failing_reach(&scene, FailsAt::Pairing, 0);
+    let calls = scene.phone.companion.app.state::<Calls>();
+    let started = calls
+        .start(
+            request_of(&scene, &prepared),
+            Arc::clone(&reach) as Arc<dyn companion_tauri::voice::HostReach>,
+            Arc::clone(&scene.tokens),
+        )
+        .await
+        .expect("a call starts");
+    let companion_tauri::voice::Started::Result(result) = started else {
+        panic!("the host answered with a result");
+    };
+    let kr_protocol::voice::VoiceStartOutcome::Started { session } = result.outcome else {
+        panic!("the call runs");
+    };
+    scene
+        .state_where("a running call", |state| state["running"] == true)
+        .await;
+    scene.stand_in.refuse_the_hosts_closes();
+    scene.stand_in.hold_then_refuse_the_first_phone_close();
+
+    reach.told.store(1, Ordering::SeqCst);
+
+    // The supervisor asks the service over the phone's own route, which holds the answer.
+    tokio::time::timeout(WATCHDOG, async {
+        while scene.stand_in.phone_closes() == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the supervisor asked the service to close the call");
+    scene.stand_in.release_the_held_phone_close();
+    scene
+        .state_where("the supervisor's end", |state| {
+            state["ended"]["cause"] == "owner_failed"
+                && state["setting_up"] == false
+                && state["finalising"] == false
+        })
+        .await;
+
+    // The next call starts, and the notice is still owed.
+    let _again = scene.start().await;
+    let later = scene.state();
+    let entries: Vec<&serde_json::Value> = later["owed"]
+        .as_array()
+        .expect("the entries")
+        .iter()
+        .filter(|each| each["kind"] == "service_close")
+        .collect();
+    assert_eq!(entries.len(), 1, "{later}");
+    assert_eq!(
+        entries[0]["voice_session_id"],
+        serde_json::to_value(session.voice_session_id).expect("a value"),
+        "{later}"
+    );
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// What a call's end owes, kept in memory while the file cannot be read, is written the first time
+/// it can be, by whatever step finds it readable: here the step that records what the voice
+/// service did, which adds nothing of its own.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_an_end_owed_while_the_record_could_not_be_read_is_written_by_the_step_that_reads_it()
+{
+    let timings = Timings {
+        host_within: Duration::from_secs(2),
+        ..quick()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    let prepared = scene.prepared().await;
+    let directory = scene.phone.data.path().join("relaunch-end-locked");
+    Kept::at(&directory)
+        .write(&companion_tauri::voice::KeptVoice::default())
+        .expect("the file is written");
+    lock_the_kept_file(&directory);
+    let calls = Calls::on_phone(
+        Arc::clone(&scene.platform) as Arc<dyn companion_platform::call::CallPlatform>,
+        service_at(scene.stand_in.origin()),
+        Timings {
+            host_within: Duration::from_secs(2),
+            ..quick()
+        },
+        Kept::at(&directory),
+    );
+    let reach = companion_tauri::voice::AppReach::new(scene.phone.companion.app.handle().clone());
+    calls
+        .start(
+            request_of(&scene, &prepared),
+            Arc::new(companion_tauri::voice::AppReach::new(
+                scene.phone.companion.app.handle().clone(),
+            )) as Arc<dyn companion_tauri::voice::HostReach>,
+            Arc::clone(&scene.tokens),
+        )
+        .await
+        .expect("a call starts");
+    tokio::time::timeout(WATCHDOG, async {
+        while calls.state(None).control != "connected" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the call's control attached");
+    // The host does not answer the stop in time, so the end owes the revocation; the service's own
+    // route is then the way left to close the call, and it is held.
+    scene.stand_in.control().provider_down(true);
+    scene.stand_in.hold_closes();
+    let closed = calls
+        .stop(None, &reach)
+        .await
+        .expect("the stop is answered");
+    assert!(
+        matches!(closed.host, companion_tauri::voice::HostEnd::NotTold { .. }),
+        "{closed:?}"
+    );
+    tokio::time::timeout(WATCHDOG, async {
+        while scene.stand_in.phone_closes() == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the device asked the service to close the call over its own route");
+
+    // The file can be read from here on; nothing but the answer of the service happens next, and
+    // the record is not read by anything else meanwhile.
+    unlock_the_kept_file(&directory);
+    scene.stand_in.release_closes();
+    let file = kept_file_where(&directory, |file| {
+        file["owed"]
+            .as_array()
+            .is_some_and(|owed| owed.len() == 1 && owed[0]["kind"] == "revocation")
+    })
+    .await;
+    assert_eq!(file["owed"].as_array().map(Vec::len), Some(1), "{file}");
+    scene.stop_host().await;
+}
+
 /// Makes the kept file one the system refuses to read, as a phone's is before its first unlock: the
 /// file is put aside, and a link that leads back to itself stands where it was, which cannot be
 /// opened by anyone.
@@ -3064,7 +3349,9 @@ fn unlock_the_kept_file(directory: &std::path::Path) {
             .is_symlink(),
         "the file that could not be read was written over"
     );
-    std::fs::remove_file(&file).expect("the link goes");
+    // One step, so that no reader of the record sees the file missing between the link going and
+    // the file coming back: a missing file is nothing kept, and the device reads the record from
+    // the moment a call ends, not only when a test asks.
     std::fs::rename(directory.join("voice-kept.locked"), &file).expect("the file is back");
 }
 

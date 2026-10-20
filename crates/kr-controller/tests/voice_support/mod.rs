@@ -98,6 +98,25 @@ struct State {
     tokens: Vec<(String, Disposition)>,
     answer: Answering,
     upgrades_turned_away: usize,
+    /// Whether a close that arrives with the host's token is refused at once, as a service that
+    /// cannot close the call does.
+    refuse_host_closes: bool,
+    /// Whether the first close that arrives with a phone's token is held until it is released and
+    /// then refused.
+    hold_first_phone_close: bool,
+    /// How many closes arrived with a phone's token, whatever became of them.
+    phone_closes: usize,
+    /// The gate the held phone close waits at.
+    phone_close_gate: Arc<Gate>,
+}
+
+/// What the service does to a close it has been told to fail.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CloseFault {
+    /// Refuses it at once.
+    Refuse,
+    /// Holds it until the test lets it go, and then refuses it.
+    HoldThenRefuse,
 }
 
 /// A voice service and its control route on a loopback port.
@@ -179,6 +198,10 @@ impl StandIn {
             tokens: Vec::new(),
             answer: Box::new(|_offer| "v=0\r\na=answered-by-the-stand-in\r\n".to_owned()),
             upgrades_turned_away: 0,
+            refuse_host_closes: false,
+            hold_first_phone_close: false,
+            phone_closes: 0,
+            phone_close_gate: Arc::default(),
         }));
         let (serving_route, serving_state) = (Arc::clone(&route), Arc::clone(&state));
         let task = tokio::spawn(async move {
@@ -273,6 +296,47 @@ impl StandIn {
     pub fn release_closes(&self) {
         let gate = Arc::clone(&self.state.lock().expect("the stand-in's state").closing);
         gate.release();
+    }
+
+    /// Refuses at once every close that arrives with the host's token, as a service that cannot
+    /// close the call does. A close with a phone's token is not touched.
+    pub fn refuse_the_hosts_closes(&self) {
+        self.state
+            .lock()
+            .expect("the stand-in's state")
+            .refuse_host_closes = true;
+    }
+
+    /// Holds the first close that arrives with a phone's token, until
+    /// [`Self::release_the_held_phone_close`] lets it go, and then refuses it. A later close with a
+    /// phone's token is answered as the service answers one.
+    pub fn hold_then_refuse_the_first_phone_close(&self) {
+        let gate = {
+            let mut state = self.state.lock().expect("the stand-in's state");
+            state.hold_first_phone_close = true;
+            Arc::clone(&state.phone_close_gate)
+        };
+        gate.hold();
+    }
+
+    /// Lets the held phone close be refused.
+    pub fn release_the_held_phone_close(&self) {
+        let gate = Arc::clone(
+            &self
+                .state
+                .lock()
+                .expect("the stand-in's state")
+                .phone_close_gate,
+        );
+        gate.release();
+    }
+
+    /// How many closes arrived with a phone's token, whatever became of them.
+    pub fn phone_closes(&self) -> usize {
+        self.state
+            .lock()
+            .expect("the stand-in's state")
+            .phone_closes
     }
 
     /// Has the service answer a start's offer with what `answer` builds from it.
@@ -408,6 +472,7 @@ async fn serve(mut stream: TcpStream, route: &ControlRoute, state: &Arc<Mutex<St
         .unwrap_or("")
         .to_owned();
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    let fault: Option<CloseFault>;
     let answer = {
         let mut state = state.lock().expect("the stand-in's state");
         state.seen.push(Seen {
@@ -428,6 +493,20 @@ async fn serve(mut stream: TcpStream, route: &ControlRoute, state: &Arc<Mutex<St
                             .iter()
                             .any(|(each, kind)| each == token && *kind == Disposition::Mine)
                     }));
+        // A close the service is told to fail: the host's, at once, or the first a phone makes,
+        // after it has been held.
+        fault = if allowed && path.ends_with("/close") {
+            let by_the_host = authorization.as_deref() == Some(&format!("Bearer {HOST_TOKEN}"));
+            if by_the_host {
+                state.refuse_host_closes.then_some(CloseFault::Refuse)
+            } else {
+                state.phone_closes += 1;
+                (state.hold_first_phone_close && state.phone_closes == 1)
+                    .then_some(CloseFault::HoldThenRefuse)
+            }
+        } else {
+            None
+        };
         if allowed {
             Some((state.answer)(parsed["offerSdp"].as_str().unwrap_or("")))
         } else {
@@ -439,6 +518,15 @@ async fn serve(mut stream: TcpStream, route: &ControlRoute, state: &Arc<Mutex<St
         let _ = stream.write_all(&response(401, refusal)).await;
         return;
     };
+    if let Some(fault) = fault {
+        if fault == CloseFault::HoldThenRefuse {
+            let gate = Arc::clone(&state.lock().expect("the stand-in's state").phone_close_gate);
+            gate.pass().await;
+        }
+        let refusal = br#"{"ok":false,"error":{"code":"SERVICE_CAPACITY","message":"Busy."}}"#;
+        let _ = stream.write_all(&response(503, refusal)).await;
+        return;
+    }
     let gate = {
         let state = state.lock().expect("the stand-in's state");
         match path.as_str() {

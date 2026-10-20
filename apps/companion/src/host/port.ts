@@ -879,6 +879,12 @@ export interface VoiceCallState {
    * would have closed. It outlives the call that left it.
    */
   readonly owed: readonly VoiceOwed[]
+  /**
+   * Whether any call that ended has still to say what the voice service did about it. While it is
+   * true the service's answer may yet arrive as something owed, whatever call the device holds or
+   * has since ended, and a screen keeps reading.
+   */
+  readonly finalising: boolean
 }
 
 /** What the host did about the end of a call, kept apart from what happened on this device. */
@@ -925,7 +931,10 @@ export interface VoiceDelegationRow {
 
 /** Something this device could not finish, which the host may still hold open. */
 export interface VoiceOwed {
-  /** `revocation` when a call's grant may still be live; `start_unknown` for a start never answered. */
+  /**
+   * `revocation` when a call's grant may still be live; `start_unknown` for a start never answered;
+   * `service_close` when the voice service has not confirmed that it closed a call.
+   */
   readonly kind: string
   /** What a person is told. */
   readonly words: string
