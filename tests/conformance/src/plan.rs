@@ -1239,6 +1239,19 @@ fn windows() -> Vec<Step> {
             "a_previous_holder_that_is_letting_go",
         ),
         qualified_only(
+            "a command node refused where no command can be run",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-automation",
+                "--test",
+                "definitions",
+                "a_command_node_is_refused_where_no_command_can_be_run",
+            ],
+            "a_command_node_is_refused_where_no_command_can_be_run",
+        ),
+        qualified_only(
             "the contact skill's installer",
             &[
                 "test",

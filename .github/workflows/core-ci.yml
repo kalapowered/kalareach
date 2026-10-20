@@ -826,6 +826,13 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller -p kr-changeset -p kr-delivery -p kr-describe -p kr-automation --lib a_previous_holder_that_is_letting_go
 
+      # A command node runs its command as the root of a session through a POSIX shell, which this
+      # platform has not, so the validation of a definition that holds one refuses it here, with the
+      # declared environment and the terminal input the node asks for.
+      - name: Test that a command node is refused
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-automation --test definitions a_command_node_is_refused_where_no_command_can_be_run
+
       # The contact skill installed and removed on this platform: the installer's own tests, the
       # crash accounting among them, and a configuration refused before anything is written where
       # it carries an entry set on it or is encrypted, replaced with the same access where its

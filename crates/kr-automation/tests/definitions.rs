@@ -1,7 +1,7 @@
 //! Tests for workflow definition validation, cycle rejection, broad-shell requirement,
 //! and template rejection.
 
-use kr_automation::{create_workflow_definition, validate_definition};
+use kr_automation::{AutomationError, create_workflow_definition, validate_definition};
 use kr_protocol::automation::WorkflowActionKind;
 use kr_protocol::automation::{EdgeCondition, WorkflowEdge, WorkflowNode};
 use kr_protocol::grant::{EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector};
@@ -168,6 +168,10 @@ fn cyclic_graph_is_rejected_three_nodes() {
     assert!(err.to_string().contains("cyclic"));
 }
 
+/// KR-REQ-25.14: a shell-command node is installed only with a declared execution environment and
+/// under the definition's own grant when that grant carries terminal input: a node that declares
+/// none is refused, so is one under a grant without terminal input or under another workflow's
+/// grant, and one with both installs.
 #[test]
 fn broad_shell_command_requires_declared_environment_and_terminal_input() {
     let mut node_without_env = common::node("sh1", WorkflowActionKind::ShellCommand);
@@ -219,6 +223,44 @@ fn broad_shell_command_requires_declared_environment_and_terminal_input() {
 
     // Passes when environment is declared AND grant has TerminalInput
     assert!(validate_definition(&def2, &grant_with_terminal).is_ok());
+}
+
+/// KR-REQ-25.14: a command is run as the root of a session through a POSIX shell, so a definition
+/// that holds a shell-command node, with the declared environment and the terminal input it needs,
+/// is refused when it is offered on Windows, and is valid where a command can be run.
+#[test]
+fn a_command_node_is_refused_where_no_command_can_be_run() {
+    let node = WorkflowNode {
+        node_id: "run".to_owned(),
+        action_kind: WorkflowActionKind::ShellCommand,
+        action_params: r#"{"command": "cargo test"}"#.to_owned(),
+        declared_environment: Nullable::some(test_env_id(10)),
+    };
+    let definition = create_workflow_definition(
+        test_wf_id(1),
+        1,
+        "a node that runs a command",
+        test_grant_id(1),
+        vec![node],
+        vec![],
+    );
+
+    let verdict = validate_definition(&definition, &make_dummy_grant(test_grant_id(1), true));
+
+    if cfg!(windows) {
+        let refusal = verdict.expect_err("Windows runs no command as the root of a session");
+        assert!(
+            matches!(
+                refusal,
+                AutomationError::ActionUnavailable {
+                    action_kind: WorkflowActionKind::ShellCommand
+                }
+            ),
+            "{refusal}"
+        );
+    } else {
+        verdict.expect("a platform with a POSIX shell accepts the same definition");
+    }
 }
 
 /// KR-REQ-25.13: a node's parameters that hold template code, in any of the common template and
