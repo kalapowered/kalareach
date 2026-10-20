@@ -2198,17 +2198,17 @@ enum Meanwhile {
 
 /// What reads the feed after a request is published in it.
 enum AfterThePublication {
-    /// The view that follows the revoke and the host read it as they do.
+    /// The view that follows the revoke and the host read it as they do: the host can read the
+    /// request as soon as that view connects to it, and a case's `host_polls` makes sure it has.
     TheFeedIsRead,
-    /// Nothing reads it until the service is mended: neither that view nor the host, so no refusal
-    /// is written or seen meanwhile.
+    /// The next sixty reads of the feed fail until the case mends the service: neither that view
+    /// nor the host sees the request, so no refusal is written or seen meanwhile.
     NothingReadsTheFeed,
 }
 
 /// The person revokes the phone on the feed host, and `meanwhile` happens at the host while they
-/// are at the dialog. The request is then published in the feed the host reads. The host can read
-/// it as soon as the view that follows the revoke connects to it, and `host_polls` makes sure it
-/// has.
+/// are at the dialog. The request is then published in the feed the host reads, and `after` says
+/// what reads it.
 async fn revokes_the_phone_while(rig: &Rig, meanwhile: Meanwhile, after: AfterThePublication) {
     let host = host_by(&rig.view().await, "feed");
     let body = json!({
@@ -2221,8 +2221,8 @@ async fn revokes_the_phone_while(rig: &Rig, meanwhile: Meanwhile, after: AfterTh
         .await
         .expect("the dialog is shown");
     if matches!(after, AfterThePublication::NothingReadsTheFeed) {
-        // Every read of the feed fails, whoever makes it and whenever it comes; the publication,
-        // which is no read, is not met by a fault.
+        // The next sixty reads of the feed fail, whoever makes them and whenever they come; the
+        // publication, which is no read, is not met by a fault.
         for nth in 1..=60 {
             rig.served.web().fail_with_member(
                 AUTHORITY,
