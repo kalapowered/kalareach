@@ -243,7 +243,20 @@ impl CompilePool {
         // compile is holding a thread while it waits.
         let (answer, wait) = tokio::sync::oneshot::channel();
         let job = Job(Box::new(move || {
-            let outcome = work();
+            // A compiler that panics on a component refuses that component. It does not end the
+            // pool thread it ran on, which would be lost for good and take a share of the pool
+            // with it, and it does not leave the caller told that the pool is gone.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                .unwrap_or_else(|panic| {
+                    let message = panic
+                        .downcast_ref::<&str>()
+                        .map(|text| (*text).to_owned())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "without a message".to_owned());
+                    Err(RuntimeError::InvalidComponent {
+                        detail: format!("the compiler panicked: {message}"),
+                    })
+                });
             // A caller that has given up on the compile is not an error: the result is cached, so
             // the next preparation finds it.
             let _ = answer.send(outcome);
@@ -328,11 +341,13 @@ pub fn compile_or_load(
         }
     }
 
-    // The only way machine code enters this host: compiling validated Wasm in this process.
+    // The only way machine code enters this host: compiling validated Wasm in this process. The
+    // refusal carries the engine's whole account of why, every cause and not only the outermost:
+    // "failed to compile" names the function and says nothing of what was wrong with it.
     let component =
         wasmtime::component::Component::new(engine.engine(), wasm).map_err(|error| {
             RuntimeError::InvalidComponent {
-                detail: error.to_string(),
+                detail: format!("{error:#}"),
             }
         })?;
     let elapsed_ms = elapsed_ms(started);

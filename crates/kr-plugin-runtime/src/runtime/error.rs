@@ -75,10 +75,10 @@ pub enum RuntimeError {
         /// The export that is absent.
         missing: String,
     },
-    /// The Wasm did not validate, or is not a component at all.
-    #[error("the component did not validate: {detail}")]
+    /// The Wasm did not validate or compile, or is not a component at all.
+    #[error("the component was refused: {detail}")]
     InvalidComponent {
-        /// What validation reported.
+        /// What validation or compilation reported, with every cause it gave.
         detail: String,
     },
     /// The component is larger than this host will compile.

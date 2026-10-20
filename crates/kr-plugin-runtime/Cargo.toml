@@ -47,10 +47,10 @@ kr-plugin-catalogue = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 
 # The workspace forbids unsafe code, which a crate that reads a compiled artefact back cannot
-# honour: `wasmtime::component::Component::deserialize_file` is an unsafe function. This crate
-# denies it instead and allows it in exactly one module, `runtime::cache`, which owns that single
-# call and verifies the file's own manifest before it makes it. Nothing else in this crate may
-# relax the rule.
+# honour: `wasmtime::component::Component::deserialize` is an unsafe function. This crate denies
+# it instead and allows it in exactly one module, `runtime::cache`, which owns that single call
+# and makes it only on bytes it has just checked against the entry's manifest. Nothing else in
+# this crate may relax the rule.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"
