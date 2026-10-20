@@ -959,13 +959,54 @@ async fn the_frames_the_controller_sends_on_its_own_are_read_by_the_worker_of_th
     host.worker_ended(&updated.worker).await;
 }
 
+/// What the host's daemon answers to `host.info`, as this release reads it.
+async fn host_info_of(host: &Host) -> kr_protocol::hostinfo::HostInfoResult {
+    let endpoint = host
+        .tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("reaches the daemon");
+    client
+        .request(Method::HostInfo, &())
+        .await
+        .expect("the call reaches the daemon")
+        .expect("host.info answers")
+        .to_typed()
+        .expect("this release reads the answer")
+}
+
 /// KR-REQ-26.10, KR-REQ-26.08: a rollback to the release before goes on while only its session is
 /// live, and waits, exit 9, naming the session, while a session of this release is live.
+///
+/// The two releases also read each other's `host.info`: the release before's own `kr` reads the
+/// answer of this release's daemon, which says where privacy mode stands, and this release reads
+/// the answer of the release before's daemon, which does not, and asks `privacy.status` instead.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_for_one_of_this_release()
  {
     let updated = Updated::new().await;
     let host = &updated.host;
+
+    // This release's daemon tells where privacy mode stands, and the release before's `kr`, whose
+    // command reads only `host.info`, reads the answer and says what it holds.
+    assert_eq!(
+        host_info_of(host).await.privacy.map(|state| (
+            state.enabled,
+            state.generation.get(),
+            state.changing
+        )),
+        Some((false, 0, false)),
+        "this release's daemon says where privacy mode stands"
+    );
+    let output = host.run(&updated.kr_before(), &["--json", "host", "machine"]);
+    assert!(
+        output.status.success(),
+        "the release before's kr reads this release's host.info: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // A session of this release: the older release's daemon does not retain its level.
     let (display, session_now) = host.new_session(&updated.kr_now());
@@ -1014,6 +1055,34 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
         format!("kr-controller/{}", updated.one.name()),
         "the daemon is the release before's again"
     );
+    // The release before's daemon says nothing of privacy mode in `host.info`, and reports it only
+    // under `privacy.status`, which is what a device that manages the host asks of it.
+    // Goes once no retained level is below 0.77: every daemon then says it in `host.info`.
+    assert!(
+        host_info_of(host).await.privacy.is_none(),
+        "the release before's daemon sends no privacy member"
+    );
+    {
+        let endpoint = host
+            .tree
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint");
+        let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("reaches the daemon");
+        let report: kr_protocol::privacy::PrivacyReport = client
+            .request(
+                Method::PrivacyStatus,
+                &kr_protocol::privacy::PrivacyStatusParams {},
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the release before's daemon reports privacy mode")
+            .to_typed()
+            .expect("this release reads the report");
+        assert!(!report.enabled);
+    }
     updated.the_worker_is_as_it_was().await;
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
