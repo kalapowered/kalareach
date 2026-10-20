@@ -300,3 +300,72 @@ pub fn a_launch_of_a_command_the_lookup_handler_asks_about_is_asked_about(kind: 
     assert_eq!(asked[0].argv, ["kr-probe", "one", "two words"]);
     assert_eq!(asked[0].executable, told(&probes.probe()));
 }
+
+/// A command-not-found hook of the person's own: a name it answers is run by a script block of its
+/// own, so a lookup finds a command that is not an application.
+const NOT_FOUND_HOOK: &str = r#"
+$ExecutionContext.InvokeCommand.CommandNotFoundAction = {
+    param($CommandName, $EventArgs)
+    if ($CommandName -eq 'kr-hooked') {
+        $EventArgs.CommandScriptBlock = { Write-Output ('kr-hook-' + 'ran') }
+        $EventArgs.StopSearch = $true
+    }
+}
+"#;
+
+/// KR-REQ-23.54: a first word that only the person's own lookup hook answers is refused like any
+/// other that no application has, and the reader goes on answering.
+///
+/// The answer a hook gives is a command the shell can run and no program, so the launch has no
+/// line to install. A reader that read a path off it would fail with no answer at all, and the
+/// caller would be told the outcome is unknown for a launch that installed nothing.
+pub fn a_launch_of_a_name_only_a_lookup_hook_answers_is_refused(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start_with_environment_and_profile(
+        &package,
+        &[],
+        Profile {
+            after_entry: NOT_FOUND_HOOK,
+            ..Profile::ORDINARY
+        },
+    );
+    session.first_prompt();
+    session.forget_events();
+    assert!(session.answered("kr-ready"));
+
+    let (enter, fence) = session.fenced_prompt(61);
+    let decision = launch_vector_at(
+        &mut session,
+        &enter,
+        &fence,
+        vec!["kr-hooked".to_owned()],
+        0xa2,
+    );
+    assert_eq!(
+        decision.rejection(),
+        Some(LaunchRejectionReason::BufferNotEmpty),
+        "a name only a lookup hook answers is no application: {decision:?}"
+    );
+    // The reader is still answering: the same fence takes a launch that runs.
+    let before = session.written();
+    let decision = launch_vector_at(
+        &mut session,
+        &enter,
+        &fence,
+        ["printf", "%s|", "five", "six"].map(str::to_owned).to_vec(),
+        0xa3,
+    );
+    assert!(
+        matches!(decision, LaunchDecision::Accepted(_)),
+        "the refusal left the reader unable to take a launch: {decision:?}"
+    );
+    session.nudge();
+    session.expect_event("command_accepted", |event| {
+        matches!(event, BridgeEvent::CommandAccepted(_))
+    });
+    assert!(
+        session.drew_after(before, "five|six|", REPLY).was_drawn(),
+        "the launch after the refusal did not run:\n{}",
+        session.terminal_output()
+    );
+}
