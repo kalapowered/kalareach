@@ -2081,6 +2081,25 @@ async fn a_change_of_sync_service_does_not_let_a_waiting_request_go() {
     assert_not_shared_with_again(&rig);
 }
 
+/// A request in a feed that the record does not name, as one an earlier version published, is found
+/// by the look at the feeds before the sheet is shown, and held from then on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_the_record_does_not_name_is_found_in_the_feed_and_held() {
+    let rig = Rig::start().await;
+    rig.sharing_with_the_phone().await;
+    let elsewhere = a_feed_the_host_does_not_read(&rig).await;
+    revokes_the_phone(&rig).await;
+    the_phone_is_taken_out(&rig).await;
+
+    let rig = rig.restarted().await;
+    // The record is as an earlier version leaves it: there is none.
+    std::fs::remove_file(rig.data.path().join("settings-sync").join("requested.json"))
+        .expect("the record is removed");
+    rig.sync_service_is(elsewhere.origin());
+    rig.start_settings_sync_listing_the_phone();
+    assert_not_shared_with_again(&rig);
+}
+
 /// A device that was never shared with, whose revoke waits in a feed, is not offered to be shared
 /// with: it is named with the devices taken out and the command refuses it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
