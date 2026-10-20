@@ -346,6 +346,17 @@ quotes and leaves the quotes to its caller, which is a trap. And on Zsh the text
 editor's own string representation: `setline` unmetafies what it is handed, so raw bytes above 0x7f
 would change on the way in.
 
+Quoting the first word does not decide what runs. A quoted first word is still looked up as a
+command, and the shell runs what it finds. For example, if a function with that name exists, it runs
+instead of the program (this is true for Zsh, Bash and Fish). To avoid such shenanigans, the
+PowerShell module resolves the first word to an application or an external script and writes its
+full path after the call operator, so a function, an alias or a cmdlet of that name never stands in
+for the program, and the line shows what runs. If there is no application with that name, the module
+refuses the launch with `buffer_not_empty`, the reason it gives for any vector it cannot build a
+line from. If one of the arguments is exactly `--%`, the shell will not pass that argument to the
+program, wherever it stands. This is the stop-parsing token in PowerShell. To avoid this, the module
+writes it as `@('--%')`.
+
 Losing the bridge does not turn a managed root shell back into an ordinary one. The handshake
 leaves a mark that is never cleared, so a shell whose worker has gone holds no fence, consumes an
 eligible gesture with the hint, and does not end itself on an empty-prompt Ctrl-D.

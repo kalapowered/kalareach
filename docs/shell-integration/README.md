@@ -472,6 +472,9 @@ named. The reason decides what the caller is told:
 | `confirmation_lost` | `OUTCOME_UNKNOWN` |
 | `session_closing` | `SESSION_CLOSED` |
 
+The PowerShell reader also gives `buffer_not_empty` for an argument vector whose first word names no
+application, because it has no line to install.
+
 Section 23 lists the preconditions of `shell.launch` as `terminal.input`, the current input lease, a
 qualified root editor, an empty prompt and fence, the working-directory revision and the launch
 profile. The caller supplies the three that are its own, which section 7 names: the argument vector

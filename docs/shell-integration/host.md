@@ -200,6 +200,13 @@ could be a reserved word, an assignment or an alias:
 PowerShell reads U+2018, U+2019, U+201A and U+201B as single quotes too, so each of the five is
 written twice: `'it’’s'`.
 
+Quoting fixes the words of the vector, not what the first word runs. Zsh, Bash, and Fish will all
+attempt to find a function of the same name as the first word of the vector if that word is quoted,
+and the function runs in the program's place. The PowerShell reader finds the application or
+external script for the first word in the vector and installs its full path. If a function, alias,
+or cmdlet exists of the same name, it will not be used, and the line shows what runs. If no
+application is found, the launch is refused as `DRAFT_CONFLICT` and nothing is installed.
+
 PowerShell puts the call operator before the line, since a quoted word at the start of a line is a
 string and not a program. A command the caller has already quoted for its target shell is
 installed exactly as given. The host quotes one thing itself: the path of a package in a startup
