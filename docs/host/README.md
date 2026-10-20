@@ -742,11 +742,11 @@ rest in the report of `privacy.status`, to find out when the host’s privacy mo
 whether its cleanup has completed, what each session still owes, what the host keeps, and what had
 already left it.
 
-The host says its privacy mode is changing while a change to on waits for in-flight deliveries to
-complete, records its state and raises its backup fence, while a change to off is about to publish
-its state, and, after a change that stopped part way, until the daemon starts again. A device
-considers the host to be private while the host’s privacy mode is changing. Older builds of the host
-do not include this member in `host.info`.
+The host says its privacy mode is changing while a change to on waits for in-flight deliveries,
+records its state and raises its backup fence, while a change to off is about to publish its state,
+and, after a change that stopped part way, until the daemon starts again. A device considers the
+host to be private while the host’s privacy mode is changing. Older builds of the host do not
+include this member in `host.info`.
 
 The allowlist walk above has all four answers as roots, so a field added to one fails the build's
 own tests until it is classed.
@@ -4004,16 +4004,16 @@ would then be published; a host that cannot record it does not enter privacy mod
 ### Turning it on and off
 
 Privacy mode is one generation for the whole environment, and it is managed by the control daemon,
-which keeps a record of the current generation and whether or not privacy mode is on in the
-`privacy.sqlite3` file in its state directory. It also keeps an **obligation** for each session
-until it can determine that the session’s own cleanup for that generation has completed. Turning
-privacy mode on and off with `kr privacy on` and `kr privacy off` is done through `privacy.set`,
-which can only be served by the host itself; a paired device whose grant carries `host.manage` reads
-`privacy.status` and changes nothing about the host. Both answer one report of the current privacy
-mode generation, whether the last change has taken effect yet, what each session still owes, what
-the daemon keeps and why, and what had already left this host. A paired device without `host.manage`
-can find out only whether or not privacy mode is on, for what generation, and whether the host is in
-the middle of changing it, using `host.info`.
+which keeps an explicit record of the current generation and whether or not privacy mode is on in
+the `privacy.sqlite3` file in its state directory. It also keeps in that file an **obligation** for
+each session until it can determine that the session’s own cleanup for that generation has
+completed. Turning privacy mode on and off with `kr privacy on` and `kr privacy off` is done through
+`privacy.set`, which can only be served by the host itself; a paired device whose grant carries
+`host.manage` reads `privacy.status` and changes nothing about the host. Both answer one report of
+the current privacy mode generation, whether the last change has taken effect across the whole
+environment yet, what each session still owes, what the daemon keeps and why, and what had already
+left this host. A paired device without `host.manage` can find out only whether or not privacy mode
+is on, for what generation, and whether the host is in the middle of changing it, using `host.info`.
 
 The act of turning it on writes the record first, in a single transaction that records an obligation
 for every session for which the environment has content, including every worker recorded in the
