@@ -14,7 +14,7 @@ import type { ShellKind } from './pending'
 const PLAIN = /^[\w@%+=:,./-]+$/
 
 /** The four characters PowerShell reads as a single quote besides the ASCII one. */
-const POWERSHELL_QUOTES = /['‘’‚‛]/g
+const POWERSHELL_QUOTES = /['\u2018\u2019\u201A\u201B]/g
 
 /** One argument as a single word of the shell `kind`. */
 function word(argument: string, kind: ShellKind): string {
@@ -22,11 +22,16 @@ function word(argument: string, kind: ShellKind): string {
     // Its stop-parsing token is left out of a program's arguments wherever it is written, quoted or
     // not, and the array expression is the one spelling that passes it on.
     if (argument === '--%') return "@('--%')"
-    // `@` at the start of a word splats a variable, and a comma makes a list.
-    if (PLAIN.test(argument) && !/[@,]/.test(argument)) return argument
+    // `@` at the start of a word splats a variable, a comma makes a list, and a dash word that holds
+    // a dot is cut at the dot into a parameter and a number.
+    const dashWithDot = argument.startsWith('-') && argument.includes('.')
+    if (PLAIN.test(argument) && !/[@,]/.test(argument) && !dashWithDot) return argument
     return `'${argument.replace(POWERSHELL_QUOTES, '$&$&')}'`
   }
-  if (PLAIN.test(argument)) return argument
+  // Zsh reads a word that starts with `=` as the path of a command, and Fish reads `%self` as a
+  // process number, so neither is left bare.
+  const bare = PLAIN.test(argument) && !argument.startsWith('=') && !argument.startsWith('%')
+  if (bare) return argument
   if (kind === 'fish') return `'${argument.replaceAll('\\', '\\\\').replaceAll("'", "\\'")}'`
   return `'${argument.replaceAll("'", `'\\''`)}'`
 }

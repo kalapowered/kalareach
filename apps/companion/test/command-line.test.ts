@@ -46,6 +46,22 @@ describe('a command written for the shell that reads it', () => {
     expect(commandLine(['git', 'status'], 'powershell')).toBe('git status')
   })
 
+  it('quotes a PowerShell word that starts with a dash and holds a dot, which it cuts at the dot', () => {
+    for (const argument of ['-Dfoo.bar=baz', '-o.txt', '-a.b']) {
+      expect(commandLine(['show', argument], 'powershell')).toBe(`show '${argument}'`)
+    }
+    // Where the dot does not follow a single dash, or a word has none, the word is whole as it is.
+    expect(commandLine(['show', '--model=gpt-5.1', '-a:b', 'a.b'], 'powershell')).toBe(
+      'show --model=gpt-5.1 -a:b a.b'
+    )
+  })
+
+  it('quotes a word Zsh reads as the path of a command and one Fish reads as a process number', () => {
+    expect(commandLine(['show', '=ls'], 'zsh')).toBe("show '=ls'")
+    expect(commandLine(['show', 'a=b', '50%'], 'zsh')).toBe('show a=b 50%')
+    expect(commandLine(['show', '%self'], 'fish')).toBe("show '%self'")
+  })
+
   it('quotes the words PowerShell would take for splatting or a list, which no other shell does', () => {
     expect(commandLine(['show', '@payload', 'a,b'], 'powershell')).toBe("show '@payload' 'a,b'")
     for (const kind of ['sh', 'zsh', 'bash', 'fish'] as const) {

@@ -706,6 +706,10 @@
   border-radius: 7px;
   background: var(--bg);
   color: var(--text);
+  /* The command is typed as it is shown, so a run of spaces in a word is kept, and the size is the
+     labels' rather than the smaller one a line of small text gives code. */
+  font-size: 0.8125rem;
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
