@@ -7,7 +7,7 @@
 //!
 //! This file is also read by the `kr-cli` upgrade suite, which chooses the release it updates from
 //! the same way, so it uses nothing but the standard library, `serde_json` and `kr_protocol`, and
-//! names its sibling modules as `crate::<module>`.
+//! names its sibling modules (`public_majors`, which reads Rust source) as `crate::<module>`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -243,8 +243,9 @@ pub fn agree_with_origin(repository: &Path, local: &[Release], head: &str) -> Re
 /// that declares them: `SURFACE_ROOTS` in `crates/kr-protocol/src/retained.rs` at `commit`. None
 /// where the release has no such file, which is how a release before the retained levels reads.
 ///
-/// The reader is strict. It knows the one shape the list is written in, string literals one to a
-/// line between the declaration and its `];`, and a source that is shaped otherwise is an error.
+/// The reader is strict: it knows the one declaration `pub const SURFACE_ROOTS: &[&str] = &[ .. ];`
+/// of plain string literals, in any layout, and a source that declares the list otherwise is an
+/// error.
 ///
 /// # Errors
 ///
@@ -264,102 +265,13 @@ pub fn surface_roots_at(repository: &Path, commit: &str) -> Result<Option<Vec<St
         .ok_or_else(|| format!("{path} at {commit} declares no SURFACE_ROOTS"))
 }
 
-/// The roots `SURFACE_ROOTS` lists in `source`; see [`surface_roots_at`].
+/// The roots `SURFACE_ROOTS` lists in `source`; see [`surface_roots_at`]. It is the one reader of
+/// Rust source the release tooling has (`public_majors::string_list`), so what is a comment, a
+/// string and a declaration is decided in one place.
 ///
 /// # Errors
 ///
 /// When the declaration is there more than once, or is not in the shape the reader knows.
 pub fn surface_roots_in(source: &str) -> Result<Option<Vec<String>>, String> {
-    const DECLARATION: &str = "pub const SURFACE_ROOTS: &[&str] = &[";
-    // Comments are taken out first, so a name in one is neither a declaration nor a use, and a
-    // comment or a line break between the name and its colon does not hide the declaration.
-    let code = without_comments(source)?;
-    let declarations: Vec<usize> = code
-        .match_indices("SURFACE_ROOTS")
-        .map(|(at, _)| at)
-        .filter(|at| {
-            code[at + "SURFACE_ROOTS".len()..]
-                .trim_start()
-                .starts_with(':')
-        })
-        .collect();
-    let at = match declarations.as_slice() {
-        [] => return Ok(None),
-        [at] => *at,
-        _ => return Err("the list is declared more than once".to_owned()),
-    };
-    // The declaration has to be the one shape, with the keyword before it on its line.
-    let line_start = code[..at].rfind('\n').map_or(0, |newline| newline + 1);
-    if !code[line_start..].trim_start().starts_with(DECLARATION)
-        || code[line_start..at].trim() != "pub const"
-    {
-        return Err("the list is declared in a form this reader does not read".to_owned());
-    }
-    let mut lines = code[line_start..].lines();
-    lines.next();
-    let mut roots = Vec::new();
-    for line in lines {
-        let line = line.trim();
-        if line == "];" {
-            return Ok(Some(roots));
-        }
-        if line.is_empty() {
-            continue;
-        }
-        let name = line
-            .strip_prefix('"')
-            .and_then(|rest| rest.strip_suffix("\","))
-            .filter(|name| {
-                !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_alphanumeric())
-            })
-            .ok_or_else(|| format!("a line that is not a root: {line}"))?;
-        roots.push(name.to_owned());
-    }
-    Err("the list does not end".to_owned())
-}
-
-/// `source` without its `//` and `/* */` comments (block comments nest). A comment is replaced by a
-/// space, or by its line break, so the lines of what is left are the lines they were.
-fn without_comments(source: &str) -> Result<String, String> {
-    let bytes = source.as_bytes();
-    let mut kept = String::with_capacity(source.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match (bytes[index], bytes.get(index + 1)) {
-            (b'/', Some(b'/')) => {
-                while index < bytes.len() && bytes[index] != b'\n' {
-                    index += 1;
-                }
-            }
-            (b'/', Some(b'*')) => {
-                let mut depth = 1;
-                index += 2;
-                while depth > 0 {
-                    match (bytes.get(index), bytes.get(index + 1)) {
-                        (Some(b'/'), Some(b'*')) => {
-                            depth += 1;
-                            index += 2;
-                        }
-                        (Some(b'*'), Some(b'/')) => {
-                            depth -= 1;
-                            index += 2;
-                        }
-                        (Some(b'\n'), _) => {
-                            kept.push('\n');
-                            index += 1;
-                        }
-                        (Some(_), _) => index += 1,
-                        (None, _) => return Err("a block comment does not end".to_owned()),
-                    }
-                }
-                kept.push(' ');
-            }
-            _ => {
-                let character = source[index..].chars().next().expect("a character");
-                kept.push(character);
-                index += character.len_utf8();
-            }
-        }
-    }
-    Ok(kept)
+    crate::public_majors::string_list(source, "SURFACE_ROOTS")
 }

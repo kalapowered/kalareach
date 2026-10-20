@@ -1102,56 +1102,133 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
     assert!(found.iter().any(|line| line.contains("kr-plugin-host/3")));
 }
 
-/// The list of roots is read in the one shape it is written in, wherever the declaration is spaced,
-/// and a source that declares it another way, twice, or not at all is told apart.
+/// The list of roots is read by the one reader of Rust source the tooling has: in whatever layout
+/// it is written, with comments and strings that look like code left alone, and a source that
+/// declares it otherwise, twice, or not at all is told apart.
 #[test]
 fn the_list_of_surface_roots_is_read_strictly() {
     use crate::releases::surface_roots_in;
-    let source = |declaration: &str| {
-        format!("// SURFACE_ROOTS: not this\n{declaration}\nuse(SURFACE_ROOTS);\n")
+    let around = |declaration: &str| {
+        format!(
+            "// SURFACE_ROOTS: not this\n/* pub const SURFACE_ROOTS: &[&str] = &[\"Old\"]; */\n\
+             const MARKER: &str = \"/*\";\nconst GLOB: &str = \"crates/*\";\n{declaration}\n\
+             const SHOWN: &str = \"{{SURFACE_ROOTS:?}}\";\nuse(SURFACE_ROOTS);\n"
+        )
     };
-    let good = source("pub const SURFACE_ROOTS: &[&str] = &[\n    \"A\",\n    \"B\",\n];");
-    assert_eq!(
-        surface_roots_in(&good).expect("a list"),
-        Some(vec!["A".to_owned(), "B".to_owned()])
-    );
+    let two = Some(vec!["A".to_owned(), "B".to_owned()]);
+    for (what, declaration) in [
+        (
+            "one to a line",
+            "pub const SURFACE_ROOTS: &[&str] = &[\n    \"A\",\n    \"B\",\n];",
+        ),
+        (
+            "a root on the line of the declaration",
+            "pub const SURFACE_ROOTS: &[&str] = &[\"A\",\n    \"B\",\n];",
+        ),
+        (
+            "all on one line",
+            "pub const SURFACE_ROOTS: &[&str] = &[\"A\", \"B\"];",
+        ),
+        (
+            "with comments between the entries",
+            "pub const SURFACE_ROOTS: &[&str] = &[\n    \"A\", // the first\n    /* then */ \"B\"\n];",
+        ),
+    ] {
+        assert_eq!(
+            surface_roots_in(&around(declaration)).expect(what),
+            two,
+            "{what}"
+        );
+    }
     assert_eq!(
         surface_roots_in("fn nothing() { f(SURFACE_ROOTS); }").expect("none"),
         None
     );
-    for (what, text) in [
+    for (what, declaration) in [
         (
             "no space before the colon is no other declaration",
-            source("pub const SURFACE_ROOTS:&[&str] = &[\n    \"A\",\n];"),
+            "pub const SURFACE_ROOTS:&[&str] = &[\n    \"A\",\n];".to_owned(),
         ),
         (
-            "the name apart from its colon",
-            source("pub const SURFACE_ROOTS : &[&str] = &[\n    \"A\",\n];"),
+            "the name apart from its colon by a line break",
+            "pub const SURFACE_ROOTS\n    : &[&str] = &[\n    \"A\",\n];".to_owned(),
         ),
         (
-            "an entry that is not a literal",
-            source("pub const SURFACE_ROOTS: &[&str] = &[\n    NAMED,\n];"),
-        ),
-        (
-            "a list that does not end",
-            source("pub const SURFACE_ROOTS: &[&str] = &[\n    \"A\",\n"),
-        ),
-        ("twice", format!("{good}{good}")),
-        (
-            "a line break between the name and its colon",
-            source("pub const SURFACE_ROOTS\n    : &[&str] = &[\n    \"A\",\n];"),
-        ),
-        (
-            "a comment between the name and its colon",
-            source("pub const SURFACE_ROOTS /* the roots */: &[&str] = &[\n    \"A\",\n];"),
+            "the name apart from its colon by a comment",
+            "pub const SURFACE_ROOTS /* the roots */: &[&str] = &[\n    \"A\",\n];".to_owned(),
         ),
         (
             "another keyword before it",
-            source("static SURFACE_ROOTS: &[&str] = &[\n    \"A\",\n];"),
+            "static SURFACE_ROOTS: &[&str] = &[\n    \"A\",\n];".to_owned(),
+        ),
+        (
+            "an entry that is not a literal",
+            "pub const SURFACE_ROOTS: &[&str] = &[\n    NAMED,\n];".to_owned(),
+        ),
+        (
+            "a list that does not end",
+            "pub const SURFACE_ROOTS: &[&str] = &[\n    \"A\",\n".to_owned(),
+        ),
+        (
+            "twice",
+            "pub const SURFACE_ROOTS: &[&str] = &[\"A\"];\npub const SURFACE_ROOTS: &[&str] = &[\"B\"];"
+                .to_owned(),
         ),
     ] {
-        assert!(surface_roots_in(&text).is_err(), "{what}");
+        assert!(
+            surface_roots_in(&around(&declaration)).is_err(),
+            "{what} is refused"
+        );
     }
+}
+
+/// The plugin host protocol is read as a constant of the one shape, from the code and not from a
+/// comment that quotes an older one.
+#[test]
+fn the_plugin_host_protocol_is_read_from_the_code() {
+    use crate::public_majors::string_const;
+    let source = "// pub const PLUGIN_HOST_PROTOCOL: &str = \"kr-plugin-host/1\";\n\
+                  pub const PLUGIN_HOST_PROTOCOL: &str = \"kr-plugin-host/2\";\n";
+    assert_eq!(
+        string_const(source, "PLUGIN_HOST_PROTOCOL").expect("read"),
+        Some("kr-plugin-host/2".to_owned())
+    );
+    assert_eq!(
+        string_const("fn f() {}", "PLUGIN_HOST_PROTOCOL").expect("none"),
+        None
+    );
+    for (what, text) in [
+        (
+            "twice",
+            "pub const PLUGIN_HOST_PROTOCOL: &str = \"a\";\npub const PLUGIN_HOST_PROTOCOL: &str = \"b\";",
+        ),
+        (
+            "not a string literal",
+            "pub const PLUGIN_HOST_PROTOCOL: &str = OTHER;",
+        ),
+        (
+            "another keyword",
+            "static PLUGIN_HOST_PROTOCOL: &str = \"a\";",
+        ),
+        (
+            "an escape",
+            "pub const PLUGIN_HOST_PROTOCOL: &str = \"a\\nb\";",
+        ),
+    ] {
+        assert!(
+            string_const(text, "PLUGIN_HOST_PROTOCOL").is_err(),
+            "{what}"
+        );
+    }
+    // Another constant that ends in the name is not it.
+    assert_eq!(
+        string_const(
+            "pub const OTHER_PLUGIN_HOST_PROTOCOL: &str = \"x\";",
+            "PLUGIN_HOST_PROTOCOL"
+        )
+        .expect("none"),
+        None
+    );
 }
 
 /// A root a revision declares that its own schema does not define is refused, and is not cut around:

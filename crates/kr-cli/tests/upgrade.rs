@@ -30,6 +30,9 @@ mod teardown;
 // this commit to.
 #[path = "../../kr-protocol/src/bin/kr-protocol-gen/excluded.rs"]
 mod excluded;
+// The one reader of Rust source the release tooling has, which the tags' roots are read with.
+#[path = "../../kr-protocol/src/bin/kr-protocol-gen/public_majors.rs"]
+mod public_majors;
 #[path = "../../kr-protocol/src/bin/kr-protocol-gen/releases.rs"]
 mod releases;
 // A device pairs with the installed host's daemon over the network. The pairing calls are the ones

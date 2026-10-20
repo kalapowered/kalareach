@@ -288,25 +288,19 @@ fn plugin_host_at(commit: &str) -> Result<String, String> {
 
 /// As [`plugin_host_at`], in the repository at `repository`.
 pub fn plugin_host_in(repository: &Path, commit: &str) -> Result<String, String> {
-    for (path, declaration) in [
-        (
-            "crates/kr-protocol/src/retained.rs",
-            "pub const PLUGIN_HOST_PROTOCOL: &str = ",
-        ),
-        (
-            "crates/kr-plugin-service/src/protocol.rs",
-            "pub const PROTOCOL: &str = ",
-        ),
+    for (path, name) in [
+        ("crates/kr-protocol/src/retained.rs", "PLUGIN_HOST_PROTOCOL"),
+        ("crates/kr-plugin-service/src/protocol.rs", "PROTOCOL"),
     ] {
         let Some(source) = releases::file_at(repository, commit, path)
             .map_err(|error| format!("{path} at {commit} cannot be read: {error}"))?
         else {
             continue;
         };
-        if let Some(rest) = source.split(declaration).nth(1)
-            && let Some(name) = rest.split('"').nth(1)
+        if let Some(text) = public_majors::string_const(&source, name)
+            .map_err(|error| format!("{name} at {commit} ({path}): {error}"))?
         {
-            return Ok(name.to_owned());
+            return Ok(text);
         }
     }
     Err(format!(

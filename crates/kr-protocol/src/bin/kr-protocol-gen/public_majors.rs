@@ -6,8 +6,13 @@
 //! strict. It knows the shape `kr-protocol` writes the table in and nothing else, and a source it
 //! does not understand is an error, never a table with rows left out or a release with no table.
 //!
-//! This file is also read by the `kr-cli` test that compares a record with the tree of the release
-//! it was cut from, so it uses nothing but the standard library and `kr_cbor`.
+//! It is also the one reader of Rust source in the release tooling: the lists and constants a release
+//! declares (`string_list`, `string_const`) are read with the same lexer, which takes comments out
+//! and masks literals, so no second reader has a second idea of what is code.
+//!
+//! This file is also read by the `kr-cli` tests that compare a record with the tree of the release
+//! it was cut from and choose the release the upgrade suite updates from, so it uses nothing but the
+//! standard library and `kr_cbor`.
 
 const START: &str = "pub const PUBLIC_MAJORS: &[PublicMajor] = &[";
 const PROTOCOL_DECLARATION: &str = "pub const PROTOCOL_VERSION: ProtocolVersion = ";
@@ -90,6 +95,100 @@ pub fn record_without_a_table(source: &str) -> Result<String, String> {
     Ok(format!(
         "major={major} versions={version} replaced=- supported_until=- retired=false\n"
     ))
+}
+
+/// The entries of `pub const NAME: &[&str] = &[ .. ];` in `source`, each a plain string literal
+/// (letters and digits only, since the lists are names of types); none where the source has no
+/// declaration of `NAME`.
+///
+/// The reader is strict, and it is the code that is read: comments are out and literals are masked
+/// before anything is looked for, so a name in a comment or a string is not a declaration, a marker
+/// in a string is not a comment, and any layout of the list reads the same. A declaration in another
+/// form (another keyword, another type, a second one) is an error, never a list left out.
+///
+/// # Errors
+///
+/// When `NAME` is declared in a form this reader does not read, more than once, or with an entry
+/// that is not a plain string literal.
+#[allow(dead_code)]
+pub fn string_list(source: &str, name: &str) -> Result<Option<Vec<String>>, String> {
+    let code = without_comments(source)?;
+    let outside = masked(&code);
+    let Some(start) = declaration(&outside, name, &format!("pub const {name}: &[&str] = &["))?
+    else {
+        return Ok(None);
+    };
+    let inside = start.end;
+    let length = closing(&code[inside..], '[', ']').ok_or("the list does not end")?;
+    if !code[inside + length + 1..].trim_start().starts_with(';') {
+        return Err("the list is followed by something other than `;`".to_owned());
+    }
+    let mut entries = Vec::new();
+    for entry in split_top(&code[inside..inside + length]) {
+        let text = entry
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .filter(|text| {
+                !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+            .ok_or_else(|| format!("an entry that is not a plain string literal: {entry}"))?;
+        entries.push(text.to_owned());
+    }
+    Ok(Some(entries))
+}
+
+/// The text of `pub const NAME: &str = "..";` in `source`, read as `string_list` reads a list; none
+/// where the source has no declaration of `NAME`.
+///
+/// # Errors
+///
+/// When `NAME` is declared in another form or more than once, or the text holds an escape.
+#[allow(dead_code)]
+pub fn string_const(source: &str, name: &str) -> Result<Option<String>, String> {
+    let code = without_comments(source)?;
+    let outside = masked(&code);
+    let Some(start) = declaration(&outside, name, &format!("pub const {name}: &str = "))? else {
+        return Ok(None);
+    };
+    let rest = &code[start.end..];
+    let text = rest
+        .strip_prefix('"')
+        .and_then(|rest| rest.split_once('"'))
+        .filter(|(text, after)| !text.contains('\\') && after.trim_start().starts_with(';'))
+        .map(|(text, _)| text)
+        .ok_or("the constant is not one plain string literal followed by `;`")?;
+    Ok(Some(text.to_owned()))
+}
+
+/// Where the declaration of `name` ends in `outside`, which is code with literals masked, once the
+/// declaration begins with `form`; none where `name` is not declared.
+struct Declaration {
+    end: usize,
+}
+
+fn declaration(outside: &str, name: &str, form: &str) -> Result<Option<Declaration>, String> {
+    let names: Vec<usize> = outside
+        .match_indices(name)
+        .map(|(at, _)| at)
+        .filter(|at| {
+            let before = outside[..*at].chars().next_back();
+            let after = outside[at + name.len()..].trim_start();
+            !before.is_some_and(|c| c.is_alphanumeric() || c == '_') && after.starts_with(':')
+        })
+        .collect();
+    let at = match names.as_slice() {
+        [] => return Ok(None),
+        [at] => *at,
+        _ => return Err(format!("{name} is declared more than once")),
+    };
+    let keyword = "pub const ";
+    let begin = at
+        .checked_sub(keyword.len())
+        .filter(|begin| outside[*begin..].starts_with(form))
+        .ok_or_else(|| format!("{name} is declared in a form this reader does not read"))?;
+    Ok(Some(Declaration {
+        end: begin + form.len(),
+    }))
 }
 
 /// `code` with the inside of every string and character literal replaced by `x`, byte for byte, so
