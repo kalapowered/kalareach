@@ -971,8 +971,27 @@ function Get-KrLaunchWord {
     Get-KrQuotedArgument $Argument
 }
 
+# The application or script a launch's first word names, as the path the shell would run, or
+# nothing when no application has that name.
+#
+# A quoted word after the call operator is still looked up as a command, so a function or an alias
+# of the same name would run in the program's place, whatever the line shows. Asking for an
+# application alone, by the engine's own lookup, leaves functions, aliases and cmdlets out, and
+# takes a name as it is: no wildcard in it is expanded.
+function Get-KrLaunchProgram {
+    param([string]$Name)
+    $kinds = [System.Management.Automation.CommandTypes]'Application, ExternalScript'
+    $found = $ExecutionContext.InvokeCommand.GetCommand($Name, $kinds)
+    if ($null -eq $found -or [string]::IsNullOrEmpty($found.Path)) { return $null }
+    $found.Path
+}
+
 # The line the reader installs: an argument vector quoted for this shell, or a command the caller
 # already quoted. Nothing is assembled by interpolation.
+#
+# The first word of an argument vector is the application it names, written as its full path, so
+# what the line shows is what runs. A vector whose first word names no application has no line,
+# and the caller is told what it is told for any vector this shell cannot build one from.
 function Get-KrLaunchText {
     param($Command)
     $variant = Get-KrVariant $Command
@@ -982,14 +1001,19 @@ function Get-KrLaunchText {
         return $null
     }
     if ($variant.Name -ne 'arguments') { return $null }
-    $parts = @()
-    foreach ($argument in @($variant.Payload)) {
+    $arguments = @($variant.Payload)
+    foreach ($argument in $arguments) {
         if ($argument -isnot [string]) { return $null }
-        $parts += Get-KrLaunchWord $argument
     }
-    if ($parts.Count -eq 0) { return '' }
-    # The call operator, because the first argument is quoted like the rest: a quoted word at the
-    # start of a line is a string of this shell's rather than the name of what to run.
+    if ($arguments.Count -eq 0) { return '' }
+    $program = Get-KrLaunchProgram $arguments[0]
+    if ($null -eq $program) { return $null }
+    $parts = @(Get-KrQuotedArgument $program)
+    for ($index = 1; $index -lt $arguments.Count; $index++) {
+        $parts += Get-KrLaunchWord $arguments[$index]
+    }
+    # The call operator, because the program is a quoted word: a quoted word at the start of a
+    # line is a string of this shell's rather than the name of what to run.
     '& ' + ($parts -join ' ')
 }
 
@@ -1038,6 +1062,9 @@ function Invoke-KrAnswerLaunch {
         Send-KrLaunchRejection $Id $transaction $fenceId 'buffer_revision_mismatch' $reader; return
     }
 
+    # A command this shell cannot build a line from is refused with the reason it has for a buffer
+    # it cannot take the command into. That includes a vector whose first word names no
+    # application: a function, an alias or a cmdlet of that name is not the program asked for.
     $text = Get-KrLaunchText $Request['command']
     if ($null -eq $text) {
         Send-KrLaunchRejection $Id $transaction $fenceId 'buffer_not_empty' $reader; return
