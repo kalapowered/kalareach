@@ -1,0 +1,33 @@
+name: Check the lock against the RustSec advisories
+description: >-
+  Checks every crate in Cargo.lock against the RustSec advisory database as it stands when the
+  action runs, and prints the commit of the database the verdict was judged against, pass or fail.
+  The repository has to be checked out first. .cargo/audit.toml says what fails the check and
+  names each advisory the workspace has accepted, with its reason and the condition for removing
+  it. The checker is one release, and its archive has to match the digest below before it runs; it
+  and the database are public downloads, so the action needs no credential. Core-ci and the daily
+  advisories workflow both run this action, so the two cannot differ.
+
+runs:
+  using: composite
+  steps:
+    - name: Run cargo-audit
+      shell: bash
+      env:
+        CARGO_AUDIT_VERSION: "0.22.2"
+        CARGO_AUDIT_SHA256: "7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428"
+      run: |
+        set -euo pipefail
+        release="cargo-audit-x86_64-unknown-linux-musl-v$CARGO_AUDIT_VERSION"
+        tag="cargo-audit%2Fv$CARGO_AUDIT_VERSION"
+        curl --fail --silent --show-error --location --retry 3 --output "$RUNNER_TEMP/$release.tgz" \
+          "https://github.com/rustsec/rustsec/releases/download/$tag/$release.tgz"
+        echo "$CARGO_AUDIT_SHA256  $RUNNER_TEMP/$release.tgz" | sha256sum --check --strict
+        tar --extract --gzip --file "$RUNNER_TEMP/$release.tgz" --directory "$RUNNER_TEMP"
+        status=0
+        "$RUNNER_TEMP/$release/cargo-audit" audit || status=$?
+        # Which state of the database this run was judged against, pass or fail. `cargo audit`
+        # keeps it in the Cargo home.
+        git -C "${CARGO_HOME:-$HOME/.cargo}/advisory-db" log -1 \
+          --format="advisory database at %H (%cI)" || true
+        exit "$status"

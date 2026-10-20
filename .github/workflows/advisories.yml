@@ -1,0 +1,33 @@
+name: advisories
+
+# core-ci checks Cargo.lock against the RustSec advisory database on a push to main, on a pull
+# request and on a manual run. An advisory published against a lock that nothing changes would show
+# only at the next one of those, so this workflow runs the same check once a day on main and on
+# demand. A scheduled run belongs to the default branch's latest commit. The time is off the hour,
+# because GitHub delays scheduled runs when the hour starts.
+#
+# The run checks and does nothing else: it reads the repository, holds no secret, calls no
+# deployment and files no issue or comment. A finding fails the run, and the failed run is the
+# report. GitHub switches a schedule off in a public repository that has had no activity for 60
+# days.
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: dependencies against the RustSec advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Dependencies against the RustSec advisories
+        uses: ./.github/actions/rustsec-audit
