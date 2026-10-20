@@ -643,11 +643,20 @@ textarea::placeholder {
   font-size: 0.75rem;
 }
 
+/*
+ * A label and its value sit side by side where the whole value fits on the label's line, and
+ * otherwise the value goes under the label and has the list's width. A value that took what the
+ * label left would be broken to a few characters a line at a large text size on a narrow window, and
+ * a label would be broken with it. The row decides by what its words need, not by the width of the
+ * window, because the same row is too narrow on a wide window at a large enough size.
+ */
 .detail-list > div {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   justify-content: space-between;
   gap: 20px;
+  row-gap: var(--gap-1);
 }
 
 .detail-list dt {
@@ -655,7 +664,8 @@ textarea::placeholder {
 }
 
 .detail-list dd {
-  text-align: right;
+  /* Under the label a value starts where the label does; beside it, it is as wide as its words. */
+  text-align: start;
   overflow-wrap: anywhere;
 }
 
