@@ -662,9 +662,9 @@ pub unsafe extern "C" fn kr_shell_cancel_key_wait(out: *mut KrCancellation) {
 /// Every argument is quoted, including the first: an argument vector is installed as literal
 /// arguments, and a bare word at command position would be an abbreviation or a variable
 /// expansion rather than the name the caller asked to run. A quoted word is neither, but it is
-/// still looked up as a command: a function of that name runs in the program's place. Inside
-/// this shell's single quotes only a backslash and a single quote mean anything, so escaping those
-/// two is the whole of it.
+/// still looked up as a command: a function or a builtin of that name runs in the program's place.
+/// Inside this shell's single quotes only a backslash and a single quote mean anything, so escaping
+/// those two is the whole of it.
 ///
 /// # Safety
 ///

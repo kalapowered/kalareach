@@ -342,7 +342,7 @@ kr_rl_cancel_observed (void)
  * An argument vector is installed as literal arguments. A bare word at command position would be
  * a reserved word, an assignment or an alias rather than the name the caller asked to run, so
  * every argument is quoted including the first. A quoted word is none of those, but it is still
- * looked up as a command: a function of that name runs in the program's place.
+ * looked up as a command: a function or a builtin of that name runs in the program's place.
  */
 char *
 kr_shell_quote_argument (const char *argument)

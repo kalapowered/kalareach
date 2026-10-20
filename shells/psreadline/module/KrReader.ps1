@@ -285,9 +285,9 @@ function Invoke-KrCancelKeyWait {
 #
 # Every argument is quoted, including the first, so that nothing a word holds is read as syntax.
 # Quoting a word does not decide what runs: the call operator looks a quoted word up as a command
-# all the same, and a function or an alias of that name would run in the application's place. A
-# launch names its application by the full path it resolves to (`Get-KrLaunchProgram`) for that
-# reason. Inside this shell's single quotes only a quote means anything, and it is written twice.
+# all the same, and a function or an alias of that name would run in the application's place, so a
+# launch names its program as `Get-KrLaunchProgram` says. Inside this shell's single quotes only a
+# quote means anything, and it is written twice.
 # This shell reads five characters as a single quote: the ASCII one (U+0027) and the typographic
 # ones U+2018, U+2019, U+201A and U+201B, and any of them ends the string unless it is doubled.
 function Get-KrQuotedArgument {

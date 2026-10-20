@@ -339,7 +339,8 @@ kr_shell_quote_argument(const char *argument)
      * Every argument is quoted, including the first. An argument vector is installed as literal
      * arguments, and a bare word at command position would be a reserved word, an assignment or
      * an alias rather than the name the caller asked to run. A quoted word is none of those, but
-     * it is still looked up as a command: a function of that name runs in the program's place.
+     * it is still looked up as a command: a function or a builtin of that name runs in the
+     * program's place.
      *
      * `quotestring` escapes for the inside of single quotes and leaves the quotes themselves to
      * its caller, so they are added here. Without them nothing would be quoted at all.

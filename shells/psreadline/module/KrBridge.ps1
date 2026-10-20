@@ -971,27 +971,41 @@ function Get-KrLaunchWord {
     Get-KrQuotedArgument $Argument
 }
 
-# The application or script a launch's first word names, as the path the shell would run, or
-# nothing when no application has that name.
+# The word a launch writes for its program, or nothing when no application or script has that name.
 #
-# A quoted word after the call operator is still looked up as a command, so a function or an alias
-# of the same name would run in the program's place, whatever the line shows. Asking for an
-# application alone, by the engine's own lookup, leaves functions, aliases and cmdlets out, and
-# takes a name as it is: no wildcard in it is expanded.
+# A quoted word after the call operator is still looked up as a command, so an alias, a function or
+# a cmdlet of the same name would run in the program's place. Where one has the name, the word is
+# the full path of the application or script, which nothing can stand in for. Where none does, the
+# word is the name as it was given: the line then reads as the name typed at the prompt does, and
+# the command-lookup handler that asks the worker about a typed name asks about it. A name no
+# application or script has is refused, because what the line would run is not the program asked
+# for. Both lookups are the engine's own, so a name is taken as it is (no wildcard in it is
+# expanded), and what a profile's lookup hook puts in the answer is not taken for an application.
 function Get-KrLaunchProgram {
     param([string]$Name)
-    $kinds = [System.Management.Automation.CommandTypes]'Application, ExternalScript'
-    $found = $ExecutionContext.InvokeCommand.GetCommand($Name, $kinds)
-    if ($null -eq $found -or [string]::IsNullOrEmpty($found.Path)) { return $null }
-    $found.Path
+    try {
+        $programs = [System.Management.Automation.CommandTypes]'Application, ExternalScript'
+        $found = $ExecutionContext.InvokeCommand.GetCommand($Name, $programs)
+        if ($found -isnot [System.Management.Automation.ApplicationInfo] -and
+            $found -isnot [System.Management.Automation.ExternalScriptInfo]) {
+            return $null
+        }
+        $standIns = [System.Management.Automation.CommandTypes]'Alias, Function, Filter, Cmdlet'
+        if ($null -eq $ExecutionContext.InvokeCommand.GetCommand($Name, $standIns)) { return $Name }
+        [string]$found.Path
+    } catch {
+        $null
+    }
 }
 
 # The line the reader installs: an argument vector quoted for this shell, or a command the caller
 # already quoted. Nothing is assembled by interpolation.
 #
-# The first word of an argument vector is the application it names, written as its full path, so
-# what the line shows is what runs. A vector whose first word names no application has no line,
-# and the caller is told what it is told for any vector this shell cannot build one from.
+# The first word of an argument vector is the program it names: the name as given where nothing but
+# that program has it, and the program's full path where an alias, a function or a cmdlet has the
+# name too, so that what runs is what was named. A vector whose first word names no application
+# has no line, and the caller is told what it is told for any vector this shell cannot build one
+# from.
 function Get-KrLaunchText {
     param($Command)
     $variant = Get-KrVariant $Command
