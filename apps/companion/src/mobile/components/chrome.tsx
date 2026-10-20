@@ -7,7 +7,7 @@
  * doing.
  */
 
-import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
 
 import { minimumTarget, showsBackControl, type Surface } from '../platform'
 
@@ -73,6 +73,29 @@ function formThatFits(bar: HTMLElement): Form {
   }
 }
 
+/**
+ * Publishes how high the bar in `element` is, on the document as `property`, for what rests clear of
+ * it: a passing message keeps between the two bars. The whole box is watched, since the bar's padding
+ * changes with the platform's inset and with nothing inside it.
+ */
+function usePublishedHeight(element: RefObject<HTMLElement | null>, property: string): void {
+  useLayoutEffect(() => {
+    const bar = element.current
+    if (bar === null) return
+    const root = document.documentElement
+    const measure = () => {
+      root.style.setProperty(property, `${String(bar.offsetHeight)}px`)
+    }
+    measure()
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure)
+    observer?.observe(bar, { box: 'border-box' })
+    return () => {
+      observer?.disconnect()
+      root.style.removeProperty(property)
+    }
+  }, [element, property])
+}
+
 /** One destination in the tab bar. */
 export interface Destination {
   readonly id: string
@@ -115,22 +138,7 @@ export function TabBar({
       observer.disconnect()
     }
   }, [destinations])
-  // How high the bar is, for what rests above it: a passing message clears it (`--tabbar-room`).
-  useLayoutEffect(() => {
-    const element = bar.current
-    if (element === null) return
-    const root = document.documentElement
-    const measure = () => {
-      root.style.setProperty('--tabbar-room', `${String(element.offsetHeight)}px`)
-    }
-    measure()
-    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure)
-    observer?.observe(element)
-    return () => {
-      observer?.disconnect()
-      root.style.removeProperty('--tabbar-room')
-    }
-  }, [])
+  usePublishedHeight(bar, '--tabbar-room')
   return (
     <nav className="m-tabbar" aria-label="Sections" ref={bar} data-form={form === 'row' ? undefined : form}>
       {destinations.map((destination) => (
@@ -204,11 +212,13 @@ export function TopBar({
   readonly surface: Surface
 }): ReactNode {
   const target = minimumTarget(surface)
+  const bar = useRef<HTMLElement | null>(null)
+  usePublishedHeight(bar, '--topbar-room')
   // Android has a system back gesture and a system affordance; a second one in the bar would be a
   // second way to do the same thing in a place the platform does not put it.
   const back = onBack && showsBackControl(surface)
   return (
-    <header className="m-topbar">
+    <header className="m-topbar" ref={bar}>
       <span className="m-topbar-side">
         {back ? (
           <button

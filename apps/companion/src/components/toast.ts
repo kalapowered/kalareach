@@ -15,7 +15,8 @@ import { useSyncExternalStore } from 'react'
  *
  * A floor, so that a short message is not gone before it is seen, and a longer one where the message
  * offers something to do, which takes a decision as well as a reading. A time for each word, so that
- * a long message is read to its end whatever its box shows of it. And a ceiling, so that no message
+ * a long message is read to its end whatever its box shows of it; a word counts for as much as each
+ * six letters of it, since a file name or a path is read in parts. And a ceiling, so that no message
  * stays on until it is put away. A pointer resting on the message or focus inside it holds it, and
  * it goes this long after both have left.
  */
@@ -23,12 +24,15 @@ export const TOAST_FLOOR_MS = 4200
 export const TOAST_FLOOR_WITH_ACTION_MS = 8000
 export const TOAST_WORD_MS = 300
 export const TOAST_CEILING_MS = 20_000
+/** The letters that count as one word where a word has no break in it. */
+export const TOAST_LETTERS_PER_WORD = 6
 
 /** How long `text` stays, with an action of its own or without. */
 export function toastDwell(text: string, hasAction: boolean): number {
-  const words = text.split(/\s+/).filter((word) => word !== '').length
+  const spoken = text.split(/\s+/).filter((word) => word !== '').length
+  const read = Math.max(spoken, Math.ceil(text.trim().length / TOAST_LETTERS_PER_WORD))
   const floor = hasAction ? TOAST_FLOOR_WITH_ACTION_MS : TOAST_FLOOR_MS
-  return Math.min(TOAST_CEILING_MS, Math.max(floor, words * TOAST_WORD_MS))
+  return Math.min(TOAST_CEILING_MS, Math.max(floor, read * TOAST_WORD_MS))
 }
 
 /** The places on offer, oldest first: one for each open surface that has one. */

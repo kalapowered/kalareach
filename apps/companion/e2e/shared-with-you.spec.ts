@@ -513,9 +513,9 @@ test.describe('a new invitation while the inbox is scrolled', () => {
   })
 })
 
-// KR-REQ-13.19, KR-REQ-18.13: a message in passing is drawn inside the card an invitation opens, above
-// the footer and not over what accepts or puts off, at every text size and wherever the clock stands,
-// and its Dismiss is in the keyboard's path between the card's body and its footer. The words of a
+// KR-REQ-13.19, KR-REQ-18.13: a message in passing is drawn inside the card an invitation opens, in a row
+// of its own above the footer, over nothing of the card, at every text size and wherever the clock
+// stands, and its Dismiss is in the keyboard's path between the card's body and its footer. The words of a
 // message about when a share ends are longer when it ends on another day; at the largest size they are
 // too many for the message's box, and the message still goes in its time.
 test.describe('a message in passing over the card an invitation opens', () => {
@@ -588,20 +588,31 @@ test.describe('a message in passing over the card an invitation opens', () => {
       }, how.insetLater)
     }
 
-    // The message does not overlap the footer or either action, and is inside the screen.
+    // The message lies over nothing of the card where the card has room for it, and never over its
+    // footer or either action: where the card is as full as it can be (the largest text on the
+    // narrowest screen), the row the message has gives way, and it rises over the body and the
+    // header. It is inside the screen.
     const overlaps = () =>
       page.evaluate(() => {
         const message = document.querySelector('.toast')?.getBoundingClientRect()
-        if (message === undefined) return ['no message']
+        const row = document.querySelector('.sheet .toast-dock')?.getBoundingClientRect()
+        if (message === undefined || row === undefined) return ['no message']
         const found: string[] = []
         if (message.top < 0 || message.bottom > window.innerHeight) found.push('the message is off the screen')
         const meets = (box: DOMRect): boolean =>
-          box.left < message.right && box.right > message.left && box.top < message.bottom && box.bottom > message.top
-        for (const [name, selector] of [
+          box.left < message.right - 0.5 &&
+          box.right > message.left + 0.5 &&
+          box.top < message.bottom - 0.5 &&
+          box.bottom > message.top + 0.5
+        // Whether the row holds the whole message: the card had room for it.
+        const room = row.height >= message.height - 0.5
+        const guarded: (readonly [string, string])[] = [
           ['the footer', '.sheet .dialog-footer'],
           ['accept-offer', '[data-testid="accept-offer"]'],
           ['not-now', '[data-testid="not-now"]']
-        ] as const) {
+        ]
+        if (room) guarded.push(['the header', '.sheet .dialog-header'], ['the body', '.sheet .dialog-body'])
+        for (const [name, selector] of guarded) {
           const box = document.querySelector(selector)?.getBoundingClientRect()
           if (box === undefined) found.push(`no ${name}`)
           else if (meets(box)) found.push(`the message lies over ${name}`)
@@ -731,6 +742,9 @@ test.describe('a message in passing over the card an invitation opens', () => {
     await page.getByRole('button', { name: /shared session 3 with you/ }).click()
     await page.clock.runFor(1_000)
     await page.getByTestId('accept-offer').click()
+    // The press leaves the pointer where the message comes up, and a pointer on a message holds it
+    // (the engines differ in whether one that is already there counts): it is moved away.
+    await page.mouse.move(1, 1)
     await page.clock.runFor(1_000)
     const toast = page.locator('.toast')
     await expect(toast).toContainText('Session 3 is shared with you until')
@@ -817,11 +831,11 @@ test.describe('a message in passing over the card an invitation opens', () => {
       const body = document.querySelector('.sheet .dialog-body')?.getBoundingClientRect()
       return message === undefined || body === undefined
         ? null
-        : { messageTop: message.top, bodyTop: body.top, bodyBottom: body.bottom }
+        : { messageBottom: message.bottom, bodyTop: body.top }
     })
     expect(place, 'the message and the body are drawn').not.toBeNull()
-    expect(place?.messageTop, 'the message is at the head of the body').toBeLessThan(
-      (place?.bodyTop ?? 0) + ((place?.bodyBottom ?? 0) - (place?.bodyTop ?? 0)) / 2
+    expect(place?.messageBottom, 'the message is above the body, away from the decisions at its foot').toBeLessThanOrEqual(
+      (place?.bodyTop ?? 0) + 0.5
     )
   })
 })

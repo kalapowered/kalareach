@@ -997,12 +997,30 @@
  * A passing message on the phone rests above the tab bar and above a software keyboard, whichever of
  * the two reaches higher. It is placed in the shell's own frame, which the keyboard's measure is in
  * (the shell follows what the platform has panned), and not in the window's: a message at the foot
- * of the window lies under a keyboard and over the bar's controls. The bar says how high it is
- * (`--tabbar-room`). While a sheet is open the message is drawn inside the sheet instead.
+ * of the window lies under a keyboard and over the bar's controls. The bars say how high they are
+ * (`--tabbar-room` and `--topbar-room`). While a sheet is open the message is drawn inside the sheet
+ * instead.
  */
 .m-shell > .toast {
+  --toast-bottom: calc(max(var(--tabbar-room, 0px), var(--keyboard)) + var(--gap-3));
   position: absolute;
-  bottom: calc(max(var(--tabbar-room, 0px), var(--keyboard)) + var(--gap-3));
+  bottom: var(--toast-bottom);
+}
+
+/* Its words keep to half of the screen, as everywhere, and to what the shell has between the top bar
+   and the message's foot, so that a keyboard and a large text do not take it up over the bar's
+   controls. The floor is the words' own. */
+.m-shell > .toast .toast-text {
+  max-height: min(
+    12rem,
+    max(
+      80px,
+      min(
+        calc(49dvh - var(--toast-controls) - 24px),
+        calc(100dvh - var(--topbar-room, 0px) - var(--toast-bottom) - var(--toast-controls) - 24px - var(--gap-3))
+      )
+    )
+  );
 }
 
 /* ---- Landscape and larger screens ------------------------------------------------------------ */

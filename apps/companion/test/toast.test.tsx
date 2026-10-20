@@ -17,6 +17,7 @@ import {
   TOAST_CEILING_MS,
   TOAST_FLOOR_MS,
   TOAST_FLOOR_WITH_ACTION_MS,
+  TOAST_LETTERS_PER_WORD,
   TOAST_WORD_MS
 } from '../src/components/toast'
 
@@ -45,6 +46,11 @@ describe('the time a message stays', () => {
   it('has a floor, longer where the message offers something to do', () => {
     expect(toastDwell('Saved.', false)).toBe(TOAST_FLOOR_MS)
     expect(toastDwell('Saved.', true)).toBe(TOAST_FLOOR_WITH_ACTION_MS)
+  })
+
+  it('counts a name with no break in it for the letters it has', () => {
+    const name = 'a'.repeat(TOAST_LETTERS_PER_WORD * 40)
+    expect(toastDwell(name, false)).toBe(40 * TOAST_WORD_MS)
   })
 
   it('grows with the words, and stops at a ceiling', () => {
@@ -113,9 +119,10 @@ describe('where a message is drawn', () => {
 
   it('is in the place a surface offers while it is open, and back where it was when the surface goes', () => {
     render(<Toast message={MESSAGE} onDismiss={() => undefined} />)
-    expect(screen.getByRole('status').parentElement).toBe(document.body.firstElementChild)
-
     const dock = dockInDocument()
+    expect(within(dock).queryByText(MESSAGE.text)).toBeNull()
+    expect(screen.getByText(MESSAGE.text)).toBeTruthy()
+
     let take: () => void = () => undefined
     act(() => {
       take = offerToastDock(dock)
@@ -163,8 +170,9 @@ describe('where a message is drawn', () => {
     fireEvent.pointerEnter(screen.getByRole('status'))
     const before = document.activeElement
     const dock = dockInDocument()
+    let take: () => void = () => undefined
     act(() => {
-      offerToastDock(dock)
+      take = offerToastDock(dock)
     })
     expect(document.activeElement).toBe(before)
     // The pointer was on the card the message was drawn in before; this one is another, and the pointer
@@ -173,6 +181,84 @@ describe('where a message is drawn', () => {
       vi.advanceTimersByTime(TOAST_FLOOR_MS)
     })
     expect(dismissed).toHaveBeenCalledTimes(1)
+    act(() => {
+      take()
+    })
     dock.remove()
+  })
+
+  it('does not hold the place a message returns to by what was on it before it left', () => {
+    const dismissed = vi.fn()
+    render(<Toast message={MESSAGE} onDismiss={dismissed} />)
+    // The pointer rests on the message where it was first drawn, and a surface opens over it and
+    // goes again without the pointer crossing the card in it.
+    fireEvent.pointerEnter(screen.getByRole('status'))
+    const dock = dockInDocument()
+    let take: () => void = () => undefined
+    act(() => {
+      take = offerToastDock(dock)
+    })
+    act(() => {
+      take()
+    })
+    act(() => {
+      vi.advanceTimersByTime(TOAST_FLOOR_MS)
+    })
+    expect(dismissed).toHaveBeenCalledTimes(1)
+    dock.remove()
+  })
+
+  it('goes at the time it had when the application gives it a new way to dismiss it', () => {
+    const first = vi.fn()
+    const second = vi.fn()
+    const { rerender } = render(<Toast message={MESSAGE} onDismiss={first} />)
+    act(() => {
+      vi.advanceTimersByTime(TOAST_FLOOR_MS - 1000)
+    })
+    rerender(<Toast message={MESSAGE} onDismiss={second} />)
+    act(() => {
+      vi.advanceTimersByTime(999)
+    })
+    expect(first).not.toHaveBeenCalled()
+    expect(second).not.toHaveBeenCalled()
+    act(() => {
+      vi.advanceTimersByTime(1)
+    })
+    expect(first).not.toHaveBeenCalled()
+    expect(second).toHaveBeenCalledTimes(1)
+  })
+
+  it('gives the focus back to where it came from when it is dismissed, and leaves it where an action puts it', () => {
+    const before = document.createElement('button')
+    document.body.append(before)
+    const acted = vi.fn()
+    const dismissed = vi.fn()
+    render(
+      <Toast
+        message={{ ...MESSAGE, action: { label: 'Review', act: acted } }}
+        onDismiss={dismissed}
+      />
+    )
+    before.focus()
+    const dismiss = screen.getByRole('button', { name: 'Dismiss' })
+    fireEvent.focusIn(dismiss, { relatedTarget: before })
+    dismiss.focus()
+    expect(document.activeElement).toBe(dismiss)
+    act(() => {
+      dismiss.click()
+    })
+    expect(dismissed).toHaveBeenCalledTimes(1)
+    expect(document.activeElement).toBe(before)
+
+    // An action decides where the focus goes by itself: the message does not take it from it.
+    const review = screen.getByRole('button', { name: 'Review' })
+    fireEvent.focusIn(review, { relatedTarget: before })
+    review.focus()
+    act(() => {
+      review.click()
+    })
+    expect(acted).toHaveBeenCalledTimes(1)
+    expect(document.activeElement).not.toBe(before)
+    before.remove()
   })
 })

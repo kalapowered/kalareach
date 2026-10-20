@@ -1118,6 +1118,12 @@ test.describe('a passing message on the phone, above the bar and the keyboard', 
               return now === null ? false : now.bottom <= now.window - covered + 0.5
             }, 'the message ends above the keyboard')
             .toBe(true)
+          // And it does not reach up over the top bar's controls, at any size.
+          const bars = await page.evaluate(() => ({
+            top: document.querySelector('.toast')?.getBoundingClientRect().top ?? 0,
+            bar: document.querySelector('.m-topbar')?.getBoundingClientRect().bottom ?? 0
+          }))
+          expect(bars.top, 'the message starts below the top bar').toBeGreaterThanOrEqual(bars.bar - 0.5)
           await toast.getByRole('button', { name: 'Dismiss' }).click({ trial: true, timeout: 2_000 })
           await page.screenshot({ path: `/tmp/kr-text-size-toast-keyboard-${surface}-${size}-${String(width)}-${test.info().project.name}.png` })
 
@@ -1137,29 +1143,30 @@ test.describe('a passing message on the phone, above the bar and the keyboard', 
   }
 })
 
+/** What a host asks the owner to confirm, for the message that says so. */
+const REQUEST = {
+  ceremony: 'touch_id' as const,
+  requests: [
+    {
+      reference: 'request-1',
+      host_name: 'studio',
+      title: 'Pair a new device',
+      detail: null,
+      value: 'f3c1 46fd',
+      facts: [],
+      notice: null,
+      statement: null,
+      reading: null,
+      expires_at_ms: Date.now() + 600_000,
+      checkable: true
+    }
+  ]
+}
+
 // KR-REQ-13.19: a message in passing that comes while a sheet is open is drawn inside it, where a
 // keyboard and a screen reader stay: its Dismiss is named, and reached after the sheet's body, and
 // focus does not go to it by itself. It goes back to the screen when the sheet goes.
 test.describe('a passing message that comes while a sheet is open', () => {
-  const REQUEST = {
-    ceremony: 'touch_id' as const,
-    requests: [
-      {
-        reference: 'request-1',
-        host_name: 'studio',
-        title: 'Pair a new device',
-        detail: null,
-        value: 'f3c1 46fd',
-        facts: [],
-        notice: null,
-        statement: null,
-        reading: null,
-        expires_at_ms: Date.now() + 600_000,
-        checkable: true
-      }
-    ]
-  }
-
   for (const [size, ratio] of [
     ['default', 1],
     ['largest', LARGEST]
@@ -1235,6 +1242,35 @@ test.describe('a passing message that comes while a sheet is open', () => {
       await expect(toast).toHaveCount(0)
     })
   }
+
+  // A sheet keeps the focus: a message that goes while it has the focus does not leave it on the page
+  // behind. The Account sheet has no footer, so nothing follows the message in it.
+  test('keeps the focus in the sheet when the message that has it goes', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 })
+    await page.goto('/harness.html')
+    await page.waitForSelector('.app-shell')
+    await page.getByRole('button', { name: /^Account/ }).click()
+    const sheet = page.getByTestId('sheet')
+    await expect(sheet).toHaveAttribute('data-presentation', 'here', { timeout: PRESENTATION_DEADLINE })
+    await page.evaluate((view) => {
+      window.krTestHost?.setConfirmations(view)
+    }, REQUEST)
+    const toast = page.locator('.toast')
+    await expect(toast).toContainText('needs your confirmation')
+    const dismiss = toast.getByRole('button', { name: 'Dismiss' })
+    const inDialog = () => page.evaluate(() => document.activeElement?.closest('[role="dialog"]') !== null)
+    // Dismissed from the keyboard, with the focus in the message.
+    await dismiss.focus()
+    await page.keyboard.press('Enter')
+    await expect(toast).toHaveCount(0)
+    expect(await inDialog(), 'the focus is in the sheet when the message has gone').toBe(true)
+    // And where the focus was left on nothing, the next Tab brings it into the sheet.
+    await page.evaluate(() => {
+      ;(document.activeElement as HTMLElement | null)?.blur()
+    })
+    await page.keyboard.press('Tab')
+    expect(await inDialog(), 'Tab from nothing goes into the sheet').toBe(true)
+  })
 })
 
 // KR-REQ-13.19: a message appears and goes by a change of its opacity alone when the person asked for
@@ -1271,6 +1307,39 @@ test.describe('a passing message and reduced motion', () => {
       await page.getByRole('button', { name: 'Files', exact: true }).click()
       await (await opened).setFiles({ name: 'notes.png', mimeType: 'image/png', buffer: Buffer.from('a picked file') })
       await expect(page.locator('.toast')).toContainText('notes.png')
+      await expect.poll(async () => (await travel(page)).includes('opacity'), 'the message fades in').toBe(true)
+      const moved = (await travel(page)).includes('transform')
+      expect(moved, `the message ${reduced ? 'does not travel' : 'travels'} (${(await travel(page)).join(', ')})`).toBe(!reduced)
+    })
+
+    // The same inside a sheet, where the message has rules of its own.
+    test(`${reduced ? 'moves nothing' : 'comes up a short way'} when it arrives in a sheet, ${name} a request for less motion`, async ({
+      page
+    }) => {
+      if (reduced) await page.emulateMedia({ reducedMotion: 'reduce' })
+      await page.addInitScript(() => {
+        const seen: string[] = []
+        ;(window as unknown as { krToastTransitions?: string[] }).krToastTransitions = seen
+        document.addEventListener(
+          'transitionrun',
+          (event) => {
+            const target = event.target
+            if (target instanceof Element && target.matches('.toast')) seen.push(event.propertyName)
+          },
+          true
+        )
+      })
+      await page.setViewportSize({ width: 1280, height: 720 })
+      await page.goto('/harness.html')
+      await page.waitForSelector('.app-shell')
+      await page.getByRole('button', { name: /^Account/ }).click()
+      await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here', {
+        timeout: PRESENTATION_DEADLINE
+      })
+      await page.evaluate((view) => {
+        window.krTestHost?.setConfirmations(view)
+      }, REQUEST)
+      await expect(page.locator('.sheet .toast')).toContainText('needs your confirmation')
       await expect.poll(async () => (await travel(page)).includes('opacity'), 'the message fades in').toBe(true)
       const moved = (await travel(page)).includes('transform')
       expect(moved, `the message ${reduced ? 'does not travel' : 'travels'} (${(await travel(page)).join(', ')})`).toBe(!reduced)

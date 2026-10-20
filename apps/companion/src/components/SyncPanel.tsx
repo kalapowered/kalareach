@@ -89,6 +89,7 @@ export function SyncPanel({
   const target = minimumTarget(surface)
   const inputId = useId()
   const serviceStatusId = useId()
+  const draftsHelpId = useId()
   const [service, setService] = useState<SyncServiceView | null>(null)
   const [serviceProblem, setServiceProblem] = useState<string | null>(null)
   const [settings, setSettings] = useState<SettingsView | null>(null)
@@ -510,13 +511,16 @@ export function SyncPanel({
                     <Switch
                       checked={settings.sync.drafts.enabled}
                       label="Keep drafts in step"
+                      describedBy={draftsHelpId}
                       disabled={busy}
                       onChange={(next) => {
                         step('settings', () => port.settingsDraftsSet(next).then(() => null))
                       }}
                     />
                   </div>
-                  <p className="account-note">{DRAFTS_SYNC_HELP}</p>
+                  <p className="account-note" id={draftsHelpId}>
+                    {DRAFTS_SYNC_HELP}
+                  </p>
                   {settings.sync.drafts.enabled
                     ? settings.sync.drafts.kept_here.map((kept) => (
                         <p

@@ -238,12 +238,15 @@ export function Switch({
   checked,
   label,
   onChange,
-  disabled = false
+  disabled = false,
+  describedBy
 }: {
   readonly checked: boolean
   readonly label: string
   readonly onChange: (next: boolean) => void
   readonly disabled?: boolean
+  /** The identifier of the words that say what it does, which a screen reader reads with it. */
+  readonly describedBy?: string
 }): ReactNode {
   return (
     <button
@@ -252,6 +255,7 @@ export function Switch({
       className="switch-control"
       aria-checked={checked}
       aria-label={label}
+      aria-describedby={describedBy}
       aria-disabled={disabled || undefined}
       onClick={() => {
         if (!disabled) onChange(!checked)
@@ -394,8 +398,9 @@ export function Toast({
  * before it goes, and it goes its time after both have left (`toastDwell`). Both live here and not
  * in the card, which is drawn in the place the newest open surface offers and is drawn anew where
  * that changes: a message that is moved onto a surface that opens over it, or back as the surface
- * goes, goes at the time it was going to, and it is not told again. A pointer and a focus belong to
- * the place the card was in, and are not carried to another.
+ * goes, goes at the time it was going to, and it is not told again. The pointer and the focus that
+ * were on the card are gone with it: a card in another place is not held until a pointer or a focus
+ * is on that one, and the place it left is not held by what was on it before.
  */
 function HeldToast({
   message,
@@ -406,31 +411,46 @@ function HeldToast({
 }): ReactNode {
   const dock = useToastDock()
   const [holds, setHolds] = useState({ place: dock, pointer: false, focused: false })
-  const held = holds.place === dock && (holds.pointer || holds.focused)
+  if (holds.place !== dock) setHolds({ place: dock, pointer: false, focused: false })
+  const held = holds.pointer || holds.focused
   const hasAction = message.action !== undefined
+  // The time is not started again by a new `onDismiss`, which the application makes of every change
+  // to what it holds: only the message, and what holds it, decide when it goes.
+  const dismiss = useRef(onDismiss)
+  useEffect(() => {
+    dismiss.current = onDismiss
+  })
   useEffect(() => {
     if (held) return
-    const handle = setTimeout(onDismiss, toastDwell(message.text, hasAction))
+    const handle = setTimeout(() => {
+      dismiss.current()
+    }, toastDwell(message.text, hasAction))
     return () => {
       clearTimeout(handle)
     }
-  }, [held, message, hasAction, onDismiss])
+  }, [held, message, hasAction])
 
-  const hold = (change: { readonly pointer?: boolean; readonly focused?: boolean }) => {
-    setHolds((now) => ({
-      ...(now.place === dock ? now : { place: dock, pointer: false, focused: false }),
-      ...change
-    }))
+  // Where the focus was before it came into the card, for the card to give it back when it goes: a
+  // card that goes while it has the focus would leave it on nothing, and a keyboard in a surface that
+  // holds the focus would start again from the page behind it.
+  const cameFrom = useRef<HTMLElement | null>(null)
+  const leave = (act?: () => void) => {
+    const back = cameFrom.current
+    act?.()
+    onDismiss()
+    // The message's own action says where the focus goes, if it says.
+    if (act === undefined && back?.isConnected) back.focus()
   }
   const card = (
     <ToastCard
       message={message}
-      onDismiss={onDismiss}
+      onLeave={leave}
       onPointer={(on) => {
-        hold({ pointer: on })
+        setHolds((now) => ({ ...now, pointer: on }))
       }}
-      onFocus={(on) => {
-        hold({ focused: on })
+      onFocus={(on, from) => {
+        if (on && from instanceof HTMLElement) cameFrom.current = from
+        setHolds((now) => ({ ...now, focused: on }))
       }}
     />
   )
@@ -440,14 +460,16 @@ function HeldToast({
 /** What a message looks like, and what its controls do. */
 function ToastCard({
   message,
-  onDismiss,
+  onLeave,
   onPointer,
   onFocus
 }: {
   readonly message: ToastMessage
-  readonly onDismiss: () => void
+  /** Takes the message away, after `act` where the message's own action was pressed. */
+  readonly onLeave: (act?: () => void) => void
   readonly onPointer: (on: boolean) => void
-  readonly onFocus: (on: boolean) => void
+  /** Whether focus is in the card now, and where it came from when it came in. */
+  readonly onFocus: (on: boolean, from: EventTarget | null) => void
 }): ReactNode {
   // Words too many for their box are read by scrolling it, which the keyboard can do: the box takes
   // focus then, and focus in the message holds it.
@@ -481,11 +503,11 @@ function ToastCard({
       onPointerLeave={() => {
         onPointer(false)
       }}
-      onFocus={() => {
-        onFocus(true)
+      onFocus={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) onFocus(true, event.relatedTarget)
       }}
       onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget)) onFocus(false)
+        if (!event.currentTarget.contains(event.relatedTarget)) onFocus(false, null)
       }}
     >
       <div className="toast-main">
@@ -516,14 +538,18 @@ function ToastCard({
         {action === undefined ? null : (
           <Button
             onClick={() => {
-              action.act()
-              onDismiss()
+              onLeave(action.act)
             }}
           >
             {action.label}
           </Button>
         )}
-        <IconButton label="Dismiss" onClick={onDismiss}>
+        <IconButton
+          label="Dismiss"
+          onClick={() => {
+            onLeave()
+          }}
+        >
           ×
         </IconButton>
       </div>
@@ -586,10 +612,10 @@ export function Sheet({
   readonly children: ReactNode
   readonly footer?: ReactNode
   /**
-   * Where a message in passing is drawn while this surface is open: it is drawn inside it, over the
-   * foot of its body, above the footer, where what the surface asks of the person is. A surface whose
-   * decisions are at the foot of its body, above a footer that only leads elsewhere, puts it at the
-   * head of its body instead, since a message at the foot would lie over the decisions.
+   * Where a message in passing is drawn while this surface is open: inside it, in a row of its own
+   * under the body and above the footer, where what the surface asks of the person is, so that nothing
+   * is under it and the body gives it the room. A surface whose decisions are at the foot of its body,
+   * above a footer that only leads elsewhere, puts it above the body instead, away from them.
    */
   readonly messageAt?: 'foot' | 'head'
 }): ReactNode {
@@ -729,7 +755,13 @@ export function Sheet({
       const first = targets[0]
       const last = targets[targets.length - 1]
       if (!first || !last) return
-      if (event.shiftKey && document.activeElement === first) {
+      // Focus that has been left on nothing, as by a control that went away while it had it, is
+      // brought back into the surface and not left to start again from the page behind it.
+      if (document.activeElement === document.body) {
+        event.preventDefault()
+        const entry = event.shiftKey ? last : first
+        entry.focus()
+      } else if (event.shiftKey && document.activeElement === first) {
         event.preventDefault()
         last.focus()
       } else if (!event.shiftKey && document.activeElement === last) {
@@ -928,14 +960,13 @@ export function Sheet({
             ×
           </IconButton>
         </header>
-        <div className="dialog-main" data-message={messageAt}>
-          {/* A screen reader inside a modal dialog does not reach a region outside it, so the
-              banners in the dialog say their words to a region of its own. */}
-          <div className="dialog-body">
-            <AnnouncementScope>{children}</AnnouncementScope>
-          </div>
-          <div className="toast-dock" ref={setDock} />
+        {messageAt === 'head' ? <div className="toast-dock" ref={setDock} /> : null}
+        {/* A screen reader inside a modal dialog does not reach a region outside it, so the
+            banners in the dialog say their words to a region of its own. */}
+        <div className="dialog-body">
+          <AnnouncementScope>{children}</AnnouncementScope>
         </div>
+        {messageAt === 'foot' ? <div className="toast-dock" ref={setDock} /> : null}
         {footer ? <footer className="dialog-footer">{footer}</footer> : null}
       </div>
     </>

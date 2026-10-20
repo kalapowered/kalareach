@@ -968,52 +968,47 @@ textarea::placeholder {
 }
 
 /*
- * Inside a sheet the message has a place of its own, which the sheet keeps: a box over the foot of
- * the sheet's body, between the body and the footer (the head of the body where the sheet says its
- * decisions are at the foot), as wide as the body and as tall as the room it has. The message is
- * inside the dialog, so it is in the keyboard's path after the body and before the footer, and in what a
- * screen reader reads of the dialog; and it rests where the footer's actions are not, whatever the
- * footer's height, with nothing measured. The box takes no press: only the message does.
+ * Inside a sheet the message has a row of its own, which the sheet keeps: under the body and above
+ * the footer (above the body where the sheet says its decisions are at the foot of it), as wide as
+ * the sheet and as tall as the message. The body gives it the room, and gives it first: it shrinks
+ * long before the row does, so nothing lies under the message, whatever the footer, the body or the
+ * window, and a message that lay over the body would lie over what the person is deciding or over a
+ * control reached by the keyboard. Where the sheet is already as full as it can be (the largest text
+ * on the narrowest screen, with a long title), the row gives way last, and the message rises out of
+ * it over the body and the header, never over the footer: what the sheet asks of the person stays
+ * where it is. The message is inside the dialog, so it is in the keyboard's path in the order the eye
+ * reads it, and in what a screen reader reads of the dialog. The row takes no room with no message.
  */
-.dialog-main {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  flex: 1 1 auto;
-  min-height: 0;
-}
-
-.dialog-main > .dialog-body {
-  flex: 1 1 auto;
-  min-height: 0;
+.sheet > .dialog-body {
+  /* The body gives up its room long before anything else does. */
+  flex-shrink: 1000;
 }
 
 .toast-dock {
-  position: absolute;
-  inset: 0;
   display: flex;
-  align-items: flex-end;
-  justify-content: center;
+  flex: 0 1 auto;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  min-height: 0;
   padding: var(--gap-3);
-  /* The words take what the dock's own height leaves, so the message never grows over the header. */
-  container-type: size;
-  pointer-events: none;
 }
 
-.dialog-main[data-message='head'] > .toast-dock {
-  align-items: flex-start;
+.toast-dock:empty {
+  display: none;
 }
 
 .toast-dock > .toast {
   position: static;
   z-index: auto;
+  flex: none;
   max-width: 100%;
-  pointer-events: auto;
   transform: none;
 }
 
+/* A sheet is a part of the screen, and the message in it takes a part of that part. */
 .toast-dock .toast-text {
-  max-height: min(12rem, max(80px, calc(100cqb - var(--toast-controls) - 24px)));
+  max-height: min(12rem, max(80px, calc(30dvh - var(--toast-controls) - 24px)));
 }
 
 /* Over a sheet it comes up a short way from where it rests, and does not cross the footer. */
@@ -1032,22 +1027,18 @@ textarea::placeholder {
     transition: opacity 120ms ease;
   }
 
-  .toast-dock > .toast,
-  .toast-dock > .toast[data-leaving='true'] {
+  .toast-dock > .toast {
     transform: none;
   }
 
   @starting-style {
-    .toast,
-    .toast-dock > .toast {
-      opacity: 0;
-    }
-
     .toast {
+      opacity: 0;
       transform: translateX(-50%);
     }
 
     .toast-dock > .toast {
+      opacity: 0;
       transform: none;
     }
   }
@@ -1198,8 +1189,11 @@ textarea::placeholder {
 }
 
 .account-switch-head {
-  /* The height of one line of the title, which the switch is centred on whatever the text size. */
-  --title-line: calc(0.9375rem * 1.45);
+  /* The title's own size and leading, and the height of one line of it, which the switch is centred
+     on whatever the text size: the three are one set of values, so none can move without the rest. */
+  --title-size: 0.9375rem;
+  --title-leading: 1.45;
+  --title-line: calc(var(--title-size) * var(--title-leading));
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -1210,6 +1204,8 @@ textarea::placeholder {
 .account-switch-head .account-lead {
   flex: 1 1 auto;
   min-width: 0;
+  font-size: var(--title-size);
+  line-height: var(--title-leading);
 }
 
 .account-switch-head .switch-control {

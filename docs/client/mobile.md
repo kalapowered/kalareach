@@ -220,13 +220,13 @@ no confirmed outcome, and ends by saying that nothing was sent again.
   or a repeated key.
 - A sheet is dragged one to one with the finger, decides on the velocity at release, and can be
   caught and reversed mid-flight. With reduced motion nothing moves by itself: it cross-fades in
-  and out, follows the finger during a drag without stretching past its edge, and goes back at once
-  when let go short of a dismissal. A message in passing is drawn inside a sheet while one is open,
-  between its body and its footer, so a keyboard and a screen reader reach it with the sheet. If no
-  sheet is open on the phone, the message is drawn above the tab bar and above a software keyboard,
-  whichever reaches higher. The message is displayed for 4.2 seconds, or 8 seconds if it offers
-  something to do, or 0.3 seconds for each word where that is longer, but at most 20 seconds. A
-  pointer on it or focus in it holds it.
+  and out, follows the finger during a drag without stretching past its edge, and goes back at
+  once when let go short of a dismissal. A message in passing is drawn inside a sheet while one is
+  open, in a row of its own beside the body, so a keyboard and a screen reader reach it with the
+  sheet. If no sheet is open on the phone, the message is drawn above the tab bar and above a
+  software keyboard, whichever reaches higher. The message is displayed for 4.2 seconds, or 8
+  seconds if it offers something to do, or 0.3 seconds for each word where that is longer, but at
+  most 20 seconds. A pointer on it or focus in it holds it.
 
 ## Push, keys and audio, with no interface running
 
