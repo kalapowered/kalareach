@@ -54,6 +54,7 @@ pub const REFUSED: &[(&str, &[&str])] = &[
     ("a percent sign", &["a%b"]),
     ("an exclamation mark", &["a!b"]),
     ("a line feed", &["a\nb"]),
+    ("a control character above the ASCII range", &["a\u{85}b"]),
     ("a carriage return", &["a\rb"]),
     ("a tab", &["a\tb"]),
     ("white space and a final backslash", &["a b\\"]),
@@ -77,6 +78,10 @@ pub const CARRIED: &[&[&str]] = &[
 /// Words that are only separators between a batch file's `%1` to `%9`. They inject nothing, so a
 /// launch carries them; a program that reads the whole argument text gets them whole.
 pub const SEPARATORS: &[&str] = &["--model=x", "a,b", "c;d"];
+
+/// Words that start with, or are only, one of those separators, in the first place and after it.
+pub const LEADING_SEPARATORS: &[&[&str]] =
+    &[&[",a", "b"], &["=", "b"], &[";x"], &["a", ",b", "=c"]];
 
 /// What one launch did.
 pub struct Launched {

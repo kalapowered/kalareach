@@ -982,4 +982,12 @@ fn a_vector_for_a_batch_program_has_a_line_only_when_cmd_exe_would_read_every_wo
     let launched =
         batch_launch::launch_all(separators.path(), &[(programs.each, words.clone())], true);
     assert_eq!(launched[0].received(), words, "{}", launched[0].describe());
+
+    for words in batch_launch::LEADING_SEPARATORS {
+        let leading = tempfile::tempdir().expect("a temporary directory");
+        let programs = write_show_each(leading.path());
+        let launched =
+            batch_launch::launch_all(leading.path(), &[(programs.each, words.to_vec())], true);
+        assert_eq!(launched[0].received(), *words, "{}", launched[0].describe());
+    }
 }

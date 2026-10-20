@@ -1019,11 +1019,13 @@ function Get-KrLaunchProgram {
 
 # Whether Windows runs this file through cmd.exe, which reads the argument line a second time.
 #
-# That is what a `.cmd` or `.bat` file is, and nothing else is on any other platform. PowerShell
-# gives such a file the legacy rules for its arguments, so the words go out as the text of one line.
+# That is what a `.cmd` or `.bat` file is, and nothing else is on any other platform. Unless the
+# setting for native arguments is `Standard`, PowerShell gives such a file the legacy rules for its
+# arguments, so the words go out as the text of one line. The check on the words below does not
+# depend on the setting: a vector that passes it gets the same arguments under every setting.
 function Test-KrBatchProgram {
     param([string]$Path)
-    if (-not [System.OperatingSystem]::IsWindows()) { return $false }
+    if (-not $IsWindows) { return $false }
     $extension = [System.IO.Path]::GetExtension($Path)
     $extension -eq '.cmd' -or $extension -eq '.bat'
 }
@@ -1034,10 +1036,11 @@ function Test-KrBatchProgram {
 # then reads the line again: `%` is expanded (a name that is set becomes its value), `^` escapes,
 # `!` is expanded where delayed expansion is on, and `&`, `|`, `<`, `>`, `(` and `)` end the
 # command or redirect it when the word is not in quotes. PowerShell puts quotes around a word only
-# for white space, so a word with one of those is a second command. A control character ends the
-# line. A word with white space that ends in a backslash gets that backslash written twice. Such a
-# vector has no line, and the program's own path is held to the `%` and `!` rule too, because cmd.exe
-# expands them in the path it is asked to run.
+# for white space, so a word with one of those is a second command. A line feed ends the line, and
+# the other control characters are refused with it, since no word that holds one is a word a person
+# can name. A word with white space that ends in a backslash gets that backslash written twice.
+# Such a vector has no line, and the program's own path is held to the `%` and `!` rule too, because
+# cmd.exe expands them in the path it is asked to run.
 #
 # A `,`, a `;` and a `=` are carried. Each is only a separator between the batch file's `%1` to
 # `%9`, so it injects nothing, and through `%*`, which is how a package manager's shim passes its
@@ -1047,8 +1050,8 @@ function Test-KrBatchVector {
     if ($Path.IndexOfAny([char[]]@('%', '!')) -ge 0) { return $false }
     foreach ($word in $Words) {
         if ($word.Length -eq 0) { return $false }
-        if ([regex]::IsMatch($word, '["%!^&|<>()\u0000-\u001F\u007F]')) { return $false }
-        if ($word.EndsWith('\')) {
+        if ([regex]::IsMatch($word, '["%!^&|<>()\p{Cc}]')) { return $false }
+        if ($word.EndsWith([char]'\')) {
             foreach ($character in $word.ToCharArray()) {
                 if ([char]::IsWhiteSpace($character)) { return $false }
             }

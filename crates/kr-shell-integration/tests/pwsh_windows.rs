@@ -1159,6 +1159,38 @@ fn a_batch_program_is_given_separator_words_whole_through_the_argument_text() {
     );
 }
 
+/// KR-REQ-23.54: a separator at the start of a word reaches a batch program that reads the whole
+/// argument text as it was named, in the first place and after it.
+///
+/// `cmd.exe` skips blanks before the first argument, and the launch says it carries `=`, `,` and
+/// `;` whole, so a word that starts with one has to come through the argument text unchanged.
+#[test]
+fn a_batch_program_is_given_a_word_that_starts_with_a_separator_whole_through_the_argument_text() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    write_programs(directory.path());
+    let program = directory.path().join("show-all.cmd").display().to_string();
+    let cases: Vec<(String, Vec<&str>)> = batch_launch::LEADING_SEPARATORS
+        .iter()
+        .map(|words| (program.clone(), words.to_vec()))
+        .collect();
+    let launched = batch_launch::launch_all(directory.path(), &cases, false);
+    let wrong: Vec<String> = cases
+        .iter()
+        .zip(&launched)
+        .filter_map(|((_, words), launch)| {
+            let expected = vec![words.join(" ")];
+            (launch.refused || launch.received() != expected).then(|| {
+                format!(
+                    "{expected:?}: {} and the program received {:?}",
+                    launch.describe(),
+                    launch.received()
+                )
+            })
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// KR-REQ-23.54: the words a batch program is refused reach a script as named, because PowerShell
 /// binds a script's arguments itself and no `cmd.exe` reads the line.
 #[test]
