@@ -82,8 +82,11 @@ export function AnnouncementScope({ children }: { readonly children: ReactNode }
   return (
     <Scope.Provider value={said}>
       {children}
+      {/* Set at the corner of its containing block: left where it would fall, an absolutely
+          placed region at the end of a scrolling dialog would make the dialog scroll to it. */}
       <div
         className="visually-hidden"
+        style={{ insetBlockStart: 0, insetInlineStart: 0 }}
         aria-live="polite"
         aria-relevant="additions text"
         data-announcements=""
