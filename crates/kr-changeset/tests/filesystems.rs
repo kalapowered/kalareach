@@ -168,6 +168,88 @@ fn a_materialisation_on_another_filesystem_is_not_read_or_emptied_whatever_its_n
     );
 }
 
+/// KR-REQ-14.34: releasing a materialisation changes nothing of a directory bound into it from the
+/// filesystem it is on. Such a directory has the copy's device number and is another mount, so the
+/// release refuses it and the owner's right to change it is not touched: a mode given back to
+/// every directory of the same device would change a directory that is not the copy's.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"]
+fn a_directory_bound_into_a_materialisation_from_its_own_filesystem_is_not_changed_by_its_release()
+{
+    volumes::with_volumes(
+        "a_directory_bound_into_a_materialisation_from_its_own_filesystem_is_not_changed_by_its_release",
+        || {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let fixture = Fixture::create();
+            let path = ordinary_repository(fixture.work(), "work");
+            write(&path, "README.md", "the version under test\n");
+            let workspace = fixture.workspace("work");
+            let record = fixture.capture(workspace, &include_everything());
+            let made = materialise::materialise(
+                fixture.service(),
+                reference(&record),
+                MaterialisationPurpose::Test,
+                "a copy",
+                None,
+            )
+            .expect("the version is materialised");
+            let directory = std::path::Path::new(&made.directory_path);
+
+            // A directory beside the copy that its owner cannot write, on the copy's own device.
+            let outside = fixture.work().join("outside");
+            let inner = outside.join("inner");
+            std::fs::create_dir_all(&inner).expect("the directory outside the copy");
+            std::fs::write(inner.join("kept"), b"not the copy's\n").expect("its file");
+            assert_eq!(
+                numbers_of(&outside).0,
+                numbers_of(directory).0,
+                "the directory is on the copy's device"
+            );
+            let read_only = || std::fs::Permissions::from_mode(0o555);
+            std::fs::set_permissions(&inner, read_only()).expect("read-only");
+            std::fs::set_permissions(&outside, read_only()).expect("read-only");
+
+            let bound = directory.join("bound");
+            std::fs::create_dir(&bound).expect("the place for the bound directory");
+            let volume = volumes::Volume::bind(&outside, &bound)
+                .unwrap_or_else(|| volumes::not_attachable());
+
+            let refused = materialise::release(fixture.service(), made.materialisation_id);
+            let mode_of = |path: &std::path::Path| {
+                std::fs::metadata(path)
+                    .expect("the directory is there")
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            let (outside_mode, inner_mode) = (mode_of(&outside), mode_of(&inner));
+            let kept = inner.join("kept").is_file();
+            let held = changeset_journal(&fixture)
+                .query_row(
+                    "SELECT released_at_ms IS NULL FROM materialisations",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .expect("the record is there");
+
+            volume.detach();
+            for path in [&inner, &outside] {
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+            }
+            refused.expect_err("a directory bound into the copy is not removed");
+            assert_eq!(
+                outside_mode, 0o555,
+                "the bound directory's mode is as it was"
+            );
+            assert_eq!(inner_mode, 0o555, "and so is the mode of what it holds");
+            assert!(kept, "what the bound directory holds is as it was");
+            assert!(held, "the copy goes on holding its version");
+        },
+    );
+}
+
 /// KR-REQ-14.33: a store written before filesystems were recorded is taken forward when its
 /// records are used: a materialisation's directory is decided as it was, by its numbers, and the
 /// filesystem it is found on becomes the record's, once.

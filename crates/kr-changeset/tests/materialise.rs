@@ -1027,16 +1027,74 @@ fn an_unreadable_entry_at_the_bound_makes_a_truncated_listing() {
         println!("not exercised: this process reads a directory whatever its mode says");
         return;
     }
+    /// Gives the unreadable directories back their mode however the case ends, so that the
+    /// temporary tree can be removed.
+    struct Readable(std::path::PathBuf);
+    impl Drop for Readable {
+        fn drop(&mut self) {
+            for entry in std::fs::read_dir(&self.0).into_iter().flatten().flatten() {
+                let _ =
+                    std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+
     let fixture = Fixture::create();
     let (record, made) = a_copy_to_run_in(&fixture, "unreadable");
     let directory = Path::new(&made.directory_path);
     let output = directory.join("out").join("inner");
     std::fs::create_dir_all(&output).expect("a directory in the output");
+    let _readable = Readable(output.clone());
     for number in 0..materialise::MAX_OUTPUT_ENTRIES / 2 {
         let unreadable = output.join(format!("d{number}"));
         std::fs::create_dir(&unreadable).expect("a directory");
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
             .expect("its owner cannot read it");
+    }
+
+    let outputs = declared(&fixture, &record, &["out"]).expect("the declaration is fine");
+    let result = materialise::record_result_with(
+        fixture.service(),
+        made.materialisation_id,
+        &report(),
+        &outputs,
+    )
+    .expect("the result is recorded");
+    assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
+    let listing = result
+        .outputs
+        .iter()
+        .find(|output| output.label == "out")
+        .expect("the output is recorded");
+    assert_eq!(listing.kind, "truncated directory listing");
+}
+
+/// KR-REQ-25.20: the bound on a listing holds for the bytes of its paths as well as for its
+/// entries. Long names in a deep directory fill the listing's path text with fewer entries than
+/// the entry bound allows; the listing is a truncated one and the source is still attested.
+#[cfg(unix)]
+#[test]
+fn an_output_whose_paths_fill_the_listing_is_a_truncated_listing() {
+    const DIRECTORY_NAME: usize = 150;
+    const FILE_NAME: usize = 255;
+    let per_entry = DIRECTORY_NAME + 1 + DIRECTORY_NAME + 1 + FILE_NAME;
+    let files = materialise::MAX_OUTPUT_LISTING_PATH_BYTES / per_entry + 10;
+    assert!(
+        files + 2 < materialise::MAX_OUTPUT_ENTRIES,
+        "the entry bound is not the one that is met"
+    );
+
+    let fixture = Fixture::create();
+    let (record, made) = a_copy_to_run_in(&fixture, "long-paths");
+    let directory = Path::new(&made.directory_path);
+    let below = directory
+        .join("out")
+        .join("a".repeat(DIRECTORY_NAME))
+        .join("b".repeat(DIRECTORY_NAME));
+    std::fs::create_dir_all(&below).expect("a deep directory in the output");
+    for number in 0..files {
+        std::fs::File::create(below.join(format!("{number:0>FILE_NAME$}")))
+            .expect("a file with a long name");
     }
 
     let outputs = declared(&fixture, &record, &["out"]).expect("the declaration is fine");
