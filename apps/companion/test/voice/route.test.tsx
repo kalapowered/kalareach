@@ -258,7 +258,7 @@ describe('starting a call', () => {
 
     await user.click(screen.getByRole('button', { name: 'Start voice session' }))
 
-    const heading = await screen.findByRole('heading', { name: 'Voice session' }, { timeout: 4000 })
+    const heading = await screen.findByRole('heading', { name: 'Voice session' })
     expect(startsReadTaken).toBe(true)
     releaseTheStartsRead()
 
