@@ -221,8 +221,12 @@ no confirmed outcome, and ends by saying that nothing was sent again.
 - A sheet is dragged one to one with the finger, decides on the velocity at release, and can be
   caught and reversed mid-flight. With reduced motion nothing moves by itself: it cross-fades in
   and out, follows the finger during a drag without stretching past its edge, and goes back at once
-  when let go short of a dismissal. A message in passing rests above the footer of a sheet that
-  holds its actions there, and does not lie over them.
+  when let go short of a dismissal. A message in passing is drawn inside a sheet while one is open,
+  between its body and its footer, so a keyboard and a screen reader reach it with the sheet. If no
+  sheet is open on the phone, the message is drawn above the tab bar and above a software keyboard,
+  whichever reaches higher. The message is displayed for 4.2 seconds, or 8 seconds if it offers
+  something to do, or 0.3 seconds for each word where that is longer, but at most 20 seconds. A
+  pointer on it or focus in it holds it.
 
 ## Push, keys and audio, with no interface running
 
