@@ -552,22 +552,24 @@ A test result is what this host observed, and nothing a caller reports.
   followed), with the sum of the lengths it lists. The listing holds up to 50,000 entries, 64 levels
   and 16 MiB of path text; beyond this it is a truncated listing. A file is recorded as the digest
   of its first 64 MiB and its whole length. A symbolic link or other non-file, non-directory object
-  is recorded as such, and an output that cannot be read is recorded as an unreadable output with
-  the digest of no bytes (an entry of a listing that cannot be read is listed as unreadable). If a
+  is recorded as such, and an output that cannot be opened, or a file that cannot be read, is
+  recorded as an unreadable output with the digest of no bytes; a directory that opens but cannot be
+  listed, or an entry of a listing that cannot be read, is listed as an unreadable entry. If a
   directory in an output is a link, a mount, or has a name this host does not carry, it is an entry
   of the listing and is not entered. Nothing in an output enters the content store. A result that
   attests the version names the output paths it left out of the comparison. A file the suite adds
   beside an output is not left out of the comparison and changes the source (an added empty
-  directory does not, unless the change set's rules keep its path out, which makes the source
-  indeterminate), so a tool that writes beside each source directory (a compiled-code cache is the
-  usual one) makes a run of that suite that exits with status zero unknown and, where what the copy
-  held can be read completely, stores what it wrote as a version of its own. An output path must be
-  exactly specified; it is not possible to use a pattern. An ancestor of an output is entered to
-  reach it, and its other entries follow the normal rules for the source. Declarations that repeat,
-  lie inside one another, or are or contain a path the version holds are refused before the suite
-  runs. So is a declaration with a name this host does not carry as input (a colon, one of `< > " |
-  ? *`, a trailing dot or space, a name a Windows device has with or without an extension, a name
-  over 255 bytes), which the configuration accepts and every dispatch of that suite then refuses. A
+  directory does not, unless the reading cannot open or list it, reaches a bound, or the change
+  set's rules keep its path out, which makes the source indeterminate), so a tool that writes beside
+  each source directory (a compiled-code cache is the usual one) makes a run of that suite that
+  exits with status zero unknown and, where what the copy held can be read completely, stores what
+  it wrote as a version of its own under the conditions given above. An output path must be exactly
+  specified; it is not possible to use a pattern. An ancestor of an output is entered to reach it,
+  and its other entries follow the normal rules for the source. Declarations that repeat, lie inside
+  one another, or are or contain a path the version holds are refused before the suite runs. So is a
+  declaration with a name this host does not carry as input (a colon, one of `< > " | ? *`, a
+  trailing dot or space, a name a Windows device has with or without an extension, a name over 255
+  bytes), which the configuration accepts and every dispatch of that suite then refuses. A
   declaration beneath a file of the version is accepted, since writing there takes the file away
   first, which reads as a change.
 * **The copy's release.** A copy is taken away by the dispatch at once when no suite ran (the copy
