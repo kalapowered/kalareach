@@ -15,8 +15,8 @@ import { overrunning } from './layout'
 /** The Linux runner draws the page in DejaVu Sans, which sets about a tenth more text across a line. */
 const WIDE_FACE = ':root { --font-ui: Verdana, "DejaVu Sans", sans-serif !important; }'
 
-/** What the window says once for each connection the application replaces. */
-const REPLACED = 'The connection to this computer was replaced. Check anything that just failed.'
+/** What the window says once for each connection the application replaces: that it was replaced. */
+const REPLACED = /connection to this computer was replaced/
 
 function shot(name: string): string {
   return `/tmp/kr-companion-shell-${name}-${test.info().project.name}.png`

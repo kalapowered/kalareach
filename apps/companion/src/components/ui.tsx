@@ -336,8 +336,15 @@ export function Banner({
 }): ReactNode {
   const announcement = `${title}${/[.!?]$/.test(title) ? '' : '.'} ${detail}`
   const region = useRef<HTMLSpanElement | null>(null)
+  // Once the page has drawn the banner: an effect after a press runs before the frame, and words
+  // put in then would arrive with the region.
   useEffect(() => {
-    if (region.current !== null) region.current.textContent = announcement
+    const frame = requestAnimationFrame(() => {
+      if (region.current !== null) region.current.textContent = announcement
+    })
+    return () => {
+      cancelAnimationFrame(frame)
+    }
   }, [announcement])
   return (
     <div className={`banner ${tone}`}>
