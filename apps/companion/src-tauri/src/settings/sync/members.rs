@@ -757,14 +757,10 @@ impl SettingsSync {
             .map(|_| ())
     }
 
-    /// Whether the page was shown a device taken out by a revoke.
+    /// Whether the page is shown a device kept out because of a revoke: one taken out by it, or one
+    /// never shared with that a request on record keeps from being offered.
     pub fn shows_held_out(&self) -> bool {
-        !self
-            .devices
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .held_out
-            .is_empty()
+        !self.devices_view().held_out.is_empty()
     }
 
     /// Whether a request of this computer's to revoke `device` may still be carried out: the
