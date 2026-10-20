@@ -130,6 +130,18 @@ for (const [surface, size] of [
       await page.setViewportSize({ width: view.width, height: Math.ceil(height) + view.height })
     }
     await card.screenshot({ path: shot(`${surface}-${size.toFixed(1)}x`) })
+
+    // What a device reads once the host says privacy mode is off: nothing is kept here, and the
+    // row has only its switch and its words.
+    await page.evaluate(() => {
+      window.krTestHost?.settings.change({
+        sync: { drafts: { enabled: true, kept_here: [], problem: null, arrivals: 0 } }
+      })
+    })
+    await expect(card.getByTestId('drafts-kept-here')).toHaveCount(0)
+    await expect(card.getByTestId('drafts-problem')).toHaveCount(0)
+    expect(await overrunning(page, '[data-testid="drafts-sync"]')).toEqual([])
+    await card.screenshot({ path: shot(`${surface}-${size.toFixed(1)}x-nothing-kept`) })
   })
 }
 

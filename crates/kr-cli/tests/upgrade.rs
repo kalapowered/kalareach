@@ -1057,7 +1057,8 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
     );
     // The release before's daemon says nothing of privacy mode in `host.info`, and reports it only
     // under `privacy.status`, which is what a device that manages the host asks of it.
-    // Goes once no retained level is below 0.77: every daemon then says it in `host.info`.
+    // Goes once no retained level is below 0.76: the release this case rolls back to is then one
+    // that says it in `host.info`.
     assert!(
         host_info_of(host).await.privacy.is_none(),
         "the release before's daemon sends no privacy member"
