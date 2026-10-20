@@ -271,11 +271,11 @@ pub fn a_launch_of_a_name_that_is_no_application_is_refused_and_installs_nothing
 /// program.
 pub fn a_launch_of_a_command_the_lookup_handler_asks_about_is_asked_about(kind: ShellKind) {
     const HOOK: &str = r#"
-$global:KrNotFoundCalls = 0
+$global:KrProbeCalls = 0
 $ExecutionContext.InvokeCommand.CommandNotFoundAction = {
     param($CommandName, $EventArgs)
-    $global:KrNotFoundCalls++
     if ($CommandName -eq 'kr-probe') {
+        $global:KrProbeCalls++
         $EventArgs.CommandScriptBlock = { Write-Output ('kr-hook-' + 'ran') }
         $EventArgs.StopSearch = $true
     }
@@ -321,6 +321,17 @@ $ExecutionContext.InvokeCommand.CommandNotFoundAction = {
             "the hook's answer ran in the program's place:\n{}",
             session.terminal_output()
         );
+        // A program that is found never reaches the hook, whatever line starts it.
+        if !hook.is_empty() {
+            assert!(
+                session.run(
+                    "Write-Output ('kr-probe-calls-' + $global:KrProbeCalls)",
+                    "kr-probe-calls-0"
+                ),
+                "the hook was called for a program that is found:\n{}",
+                session.terminal_output()
+            );
+        }
     }
 }
 
