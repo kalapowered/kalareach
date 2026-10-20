@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 /// How long the helper is given to build and run every case of one launch.
 const WITHIN: Duration = Duration::from_secs(180);
 
-/// The program a launch is made to, found four ways.
+/// The program a launch is made to, and the places it is found in.
 pub struct Programs {
     /// By its full path.
     pub each: String,
@@ -231,9 +231,10 @@ pub fn launch_all(
         .collect()
 }
 
-/// Launches every vector that [`REFUSED`] lists, two more at a program found by its name, and a
-/// plain word at each program in a directory whose name holds a character cmd.exe expands, and
-/// fails with what was started when any of them was. It is made once for each directory.
+/// Launches every vector that [`REFUSED`] lists, two more at a program found by its name, two at a
+/// program written with a trailing dot or a trailing space, and a plain word at each program in a
+/// directory whose name holds a character cmd.exe expands, and fails with what was started when any
+/// of them was. It is made once for each directory.
 pub fn assert_nothing_is_started_that_cmd_exe_would_change(
     directory: &Path,
     programs: &Programs,

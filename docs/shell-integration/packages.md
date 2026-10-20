@@ -364,10 +364,10 @@ reach the batch file. The module does not build a command line for an argument v
 such a word, and it refuses the launch with `buffer_not_empty` before anything runs, whatever the
 setting for native arguments is. Specifically, the module refuses the launch if any word after the
 program is empty, contains a control character or one of `"`, `%`, `!`, `^`, `&`, `|`, `<`, `>`, `(`
-or `)`, or contains white space and ends with a backslash (as PowerShell will double the backslash);
-or if the path to the program contains `%` or `!` (as `cmd.exe` will try to expand them). For any
-other argument vector, the module will build the command line in the same way as it does for any
-other program.
+or `)`, or contains white space character(s) and ends with a backslash (as PowerShell will double
+the backslash); or if the path to the program contains `%` or `!` (as `cmd.exe` will try to expand
+them). For any other argument vector, the module will build the command line in the same way as it
+does for any other program.
 
 The characters `=`, `,` and `;` are safe to pass. They do not cause any injection and they will be
 kept regardless of where they appear in a word when passed through `%*` (which is how package

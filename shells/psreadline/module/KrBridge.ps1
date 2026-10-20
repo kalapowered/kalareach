@@ -1027,7 +1027,7 @@ function Test-KrBatchProgram {
     param([string]$Path)
     if (-not $IsWindows) { return $false }
     # Windows drops a trailing dot or space from a file name when it opens the file, so a path that
-    # ends in `.cmd.` or `.cmd ` is the batch file `.cmd` and runs through cmd.exe all the same.
+    # ends in `.cmd.` or `.cmd ` names a `.cmd` file all the same, and the rule holds for it too.
     $extension = [System.IO.Path]::GetExtension($Path.TrimEnd('.', ' '))
     $extension -eq '.cmd' -or $extension -eq '.bat'
 }
@@ -1039,9 +1039,9 @@ function Test-KrBatchProgram {
 # `!` is expanded where delayed expansion is on, and `&`, `|`, `<`, `>`, `(` and `)` end the
 # command or redirect it when the word is not in quotes. PowerShell puts quotes around a word only
 # for white space, so a word with one of those is a second command. A line feed ends the line, and
-# the rule refuses every other control character with it. A word with white space that ends in a backslash gets that backslash written twice.
-# Such a vector has no line, and the program's own path is held to the `%` and `!` rule too, because
-# cmd.exe expands them in the path it is asked to run.
+# the rule refuses every other control character with it. A word with white space that ends in a
+# backslash gets that backslash written twice. Such a vector has no line, and the program's own path
+# is held to the `%` and `!` rule too, because cmd.exe expands them in the path it is asked to run.
 #
 # A `,`, a `;` and a `=` are carried. Each is only a separator between the batch file's `%1` to
 # `%9`, so it injects nothing, and through `%*`, which is how a package manager's shim passes its
