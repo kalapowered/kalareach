@@ -59,6 +59,7 @@ use kr_protocol::session::{
     ClosureReason, SessionCloseResult, SessionReadParams, SessionReadResult,
 };
 use kr_protocol::worker::GenerationChallenge;
+use kr_protocol::worker_surface;
 use kr_transport::clock::{ContinuousClock, ContinuousInstant, SystemContinuousClock};
 use kr_transport::window::{AcceptedDeadline, ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 
@@ -2321,20 +2322,31 @@ impl WorkerService {
                                 // it holds. The event names the type it is published under, so there
                                 // is one place that decides that rather than one per variant.
                                 OutputDelivery::Projection { event, .. } => {
-                                    let event_type = event.event_type();
                                     let frame = match event.as_ref() {
-                                        ProjectionEvent::Reset(reset) => {
-                                            notification(&stream_id, sequence, event_type, reset)
-                                        }
-                                        ProjectionEvent::Snapshot(header) => {
-                                            notification(&stream_id, sequence, event_type, header)
-                                        }
-                                        ProjectionEvent::Rows(page) => {
-                                            notification(&stream_id, sequence, event_type, page)
-                                        }
-                                        ProjectionEvent::Delta(delta) => {
-                                            notification(&stream_id, sequence, event_type, delta)
-                                        }
+                                        ProjectionEvent::Reset(reset) => notification(
+                                            &stream_id,
+                                            sequence,
+                                            &worker_surface::PROJECTION_RESET,
+                                            reset,
+                                        ),
+                                        ProjectionEvent::Snapshot(header) => notification(
+                                            &stream_id,
+                                            sequence,
+                                            &worker_surface::PROJECTION_SNAPSHOT,
+                                            header,
+                                        ),
+                                        ProjectionEvent::Rows(page) => notification(
+                                            &stream_id,
+                                            sequence,
+                                            &worker_surface::PROJECTION_ROWS,
+                                            page,
+                                        ),
+                                        ProjectionEvent::Delta(delta) => notification(
+                                            &stream_id,
+                                            sequence,
+                                            &worker_surface::PROJECTION_DELTA,
+                                            delta,
+                                        ),
                                     };
                                     let Some(frame) = frame else {
                                         continue;
@@ -2351,7 +2363,7 @@ impl WorkerService {
                                     let Some(notification) = notification(
                                         &stream_id,
                                         sequence,
-                                        kr_protocol::projection::AGENT_RESOURCE_EVENT,
+                                        &worker_surface::SESSION_AGENT_RESOURCE,
                                         &*event,
                                     ) else {
                                         continue;
@@ -2364,7 +2376,7 @@ impl WorkerService {
                                     let Some(notification) = notification(
                                         &stream_id,
                                         sequence,
-                                        kr_protocol::projection::AGENT_INSTANCE_EVENT,
+                                        &worker_surface::SESSION_AGENT_INSTANCE,
                                         &*event,
                                     ) else {
                                         continue;
@@ -2376,7 +2388,7 @@ impl WorkerService {
                                     let Some(notification) = notification(
                                         &stream_id,
                                         sequence,
-                                        kr_protocol::root::EDITOR_BUSY_EVENT,
+                                        &worker_surface::EDITOR_BUSY,
                                         &*event,
                                     ) else {
                                         continue;
@@ -2388,7 +2400,7 @@ impl WorkerService {
                                     let Some(notification) = notification(
                                         &stream_id,
                                         sequence,
-                                        "session.resync",
+                                        &worker_surface::SESSION_RESYNC,
                                         &marker,
                                     ) else {
                                         continue;
@@ -2402,7 +2414,7 @@ impl WorkerService {
                                     if let Some(notification) = notification(
                                         &stream_id,
                                         sequence,
-                                        "session.detached",
+                                        &worker_surface::SESSION_DETACHED,
                                         &kr_protocol::attachment::SessionDetachParams {
                                             attachment_id: Nullable::some(attachment_id),
                                             line_token: Nullable::null(),
@@ -2421,7 +2433,7 @@ impl WorkerService {
                                     if let Some(notification) = notification(
                                         &stream_id,
                                         sequence,
-                                        kr_protocol::session::SESSION_CLOSED_EVENT,
+                                        &worker_surface::SESSION_CLOSED,
                                         notice.record(),
                                     ) && outlet.write(&notification).await
                                     {
@@ -6985,6 +6997,12 @@ impl WorkerService {
         version: MethodVersion,
         ingress: ActorIngress,
     ) -> Option<&'static kr_protocol::authority::MethodEntry> {
+        // A method the registry lists and this worker has no row for is not one it serves: the
+        // table is what a level of the protocol fixes of a worker, and a method outside it is
+        // refused as unlisted, before anything is parsed or journalled.
+        if !kr_protocol::worker_surface::serves(method) {
+            return None;
+        }
         match kr_protocol::method::decide(method.as_str(), version, ingress) {
             kr_protocol::authority::AuthorityDecision::Listed(entry) => Some(entry),
             kr_protocol::authority::AuthorityDecision::Denied(_) => None,
@@ -10116,8 +10134,12 @@ async fn send_stream(
             cursor: U64::new(at),
             bytes: kr_protocol::scalars::Bytes::new(chunk.to_vec()),
         };
-        let Some(notification) = notification(stream_id, *sequence, "session.output", &event)
-        else {
+        let Some(notification) = notification(
+            stream_id,
+            *sequence,
+            &worker_surface::SESSION_OUTPUT,
+            &event,
+        ) else {
             return false;
         };
         *sequence += 1;
@@ -10153,8 +10175,12 @@ async fn send_effect(
             cursor: U64::new(cursor),
             bytes: kr_protocol::scalars::Bytes::new(chunk.to_vec()),
         };
-        let Some(notification) = notification(stream_id, *sequence, "session.output", &event)
-        else {
+        let Some(notification) = notification(
+            stream_id,
+            *sequence,
+            &worker_surface::SESSION_OUTPUT,
+            &event,
+        ) else {
             return false;
         };
         *sequence += 1;
@@ -10178,7 +10204,8 @@ async fn open_delivery(
     joined: JoinedScreen,
 ) -> Option<bool> {
     if let Some(gap) = joined.gap.as_ref()
-        && let Some(notification) = notification(stream_id, *sequence, "session.gap", gap)
+        && let Some(notification) =
+            notification(stream_id, *sequence, &worker_surface::SESSION_GAP, gap)
     {
         *sequence += 1;
         if !outlet.write(&notification).await {
@@ -10291,8 +10318,12 @@ async fn send_screen(
             cursor: U64::new(cursor),
             bytes: kr_protocol::scalars::Bytes::new(chunk.to_vec()),
         };
-        let Some(notification) = notification(stream_id, *sequence, "session.output", &event)
-        else {
+        let Some(notification) = notification(
+            stream_id,
+            *sequence,
+            &worker_surface::SESSION_OUTPUT,
+            &event,
+        ) else {
             return false;
         };
         *sequence += 1;
@@ -10744,17 +10775,19 @@ fn unlisted() -> ProtocolError {
     )
 }
 
+/// Builds the notification a worker sends for one row of its table of events: the row says the
+/// name and the type of the payload, so no notification is written that the table does not have.
 fn notification<T: serde::Serialize>(
     stream_id: &StreamId,
     sequence: u64,
-    event: &str,
+    event: &kr_protocol::worker_surface::WorkerEvent<T>,
     payload: &T,
 ) -> Option<ControlFrame> {
     Some(ControlFrame::Notification(
         kr_protocol::envelope::Notification {
             stream_id: stream_id.clone(),
             sequence: kr_protocol::ids::EventSequence::new(sequence),
-            event_type: kr_protocol::ids::EventType::new(event).ok()?,
+            event_type: kr_protocol::ids::EventType::new(event.name()).ok()?,
             payload: ParamsValue::from_typed(payload).ok()?,
         },
     ))
@@ -11078,7 +11111,13 @@ mod tests {
             cursor: kr_protocol::scalars::U64::new(0),
             bytes: kr_protocol::scalars::Bytes::new(vec![b'a'; bytes]),
         };
-        notification(&stream, 0, "session.output", &event).expect("a notification")
+        notification(
+            &stream,
+            0,
+            &kr_protocol::worker_surface::SESSION_OUTPUT,
+            &event,
+        )
+        .expect("a notification")
     }
 
     /// The schedule a withdrawal has to win, and how it is arranged.

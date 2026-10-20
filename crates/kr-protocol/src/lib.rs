@@ -182,3 +182,4 @@ pub mod vectors;
 pub mod voice;
 pub mod wire;
 pub mod worker;
+pub mod worker_surface;

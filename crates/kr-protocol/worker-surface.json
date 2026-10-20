@@ -1,0 +1,339 @@
+{
+  "events": [
+    {
+      "name": "editor_busy",
+      "payload": "EditorBusyEvent"
+    },
+    {
+      "name": "session.agent.instance",
+      "payload": "AgentInstanceEvent"
+    },
+    {
+      "name": "session.agent.resource",
+      "payload": "AgentResourceEvent"
+    },
+    {
+      "name": "session.closed",
+      "payload": "ClosureRecord"
+    },
+    {
+      "name": "session.detached",
+      "payload": "SessionDetachParams"
+    },
+    {
+      "name": "session.gap",
+      "payload": "HistoryGap"
+    },
+    {
+      "name": "session.output",
+      "payload": "OutputEvent"
+    },
+    {
+      "name": "session.projection.delta",
+      "payload": "ProjectionDelta"
+    },
+    {
+      "name": "session.projection.reset",
+      "payload": "ProjectionReset"
+    },
+    {
+      "name": "session.projection.rows",
+      "payload": "ProjectionRowPage"
+    },
+    {
+      "name": "session.projection.snapshot",
+      "payload": "ProjectionSnapshot"
+    },
+    {
+      "name": "session.resync",
+      "payload": "ResyncRequired"
+    }
+  ],
+  "methods": [
+    {
+      "name": "action.cancel",
+      "params": "ActionCancelParams",
+      "result": "ActionCancelResult"
+    },
+    {
+      "name": "action.read",
+      "params": "ActionReadParams",
+      "result": "ActionReadResult"
+    },
+    {
+      "name": "agent.approval.inspect",
+      "params": "AgentApprovalInspectParams",
+      "result": "AgentApprovalInspectResult"
+    },
+    {
+      "name": "agent.approval.respond",
+      "params": "AgentApprovalRespondParams",
+      "result": "AgentApprovalRespondResult"
+    },
+    {
+      "name": "agent.capabilities",
+      "params": "AgentCapabilitiesParams",
+      "result": "AgentCapabilitiesResult"
+    },
+    {
+      "name": "agent.commands",
+      "params": "AgentCommandsParams",
+      "result": "AgentCommandsResult"
+    },
+    {
+      "name": "agent.instances",
+      "params": "AgentInstancesParams",
+      "result": "AgentInstancesResult"
+    },
+    {
+      "name": "agent.prompt.queue",
+      "params": "AgentPromptParams",
+      "result": "AgentMutationResult"
+    },
+    {
+      "name": "agent.prompt.submit",
+      "params": "AgentPromptParams",
+      "result": "AgentMutationResult"
+    },
+    {
+      "name": "agent.snapshot",
+      "params": "AgentSnapshotParams",
+      "result": "AgentSnapshotResult"
+    },
+    {
+      "name": "agent.turn.cancel",
+      "params": "AgentCancelParams",
+      "result": "AgentMutationResult"
+    },
+    {
+      "name": "agent.turn.steer",
+      "params": "AgentSteerParams",
+      "result": "AgentMutationResult"
+    },
+    {
+      "name": "alert.create",
+      "params": "AlertCreateParams",
+      "result": "AlertCreateResult"
+    },
+    {
+      "name": "attachment.configure",
+      "params": "AttachmentConfigureParams",
+      "result": "GeometryResult"
+    },
+    {
+      "name": "attachment.viewport",
+      "params": "AttachmentViewportParams",
+      "result": "AttachmentViewportResult"
+    },
+    {
+      "name": "events.snapshot",
+      "params": "EventsSnapshotParams",
+      "result": "EventsSnapshotResult"
+    },
+    {
+      "name": "events.subscribe",
+      "params": "EventsSubscribeParams",
+      "result": "EventsSubscribeResult"
+    },
+    {
+      "name": "history.page",
+      "params": "HistoryPageParams",
+      "result": "HistoryPageResult"
+    },
+    {
+      "name": "input.acquire",
+      "params": "InputAcquireParams",
+      "result": "InputAcquireResult"
+    },
+    {
+      "name": "input.interrupt",
+      "params": "InputInterruptParams",
+      "result": "InputLeaseResult"
+    },
+    {
+      "name": "input.release",
+      "params": "InputReleaseParams",
+      "result": "InputLeaseResult"
+    },
+    {
+      "name": "input.write",
+      "params": "InputWriteParams",
+      "result": "InputWriteResult"
+    },
+    {
+      "name": "plugin.action.invoke",
+      "params": "PluginActionInvokeParams",
+      "result": "PluginActionInvokeResult"
+    },
+    {
+      "name": "question.answer",
+      "params": "QuestionAnswerParams",
+      "result": "QuestionResolveResult"
+    },
+    {
+      "name": "question.cancel",
+      "params": "QuestionCancelParams",
+      "result": "QuestionResolveResult"
+    },
+    {
+      "name": "question.cancel_own",
+      "params": "QuestionCancelOwnParams",
+      "result": "QuestionOwnResult"
+    },
+    {
+      "name": "question.create",
+      "params": "QuestionCreateParams",
+      "result": "QuestionCreateResult"
+    },
+    {
+      "name": "question.read",
+      "params": "QuestionReadParams",
+      "result": "QuestionReadResult"
+    },
+    {
+      "name": "question.read_own",
+      "params": "QuestionReadOwnParams",
+      "result": "QuestionOwnResult"
+    },
+    {
+      "name": "session.attach",
+      "params": "SessionAttachParams",
+      "result": "SessionAttachResult"
+    },
+    {
+      "name": "session.close",
+      "params": "SessionCloseParams",
+      "result": "SessionCloseResult"
+    },
+    {
+      "name": "session.detach",
+      "params": "SessionDetachParams",
+      "result": "SessionDetachResult"
+    },
+    {
+      "name": "session.read",
+      "params": "SessionReadParams",
+      "result": "SessionReadResult"
+    },
+    {
+      "name": "session.screen.preview",
+      "params": "SessionScreenPreviewParams",
+      "result": "SessionScreenPreviewResult"
+    },
+    {
+      "name": "shell.launch",
+      "params": "ShellLaunchParams",
+      "result": "ShellLaunchResult"
+    },
+    {
+      "name": "terminal.geometry.transfer",
+      "params": "TerminalGeometryTransferParams",
+      "result": "GeometryResult"
+    },
+    {
+      "name": "terminal.resize",
+      "params": "TerminalResizeParams",
+      "result": "GeometryResult"
+    }
+  ],
+  "peer_roots": [
+    "ActionCancelParams",
+    "ActionCancelResult",
+    "ActionReadParams",
+    "ActionReadResult",
+    "AgentApprovalInspectParams",
+    "AgentApprovalInspectResult",
+    "AgentApprovalRespondParams",
+    "AgentApprovalRespondResult",
+    "AgentCancelParams",
+    "AgentCapabilitiesParams",
+    "AgentCapabilitiesResult",
+    "AgentCommandsParams",
+    "AgentCommandsResult",
+    "AgentInstanceEvent",
+    "AgentInstancesParams",
+    "AgentInstancesResult",
+    "AgentMutationResult",
+    "AgentPromptParams",
+    "AgentResourceEvent",
+    "AgentSnapshotParams",
+    "AgentSnapshotResult",
+    "AgentSteerParams",
+    "AlertCreateParams",
+    "AlertCreateResult",
+    "AttachmentConfigureParams",
+    "AttachmentViewportParams",
+    "AttachmentViewportResult",
+    "BridgeFrame",
+    "BridgeHello",
+    "BridgeHelloAck",
+    "ClosureRecord",
+    "EditorBusyEvent",
+    "EventsSnapshotParams",
+    "EventsSnapshotResult",
+    "EventsSubscribeParams",
+    "EventsSubscribeResult",
+    "GeometryResult",
+    "HistoryGap",
+    "HistoryPageParams",
+    "HistoryPageResult",
+    "InputAcquireParams",
+    "InputAcquireResult",
+    "InputInterruptParams",
+    "InputLeaseResult",
+    "InputReleaseParams",
+    "InputWriteParams",
+    "InputWriteResult",
+    "OutputEvent",
+    "PluginActionInvokeParams",
+    "PluginActionInvokeResult",
+    "ProjectionDelta",
+    "ProjectionReset",
+    "ProjectionRowPage",
+    "ProjectionSnapshot",
+    "QuestionAnswerParams",
+    "QuestionCancelOwnParams",
+    "QuestionCancelParams",
+    "QuestionCreateParams",
+    "QuestionCreateResult",
+    "QuestionOwnResult",
+    "QuestionReadOwnParams",
+    "QuestionReadParams",
+    "QuestionReadResult",
+    "QuestionResolveResult",
+    "ResyncRequired",
+    "SessionAttachParams",
+    "SessionAttachResult",
+    "SessionCloseParams",
+    "SessionCloseResult",
+    "SessionDetachParams",
+    "SessionDetachResult",
+    "SessionReadParams",
+    "SessionReadResult",
+    "SessionScreenPreviewParams",
+    "SessionScreenPreviewResult",
+    "ShellLaunchParams",
+    "ShellLaunchResult",
+    "TerminalGeometryTransferParams",
+    "TerminalResizeParams"
+  ],
+  "surface_roots": [
+    "ActionReadParams",
+    "ActionReadResult",
+    "AgentApprovalInspectParams",
+    "AgentApprovalInspectResult",
+    "ControlFrame",
+    "EventsSnapshotParams",
+    "EventsSnapshotResult",
+    "QuestionReadOwnParams",
+    "QuestionReadParams",
+    "QuestionReadResult",
+    "ReceiptResponse",
+    "SessionCloseResult",
+    "SessionReadParams",
+    "SessionReadResult",
+    "SessionScreenPreviewParams",
+    "SessionScreenPreviewResult",
+    "WorkerDescriptor"
+  ]
+}

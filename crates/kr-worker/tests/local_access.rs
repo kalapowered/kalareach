@@ -931,3 +931,44 @@ async fn bytes_queued_under_a_lease_whose_utc_end_passes_while_they_wait_are_nev
     );
     world.close();
 }
+
+/// A method the registry lists and the worker has no row for in its table of what it serves is
+/// refused as unlisted, as a read and as a mutation, before a parameter is read or anything is
+/// journalled. The table is what a level of the protocol fixes of a worker, so a method outside it
+/// is not served. The control: a method with a row is served on the same connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_method_the_worker_does_not_serve_is_refused_as_unlisted() {
+    let world = world("sleep 30", false).await;
+    let mut window = world.window().await;
+    let mut daemon = world.authority(1).await;
+    tell(&mut daemon, open(1)).await;
+    world
+        .read(&mut window)
+        .await
+        .expect("session.read has a row");
+
+    let params = SessionReadParams {
+        session_id: world.session_id,
+    };
+    let read = window
+        .request(Method::HostInfo, &params)
+        .await
+        .expect("the worker answers")
+        .expect_err("host.info is the daemon's");
+    assert_eq!(read.code, ErrorCode::PermissionDenied, "{read:?}");
+    assert_eq!(read.message, kr_protocol::local::METHOD_NOT_REACHABLE);
+
+    let mutation = window
+        .mutate(
+            Method::TerminalPaletteSet,
+            ActionId::new(kr_ipc::new_uuid()),
+            world.target(),
+            &params,
+        )
+        .await
+        .expect("the worker answers")
+        .expect_err("terminal.palette.set is not served");
+    assert_eq!(mutation.code, ErrorCode::PermissionDenied, "{mutation:?}");
+    assert_eq!(mutation.message, kr_protocol::local::METHOD_NOT_REACHABLE);
+    world.close();
+}
