@@ -5565,10 +5565,10 @@ async fn a_command_a_stopped_daemon_left_running_is_closed_and_released_by_the_n
             .query_row("SELECT worker_process FROM owned", [], |row| row.get(0))
             .expect("reads the row")
     };
-    assert!(
-        worker_of_the_row().is_some(),
-        "the dispatch wrote its session's worker down"
-    );
+    until("the dispatch to write its session's worker down", || {
+        worker_of_the_row().is_some()
+    })
+    .await;
     let boot: Option<String> = ledger
         .query_row("SELECT boot FROM owned", [], |row| row.get(0))
         .expect("reads the row");
