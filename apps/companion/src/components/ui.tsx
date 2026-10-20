@@ -22,6 +22,7 @@ import {
 
 import markLight from '../assets/kala-mark.svg'
 import markDark from '../assets/kala-mark-dark.svg'
+import { useAnnounced } from './announcements'
 import { failureMessage, type HostPort } from '../host/port'
 import { applyMode, modeApplications, shownMode, type ColourMode } from '../theme-init'
 import {
@@ -318,10 +319,9 @@ export function Segmented<T extends string>({
 /**
  * A banner that says what is happening, without claiming more than it knows.
  *
- * A screen reader says what a live region changes to, and not what one arrives holding. The
- * banner appears with its words, so its live region is in the page first and empty, and the words
- * go into it once the page has drawn it, as the standing banner's do. The region is for a screen
- * reader alone: the words a person reads are the banner's own.
+ * Its words are said to a screen reader through the region the application keeps
+ * ([`Announcements`]), and not through one of its own: a region that arrives with its words says
+ * nothing.
  */
 export function Banner({
   tone,
@@ -334,18 +334,7 @@ export function Banner({
   readonly detail: string
   readonly action?: ReactNode
 }): ReactNode {
-  const announcement = `${title}${/[.!?]$/.test(title) ? '' : '.'} ${detail}`
-  const region = useRef<HTMLSpanElement | null>(null)
-  // Once the page has drawn the banner: an effect after a press runs before the frame, and words
-  // put in then would arrive with the region.
-  useEffect(() => {
-    const frame = requestAnimationFrame(() => {
-      if (region.current !== null) region.current.textContent = announcement
-    })
-    return () => {
-      cancelAnimationFrame(frame)
-    }
-  }, [announcement])
+  useAnnounced(`${title}${/[.!?]$/.test(title) ? '' : '.'} ${detail}`)
   return (
     <div className={`banner ${tone}`}>
       <div className="spacer">
@@ -353,13 +342,6 @@ export function Banner({
         {detail}
       </div>
       {action}
-      <span
-        className="visually-hidden"
-        role="status"
-        aria-live="polite"
-        data-announcement=""
-        ref={region}
-      />
     </div>
   )
 }

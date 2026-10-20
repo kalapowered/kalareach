@@ -29,9 +29,9 @@ afterEach(cleanup)
 configure({ asyncUtilTimeout: 20_000 })
 vi.setConfig({ testTimeout: 30_000 })
 
-// A banner repeats its words in a live region kept for a screen reader, which a person never reads as
-// a second copy: a query for text finds the words on the screen.
-configure({ defaultIgnore: 'script, style, [data-announcement]' })
+// A banner repeats its words in the live region kept for a screen reader, which a person never reads
+// as a second copy: a query for text finds the words on the screen.
+configure({ defaultIgnore: 'script, style, [data-announcements], [data-announcements] *' })
 
 // jsdom has no layout, so an element's height is zero and the sheet's own measurements would be
 // meaningless. A fixed height makes the drag arithmetic testable.

@@ -1,6 +1,7 @@
 /**
- * The desktop shell in a real browser engine: the mark and wordmark in the sidebar, and what the
- * window says when the application replaced a connection the host withdrew.
+ * The desktop shell in a real browser engine: the mark and wordmark in the sidebar, what the
+ * window says when the application replaced a connection the host withdrew, and the region a
+ * banner's words are said to a screen reader through.
  *
  * What a component test cannot hold is layout at the largest text size and in a face as wide as the
  * Linux runner's, and a message that has to fit the screen it is said on.
@@ -120,3 +121,34 @@ for (const [size, face] of [
     await expect(toast).toContainText(REPLACED)
   })
 }
+
+// A banner's words reach a screen reader through a region that was in the page before the banner,
+// and the same region says the next banner's: a region that arrived with its words would say
+// nothing in a real engine's accessibility tree.
+test('says a banner through the region the page already held', async ({ page }) => {
+  await openTheShell(page, 'system')
+  const region = page.locator('[data-announcements]')
+  await expect(region).toHaveCount(1)
+  await expect(page.locator('.banner')).toHaveCount(0)
+  await expect(region).toBeEmpty()
+  const before = await region.elementHandle()
+
+  // The sessions cannot be listed when the person opens them: a banner comes into the page.
+  await page.evaluate(() => {
+    window.krTestHost?.failNextSessionList('The host did not answer.')
+  })
+  await page.getByRole('button', { name: 'Sessions' }).click()
+  await expect(page.locator('.banner')).toContainText('This host is not answering')
+  await expect(region.locator('p')).toHaveCount(1)
+  await expect(region).toMatchAriaSnapshot('- paragraph: /This host is not answering\\. The host did not answer\\..*/')
+  expect(await before?.evaluate((node) => node.isConnected)).toBe(true)
+  expect(
+    await page.evaluate(() => document.querySelectorAll('[data-announcements]').length),
+    'one region says every banner'
+  ).toBe(1)
+
+  // The banner goes and its words go from the region with it.
+  await page.getByRole('button', { name: 'Try again' }).click()
+  await expect(page.locator('.banner')).toHaveCount(0)
+  await expect(region).toBeEmpty()
+})
