@@ -46,7 +46,7 @@ import type {
   VoiceStopResult
 } from '@kalareach/protocol'
 
-import type { LaunchSurface, RetainedArtefacts } from '../model/pending'
+import type { LaunchSurface, RetainedArtefacts, ShellKind } from '../model/pending'
 import type { AccountView, UsageView } from '../model/account'
 import type {
   ApprovedLink,
@@ -836,11 +836,36 @@ export interface HeldMutations {
   release(): void
 }
 
+/** The shells a fake stock session can run. */
+const STOCK_SHELLS: readonly ShellKind[] = ['sh', 'zsh', 'bash', 'fish', 'powershell']
+
+/** Where each of them lives on the fake host. */
+const STOCK_SHELL_PATHS: Readonly<Record<ShellKind, string>> = {
+  sh: '/bin/sh',
+  zsh: '/bin/zsh',
+  bash: '/bin/bash',
+  fish: '/opt/homebrew/bin/fish',
+  powershell: '/usr/local/bin/pwsh'
+}
+
 /** The fake host, and the controls a test drives it with. */
-export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
+export function fakeHost(
+  options: { readonly drafts?: FakeDraftStore; readonly stockShell?: ShellKind } = {}
+): {
   port: HostPort
   controls: FakeHostControls
 } {
+  /**
+   * The shell a stock session runs: the option, else what the address asks for
+   * (`stock_shell=powershell`), else Zsh.
+   */
+  const stockShell: ShellKind =
+    options.stockShell ??
+    ((): ShellKind => {
+      if (typeof window === 'undefined') return 'zsh'
+      const asked = new URLSearchParams(window.location.search).get('stock_shell')
+      return STOCK_SHELLS.find((shell) => shell === asked) ?? 'zsh'
+    })()
   // The device's drafts outlive a host: a test that starts the application again hands the next
   // host the store the last one wrote to, as a device's disk would be.
   const drafts = options.drafts ?? new FakeDraftStore()
@@ -1523,7 +1548,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
           'no qualified shell packages are installed; KR_SHELL_PACKAGES names none either'
         )
       }
-      const summary = createdSession(params, created.length)
+      const summary = createdSession(params, created.length, stockShell)
       created.push(summary)
       records.startShell(summary.session_id)
       const result: SessionCreateResult = {
@@ -1639,7 +1664,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
         const stock = listed().some(
           (session) => session.session_id === sessionId && session.shell_mode === 'native_compat'
         )
-        return fakeLaunchSurface(!stock, String(promptGeneration))
+        return fakeLaunchSurface(!stock, String(promptGeneration), stock ? stockShell : 'zsh')
       }),
     shellLaunch: (params) => {
       requireConnection()
@@ -2892,7 +2917,8 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
             environment_id: first?.environment_id,
             worker_profile: first?.worker_profile
           } as unknown as SessionCreateParams,
-          created.length
+          created.length,
+          stockShell
         )
         created.push(summary)
         records.startShell(summary.session_id)
@@ -3437,8 +3463,13 @@ function fakeVoiceContext(voiceSessionId: string, sessionId: string): VoiceConte
 }
 
 /** The launch surface this host reports, read by the interface before it draws a button. */
-export function fakeLaunchSurface(promptIsEmpty: boolean, promptGeneration: string): LaunchSurface {
+export function fakeLaunchSurface(
+  promptIsEmpty: boolean,
+  promptGeneration: string,
+  shellKind: ShellKind = 'zsh'
+): LaunchSurface {
   return {
+    shell_kind: shellKind,
     prompt_is_empty: promptIsEmpty,
     prompt_generation: promptGeneration,
     buffer_revision: '12',
@@ -3449,7 +3480,10 @@ export function fakeLaunchSurface(promptIsEmpty: boolean, promptGeneration: stri
       { profile_id: 'gemini', label: 'Gemini', executable: '/usr/local/bin/gemini', version: '0.9.3', user_defined: false, arguments: ['gemini'] },
       { profile_id: 'kimi', label: 'Kimi', executable: null, version: null, user_defined: false, arguments: ['kimi'] },
       { profile_id: 'qoder', label: 'Qoder', executable: '/usr/local/bin/qoder', version: '0.6.1', user_defined: false, arguments: ['qoder'] },
-      { profile_id: 'named-1', label: 'Run the test suite', executable: '/bin/sh', version: null, user_defined: true, arguments: ['pnpm', 'test'] }
+      { profile_id: 'named-1', label: 'Run the test suite', executable: '/bin/sh', version: null, user_defined: true, arguments: ['pnpm', 'test'] },
+      // A command whose words need quoting in every shell: a path with a space, a word with a quote
+      // and a word a shell would read as more than itself.
+      { profile_id: 'named-2', label: 'Open my notes', executable: '/bin/sh', version: null, user_defined: true, arguments: ['/Users/rs/My Notes/open-notes', '--title', 'It’s a draft', "--note=don't", '--tags=a,b', '@today'] }
     ]
   }
 }
@@ -3538,7 +3572,11 @@ type SessionSummaryOf = SessionListResult['sessions'][number]
  * The session a creation made, as the host reports it: running the shell the mode asked for, in
  * the directory the request named, with nothing attached yet.
  */
-function createdSession(params: SessionCreateParams, before: number): SessionSummaryOf {
+function createdSession(
+  params: SessionCreateParams,
+  before: number,
+  stockShell: ShellKind
+): SessionSummaryOf {
   const number = 4 + before
   return {
     application_state: 'shell_ready',
@@ -3558,7 +3596,7 @@ function createdSession(params: SessionCreateParams, before: number): SessionSum
     shell_path:
       params.shell_mode === 'managed'
         ? '/Users/rs/Library/Application Support/KalaReach/shells/zsh/bin/zsh'
-        : '/bin/zsh',
+        : STOCK_SHELL_PATHS[stockShell],
     state: 'live',
     worker_profile: params.worker_profile
   } as unknown as SessionSummaryOf

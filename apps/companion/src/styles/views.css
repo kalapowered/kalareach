@@ -695,6 +695,20 @@
   opacity: 0.6;
 }
 
+/* The command a stock shell's launch button shows. It stands on lines of its own, in the text colour
+   rather than the faint one the sentence is in, so that a long one wraps under itself and reads as
+   what to type; a word wider than the room, such as a path, is broken as one in a line of text is. */
+.launch-surface code {
+  display: block;
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
 /* ---- The composer ---------------------------------------------------------------------------- */
 
 .composer {

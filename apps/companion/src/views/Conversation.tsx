@@ -110,6 +110,7 @@ import {
   wasRefused,
   type Submission
 } from '../model/receipts'
+import { commandLine } from '../model/command-line'
 import type { LaunchSurface } from '../model/pending'
 import { useBook, useSessionDraft } from '../app/drafts'
 import { useReceiptReads } from '../app/receipts'
@@ -1485,6 +1486,7 @@ function LaunchInstructions({ surface }: { readonly surface: LaunchSurface }): R
           <Button
             key={profile.profile_id}
             data-profile={profile.profile_id}
+            data-wraps
             disabled={profile.executable === null}
             aria-pressed={shown?.profile_id === profile.profile_id}
             title={
@@ -1496,8 +1498,11 @@ function LaunchInstructions({ surface }: { readonly surface: LaunchSurface }): R
               setShown(profile)
             }}
           >
-            {profile.label}
-            {profile.user_defined ? <span className="faint small"> · yours</span> : null}
+            {/* One piece of text, so that a label that has to wrap wraps as a line does. */}
+            <span>
+              {profile.label}
+              {profile.user_defined ? <span className="faint small"> · yours</span> : null}
+            </span>
           </Button>
         ))}
       </div>
@@ -1506,21 +1511,12 @@ function LaunchInstructions({ surface }: { readonly surface: LaunchSurface }): R
           'This is a stock shell, so nothing is typed into it for you. Choose one to see what to type.'
         ) : (
           <>
-            Type this at the prompt: <code>{commandLine(shown.arguments)}</code>
+            Type this at the prompt: <code>{commandLine(shown.arguments, surface.shell_kind)}</code>
           </>
         )}
       </p>
     </section>
   )
-}
-
-/** An argument vector as a person types it at a shell's prompt. */
-function commandLine(argv: readonly string[]): string {
-  return argv
-    .map((argument) =>
-      /^[\w@%+=:,./-]+$/.test(argument) ? argument : `'${argument.replaceAll("'", `'\\''`)}'`
-    )
-    .join(' ')
 }
 
 /** The composer. */

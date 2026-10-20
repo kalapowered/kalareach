@@ -201,6 +201,41 @@ describe('creating a session (KR-REQ-07.21)', () => {
     expect(launched).toEqual([])
   })
 
+  // The same command, written for the shell the stock session runs: what a person types at a
+  // PowerShell prompt is not what they type at a POSIX one.
+  it.each([
+    [
+      'zsh',
+      "'/Users/rs/My Notes/open-notes' --title 'It’s a draft' '--note=don'\\''t' --tags=a,b @today"
+    ],
+    [
+      'fish',
+      "'/Users/rs/My Notes/open-notes' --title 'It’s a draft' '--note=don\\'t' --tags=a,b @today"
+    ],
+    [
+      'powershell',
+      "& '/Users/rs/My Notes/open-notes' --title 'It’’s a draft' '--note=don''t' '--tags=a,b' '@today'"
+    ]
+  ] as const)(
+    'shows a stock %s session’s command in that shell’s own quoting',
+    async (shell, expected) => {
+      const person = userEvent.setup()
+      const { port } = fakeHost({ stockShell: shell })
+      const created = await port.sessionCreate(stockCreation('/Users/rs/work/notes'), {})
+      open(port, {
+        view: 'session',
+        sessionId: created.value?.session.session_id ?? '',
+        pane: 'semantic'
+      })
+
+      const surface = await screen.findByTestId('launch-instructions')
+      await person.click(within(surface).getByRole('button', { name: /Open my notes/ }))
+      expect(within(surface).getByTestId('launch-instruction')).toHaveTextContent(
+        `Type this at the prompt: ${expected}`
+      )
+    }
+  )
+
   it('lists a stock shell as one on the phone', async () => {
     const { port } = fakeHost()
     await port.sessionCreate(stockCreation('/Users/rs/work/notes'), {})

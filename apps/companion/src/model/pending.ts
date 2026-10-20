@@ -39,8 +39,16 @@ export interface LaunchProfile {
   readonly arguments: readonly string[]
 }
 
+/**
+ * The shell a session runs, as far as how it reads a command: the three families whose quoting
+ * differs are POSIX shells (`sh`, `zsh`, `bash`), Fish and PowerShell.
+ */
+export type ShellKind = 'sh' | 'zsh' | 'bash' | 'fish' | 'powershell'
+
 /** What the launch surface reads before it draws a button. */
 export interface LaunchSurface {
+  /** The shell the session runs, which decides how a command is written for the person to type. */
+  readonly shell_kind: ShellKind
   /** True only when the host verified the prompt is empty. */
   readonly prompt_is_empty: boolean
   /** The generation a launch must name. A launch at another generation is refused. */
