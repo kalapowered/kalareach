@@ -1792,7 +1792,8 @@ removed comes back when it is turned off.
 `kr privacy status` also names what this host keeps while privacy mode is on, and why, and lists
 what had already left it before privacy mode was turned on: backup archives and notifications, each
 with whether this host holds any way to ask for its removal. It changes nothing. A paired device
-whose grant carries `host.manage` reads the same report; no device can turn privacy mode on or off.
+whose grant carries `host.manage` reads the same report; no device can turn privacy mode on or off. A device without it
+reads only whether privacy mode is on, in `host.info`.
 `docs/host/README.md` has what each step does and what privacy mode does not reach.
 
 ## `kr destination`

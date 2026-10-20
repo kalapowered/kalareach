@@ -733,6 +733,16 @@ what the platform said:
 | `environment.capabilities` | the capability evidence, the desktop context and the persistence table on the same terms as a support bundle |
 | `host.doctor` | the checks and the effective configuration on the same terms as a support bundle |
 
+`host.info` also tells every paired device, whatever rights its grant carries, whether privacy mode
+is currently on at the host. All devices see the on/off state and the generation, and whether the
+host is changing its privacy mode. Devices that do not have the `host.manage` right see only that.
+Devices with the `host.manage` right read the rest in the report of `privacy.status`: when privacy
+mode last changed, whether its cleanup is complete, what each session still owes, what the host
+keeps and what had already left it. The host says it is changing privacy mode from the moment a
+change is asked for until the change is published, and, after a change that stopped part way, until
+the daemon starts again. A device reads the host as private while the host is changing its privacy
+mode. A host of an earlier build leaves this member out of `host.info`.
+
 The allowlist walk above has all four answers as roots, so a field added to one fails the build's
 own tests until it is classed.
 
@@ -3995,7 +4005,8 @@ to be complete. `kr privacy on` and `kr privacy off` reach it through `privacy.s
 host serves: a paired device whose grant carries `host.manage` reads `privacy.status` and changes
 nothing about the host. Both answer one report: the generation, whether the last change has taken
 effect, what each session still owes, what the daemon keeps and why, and what had already left this
-host.
+host. A paired device without `host.manage` reads only whether privacy mode is on, and its
+generation, in `host.info`.
 
 The act of turning it on writes the record first, in a single transaction that records an obligation
 for every session for which the environment has content, including every worker recorded in the

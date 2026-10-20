@@ -293,7 +293,7 @@ Mutation schemas are closed for the negotiated version. Read-only metadata may c
 optional fields a receiver does not know: a type opts in with the schema keyword
 `x-kalareach-read-only-metadata` and without `deny_unknown_fields`, and the check removes an
 undeclared field there before typed decoding and never delivers it. `HostInfoResult`,
-`EnvironmentListResult` and `EnvironmentSummary` are read-only metadata. A field a newer host adds
+`EnvironmentListResult`, `EnvironmentSummary` and `HostPrivacyState` are read-only metadata. A field a newer host adds
 to one of them is optional, absent when unset, and an older client ignores it. A test holds that no
 parameter schema, envelope, handshake message, signed object, event or write result reaches a
 read-only metadata type, so an ignored field is never one a signature or a digest covers.
