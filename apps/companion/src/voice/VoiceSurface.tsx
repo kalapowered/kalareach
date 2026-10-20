@@ -121,7 +121,38 @@ export interface VoiceSurfaceProps {
    * that the control that was pressed going away does not leave focus on nothing.
    */
   readonly focusToken?: number
+  /**
+   * Whether the screen shown now follows the one the person pressed Start on: the call this screen
+   * started, or the screen left when the choice could not be read again. Its heading then takes
+   * focus when it appears, if nothing holds it, because the control that was pressed went with the
+   * screen before.
+   */
+  readonly focusHeadingOnShow?: boolean
   readonly actions: VoiceSurfaceActions
+}
+
+/**
+ * Focuses `heading` once, when the screen it heads appears, if nothing holds focus.
+ *
+ * The control that was pressed to bring this screen went with the screen before it, and focus left
+ * on nothing sends a keyboard or screen-reader user back to the top of the document. Nothing holds
+ * focus when it is on the page itself or on a region that holds this screen (an engine that does
+ * not focus a button when it is pressed leaves it there). A person who has moved focus to some
+ * other control keeps it there.
+ */
+function useHeadingFocusWhenNothingHolds(
+  heading: React.RefObject<HTMLHeadingElement | null>,
+  enabled: boolean
+): void {
+  const take = useRef(enabled)
+  useEffect(() => {
+    if (!take.current) return
+    const held = document.activeElement
+    const target = heading.current
+    if (target !== null && (held === null || held === document.body || held.contains(target))) {
+      target.focus()
+    }
+  }, [heading])
 }
 
 /** The voice screen. */
@@ -136,10 +167,20 @@ export function VoiceSurface({
   settingUp = false,
   ending = false,
   focusToken = 0,
+  focusHeadingOnShow = false,
   actions
 }: VoiceSurfaceProps): React.ReactElement {
   if (call) {
-    return <CallScreen call={call} currentTurn={currentTurn} busy={busy} notice={notice} actions={actions} />
+    return (
+      <CallScreen
+        call={call}
+        currentTurn={currentTurn}
+        busy={busy}
+        notice={notice}
+        focusOnShow={focusHeadingOnShow}
+        actions={actions}
+      />
+    )
   }
   if (settingUp) {
     return <SettingUpScreen ending={ending} notice={notice} onEnd={actions.endSetup} />
@@ -159,9 +200,29 @@ export function VoiceSurface({
       />
     )
   }
+  return <AskingScreen busy={busy} notice={notice} focusOnShow={focusHeadingOnShow} />
+}
+
+/**
+ * The screen while there is no choice to show: the host has not answered what a call would be, or
+ * its answer could not be read again after the start named one that had changed.
+ */
+function AskingScreen({
+  busy,
+  notice,
+  focusOnShow
+}: {
+  readonly busy: boolean
+  readonly notice: string | null
+  readonly focusOnShow: boolean
+}): React.ReactElement {
+  const heading = useRef<HTMLHeadingElement | null>(null)
+  useHeadingFocusWhenNothingHolds(heading, focusOnShow)
   return (
     <section className="kr-voice" aria-busy={busy}>
-      <h1 className="kr-voice__title">Start a voice session</h1>
+      <h1 className="kr-voice__title" ref={heading} tabIndex={-1}>
+        Start a voice session
+      </h1>
       <p className="kr-voice__refusal" role="status">
         {notice ?? 'Asking this host what a voice session would be allowed to do…'}
       </p>
@@ -462,7 +523,7 @@ function ProviderChoiceScreen({
           <button
             type="button"
             ref={startControl}
-            className="kr-voice__start"
+            className={busy ? 'kr-voice__start kr-voice__start--busy' : 'kr-voice__start'}
             onClick={onStart}
             disabled={busy}
             aria-describedby={`${id}-cost-rate ${id}-cost-limits`}
@@ -540,12 +601,14 @@ function CallScreen({
   currentTurn,
   busy,
   notice,
+  focusOnShow,
   actions
 }: {
   readonly call: RunningCall
   readonly currentTurn: CurrentTurn | null
   readonly busy: boolean
   readonly notice: string | null
+  readonly focusOnShow: boolean
   readonly actions: VoiceSurfaceActions
 }): React.ReactElement {
   /**
@@ -569,6 +632,8 @@ function CallScreen({
   const heard = speechCouldHaveBeenHeard(call.capture)
   const canCancel = controlAvailable('cancel_task', call) && currentTurn !== null
   const headingId = useId()
+  const heading = useRef<HTMLHeadingElement | null>(null)
+  useHeadingFocusWhenNothingHolds(heading, focusOnShow)
 
   const askRef = useRef<HTMLButtonElement | null>(null)
   const confirmRef = useRef<HTMLButtonElement | null>(null)
@@ -607,7 +672,7 @@ function CallScreen({
 
   return (
     <section className="kr-voice kr-voice--live" aria-labelledby={headingId}>
-      <h1 id={headingId} className="kr-voice__title">
+      <h1 id={headingId} className="kr-voice__title" ref={heading} tabIndex={-1}>
         Voice session
       </h1>
 

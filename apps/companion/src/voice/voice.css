@@ -277,6 +277,15 @@
   cursor: default;
 }
 
+/* The word that says a start is under way is one thing with its ellipsis, and is not broken: at
+   the largest text size, in a face as wide as the runner's, the word fills the control and the
+   ellipsis would go to a line of its own. The control gives up some of its inline padding for it, as
+   its label is the only thing in it, and the label is centred in what is left. */
+.kr-voice__start--busy {
+  padding-inline: var(--gap-2);
+  white-space: nowrap;
+}
+
 .kr-voice__delegation {
   border-bottom: 1px solid var(--faint);
   padding-bottom: var(--gap-2);

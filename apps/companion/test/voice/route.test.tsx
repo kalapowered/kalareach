@@ -208,6 +208,55 @@ describe('starting a call', () => {
     })
     expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
   })
+
+  // The control that was pressed goes with the screen it was on, and focus left on nothing sends a
+  // keyboard or screen-reader user back to the top of the document: the call this screen's own start
+  // began takes focus on its heading.
+  it('puts focus on the call screen\'s heading once its own start has begun the call', async () => {
+    const user = userEvent.setup()
+    start()
+    await waitForChoice()
+
+    await user.click(screen.getByRole('button', { name: 'Start voice session' }))
+
+    const heading = await screen.findByRole('heading', { name: 'Voice session' })
+    expect(heading).toHaveFocus()
+  })
+
+  // A call this screen found, because it was loaded again while one ran, is not one it started: the
+  // person has not pressed anything here, and focus is not taken from wherever they are.
+  it('leaves focus alone for a call it found running', async () => {
+    start((controls) => {
+      controls.holdAVoiceCall()
+    })
+
+    const heading = await screen.findByRole('heading', { name: 'Voice session' })
+
+    expect(heading).not.toHaveFocus()
+  })
+
+  // The same, when the start found that what a call would be had changed and what a call would be
+  // could not be read again: the choice goes, and the screen that is left takes focus on its heading.
+  it('puts focus on the heading when the choice could not be read again after a start', async () => {
+    const user = userEvent.setup()
+    const { controls, port } = start()
+    await waitForChoice()
+    controls.changeVoiceScope()
+    vi.spyOn(port, 'voicePrepare').mockRejectedValue({
+      code: 'RESOURCE_UNAVAILABLE',
+      message: 'This host cannot be contacted right now.',
+      user_action: 'retry'
+    })
+
+    await user.click(screen.getByRole('button', { name: 'Start voice session' }))
+
+    const heading = await screen.findByRole('heading', { name: 'Start a voice session' })
+    await waitFor(() => {
+      expect(screen.getByText('This host cannot be contacted right now.')).toBeInTheDocument()
+    })
+    expect(screen.queryByRole('button', { name: 'Start voice session' })).not.toBeInTheDocument()
+    expect(heading).toHaveFocus()
+  })
 })
 
 describe('while a call is running', () => {

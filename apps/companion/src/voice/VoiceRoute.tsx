@@ -137,6 +137,13 @@ export function VoiceRoute({
    * screen-reader user back to the top of the document.
    */
   const [leftCount, setLeftCount] = useState(0)
+  /**
+   * The call this screen's own start began, and whether the choice was lost after a start that
+   * found what a call would be had changed and could not read it again: the screens that follow the
+   * control that was pressed, whose heading takes focus when they appear.
+   */
+  const [startedHere, setStartedHere] = useState<string | null>(null)
+  const [choiceLostAfterStart, setChoiceLostAfterStart] = useState(false)
 
   /**
    * Whether this device's connection to the host is carrying requests.
@@ -515,6 +522,7 @@ export function VoiceRoute({
         setBusy(true)
         setWaitingForHost(true)
         setNotice(null)
+        setChoiceLostAfterStart(false)
         starting.current = true
         const shown = choice
         void ask(() =>
@@ -551,10 +559,17 @@ export function VoiceRoute({
               setNotice(
                 'What this call would reach or do changed after you read it, so nothing was started. It is shown again below.'
               )
-              await prepare().then(setChoice, (error: unknown) => {
-                setChoice(null)
-                setNotice(failureMessage(error))
-              })
+              await prepare().then(
+                (prepared) => {
+                  setChoiceLostAfterStart(false)
+                  setChoice(prepared)
+                },
+                (error: unknown) => {
+                  setChoiceLostAfterStart(true)
+                  setChoice(null)
+                  setNotice(failureMessage(error))
+                }
+              )
               return
             }
             if ('rate_changed' in outcome) {
@@ -593,6 +608,7 @@ export function VoiceRoute({
             )
             setLeft(null)
             setEndedBefore(null)
+            setStartedHere(session.voice_session_id)
             setCall(runningCallFrom(session, state, terms.admission_note))
           })
           .catch((error: unknown) => {
@@ -764,6 +780,7 @@ export function VoiceRoute({
         settingUp={setUp && !call}
         ending={endingSetUp}
         focusToken={leftCount}
+        focusHeadingOnShow={call === null ? choiceLostAfterStart : call.voiceSessionId === startedHere}
         actions={actions}
       />
     </Region>

@@ -71,6 +71,22 @@ async function withWideFace(page: Page): Promise<void> {
   })
 }
 
+/**
+ * How many lines the text of the first element matching `selector` is set on, counted by the tops
+ * of the boxes its text fills. An element that is not on the screen is a failure, not a count.
+ */
+const lineCount = (page: Page, selector: string): Promise<number> =>
+  page.evaluate((target) => {
+    const element = document.querySelector(target)
+    if (element === null) throw new Error(`${target} is not on the screen`)
+    const range = document.createRange()
+    range.selectNodeContents(element)
+    const tops = Array.from(range.getClientRects())
+      .filter((rect) => rect.width > 0)
+      .map((rect) => Math.round(rect.top))
+    return new Set(tops).size
+  }, selector)
+
 const rootSize = (page: Page): Promise<number> =>
   page.evaluate(() => parseFloat(getComputedStyle(document.documentElement).fontSize))
 
@@ -466,6 +482,8 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         const end = page.getByRole('button', { name: 'End the call' })
         await expect(end).toBeInViewport()
         await expect(page.getByRole('button', { name: 'Starting…' })).toBeDisabled()
+        // The word and its ellipsis are one thing: the ellipsis never sits on a line of its own.
+        expect(await lineCount(page, '.kr-voice__start'), 'the start label on one line').toBe(1)
         await page.screenshot({
           path: `/tmp/kr-voice-own-start-${size}-${surface}-${test.info().project.name}.png`
         })
@@ -497,6 +515,22 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
       })
     }
 
+    // The control that was pressed goes with the screen it was on, and focus left on nothing sends a
+    // keyboard or screen-reader user back to the top of the document. In both engines, the call
+    // this screen's own start began takes focus on its heading.
+    test(`puts focus on the call screen's heading after its own start on ${surface}`, async ({
+      page
+    }) => {
+      await page.setViewportSize({ width: 390, height: 720 })
+      await page.goto(`/harness.html?surface=${surface}&tab=sessions`)
+      await page.getByTestId('voice-entry').click()
+      const start = page.getByRole('button', { name: 'Start voice session' })
+      await start.scrollIntoViewIfNeeded()
+      await start.click()
+
+      await expect(page.getByRole('heading', { name: 'Voice session' })).toBeFocused()
+    })
+
     // The same start, in a face as wide as the runner's: the words that say the end has begun take
     // more lines than in a phone's face, and the control that was pressed and the words together are taller than the screen
     // they are on. The control stays on the screen, as the words are brought into view only as far
@@ -518,6 +552,11 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
 
       const end = page.getByRole('button', { name: 'End the call' })
       await expect(end).toBeInViewport()
+      await expect(page.getByRole('button', { name: 'Starting…' })).toBeDisabled()
+      await page.screenshot({
+        path: `/tmp/kr-voice-own-start-wide-${surface}-${test.info().project.name}.png`
+      })
+      expect(await lineCount(page, '.kr-voice__start'), 'the start label on one line').toBe(1)
       await end.click()
       const ending = page.getByRole('button', { name: 'Ending…' })
       await expect(ending).toBeDisabled()
