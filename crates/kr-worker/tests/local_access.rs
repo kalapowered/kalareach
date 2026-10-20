@@ -933,9 +933,9 @@ async fn bytes_queued_under_a_lease_whose_utc_end_passes_while_they_wait_are_nev
 }
 
 /// A method the registry lists and the worker has no row for in its table of what it serves is
-/// refused as unlisted, as a read and as a mutation, before a parameter is read or anything is
-/// journalled. The table is what a level of the protocol fixes of a worker, so a method outside it
-/// is not served. The control: a method with a row is served on the same connection.
+/// refused as unlisted, as a read and as a mutation, before a parameter is read. The table is what
+/// a level of the protocol fixes of a worker, so a method outside it is not served. The control: a
+/// method with a row is served on the same connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_method_the_worker_does_not_serve_is_refused_as_unlisted() {
     let world = world("sleep 30", false).await;

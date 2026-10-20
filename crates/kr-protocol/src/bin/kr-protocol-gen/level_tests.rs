@@ -1156,3 +1156,35 @@ fn a_declared_root_that_is_no_definition_is_refused() {
         .expect_err("the head lists a root its schema lacks");
     assert!(error.contains("this commit declares"), "{error}");
 }
+
+/// A file that is in the release's tree and cannot be read is a failure; it is not the absence of the
+/// file, which is how a release from before the retained levels reads.
+#[test]
+fn a_roots_file_that_cannot_be_read_is_not_an_absent_one() {
+    use crate::releases::surface_roots_at;
+    let repo = Repo::new("unreadable-roots");
+    let commit = repo.commit(&Tree::the_level(), "a release");
+    assert_eq!(
+        surface_roots_at(&repo.directory, &commit).expect("a list"),
+        Some(vec!["ControlFrame".to_owned()])
+    );
+    // A tree with no such file: absent.
+    repo.git(&["rm", "-q", "crates/kr-protocol/src/retained.rs"]);
+    repo.git(&["commit", "-q", "-m", "without the file"]);
+    let without = repo.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    assert_eq!(
+        surface_roots_at(&repo.directory, &without).expect("absent"),
+        None
+    );
+    // A tree where the path is a commit of another repository: listed, and not a file git can show.
+    repo.git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        "160000,0123456789abcdef0123456789abcdef01234567,crates/kr-protocol/src/retained.rs",
+    ]);
+    repo.git(&["commit", "-q", "-m", "a path that cannot be shown"]);
+    let broken = repo.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    let error = surface_roots_at(&repo.directory, &broken).expect_err("unreadable");
+    assert!(error.contains("cannot be read"), "{error}");
+}
