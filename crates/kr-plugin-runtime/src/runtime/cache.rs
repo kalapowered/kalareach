@@ -492,7 +492,7 @@ mod tests {
             wasm_digest: PayloadDigest::of(b"a component"),
             wasm_bytes: 11,
             engine_compatibility: "engine-abc".to_owned(),
-            engine_version: "48.0.6".to_owned(),
+            engine_version: "48.0.7".to_owned(),
             target: "aarch64-apple-darwin".to_owned(),
         }
     }

@@ -899,11 +899,13 @@ fn kr_req_11_41_the_compatibility_hash_covers_the_engine_release() {
         )),
         "the engine's compatibility hash is not the one of the release this host names"
     );
-    assert_ne!(
-        this_release,
-        compatibility_under(wasmtime::ModuleVersionStrategy::Custom("48.0.3".to_owned())),
-        "an earlier patch release of this major version shares this one's compatibility hash"
-    );
+    for earlier in ["48.0.3", "48.0.6"] {
+        assert_ne!(
+            this_release,
+            compatibility_under(wasmtime::ModuleVersionStrategy::Custom(earlier.to_owned())),
+            "the earlier patch release {earlier} shares this one's compatibility hash"
+        );
+    }
 }
 
 // KR-REQ-11.41: a cache another engine release filed is compiled again, and left alone.
@@ -921,7 +923,7 @@ fn kr_req_11_41_a_cache_another_engine_release_filed_is_compiled_again() {
     // directory an entry is filed in names the first and is derived from the second, so each of
     // the three is a directory of its own.
     let mut by_version = current.clone();
-    by_version.engine_version = "48.0.3".to_owned();
+    by_version.engine_version = "48.0.6".to_owned();
     let mut by_hash = current.clone();
     by_hash.engine_compatibility = "another release's compatibility".to_owned();
     let mut by_both = by_version.clone();
