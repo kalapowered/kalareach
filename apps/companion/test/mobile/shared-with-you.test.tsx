@@ -248,7 +248,7 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     controls.sharing.withdrawOffer(offered.id)
     held = true
     await userEvent.click(accept)
-    expect(await screen.findByText(/no longer offered to this device/)).toBeInTheDocument()
+    expect(await screen.findByText(/was not shown that invitation/)).toBeInTheDocument()
     await waitFor(() => {
       expect(screen.queryByTestId('sheet')).toBeNull()
     })

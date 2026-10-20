@@ -152,8 +152,9 @@ struct Seen {
     display_number: u64,
 }
 
-/// The most invitations the application remembers having listed. The oldest are let go first.
-const MAX_REMEMBERED_OFFERS: usize = 512;
+/// The most invitations the application remembers having listed: as many as one read of the host's
+/// list can hold, so that every invitation the page can name is remembered.
+const MAX_REMEMBERED_OFFERS: usize = MAX_HELD_PAGES * kr_protocol::sharing::GRANT_HELD_PAGE;
 
 impl std::fmt::Debug for ShareDesk {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1390,7 +1391,7 @@ pub async fn redeem(state: &AppState, params: GrantRedeemParams) -> Result<Attem
     else {
         return Err(CommandError::new(
             ErrorCode::ResourceUnavailable,
-            "this device was not offered that invitation",
+            "this device was not shown that invitation, so nothing was sent",
         ));
     };
     let action_id = ActionId::new(kr_ipc::new_uuid());

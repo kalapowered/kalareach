@@ -255,7 +255,13 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
           // The host's answer was lost or did not settle it. The row for the acceptance says where
           // it stands, in the host's words, and what the host lists decides how it ended.
           book.keep(done.attempt)
-          say(`Waiting to hear from the host about ${sessionWords(offer.display_number)}.`, 'pending')
+          // A refusal of the first send is the host's answer, and is said as it was given: the
+          // row for the acceptance says where it stands.
+          if (done.attempt.refusal !== null) {
+            say(`The host said: ${visibly(done.attempt.refusal)}`, 'danger')
+          } else {
+            say(`Waiting to hear from the host about ${sessionWords(offer.display_number)}.`, 'pending')
+          }
         }
         closeCardOf(offer)
       })

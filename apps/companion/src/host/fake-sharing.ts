@@ -521,7 +521,7 @@ export class ScriptedSharing implements FakeSharing {
     if (!this.#phone) return this.#owner()
     const offer = this.#offers.find((each) => each.invitation_id === read.invitation_id)
     if (offer === undefined) {
-      refuse('RESOURCE_UNAVAILABLE', 'that invitation is no longer offered to this device')
+      refuse('RESOURCE_UNAVAILABLE', 'this device was not shown that invitation, so nothing was sent')
     }
     const entry = this.#begin(
       'redeem',
