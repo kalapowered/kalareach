@@ -1257,11 +1257,12 @@ fn transitions(world: &World) -> Vec<Transition> {
             // revoking it or leaving it out. The owner's confirmation takes the record back in the
             // write that adds it.
             //
-            // The owner is offered this only for a revocation no feed holds. A request in a feed
-            // that a host has yet to act on is recorded here exactly as one that never went
-            // through is, and the membership cannot tell the two apart: the application that
-            // sends the requests offers the choice only when no request of its own is in force,
-            // so a device a feed verified is never offered, and the model never takes it.
+            // The owner is offered this only for a revocation no feed holds. A request in a feed is
+            // recorded here exactly as one that never went through is, and the membership cannot
+            // tell the two apart: the application that publishes the requests keeps a record of
+            // each, let go of only when the service says it refused the request or the feed shows
+            // the host refused it, and offers the choice only for a device with none recorded. So a
+            // device a feed verified is never offered, and the model never takes it.
             for member in DEVICES {
                 let recorded = &world.facts.answers;
                 let kept_out = recorded.verified & bit(member) != 0

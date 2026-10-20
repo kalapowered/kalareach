@@ -1093,8 +1093,8 @@ impl SyncMembership {
     ///
     /// A revocation told of ([`Self::feed_revocation`]) is recorded alike whether its request
     /// failed or waits in an authority feed for a host to act on it, and this cannot tell which.
-    /// The caller can, and offers the owner the choice only for a device that no request of its own
-    /// is in force for.
+    /// The caller can, and offers the owner the choice only for a device it has no request recorded
+    /// for in a feed.
     ///
     /// # Errors
     ///
