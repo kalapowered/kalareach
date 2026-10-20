@@ -17706,9 +17706,10 @@ export interface SleepInhibitionState1 {
  */
 export interface HostPrivacyState {
   /**
-   * Whether the host is changing privacy mode now: a change of state has been asked for and has
-   * not been published, or one stopped part way and the host has not restarted since. The other
-   * two members are then the last state the host published, which a reader does not rely on: it
+   * Whether the host is changing privacy mode now: a change to on is waiting for the messages
+   * in flight or recording its state, a change to off has recorded its state and is about to
+   * publish it, or one stopped part way and the host has not restarted since. The other two
+   * members are then the last state the host published, which a reader does not rely on: it
    * treats the host as private until a later answer says otherwise.
    */
   changing: boolean

@@ -22,9 +22,11 @@
 //! What a device can read of a host's privacy mode is [`Hosts`]'s to say, and it says one of
 //! three things. A host with privacy mode off lets its drafts be published; a host with it on does
 //! not, and an answer that arrives after the host went private is discarded by the store's
-//! generation, which is moved before the answer is settled; and a host this device cannot read,
-//! because it is not connected to it or holds no right to ask, is treated as private. Each draft
-//! kept here, and why, is in the view the page shows.
+//! generation, which is moved before the answer is settled; and a host this device cannot read is
+//! treated as private. A host cannot be read when this device is not connected to it, when the host
+//! is changing its privacy mode, when the host does not answer, and when the host is of an earlier
+//! build that tells only a device that manages it. Each draft kept here, and why, is in the view
+//! the page shows.
 //!
 //! # What lives where
 //!

@@ -321,8 +321,10 @@ struct Change<'a> {
 impl Change<'_> {
     /// Publishes the new state, which ends the change.
     ///
-    /// The copy a report reads takes the new state and loses this change in one step, before the
-    /// lock does, so a report never says the new state while it says a change is under way.
+    /// The copy a report reads takes the new state and loses this change's count in one step,
+    /// before the lock does, so a report never says the new state together with this change still
+    /// under way. A change that stopped part way earlier keeps its own count, and a report says
+    /// that until the daemon starts again.
     fn publish(mut self, published: Published) {
         self.queued.settle(published);
         *self.held = published;
