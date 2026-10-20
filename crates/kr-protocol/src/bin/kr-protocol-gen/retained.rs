@@ -23,19 +23,20 @@ use std::path::{Path, PathBuf};
 use kr_protocol::hello::PACKAGE_VERSION;
 use kr_protocol::retained::{RETAINED, RETAINED_WORKER_LEVELS, SURFACE_ROOTS, Surface};
 
-use crate::{predecessor, public_majors};
+use crate::excluded::{self, Exclusions};
+use crate::{in_level, predecessor, public_majors, releases};
 
 /// The directory the retained levels are kept in.
 pub fn retained_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("retained")
 }
 
-fn repository() -> PathBuf {
+pub fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn git(arguments: &[&str]) -> Result<String, String> {
-    predecessor::git_in(&repository(), arguments)
+    releases::git_in(&repository(), arguments)
 }
 
 /// What is wrong with the retained levels as they stand, without comparing them with this build's
@@ -117,6 +118,32 @@ pub fn problems(directory: &Path) -> Vec<String> {
     problems
 }
 
+/// What is wrong with the record of excluded releases without asking git: it is malformed, or it
+/// names a level that this build neither is at nor retains, which is the 0.78 cut's to remove.
+pub fn exclusion_problems() -> Vec<String> {
+    let exclusions = match Exclusions::read(&repository()) {
+        Ok(exclusions) => exclusions,
+        Err(error) => return vec![error],
+    };
+    exclusions
+        .entries()
+        .iter()
+        .filter(|entry| {
+            entry.level != kr_protocol::update::THIS_LEVEL
+                && !RETAINED_WORKER_LEVELS.contains(&entry.level)
+        })
+        .map(|entry| {
+            format!(
+                "{} excludes {}, whose level {} is neither this build's nor a retained one: remove the \
+                 record and its readers",
+                excluded::RECORD,
+                entry.tag,
+                entry.level
+            )
+        })
+        .collect()
+}
+
 /// Cuts a new retained level from the release at `commit`.
 pub fn retain(level: &str, commit: &str) -> Result<(), String> {
     let target = retained_dir().join(level);
@@ -180,7 +207,15 @@ pub fn retain(level: &str, commit: &str) -> Result<(), String> {
 /// The record of the table of public majors a release listed, read from its source at `commit`:
 /// the table's own, or for a release whose source has none, the one major it negotiated.
 pub fn expected_public_majors_at(commit: &str) -> Result<String, String> {
-    let source = git(&["show", &format!("{commit}:crates/kr-protocol/src/hello.rs")])?;
+    expected_public_majors_in(&repository(), commit)
+}
+
+/// As [`expected_public_majors_at`], in the repository at `repository`.
+pub fn expected_public_majors_in(repository: &Path, commit: &str) -> Result<String, String> {
+    let source = releases::git_in(
+        repository,
+        &["show", &format!("{commit}:crates/kr-protocol/src/hello.rs")],
+    )?;
     let context = |error: String| format!("the table of public majors at {commit}: {error}");
     match public_majors::record_of(&source).map_err(context)? {
         Some(record) => Ok(record),
@@ -191,6 +226,11 @@ pub fn expected_public_majors_at(commit: &str) -> Result<String, String> {
 /// The protocol name the plugin host speaks at `commit`, read from that commit's source and not
 /// from this build's: where the name is kept moved, and a level records what its own release spoke.
 fn plugin_host_at(commit: &str) -> Result<String, String> {
+    plugin_host_in(&repository(), commit)
+}
+
+/// As [`plugin_host_at`], in the repository at `repository`.
+pub fn plugin_host_in(repository: &Path, commit: &str) -> Result<String, String> {
     for (path, declaration) in [
         (
             "crates/kr-protocol/src/retained.rs",
@@ -201,7 +241,8 @@ fn plugin_host_at(commit: &str) -> Result<String, String> {
             "pub const PROTOCOL: &str = ",
         ),
     ] {
-        let Ok(source) = git(&["show", &format!("{commit}:{path}")]) else {
+        let Ok(source) = releases::git_in(repository, &["show", &format!("{commit}:{path}")])
+        else {
             continue;
         };
         if let Some(rest) = source.split(declaration).nth(1)
@@ -215,19 +256,27 @@ fn plugin_host_at(commit: &str) -> Result<String, String> {
     ))
 }
 
+/// The releases the record excludes, read and held to this checkout's tags.
+fn checked_exclusions() -> Result<Exclusions, String> {
+    let exclusions = Exclusions::read(&repository())?;
+    exclusions.validate(&repository(), &releases::inventory(&repository())?)?;
+    Ok(exclusions)
+}
+
 /// The level, full commit and tag of the release before this one, as one line of text. It fails
 /// unless that release's level is the newest this build retains, and unless this build is the one
 /// the checkout's `HEAD` makes, since the tags are read from `HEAD`'s history.
 pub fn release_before() -> Result<String, String> {
-    let head = predecessor::package_version_at(&repository(), "HEAD")?;
+    let head = releases::package_version_at(&repository(), "HEAD")?;
     if head != PACKAGE_VERSION {
         return Err(format!(
             "the package at HEAD is {head} and this build is {PACKAGE_VERSION}; run this in a \
              clean checkout of the commit to release"
         ));
     }
-    let releases = predecessor::before(&repository(), "HEAD")?;
-    let release = releases
+    let exclusions = checked_exclusions()?;
+    let history = predecessor::before(&repository(), "HEAD", &exclusions)?;
+    let release = history
         .last()
         .ok_or("no release is tagged before this one")?;
     predecessor::is_the_newest_retained(release, &RETAINED_WORKER_LEVELS)?;
@@ -239,10 +288,10 @@ pub fn release_before() -> Result<String, String> {
     ))
 }
 
-/// Moves a level's record to the release before this one, after comparing that release's schema
-/// and table of public majors, and the plugin host protocol it spoke, with the kept ones, and the
-/// schema of every other release of the level too. `commit` has to be that release: the newest
-/// tagged at the highest level below this checkout's, which is the level's last release. The
+/// Moves a level's record to the release before this one, after comparing the schema, the table of
+/// public majors and the plugin host protocol of every release of the level that is not excluded
+/// with the kept ones. `commit` has to be the release before this one: the newest tagged in this
+/// checkout's history at the highest level below its own, which is the level's last release. The
 /// sources the rules, limits and probes read are compared by the `retained_surface` test run with
 /// `KR_RELEASE_TREE` set to that release's tree.
 pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
@@ -256,8 +305,9 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
     if full != commit {
         return Err(format!("give the full commit: {commit} is {full}"));
     }
-    let releases = predecessor::before(&repository(), "HEAD")?;
-    let before = releases
+    let exclusions = checked_exclusions()?;
+    let history = predecessor::before(&repository(), "HEAD", &exclusions)?;
+    let before = history
         .last()
         .ok_or("no release is tagged before this one")?;
     if before.commit != full || before.level() != retained.level {
@@ -271,14 +321,22 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
     let recorded = retained
         .record("commit")
         .ok_or("the record names no commit")?;
-    if recorded != full && !predecessor::is_ancestor(&repository(), recorded, &full)? {
+    if recorded != full && !releases::is_ancestor(&repository(), recorded, &full)? {
         return Err(format!(
             "the record for {level} names {recorded}, which is not in the history of {full}; fetch \
              the release tags (git fetch --tags)"
         ));
     }
-    // Every release of the level was spoken to by workers in the field, not only the newest.
-    for release in &releases {
+    // Every release of the level was spoken to by workers in the field, not only the newest, and
+    // the tags say which they are whether or not this checkout's history reaches them. The kept
+    // surface's own roots are the ones compared, and a root a release lacks is a difference.
+    let peers = excluded::kept(
+        &releases::inventory(&repository())?,
+        retained.level,
+        &exclusions,
+        "",
+    );
+    for release in &peers {
         let schema_text = git(&[
             "show",
             &format!(
@@ -288,7 +346,9 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
         ])?;
         let schema: serde_json::Value = serde_json::from_str(&schema_text)
             .map_err(|error| format!("the schema at {}: {error}", release.tag))?;
-        let surface = Surface::cut(&schema, SURFACE_ROOTS).map_err(|error| error.to_string())?;
+        let roots: std::collections::BTreeSet<String> =
+            retained.surface().roots().iter().cloned().collect();
+        let surface = in_level::cut_over(&schema, &roots).map_err(|error| error.to_string())?;
         let found = kr_protocol::retained::differences(retained.surface(), &surface);
         if !found.is_empty() {
             let mut lines = vec![format!(
@@ -302,32 +362,31 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
             "the schema at {} is the surface kept for {level}",
             release.tag
         );
+        // The table of public majors and the plugin host protocol are the level's too.
+        let found = expected_public_majors_at(&release.commit)?;
+        if retained.public_majors != Some(found.as_str()) {
+            return Err(format!(
+                "the table of public majors at {} is not the one recorded for {level}; rebase onto \
+                 that release and cut the level again at the rebased commit.\nrecorded: {}\nat \
+                 the commit: {found}",
+                release.tag,
+                retained.public_majors.unwrap_or("none"),
+            ));
+        }
+        let host = plugin_host_at(&release.commit)?;
+        if retained.plugin_host.trim() != host {
+            return Err(format!(
+                "{} spoke the plugin host protocol {host} and the record for {level} says {}; \
+                 rebase onto that release and cut the level again at the rebased commit",
+                release.tag,
+                retained.plugin_host.trim()
+            ));
+        }
+        println!(
+            "the table of public majors and the plugin host protocol at {} are the ones kept for {level}",
+            release.tag
+        );
     }
-    // The table of public majors the level recorded is the one in the tree of the release it is
-    // moved to, whole, digest included.
-    let found = expected_public_majors_at(&full)?;
-    if retained.public_majors != Some(found.as_str()) {
-        return Err(format!(
-            "the table of public majors at {} is not the one recorded for {level}; rebase onto \
-             that release and cut the level again at the rebased commit.\nrecorded: {}\nat the \
-             commit: {found}",
-            before.tag,
-            retained.public_majors.unwrap_or("none"),
-        ));
-    }
-    let host = plugin_host_at(&full)?;
-    if retained.plugin_host.trim() != host {
-        return Err(format!(
-            "{} spoke the plugin host protocol {host} and the record for {level} says {}; rebase \
-             onto that release and cut the level again at the rebased commit",
-            before.tag,
-            retained.plugin_host.trim()
-        ));
-    }
-    println!(
-        "the table of public majors and the plugin host protocol at {} are the ones kept for {level}",
-        before.tag
-    );
     let source_changes = git(&[
         "diff",
         "--stat",

@@ -1,0 +1,27 @@
+# The releases the contract of level 0.76 does not cover.
+#
+# The level's contract is the surface of the release at 5db0b32c6af4: every member the level's
+# planned changes added, among them `ForwardedMutation.lease`. These two releases were made before
+# the last of those changes landed, so each speaks a surface without it. They stay published, since
+# a published release stays where it is, and nothing built a host at either: they carry only the
+# TypeScript archives. Release selection, the cut's comparison, the in-level check and the upgrade
+# suite skip them. A host built at one of these commits drains its workers before an update or a
+# rollback (docs/releases/packages.md).
+#
+# The record is closed to these two tags and carries the removal condition beside the code that
+# reads it (`kr-protocol-gen`, excluded.rs): it is removed with its readers at the 0.78 cut.
+#
+# Each block: the tag, its full commit, its level, the sha256 of the surface cut from its own schema
+# with the roots its own source declares, and why.
+
+tag=packages/v0.76.0+53a2e0be5111
+commit=53a2e0be511158180ff0e1654681b96ff90d97c2
+level=0.76
+surface=598bdb8fe0f7db9f8b68d0b48468148958f8d60ceb63014c7b7d67f26c432a37
+why=made before the level's last planned change landed: its surface has no ForwardedMutation.lease
+
+tag=packages/v0.76.0+d3a552aa2ea6
+commit=d3a552aa2ea66b5e175962eaa436d4a6f852405a
+level=0.76
+surface=598bdb8fe0f7db9f8b68d0b48468148958f8d60ceb63014c7b7d67f26c432a37
+why=made before the level's last planned change landed: its surface has no ForwardedMutation.lease

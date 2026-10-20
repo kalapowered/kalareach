@@ -7,132 +7,26 @@
 //! says which release that is: the tags do. This reads them, so it needs a checkout that has them.
 
 use std::path::Path;
-use std::process::Command;
 
-use kr_protocol::hello::PackageVersion;
 use kr_protocol::update::CompatibilityLevel;
 
-/// A release as its tag names it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Release {
-    /// The tag, `packages/v<version>+<commit>`.
-    pub tag: String,
-    /// The version the tag states.
-    pub version: PackageVersion,
-    /// The full commit the tag points at.
-    pub commit: String,
-}
-
-impl Release {
-    /// The compatibility level of the release.
-    pub fn level(&self) -> CompatibilityLevel {
-        CompatibilityLevel::of(self.version)
-    }
-}
-
-/// What `git` prints for `arguments` run in `repository`.
-pub fn git_in(repository: &Path, arguments: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .args(arguments)
-        .current_dir(repository)
-        .output()
-        .map_err(|error| format!("git {}: {error}", arguments.join(" ")))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git {}: {}",
-            arguments.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    String::from_utf8(output.stdout).map_err(|error| error.to_string())
-}
-
-pub fn is_ancestor(repository: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
-    let status = Command::new("git")
-        .args(["merge-base", "--is-ancestor", ancestor, descendant])
-        .current_dir(repository)
-        .status()
-        .map_err(|error| format!("git merge-base: {error}"))?;
-    match status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err(format!(
-            "git merge-base --is-ancestor {ancestor} {descendant} failed"
-        )),
-    }
-}
-
-/// The version `packages/protocol/package.json` states at `commit`.
-pub fn package_version_at(repository: &Path, commit: &str) -> Result<PackageVersion, String> {
-    let manifest = git_in(
-        repository,
-        &["show", &format!("{commit}:packages/protocol/package.json")],
-    )?;
-    let manifest: serde_json::Value = serde_json::from_str(&manifest)
-        .map_err(|error| format!("the package manifest at {commit}: {error}"))?;
-    let version = manifest["version"]
-        .as_str()
-        .ok_or_else(|| format!("the package manifest at {commit} states no version"))?;
-    version_of(version).ok_or_else(|| format!("{version} at {commit} is not major.minor.patch"))
-}
-
-fn version_of(text: &str) -> Option<PackageVersion> {
-    let mut parts = text.split('.').map(|part| {
-        (!part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-            .then(|| part.parse::<u16>().ok())
-            .flatten()
-    });
-    let version = PackageVersion::new(parts.next()??, parts.next()??, parts.next()??);
-    parts.next().is_none().then_some(version)
-}
-
-/// The release a tag names, with the commit it points at. A tag that is not of the form, or whose
-/// name does not start the commit it points at, is an error and not a tag to skip: the tags are
-/// the record of what was released.
-fn release_of(repository: &Path, tag: &str) -> Result<Release, String> {
-    let named = tag
-        .strip_prefix("packages/v")
-        .and_then(|rest| rest.split_once('+'))
-        .and_then(|(version, short)| {
-            let well_formed = short.len() == 12
-                && short
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-            well_formed.then_some((version_of(version)?, short))
-        })
-        .ok_or_else(|| {
-            format!("{tag} is not of the form packages/v<major.minor.patch>+<commit>")
-        })?;
-    let commit = git_in(
-        repository,
-        &[
-            "rev-parse",
-            "--verify",
-            &format!("refs/tags/{tag}^{{commit}}"),
-        ],
-    )?
-    .trim()
-    .to_owned();
-    if !commit.starts_with(named.1) {
-        return Err(format!("{tag} points at {commit}, which it does not name"));
-    }
-    Ok(Release {
-        tag: tag.to_owned(),
-        version: named.0,
-        commit,
-    })
-}
+use crate::excluded::Exclusions;
+use crate::releases::{Release, git_in, is_ancestor, package_version_at, release_of};
 
 /// The releases before the one at `commit`: those tagged in its history at the highest level below
-/// its own, oldest first, so the last is the release before. Releases of a lower level than that
-/// are the business of the release that retained them.
+/// its own that are not excluded, oldest first, so the last is the release before. Releases of a
+/// lower level than that are the business of the release that retained them.
 ///
 /// # Errors
 ///
 /// When no release below the commit's level is tagged, when the tags of that level do not lie on
 /// one line of history (so none is the newest), when two tags name one commit, or when a tag
 /// states another version than its commit's package.
-pub fn before(repository: &Path, commit: &str) -> Result<Vec<Release>, String> {
+pub fn before(
+    repository: &Path,
+    commit: &str,
+    excluded: &Exclusions,
+) -> Result<Vec<Release>, String> {
     let level = CompatibilityLevel::of(package_version_at(repository, commit)?);
     let tags = git_in(
         repository,
@@ -141,7 +35,7 @@ pub fn before(repository: &Path, commit: &str) -> Result<Vec<Release>, String> {
     let mut below = Vec::new();
     for tag in tags.lines() {
         let release = release_of(repository, tag)?;
-        if release.level() < level {
+        if release.level() < level && !excluded.contains(&release.tag) {
             below.push(release);
         }
     }
@@ -227,6 +121,9 @@ pub fn is_the_newest_retained(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::process::Command;
+
+    use kr_protocol::hello::PackageVersion;
 
     use super::*;
 
@@ -297,7 +194,7 @@ mod tests {
 
         /// The release before `commit`, and the tags of its level up to it.
         fn before(&self, commit: &str) -> Result<(Release, Vec<String>), String> {
-            let mut releases = before(&self.directory, commit)?;
+            let mut releases = before(&self.directory, commit, &Exclusions::none())?;
             let tags = releases.iter().map(|release| release.tag.clone()).collect();
             Ok((releases.pop().expect("at least one"), tags))
         }
@@ -406,6 +303,38 @@ mod tests {
         let tag = history.release("0.75.0", &later);
         let next = history.commit("0.76.0", "next cut");
         assert_eq!(history.before(&next).expect("one line").0.tag, tag);
+    }
+
+    /// A release the record excludes is not the release before, and not one of the level's releases
+    /// the cut compares; the release before it is.
+    #[test]
+    fn an_excluded_release_is_skipped() {
+        let history = History::new("excluded");
+        let first = history.commit("0.74.0", "first");
+        let first_tag = history.release("0.74.0", &first);
+        let early = history.commit("0.74.0", "released before the level was whole");
+        let early_tag = history.release("0.74.0", &early);
+        let last = history.commit("0.74.0", "last");
+        let last_tag = history.release("0.74.0", &last);
+        let cut = history.commit("0.75.0", "cut");
+        let record = Exclusions::parse(&format!(
+            "tag={early_tag}\ncommit={early}\nlevel=0.74\nsurface={}\nwhy=a reason\n",
+            "0".repeat(64)
+        ))
+        .expect("a record");
+        let kept: Vec<String> = before(&history.directory, &cut, &record)
+            .expect("releases before")
+            .into_iter()
+            .map(|release| release.tag)
+            .collect();
+        assert_eq!(kept, [first_tag.clone(), last_tag.clone()]);
+        // Without the record the early release is one of the level's, and a release before the last.
+        let all: Vec<String> = before(&history.directory, &cut, &Exclusions::none())
+            .expect("releases before")
+            .into_iter()
+            .map(|release| release.tag)
+            .collect();
+        assert_eq!(all, [first_tag, early_tag, last_tag]);
     }
 
     /// The newest retained level has to be the level of the release before.

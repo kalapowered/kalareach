@@ -14,11 +14,19 @@
 //! kr-protocol-gen --retain L --commit C           cut retained level L from the release at C
 //! kr-protocol-gen --release-commit L C            move level L's record to release C, the release before this one, if its schema is the kept one
 //! kr-protocol-gen --predecessor                   print the level, commit and tag of the release before this one, which has to be the newest retained level
+//! kr-protocol-gen --in-level                      fail unless this commit has the surface of every release at its level that is not excluded
+//! kr-protocol-gen --public-contract               report what a client of an earlier release cannot read of this commit's schema, and fail on it once public 1.0 is frozen
 //! ```
 
+mod excluded;
+mod in_level;
+#[cfg(test)]
+mod level_tests;
 mod method_index;
 mod predecessor;
+mod public_contract;
 mod public_majors;
+mod releases;
 mod retained;
 
 use std::path::{Path, PathBuf};
@@ -37,6 +45,11 @@ fn default_fixtures_dir() -> PathBuf {
 
 fn default_docs_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs")
+}
+
+/// What a worker serves, as `kr_protocol::worker_surface` has it.
+fn worker_surface_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("worker-surface.json")
 }
 
 /// Every generated vector file, with the directory it belongs in under the fixtures root.
@@ -115,6 +128,24 @@ fn main() -> ExitCode {
                     }
                 };
             }
+            "--in-level" => {
+                return match in_level::run(&retained::repository()) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            "--public-contract" => {
+                return match public_contract::run(&retained::repository()) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
             "--predecessor" => {
                 return match retained::release_before() {
                     Ok(line) => {
@@ -131,7 +162,7 @@ fn main() -> ExitCode {
                 println!(
                     "kr-protocol-gen [--check] [--out-dir <path>] [--fixtures-dir <path>] \
                      [--docs-dir <path>] | --retain <level> --commit <commit> | \
-                     --release-commit <level> <commit> | --predecessor"
+                     --release-commit <level> <commit> | --predecessor | --in-level | --public-contract"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -167,6 +198,10 @@ fn main() -> ExitCode {
         .chain(std::iter::once((
             docs_dir.join(method_index::INDEX_PATH),
             method_index::render(),
+        )))
+        .chain(std::iter::once((
+            worker_surface_path(),
+            kr_protocol::worker_surface::document(),
         )))
         .collect();
 
@@ -230,6 +265,7 @@ fn run_check(files: &[(PathBuf, String)], docs_dir: &Path) -> ExitCode {
         }
     }
     let mut retained_problems = retained::problems(&retained::retained_dir());
+    retained_problems.extend(retained::exclusion_problems());
     if let Err(found) = kr_protocol::retained::check() {
         retained_problems.extend(found);
     }

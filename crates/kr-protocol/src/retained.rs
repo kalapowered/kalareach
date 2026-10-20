@@ -53,8 +53,12 @@ pub const RETAINED_WORKER_LEVELS: [CompatibilityLevel; 1] = [CompatibilityLevel:
     crate::hello::PackageVersion::new(0, 75, 0),
 )];
 
-/// The roots of the surface: the frames, the descriptor, and the parameters and results of the
-/// reads the control daemon makes of a worker or interprets from its answers.
+/// The roots of the surface a retained level keeps: the frames, the descriptor, and the parameters
+/// and results of the reads the control daemon makes of a worker or interprets from its answers.
+///
+/// The types that `kr`, `kr-client`, a paired device and the bridge exchange with a worker directly
+/// are the roots a level is held to as well ([`crate::worker_surface::peer_roots`]), and the
+/// in-level check compares both; a retained level keeps this list's surface.
 ///
 /// The lists a device is shown are the daemon's own answers and are not here, and neither are the
 /// methods passed through for a device, whose parameters and results are opaque to the daemon.
@@ -314,7 +318,12 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
                      the retained level never writes this member, so this build's daemon reads \
                      what it writes as a session whose root is a shell. A summary that carries \
                      the member is written only by a worker of this build, for a session it was \
-                     started to run a command in.",
+                     started to run a command in. The daemon hands summaries on to callers \
+                     through `session.list` and `session.read`, and an earlier release's reader, \
+                     whose summary is a closed object, cannot read one that carries the member. \
+                     No client was released, so there is no shim: the public contract may change \
+                     with a level move until public 1.0 freezes at the first client release \
+                     (`docs/releases/packages.md`).",
         },
         Compatible {
             at: "ForwardedMutation.lease",
@@ -325,8 +334,10 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
                      mutation that level reads is byte for byte what it read before. Such a worker \
                      enforces the generation fence, the authority revision the grant was validated \
                      at and the deadline the lease bounds, and the daemon alone holds the lease for \
-                     it. No release at the next level exists without the member: were one tagged, \
-                     the member would belong to the level after it and this cut would move.",
+                     it. The member belongs to the level this release is at. Two releases of that \
+                     level were made before it and are excluded (`retained/EXCLUDED`); a change to \
+                     a level's surface after its first release moves the level in the train that \
+                     makes it, with its cut.",
         },
     ],
 )
