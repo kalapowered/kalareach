@@ -2019,15 +2019,15 @@ async fn a_request_that_may_be_stored_late_is_not_let_go_of_by_a_feed_that_shows
         .expect("the call ends")
         .expect("the call ends")
         .expect_err("nothing was answered");
-    assert_eq!(
-        published_at(&elsewhere),
-        0,
-        "the service stored nothing, as far as this computer could see"
-    );
     the_phone_is_taken_out(&rig).await;
 
     // A look at the feeds, which show nothing of the request, does not let it go.
-    rig.view().await;
+    let shown = rig.view().await;
+    assert_eq!(
+        host_by(&shown, "feed")["feed"]["outstanding"],
+        json!(0),
+        "the feed shows no request: {shown}"
+    );
     assert_not_shared_with_again(&rig);
 }
 
