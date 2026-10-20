@@ -1019,9 +1019,11 @@ async fn kr_req_18_13_a_withdrawal_leaves_an_invitation_whose_end_was_found_sinc
 }
 
 /// KR-REQ-18.13: a redeem that finds an invitation's end on the wall clock between the close's
-/// reading of the waiting invitations and its withdrawal marks the invitation as run out, and the
+/// reading of the waiting invitations and its withdrawal has answered that it ran out, and the
 /// withdrawal leaves it so: the issuer is told `expired` and not `revoked`. The wall clock is moved
 /// by hand past the end after the reading, and the withdrawal is handed the time of the reading.
+/// The withdrawal holds off for more than one reason here (the end the redeem wrote down, the
+/// invitation it marked, the wall clock); the case before it isolates the wall clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_18_13_a_withdrawal_leaves_an_invitation_a_redeem_found_run_out_since_it_was_read() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -1074,6 +1076,53 @@ async fn kr_req_18_13_a_withdrawal_leaves_an_invitation_a_redeem_found_run_out_s
         "{ended:?}"
     );
     connection.close();
+    host.stop().await;
+}
+
+/// KR-REQ-18.13: the withdrawal decides the wall clock at its own reading, under the host's floor,
+/// and not at the close's earlier reading: an invitation whose end comes between the two has ended,
+/// and the withdrawal leaves it so, whether or not any request has asked about it. The wall clock
+/// is moved by hand past the end after the reading, and the withdrawal is handed the time of the
+/// reading.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_18_13_a_withdrawal_decides_the_wall_clock_at_its_own_reading() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let wall = MovedWall::new();
+    let host = Host::start_on_clocks(&owner, wall.clocks()).await;
+    let (_device, record) = recipient(&host, &owner).await;
+    let (session, _) = an_open_session(&host);
+    share_with(
+        &host,
+        session,
+        record.device_id,
+        RoleSelection::plain(SessionRole::Viewer),
+        Some(60_000),
+    )
+    .await
+    .expect("a short share is written");
+    let grants = host.controller().sharing().grants();
+    let read_at = wall.now_ms();
+    let read = grants
+        .waiting_invitations(&std::collections::BTreeSet::from([session]), read_at)
+        .expect("the waiting invitations are read");
+    assert_eq!(read.len(), 1);
+    wall.advance(Duration::from_secs(5 * 60));
+
+    let ids: Vec<GrantId> = read.iter().map(|record| record.grant.grant_id).collect();
+    let withdrawn = grants
+        .withdraw_waiting_grants(&ids, read_at)
+        .expect("the withdrawal runs");
+
+    assert!(withdrawn.is_empty(), "{withdrawn:?}");
+    let ended = issued_over(&host, session).await;
+    assert_eq!(
+        ended
+            .iter()
+            .map(|summary| summary.state)
+            .collect::<Vec<_>>(),
+        [GrantState::Expired],
+        "{ended:?}"
+    );
     host.stop().await;
 }
 
