@@ -309,8 +309,17 @@ pub(super) struct Silent {
 }
 
 /// A daemon with one silent worker in its directory, and everything a close needs.
+///
+/// The daemon has the worker on record as one its publisher sends no statement of what the host's
+/// local owner may do, before it lists the worker. A worker not yet reached is one the publisher
+/// goes to by itself, and the link it asks for waits behind a close for as long as the close holds
+/// the worker's one link, and takes it the moment the close lets it go: the slot a case looks at
+/// after a close would then hold the publisher's link and not the close's.
 async fn silent_worker() -> Silent {
-    fake_worker(None).await
+    fake_world_reached(|listener, identity, endpoint_text| {
+        serve_fake_worker(listener, identity, endpoint_text, None)
+    })
+    .await
 }
 
 /// A daemon with one fake worker in its directory, silent or recording
