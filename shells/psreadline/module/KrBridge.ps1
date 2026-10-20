@@ -974,25 +974,31 @@ function Get-KrLaunchWord {
 # The word a launch writes for its program, or nothing when no application or script has that name.
 #
 # A quoted word after the call operator is still looked up as a command, so an alias, a function or
-# a cmdlet of the same name would run in the program's place. Where one has the name, the word is
-# the full path of the application or script, which nothing can stand in for. Where none does, the
-# word is the name as it was given: the line then reads as the name typed at the prompt does, and
-# the command-lookup handler that asks the worker about a typed name asks about it. A name no
-# application or script has is refused, because what the line would run is not the program asked
-# for. Both lookups are the engine's own, so a name is taken as it is (no wildcard in it is
-# expanded), and what a profile's lookup hook puts in the answer is not taken for an application.
+# a cmdlet of the same name would run in the program's place. The lookup here is the engine's own,
+# for every kind of command at once and in the order a typed name is found in, so what it answers
+# first is what would run. Where that is the application or script, nothing stands in for it and
+# the word is the name as it was given: the line then reads as the name typed at the prompt does,
+# and the command-lookup handler that asks the worker about a typed name asks about it. Where it
+# is anything else, the word is the full path of the application or script, which nothing can
+# stand in for. A name no application or script has is refused, because what the line would run is
+# not the program asked for. A name is taken as it is (no wildcard in it is expanded), and what a
+# profile's lookup hook puts in the answer is not taken for an application.
 function Get-KrLaunchProgram {
     param([string]$Name)
     try {
+        $first = $ExecutionContext.InvokeCommand.GetCommand($Name, [System.Management.Automation.CommandTypes]::All)
+        if ($first -is [System.Management.Automation.ApplicationInfo] -or
+            $first -is [System.Management.Automation.ExternalScriptInfo]) {
+            return $Name
+        }
+        if ($null -eq $first) { return $null }
         $programs = [System.Management.Automation.CommandTypes]'Application, ExternalScript'
         $found = $ExecutionContext.InvokeCommand.GetCommand($Name, $programs)
-        if ($found -isnot [System.Management.Automation.ApplicationInfo] -and
-            $found -isnot [System.Management.Automation.ExternalScriptInfo]) {
-            return $null
+        if ($found -is [System.Management.Automation.ApplicationInfo] -or
+            $found -is [System.Management.Automation.ExternalScriptInfo]) {
+            return [string]$found.Path
         }
-        $standIns = [System.Management.Automation.CommandTypes]'Alias, Function, Filter, Cmdlet'
-        if ($null -eq $ExecutionContext.InvokeCommand.GetCommand($Name, $standIns)) { return $Name }
-        [string]$found.Path
+        $null
     } catch {
         $null
     }
