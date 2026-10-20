@@ -740,14 +740,14 @@ if the host says it is currently in the process of changing its privacy mode. De
 have the `host.manage` right cannot see any further information while devices with that right can
 see all the information that is returned by the `privacy.status` report, like when the host last
 changed its privacy mode, if the last change was fully effective, what each session still owes, what
-the host keeps and what has left the host. The host says it is in the process of changing its
-privacy mode when it is either changing the privacy mode on and waiting for all admitted delivery
-exchanges to finish, when it is recording its state and raising its backup fence as part of changing
-the privacy mode on, when it is about to publish its new state as part of changing the privacy mode
-off and when it is waiting for the daemon to start again after a panic that occurred while the
-privacy mode was changing. While the host says it is in the process of changing its privacy mode,
-devices will see it as if it was private. Older builds of the host do not have the `privacy` member
-in `host.info`.
+the host keeps and what has already left the host. The host says it is in the process of changing
+its privacy mode when it is either changing the privacy mode on and waiting for all admitted
+delivery exchanges to finish, when it is recording its state and raising its backup fence as part of
+changing the privacy mode on, when it is about to publish its new state as part of changing the
+privacy mode off and when it is waiting for the daemon to start again after a panic that stopped a
+change part way. While the host says it is in the process of changing its privacy mode, devices will
+see it as if it was private. Older builds of the host do not have the `privacy` member in
+`host.info`.
 
 The allowlist walk above has all four answers as roots, so a field added to one fails the build's
 own tests until it is classed.
@@ -4006,7 +4006,7 @@ would then be published; a host that cannot record it does not enter privacy mod
 
 Privacy mode is always one generation for the entire environment, and is held by the control daemon.
 The daemon remembers the generation, whether privacy mode is on, and for every session whose own
-cleanup for this generation has not yet been shown to be complete, one **obligation**. The daemon’s
+cleanup for this generation has not yet been shown to be complete, one **obligation** . The daemon’s
 privacy mode state is stored in the file `privacy.sqlite3` in the state directory. Turning privacy
 mode on and off using `kr privacy on` and `kr privacy off` happens by sending the daemon a
 `privacy.set` message, which can only be done from the host. A device paired to a host with a grant
@@ -4015,7 +4015,7 @@ answer a single report containing the generation, whether the most recent change
 taken effect yet, what each session still owes, what the daemon keeps and why, and what has left
 this host. A device paired to the host without `host.manage` can see only whether privacy mode is
 on, for which generation, and whether the host says it is changing it, as part of the `host.info`
-answer.
+report.
 
 The act of turning it on writes the record first, in a single transaction that records an obligation
 for every session for which the environment has content, including every worker recorded in the

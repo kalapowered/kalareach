@@ -1792,11 +1792,11 @@ removed comes back when it is turned off.
 Use `kr privacy status` to also show what data will be retained on this host while in privacy mode
 (and why), and what has left this host (backup archives and notifications, each with whether this
 host holds any way to ask for its removal). This command does not change anything. Other devices
-paired with this host that are granted `host.manage` can read the same report, but cannot enable or
-disable privacy mode. Other devices that are not granted `host.manage` will see only whether the
-host is in privacy mode, what generation it is at, and whether the host indicates it is changing
-privacy mode, as part of `host.info`. For more information on what each step does, and what privacy
-mode does not affect, see `docs/host/README.md`.
+paired with this host that are granted `host.manage` can read the same report, but no device can
+enable or disable privacy mode. Other devices that are not granted `host.manage` will see only
+whether the host is in privacy mode, what generation it is at, and whether the host indicates it is
+changing privacy mode, as part of `host.info`. For more information on what each step does, and what
+privacy mode does not affect, see `docs/host/README.md`.
 
 ## `kr destination`
 
