@@ -294,8 +294,8 @@ impl PrivacyState {
     /// waits for something a writer holds into a stall; a new taker of this side goes under the
     /// same rule.
     fn change(&self) -> Change<'_> {
-        // Raised before the wait, so a report says a change is under way from the moment it is
-        // asked for and not only from the moment it holds the write side.
+        // Raised before the wait, so a report says a change is under way from the moment this asks
+        // for the write side and not only from the moment it holds it.
         let queued = Queued::raise(&self.observed);
         Change {
             held: self

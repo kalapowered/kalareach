@@ -77,9 +77,10 @@ pub struct HostPrivacyState {
     pub enabled: bool,
     /// The privacy generation in force. Turning privacy mode on and turning it off each advance it.
     pub generation: U64,
-    /// Whether the host is changing privacy mode now: a change to on is waiting for the messages
-    /// in flight or recording its state, a change to off has recorded its state and is about to
-    /// publish it, or one stopped part way and the host has not restarted since. The other two
+    /// Whether the host is changing privacy mode now: a change to on is waiting for the deliveries
+    /// in flight, or is recording its state and raising the backup fence, and has not published; a
+    /// change to off has recorded its state and is about to publish it; or one stopped part way and
+    /// the host has not restarted since. The other two
     /// members are then the last state the host published, which a reader does not rely on: it
     /// treats the host as private until a later answer says otherwise.
     pub changing: bool,

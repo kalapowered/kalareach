@@ -18488,7 +18488,7 @@
       "description": "Where a host's privacy mode stands, as every paired device may read it.\n\nThis is the generation in force and whether privacy mode is on at it: what a device needs to\nkeep what it holds for this host off a service while the host is private, and nothing the\nreport `privacy.status` makes (when it changed, what is still owed, what is kept and what had\nalready left), which only a device that manages the host reads.\n\nRead-only metadata like `EnvironmentSummary`: a member added later is explicitly optional, a\nreader whose schema predates it ignores it rather than refusing the answer, and it never\nchanges what the members here mean. An extension may extend it.",
       "properties": {
         "changing": {
-          "description": "Whether the host is changing privacy mode now: a change to on is waiting for the messages\nin flight or recording its state, a change to off has recorded its state and is about to\npublish it, or one stopped part way and the host has not restarted since. The other two\nmembers are then the last state the host published, which a reader does not rely on: it\ntreats the host as private until a later answer says otherwise.",
+          "description": "Whether the host is changing privacy mode now: a change to on is waiting for the deliveries\nin flight, or is recording its state and raising the backup fence, and has not published; a\nchange to off has recorded its state and is about to publish it; or one stopped part way and\nthe host has not restarted since. The other two\nmembers are then the last state the host published, which a reader does not rely on: it\ntreats the host as private until a later answer says otherwise.",
           "type": "boolean"
         },
         "enabled": {

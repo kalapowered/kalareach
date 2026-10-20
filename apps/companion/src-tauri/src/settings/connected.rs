@@ -149,10 +149,10 @@ pub(crate) enum Choice {
 /// Decides, from what `host.info` came to, how this device reads a host's privacy mode.
 ///
 /// `told` is the host's answer, or why there was none. `manages` says whether this device holds
-/// the right to manage the host, which `privacy.status` asks for and `host.info` does not. A branch that reads a host
-/// as off where it is not lets drafts leave this device, so each of the others stays closed: a
-/// host that is changing, one that did not answer, and one that tells nothing to a device that
-/// cannot ask.
+/// the right to manage the host, which `privacy.status` asks for and `host.info` does not. A
+/// branch that reads a host as off where it is not lets drafts leave this device, so each of the
+/// others stays closed: a host that is changing, one that did not answer, and one that tells
+/// nothing to a device that cannot ask.
 ///
 /// Goes once no retained level is below 0.77: every host then sends the member, and the branch
 /// for an answer without it, with the request it leads to, is removed.

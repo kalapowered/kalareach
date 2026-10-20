@@ -25,8 +25,8 @@
 //! generation, which is moved before the answer is settled; and a host this device cannot read is
 //! treated as private. A host cannot be read when this device is not connected to it, when the host
 //! is changing its privacy mode, when the host does not answer, and when the host is of an earlier
-//! build that tells only a device that manages it. Each draft kept here, and why, is in the view
-//! the page shows.
+//! build, which tells only a device that manages it, and this device does not manage it. Each draft
+//! kept here, and why, is in the view the page shows.
 //!
 //! # What lives where
 //!
