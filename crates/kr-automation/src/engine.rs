@@ -83,8 +83,9 @@ pub struct Dispatch<'a> {
 pub enum Cancellation {
     /// The action was asked to stop. Nothing is claimed about what it did before it stopped.
     Requested,
-    /// The runner did not stop the action: its kind offers no point to stop at once it has begun,
-    /// it is past the point it can be stopped at, or its dispatch has already ended.
+    /// The runner does not say the action is stopped: its kind offers no point to stop at once it
+    /// has begun, it has passed the point where the runner can stop it, or its dispatch has
+    /// already ended.
     Unsupported,
 }
 
@@ -108,8 +109,9 @@ pub trait ActionRunner: Send + Sync {
     /// stops waiting for it: `Requested` settles the node cancelled, which says the host stopped
     /// asking and not that the world is as it was, and `Unsupported` settles it unknown, and its
     /// dependants pause for review. The answer is the runner's, not the kind's: an action that
-    /// could be stopped a moment ago may have ended since. The engine also asks it when the run is
-    /// cancelled, and the journal has cancelled the node then, whatever the answer.
+    /// could be stopped a moment ago may have ended since. The engine also asks it when its wait
+    /// finds the run cancelled before the action reports, and the journal has cancelled the node
+    /// then, whatever the answer.
     fn cancel(&self, dispatch: &Dispatch<'_>) -> Cancellation;
 }
 
@@ -401,7 +403,8 @@ impl WorkflowEngine {
                     // Reading its status and moving it to running is one statement, so a
                     // cancellation that arrives while an earlier node was running either gets
                     // there first and this node is never dispatched, or finds it already
-                    // running and cancels it as well, and its runner is then asked to stop.
+                    // running and cancels it as well, and the engine asks its runner to stop if its
+                    // wait finds the cancellation before the action reports.
                     if !self.store.claim_node_for_dispatch(run_id, &node.node_id)? {
                         let recorded = self.store.node_status(run_id, &node.node_id)?;
                         node_statuses.insert(
@@ -469,7 +472,7 @@ impl WorkflowEngine {
                     }
 
                     // The action is waited for until its own wait or the run's deadline passes,
-                    // whichever comes first, and no longer.
+                    // whichever comes first; a report read after that moment is not taken.
                     let wait_until = dispatch_time_ms
                         .saturating_add(action_wait_ms)
                         .min(deadline_ms);

@@ -257,16 +257,16 @@ row, the daemon's sweeping procedure will close the dispatch's session, remove i
 release the workspace hold, and release the row, without waiting for the run to end. A run only
 holds a workspace once, even if multiple nodes are run in the same workspace. The hold ends with the
 last of them. If a run pauses between nodes, it does not hold the workspace while it is paused,
-unless a row of a command that ran in it is still owed. When a session is closed, if it does not
-account for the command node's worker, the node's row will be kept open until the kernel indicates
-that the worker's process has ended or that the boot it ran in has ended. The node's row records the
-boot it began in. The node's row also records the process the launcher started, which the daemon's
-registry keeps after the session has closed. The daemon's sweeping procedure will look again less
-and less often while a row stays owed. What the worker could not account for stays outside the
-release: a process the command started that left the session's boundary can outlive it, and where
-the platform gives incomplete coverage of owned processes (always on macOS) the closure says so. The
-ledger is a store of its own beside the journal, so a release that does not know it reads the
-journal as before.
+unless the row of one of its command nodes in that workspace is still owed. When a session is
+closed, if it does not account for the command node's worker, the node's row will be kept open until
+the kernel indicates that the worker's process has ended or that the boot it ran in has ended. The
+node's row records the boot it began in. The node's row also records the process the launcher
+started, which the daemon's registry keeps after the session has closed. The daemon's sweeping
+procedure will look again less and less often while a row stays owed. What the worker could not
+account for stays outside the release: a process the command started that left the session's
+boundary can outlive it, and where the platform gives incomplete coverage of owned processes (always
+on macOS) the closure says so. The ledger is a store of its own beside the journal, so a release
+that does not know it reads the journal as before.
 
 The host carries out the change-set nodes against the environment's own change-set service. A
 `capture_changeset` node's parameters are the `changeset.capture` method's own typed parameters,
