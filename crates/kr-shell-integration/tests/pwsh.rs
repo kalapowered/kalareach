@@ -863,28 +863,36 @@ fn a_launch_of_a_name_only_a_lookup_hook_answers_is_refused() {
 }
 
 /// KR-REQ-23.54: a first word that no application has is refused even when PowerShell would run
-/// another program for it.
+/// another program for it, and a word that names a program of that kind is not.
 ///
-/// A name with no dash in it that nothing answers is looked for once more as `get-` and the name,
-/// so a program called `get-krfallback` is what a typed `krfallback` starts. A launch names a
-/// program, and that one is not the program it named, so there is no line to install; the name
-/// `get-krfallback` itself is a program and has one.
+/// A name with no dash and no backslash in it that nothing answers is looked for once more as
+/// `get-` and the name, so a program called `get-krfallback` is what a typed `krfallback` starts.
+/// A launch names a program, and that one is not the program it named, so there is no line to
+/// install. The same holds when a function has the name and the program is only found for it by
+/// that lookup. The name `get-krfallback` itself, written with a backslash path as PowerShell
+/// reads one on every platform, is a program and has a line.
 #[test]
 #[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn a_launch_of_a_name_only_the_get_fallback_answers_is_refused() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let directory = tempfile::tempdir().expect("a temporary directory");
-    let program = directory.path().join("get-krfallback");
-    std::fs::write(&program, "#!/bin/sh\necho fallback-ran\n").expect("a program");
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-        .expect("the program can be run");
+    for name in ["get-krfallback", "get-krfunction"] {
+        let program = directory.path().join(name);
+        std::fs::write(&program, "#!/bin/sh\necho fallback-ran\n").expect("a program");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("the program can be run");
+    }
+    let here = shellpkg::told(directory.path());
     let output = in_the_package_host(&format!(
-        "$env:PATH = '{}' + [System.IO.Path]::PathSeparator + $env:PATH; \
-         $asked = & $module {{ Get-KrLaunchText @{{ arguments = @('krfallback', 'a') }} }}; \
-         $named = & $module {{ Get-KrLaunchText @{{ arguments = @('get-krfallback', 'a') }} }}; \
-         Write-Output \"kr-key[asked]=[$asked]\"; Write-Output \"kr-key[named]=[$named]\"",
-        shellpkg::told(directory.path())
+        "$env:PATH = '{here}' + [System.IO.Path]::PathSeparator + $env:PATH; \
+         Set-Location '{here}'; \
+         function krfunction {{ 'a function' }}; \
+         $ask = {{ param($name) & $module {{ param($name) Get-KrLaunchText @{{ arguments = @($name, 'a') }} }} $name }}; \
+         Write-Output \"kr-key[asked]=[$(& $ask 'krfallback')]\"; \
+         Write-Output \"kr-key[function]=[$(& $ask 'krfunction')]\"; \
+         Write-Output \"kr-key[named]=[$(& $ask 'get-krfallback')]\"; \
+         Write-Output \"kr-key[path]=[$(& $ask '.\\get-krfallback')]\""
     ));
     assert_eq!(
         said(&output, "asked"),
@@ -892,8 +900,18 @@ fn a_launch_of_a_name_only_the_get_fallback_answers_is_refused() {
         "a name only the fallback answers was given a line:\n{output}"
     );
     assert_eq!(
+        said(&output, "function"),
+        "",
+        "a function's name was given the line of the program the fallback finds:\n{output}"
+    );
+    assert_eq!(
         said(&output, "named"),
         "& 'get-krfallback' 'a'",
         "the program's own name was refused:\n{output}"
+    );
+    assert_eq!(
+        said(&output, "path"),
+        "& '.\\get-krfallback' 'a'",
+        "a path to the program, written with a backslash, was refused:\n{output}"
     );
 }
