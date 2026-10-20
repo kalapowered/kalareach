@@ -776,3 +776,34 @@ fn a_launch_runs_the_application_and_not_a_function_or_alias_of_its_name() {
 fn a_launch_of_a_name_that_is_no_application_is_refused_and_installs_nothing() {
     shellpkg::a_launch_of_a_name_that_is_no_application_is_refused_and_installs_nothing(PWSH);
 }
+
+/// KR-REQ-07.37: what the module's wrapper of an editor operation is told is held as values, not
+/// built into the text of the script block it runs.
+///
+/// The wrapper names the operation and the state it waits in. A name that holds script would run
+/// as script if the wrapper were assembled as text, so the case gives one a state of that kind
+/// and presses the key: the wrapper has to treat it as the word it is.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_wrapper_of_an_editor_operation_holds_the_state_it_is_given_as_a_value() {
+    let output = in_the_package_host(
+        r#"$q = [char]39;
+           $hostile = $q + ' $($global:kr_injected = "yes") ' + $q;
+           $null = & $module { param($state) $script:Observed = @(@{ Function = 'BackwardChar'; Pending = $state }); Install-KrObservedHandlers } $hostile;
+           $chords = & $module { Get-KrScriptChords };
+           Write-Output "kr-key[wrapped]=[$($chords.ContainsKey('Ctrl+b'))]";
+           $global:kr_injected = $null;
+           try { & $chords['Ctrl+b'] $null $null } catch { };
+           Write-Output "kr-key[injected]=[$($global:kr_injected)]""#,
+    );
+    assert_eq!(
+        said(&output, "wrapped"),
+        "True",
+        "the key the case presses is wrapped, so the check does not pass for want of a wrapper:\n{output}"
+    );
+    assert_eq!(
+        said(&output, "injected"),
+        "",
+        "script held in a wrapper's state ran when the key was pressed:\n{output}"
+    );
+}
