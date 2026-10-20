@@ -219,7 +219,7 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     })
   })
 
-  it('puts focus on the screen when an invitation is gone by the time the host refuses to accept it', async () => {
+  it('puts focus on the acceptance when an invitation is gone by the time the host refuses to accept it', async () => {
     const offered = { id: '' }
     // The list that says the invitation is gone is held until the card has left, so the row goes
     // with nothing open over the screen.
@@ -244,21 +244,29 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     const row = await screen.findByRole('button', { name: new RegExp(INVITATION) })
     await userEvent.click(row)
     const accept = await screen.findByTestId('accept-offer')
-    // The issuer withdraws it after the phone read its list: the host refuses the acceptance.
+    // The issuer withdraws it after the phone read its list. The phone was shown it, so the
+    // acceptance is sent, and the host says why it is gone: the toast and the row for the acceptance
+    // both give the host's word, and neither says the host has not spoken.
     controls.sharing.withdrawOffer(offered.id)
     held = true
     await userEvent.click(accept)
-    expect(await screen.findByText(/was not shown that invitation/)).toBeInTheDocument()
+    expect(await screen.findByText('The host said: this invitation was withdrawn')).toBeInTheDocument()
+    expect(controls.sharing.sent().redeem).toBe(1)
+    const attempt = await screen.findByTestId('accept-attempt')
+    expect(attempt).toHaveTextContent('the host refused it')
+    expect(attempt).not.toHaveTextContent('has not said')
     await waitFor(() => {
       expect(screen.queryByTestId('sheet')).toBeNull()
     })
     expect(screen.getByRole('button', { name: new RegExp(INVITATION) })).toBeInTheDocument()
     release()
+    // The list that says the invitation is gone arrives: the row goes, and focus is on the row for
+    // the acceptance, which is what the person is dealing with.
     await waitFor(() => {
-      expect(screen.queryByTestId('offers')).toBeNull()
+      expect(screen.queryByRole('button', { name: new RegExp(INVITATION) })).toBeNull()
     })
     await waitFor(() => {
-      expect(document.activeElement?.id).toBe('main')
+      expect(document.activeElement).toBe(screen.getByTestId('accept-attempt'))
     })
   })
 
@@ -425,11 +433,12 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
     await userEvent.click(await screen.findByTestId('accept-offer'))
 
-    // The row for the acceptance is unfinished, in the host's words.
+    // The row for the acceptance says that the host refused it and that what it shows is read, with
+    // the host's words beside: it does not say the host has not spoken, or that nothing was accepted.
     const attempt = await screen.findByTestId('accept-attempt')
-    expect(attempt).toHaveTextContent('Unfinished: Accepting session 3.')
+    expect(attempt).toHaveTextContent('Accepting session 3: the host refused it. Checking what it shows now')
     expect(attempt).toHaveTextContent('The host said: The host could not finish accepting that just now.')
-    expect(attempt).not.toHaveTextContent(/nothing was accepted|was not accepted/)
+    expect(attempt).not.toHaveTextContent(/has not said|nothing was accepted|was not accepted/)
 
     // The host had written the share before it refused: the rows decide, and the share is held.
     await openTab('Sessions')
@@ -453,7 +462,7 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     controls.sharing.refuseNextRedeem('That invitation cannot be used right now.', false)
     await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
     await userEvent.click(await screen.findByTestId('accept-offer'))
-    expect(await screen.findByTestId('accept-attempt')).toHaveTextContent('Unfinished')
+    expect(await screen.findByTestId('accept-attempt')).toHaveTextContent('the host refused it')
 
     act(() => {
       controls.sharing.passTheBound()

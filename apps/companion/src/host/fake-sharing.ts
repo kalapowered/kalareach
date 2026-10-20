@@ -95,8 +95,11 @@ export interface FakeSharing {
   offer(spec?: OfferSpec): ShareOffer
   /** The host lists a share the device holds, which it accepted before this phone was looking. */
   hold(spec?: OfferSpec): HeldShare
-  /** The host's invitation goes: withdrawn by its issuer, or run out. */
-  withdrawOffer(invitationId: string): void
+  /**
+   * The host's invitation goes: withdrawn by its issuer, or run out. `words` is what the host says
+   * of it when the phone, which was shown it, asks to accept it.
+   */
+  withdrawOffer(invitationId: string, words?: string): void
   /** The host stops listing a share the device holds: taken back, run out or its session gone. */
   endShare(grantId: string): void
   /** The host lists a share again that it had stopped listing. */
@@ -225,6 +228,10 @@ export class ScriptedSharing implements FakeSharing {
   #unreadable = 0
   #phone = false
   #offers: ShareOffer[] = []
+  /** Every offer a read of the host's list returned, by invitation, as the application remembers. */
+  readonly #shown = new Map<string, ShareOffer>()
+  /** What the host says of an invitation it no longer lists, by invitation. */
+  readonly #gone = new Map<string, string>()
   #holds: HeldShare[] = []
   #ended: HeldShare[] = []
   #heldFailure: string | null = null
@@ -394,8 +401,9 @@ export class ScriptedSharing implements FakeSharing {
     return share
   }
 
-  withdrawOffer(invitationId: string): void {
+  withdrawOffer(invitationId: string, words = 'this invitation was withdrawn'): void {
     this.#offers = this.#offers.filter((offer) => offer.invitation_id !== invitationId)
+    this.#gone.set(invitationId, words)
   }
 
   endShare(grantId: string): void {
@@ -521,7 +529,26 @@ export class ScriptedSharing implements FakeSharing {
     if (!this.#phone) return this.#owner()
     const offer = this.#offers.find((each) => each.invitation_id === read.invitation_id)
     if (offer === undefined) {
-      refuse('RESOURCE_UNAVAILABLE', 'this device was not shown that invitation, so nothing was sent')
+      const shown = this.#shown.get(read.invitation_id)
+      if (shown === undefined) {
+        refuse('RESOURCE_UNAVAILABLE', 'this device was not shown that invitation, so nothing was sent')
+      }
+      // The application listed it, and the host lists it no more: the acceptance is sent all the
+      // same, and the host says why it is gone. A refusal to the first send of an acceptance is a
+      // reason to read what the host shows, not the end of the attempt.
+      const gone = this.#begin(
+        'redeem',
+        `Accepting session ${shown.display_number}`,
+        shown.session_id,
+        null,
+        shown.grant_id
+      )
+      gone.view = {
+        ...gone.view,
+        refusal: this.#gone.get(read.invitation_id) ?? 'this invitation is not open'
+      }
+      this.#set(gone, 'checking')
+      return { attempt: gone.view, value: null }
     }
     const entry = this.#begin(
       'redeem',
@@ -561,6 +588,7 @@ export class ScriptedSharing implements FakeSharing {
     this.#heldFailures -= 1
     if (this.#heldFailures <= 0) this.#heldFailure = null
     if (failure !== null) refuse('UPSTREAM_UNAVAILABLE', failure)
+    for (const offer of this.#offers) this.#shown.set(offer.invitation_id, offer)
     return { offers: [...this.#offers], shares: [...this.#holds] }
   }
 

@@ -252,6 +252,39 @@ for (const surface of ['ios', 'android'] as const) {
           expect(await overrunning(page, '[data-testid="offers"]')).not.toEqual([])
         })
 
+        // KR-REQ-18.13: an invitation the host stopped listing after the phone listed it is still sent
+        // to the host, which says why it is gone. The message and the row for the acceptance both
+        // give the host's word, neither says the host has not spoken, and both lay out inside the
+        // screen whatever the text size and the face.
+        test('says why an invitation is gone in the message and in the row for the acceptance', async ({
+          page
+        }) => {
+          await open(page, surface, 'attention', offers)
+          const invitation = await page.evaluate(
+            () => window.krTestHost?.sharing.offer({ session: '5' }).invitation_id ?? ''
+          )
+          await readAgain(page)
+          await expect(page.locator('[data-offer]')).toHaveCount(3)
+          await page.getByRole('button', { name: /shared session 5 with you/ }).click()
+          // The issuer withdraws it while the card is open.
+          await page.evaluate((id) => {
+            window.krTestHost?.sharing.withdrawOffer(id, 'this invitation was withdrawn')
+          }, invitation)
+          await page.getByTestId('accept-offer').click()
+          await expect(page.getByTestId('sheet')).toBeHidden()
+
+          const toast = page.locator('.toast')
+          await expect(toast).toContainText('The host said: this invitation was withdrawn')
+          const row = page.getByTestId('accept-attempt')
+          await expect(row).toHaveCount(1)
+          await expect(row).toContainText('Accepting session 5: the host refused it.')
+          await expect(row).toContainText('The host said: this invitation was withdrawn')
+          await expect(row).not.toContainText('has not said')
+          expect(await overrunning(page, '[data-testid="offers"]')).toEqual([])
+          expect(await overrunning(page, '.toast')).toEqual([])
+          await page.screenshot({ path: shot(`gone-${surface}-${size.name}${face.shot}`) })
+        })
+
         test('lays the card an invitation opens out inside the screen, with Accept and Not now reachable', async ({
           page
         }) => {
