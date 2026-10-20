@@ -4977,14 +4977,14 @@ async fn a_wait_that_ends_at_the_door_makes_no_session(
         reservation_phases(&host, grant_id(number)) == ["failed"]
     })
     .await;
-    // The platform started a worker and the reservation failed with no claim committed: the
-    // worker's claim was refused, not admitted and then reported failed, and the launch did not
-    // fail before it started.
+    // The platform started a worker and the reservation failed with no claim committed, so the
+    // worker was not admitted and then reported failed, and the launch did not fail before it
+    // started.
     assert_eq!(door.workers_started(), 1, "a worker was started");
     assert_eq!(
         reservation_claims(&host, grant_id(number)),
         [false],
-        "the worker's claim was refused"
+        "no claim of the worker was committed"
     );
     assert!(!marker.exists(), "the command never ran");
     assert!(
