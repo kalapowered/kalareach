@@ -590,11 +590,11 @@ impl Prepared {
     }
 }
 
-/// KR-REQ-26.06, KR-REQ-26.08, KR-ACC-035: a host on the release before is updated, by that
-/// release's own `kr`, to this one while a session's worker still runs the release before: the
-/// update goes on and does not wait, the worker is the process it was, the new control daemon lists
-/// the session and closes it with the answer of the worker's level, and the release the worker holds
-/// is let go once the session ends.
+/// KR-REQ-26.06, KR-REQ-26.08, KR-REQ-20.23, KR-ACC-035: a host on the release before is updated,
+/// by that release's own `kr`, to this one while a session's worker still runs the release before:
+/// the update goes on and does not wait, the worker is the process it was, the new control daemon
+/// lists the session and closes it with the answer of the worker's level, and the release the
+/// worker holds is let go once the session ends.
 #[tokio::test(flavor = "multi_thread")]
 async fn kr_host_update_goes_on_beside_a_live_worker_of_the_release_before() {
     let updated = Updated::new().await;
@@ -625,9 +625,10 @@ async fn kr_host_update_goes_on_beside_a_live_worker_of_the_release_before() {
     host.released(updated.one.name()).await;
 }
 
-/// KR-REQ-26.06, KR-ACC-035: a control daemon of this release that starts again beside the worker
-/// of the release before finds it again from its descriptor and publishes the descriptor in the
-/// shape the release before reads, so that release's own `kr` still finds and reads the session.
+/// KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035: a control daemon of this release that starts again
+/// beside the worker of the release before finds it again from its descriptor and publishes the
+/// descriptor in the shape the release before reads, so that release's own `kr` still finds and
+/// reads the session, and the restarted daemon still closes it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_start_of_the_daemon_leaves_the_session_readable_by_the_release_before() {
     let mut updated = Updated::new().await;
@@ -738,9 +739,9 @@ fn hexadecimal(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// KR-REQ-26.06, KR-ACC-035: the frames a control daemon sends a worker on its own, and the worker's
-/// answers, are read by the real worker of the release before, and the exchange, recorded as it
-/// went over the wire, reads under the level that release stated.
+/// KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035: the frames a control daemon sends a worker on its own,
+/// and the worker's answers, are read by the real worker of the release before, and the exchange,
+/// recorded as it went over the wire, reads under the level that release stated.
 ///
 /// A link of the test process speaks for the host with the host's own keys, once the host's daemon
 /// has stopped (a generation there takes authority from the daemon's link), and is bound to the
@@ -1093,11 +1094,11 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
 #[derive(serde::Serialize)]
 struct Empty {}
 
-/// KR-REQ-26.06, KR-REQ-23.34, KR-ACC-035: a device paired with the updated host's daemon over the
-/// network, as a phone is, meets the worker of the release before through the new daemon. The
-/// daemon lists the session, reads it, its description, and its attention inbox
-/// at the worker's level, and closes it for the device, answering with what the worker answered;
-/// the worker is the process it was throughout.
+/// KR-REQ-26.06, KR-REQ-23.34, KR-REQ-20.23, KR-ACC-035: a device paired with the updated host's
+/// daemon over the network, as a phone is, meets the worker of the release before through the new
+/// daemon. The daemon lists the session, reads it, its description, and its attention inbox at the
+/// worker's level, and closes it for the device, answering with what the worker answered; the
+/// worker is the process it was throughout.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_at_the_door_of_the_updated_host_meets_the_worker_of_the_release_before() {
     use kr_protocol::describe::{SessionDescribeParams, SessionDescribeResult};
@@ -1219,8 +1220,9 @@ async fn a_device_at_the_door_of_the_updated_host_meets_the_worker_of_the_releas
     assert!(closed.closure.0.is_some(), "{closed:?}");
 }
 
-/// KR-REQ-09.10, KR-REQ-26.06: a mutation a paired device makes, which the daemon of this release
-/// takes a remote dispatch lease for, is performed by the worker of the release before.
+/// KR-REQ-09.10, KR-REQ-26.06, KR-REQ-20.23: a mutation a paired device makes, which the daemon of
+/// this release takes a remote dispatch lease for, is performed by the worker of the release
+/// before.
 ///
 /// That worker reads no lease and holds the daemon's deadline and the revision its grant was
 /// checked at, so the daemon sends it the frame it read before this release and not the lease: a
@@ -1886,10 +1888,10 @@ async fn the_plugin_runtime_of_the_release_before_survives_the_update_and_is_rep
     host.end_the_plugin_host().await;
 }
 
-/// KR-REQ-05.06, KR-REQ-26.06, KR-ACC-035: a program the package recognises, started in the session
-/// of the release before after the update, makes its worker ask the daemon of this release for the
-/// plugin runtime. The daemon starts one of this release, the worker registers with it, and a
-/// session of this release registers with the same runtime.
+/// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035: a program the package recognises, started
+/// in the session of the release before after the update, makes its worker ask the daemon of this
+/// release for the plugin runtime. The daemon starts one of this release, the worker registers with
+/// it, and a session of this release registers with the same runtime.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_worker_of_the_release_before_asks_this_releases_daemon_for_the_plugin_runtime() {
     let updated = Updated::prepare(Setup {
@@ -1939,11 +1941,11 @@ async fn a_worker_of_the_release_before_asks_this_releases_daemon_for_the_plugin
     host.end_the_plugin_host().await;
 }
 
-/// KR-REQ-05.06, KR-REQ-26.06, KR-ACC-035: the plugin runtime of the release before ends while a
-/// program the package recognises still runs in the session of the release before. The worker,
-/// left without a runtime, asks the daemon of this release for another; the daemon starts one of
-/// this release and the worker registers with it, so the program's binding survives the end of the
-/// runtime that held it.
+/// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035: the plugin runtime of the release before
+/// ends while a program the package recognises still runs in the session of the release before.
+/// The worker, left without a runtime, asks the daemon of this release for another; the daemon
+/// starts one of this release and the worker registers with it, so the program's binding survives
+/// the end of the runtime that held it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_worker_of_the_release_before_registers_again_with_the_runtime_of_this_release_when_its_own_ends()
  {
@@ -2006,8 +2008,8 @@ async fn a_worker_of_the_release_before_registers_again_with_the_runtime_of_this
     host.end_the_plugin_host().await;
 }
 
-/// KR-REQ-26.06, KR-ACC-029, KR-ACC-035: what the worker of the release before wrote to the
-/// session's terminal is kept by the daemon of this release when the session closes, and `kr
+/// KR-REQ-26.06, KR-REQ-20.23, KR-ACC-029, KR-ACC-035: what the worker of the release before wrote
+/// to the session's terminal is kept by the daemon of this release when the session closes, and `kr
 /// export` of this release reads it back through the daemon.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_output_of_a_session_of_the_release_before_is_exported_through_the_daemon_of_this_release()
@@ -2084,10 +2086,10 @@ async fn the_output_of_a_session_of_the_release_before_is_exported_through_the_d
     );
 }
 
-/// KR-REQ-23.34, KR-REQ-26.06, KR-ACC-035: the `kr` of the release before issues a share of its
-/// session with the live screen to a paired device, at a terminal. The daemon of this release reads
-/// the lines on the screen from the worker of the release before, as the share asks, and holds the
-/// share, which `kr share list` of this release shows.
+/// KR-REQ-23.34, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035: the `kr` of the release before issues a
+/// share of its session with the live screen to a paired device, at a terminal. The daemon of this
+/// release reads the lines on the screen from the worker of the release before, as the share asks,
+/// and holds the share, which `kr share list` of this release shows.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_share_with_the_live_screen_of_the_session_of_the_release_before_is_issued_through_the_daemon_of_this_release()
  {
