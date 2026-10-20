@@ -393,7 +393,8 @@ struct NodeTask {
 struct TaskState {
     /// The run was cancelled, or the node's wait ended and the engine asked it to stop.
     cancelled: bool,
-    /// The node's session passed its admission at the launch transition.
+    /// The node's admission at the launch transition has begun. It is set before the admission's
+    /// checks run and stays set if one of them refuses.
     committed: bool,
 }
 
@@ -497,14 +498,15 @@ impl std::fmt::Debug for HostActions {
 impl ActionRunner for HostActions {
     /// A command's session is closed when its dispatch is asked to stop: the dispatch sees the
     /// flag, closes the session, and releases what it owned once the closure is recorded. A
-    /// `create_session` node is stopped only while its session has not passed its first
-    /// admission, and the node of one that has settles unknown. Its worker's claim is refused if
-    /// it comes after the request, so no program starts, and a session whose claim came before it
-    /// stays. Nothing is claimed about what a command did before it stopped.
+    /// `create_session` node is stopped only while its first admission has not begun, and the node
+    /// of one that has settles unknown. Its worker's claim is refused if it comes after the
+    /// request, so no program starts, and a session whose claim came before it stays. Nothing is
+    /// claimed about what a command did before it stopped.
     ///
     /// Neither change-set kind can be stopped once it has begun: the change-set service offers no
-    /// point inside a capture or a materialisation to stop at. An action that outlives its wait
-    /// and cannot be stopped is left unknown, and its dependants pause for review.
+    /// point inside a capture or a materialisation to stop at. A dispatch that has ended is no
+    /// longer among the running ones and cannot be stopped either. An action that outlives its
+    /// wait and cannot be stopped is left unknown, and its dependants pause for review.
     fn cancel(&self, dispatch: &Dispatch<'_>) -> kr_automation::Cancellation {
         let kind = dispatch.node.action_kind;
         if matches!(

@@ -83,7 +83,8 @@ pub struct Dispatch<'a> {
 pub enum Cancellation {
     /// The action was asked to stop. Nothing is claimed about what it did before it stopped.
     Requested,
-    /// An action of this kind cannot be stopped once it has begun.
+    /// The action cannot be stopped: its kind offers no point to stop at once it has begun, or its
+    /// dispatch has already ended.
     Unsupported,
 }
 
@@ -682,9 +683,10 @@ impl WorkflowEngine {
     /// [`Waited::Outlived`] when it outlived that moment, including when its report is read only
     /// after that moment, and [`Waited::Cancelled`] when the run was cancelled first.
     ///
-    /// The clock is read at least every [`DEADLINE_POLL_MS`], so a deadline that passes while the
-    /// host sleeps or while nothing else happens is found soon after it passes rather than when
-    /// the action ends. A cancellation is read before a lapsed wait is answered: a run that was
+    /// The clock is read after each timer wait, with the timer set for at most
+    /// [`DEADLINE_POLL_MS`], so a deadline that passes while nothing else happens is found soon
+    /// after it passes rather than when the action ends. A host that is suspended or starved reads
+    /// it later. A cancellation is read before a lapsed wait is answered: a run that was
     /// cancelled exceeded no limit, whatever the clock says by the time anyone looks.
     async fn wait_for<T>(
         &self,
