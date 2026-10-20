@@ -193,68 +193,78 @@ cancelled. A request to stop that comes before the worker's claim is still held 
 which is refused, so no program will start and no session will be made. A session whose claim came
 before the request stays.
 
-A `shell_command` node will run the specified command as the root of a new session. The worker runs
-the command line through `/bin/sh -c`. No login or interactive startup is performed, and the
-environment variable `SHELL` is set to the path of that interpreter. The command will be run in the
-workspace specified by the scope of the definition, if it is named (a shared checkout only because
-the definition named it); otherwise, a private directory will be created for the command node. The
-workspace is opened the same way as for captures; if the tree has been moved, removed or replaced
-since it was recorded in the project service, the tree is refused and the node pauses. Also, the
-worker refuses a directory that is not there instead of running the command somewhere else. (The
-directory is verified when the command is accepted; one swapped in the moments after that is not
-detected.) Standard input for the command will be the terminal of the session, so that a command
-that reads it waits for a person or for the node's wait. The result of the command node will depend
-on how the root process of the session exited, as this host recorded it. If it exited with status
-zero, the command will succeed; if it exited with a non-zero exit status or was terminated by a
-signal, the command will fail and record the exit status or signal that terminated it. If the worker
-could not launch the command, the node fails; a start refused because the grant was withdrawn or has
-ended pauses the node and its run, as any refusal does. If the session is closed for any other
-reason (by a request, a crash, the loss of the desktop or the host's shutdown), it says nothing
+A `shell_command` node runs its command as the root of a new session. The worker runs the command
+line with `/bin/sh -c` (without any login or other interactive startup), setting the `SHELL`
+environment variable to the path of that interpreter. As with captures, the command will be run in
+the workspace of the scope of its definition if it's named (a shared checkout only because the
+definition is named), else in a private directory made for the node. Also as with captures, if the
+workspace can't be opened because the tree has been moved, removed, or replaced since it was
+recorded in the project service, then the tree will be refused and the node paused. Likewise, if the
+directory isn't present the worker won't try to run the command in some other directory but will
+refuse it (though it only checks for the directory at the time the command is accepted, and won't
+notice if it's swapped in the following moments). The standard input of the command is the terminal
+of the session, so if the command reads from it it will wait for a person or for the node's wait.
+The result of a command node depends on how the process that was the root of its session exited as
+recorded by this host. If it exited with status 0 the command is considered to have succeeded, but
+if it exited with any other status or was terminated by a signal the command failed, and the exit
+status or the signal that ended it is recorded. If the worker is unable to launch the command at all
+the node will fail, but if it's because the grant was withdrawn or has ended then the node (and its
+run) will be paused instead (as it would if the grant was refused at any other point; a node of a
+kind that's refused by name fails instead, as described below). If the session is closed for any
+other reason (by a request, a crash, the loss of the desktop or the host's shutdown) it says nothing
 reliable about the command, and the node is left unknown; so is a node whose command exited with no
-exit status recorded. Like any other session, the session running the command can be listed and
-attached to; additionally, its summary will note that it is running a command as its root. The
-session's journal keeps that word in a row of its own and its summary in the form the release before
-reads, so that a host rolled back to that release reads a command's session as it reads any other.
-An update that closes sessions closes a running command too. Commands are offered only on hosts that
-have a POSIX shell: a definition that holds one is refused at install on Windows.
+exit status recorded. The session used to run the command can be listed and attached to like any
+other; its summary will note that it's running a command as its root, and its journal will record
+that word in a row of its own as well as recording the summary in a form that can be read by the
+previous release so that if a host is rolled back to that release it can read such sessions like any
+other. An update that closes sessions closes a running command too. Commands are only offered on
+hosts that have a POSIX shell; attempting to install a definition that contains one on a Windows
+host will result in the definition being refused.
 
 When a node reaches its wait or run deadline or its run is cancelled, the command's session is
-closed and the node settles cancelled, which says the host stopped asking and nothing about what the
-command did. Everything a command node owns outside the journal (its session, its directory, the
-run's hold on its workspace) is written down in a ledger of its own before any of it is made, and
-released once the session's closure accounts for its worker. A node's private directory is made for
-it alone, and its identity is recorded before the command can start. The directory is removed only
-while it is still the object that was recorded, by the removal the project uses for a directory it
-recorded: its inode and the filesystem it is on must be the ones the handle that made it reported,
-and its device number may differ from the recorded one only where it is on the filesystem of the
-directory it is in. The removal opens the scratch root without following a link, and opens the
-directory beneath it through that handle. The directory is made private again if the command
-loosened its mode (unpacking an archive does), and it has to be one only this account can change.
-What is in it goes through handles the removal holds, staying on the directory's own mount and
-holding no more than 128 levels. A tree the removal does not take (a mount inside it, one nested
-deeper than that, a directory in it that its owner cannot write, one whose owner read bit the
-command removed, one with an access-control list on macOS, entries still being written, a failure of
-the storage) stays where it is after that attempt: the row is released and the daemon's log names
-the directory (the removal is tried again only if the row stays open for another reason). On a
-filesystem that reports no identity of its own (some Linux ones report only the device number; a
-macOS volume may have no UUID) the filesystem part of the identity is zeros, and the check rests on
-the inode with the exact device number, or on the inode alone where the directory is on the
-filesystem of the directory it is in. There is one further limit: between the last check of the
-directory's name and its removal, another process running as the same account could create an empty
-directory with the same name, and that directory would be substituted for the one being removed. If
-the directory was created but its identity was never recorded, it will only be removed if it is
-empty. A dispatch always owns its row while it is running. If the daemon restarts while a dispatch
-is running, or a dispatch exits without releasing its row, the sweep will close the session, remove
-the node directory, end the hold, and release the row, without waiting for the run to end. A run
-only holds a workspace once, even if multiple nodes are run in the same workspace. The hold ends
-with the last of them. If a run pauses between nodes, it does not hold the workspace while paused.
-If the session's closure does not account for the worker, the row is kept until the kernel says that
-the worker's process has ended or the boot it ran in has (the row records the boot it began in). The
-row also records the process the launcher started, which the daemon registry retains even after the
-session has closed. The sweep looks again less and less often while a row stays owed. What the
-worker could not account for stays outside the release: a process the command started that left the
-session's boundary can outlive it, and where the platform gives incomplete coverage of owned
-processes (always on macOS) the closure says so. The ledger is a store of its own beside the
+closed and the node is settled as cancelled. This indicates that the host stopped asking and says
+nothing about what the command did. A node whose dispatch had already ended when its wait or
+deadline was found to have lapsed is left unknown instead, because there is nothing for the host to
+ask to stop; a node whose run is cancelled is settled as cancelled in either case. A command node
+owns some resources outside the journal (its session, its directory, the run's hold on its
+workspace). These are recorded in its own ledger before any of them is made, and are released when
+the node's session is closed and the session's closure accounts for its worker. A node's private
+directory is made for it alone, and its identity is recorded in the node's ledger before the command
+can start. The directory is removed only while it is still the object that was recorded, by the
+removal the project uses for a directory it recorded. This checks that the directory's inode and the
+filesystem it is on are the ones the handle that made it reported. The directory's device number may
+differ from the recorded one only where it is on the filesystem of the directory it is in. The
+removal opens the scratch root without following a link, and opens the directory beneath it through
+that handle. It then makes the directory private again if the command loosened its mode (unpacking
+an archive does), and it has to be one only this account can change. What is in it goes through
+handles the removal holds, so that it stays on the directory's own mount and holds no more than 128
+levels. A tree the removal does not take (a mount inside it, one nested deeper than that, a
+directory in it that its owner cannot write, one whose owner read bit the command removed, one with
+an access-control list on macOS, entries still being written, a failure of the storage) stays where
+it is after that attempt: the row is released and the daemon's log names the directory (the removal
+is tried again only if the row stays open for another reason). On a filesystem that reports no
+identity of its own (some Linux ones report only the device number; a macOS volume may have no UUID)
+the filesystem part of the identity is zeros. In this case, the directory's identity is checked by
+checking its inode number and requiring its device number to match the recorded device number
+exactly. If the directory is on the same filesystem as the directory containing it, the directory's
+identity is checked only by its inode number. There is one further limit: between the point at which
+the directory's name is last checked and the point at which the directory is removed, another
+process running as the same account can create an empty directory with the same name, and that
+directory will be removed instead. If the directory is created but its identity is not recorded for
+some reason, it will only be removed if it is empty. A running dispatch always has an open row in
+the ledger. If the daemon is restarted while a dispatch is running, or if a dispatch exits without
+releasing its row, the daemon's sweeping procedure will close the dispatch's session, remove its
+node directory, release the workspace hold, and release the row, without waiting for the run to end.
+A run only holds a workspace once, even if multiple nodes are run in the same workspace. The hold
+ends with the last of them. If a run pauses between nodes, it does not hold the workspace while it
+is paused. When a session is closed, if it does not account for the command node's worker, the
+node's row will be kept open until the kernel indicates that the worker's process has ended or that
+the boot it ran in has ended. The node's row records the boot it began in. The node's row also
+records the process the launcher started, which the daemon's registry keeps after the session has
+closed. The daemon's sweeping procedure will look again less and less often while a row stays owed.
+What the worker could not account for stays outside the release: a process the command started that
+left the session's boundary can outlive it, and where the platform gives incomplete coverage of
+owned processes (always on macOS) the closure says so. The ledger is a store of its own beside the
 journal, so a release that does not know it reads the journal as before.
 
 The host carries out the change-set nodes against the environment's own change-set service. A
