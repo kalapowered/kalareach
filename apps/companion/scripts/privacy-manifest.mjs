@@ -29,6 +29,8 @@
 //   - a category a binary uses that the manifest of its bundle does not declare;
 //   - a category the manifest of the application (or of an extension or a nested application)
 //     declares that its executable does not use;
+//   - an application with no privacy manifest, whether or not it uses a category (a nested
+//     application or an extension with no manifest and no use of a category passes);
 //   - a category declared with no reason, with a reason that is not Apple's for that category, or
 //     with a reason only a third-party SDK may give;
 //   - a manifest with a key or a value Apple does not define (the root, an accessed API dictionary,

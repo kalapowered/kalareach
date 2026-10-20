@@ -452,7 +452,9 @@ if (toolchain) {
    * and `extension` are what each bundle's manifest says (`null`: none). Beside them, a fault can be
    * laid in: `x86` is the source of a second slice of the application's executable, `link` makes a
    * symbolic link, `frameworkInfo: false` leaves the framework no Info.plist, `executable: false`
-   * leaves the application's executable out of its bundle, and `root` lists SDK resource bundles.
+   * leaves the application's executable out of its bundle, `nested` adds a nested application,
+   * `named` and `main` set the executable's name in the Info.plist and its source, and `root` lists
+   * SDK resource bundles.
    */
   function bundle(
     name,
