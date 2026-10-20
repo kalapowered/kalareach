@@ -23,9 +23,9 @@
 		Data collected. Each entry is data about the person or the device that a service the
 		application reaches (or its provider) can read and keeps beyond answering the request,
 		whether the application sends it or the service records it. Each is tied to the account or
-		installation it came from, and none is used for tracking. Content the application seals on the device before sending (settings, drafts, the
-		recovery bundle) is not here: the sync service holds ciphertext it cannot read, and Apple
-		counts data stored in a readable form.
+		installation it came from, and none is used for tracking. Content the application seals on
+		the device before sending (settings, drafts, the recovery bundle) is not here: the sync
+		service holds ciphertext it cannot read, and Apple counts data stored in a readable form.
 	-->
 	<key>NSPrivacyCollectedDataTypes</key>
 	<array>
