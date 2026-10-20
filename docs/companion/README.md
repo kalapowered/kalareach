@@ -483,26 +483,27 @@ device is removed from the shared settings, a step already under way included. F
 nothing written after the revocation is sealed under a key the device holds. Once the device has
 been removed, the previously unsent requests are sent, sealed under the key that follows its
 removal. This record persists across restarts of this computer. The next step of any companion over
-the same data takes the device out of the shared settings. Nothing takes the record back. Note that
-the revocation request might have reached the host even if the computer receives no answer.
-Therefore the device will be removed from the shared settings in any case. In the case that settings
-are shared with other devices, the person is told that the device was removed. If you revoke a
-device, this computer will remove it from the list of devices sharing your settings. It is out for
-every device that shares them. If another device that shares your settings adds it again, this
-computer will again remove it. Pairing the device again does not bring it back. If you attempt to
-revoke a device, but this operation fails, this computer will remove it from the list of devices
+the same data takes the device out of the shared settings. Nothing takes that written-down record
+back. Note that the revocation request might have reached the host even if the computer receives no
+answer. Therefore the device will be removed from the shared settings in any case. In the case that
+settings are shared with other devices, the person is told that the device was removed. If you
+revoke a device, this computer will remove it from the list of devices sharing your settings. It is
+out for every device that shares them. If another device that shares your settings adds it again,
+this computer will again remove it. Pairing the device again does not bring it back. If you attempt
+to revoke a device, but this operation fails, this computer will remove it from the list of devices
 sharing your settings nevertheless, because the revoke request may have reached its host. As long as
-a host still lists it as paired (and not revoked), this device will be listed on this sheet,
-separated from the devices that have never had your settings. You can select it by pressing the
-button “Share again” in its row. This runs the ceremony on the respective platform, with the reason
-“Share your settings with”, the device's name and “again”. If the ceremony succeeds, this computer
-will first take back its record of the revoke, ask the hosts again, and then attempt to add the
-device again, just as if it were added for the first time. Again, this will succeed only if the
-device is still listed by at least one of its hosts and none of them lists it as revoked. A device
-that a host reports as revoked is not offered. If a view finds that a device is revoked, either
-because a host's feed contains a revocation signed by this computer or because the host on this
-computer lists it as revoked (regardless of who revoked it), the device is taken out as described
-above. Note that there is no way to stop a send of settings or drafts that is already on its way.
+a host lists it as paired and none reports it revoked, this device will be listed on the account
+sheet, separated from the devices that have never had your settings. You can select it by pressing
+the button “Share again” in its row. This runs the ceremony on the respective platform, with the
+reason “Share your settings with”, the device's name and “again”. If the ceremony succeeds, this
+computer will ask the hosts again and then, in one step, take back the membership's own record of
+the revoke and attempt to add the device again, just as if it were added for the first time. Again,
+this will succeed only if the device is still listed by at least one of its hosts and none of them
+lists it as revoked. A device that a host reports as revoked is not offered. If a view finds that a
+device is revoked, either because a host's feed contains a revocation signed by this computer or
+because the host on this computer lists it as revoked (regardless of who revoked it), the device is
+taken out as described above. Note that there is no way to stop a send of settings or drafts that is
+already on its way.
 
 The Devices screen, which appears after the Hosts screen in the desktop navigation, shows one card
 for each host with the card for the local host (that is, the host which is on this computer) first.
@@ -570,7 +571,7 @@ The four actions that change who holds a session (inviting a device to a share, 
 
 A hand-over that is still being asked for can be cancelled, but cannot be hidden. A hand-over left behind when the application was started again while one was being asked for will have lost its reference, and so cannot be completed. It will be shown in the list of attempts, with a button to cancel it, removing the record of it and allowing another hand-over of the session to be made.
 
-Even if the host has stopped listing an invitation, the application can send an acceptance of it, if it has listed the invitation before. The host would know if it was withdrawn, expired, already used, or belongs to a session that is no longer open, and the person is told its answer in the host's own words. However, if the application has not listed an invitation, the application will immediately refuse it without talking to the host.
+Even if the host has stopped listing an invitation, the application can send an acceptance of it, if it has listed the invitation before. The host would know if it was withdrawn, expired, already used, or belongs to a session that is no longer open, and the person is told its answer in the host's own words. However, if the application has not listed an invitation, the application refuses it without sending an acceptance to the host.
 
 It is not possible to make a second invitation to the same session and device, or a second hand-over of the same session, until the first can no longer happen, even if the attempt is hidden or the application is started again. However, the attempts will not be repeated after the application is started again unless the user requests them to be.
 
