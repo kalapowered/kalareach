@@ -1233,7 +1233,7 @@ fn transitions(world: &World) -> Vec<Transition> {
                     continue;
                 }
                 let ran = run(world, false, |reconciler| {
-                    reconciler.add(member, collection(), epoch)
+                    reconciler.add(member, collection(), epoch, None)
                 });
                 ran.value
                     .unwrap_or_else(|error| panic!("a model addition failed: {error}"));

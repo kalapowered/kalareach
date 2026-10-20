@@ -787,12 +787,14 @@ impl<E: Environment> Reconciler<E> {
     /// reported (I3).
     ///
     /// The plan's collection and epoch are checked under the same hold of the lock that records
-    /// the addition, so no other operation can move the collection on in between.
+    /// the addition, so no other operation can move the collection on in between. A revocation to
+    /// take back, when one is named, is taken back by the write that records the addition.
     pub(crate) fn add(
         &mut self,
         member: MemberOf<E>,
         collection: CollectionRef,
         epoch: u64,
+        taking_back: Option<<E::Kinds as Kinds>::Revocation>,
     ) -> Result<Ended, MembershipError> {
         let _guard = self.env.lock()?;
         let facts = self.member_facts()?;
@@ -815,6 +817,11 @@ impl<E: Environment> Reconciler<E> {
             });
             self.commit(before, next)?;
             return Ok(Ended::Refused);
+        }
+        // A revocation the owner chose to take back goes with the same write that records the
+        // addition, and only when the addition is recorded: a refused addition leaves it as it was.
+        if let Some(revocation) = taking_back {
+            <E::Kinds as Kinds>::forget(&mut next.answers, revocation);
         }
         next.begin(Change::Addition(member), false);
         self.commit(before, next)?;
@@ -839,23 +846,6 @@ impl<E: Environment> Reconciler<E> {
         if !next.out {
             next.record_answers(&self.env.me(), false);
         }
-        if next != facts {
-            self.commit(before, next)?;
-        }
-        Ok(())
-    }
-
-    /// Takes back a revocation recorded by [`Self::feed_revocation`]: the answers the hosts give
-    /// decide the device from then on.
-    pub(crate) fn forget_revocation(
-        &mut self,
-        revocation: <E::Kinds as Kinds>::Revocation,
-    ) -> Result<(), MembershipError> {
-        let _guard = self.env.lock()?;
-        let facts = self.load()?.ok_or(MembershipError::NoMembership)?;
-        let before = facts.outcomes.len();
-        let mut next = facts.clone();
-        <E::Kinds as Kinds>::forget(&mut next.answers, revocation);
         if next != facts {
             self.commit(before, next)?;
         }

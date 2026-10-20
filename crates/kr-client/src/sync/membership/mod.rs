@@ -1189,10 +1189,10 @@ impl SyncMembership {
         else {
             return Err(PlanRefusal::Substituted.into());
         };
-        if again {
-            // Confirmed by the owner, so the recorded revocation goes, and the hosts' answers alone
-            // decide whether the device is added. A device that has since stopped being held out
-            // has nothing to take back, and is refused.
+        let taking_back = if again {
+            // Confirmed by the owner. A device that has since stopped being held out has nothing
+            // to take back, and is refused; the revocation goes in the write that adds the
+            // device, and stays when the addition is refused.
             if !self
                 .held_out()?
                 .iter()
@@ -1200,9 +1200,11 @@ impl SyncMembership {
             {
                 return Err(MembershipError::NotHeldOut);
             }
-            self.reconciler.forget_revocation(device.authorisation)?;
-        }
-        self.reconciler.add(device, collection, epoch)
+            Some(device.authorisation)
+        } else {
+            None
+        };
+        self.reconciler.add(device, collection, epoch, taking_back)
     }
 
     /// Plans joining a collection another device shares, for the owner to confirm on this device
