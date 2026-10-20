@@ -207,22 +207,32 @@ mod tests {
         assert!(!restarted.holds(&key(8)));
     }
 
-    /// A request is let go of by its own identity alone: a second request for the device, to the
-    /// same host or to another, is still held, and another request's end releases nothing.
+    /// A request is let go of by its own identity alone: a second request for the device in the same
+    /// feed is still held, and a request of another host's feed is not released by one of this
+    /// feed's.
     #[test]
     fn a_request_is_let_go_of_by_its_own_identity_only() {
         let directory = tempfile::tempdir().expect("a directory");
         let requests = requests_in(&directory);
         requests.raise("host-a", key(7), "one").expect("written");
         requests.raise("host-a", key(7), "two").expect("written");
-        requests.raise("host-b", key(7), "one").expect("written");
+        requests.raise("host-b", key(8), "one").expect("written");
 
         requests.release("host-a", &["one".to_owned()]);
         assert!(requests.holds(&key(7)), "the second request is still held");
-        requests.release("host-a", &["two".to_owned()]);
-        assert!(requests.holds(&key(7)), "host-b's request is still held");
-        requests.release("host-b", &["one".to_owned()]);
+        requests.release("host-b", &["two".to_owned()]);
+        assert!(
+            requests.holds(&key(8)),
+            "no request of host-b has that identity"
+        );
+        requests.release("host-a", &["one".to_owned(), "two".to_owned()]);
         assert!(!requests.holds(&key(7)));
+        assert!(
+            requests.holds(&key(8)),
+            "host-b's request is another feed's"
+        );
+        requests.release("host-b", &["one".to_owned()]);
+        assert!(!requests.holds(&key(8)));
     }
 
     /// A record that cannot be read holds every device, so that nothing is offered on the strength

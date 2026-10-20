@@ -1999,9 +1999,16 @@ async fn a_request_that_may_be_stored_late_is_not_let_go_of_by_a_feed_that_shows
         "host": host["reference"],
         "device": the_phone(&host)["reference"],
     });
+    // The person is at the dialog: the feed has been read, and the next request to it is the
+    // publication, which the service holds open until it is let go without an answer.
+    let (shown, release) = rig.ceremony.hold_the_dialog();
+    let revoking = rig.app.start_call("revocation_revoke", body);
+    tokio::time::timeout(WATCHDOG, shown.notified())
+        .await
+        .expect("the dialog is shown");
     elsewhere.web().fail(AUTHORITY, 1, Moment::Hold);
     let asked_before = elsewhere.web().requests_to(AUTHORITY);
-    let revoking = rig.app.start_call("revocation_revoke", body);
+    release.notify_one();
     elsewhere
         .web()
         .requests_reach(AUTHORITY, asked_before + 1)
