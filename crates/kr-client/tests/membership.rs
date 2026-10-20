@@ -2718,6 +2718,61 @@ async fn a_device_a_host_reports_revoked_is_not_held_out_and_cannot_be_given_bac
     ));
 }
 
+/// A share again that is refused leaves the revocation recorded where it was: the owner planned it,
+/// and then confirmed the addition of another device, which is still pending when the first plan is
+/// confirmed and so is refused beside it. The device is still held out, and the owner can plan
+/// again.
+#[tokio::test]
+async fn a_refused_share_again_leaves_the_recorded_revocation_in_place() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut revoked = Node::new(&world);
+    let another = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut revoked]).await;
+    world.hosts.commit(another.device(), true);
+    owner
+        .membership
+        .feed_revocation(&revoked.auth())
+        .expect("recorded");
+    owner.refresh().await;
+    run(&mut owner).await;
+    assert!(!lists(&world.newest(&collection), &revoked), "taken out");
+
+    let again = owner
+        .membership
+        .plan_share_again(&revoked.auth(), now())
+        .expect("a plan to share with it again");
+    let addition = owner
+        .membership
+        .plan_share(&another.auth(), now())
+        .expect("a plan to add another device");
+    assert_eq!(
+        owner
+            .membership
+            .authorise(&addition, now())
+            .expect("confirmed"),
+        Ended::Done
+    );
+
+    assert_eq!(
+        owner.membership.authorise(&again, now()).expect("a plan"),
+        Ended::Refused,
+        "an addition is pending, and a second is refused beside it"
+    );
+    assert_eq!(
+        owner.membership.held_out().expect("the devices held out"),
+        vec![revoked.device()],
+        "the revocation recorded here is still what keeps it out"
+    );
+    assert!(
+        owner
+            .membership
+            .plan_share_again(&revoked.auth(), now())
+            .is_ok(),
+        "the owner can plan again"
+    );
+}
+
 /// The record read to settle a candidate whose receipt expired becomes the head, with
 /// the host answers applied to it in the same write.
 #[tokio::test]
