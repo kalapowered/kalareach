@@ -901,6 +901,8 @@ test.describe('a passing message', () => {
       await (await opened).setFiles(FILE)
       const toast = page.locator('.toast')
       await expect(toast).toContainText('a-long-name-for-a-file')
+      // Held where it is, as a pointer resting on it holds it: this case measures it, and no time decides it.
+      await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
 
       const layout = await settledToast(page)
       expect(layout?.height ?? 720, 'the toast takes under half of the screen').toBeLessThan(720 / 2)
@@ -966,6 +968,7 @@ test.describe('a passing message', () => {
       await (await opened).setFiles({ name: 'notes.png', mimeType: 'image/png', buffer: Buffer.from('a picked file') })
       const toast = page.locator('.toast')
       await expect(toast).toContainText('notes.png')
+      await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
       const layout = await settledToast(page)
       expect(layout?.scrolls, 'the shortened notice needs no scrolling').toBe(false)
       await expect(toast.locator('.toast-text')).not.toHaveAttribute('tabindex')
@@ -995,6 +998,7 @@ test.describe('a passing message', () => {
       }, OWNER_REQUEST(host))
       const toast = page.locator('.toast')
       await expect(toast).toContainText('needs your confirmation')
+      await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
       const layout = await settledToast(page)
       expect(await overrunning(page, '.toast'), 'lines of the message that run past the screen or its box').toEqual([])
       expect(layout?.controls.map((control) => control.name)).toEqual(['Review', 'Dismiss'])
@@ -1107,6 +1111,21 @@ test.describe('a passing message on the phone, above the bar and the keyboard', 
             .toBe(true)
           await toast.getByRole('button', { name: 'Dismiss' }).click({ trial: true, timeout: 2_000 })
 
+          // The platform's inset under the bar grows (a device turned, a home indicator): the bar is
+          // taller by it, and the message stays above the bar.
+          await page.evaluate(() => {
+            document.documentElement.style.setProperty('--safe-bottom', '34px')
+          })
+          await expect
+            .poll(async () => {
+              const now = await where()
+              return now !== null && now.bottom <= now.bar + 0.5
+            }, 'the message stays above the bar when the inset under it grows')
+            .toBe(true)
+          await page.evaluate(() => {
+            document.documentElement.style.removeProperty('--safe-bottom')
+          })
+
           // A software keyboard over the page: the message goes up with it, and the bar is under it.
           const covered = 336
           await page.evaluate((inset) => {
@@ -1190,6 +1209,7 @@ test.describe('a passing message that comes while a sheet is open', () => {
       }, REQUEST)
       const toast = page.locator('.toast')
       await expect(toast).toContainText('needs your confirmation')
+      await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
       // Inside the dialog, and named by what it does.
       const dismiss = page.getByRole('dialog').getByRole('button', { name: 'Dismiss' })
       await expect(dismiss, 'its Dismiss is in the dialog, named').toBeVisible()
@@ -1257,6 +1277,7 @@ test.describe('a passing message that comes while a sheet is open', () => {
     }, REQUEST)
     const toast = page.locator('.toast')
     await expect(toast).toContainText('needs your confirmation')
+    await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
     const dismiss = toast.getByRole('button', { name: 'Dismiss' })
     const inDialog = () => page.evaluate(() => document.activeElement?.closest('[role="dialog"]') !== null)
     // Dismissed from the keyboard, with the focus in the message.
