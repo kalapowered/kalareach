@@ -229,13 +229,21 @@ impl CompilePool {
                 limit: budget.max_bytes,
             });
         }
+        let engine = engine.clone();
+        let cache = cache.clone();
+        self.submit_work(move || compile_or_load(&engine, &cache, &wasm, budget))
+    }
+
+    /// Queues one piece of work for a pool thread and returns a receiver for what it comes to.
+    fn submit_work(
+        &self,
+        work: impl FnOnce() -> RuntimeResult<Compiled> + Send + 'static,
+    ) -> RuntimeResult<tokio::sync::oneshot::Receiver<RuntimeResult<Compiled>>> {
         // A channel a caller can await rather than block on, so nothing that is waiting for a
         // compile is holding a thread while it waits.
         let (answer, wait) = tokio::sync::oneshot::channel();
-        let engine = engine.clone();
-        let cache = cache.clone();
         let job = Job(Box::new(move || {
-            let outcome = compile_or_load(&engine, &cache, &wasm, budget);
+            let outcome = work();
             // A caller that has given up on the compile is not an error: the result is cached, so
             // the next preparation finds it.
             let _ = answer.send(outcome);
@@ -423,6 +431,30 @@ mod tests {
         )
         .expect_err("text is not a component");
         assert!(matches!(error, RuntimeError::InvalidComponent { .. }));
+    }
+
+    #[test]
+    fn a_compile_that_panics_is_refused_and_leaves_the_pool_serving_the_next_one() {
+        let pool = CompilePool::with_threads(1, 2);
+        let panicked = pool
+            .submit_work(|| panic!("the compiler fell over"))
+            .expect("the work is queued");
+        // Behind it on the pool's only thread: it runs only if that thread is still there. The wait
+        // is a bound so that a lost thread fails the case rather than holding it.
+        let (ran, next) = mpsc::channel::<()>();
+        pool.sender
+            .try_send(Job(Box::new(move || {
+                let _ = ran.send(());
+            })))
+            .expect("the next job is queued");
+        next.recv_timeout(core::time::Duration::from_secs(5))
+            .expect("the pool thread survived the panic");
+        match panicked.blocking_recv().expect("the caller is answered") {
+            Err(RuntimeError::InvalidComponent { detail }) => {
+                assert!(detail.contains("the compiler fell over"), "{detail}");
+            }
+            other => panic!("the caller was told {other:?}"),
+        }
     }
 
     #[test]

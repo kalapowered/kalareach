@@ -1121,6 +1121,58 @@ fn kr_req_11_41_a_downloaded_artefact_is_never_deserialised() {
     }
 }
 
+/// A component with one core module whose one function declares an `i32` result and returns an
+/// `i64`. It parses, and fails only when the engine compiles the function, so the engine's error
+/// names the function in its outermost message and the fault in a cause beneath it.
+fn component_with_a_function_of_the_wrong_type() -> Vec<u8> {
+    let module: [u8; 27] = [
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // the module header
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // one type: () -> i32
+        0x03, 0x02, 0x01, 0x00, // one function, of that type
+        0x0a, 0x06, 0x01, 0x04, 0x00, 0x42, 0x00, 0x0b, // its body: i64.const 0
+    ];
+    let mut component = b"\0asm\x0d\0\x01\0".to_vec();
+    component.push(0x01); // a core module section
+    component.push(u8::try_from(module.len()).expect("a short module"));
+    component.extend_from_slice(&module);
+    component
+}
+
+// A component the engine refuses while compiling it is refused with the engine's whole account of
+// why, every cause and not only the outermost message, which names the function and says nothing
+// of what was wrong with it. A compile error such as an over-long `br_table` reaches the person
+// the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_component_the_engine_refuses_to_compile_is_refused_with_every_cause() {
+    let wasm = component_with_a_function_of_the_wrong_type();
+    let engine = engine();
+    let direct = wasmtime::component::Component::new(engine.engine(), &wasm)
+        .expect_err("the function does not compile");
+    let causes: Vec<String> = direct.chain().map(ToString::to_string).collect();
+    assert!(
+        causes.len() > 1,
+        "the engine's error has one message, so the case shows nothing: {causes:?}"
+    );
+
+    let host = host();
+    let error = host
+        .runtime
+        .compile(Arc::from(wasm))
+        .expect("the compile is queued")
+        .wait(COMPILE_WAIT)
+        .await
+        .expect_err("a function of the wrong type is refused");
+    let RuntimeError::InvalidComponent { detail } = error else {
+        panic!("the refusal was {error:?}");
+    };
+    for cause in &causes {
+        assert!(
+            detail.contains(cause.as_str()),
+            "the refusal {detail:?} leaves out the cause {cause:?}"
+        );
+    }
+}
+
 // KR-REQ-11.41: a cold compile is not inside a call deadline, and does not count as a fault.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_41_a_cold_compile_is_not_inside_an_observation_deadline() {
