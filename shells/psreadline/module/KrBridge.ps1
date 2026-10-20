@@ -982,17 +982,20 @@ function Get-KrLaunchWord {
 # is anything else, the word is the full path of the application or script, which nothing can
 # stand in for. A name no application or script has is refused, because what the line would run is
 # not the program asked for: that includes a name the engine answers only by looking for `get-`
-# and the name, which is another command. A name is taken as it is (no wildcard in it is
-# expanded), and what a profile's lookup hook answers with a script block is not taken for an
-# application.
+# and the name, which is another command (for a name with no path in it). A name is taken as it
+# is (no wildcard in it is expanded), and what a profile's lookup hook answers with a script block
+# is not taken for an application.
 function Get-KrLaunchProgram {
     param([string]$Name)
     try {
-        $leaf = [System.IO.Path]::GetFileName($Name)
+        # The engine looks for `get-` and the name only for a name with no dash and no backslash in
+        # it (it reads a backslash as a path separator on every platform), and then the answer is
+        # named `get-` and the name. It puts `get-` before the whole of a name that has a slash,
+        # which no answer's name shows, so a name with a path in it is not covered.
+        $fallback = -not ($Name.Contains('-') -or $Name.Contains('\'))
         $isGetFallback = {
             param($Command)
-            $Command.Name.StartsWith('get-', [System.StringComparison]::OrdinalIgnoreCase) -and
-                -not $leaf.StartsWith('get-', [System.StringComparison]::OrdinalIgnoreCase)
+            $fallback -and $Command.Name.StartsWith('get-', [System.StringComparison]::OrdinalIgnoreCase)
         }
         $first = $ExecutionContext.InvokeCommand.GetCommand($Name, [System.Management.Automation.CommandTypes]::All)
         if ($null -eq $first -or (& $isGetFallback $first)) { return $null }
