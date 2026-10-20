@@ -1588,7 +1588,8 @@ async fn note_node_session(
 /// the version. The copy is then made under the identifier the ledger row already names, so a stop
 /// at any point leaves something the sweep finds from the row. When the session has closed, the
 /// copy is read back and the version it still holds, or what it holds instead, is recorded with
-/// the command's exit status as evidence against the version; the copy is released after that.
+/// the command's exit status as evidence against the version; the copy is released after that when
+/// the session has closed and its worker is accounted for.
 async fn run_tests(
     context: &NodeContext,
     held: &Arc<HeldGrant>,
@@ -1758,12 +1759,13 @@ struct TestRun<'a> {
 ///
 /// A result is recorded only for a suite that ran to an end of its own: it exited with a status, or
 /// a signal ended it. A suite that never started, or that was stopped, has no result to record, and
-/// the node's answer is how the session closed. Of the suites that ran, the session's own exit
-/// status and the copy as it is read back now decide the node. A suite that exits zero against a
-/// copy that still holds exactly the version has passed that version; one that exits zero against a
-/// copy that was changed, or that cannot be read back, has passed nothing this host can name, and
-/// the node is left unknown. A non-zero status or a signal fails the node whatever the copy holds,
-/// once what was observed is recorded; when that cannot be recorded the node is left unknown.
+/// the answer this function returns is how the session closed. Of the suites that ran, the
+/// session's own exit status and the copy as it is read back now decide the node. A suite that
+/// exits zero against a copy that still holds exactly the version has passed that version; one that
+/// exits zero against a copy that was changed, or that cannot be read back, has passed nothing this
+/// host can name, and the node is left unknown. A non-zero status or a signal fails the node
+/// whatever the copy holds, once what was observed is recorded; when that cannot be recorded the
+/// node is left unknown.
 async fn observe_tests(
     context: &NodeContext,
     held: &HeldGrant,
