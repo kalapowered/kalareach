@@ -287,7 +287,7 @@ test.describe('the attention inbox', () => {
     expect(await state()).toBe('pending')
 
     await allow.click()
-    await expect(page.getByText('You chose “Allow once”.')).toBeVisible()
+    await expect(page.locator('.toast').getByText('You chose “Allow once”.')).toBeVisible()
     expect(await state()).toBe('resolved')
   })
 
@@ -903,7 +903,7 @@ test.describe('settings over a live session', () => {
     await page.getByRole('checkbox', { name: /I understand this lets Sam/ }).check()
     await still(page, 'sharing-25.08-invitation')
     await page.getByTestId('invite').click()
-    await expect(page.getByText(/Invitation ready for Sam's iPhone/)).toBeVisible()
+    await expect(page.locator('.toast').getByText(/Invitation ready for Sam's iPhone/)).toBeVisible()
     await expect(page.getByTestId('issued-grants')).toContainText('Waiting to be accepted')
   })
 })

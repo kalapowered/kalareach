@@ -214,7 +214,7 @@ async function openPhoneCard(page: Page, width: number, height: number, ratio: n
   await page.evaluate((kept) => {
     window.krTestHost?.settings.change({ sync: { drafts: kept } })
   }, KEPT)
-  await expect(card.getByTestId('drafts-kept-here')).toHaveCount(3)
+  await expect(card.getByTestId('drafts-kept-here')).toHaveCount(KEPT.kept_here.length)
   await card.getByTestId('drafts-sync').scrollIntoViewIfNeeded()
   return card
 }
