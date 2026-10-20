@@ -4473,10 +4473,10 @@ pub async fn settings_device_share(
     let settings = state.settings()?;
     // A device the page showed as taken out by a revoke is shared with again only when no request
     // of this computer's for it is in force, so the hosts and their feeds are looked at first.
-    if settings.names_held_out(&reference) {
-        if let Ok(revocations) = state.revocations() {
-            revocations.view(&state.revocation_context()).await;
-        }
+    if settings.names_held_out(&reference)
+        && let Ok(revocations) = state.revocations()
+    {
+        revocations.view(&state.revocation_context()).await;
     }
     settings.device_share(&reference).await
 }

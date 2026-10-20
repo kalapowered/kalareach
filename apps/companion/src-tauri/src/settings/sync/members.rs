@@ -581,11 +581,19 @@ impl SettingsSync {
                 .map_err(member_failure)?
                 .into_iter()
                 .find(|device| installation_id_of(device) == reference)
-                .filter(|device| {
-                    self.fence.holds_none_of(&[device.authorisation])
+                .ok_or_else(|| CommandError::refused("no host lists that device any more"))
+                .and_then(|device| {
+                    if self.fence.holds_none_of(&[device.authorisation])
                         && !self.listed.in_force(&device.authorisation)
-                })
-                .ok_or_else(|| CommandError::refused("no host lists that device any more"))?,
+                    {
+                        Ok(device)
+                    } else {
+                        Err(CommandError::refused(
+                            "a request to revoke that device is still waiting for its host, so \
+                             nothing was shared with it",
+                        ))
+                    }
+                })?,
         };
         if self.listed.is_disputed(&device.authorisation) {
             return Err(CommandError::refused(

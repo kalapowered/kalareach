@@ -144,7 +144,7 @@ async fn viewer_selecting(
     let mut grant = proposal(actions);
     grant.session_selector = selector;
     let record = pair_with(host, &device, owner, grant).await;
-    let session_id = net_support::an_open_session(&host).0;
+    let session_id = net_support::an_open_session(host).0;
     let selection = RoleSelection::plain(SessionRole::Viewer);
     let issued: GrantCreateResult = host
         .client()
