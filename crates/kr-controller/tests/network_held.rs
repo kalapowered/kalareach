@@ -14,12 +14,16 @@ mod net_support;
 use kr_controller::sharing::ShareRequest;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{ActionId, DeviceId, GrantId, InvitationId, QuestionId, SessionId};
+use kr_protocol::ids::{
+    ActionId, DeviceId, GrantId, InvitationId, QuestionId, SessionEpoch, SessionId,
+};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
+use kr_protocol::session::{ClosureReason, ClosureRecord, Durability, OwnershipCoverage};
 use kr_protocol::sharing::{
     AuthorityNotice, GrantCreateParams, GrantCreateResult, GrantHeldParams, GrantHeldResult,
-    GrantRedeemParams, GrantRevokeParams, OfferKey, RoleSelection, SessionRole, ShareKey,
+    GrantListParams, GrantListResult, GrantRedeemParams, GrantRevokeParams, GrantState,
+    GrantSummary, OfferKey, RevocationResult, RoleSelection, SessionRole, ShareKey,
 };
 use net_support::{
     Host, MovedWall, RawDevice, an_open_session, end_session, fail_session, on_the_host, recipient,
@@ -642,5 +646,182 @@ async fn kr_req_25_10_the_end_told_is_the_earlier_of_the_share_and_the_pairing()
     assert_eq!(told.shares.len(), 1);
     assert_eq!(told.shares[0].ends_at_ms, Nullable::some(pairing_ends));
     connection.close();
+    host.stop().await;
+}
+
+/// How `session_id` closed, as the daemon records it.
+fn closed(session_id: SessionId) -> ClosureRecord {
+    ClosureRecord {
+        session_id,
+        session_epoch: SessionEpoch::V1,
+        reason: ClosureReason::CloseRequested,
+        root_exit_code: Nullable::null(),
+        root_signal: Nullable::null(),
+        terminated: Vec::new(),
+        surviving: Vec::new(),
+        ownership_coverage: OwnershipCoverage::Complete,
+        durability: Durability::Durable,
+        closed_at_ms: kr_ipc::now_ms(),
+    }
+}
+
+/// What the person at this machine is told of the grants over `session_id`, the resolved ones
+/// included.
+async fn issued_over(host: &Host, session_id: SessionId) -> Vec<GrantSummary> {
+    host.client()
+        .await
+        .request(
+            Method::GrantList,
+            &GrantListParams {
+                session_id: Nullable::some(session_id),
+                include_resolved: true,
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the owner's listing is answered")
+        .to_typed::<GrantListResult>()
+        .expect("decodes")
+        .grants
+}
+
+/// The person at this machine revokes `grant_id`, and is told the revision and the workers.
+async fn revoke_as_issuer(host: &Host, grant_id: GrantId) -> RevocationResult {
+    host.client()
+        .await
+        .mutate(
+            Method::GrantRevoke,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(host),
+            &GrantRevokeParams { grant_id },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the revocation is answered")
+        .to_typed()
+        .expect("decodes")
+}
+
+/// KR-REQ-18.14: a session that closes withdraws the invitations still waiting over it, so the
+/// issuer is told they are withdrawn and no device can redeem one. An invitation over a session
+/// that is still open is left as it was. The issuer's own withdrawal of a waiting invitation, and
+/// its repeat of a withdrawal the close made, are answered with the revision in force and the
+/// workers' completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_18_14_a_session_that_closes_withdraws_the_invitations_waiting_over_it() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (device, record) = recipient(&host, &owner).await;
+    let connection = RawDevice::connect(&host, &device, &record).await;
+    let (closing, _) = an_open_session(&host);
+    let (staying, _) = an_open_session(&host);
+    let waiting = share(&host, closing, record.device_id).await;
+    let kept = share(&host, staying, record.device_id).await;
+    let states = |grants: &[GrantSummary]| {
+        grants
+            .iter()
+            .map(|summary| summary.state)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        states(&issued_over(&host, closing).await),
+        [GrantState::Pending]
+    );
+
+    host.controller()
+        .retire(&closed(closing))
+        .await
+        .expect("the session closes");
+
+    let withdrawn = issued_over(&host, closing).await;
+    assert_eq!(states(&withdrawn), [GrantState::Revoked], "{withdrawn:?}");
+    assert!(withdrawn[0].revoked_at_ms.is_present());
+    assert_eq!(
+        states(&issued_over(&host, staying).await),
+        [GrantState::Pending],
+        "an invitation over a session that is open is left as it was"
+    );
+    let refused = connection
+        .mutate(
+            Method::GrantRedeem,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(&host),
+            &GrantRedeemParams {
+                invitation_id: waiting.preview.invitation_id,
+            },
+        )
+        .await
+        .expect_err("an invitation over a closed session is not redeemed");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+
+    // The issuer who asks for a withdrawal the close already made finds the work done, and is told
+    // the revision in force and where the workers stand.
+    let revision = host
+        .controller()
+        .authority_revision()
+        .await
+        .expect("a revision");
+    let repeated = revoke_as_issuer(&host, waiting.grant.grant_id).await;
+    assert_eq!(repeated.revoked_grants_total.get(), 0);
+    assert_eq!(repeated.authority_revision, revision);
+    assert!(repeated.barrier.holds());
+
+    // And withdrawing one that waits over an open session states the same.
+    let own = revoke_as_issuer(&host, kept.grant.grant_id).await;
+    assert_eq!(own.revoked_grants_total.get(), 1);
+    assert!(
+        own.revoked_grants
+            .iter()
+            .any(|id| *id == kept.grant.grant_id)
+    );
+    assert_eq!(
+        own.authority_revision,
+        host.controller()
+            .authority_revision()
+            .await
+            .expect("a revision")
+    );
+    assert!(own.barrier.holds());
+    connection.close();
+    host.stop().await;
+}
+
+/// KR-REQ-18.14: a daemon that starts and finds a session closed while it was down, with an
+/// invitation still waiting over it, withdraws the invitation before it serves, and leaves the
+/// invitation over a session that is still open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_18_14_a_daemon_that_finds_a_session_closed_withdraws_the_invitations_over_it() {
+    use kr_controller::registry::Registry;
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (_device, record) = recipient(&host, &owner).await;
+    let (closing, _) = an_open_session(&host);
+    let (staying, _) = an_open_session(&host);
+    share(&host, closing, record.device_id).await;
+    share(&host, staying, record.device_id).await;
+
+    let stopped = host.shut_down().await;
+    let mut registry = Registry::open(
+        stopped.tree().environment().registry_database(),
+        stopped.tree().environment_id(),
+    )
+    .expect("the registry opens while the daemon is down");
+    registry
+        .record_closure(&closed(closing))
+        .expect("the session closed while the daemon was down");
+    drop(registry);
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+
+    let states = |grants: Vec<GrantSummary>| grants.iter().map(|g| g.state).collect::<Vec<_>>();
+    assert_eq!(
+        states(issued_over(&host, closing).await),
+        [GrantState::Revoked]
+    );
+    assert_eq!(
+        states(issued_over(&host, staying).await),
+        [GrantState::Pending]
+    );
     host.stop().await;
 }
