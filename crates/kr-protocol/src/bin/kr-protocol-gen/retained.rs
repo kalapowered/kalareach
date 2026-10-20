@@ -12,11 +12,12 @@
 //! of recorded frames. It refuses to overwrite a level. The record is given to `RETAINED` with
 //! `RetainedLevel::with_public_majors`, and `--check` fails until it is.
 //! `--release-commit` is for when the release a level was cut from is not the commit its record
-//! names: it compares the schema, the table of public majors and the plugin host protocol at
-//! `<commit>` with the kept ones, and the schema of every other release of the level too, refuses
-//! on a difference, and only then edits the record. The commit has to be the release before this
-//! one, the newest release tagged in this checkout's history at the highest level below its own,
-//! and `--predecessor` prints that release and fails unless its level is the newest retained.
+//! names: it compares the schema, the table of public majors and the plugin host protocol of every
+//! release of the level that `retained/EXCLUDED` does not name, from the release tags and not from
+//! the history of this checkout, with the kept ones, refuses on a difference, and only then edits
+//! the record. The commit has to be the release before this one, the newest release that is not
+//! excluded and is tagged in this checkout's history at the highest level below its own, and
+//! `--predecessor` prints that release and fails unless its level is the newest retained.
 
 use std::path::{Path, PathBuf};
 
