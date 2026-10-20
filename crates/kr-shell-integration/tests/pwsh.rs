@@ -755,3 +755,10 @@ fn an_alias_that_changes_an_agent_name_is_reported_by_the_comparison() {
 fn the_integration_stays_in_the_root_shell_and_adds_no_global_accept_line_or_mark() {
     shellpkg::the_integration_stays_in_the_root_shell_and_adds_no_global_accept_line_or_mark(PWSH);
 }
+
+/// KR-REQ-23.54
+#[test]
+#[ignore = "drives this tree's built PSReadLine package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_launch_passes_every_word_it_is_given() {
+    shellpkg::a_launch_passes_every_word_it_is_given(PWSH);
+}

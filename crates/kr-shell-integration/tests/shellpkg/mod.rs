@@ -2580,6 +2580,7 @@ mod confinement;
 mod dialect;
 mod identity;
 mod inbox;
+mod launch;
 mod lines;
 mod stacks;
 
@@ -2595,6 +2596,8 @@ pub use confinement::*;
 pub use dialect::*;
 #[allow(unused_imports)]
 pub use inbox::*;
+#[allow(unused_imports)]
+pub use launch::*;
 #[allow(unused_imports)]
 pub use lines::*;
 #[allow(unused_imports)]
