@@ -2,10 +2,11 @@
 //! stands, through the connection this application holds to it.
 //!
 //! Only the host the application is connected to can be asked. It is asked whether it holds a
-//! session, which is how a draft comes to be known as that host's, and it is asked for its privacy
-//! mode, which `privacy.status` gives only a device the host gave the right to manage it.
-//! Everything else is a host this device cannot read, and its drafts stay on this device
-//! ([`HostPrivacy::Unreadable`], [`Holds::Unknown`]).
+//! session, which is how a draft comes to be known as that host's, and it is asked where its privacy
+//! mode stands. A host says that in `host.info`, to every device it is paired with. A host of an
+//! earlier build does not, and tells it only to a device the host gave the right to manage it, in
+//! the answer to `privacy.status`. Everything else is a host this device cannot read, and its drafts
+//! stay on this device ([`HostPrivacy::Unreadable`], [`Holds::Unknown`]).
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, Weak};
@@ -14,6 +15,7 @@ use std::time::Duration;
 use kr_client::pairing::link::LinkError;
 use kr_client::{ClientError, Session};
 use kr_protocol::error::ErrorCode;
+use kr_protocol::hostinfo::HostInfoResult;
 use kr_protocol::ids::{EnvironmentId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::privacy::{PrivacyReport, PrivacyStatusParams};
@@ -23,6 +25,7 @@ use kr_protocol::sharing::{DeviceListParams, DeviceListResult};
 use tauri::{AppHandle, Manager as _, Runtime};
 
 use super::drafts::{Holds, HostLists, HostPrivacy, Hosts};
+use crate::commands::NoParams;
 use crate::connection::{Connection, Replacer, Standing};
 use crate::drafts::DraftHost;
 use crate::error::CommandError;
@@ -119,6 +122,54 @@ fn host_of(connection: &Connection) -> DraftHost {
 fn unreadable(reason: impl Into<String>) -> HostPrivacy {
     HostPrivacy::Unreadable {
         reason: reason.into(),
+    }
+}
+
+/// What a host that is changing its privacy mode is read as: private, until a later answer says
+/// otherwise.
+const HOST_IS_CHANGING: &str = "the host is changing its privacy mode";
+
+/// Why a host of an earlier build cannot be read by a device that does not manage it, and what to
+/// do about it.
+const EARLIER_BUILD: &str =
+    "the host is of an earlier build and tells only a device that manages it; update the host";
+
+/// What the seam does with the answer to `host.info`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Choice {
+    /// The host said where its privacy mode stands.
+    Known(HostPrivacy),
+    /// The host of an earlier build said nothing of it in `host.info`, and this device may ask
+    /// `privacy.status`.
+    AskStatus,
+    /// This device cannot read it, and the host's drafts are treated as private.
+    Unreadable(String),
+}
+
+/// Decides, from what `host.info` came to, how this device reads a host's privacy mode.
+///
+/// `told` is the host's answer, or why there was none. `manages` says whether this device holds
+/// the right to manage the host, which only `privacy.status` asks for. A branch that reads a host
+/// as off where it is not lets drafts leave this device, so each of the others stays closed: a
+/// host that is changing, one that did not answer, and one that tells nothing to a device that
+/// cannot ask.
+///
+/// Goes once no retained level is below 0.77: every host then sends the member, and the branch
+/// for an answer without it, with the request it leads to, is removed.
+pub(crate) fn choose(told: Result<HostInfoResult, String>, manages: bool) -> Choice {
+    match told {
+        Err(reason) => Choice::Unreadable(reason),
+        Ok(info) => match info.privacy {
+            Some(state) if state.changing => Choice::Unreadable(HOST_IS_CHANGING.to_owned()),
+            Some(state) if state.enabled => Choice::Known(HostPrivacy::On {
+                generation: state.generation.get(),
+            }),
+            Some(state) => Choice::Known(HostPrivacy::Off {
+                generation: state.generation.get(),
+            }),
+            None if manages => Choice::AskStatus,
+            None => Choice::Unreadable(EARLIER_BUILD.to_owned()),
+        },
     }
 }
 
@@ -356,43 +407,147 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
             if connection.environment_id() != environment {
                 return unreadable("this computer is not connected to that host");
             }
-            // The host checks the right again. Asking without it only fills the log with a refusal.
-            if let Standing::Paired { rights, .. } = connection.standing()
-                && !rights.contains(&ActionRight::HostManage)
-            {
-                return unreadable("this device holds no right to read the host's privacy mode");
-            }
-            let asked = tokio::time::timeout(
+            let manages = match connection.standing() {
+                Standing::Owner => true,
+                Standing::Paired { rights, .. } => rights.contains(&ActionRight::HostManage),
+            };
+            let told = match tokio::time::timeout(
                 ANSWER_WITHIN,
                 connection
                     .session()
-                    .read::<_, PrivacyReport>(Method::PrivacyStatus, &PrivacyStatusParams {}),
+                    .read::<_, HostInfoResult>(Method::HostInfo, &NoParams {}),
             )
-            .await;
-            match asked {
-                Err(_) => unreadable("the host did not say where privacy mode stands in time"),
-                Ok(Err(error)) => {
-                    let error = CommandError::from(error);
-                    if error.code == ErrorCode::PermissionDenied {
-                        unreadable("the host does not let this device read its privacy mode")
-                    } else {
-                        unreadable(error.message)
-                    }
-                }
-                Ok(Ok(report)) if report.enabled => HostPrivacy::On {
-                    generation: report.generation.get(),
-                },
-                Ok(Ok(report)) => HostPrivacy::Off {
-                    generation: report.generation.get(),
-                },
+            .await
+            {
+                Err(_) => Err("the host did not say where privacy mode stands in time".to_owned()),
+                Ok(Err(error)) => Err(CommandError::from(error).message),
+                Ok(Ok(info)) => Ok(info),
+            };
+            match choose(told, manages) {
+                Choice::Known(state) => state,
+                Choice::Unreadable(reason) => unreadable(reason),
+                Choice::AskStatus => status_of(&connection).await,
             }
         })
+    }
+}
+
+/// Where a host of an earlier build says its privacy mode stands, in the answer to
+/// `privacy.status`, which it gives only a device it gave the right to manage it.
+async fn status_of(connection: &Connection) -> HostPrivacy {
+    let asked = tokio::time::timeout(
+        ANSWER_WITHIN,
+        connection
+            .session()
+            .read::<_, PrivacyReport>(Method::PrivacyStatus, &PrivacyStatusParams {}),
+    )
+    .await;
+    match asked {
+        Err(_) => unreadable("the host did not say where privacy mode stands in time"),
+        Ok(Err(error)) => {
+            let error = CommandError::from(error);
+            if error.code == ErrorCode::PermissionDenied {
+                unreadable("the host does not let this device read its privacy mode")
+            } else {
+                unreadable(error.message)
+            }
+        }
+        Ok(Ok(report)) if report.enabled => HostPrivacy::On {
+            generation: report.generation.get(),
+        },
+        Ok(Ok(report)) => HostPrivacy::Off {
+            generation: report.generation.get(),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kr_protocol::hostinfo::HostPrivacyState;
+    use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
+
+    /// What a host answers to `host.info`, saying `privacy` of its privacy mode.
+    fn info(privacy: Option<HostPrivacyState>) -> HostInfoResult {
+        HostInfoResult {
+            build_id: kr_protocol::ids::BuildId::new("kr/0.1.0+test").expect("a build identifier"),
+            protocol_version: kr_protocol::hello::ProtocolVersion::new(1, 0),
+            environment_id: EnvironmentId::new(Uuid::from_bytes([3; 16])),
+            generation: kr_protocol::ids::ControllerGeneration::new(1),
+            boot_identity: kr_protocol::identity::BootIdentity {
+                source: kr_protocol::identity::BootIdentitySource::BootTime,
+                value: kr_protocol::scalars::Bytes::new(vec![1, 2, 3, 4]),
+            },
+            started_at_ms: TimestampMs::new(1),
+            live_sessions: U64::new(0),
+            session_limit: U64::new(8),
+            default_worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            power: kr_protocol::desktop::SleepInhibitionState {
+                holder: Nullable::null(),
+                ..kr_protocol::desktop::SleepInhibitionState::off(
+                    kr_protocol::desktop::InhibitionMechanism::None,
+                    kr_protocol::desktop::PowerSource::Unknown,
+                )
+            },
+            machine: None,
+            privacy,
+        }
+    }
+
+    fn says(enabled: bool, generation: u64, changing: bool) -> Option<HostPrivacyState> {
+        Some(HostPrivacyState {
+            enabled,
+            generation: U64::new(generation),
+            changing,
+        })
+    }
+
+    /// A host that says where its privacy mode stands is read as it says, whatever right this
+    /// device holds, and a host that says it is changing is read as private, because an answer
+    /// that reads a host as off where it is not lets drafts leave this device.
+    #[test]
+    fn a_host_that_says_where_its_privacy_mode_stands_is_read_as_it_says() {
+        for manages in [false, true] {
+            assert_eq!(
+                choose(Ok(info(says(false, 4, false))), manages),
+                Choice::Known(HostPrivacy::Off { generation: 4 }),
+                "the control"
+            );
+            assert_eq!(
+                choose(Ok(info(says(true, 5, false))), manages),
+                Choice::Known(HostPrivacy::On { generation: 5 })
+            );
+            assert!(
+                matches!(
+                    choose(Ok(info(says(false, 4, true))), manages),
+                    Choice::Unreadable(_)
+                ),
+                "a host that is changing is not read as off"
+            );
+        }
+    }
+
+    /// A host of an earlier build says nothing in `host.info`: a device that manages it asks
+    /// `privacy.status`, and one that does not cannot read it. Neither reads it as off.
+    #[test]
+    fn a_host_that_says_nothing_is_asked_where_the_right_allows_and_otherwise_unread() {
+        assert_eq!(choose(Ok(info(None)), true), Choice::AskStatus);
+        assert!(matches!(
+            choose(Ok(info(None)), false),
+            Choice::Unreadable(_)
+        ));
+    }
+
+    /// A host that did not answer, or refused, is unread, whatever right this device holds.
+    #[test]
+    fn a_host_that_did_not_answer_is_unread() {
+        for manages in [false, true] {
+            assert_eq!(
+                choose(Err("it did not answer".to_owned()), manages),
+                Choice::Unreadable("it did not answer".to_owned())
+            );
+        }
+    }
 
     /// A session whose worker cannot be reached is refused as unavailable, and that says nothing of
     /// the host's other sessions; a host that is rate limited answers none.
