@@ -733,16 +733,20 @@ what the platform said:
 | `environment.capabilities` | the capability evidence, the desktop context and the persistence table on the same terms as a support bundle |
 | `host.doctor` | the checks and the effective configuration on the same terms as a support bundle |
 
-`host.info` also tells every paired device, whatever rights its grant carries, whether privacy mode
-is currently on at the host. All devices see the on/off state and the generation, and whether the
-host is changing its privacy mode. Devices that do not have the `host.manage` right see only that.
-Devices with the `host.manage` right read the rest in the report of `privacy.status`: when privacy
-mode last changed, whether its cleanup is complete, what each session still owes, what the host
-keeps and what had already left it. The host says it is changing privacy mode while a change to on
-waits for the deliveries in flight, records its state and raises the backup fence, while a change to
-off is about to publish its state, and, after a change that stopped part way, until the daemon
-starts again. A device reads the host as private while the host is changing its privacy mode. A host
-of an earlier build leaves this member out of `host.info`.
+All paired devices, whatever rights their grant carries, can also read from `host.info` whether the
+host’s privacy mode is on or off, and the current generation. All paired devices, regardless of
+whether they have the `host.manage` right, can read whether the host’s privacy mode is currently
+changing. Devices that do not have the `host.manage` right see only the on/off state, the generation
+and whether the host is changing its privacy mode. Devices with the `host.manage` right can read the
+rest in the report of `privacy.status`, to find out when the host’s privacy mode last changed,
+whether its cleanup has completed, what each session still owes, what the host keeps, and what had
+already left it.
+
+The host says its privacy mode is changing while a change to on waits for in-flight deliveries to
+complete, records its state and raises its backup fence, while a change to off is about to publish
+its state, and, after a change that stopped part way, until the daemon starts again. A device
+considers the host to be private while the host’s privacy mode is changing. Older builds of the host
+do not include this member in `host.info`.
 
 The allowlist walk above has all four answers as roots, so a field added to one fails the build's
 own tests until it is classed.
@@ -3999,15 +4003,17 @@ would then be published; a host that cannot record it does not enter privacy mod
 
 ### Turning it on and off
 
-Privacy mode is one generation for the whole environment, and the control daemon keeps it. Its
-record, `privacy.sqlite3` in the state directory, holds the generation, whether privacy mode is on,
-and one **obligation** for each session whose own cleanup at that generation has not yet been shown
-to be complete. `kr privacy on` and `kr privacy off` reach it through `privacy.set`, which only this
-host serves: a paired device whose grant carries `host.manage` reads `privacy.status` and changes
-nothing about the host. Both answer one report: the generation, whether the last change has taken
-effect, what each session still owes, what the daemon keeps and why, and what had already left this
-host. A paired device without `host.manage` reads only whether privacy mode is on, at which
-generation, and whether the host is changing it, in `host.info`.
+Privacy mode is one generation for the whole environment, and it is managed by the control daemon,
+which keeps a record of the current generation and whether or not privacy mode is on in the
+`privacy.sqlite3` file in its state directory. It also keeps an **obligation** for each session
+until it can determine that the session’s own cleanup for that generation has completed. Turning
+privacy mode on and off with `kr privacy on` and `kr privacy off` is done through `privacy.set`,
+which can only be served by the host itself; a paired device whose grant carries `host.manage` reads
+`privacy.status` and changes nothing about the host. Both answer one report of the current privacy
+mode generation, whether the last change has taken effect yet, what each session still owes, what
+the daemon keeps and why, and what had already left this host. A paired device without `host.manage`
+can find out only whether or not privacy mode is on, for what generation, and whether the host is in
+the middle of changing it, using `host.info`.
 
 The act of turning it on writes the record first, in a single transaction that records an obligation
 for every session for which the environment has content, including every worker recorded in the

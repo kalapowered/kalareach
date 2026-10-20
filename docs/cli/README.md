@@ -1789,12 +1789,14 @@ what. A session whose worker has ended does not hold it back, because nothing re
 its obligation stays recorded and `kr privacy status` keeps reporting it. Nothing privacy mode
 removed comes back when it is turned off.
 
-`kr privacy status` also names what this host keeps while privacy mode is on, and why, and lists
-what had already left it before privacy mode was turned on: backup archives and notifications, each
-with whether this host holds any way to ask for its removal. It changes nothing. A paired device
-whose grant carries `host.manage` reads the same report; no device can turn privacy mode on or off.
-A device without that right reads only whether privacy mode is on, at which generation, and
-whether the host is changing it, in `host.info`. `docs/host/README.md` has what each step does and what privacy mode does not reach.
+To also see what this host keeps while privacy mode is on and why, as well as what had already left
+the host before privacy mode was turned on (backup archives and notifications, each with whether
+this host holds any way to ask for its removal), without making any changes, run
+`kr privacy status`. A device paired to the host with a grant that includes `host.manage` can also
+view the same report, but no device can enable or disable privacy mode. A device without that right
+can see only whether privacy mode is enabled, its generation, and whether it is being changed, in
+`host.info`. For information on what each step does, as well as what privacy mode does not reach,
+see `docs/host/README.md`.
 
 ## `kr destination`
 
