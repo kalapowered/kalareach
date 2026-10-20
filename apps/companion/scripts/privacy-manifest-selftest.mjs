@@ -456,14 +456,14 @@ if (toolchain) {
    */
   function bundle(
     name,
-    { app, framework, extension, root = [], x86, link, frameworkInfo = true, executable: hasExecutable = true, nested, named = 'Fx' }
+    { app, framework, extension, root = [], x86, link, frameworkInfo = true, executable: hasExecutable = true, nested, named = 'Fx', main = MAIN }
   ) {
     const dir = join(work, name, 'Fx.app')
     mkdirSync(dir, { recursive: true })
     plist(join(dir, 'Info.plist'), { CFBundleExecutable: named, CFBundleIdentifier: 'to.kala.fx' })
     if (!hasExecutable) executable(join(dir, 'Other'), MAIN)
-    else if (x86) universal(join(dir, 'Fx'), MAIN, x86)
-    else executable(join(dir, 'Fx'), MAIN)
+    else if (x86) universal(join(dir, 'Fx'), main, x86)
+    else executable(join(dir, 'Fx'), main)
     if (app) plist(join(dir, 'PrivacyInfo.xcprivacy'), app)
     if (framework !== undefined) {
       const fw = join(dir, 'Frameworks', 'Lib.framework')
@@ -534,6 +534,11 @@ if (toolchain) {
     ['and the manifest of the application is missing']
   )
   heldProblems(
+    'an application that uses no category still needs a manifest of its own',
+    examine(bundle('quiet-no-manifest', { app: null, framework: library_manifest, main: EXT })).problems,
+    ['the application has no privacy manifest']
+  )
+  heldProblems(
     'a declared category no code in the executable uses fails',
     examine(
       bundle('unused', {
@@ -557,6 +562,28 @@ if (toolchain) {
     'an extension that uses a category and has no manifest fails',
     examine(bundle('extension-bare', { app: whole, framework: library_manifest, extension: { source: MAIN } })).problems,
     ['Ext uses FileTimestamp (stat)']
+  )
+  heldProblems(
+    'an extension\'s manifest may not give a reason only a package may give',
+    examine(
+      bundle('extension-sdk-reason', {
+        app: whole,
+        framework: library_manifest,
+        extension: { source: MAIN, manifest: manifest(declares('FileTimestamp', '0A2A.1'), declares('SystemBootTime', '35F9.1'), declares('UserDefaults', 'CA92.1')) }
+      })
+    ).problems,
+    ['the manifest of PlugIns/Ext.appex: FileTimestamp is declared with 0A2A.1, which only a third-party SDK may give']
+  )
+  heldProblems(
+    'an extension that declares a category it does not use fails',
+    examine(
+      bundle('extension-unused', {
+        app: whole,
+        framework: library_manifest,
+        extension: { manifest: manifest(declares('ActiveKeyboards', '54BD.1')) }
+      })
+    ).problems,
+    ['the manifest of PlugIns/Ext.appex declares ActiveKeyboards and no code in its executable uses it']
   )
   heldProblems(
     'an extension that uses nothing needs no manifest',

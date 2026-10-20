@@ -715,6 +715,9 @@ export function examine(path) {
   for (const bundle of new Set(binaries.map((each) => each.bundle))) {
     const where = bundle === app ? 'the application' : relative(app, bundle)
     const manifest = manifestOf(bundle)
+    if (bundle === app && !manifest.present) {
+      problems.push('the application has no privacy manifest (it has to state that it does not track, with or without a use of a category)')
+    }
     declarations.push({ where, present: manifest.present, declared: manifest.declared, tracking: manifest.tracking })
     for (const problem of manifest.problems) problems.push(`the manifest of ${where}: ${problem}`)
     for (const note of manifest.notes) notes.push(`the manifest of ${where}: ${note}`)
