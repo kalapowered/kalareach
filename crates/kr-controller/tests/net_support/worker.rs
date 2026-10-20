@@ -68,13 +68,14 @@ impl Worker {
         Self::start_as(tree, display, false, "exec cat").await
     }
 
-    /// As [`Self::start`], for a session whose application is `script`, a POSIX shell script.
+    /// As [`Self::start_reserved`], for a session whose application is `script`, a POSIX shell
+    /// script.
     pub async fn start_running(
         tree: &kr_ipc::testing::TempHost,
         display: u64,
         script: &str,
     ) -> Self {
-        Self::start_as(tree, display, false, script).await
+        Self::start_as(tree, display, true, script).await
     }
 
     /// As [`Self::start`], for a session the registry also holds an open reservation of, as it does
@@ -591,7 +592,7 @@ impl Adopted {
     /// workers on the tree, each reserved and open in the registry as every session a daemon
     /// creates is, and starts the daemon again, which adopts them.
     pub async fn start(sessions: u64) -> Self {
-        Self::start_on(sessions, None, Clocks::system(), true).await
+        Self::start_on(sessions, None, Clocks::system()).await
     }
 
     /// As [`Self::start`], for a host whose configuration is `document`.
@@ -599,19 +600,18 @@ impl Adopted {
         sessions: u64,
         document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
     ) -> Self {
-        Self::start_on(sessions, Some(document), Clocks::system(), true).await
+        Self::start_on(sessions, Some(document), Clocks::system()).await
     }
 
     /// As [`Self::start`], on the clocks a suite moves by hand.
     pub async fn start_on_clocks(sessions: u64, clocks: Clocks) -> Self {
-        Self::start_on(sessions, None, clocks, true).await
+        Self::start_on(sessions, None, clocks).await
     }
 
     async fn start_on(
         sessions: u64,
         document: Option<&kr_protocol::hostinfo::configuration::ConfigurationDocument>,
         clocks: Clocks,
-        reserved: bool,
     ) -> Self {
         let owner = DeviceKeys::generate().expect("owner keys");
         let host = match document {
@@ -621,11 +621,7 @@ impl Adopted {
         let stopped = host.shut_down().await;
         let mut workers = Vec::new();
         for display in 1..=sessions {
-            workers.push(if reserved {
-                Worker::start_reserved(stopped.tree(), display).await
-            } else {
-                Worker::start(stopped.tree(), display).await
-            });
+            workers.push(Worker::start_reserved(stopped.tree(), display).await);
         }
         let settings = stopped.settings().clone();
         let host = stopped.start(settings).await;
