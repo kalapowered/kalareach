@@ -448,9 +448,9 @@ function HeldToast({
   const dock = useToastDock()
   const [holds, setHolds] = useState({ place: dock, pointer: false, focused: false })
   if (holds.place !== dock) setHolds({ place: dock, pointer: false, focused: false })
-  // The words are said once, in the region of the place the message is first drawn in: the newest
-  // open surface's, or the page's. They are said again only when they are new, and then where the
-  // message is; a move between the page and a dialog says nothing.
+  // The words are said in the region of the newest open surface when they are said, or of the
+  // page where none is open. They are said again only when they are new or the message says them
+  // anew, and then where the message is then; a move between the page and a dialog says nothing.
   const page = useAnnouncer()
   useAnnouncedIn(
     useCallback(() => currentToastDock()?.announcer ?? page, [page]),

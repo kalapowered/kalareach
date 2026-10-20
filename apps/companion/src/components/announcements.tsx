@@ -93,7 +93,9 @@ export function useAnnounced(words: string): void {
  * that is drawn in a dialog that opens over it, nothing is said: the person has heard the words, and
  * the paragraph stays where it is until the caller goes or has new words. New words are said in the
  * place the caller is in then, and the paragraph left behind is taken away, which a screen reader
- * does not say.
+ * does not say. Words said in the update that opens a surface go to a region that arrives in that
+ * update, which a screen reader may not say: they are where the person is, which the page's region
+ * behind a modal surface is not.
  */
 export function useAnnouncedIn(
   place: () => Announcer | null,

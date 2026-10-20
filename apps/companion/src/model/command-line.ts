@@ -13,8 +13,9 @@
  * see which alias, function or cmdlet that shell finds before the program, so it shows the program
  * as named, where a launch writes the program's full path if something else would stand in for it.
  * And it does not see that the program is a batch file, which Windows runs through cmd.exe: a launch
- * builds no line for such a program when a word holds a character cmd.exe reads again, and the line
- * shown here is the one for the words as given.
+ * builds no line for such a program when a word is empty, or ends in a backslash after white space,
+ * or holds a character cmd.exe reads again, or when the program's own path holds `%` or `!`. The
+ * line shown here is the one for the words as given.
  */
 
 import type { ShellKind } from './pending'

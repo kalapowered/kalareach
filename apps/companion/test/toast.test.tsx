@@ -526,7 +526,7 @@ describe('a passing message is said to a screen reader', () => {
     expect(now.page && heardIn(now.page)).toEqual([])
   })
 
-  it('is said in the region of the sheet that opens in the update it arrives in', () => {
+  it('goes to the region of the sheet that opens in the update it arrives in, and not to the page’s behind it', () => {
     const { regions, show } = mount(null, false)
     show(MESSAGE, true)
     const now = regions()

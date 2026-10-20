@@ -50,8 +50,8 @@ function finish(): void {
   })
 }
 
-describe('a sheet’s focus', () => {
-  it('is not modal once it is on its way out, so that what the focus went to is reachable', () => {
+describe('a sheet on its way out', () => {
+  it('is not modal, so that what the focus went to is reachable', () => {
     const close = vi.fn()
     const { rerender } = render(<Page open onClose={close} />)
     finish()
@@ -62,7 +62,9 @@ describe('a sheet’s focus', () => {
     // control the focus went to when it was asked to close.
     expect(screen.getByRole('dialog')).not.toHaveAttribute('aria-modal', 'true')
   })
+})
 
+describe('a sheet’s focus', () => {
   it('stays where something put it on purpose while the sheet was going', () => {
     const close = vi.fn()
     const { rerender } = render(<Page open={false} onClose={close} />)
