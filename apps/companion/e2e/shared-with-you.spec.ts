@@ -629,20 +629,20 @@ test.describe('a message in passing over the card an invitation opens', () => {
         return found
       })
     await expect.poll(overlaps, 'where the message and the card overlap').toEqual([])
+    // The footer is where it is without the message: the message moves nothing of what the card asks
+    // of the person, whether the card has room for it or not. It is read before anything is pressed,
+    // since a press can scroll a card that is fuller than its window.
+    const footerTop = () =>
+      page.evaluate(() => document.querySelector('.sheet .dialog-footer')?.getBoundingClientRect().top ?? -1)
+    const withMessage = await footerTop()
     // A trial press fails where something else would take it: both actions of the card, and the
     // message's own Dismiss, which the card's body must not lie over in any engine's paint order.
     for (const control of [accept, notNow, toast.getByRole('button', { name: 'Dismiss' })]) {
       await control.click({ trial: true, timeout: 5_000 })
     }
-    // The footer is where it is without the message: the message moves nothing of what the card
-    // asks of the person, whether the card has room for it or not.
-    const footerTop = () =>
-      page.evaluate(() => document.querySelector('.sheet .dialog-footer')?.getBoundingClientRect().top ?? -1)
-    const withMessage = await footerTop()
     await page.screenshot({ path: `/tmp/kr-shared-with-you-toast-${how.shot}-${test.info().project.name}.png` })
 
-    // It is the card's own: inside the dialog while the card is open, and back on the screen when the
-    // card goes.
+    // It is the card's own: inside the dialog while the card is open.
     expect(await toast.evaluate((element) => element.closest('[role="dialog"]') !== null)).toBe(true)
     await toast.getByRole('button', { name: 'Dismiss' }).click()
     await expect(toast).toHaveCount(0)

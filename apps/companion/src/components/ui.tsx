@@ -391,19 +391,41 @@ export function Toast({
   return <HeldToast key={message.id} message={message} onDismiss={onDismiss} />
 }
 
-/** What a keyboard stops at inside a surface, in document order. */
+/** What a keyboard can stop at, before the rule for a group of radios. */
 const STOPS =
   'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
 
-/** The stop that follows `place` in `dialog`, or else the one before it. */
-function stopBeside(dialog: HTMLElement, place: HTMLElement): HTMLElement | null {
-  const stops = Array.from(dialog.querySelectorAll<HTMLElement>(STOPS)).filter(
-    (stop) => !place.contains(stop)
+/**
+ * The controls Tab moves between inside `surface`, in document order. A group of radios is one of
+ * them, at the checked radio or at the first where none is checked: the others are reached by the
+ * arrow keys, so treating each as a stop would put the trap's edge where Tab never lands and let Tab
+ * out of the sheet.
+ */
+function stopsOf(surface: HTMLElement): HTMLElement[] {
+  const all = Array.from(surface.querySelectorAll<HTMLElement>(STOPS))
+  const radios = all.filter(
+    (element): element is HTMLInputElement =>
+      element instanceof HTMLInputElement && element.type === 'radio' && element.name !== ''
   )
-  const after = stops.find(
-    (stop) => Boolean(place.compareDocumentPosition(stop) & Node.DOCUMENT_POSITION_FOLLOWING)
-  )
-  return after ?? stops.at(-1) ?? null
+  return all.filter((element) => {
+    if (!(element instanceof HTMLInputElement) || element.type !== 'radio' || element.name === '') return true
+    const group = radios.filter((radio) => radio.name === element.name && radio.form === element.form)
+    return (group.find((radio) => radio.checked) ?? group[0]) === element
+  })
+}
+
+/**
+ * Gives the focus to the first of `choices` that takes it, and says whether one did. A control that is
+ * disabled, inert or hidden refuses a call to `focus()` and leaves the focus on the page's body, where
+ * a keyboard would start again from behind the surface.
+ */
+function focusFirst(choices: readonly (HTMLElement | null)[]): boolean {
+  for (const choice of choices) {
+    if (choice === null || !choice.isConnected) continue
+    choice.focus()
+    if (document.activeElement === choice) return true
+  }
+  return false
 }
 
 /**
@@ -461,11 +483,10 @@ function HeldToast({
     // The message's own action says where the focus goes, if it says.
     if (act !== undefined || !hadFocus) return
     const dialog = dock?.closest<HTMLElement>('[role="dialog"]') ?? null
-    if (back?.isConnected && (dialog === null || dialog.contains(back))) {
-      back.focus()
-    } else if (dialog !== null && dock !== null) {
-      stopBeside(dialog, dock)?.focus()
-    }
+    const owned = back !== null && (dialog === null || dialog.contains(back)) ? back : null
+    // Where it came from if that is in the card's own dialog; else the dialog's first stop, which is
+    // the control that closes it and commits nothing.
+    focusFirst([owned, ...(dialog === null ? [] : stopsOf(dialog).filter((stop) => !dock?.contains(stop)).slice(0, 1))])
   }
   const card = (
     <ToastCard
@@ -475,7 +496,7 @@ function HeldToast({
         setHolds((now) => ({ ...now, pointer: on }))
       }}
       onFocus={(on, from) => {
-        if (on && from instanceof HTMLElement) cameFrom.current = from
+        if (on) cameFrom.current = from instanceof HTMLElement ? from : null
         setHolds((now) => ({ ...now, focused: on }))
       }}
     />
@@ -758,21 +779,7 @@ export function Sheet({
     const sheet = sheetRef.current
     if (!sheet) return
     restoreFocus.current = document.activeElement as HTMLElement | null
-    // The controls Tab moves between. A group of radios is one of them, at the checked radio or at
-    // the first where none is checked: the others are reached by the arrow keys, so treating each
-    // as a stop would put the trap's edge where Tab never lands and let Tab out of the sheet.
-    const focusable = () => {
-      const all = Array.from(sheet.querySelectorAll<HTMLElement>(STOPS))
-      const radios = all.filter(
-        (element): element is HTMLInputElement =>
-          element instanceof HTMLInputElement && element.type === 'radio' && element.name !== ''
-      )
-      return all.filter((element) => {
-        if (!(element instanceof HTMLInputElement) || element.type !== 'radio' || element.name === '') return true
-        const group = radios.filter((radio) => radio.name === element.name && radio.form === element.form)
-        return (group.find((radio) => radio.checked) ?? group[0]) === element
-      })
-    }
+    const focusable = () => stopsOf(sheet)
     focusable()[0]?.focus()
 
     const onKey = (event: KeyboardEvent) => {

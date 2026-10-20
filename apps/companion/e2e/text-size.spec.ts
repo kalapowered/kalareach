@@ -1314,7 +1314,7 @@ test.describe('a passing message that comes while a sheet is open', () => {
 
   // A sheet keeps the focus: a message that goes while it has the focus does not leave it on the page
   // behind. The Account sheet has no footer, so nothing follows the message in it.
-  test('keeps the focus in the sheet when the message that has it goes', async ({ page }) => {
+  test('keeps the focus in the sheet when the message that has it goes', async ({ page, browserName }) => {
     await page.setViewportSize({ width: 1280, height: 720 })
     await page.goto('/harness.html')
     await page.waitForSelector('.app-shell')
@@ -1328,14 +1328,37 @@ test.describe('a passing message that comes while a sheet is open', () => {
     await expect(toast).toContainText('needs your confirmation')
     await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
     const dismiss = toast.getByRole('button', { name: 'Dismiss' })
-    const inDialog = () => page.evaluate(() => document.activeElement?.closest('[role="dialog"]') !== null)
-    // Dismissed from the keyboard, with the focus in the message.
+    const where = () =>
+      page.evaluate(() => {
+        const here = document.activeElement
+        if (here === null || here === document.body) return 'nothing'
+        if (here.closest('.dialog-header') !== null) return 'the header'
+        return here.closest('[role="dialog"]') !== null ? 'the dialog' : 'the page behind'
+      })
+    // Dismissed from the keyboard, with the focus in the message: it goes back to where it came from,
+    // which is in the sheet.
     await dismiss.focus()
     await page.keyboard.press('Enter')
     await expect(toast).toHaveCount(0)
-    expect(await inDialog(), 'the focus is in the sheet when the message has gone').toBe(true)
-    // Not on the sheet's first control (the top of the sheet), but beside where the message was.
-    await expect(page.getByRole('dialog').locator(':focus')).toHaveCount(1)
+    expect(await where(), 'the focus is in the sheet when the message has gone').not.toMatch(/nothing|page behind/)
+
+    // Dismissed by a press while the focus was on nothing (a press on text of the sheet, where the engine
+    // that gives a button the focus on a press makes the message's control the focused one): the
+    // focus goes to the control that closes the sheet and commits nothing. WebKit takes no focus on
+    // a press, so there the press moves nothing.
+    await page.evaluate((view) => {
+      window.krTestHost?.setConfirmations({ ...view, requests: [{ ...view.requests[0], reference: 'request-2' }] })
+    }, REQUEST)
+    await expect(toast).toContainText('needs your confirmation')
+    await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
+    await page.getByRole('dialog').getByText('Sessions keep running while this is open.').click()
+    await dismiss.click()
+    await expect(toast).toHaveCount(0)
+    if (browserName === 'chromium') {
+      expect(await where(), 'the focus is on the control that closes the sheet').toBe('the header')
+    } else {
+      expect(await where(), 'the focus is not on the page behind').not.toBe('the page behind')
+    }
   })
 })
 

@@ -299,13 +299,13 @@ describe('where a message is drawn', () => {
     dialog.remove()
   })
 
-  it('brings the focus to the stop beside the message when the message that had it goes in a dialog', () => {
+  it('brings the focus to the dialog\'s first stop, which commits nothing, when the message that had it goes in a dialog', () => {
     const dialog = document.createElement('div')
     dialog.setAttribute('role', 'dialog')
-    const header = document.createElement('button')
+    const close = document.createElement('button')
     const dock = document.createElement('div')
-    const footer = document.createElement('button')
-    dialog.append(header, dock, footer)
+    const decision = document.createElement('button')
+    dialog.append(close, dock, decision)
     document.body.append(dialog)
 
     render(<Toast message={MESSAGE} onDismiss={() => undefined} />)
@@ -314,12 +314,12 @@ describe('where a message is drawn', () => {
       take = offerToastDock(dock)
     })
     const dismiss = within(dock).getByRole('button', { name: 'Dismiss' })
-    // It came to the message from nowhere (a pointer, or the page's own start), and has it now.
+    // It came to the message from nowhere (a press that had focus on nothing), and has it now.
     dismiss.focus()
     act(() => {
       dismiss.click()
     })
-    expect(document.activeElement, 'the next stop in the dialog has it').toBe(footer)
+    expect(document.activeElement, 'the control that closes the dialog has it, not a decision').toBe(close)
     act(() => {
       take()
     })
