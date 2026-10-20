@@ -1,69 +1,97 @@
 /**
- * The words of the banners in the page, said to a screen reader.
+ * The words of the banners on a screen, said to a screen reader.
  *
  * A screen reader says what a live region changes to, and not what one arrives holding, so a banner
  * that comes with its words cannot carry its own region: the region and the words reach the page
- * together, and nothing changes. One region is in the page for as long as the application is, and
- * each banner puts its words into it. The words are for a screen reader alone: what a person reads
- * is the banner.
+ * together, and nothing changes. A scope draws one region, with what it holds, before any banner in
+ * it, and each banner puts its words into the nearest one. The application is a scope, and so is
+ * each dialog that holds a banner, because a screen reader inside a modal dialog does not reach a
+ * region outside it. The words are for a screen reader alone: what a person reads is the banner.
  */
 
-import { useEffect, useId, useSyncExternalStore, type ReactNode } from 'react'
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useId,
+  useState,
+  useSyncExternalStore,
+  type ReactNode
+} from 'react'
 
-/** The words each banner in the page has said, by banner, in the order the banners came. */
-const said = new Map<string, string>()
-const listeners = new Set<() => void>()
-let heard: readonly (readonly [string, string])[] = []
+/** The words each banner in a scope has said, by banner, in the order the banners came. */
+class Said {
+  readonly #words = new Map<string, string>()
+  readonly #listeners = new Set<() => void>()
+  #heard: readonly (readonly [string, string])[] = []
 
-function publish(): void {
-  heard = Array.from(said)
-  for (const listener of listeners) listener()
-}
+  readonly subscribe = (listener: () => void): (() => void) => {
+    this.#listeners.add(listener)
+    return () => {
+      this.#listeners.delete(listener)
+    }
+  }
 
-function subscribe(listener: () => void): () => void {
-  listeners.add(listener)
-  return () => {
-    listeners.delete(listener)
+  readonly heard = (): readonly (readonly [string, string])[] => this.#heard
+
+  say(banner: string, words: string): void {
+    this.#words.set(banner, words)
+    this.#publish()
+  }
+
+  withdraw(banner: string): void {
+    this.#words.delete(banner)
+    this.#publish()
+  }
+
+  #publish(): void {
+    this.#heard = Array.from(this.#words)
+    for (const listener of this.#listeners) listener()
   }
 }
 
+const Scope = createContext<Said | null>(null)
+
 /**
- * Says `words` to a screen reader for as long as the caller is in the page, and says them again
- * when they change. Nothing is said when no region has been drawn: a page without one is a page
- * with nobody listening.
+ * Says `words` to a screen reader for as long as the caller is on the screen, and says them again
+ * when they change. Nothing is said outside every scope: a page without a region is a page with
+ * nobody listening.
  */
 export function useAnnounced(words: string): void {
+  const said = useContext(Scope)
   const key = useId()
   useEffect(() => {
-    said.set(key, words)
-    publish()
-  }, [key, words])
+    said?.say(key, words)
+  }, [said, key, words])
   useEffect(
     () => () => {
-      said.delete(key)
-      publish()
+      said?.withdraw(key)
     },
-    [key]
+    [said, key]
   )
 }
 
 /**
- * The live region the banners' words go into. It is drawn once, with the application, and holds one
- * paragraph for each banner in the page: a banner that comes adds one, and a banner whose words
- * change changes its own.
+ * A scope for the banners in `children`: the live region their words go into is drawn with it, as
+ * its last child, and holds one paragraph for each banner in the scope. A banner that comes adds
+ * one, and a banner whose words change changes its own.
  */
-export function Announcements(): ReactNode {
-  const items = useSyncExternalStore(subscribe, () => heard)
+export function AnnouncementScope({ children }: { readonly children: ReactNode }): ReactNode {
+  const [said] = useState(() => new Said())
+  const items = useSyncExternalStore(said.subscribe, said.heard)
   return (
-    <div
-      className="visually-hidden"
-      aria-live="polite"
-      aria-relevant="additions text"
-      data-announcements=""
-    >
-      {items.map(([key, words]) => (
-        <p key={key}>{words}</p>
-      ))}
-    </div>
+    <Scope.Provider value={said}>
+      {children}
+      <div
+        className="visually-hidden"
+        aria-live="polite"
+        aria-relevant="additions text"
+        data-announcements=""
+      >
+        {items.map(([key, words]) => (
+          <p key={key}>{words}</p>
+        ))}
+      </div>
+    </Scope.Provider>
   )
 }

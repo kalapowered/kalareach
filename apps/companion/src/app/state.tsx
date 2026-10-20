@@ -21,7 +21,7 @@ import {
 import type { ActionRight } from '@kalareach/protocol'
 
 import type { HostPort } from '../host/port'
-import { Announcements } from '../components/announcements'
+import { AnnouncementScope } from '../components/announcements'
 import type { ToastAction, ToastMessage } from '../components/ui'
 import { DraftBook } from '../model/draft-book'
 import { ManualPaths } from '../model/manual-paths'
@@ -304,8 +304,7 @@ export function AppProvider({
 
   return (
     <AppContext.Provider value={value}>
-      {children}
-      <Announcements />
+      <AnnouncementScope>{children}</AnnouncementScope>
     </AppContext.Provider>
   )
 }

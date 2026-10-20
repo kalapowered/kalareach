@@ -22,7 +22,7 @@ import {
 
 import markLight from '../assets/kala-mark.svg'
 import markDark from '../assets/kala-mark-dark.svg'
-import { useAnnounced } from './announcements'
+import { AnnouncementScope, useAnnounced } from './announcements'
 import { failureMessage, type HostPort } from '../host/port'
 import { applyMode, modeApplications, shownMode, type ColourMode } from '../theme-init'
 import {
@@ -921,7 +921,11 @@ export function Sheet({
             ×
           </IconButton>
         </header>
-        <div className="dialog-body">{children}</div>
+        {/* A screen reader inside a modal dialog does not reach a region outside it, so the
+            banners in the dialog say their words to a region of its own. */}
+        <div className="dialog-body">
+          <AnnouncementScope>{children}</AnnouncementScope>
+        </div>
         {footer ? (
           <footer className="dialog-footer" ref={footerRef}>
             {footer}

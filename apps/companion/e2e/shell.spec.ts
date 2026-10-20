@@ -127,7 +127,8 @@ for (const [size, face] of [
 // nothing in a real engine's accessibility tree.
 test('says a banner through the region the page already held', async ({ page }) => {
   await openTheShell(page, 'system')
-  const region = page.locator('[data-announcements]')
+  // The region of the screen, which is the one outside every dialog.
+  const region = page.locator('[data-announcements]:not([role="dialog"] *)')
   await expect(region).toHaveCount(1)
   await expect(page.locator('.banner')).toHaveCount(0)
   await expect(region).toBeEmpty()
@@ -142,13 +143,34 @@ test('says a banner through the region the page already held', async ({ page }) 
   await expect(region.locator('p')).toHaveCount(1)
   await expect(region).toMatchAriaSnapshot('- paragraph: /This host is not answering\\. The host did not answer\\..*/')
   expect(await before?.evaluate((node) => node.isConnected)).toBe(true)
-  expect(
-    await page.evaluate(() => document.querySelectorAll('[data-announcements]').length),
-    'one region says every banner'
-  ).toBe(1)
+  await expect(region, 'one region says every banner of the screen').toHaveCount(1)
 
   // The banner goes and its words go from the region with it.
   await page.getByRole('button', { name: 'Try again' }).click()
   await expect(page.locator('.banner')).toHaveCount(0)
   await expect(region).toBeEmpty()
+})
+
+// A dialog is modal: a screen reader inside it does not reach a region outside it, so the banners in
+// the dialog say their words to a region the dialog holds, and the region outside says none of them.
+test('says the banner of a sheet through a region inside the sheet', async ({ page }) => {
+  await openTheShell(page, 'system')
+  await page.evaluate(() => {
+    window.krTestHost?.withoutQualifiedShell()
+  })
+  await page.getByRole('button', { name: 'Sessions' }).click()
+  await page.getByRole('button', { name: 'New session' }).click()
+  const sheet = page.getByTestId('sheet')
+  await sheet.getByRole('textbox', { name: 'Directory' }).fill('/Users/rs/work/notes')
+  await sheet.getByRole('button', { name: 'Create session' }).click()
+  await expect(sheet.locator('.banner')).toContainText('This host has no managed shell to start')
+
+  const inside = sheet.locator('[data-announcements]')
+  await expect(inside).toHaveCount(1)
+  await expect(inside.locator('p')).toHaveCount(1)
+  await expect(inside).toContainText('This host has no managed shell to start.')
+  // The region outside the sheet says none of the sheet's banners.
+  const outside = page.locator('[data-announcements]:not([role="dialog"] *)')
+  await expect(outside).toHaveCount(1)
+  await expect(outside).toBeEmpty()
 })
