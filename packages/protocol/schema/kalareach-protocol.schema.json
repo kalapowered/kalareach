@@ -21815,7 +21815,7 @@
         },
         {
           "const": "privacy.set",
-          "description": "Turn privacy mode on or off for this environment, at the host itself: a paired device reads where it stands with `privacy.status` and cannot turn it on or off. The change is recorded, and the generation advanced, before any subsystem is touched; the answer says where it stands.",
+          "description": "Turn privacy mode on or off for this environment, at the host itself: a paired device whose grant carries `host.manage` reads where it stands with `privacy.status`, and no paired device can turn it on or off. The change is recorded, and the generation advanced, before any subsystem is touched; the answer says where it stands.",
           "type": "string"
         },
         {
@@ -27797,7 +27797,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "Something is in the way: a subsystem could not take a step or cannot say where its cleanup\nstands. Cleanup is not complete, and it is not merely waiting for work to settle.",
+          "description": "Something is in the way: a subsystem could not take a step or cannot say where its cleanup\nstands. The last change has not finished taking effect, and it is not merely waiting for\nwork to settle.",
           "properties": {
             "outstanding": {
               "description": "Each subsystem with work outstanding, and how much.",

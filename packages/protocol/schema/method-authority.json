@@ -369,7 +369,7 @@
       "resource_selectors": [
         "environment"
       ],
-      "summary": "Turn privacy mode on or off for this environment, at the host itself: a paired device reads where it stands with `privacy.status` and cannot turn it on or off. The change is recorded, and the generation advanced, before any subsystem is touched; the answer says where it stands.",
+      "summary": "Turn privacy mode on or off for this environment, at the host itself: a paired device whose grant carries `host.manage` reads where it stands with `privacy.status`, and no paired device can turn it on or off. The change is recorded, and the generation advanced, before any subsystem is touched; the answer says where it stands.",
       "version": 1
     },
     {

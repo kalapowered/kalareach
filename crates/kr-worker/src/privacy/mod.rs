@@ -117,7 +117,7 @@ pub struct KeptExplicitly {
     pub why: &'static str,
 }
 
-/// Something that had already left this host before privacy mode was enabled.
+/// Something that has left this host.
 ///
 /// It is not erased and this host does not claim it could be. What it offers instead is the truth
 /// and a separate action: the copy is shown, and deleting it is authorised on its own.
