@@ -3,14 +3,16 @@
 //! This runs [`Reconciler`] itself, row for row and write for write, against a model environment:
 //! one device D, two other members A and X that append records at an honest service, a fourth
 //! device B, the owner's removals and additions on D, a host revocation, a revocation D verifies
-//! from an authority feed, D's refreshes, the owner confirming a join, a lost request, a lost
-//! reply, a receipt the service no longer holds, a refresh a hostile service answers as if the
-//! collection were gone, and a crash, which loses what the membership file does not hold (the
-//! send that follows a dispatch mark, and an answer not yet taken). The service answers a device
-//! its newest record does not list as a missing collection, and goes on taking a request in
-//! flight after D is out. X also misbehaves: it wraps another key at the same epoch, reuses a key
-//! in a new epoch, or carries the key of any candidate D sent into a record of its own. A host
-//! does not answer, and the hosts that answer stop listing a device.
+//! from an authority feed, a revocation D is told of that no host or feed holds (a request that
+//! did not go through), the owner sharing again with a device only such a record keeps out, D's
+//! refreshes, the owner confirming a join, a lost request, a lost reply, a receipt the service no
+//! longer holds, a refresh a hostile service answers as if the collection were gone, and a crash,
+//! which loses what the membership file does not hold (the send that follows a dispatch mark, and
+//! an answer not yet taken). The service answers a device its newest record does not list as a
+//! missing collection, and goes on taking a request in flight after D is out. X also misbehaves:
+//! it wraps another key at the same epoch, reuses a key in a new epoch, or carries the key of any
+//! candidate D sent into a record of its own. A host does not answer, and the hosts that answer
+//! stop listing a device.
 //!
 //! Records here are a few small numbers rather than signed records, so every reachable state
 //! within the budgets can be visited; the checks that need keys (the chain, the signature, the
@@ -43,9 +45,9 @@
 //!   the hosts vouched for before, that no host which answered mentions), and no candidate is built
 //!   over a record that fails only for want of that host's answer, however many records lie on top
 //!   of it, since it would list a device that record took out.
-//! * Liveness: once events stop, and a host that did not answer answers, every state settles: nothing pending, the newest record installed
-//!   and publication open, or D out of the collection with its request settled and its keys
-//!   forgotten.
+//! * Liveness: once events stop, and a host that did not answer answers, every state settles:
+//!   nothing pending, the newest record installed and publication open, or D out of the
+//!   collection with its request settled and its keys forgotten.
 //!
 //! Every visited membership file passes the load check and survives the file's own encoding. Each
 //! rule the test weakens ([`Rule`]) must make a run fail.
@@ -867,8 +869,8 @@ enum Label {
     Other(ModelRecord),
     Revoke(Dev),
     Feed(Dev),
-    /// D is told to take a device out that no host revokes and no feed holds: the request that was to
-    /// revoke it did not go through.
+    /// D is told to take a device out that no host revokes and no feed holds: the request that was
+    /// to revoke it did not go through.
     Told(Dev),
     /// A host does not answer.
     Silence,
@@ -1254,11 +1256,18 @@ fn transitions(world: &World) -> Vec<Transition> {
             // A device only a recorded revocation keeps out: the answers D recorded have no host
             // revoking it or leaving it out. The owner's confirmation takes the record back in the
             // write that adds it.
+            //
+            // The owner is offered this only for a revocation no feed holds. A request in a feed
+            // that a host has yet to act on is recorded here exactly as one that never went
+            // through is, and the membership cannot tell the two apart: the application that
+            // sends the requests offers the choice only when no request of its own is in force,
+            // so a device a feed verified is never offered, and the model never takes it.
             for member in DEVICES {
                 let recorded = &world.facts.answers;
                 let kept_out = recorded.verified & bit(member) != 0
                     && (recorded.hosts | recorded.unlisted) & bit(member) == 0;
                 if !kept_out
+                    || world.verified & bit(member) != 0
                     || installed_members & bit(member) != 0
                     || addition & bit(member) != 0
                     || removals & bit(member) != 0

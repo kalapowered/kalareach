@@ -1091,6 +1091,11 @@ impl SyncMembership {
     /// hosts report them paired and unrevoked, as when the request that was to revoke one did not
     /// go through: the owner may share with one again ([`Self::plan_share_again`]).
     ///
+    /// A revocation told of ([`Self::feed_revocation`]) is recorded alike whether its request
+    /// failed or waits in an authority feed for a host to act on it, and this cannot tell which.
+    /// The caller can, and offers the owner the choice only for a device that no request of its own
+    /// is in force for.
+    ///
     /// # Errors
     ///
     /// A storage failure.
