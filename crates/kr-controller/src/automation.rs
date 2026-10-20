@@ -1758,11 +1758,12 @@ struct TestRun<'a> {
 ///
 /// A result is recorded only for a suite that ran to an end of its own: it exited with a status, or
 /// a signal ended it. A suite that never started, or that was stopped, has no result to record, and
-/// the node's answer says how the session closed. Of the suites that ran, the session's own exit
+/// the node's answer is how the session closed. Of the suites that ran, the session's own exit
 /// status and the copy as it is read back now decide the node. A suite that exits zero against a
 /// copy that still holds exactly the version has passed that version; one that exits zero against a
 /// copy that was changed, or that cannot be read back, has passed nothing this host can name, and
-/// the node is left unknown. A non-zero status or a signal fails the node whatever the copy holds.
+/// the node is left unknown. A non-zero status or a signal fails the node whatever the copy holds,
+/// once what was observed is recorded; when that cannot be recorded the node is left unknown.
 async fn observe_tests(
     context: &NodeContext,
     held: &HeldGrant,

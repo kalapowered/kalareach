@@ -5081,8 +5081,8 @@ async fn version_as_read(
 /// KR-REQ-25.20 and KR-REQ-25.14: a suite that passes against a version succeeds, and the host
 /// records what it observed: the session the suite ran in, its exit status, and that the copy it
 /// ran in still held exactly the version. The edit a person makes in the main workspace after the
-/// capture changes nothing the suite reads, and a capture after it is a later version; the
-/// evidence stays against the earlier one. The copy is released when the node settles.
+/// capture changes neither the version nor its copy, and a capture after it is a later version; the
+/// evidence stays against the earlier one. The copy is released once the session has closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_suite_that_passes_against_a_version_is_recorded_as_the_host_observed_it() {
     let host = working_host_with_suites(&[(

@@ -463,8 +463,9 @@ pub fn reread_with(
 /// A re-read leaves them out of its comparison and records each as one [`OutputReference`], so a
 /// run that wrote only there still attests the version it ran against. Everything else keeps the
 /// rules it has: a path beside a declared output that the run added makes the source
-/// indeterminate, an ancestor of an output is entered only to reach it, and a declaration that
-/// the version's own paths contradict is refused before anything runs ([`Outputs::new`]).
+/// indeterminate, an ancestor of an output is entered to reach it and its other entries keep every
+/// rule, and a declaration that the version's own paths contradict is refused before anything
+/// runs ([`Outputs::new`]).
 #[derive(Clone, Debug, Default)]
 pub struct Outputs {
     /// The declared paths, relative and normalised.
