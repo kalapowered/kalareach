@@ -539,6 +539,9 @@ impl Companion {
                 companion_tauri::commands::voice_stop,
                 companion_tauri::commands::voice_set_muted,
                 companion_tauri::commands::voice_call_state,
+                companion_tauri::commands::settings_view,
+                companion_tauri::commands::settings_devices_refresh,
+                companion_tauri::commands::settings_device_share,
             ]);
         let app = companion_tauri::terminal::install(
             builder,

@@ -35,9 +35,11 @@ use kr_controller::testing::HeldTimer;
 use kr_crypto::keys::{AuthorisationKeyPair, DeviceKeys};
 use kr_crypto::sign::{SigningTranscript, sign};
 use kr_crypto::store::{MemoryStore, SecretStore, store_device_keys};
-use kr_protocol::ids::{EnvironmentId, SessionId};
+use kr_protocol::ids::{DeviceId, EnvironmentId, GrantId, SessionId};
+use kr_protocol::pairing::DevicePublicKeys;
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{AuthorisationKey, Signature64};
+use kr_protocol::scalars::{AuthorisationKey, Nullable, Signature64, TimestampMs, Uuid};
+use kr_protocol::sharing::{DeviceListResult, DeviceSummary};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_service_stand_in::{Moment, Served, serve};
 use net_support::{Device, Host, pair_with, proposal};
@@ -153,6 +155,73 @@ impl Hosts for NoHosts {
     }
 }
 
+/// What settings sync asks of hosts when two owner devices are listed: this computer and the phone,
+/// each with its keys and the right to manage the host, as a host lists a device the person owns.
+struct ListsOwners {
+    list: DeviceListResult,
+}
+
+impl ListsOwners {
+    fn of(this: &DeviceKeys, phone: &DeviceKeys) -> Self {
+        let owner_device = |number: u8, name: &str, keys: &DeviceKeys| DeviceSummary {
+            device_id: DeviceId::new(Uuid::from_bytes([number; 16])),
+            display_name: name.to_owned(),
+            grant_id: GrantId::new(Uuid::from_bytes([0x90; 16])),
+            paired_at_ms: TimestampMs::new(1),
+            revoked: false,
+            keys: Nullable::some(DevicePublicKeys {
+                transport: *keys.transport.public(),
+                authorisation: *keys.authorisation.public(),
+                stored_envelope: *keys.stored_envelope.public(),
+                notification_preview: *keys.notification_preview.public(),
+            }),
+            manages_host: true,
+            platform: kr_protocol::pairing::DevicePlatform::Macos,
+            grant_expires_at_ms: Nullable::null(),
+            grant_expired: false,
+            all_sessions: true,
+        };
+        Self {
+            list: DeviceListResult {
+                devices: vec![
+                    owner_device(1, "this-mac", this),
+                    owner_device(2, "the-phone", phone),
+                ],
+                authority_revision: kr_protocol::ids::AuthorityRevision::new(1),
+                feed_synchronised_at_ms: Nullable::null(),
+                feed_stale: false,
+                feed_removed: false,
+            },
+        }
+    }
+}
+
+impl Hosts for ListsOwners {
+    fn device_lists(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HostLists> + Send + '_>> {
+        Box::pin(std::future::ready(HostLists {
+            lists: vec![self.list.clone()],
+            silent: false,
+            refused: false,
+        }))
+    }
+
+    fn holds(
+        &self,
+        session: SessionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Holds> + Send + '_>> {
+        NoHosts.holds(session)
+    }
+
+    fn privacy(
+        &self,
+        environment: EnvironmentId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HostPrivacy> + Send + '_>> {
+        NoHosts.privacy(environment)
+    }
+}
+
 /// Whether any file under `directory` holds `needle`.
 fn somewhere_in(directory: &std::path::Path, needle: &[u8]) -> bool {
     std::fs::read_dir(directory)
@@ -179,6 +248,8 @@ struct Rig {
     ceremony: Arc<Scripted>,
     app: Companion,
     data: tempfile::TempDir,
+    /// The keys this computer holds, which a restart keeps.
+    secrets: Arc<dyn SecretStore>,
     /// The device the host paired, which is the one that is revoked.
     phone: Device,
 }
@@ -204,7 +275,7 @@ impl Rig {
         let ceremony = Scripted::new(CeremonyOutcome::Confirmed);
         let app = Companion::start(
             data.path(),
-            support::parts(secrets, Arc::new(host.room.clone())),
+            support::parts(Arc::clone(&secrets), Arc::new(host.room.clone())),
             Arc::clone(&ceremony) as Arc<dyn Ceremony>,
             StubPaste::holding("", false),
         );
@@ -217,6 +288,7 @@ impl Rig {
             ceremony,
             app,
             data,
+            secrets,
             phone,
         };
         rig.sync_service_is(rig.served.origin());
@@ -224,6 +296,38 @@ impl Rig {
         // connection admitted while one runs is withdrawn when it finishes.
         rig.host_polls().await;
         rig
+    }
+
+    /// This computer's application is closed and opened again over the records it kept.
+    async fn restarted(self) -> Self {
+        let Self {
+            host,
+            served,
+            owner,
+            ceremony,
+            app,
+            data,
+            secrets,
+            phone,
+        } = self;
+        drop(app);
+        let app = Companion::start(
+            data.path(),
+            support::parts(Arc::clone(&secrets), Arc::new(host.room.clone())),
+            Arc::clone(&ceremony) as Arc<dyn Ceremony>,
+            StubPaste::holding("", false),
+        );
+        companion_tauri::start_sync_service(app.app.handle(), data.path());
+        Self {
+            host,
+            served,
+            owner,
+            ceremony,
+            app,
+            data,
+            secrets,
+            phone,
+        }
     }
 
     /// The host pairs one more device, which is not the one `phone` names.
@@ -260,6 +364,55 @@ impl Rig {
             Arc::clone(&self.ceremony) as Arc<dyn Ceremony>,
         )
         .expect("settings sync opens");
+    }
+
+    /// Settings sync starts on this computer over hosts that list it and the phone as the owner's
+    /// devices, and is not turned on.
+    fn start_settings_sync_listing_the_phone(&self) {
+        let device = self.app.device();
+        let hosts = ListsOwners::of(&device.identity().keys, self.phone.keys());
+        companion_tauri::start_settings_sync(
+            self.app.app.handle(),
+            device.identity(),
+            Arc::new(hosts),
+            Arc::clone(&self.ceremony) as Arc<dyn Ceremony>,
+        )
+        .expect("settings sync opens");
+    }
+
+    /// This computer shares its settings with the phone: the hosts list it, and the person
+    /// confirmed here.
+    async fn sharing_with_the_phone(&self) {
+        self.start_settings_sync_listing_the_phone();
+        self.app
+            .app
+            .state::<AppState>()
+            .settings()
+            .expect("settings are open")
+            .sync_turn_on()
+            .await
+            .expect("settings sync is on");
+        let devices = self.devices();
+        let candidate = devices["candidates"][0]["reference"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the phone is offered: {devices}"))
+            .to_owned();
+        self.app
+            .call("settings_device_share", json!({ "reference": candidate }))
+            .expect("the person shares with the phone");
+        let members = self.devices()["members"]
+            .as_array()
+            .expect("members")
+            .len();
+        assert_eq!(members, 2, "the phone holds the key now");
+    }
+
+    /// The devices that share this computer's settings, after the hosts are asked.
+    fn devices(&self) -> Value {
+        self.app
+            .call("settings_devices_refresh", json!({}))
+            .expect("the settings view")["sync"]["devices"]
+            .clone()
     }
 
     /// This computer takes part in settings sync, over a collection of its own.
@@ -612,6 +765,7 @@ async fn a_host_that_does_not_answer_is_revoked_on_through_its_feed_from_the_lis
         app,
         data,
         phone: _phone,
+        secrets: _,
     } = rig;
     daemon.stop().await;
 
@@ -887,6 +1041,12 @@ async fn a_revocation_whose_hold_on_settings_sync_cannot_be_written_down_is_not_
 /// Revokes the phone on the feed host with the service answering the publication "stored, and I
 /// cannot say whether it took effect", and says what the call answered.
 async fn revoke_with_the_outcome_unknown(rig: &Rig) -> Value {
+    revoke_with_the_publication(rig, Moment::ActedAndUnknown).await
+}
+
+/// Revokes the phone on the feed host with the service meeting the publication as `moment` says,
+/// and says what the call answered.
+async fn revoke_with_the_publication(rig: &Rig, moment: Moment) -> Value {
     let view = rig.view().await;
     let host = host_by(&view, "feed");
     let phone = the_phone(&host);
@@ -898,15 +1058,15 @@ async fn revoke_with_the_outcome_unknown(rig: &Rig) -> Value {
         .expect("the dialog is shown");
     // The host has read its feed by now, so the next request to the feed is the publication.
     rig.host_polls().await;
-    rig.served.web().fail(AUTHORITY, 1, Moment::ActedAndUnknown);
+    rig.served.web().fail(AUTHORITY, 1, moment);
     release.notify_one();
 
     let lost = tokio::time::timeout(WATCHDOG, call)
         .await
         .expect("the call ends")
         .expect("the call ends")
-        .expect_err("the service could not say whether it took effect");
-    assert_eq!(rig.publications(), 1, "the service stored the request");
+        .expect_err("the publication failed");
+    assert_eq!(rig.publications(), 1, "the publication reached the service");
     lost
 }
 
@@ -1704,4 +1864,179 @@ async fn a_view_over_a_copy_of_a_connection_that_was_replaced_still_lists_the_ho
         companion_tauri::revocation::Contact::Answered,
         "a connection that ended says nothing of the host"
     );
+}
+
+/// The feed's service refuses everything addressed to it, as one does that is out of reach.
+fn the_feed_cannot_be_read(rig: &Rig) {
+    for nth in 1..=40 {
+        rig.served.web().fail(
+            AUTHORITY,
+            nth,
+            Moment::Refuse {
+                status: 503,
+                code: "SERVICE_UNAVAILABLE",
+                retry_after_seconds: None,
+            },
+        );
+    }
+}
+
+/// Settings sync has taken the phone out of the shared settings, as it does for a device a
+/// revocation request names.
+async fn the_phone_is_taken_out(rig: &Rig) {
+    tokio::time::timeout(WATCHDOG, async {
+        while rig.devices()["members"].as_array().map(Vec::len) != Some(1) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the phone is taken out of the shared settings");
+}
+
+/// The reference the sheet names the device taken out by a revoke with, when it names one.
+fn the_device_held_out(devices: &Value) -> String {
+    let held = devices["held_out"].as_array().expect("held out");
+    assert_eq!(held.len(), 1, "one device is named as taken out: {devices}");
+    held[0]["reference"]
+        .as_str()
+        .expect("a reference")
+        .to_owned()
+}
+
+/// A person asks to share the settings with the device again.
+fn share_again(rig: &Rig, reference: &str) -> Result<Value, Value> {
+    rig.app
+        .call("settings_device_share", json!({ "reference": reference }))
+}
+
+/// A request this computer put in a host's feed, that the host has not acted on, can still revoke
+/// the device: sharing the settings with the device again is not offered across a restart, and
+/// not while the feed cannot be read to say the request is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_whose_request_waits_in_a_feed_is_not_shared_with_again_after_a_restart() {
+    let rig = Rig::start().await;
+    rig.sharing_with_the_phone().await;
+    let host = host_by(&rig.view().await, "feed");
+    rig.revoke(
+        host["reference"].as_str().expect("a reference"),
+        the_phone(&host)["reference"].as_str().expect("a reference"),
+    )
+    .expect("the request is published");
+    the_phone_is_taken_out(&rig).await;
+
+    let rig = rig.restarted().await;
+    rig.start_settings_sync_listing_the_phone();
+    the_feed_cannot_be_read(&rig);
+    let devices = rig.devices();
+    let reference = the_device_held_out(&devices);
+    share_again(&rig, &reference)
+        .expect_err("a device a request may still revoke is not shared with");
+    assert!(
+        rig.ceremony
+            .reasons()
+            .iter()
+            .all(|reason| !reason.contains("again")),
+        "nobody is asked to confirm it: {:?}",
+        rig.ceremony.reasons()
+    );
+    assert_eq!(
+        rig.devices()["members"].as_array().map(Vec::len),
+        Some(1),
+        "the phone holds no key"
+    );
+    assert_eq!(
+        devices["held_out"][0]["waiting"], true,
+        "the sheet says a revoke waits for its host: {devices}"
+    );
+}
+
+/// A request the service stored and could not say it took effect is in a feed that no read has
+/// since been able to show: the device stays off the sheet's offers until one does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_whose_outcome_is_unknown_keeps_its_device_from_being_shared_with_again() {
+    let rig = Rig::start().await;
+    rig.sharing_with_the_phone().await;
+    revoke_with_the_outcome_unknown(&rig).await;
+    the_phone_is_taken_out(&rig).await;
+
+    the_feed_cannot_be_read(&rig);
+    let devices = rig.devices();
+    let reference = the_device_held_out(&devices);
+    share_again(&rig, &reference)
+        .expect_err("a device a request may still revoke is not shared with");
+    assert_eq!(
+        rig.devices()["members"].as_array().map(Vec::len),
+        Some(1),
+        "the phone holds no key"
+    );
+    assert_eq!(devices["held_out"][0]["waiting"], true, "{devices}");
+}
+
+/// A request that never reached the feed does not keep its device from being shared with again
+/// once a read of the feed shows nothing there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_no_feed_holds_is_let_go_when_the_feed_is_read() {
+    let rig = Rig::start().await;
+    rig.sharing_with_the_phone().await;
+    revoke_with_the_publication(
+        &rig,
+        Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: None,
+        },
+    )
+    .await;
+    the_phone_is_taken_out(&rig).await;
+
+    let reference = the_device_held_out(&rig.devices());
+    share_again(&rig, &reference).expect("the feed holds no request, so the person may share again");
+    assert_eq!(
+        rig.devices()["members"].as_array().map(Vec::len),
+        Some(2),
+        "the phone holds the key again"
+    );
+    assert!(
+        rig.ceremony
+            .reasons()
+            .contains(&"Share your settings with the-phone again".to_owned()),
+        "{:?}",
+        rig.ceremony.reasons()
+    );
+}
+
+/// A look at the hosts that began before a request was sent cannot say the request is not there,
+/// however late it ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_look_that_began_before_a_request_was_sent_does_not_let_its_device_go() {
+    let rig = Rig::start().await;
+    rig.sharing_with_the_phone().await;
+    let host = host_by(&rig.view().await, "feed");
+    // The next read of the feed is answered from what the feed holds now, which is no request, and
+    // reaches this computer only when the test lets it.
+    rig.served.web().fail(AUTHORITY, 1, Moment::Slow);
+    let asked_before = rig.served.web().requests_to(AUTHORITY);
+    let earlier_look = rig.app.start_call("revocation_view", json!({}));
+    rig.served
+        .web()
+        .requests_reach(AUTHORITY, asked_before + 1)
+        .await;
+    rig.revoke(
+        host["reference"].as_str().expect("a reference"),
+        the_phone(&host)["reference"].as_str().expect("a reference"),
+    )
+    .expect("the request is published");
+    rig.served.web().release_held();
+    tokio::time::timeout(WATCHDOG, earlier_look)
+        .await
+        .expect("the earlier look ends")
+        .expect("the earlier look ends")
+        .expect("the earlier look is answered");
+    the_phone_is_taken_out(&rig).await;
+
+    let devices = rig.devices();
+    let reference = the_device_held_out(&devices);
+    share_again(&rig, &reference)
+        .expect_err("a device a request may still revoke is not shared with");
+    assert_eq!(devices["held_out"][0]["waiting"], true, "{devices}");
 }
