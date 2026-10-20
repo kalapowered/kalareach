@@ -1856,6 +1856,22 @@ pub fn end_session(host: &Host, session_id: SessionId) {
         .expect("the session is closed");
 }
 
+/// Fails the launch of a session made by [`an_open_session`], as the registry records a launch that
+/// never produced a running worker.
+pub fn fail_session(host: &Host, session_id: SessionId) {
+    use kr_controller::registry::{LaunchPhase, Registry};
+
+    let mut registry = Registry::open(host.registry_database(), host.environment_id)
+        .expect("the registry opens beside the daemon's own handle");
+    let reservation = registry
+        .reservation_for_session(session_id)
+        .expect("readable")
+        .expect("the session is reserved");
+    registry
+        .set_phase(reservation.reservation_id, LaunchPhase::Failed)
+        .expect("the launch is failed");
+}
+
 /// Shares `session_id` with the device `record` names as an owner of it, as the person at this
 /// machine does, and has that device redeem it on a connection of its own, which is returned.
 pub async fn owned_by(

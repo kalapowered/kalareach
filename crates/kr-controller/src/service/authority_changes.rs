@@ -1222,6 +1222,13 @@ impl Controller {
             allowed?;
         }
         let pairing = self.check_recipient_pairing(caller, &request)?;
+        // An invitation for a session that is not open is one nobody can use. This is asked before
+        // the session's worker is, so a session that has closed is refused as closed whatever the
+        // share names, and again below under the registry's lock, where a closure that lands in
+        // between is found.
+        let registry = self.registry.lock().await;
+        require_open_session(&registry, params.session_id)?;
+        drop(registry);
         let named = self
             .named_previews(params.session_id, &params.selection)
             .await?;
@@ -1243,6 +1250,7 @@ impl Controller {
         self.check_admission(&registry, &carried)?;
         let result = self.sharing.share(&request, || {
             self.check_admission(&registry, &carried)?;
+            require_open_session(&registry, request.session_id)?;
             self.recipient_still_paired(caller, request.recipient_device_id, &pairing)
         });
         drop(registry);
@@ -2406,6 +2414,37 @@ fn recipient_refusal(delegating: bool, detail: &str) -> ControllerError {
     }
 }
 
+/// Whether a session's reservation is for a session that is open: neither closed nor failed.
+fn reservation_is_open(reservation: &crate::registry::Reservation) -> bool {
+    !matches!(
+        reservation.phase,
+        crate::registry::LaunchPhase::Closed | crate::registry::LaunchPhase::Failed
+    )
+}
+
+/// Refuses a request that needs `session_id` open when it is not.
+///
+/// A session that ran and has closed is refused as closed. One this host has no reservation for,
+/// and one whose launch failed and so never ran, is refused as unknown.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::SessionClosed`] or [`ControllerError::UnknownSession`] for a session
+/// that is not open, and a registry error when the reservation cannot be read.
+fn require_open_session(registry: &crate::registry::Registry, session_id: SessionId) -> Result<()> {
+    match registry.reservation_for_session(session_id)? {
+        Some(reservation) if reservation_is_open(&reservation) => Ok(()),
+        Some(reservation) if matches!(reservation.phase, crate::registry::LaunchPhase::Closed) => {
+            Err(ControllerError::SessionClosed {
+                session: session_id.to_string(),
+            })
+        }
+        Some(_) | None => Err(ControllerError::UnknownSession {
+            session: session_id.to_string(),
+        }),
+    }
+}
+
 /// A span in words a person reads in a refusal: whole days, hours or minutes, rounded down.
 fn how_long(ms: u64) -> String {
     let minutes = ms / 60_000;
@@ -2922,12 +2961,7 @@ fn open_number(
 ) -> Result<Option<kr_protocol::session::DisplayNumber>> {
     Ok(registry
         .reservation_for_session(session_id)?
-        .filter(|reservation| {
-            !matches!(
-                reservation.phase,
-                crate::registry::LaunchPhase::Closed | crate::registry::LaunchPhase::Failed
-            )
-        })
+        .filter(reservation_is_open)
         .map(|reservation| reservation.display_number))
 }
 

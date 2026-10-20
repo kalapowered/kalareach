@@ -367,7 +367,7 @@ pub(super) async fn fake_world_on(
     clocks: Option<crate::service::Clocks>,
     serve: impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()>,
 ) -> Silent {
-    fake_world_with(clocks, false, serve).await
+    fake_world_with(clocks, false, false, serve).await
 }
 
 /// The same world with the worker on the daemon's record as one its publisher sends no statement
@@ -377,12 +377,43 @@ pub(super) async fn fake_world_on(
 pub(super) async fn fake_world_reached(
     serve: impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()>,
 ) -> Silent {
-    fake_world_with(None, true, serve).await
+    fake_world_with(None, true, false, serve).await
+}
+
+/// The same world with the worker's session held open in the daemon's registry, as every session a
+/// daemon creates is. What a share of a session depends on that: a session the registry does not
+/// hold open is not one the host shares.
+pub(super) async fn fake_world_open(
+    serve: impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()>,
+) -> Silent {
+    fake_world_with(None, false, true, serve).await
+}
+
+/// Reserves a session in `controller`'s registry and opens it, and returns its identity.
+pub(super) async fn open_session(controller: &Controller) -> SessionId {
+    let mut registry = controller.registry.lock().await;
+    let admitted = registry
+        .reserve(
+            &kr_protocol::ids::ActorId::new("local:test").expect("a principal"),
+            kr_ipc::new_uuid(),
+            kr_protocol::scalars::Digest256::from_bytes([0x5e; 32]),
+            &[0xa0],
+            kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+        )
+        .expect("the session is reserved");
+    registry
+        .set_phase(
+            admitted.reservation.reservation_id,
+            crate::registry::LaunchPhase::Live,
+        )
+        .expect("the session is live");
+    admitted.reservation.session_id
 }
 
 async fn fake_world_with(
     clocks: Option<crate::service::Clocks>,
     reached: bool,
+    open: bool,
     serve: impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()>,
 ) -> Silent {
     let temp = kr_ipc::testing::TempHost::create();
@@ -394,7 +425,11 @@ async fn fake_world_with(
     }
     .expect("the daemon starts");
 
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = if open {
+        open_session(&controller).await
+    } else {
+        SessionId::new(kr_ipc::new_uuid())
+    };
     let worker_endpoint = environment
         .worker_endpoint(DisplayNumber::new(1))
         .expect("an endpoint");

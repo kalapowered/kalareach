@@ -4220,6 +4220,7 @@ fn share_params(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart() {
     let host = Serving::start().await;
+    let session = open_session(&host);
     host.controller
         .devices()
         .commit(&paired_record(device_id(0xf3)))
@@ -4230,8 +4231,8 @@ async fn a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_a
         .compose(
             Method::GrantCreate,
             action_id,
-            shared_session(host.temp.environment_id(), session_id(0xa1)),
-            &share_params(session_id(0xa1), device_id(0xf3), None),
+            shared_session(host.temp.environment_id(), session),
+            &share_params(session, device_id(0xf3), None),
         )
         .await
         .expect("the share is composed");
@@ -4850,6 +4851,7 @@ async fn an_unfinished_key_registration_is_not_answered_with_another_actions_reg
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delegation_is_not_refused_as_expired_on_a_reading_this_host_could_not_write() {
     let host = Serving::start().await;
+    let session = open_session(&host);
     let host_device = DeviceId::new(host.temp.environment_id().get());
     let now_ms = kr_ipc::now_ms().get();
     let parent = Grant {
@@ -4859,7 +4861,7 @@ async fn a_delegation_is_not_refused_as_expired_on_a_reading_this_host_could_not
             environment_ids: [host.temp.environment_id()].into_iter().collect(),
         },
         session_selector: SessionSelector::These {
-            session_ids: [session_id(0xa1)].into_iter().collect(),
+            session_ids: [session].into_iter().collect(),
         },
         history: HistoryScope {
             lower_bound_ms: Nullable::some(TimestampMs::new(now_ms - 2 * 60 * 60 * 1000)),
@@ -4883,7 +4885,7 @@ async fn a_delegation_is_not_refused_as_expired_on_a_reading_this_host_could_not
             &GrantRecord {
                 issued_at_ms: now_ms - 2 * 60 * 60 * 1000,
                 activated_at_ms: Some(now_ms - 2 * 60 * 60 * 1000),
-                session_id: Some(session_id(0xa1)),
+                session_id: Some(session),
                 ..record(parent.clone())
             },
             || Ok(()),
@@ -4912,8 +4914,8 @@ async fn a_delegation_is_not_refused_as_expired_on_a_reading_this_host_could_not
         .mutate(
             Method::GrantCreate,
             kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x65; 16])),
-            shared_session(host.temp.environment_id(), session_id(0xa1)),
-            &share_params(session_id(0xa1), device_id(0xf3), Some(parent.grant_id)),
+            shared_session(host.temp.environment_id(), session),
+            &share_params(session, device_id(0xf3), Some(parent.grant_id)),
         )
         .await
         .expect("the daemon answers")
@@ -4926,6 +4928,30 @@ async fn a_delegation_is_not_refused_as_expired_on_a_reading_this_host_could_not
     registry
         .execute_batch("DROP TRIGGER refuse_policy;")
         .expect("the fault is cleared");
+}
+
+/// A session this host's registry holds as open, with no worker behind it: what a share is about.
+fn open_session(host: &Serving) -> SessionId {
+    use kr_controller::registry::{LaunchPhase, Registry};
+
+    let mut registry = Registry::open(
+        host.temp.environment().registry_database(),
+        host.temp.environment_id(),
+    )
+    .expect("the registry opens beside the daemon's own handle");
+    let admitted = registry
+        .reserve(
+            &kr_protocol::ids::ActorId::new("local:501").expect("an actor"),
+            kr_ipc::new_uuid(),
+            kr_protocol::scalars::Digest256::from_bytes([0x5e; 32]),
+            &[0xa0],
+            TimestampMs::new(kr_ipc::now_ms().get()),
+        )
+        .expect("the session is reserved");
+    registry
+        .set_phase(admitted.reservation.reservation_id, LaunchPhase::Live)
+        .expect("the session is live");
+    admitted.reservation.session_id
 }
 
 /// A paired device's record, as this host commits one when a pairing completes.

@@ -347,7 +347,7 @@ pub(super) async fn world(
     stated: CanonicalSet<CapabilityId>,
 ) -> (fake::Silent, Arc<Mutex<Holding>>) {
     let holding = Arc::new(Mutex::new(holding));
-    let world = fake::fake_world(serving(Arc::clone(&holding), stated)).await;
+    let world = fake::fake_world_open(serving(Arc::clone(&holding), stated)).await;
     fake::acknowledged(&world.controller, world.session_id);
     // The device a test shares with is one this host pairs with, for a day, as a share to any other
     // is refused.
@@ -1512,9 +1512,10 @@ async fn kr_req_10_51_a_share_whose_worker_cannot_be_asked_is_not_decided() {
     let again = refusal_of(shared(&world, &mutation).await);
     assert_eq!(again.code, ErrorCode::OutcomeUnknown, "{again:?}");
 
+    // A session the registry holds open and no worker is known for: the worker lookup refuses it.
     let elsewhere = share(
         world.environment_id,
-        SessionId::new(kr_ipc::new_uuid()),
+        fake::open_session(&world.controller).await,
         0x52,
         naming(5_000, &[question_id(0x74)], &[]),
     );
@@ -2199,7 +2200,7 @@ impl Served {
         let controller = crate::service::Controller::start(fake::setup(&temp))
             .await
             .expect("the daemon starts");
-        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let session_id = fake::open_session(&controller).await;
         let identity = Arc::new(
             WorkerIdentity::generate(
                 session_id,

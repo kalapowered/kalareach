@@ -4,7 +4,8 @@
 //! what is offered to the device that asks and the shares it holds, and tells no device anything
 //! about another's. What these demonstrate: KR-REQ-25.10 (single-use, expiring invitations: an
 //! invitation that is redeemed, withdrawn or run out is no longer offered) and KR-REQ-18.03 (a
-//! scoped invitation is told to the device it names and to no other). Nothing here starts a
+//! scoped invitation is told to the device it names and to no other), and KR-REQ-18.12 (the owner is
+//! refused an invitation for a session that is not open before it exists). Nothing here starts a
 //! worker, so every answer is the daemon's own; a session is a reservation its registry holds as
 //! open.
 
@@ -12,15 +13,16 @@ mod net_support;
 
 use kr_controller::sharing::ShareRequest;
 use kr_crypto::keys::DeviceKeys;
-use kr_protocol::ids::{ActionId, DeviceId, GrantId, InvitationId, SessionId};
+use kr_protocol::error::ErrorCode;
+use kr_protocol::ids::{ActionId, DeviceId, GrantId, InvitationId, QuestionId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::sharing::{
-    AuthorityNotice, GrantCreateResult, GrantHeldParams, GrantHeldResult, GrantRedeemParams,
-    GrantRevokeParams, OfferKey, RoleSelection, SessionRole, ShareKey,
+    AuthorityNotice, GrantCreateParams, GrantCreateResult, GrantHeldParams, GrantHeldResult,
+    GrantRedeemParams, GrantRevokeParams, OfferKey, RoleSelection, SessionRole, ShareKey,
 };
 use net_support::{
-    Host, MovedWall, RawDevice, an_open_session, end_session, on_the_host, recipient,
+    Host, MovedWall, RawDevice, an_open_session, end_session, fail_session, on_the_host, recipient,
     recipient_ending_in, share_with,
 };
 use std::time::Duration;
@@ -292,6 +294,151 @@ async fn kr_req_25_10_a_closed_sessions_offers_and_shares_are_not_told() {
         "a closed session is not told of: {after:?}"
     );
     connection.close();
+    host.stop().await;
+}
+
+/// KR-REQ-18.12: the owner is refused an invitation for a session that has closed, as closed, even
+/// when it names a question only the session's worker could preview; and for one that never ran or
+/// whose launch failed, as unknown, before the invitation exists: nothing is written for any of
+/// them, and the same share of an open session is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_18_12_a_session_that_is_not_open_is_refused_before_an_invitation_exists() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (_device, record) = recipient(&host, &owner).await;
+    let offers = || {
+        host.controller()
+            .sharing()
+            .grants()
+            .offers_after(record.device_id, None, 16)
+            .expect("the offers are read")
+            .len()
+    };
+    let (closed, _) = an_open_session(&host);
+    end_session(&host, closed);
+    let (failed, _) = an_open_session(&host);
+    fail_session(&host, failed);
+    let (open, _) = an_open_session(&host);
+    let never_ran = SessionId::new(kr_ipc::new_uuid());
+    let names_a_question = RoleSelection {
+        named_questions: [QuestionId::new(kr_ipc::new_uuid())].into_iter().collect(),
+        ..RoleSelection::plain(SessionRole::Viewer)
+    };
+
+    for (session_id, selection, refusal) in [
+        (
+            closed,
+            RoleSelection::plain(SessionRole::Viewer),
+            ErrorCode::SessionClosed,
+        ),
+        (closed, names_a_question, ErrorCode::SessionClosed),
+        (
+            failed,
+            RoleSelection::plain(SessionRole::Viewer),
+            ErrorCode::UnknownSession,
+        ),
+        (
+            never_ran,
+            RoleSelection::plain(SessionRole::Viewer),
+            ErrorCode::UnknownSession,
+        ),
+    ] {
+        let refused = share_with(&host, session_id, record.device_id, selection, None)
+            .await
+            .expect_err("a session that is not open is not shared");
+        assert_eq!(refused.code, refusal, "{refused:?}");
+    }
+    assert_eq!(offers(), 0, "no invitation was written");
+
+    share(&host, open, record.device_id).await;
+    assert_eq!(offers(), 1, "an open session is shared");
+    host.stop().await;
+}
+
+/// KR-REQ-18.12: the check where the share is written reads the session's reservation again. The
+/// request found the session open, is held before its transaction, and the session is recorded as
+/// closed while it is held: the write refuses it as closed and no invitation is written. The
+/// control is the same request released with the session still open, which is written. (The
+/// closure is recorded through a second handle of the registry, as `end_session` does; a daemon
+/// records one under its registry's lock, which this request holds from its second look to the
+/// write, so what the check covers is a closure recorded between the first look and the second.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_18_12_a_session_that_closes_while_the_share_waits_takes_no_invitation() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (_device, record) = recipient(&host, &owner).await;
+    let offers = || {
+        host.controller()
+            .sharing()
+            .grants()
+            .offers_after(record.device_id, None, 16)
+            .expect("the offers are read")
+            .len()
+    };
+    let held_share = |session_id: SessionId, mut client: kr_ipc::client::LocalClient| {
+        let target = net_support::on_the_session(&host, session_id);
+        let selection = RoleSelection::plain(SessionRole::Viewer);
+        let params = GrantCreateParams {
+            session_id,
+            recipient_device_id: record.device_id,
+            parent_grant_id: Nullable::null(),
+            accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+            selection,
+            lifetime_ms: Nullable::null(),
+            owner_confirmation: Nullable::null(),
+        };
+        tokio::spawn(async move {
+            client
+                .mutate(
+                    Method::GrantCreate,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    target,
+                    &params,
+                )
+                .await
+                .expect("the call reaches the daemon")
+        })
+    };
+    let at_the_store = || {
+        let (arrived, go) = host.controller().sharing().grants().pause_before_effect();
+        let arrived =
+            tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(60)));
+        (arrived, go)
+    };
+
+    let (standing, _) = an_open_session(&host);
+    let (arrived, go) = at_the_store();
+    let request = held_share(standing, host.client().await);
+    arrived
+        .await
+        .expect("the wait ran")
+        .expect("the request is held at the store");
+    go.send(()).expect("the request is let go");
+    request
+        .await
+        .expect("the request ran")
+        .expect("a session that is still open takes the share");
+    assert_eq!(offers(), 1);
+
+    let (ending, _) = an_open_session(&host);
+    let (arrived, go) = at_the_store();
+    let request = held_share(ending, host.client().await);
+    arrived
+        .await
+        .expect("the wait ran")
+        .expect("the request is held at the store");
+    end_session(&host, ending);
+    go.send(()).expect("the request is let go");
+    let refused = request
+        .await
+        .expect("the request ran")
+        .expect_err("a session that closed while the request waited takes no invitation");
+    assert_eq!(refused.code, ErrorCode::SessionClosed, "{refused:?}");
+    assert_eq!(
+        offers(),
+        1,
+        "no invitation was written for the closed session"
+    );
     host.stop().await;
 }
 
