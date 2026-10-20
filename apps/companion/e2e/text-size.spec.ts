@@ -1266,6 +1266,20 @@ test.describe('a passing message that comes while a sheet is open', () => {
       // Focus is where it was: the message does not take it.
       expect(await page.evaluate(() => `${document.activeElement?.tagName ?? ''}.${document.activeElement?.className ?? ''} ${document.activeElement?.getAttribute('aria-label') ?? ''}`)).toBe(before)
       await expect(toast.locator(':focus')).toHaveCount(0)
+      // A screen reader inside the dialog hears the region that is in it, so the words are said
+      // there and not in the page's region behind it.
+      const heard = await page.evaluate(() => {
+        const dialog = document.querySelector('[role="dialog"]')
+        const regions = Array.from(document.querySelectorAll('[data-announcements]'))
+        const said = (region: Element): string[] =>
+          Array.from(region.querySelectorAll('p')).map((paragraph) => paragraph.textContent ?? '')
+        return {
+          inside: regions.filter((region) => dialog?.contains(region)).flatMap(said),
+          outside: regions.filter((region) => !dialog?.contains(region)).flatMap(said)
+        }
+      })
+      expect(heard.inside.join(' '), 'said in the dialog’s own region').toContain('needs your confirmation')
+      expect(heard.outside.join(' '), 'and not outside it').not.toContain('needs your confirmation')
       // After the body, in the order of the document.
       expect(
         await page.evaluate(() => {

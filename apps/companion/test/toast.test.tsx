@@ -8,9 +8,11 @@
  */
 
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import type { ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { Toast, type ToastMessage } from '../src/components/ui'
+import { AnnouncementScope, Announcer } from '../src/components/announcements'
+import { Sheet, Toast, type ToastMessage } from '../src/components/ui'
 import {
   offerToastDock,
   toastDwell,
@@ -20,8 +22,16 @@ import {
   TOAST_LETTERS_PER_WORD,
   TOAST_WORD_MS
 } from '../src/components/toast'
+import { addedTo, heardIn, regionsOf, watched } from './live-regions'
 
 const MESSAGE: ToastMessage = { id: 1, text: 'A message that is read in passing.', tone: 'success' }
+
+/** The card a message is drawn in. */
+function cardOf(message: ToastMessage): HTMLElement {
+  const card = screen.getByText(message.text).closest<HTMLElement>('.toast')
+  if (card === null) throw new Error('the message is not in a card')
+  return card
+}
 
 /** Makes every box report `scrollHeight` of content in a box `clientHeight` tall. */
 function measuring(scrollHeight: number, clientHeight: number): void {
@@ -125,7 +135,7 @@ describe('where a message is drawn', () => {
 
     let take: () => void = () => undefined
     act(() => {
-      take = offerToastDock(dock)
+      take = offerToastDock(dock, new Announcer())
     })
     expect(within(dock).getByText(MESSAGE.text)).toBeTruthy()
     expect(within(dock).getByRole('button', { name: 'Dismiss' })).toBeTruthy()
@@ -147,7 +157,7 @@ describe('where a message is drawn', () => {
     const dock = dockInDocument()
     let take: () => void = () => undefined
     act(() => {
-      take = offerToastDock(dock)
+      take = offerToastDock(dock, new Announcer())
     })
     act(() => {
       vi.advanceTimersByTime(500)
@@ -167,12 +177,12 @@ describe('where a message is drawn', () => {
   it('does not take the focus when it moves into a surface, and a pointer that was on it does not hold it there', () => {
     const dismissed = vi.fn()
     render(<Toast message={MESSAGE} onDismiss={dismissed} />)
-    fireEvent.pointerEnter(screen.getByRole('status'))
+    fireEvent.pointerEnter(cardOf(MESSAGE))
     const before = document.activeElement
     const dock = dockInDocument()
     let take: () => void = () => undefined
     act(() => {
-      take = offerToastDock(dock)
+      take = offerToastDock(dock, new Announcer())
     })
     expect(document.activeElement).toBe(before)
     // The pointer was on the card the message was drawn in before; this one is another, and the pointer
@@ -192,11 +202,11 @@ describe('where a message is drawn', () => {
     render(<Toast message={MESSAGE} onDismiss={dismissed} />)
     // The pointer rests on the message where it was first drawn, and a surface opens over it and
     // goes again without the pointer crossing the card in it.
-    fireEvent.pointerEnter(screen.getByRole('status'))
+    fireEvent.pointerEnter(cardOf(MESSAGE))
     const dock = dockInDocument()
     let take: () => void = () => undefined
     act(() => {
-      take = offerToastDock(dock)
+      take = offerToastDock(dock, new Announcer())
     })
     act(() => {
       take()
@@ -282,7 +292,7 @@ describe('where a message is drawn', () => {
     // The dialog opens over it and the message moves into it.
     let take: () => void = () => undefined
     act(() => {
-      take = offerToastDock(dock)
+      take = offerToastDock(dock, new Announcer())
     })
     inside.focus()
     const dismissInDialog = within(dock).getByRole('button', { name: 'Dismiss' })
@@ -312,7 +322,7 @@ describe('where a message is drawn', () => {
     render(<Toast message={MESSAGE} onDismiss={() => undefined} />)
     let take: () => void = () => undefined
     act(() => {
-      take = offerToastDock(dock)
+      take = offerToastDock(dock, new Announcer())
     })
     const dismiss = within(dock).getByRole('button', { name: 'Dismiss' })
     // It came to the message from nowhere (a press that had focus on nothing), and has it now.
@@ -340,7 +350,7 @@ describe('where a message is drawn', () => {
     render(<Toast message={MESSAGE} onDismiss={() => undefined} />)
     let take: () => void = () => undefined
     act(() => {
-      take = offerToastDock(dock)
+      take = offerToastDock(dock, new Announcer())
     })
     const dismiss = within(dock).getByRole('button', { name: 'Dismiss' })
     origin.focus()
@@ -371,7 +381,7 @@ describe('where a message is drawn', () => {
     render(<Toast message={MESSAGE} onDismiss={() => undefined} />)
     let take: () => void = () => undefined
     act(() => {
-      take = offerToastDock(dock)
+      take = offerToastDock(dock, new Announcer())
     })
     const dismiss = within(dock).getByRole('button', { name: 'Dismiss' })
     origin.focus()
@@ -389,5 +399,131 @@ describe('where a message is drawn', () => {
       take()
     })
     dialog.remove()
+  })
+})
+
+describe('a passing message is said to a screen reader', () => {
+  /** The application's scope with a message in it, and a sheet that has the scope of a dialog. */
+  function Page({
+    message,
+    sheet = false
+  }: {
+    readonly message: ToastMessage | null
+    readonly sheet?: boolean
+  }): ReactNode {
+    return (
+      <AnnouncementScope>
+        <Toast message={message} onDismiss={() => undefined} />
+        <Sheet open={sheet} title="A sheet" closeLabel="Close the sheet" onClose={() => undefined}>
+          <p>The sheet’s body.</p>
+        </Sheet>
+      </AnnouncementScope>
+    )
+  }
+
+  /** Mounts the page and returns what a test reads: the holder, and the two regions as they are. */
+  function mount(message: ToastMessage | null, sheet = false) {
+    const holder = document.createElement('div')
+    document.body.append(holder)
+    const view = render(<Page message={message} sheet={sheet} />, { container: holder })
+    const regions = () => {
+      const dialog = holder.querySelector('[data-testid="sheet"]')
+      const all = regionsOf(holder)
+      return {
+        page: all.find((region) => !(dialog?.contains(region) ?? false)),
+        sheet: all.find((region) => dialog?.contains(region) ?? false)
+      }
+    }
+    return { holder, regions, show: (next: ToastMessage | null, open = sheet) => {
+      view.rerender(<Page message={next} sheet={open} />)
+    } }
+  }
+
+  /** How many times `words` are in a region of the page, in the page's and the sheet's together. */
+  function timesHeard(regions: ReturnType<ReturnType<typeof mount>['regions']>, words: string): number {
+    return [regions.page, regions.sheet].flatMap((region) => (region ? heardIn(region) : [])).filter((each) => each === words).length
+  }
+
+  it('puts its words into a region that was in the page before them, and is no live region itself', () => {
+    const { holder, regions, show } = mount(null)
+    const region = regions().page
+    expect(region).toBeDefined()
+    if (region === undefined) return
+    expect(heardIn(region)).toEqual([])
+
+    const watching = watched(holder)
+    show(MESSAGE)
+    const records = watching.records()
+    watching.stop()
+    expect(heardIn(region)).toEqual([MESSAGE.text])
+    expect(regions().page, 'the region is the one that was there').toBe(region)
+    expect(
+      records.some((record) => Array.from(record.addedNodes).some((node) => node.contains(region))),
+      'the region was not added with the words'
+    ).toBe(false)
+    const card = holder.querySelector('.toast')
+    expect(card?.matches('[aria-live], [role="status"]'), 'the card is not a region').toBe(false)
+    expect(card?.querySelector('[aria-live], [role="status"]'), 'nor holds one').toBeNull()
+  })
+
+  it('is not said again when it moves into a sheet that opens over it, nor when the sheet goes', () => {
+    const { holder, regions, show } = mount(MESSAGE)
+    expect(timesHeard(regions(), MESSAGE.text)).toBe(1)
+
+    const before = watched(holder)
+    show(MESSAGE, true)
+    expect(holder.querySelector('[data-testid="sheet"] .toast'), 'the card is in the sheet').not.toBeNull()
+    const inSheet = regions()
+    expect(timesHeard(inSheet, MESSAGE.text), 'said once, wherever it is').toBe(1)
+    expect(inSheet.sheet).toBeDefined()
+    expect(addedTo(inSheet.sheet as HTMLElement, before.records()), 'nothing was added to the sheet’s region').toEqual([])
+    before.stop()
+
+    // The sheet starts to leave: the card goes back to the page, and its words stay where they are.
+    const leaving = watched(holder)
+    show(MESSAGE, false)
+    expect(holder.querySelector('[data-testid="sheet"] .toast'), 'the card has left the sheet').toBeNull()
+    const after = regions()
+    expect(timesHeard(after, MESSAGE.text)).toBe(1)
+    expect(leaving.records().filter((record) => record.addedNodes.length > 0 && (record.target as HTMLElement).closest('[data-announcements]') !== null)).toEqual([])
+    leaving.stop()
+  })
+
+  it('says new words in the region of the sheet it is in, and takes the old ones away', () => {
+    const { holder, regions, show } = mount(MESSAGE, true)
+    const words = 'Different words.'
+    const watching = watched(holder)
+    show({ ...MESSAGE, text: words })
+    const now = regions()
+    expect(now.sheet && heardIn(now.sheet)).toEqual([words])
+    expect(now.page && heardIn(now.page), 'not the page’s').toEqual([])
+    expect(timesHeard(now, MESSAGE.text)).toBe(0)
+    expect(addedTo(now.sheet as HTMLElement, watching.records())).toEqual([words])
+    watching.stop()
+  })
+
+  it('says the same words again when it is told they are said anew', () => {
+    const { holder, regions, show } = mount({ ...MESSAGE, said: 0 })
+    const watching = watched(holder)
+    show({ ...MESSAGE, said: 1 })
+    const now = regions()
+    expect(now.page && heardIn(now.page)).toEqual([MESSAGE.text])
+    expect(addedTo(now.page as HTMLElement, watching.records()), 'a new paragraph is a new announcement').toEqual([MESSAGE.text])
+    watching.stop()
+  })
+
+  it('is said in the region of the sheet that is open when it arrives, and only there', () => {
+    const { regions, show } = mount(null, true)
+    show(MESSAGE, true)
+    const now = regions()
+    expect(now.sheet && heardIn(now.sheet)).toEqual([MESSAGE.text])
+    expect(now.page && heardIn(now.page)).toEqual([])
+  })
+
+  it('leaves the region when it goes', () => {
+    const { regions, show } = mount(MESSAGE, true)
+    expect(timesHeard(regions(), MESSAGE.text)).toBe(1)
+    show(null, true)
+    expect(timesHeard(regions(), MESSAGE.text)).toBe(0)
   })
 })

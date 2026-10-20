@@ -5,10 +5,13 @@
  * (a sheet), the message is drawn inside it, where the keyboard and a screen reader stay: a modal
  * surface is the whole of the screen to both, and a message outside it can be neither reached nor
  * dismissed from them. The surface offers a place for it, and the message takes the newest place on
- * offer.
+ * offer. The place comes with the surface's own announcements, since a screen reader inside a modal
+ * surface hears only the live region that is in it.
  */
 
 import { useSyncExternalStore } from 'react'
+
+import type { Announcer } from './announcements'
 
 /**
  * The time a message stays once nothing holds it, in milliseconds.
@@ -35,16 +38,23 @@ export function toastDwell(text: string, hasAction: boolean): number {
   return Math.min(TOAST_CEILING_MS, Math.max(floor, read * TOAST_WORD_MS))
 }
 
+/** A place for a message, and the announcements of the surface that keeps it. */
+export interface ToastDock {
+  readonly element: HTMLElement
+  readonly announcer: Announcer
+}
+
 /** The places on offer, oldest first: one for each open surface that has one. */
-let docks: readonly HTMLElement[] = []
+let docks: readonly ToastDock[] = []
 const watchers = new Set<() => void>()
 
 function publish(): void {
   for (const watcher of watchers) watcher()
 }
 
-/** Offers `dock` as a place for a message, until the returned function takes it back. */
-export function offerToastDock(dock: HTMLElement): () => void {
+/** Offers `element` as a place for a message, until the returned function takes it back. */
+export function offerToastDock(element: HTMLElement, announcer: Announcer): () => void {
+  const dock: ToastDock = { element, announcer }
   docks = [...docks, dock]
   publish()
   return () => {
@@ -61,6 +71,6 @@ function subscribe(watcher: () => void): () => void {
 }
 
 /** The place the newest open surface offers, or null where none is open. */
-export function useToastDock(): HTMLElement | null {
+export function useToastDock(): ToastDock | null {
   return useSyncExternalStore(subscribe, () => docks.at(-1) ?? null)
 }

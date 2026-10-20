@@ -700,7 +700,7 @@ describe("the owner's confirmations", () => {
       controls.setConfirmations({ ceremony: 'touch_id', requests: [request()] })
     })
     const toast = (await screen.findByText('studio needs your confirmation')).closest<HTMLElement>(
-      '[role="status"]'
+      '.toast'
     )
     expect(toast).not.toBeNull()
     await userEvent.click(within(toast!).getByRole('button', { name: 'Review' }))
@@ -723,7 +723,7 @@ describe("the owner's confirmations", () => {
       })
     })
     const toast = (await screen.findByText('2 requests need your confirmation')).closest<HTMLElement>(
-      '[role="status"]'
+      '.toast'
     )
     expect(toast).not.toBeNull()
     await userEvent.click(within(toast!).getByRole('button', { name: 'Review' }))
@@ -739,7 +739,7 @@ describe("the owner's confirmations", () => {
       controls.setConfirmations({ ceremony: 'touch_id', requests: [request({ reference: 'r-1' })] })
     })
     const toast = (await screen.findByText('studio needs your confirmation')).closest<HTMLElement>(
-      '[role="status"]'
+      '.toast'
     )
     const review = within(toast!).getByRole('button', { name: 'Review' })
     act(() => {
@@ -762,8 +762,11 @@ describe("the owner's confirmations", () => {
       controls.setConfirmations({ ceremony: 'touch_id', requests: [request({ reference: 'r-1' }), invitation] })
     })
     const said = await screen.findByText('2 requests need your confirmation')
-    const toast = said.closest<HTMLElement>('[role="status"]')!
+    const toast = said.closest<HTMLElement>('.toast')!
     const review = within(toast).getByRole('button', { name: 'Review' })
+    const region = document.querySelector<HTMLElement>('[data-announcements]')!
+    const first = region.querySelector('p')
+    expect(first).toHaveTextContent('2 requests need your confirmation')
     act(() => {
       controls.setConfirmations({
         ceremony: 'touch_id',
@@ -773,10 +776,11 @@ describe("the owner's confirmations", () => {
         ]
       })
     })
-    // The words are said again, as a new text in the live region, though they read the same.
+    // The words are said again, as a new paragraph in the live region, though they read the same.
     await waitFor(() => {
-      expect(screen.getByText('2 requests need your confirmation')).not.toBe(said)
+      expect(region.querySelector('p')).not.toBe(first)
     })
+    expect(region.querySelector('p')).toHaveTextContent('2 requests need your confirmation')
     expect(within(toast).getByRole('button', { name: 'Review' })).toBe(review)
     await userEvent.click(review)
     const newest = (await screen.findByText('Widen what devices may do')).closest('li')
@@ -796,7 +800,7 @@ describe("the owner's confirmations", () => {
         controls.setConfirmations({ ceremony: 'touch_id', requests: [request({ reference: 'r-1' })] })
       })
       const message = 'studio needs your confirmation'
-      const toast = screen.getByText(message).closest<HTMLElement>('[role="status"]')!
+      const toast = screen.getByText(message).closest<HTMLElement>('.toast')!
       const review = within(toast).getByRole('button', { name: 'Review' })
 
       // The pointer rests on it, focus moves in, and the pointer leaves: focus still holds it.

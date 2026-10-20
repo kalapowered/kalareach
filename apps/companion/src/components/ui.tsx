@@ -23,7 +23,7 @@ import { createPortal } from 'react-dom'
 
 import markLight from '../assets/kala-mark.svg'
 import markDark from '../assets/kala-mark-dark.svg'
-import { AnnouncementScope, useAnnounced } from './announcements'
+import { AnnouncementScope, useAnnounced, useAnnouncedIn, useAnnouncer } from './announcements'
 import { failureMessage, type HostPort } from '../host/port'
 import { offerToastDock, toastDwell, useToastDock } from './toast'
 import { applyMode, modeApplications, shownMode, type ColourMode } from '../theme-init'
@@ -373,8 +373,8 @@ export interface ToastMessage {
    */
   readonly topic?: string
   /**
-   * Which time the words are said, for a message updated in place: a new count puts the words in
-   * the live region anew, so a screen reader says them again even when they read the same.
+   * Which time the words are said, for a message updated in place: a new count says them to a
+   * screen reader anew, even when they read the same.
    */
   readonly said?: number
 }
@@ -448,6 +448,11 @@ function HeldToast({
   const dock = useToastDock()
   const [holds, setHolds] = useState({ place: dock, pointer: false, focused: false })
   if (holds.place !== dock) setHolds({ place: dock, pointer: false, focused: false })
+  // The words are said once, in the region of the place the message is first drawn in. They are
+  // said again only when they are new, and then where the message is; a move between the page and
+  // a dialog says nothing.
+  const page = useAnnouncer()
+  useAnnouncedIn(dock?.announcer ?? page, message.text, message.said ?? 0)
   const held = holds.pointer || holds.focused
   const hasAction = message.action !== undefined
   // The time is not started again by a new `onDismiss`, which the application makes of every change
@@ -482,7 +487,7 @@ function HeldToast({
     onDismiss()
     // The message's own action says where the focus goes, if it says.
     if (act !== undefined || !hadFocus) return
-    const dialog = dock?.closest<HTMLElement>('[role="dialog"]') ?? null
+    const dialog = dock?.element.closest<HTMLElement>('[role="dialog"]') ?? null
     const owned = back !== null && (dialog === null || dialog.contains(back)) ? back : null
     // Where it came from if that is in the card's own dialog; else the control that closes the dialog.
     focusFirst([owned, dialog?.querySelector<HTMLElement>('[data-sheet-close]') ?? null])
@@ -500,7 +505,7 @@ function HeldToast({
       }}
     />
   )
-  return dock === null ? card : createPortal(card, dock)
+  return dock === null ? card : createPortal(card, dock.element)
 }
 
 /** What a message looks like, and what its controls do. */
@@ -534,7 +539,7 @@ function ToastCard({
     return () => {
       watching.disconnect()
     }
-  }, [message.text, message.said])
+  }, [message.text])
 
   const card = useRef<HTMLDivElement | null>(null)
   const { action } = message
@@ -545,8 +550,6 @@ function ToastCard({
     <div
       ref={card}
       className="toast"
-      role="status"
-      aria-live="polite"
       data-with-action={action === undefined ? undefined : ''}
       onPointerEnter={() => {
         onPointer(true)
@@ -576,7 +579,6 @@ function ToastCard({
         </span>
         <span
           className="toast-text"
-          key={message.said ?? 0}
           ref={words}
           tabIndex={overflowing ? 0 : undefined}
           role={overflowing ? 'region' : undefined}
@@ -712,10 +714,6 @@ export function Sheet({
   // A message in passing is drawn inside an open surface, in the place the surface keeps for it, and
   // goes back to the screen as the surface starts to leave.
   const [dock, setDock] = useState<HTMLElement | null>(null)
-  useEffect(() => {
-    if (!open || dock === null) return
-    return offerToastDock(dock)
-  }, [open, dock])
 
   useEffect(() => {
     if (!mounted) {
@@ -989,15 +987,33 @@ export function Sheet({
         </header>
         {messageAt === 'head' ? <div className="toast-dock" ref={setDock} /> : null}
         {/* A screen reader inside a modal dialog does not reach a region outside it, so the
-            banners in the dialog say their words to a region of its own. */}
+            banners in the dialog, and a message drawn in its row, say their words to a region of
+            its own. */}
         <div className="dialog-body">
-          <AnnouncementScope>{children}</AnnouncementScope>
+          <AnnouncementScope>
+            {children}
+            <DockOffer element={open ? dock : null} />
+          </AnnouncementScope>
         </div>
         {messageAt === 'foot' ? <div className="toast-dock" ref={setDock} /> : null}
         {footer ? <footer className="dialog-footer">{footer}</footer> : null}
       </div>
     </>
   )
+}
+
+/**
+ * Offers `element` as the place for a passing message while it is not null, together with the
+ * announcements of the scope this is drawn in, so that the words of a message in that place are
+ * said in the dialog's own region.
+ */
+function DockOffer({ element }: { readonly element: HTMLElement | null }): null {
+  const announcer = useAnnouncer()
+  useEffect(() => {
+    if (element === null || announcer === null) return
+    return offerToastDock(element, announcer)
+  }, [element, announcer])
+  return null
 }
 
 /* ---- Appearance ------------------------------------------------------------------------------ */

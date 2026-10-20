@@ -226,7 +226,9 @@ no confirmed outcome, and ends by saying that nothing was sent again.
   sheet. If no sheet is open on the phone, the message is drawn above the tab bar and above a
   software keyboard, whichever reaches higher. The message is displayed for 4.2 seconds, or 8
   seconds if it offers something to do, or 0.3 seconds for each word where that is longer, but at
-  most 20 seconds. A pointer on it or focus in it holds it.
+  most 20 seconds. A pointer on it or focus in it holds it. A screen reader is told its words once,
+  in the region of the sheet or the screen the message first appears in, and again only when they
+  change.
 
 ## Push, keys and audio, with no interface running
 

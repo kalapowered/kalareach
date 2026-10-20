@@ -11,28 +11,7 @@ import { describe, expect, it } from 'vitest'
 
 import { AnnouncementScope } from '../src/components/announcements'
 import { Banner } from '../src/components/ui'
-
-/** The page's own mutations, kept from the moment `holder` is watched. */
-function watched(holder: HTMLElement): { records: () => MutationRecord[]; stop: () => void } {
-  const kept: MutationRecord[] = []
-  const watching = new MutationObserver((batch) => {
-    kept.push(...batch)
-  })
-  watching.observe(holder, { childList: true, subtree: true, characterData: true })
-  return {
-    records: () => {
-      kept.push(...watching.takeRecords())
-      return kept
-    },
-    stop: () => {
-      watching.disconnect()
-    }
-  }
-}
-
-function regionsOf(holder: HTMLElement): HTMLElement[] {
-  return Array.from(holder.querySelectorAll<HTMLElement>('[data-announcements]'))
-}
+import { regionsOf, watched } from './live-regions'
 
 describe('a banner', () => {
   it('puts its words into a region that was in the page before it', async () => {

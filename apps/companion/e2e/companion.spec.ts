@@ -529,7 +529,7 @@ test.describe('the semantic view', () => {
     const link = page.getByRole('button', { name: 'the reconnect notes' })
     await expect(link).toBeVisible()
     await link.click()
-    await expect(page.getByRole('status')).toContainText('docs.example.org')
+    await expect(page.locator('.toast')).toContainText('docs.example.org')
     expect(page.url()).toContain('/harness.html')
   })
 
