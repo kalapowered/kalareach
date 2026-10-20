@@ -206,7 +206,7 @@ async fn a_device_that_acts_after_its_window_was_renewed_acts_under_the_window_i
     .await;
     let (boss, boss_record) = recipient(&host, &owner).await;
     let (_friend, friend_record) = recipient(&host, &owner).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
     let (above, boss_connection) = owned_by(&host, session_id, &boss, &boss_record).await;
     let started_with = boss_connection.first_action_window_id();
     let params = delegation(
