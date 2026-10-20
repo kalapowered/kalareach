@@ -1935,6 +1935,10 @@ async fn a_stop_for_a_voice_session_the_host_does_not_hold_is_refused_as_unknown
         "{not_theirs:?}"
     );
     assert_eq!(
+        not_theirs.message, never_held.message,
+        "the words do not tell a call that is not this device's from one that does not exist"
+    );
+    assert_eq!(
         host.controller().voice().coordinator().live_sessions(),
         1,
         "the other device's call is still live"
