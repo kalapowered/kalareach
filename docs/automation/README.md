@@ -186,12 +186,11 @@ A `create_session` node creates a session using the parameters of `session.creat
 is created, it will continue to run, and the session will be the output of this node. The session
 belongs to whoever uses it afterwards. The create runs on a task of the daemon's own, so a node
 whose wait ends in the middle of it leaves no half-made reservation. If the node is asked to stop
-before its admission at the launch transition has looked for a request to stop, the node stops and
-no session is made. Once that look has found none, the node can no longer be stopped: a node whose
-wait or run deadline passes is left unknown, and a node whose run is cancelled is recorded as
-cancelled. A request to stop that comes before the worker's claim is still held against the claim,
-which is refused, so no program will start and no session will be made. A session whose claim came
-before the request stays.
+before its admission at the launch transition has passed, the node stops and no session is made.
+Once it has passed, the node can no longer be stopped: a node whose wait or run deadline passes is
+left unknown, and a node whose run is cancelled is recorded as cancelled. A request to stop that
+comes before the worker's claim is still held against the claim, which is refused, so no program
+will start and no session will be made. A session whose claim came before the request stays.
 
 A `shell_command` node runs its command as the root of a new session. The worker runs the command
 line with `/bin/sh -c` (without any login or other interactive startup), setting the `SHELL`
@@ -412,8 +411,8 @@ each of them as it stood and two admissions that arrive together cannot both tak
   wait, for any reason, it does not take that report. An action the host can still stop settles
   cancelled, which says the host stopped asking and not that the world is as it was; one it cannot
   stop settles unknown. A change-set node cannot be stopped after it has begun. A `create_session`
-  node cannot be stopped once its admission at the launch transition has found no request to stop. A
-  command, test or `create_session` node whose dispatch has ended cannot be stopped either.
+  node cannot be stopped once its admission at the launch transition has passed. A command, test or
+  `create_session` node whose dispatch has ended cannot be stopped either.
 * **A limit stops the run.** When a run's deadline or an action's wait passes, the run dispatches
   nothing further. In one transaction, the action it outlived settles as above, every node still
   waiting that depends on an outcome that is not known pauses for review, every other node still

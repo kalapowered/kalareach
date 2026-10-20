@@ -393,8 +393,8 @@ struct NodeTask {
 struct TaskState {
     /// The run was cancelled, or the node's wait ended and the engine asked it to stop.
     cancelled: bool,
-    /// The node's admission at the launch transition looked for a request to stop, found none and
-    /// let the node go on. It stays set if a later check of the admission refuses.
+    /// The node's admission at the launch transition passed its checks, found no request to stop
+    /// and let the node go on. It stays set if a later check of the admission refuses.
     committed: bool,
 }
 
@@ -410,9 +410,9 @@ impl NodeTask {
     }
 
     /// Asks the node to stop. Whatever has not started never will: the worker's claim of a node
-    /// that was asked to stop is refused. A node whose admission has found no request to stop is
-    /// stopped only by a node that closes its session; one that keeps its session cannot be
-    /// stopped from here, and the answer is that it was not.
+    /// that was asked to stop is refused. A node whose admission has passed is stopped only by a
+    /// node that closes its session; one that keeps its session cannot be stopped from here, and
+    /// the answer is that it was not.
     fn cancel(&self, closes_its_session: bool) -> bool {
         let mut state = self.state();
         state.cancelled = true;
@@ -523,11 +523,11 @@ impl std::fmt::Debug for HostActions {
 impl ActionRunner for HostActions {
     /// A command's session is closed when its dispatch is asked to stop: the dispatch sees the
     /// flag, closes the session, and releases what it owned once the closure accounts for its
-    /// worker. A `create_session` node is stopped only until its first admission has found no
-    /// request to stop, and the node of one that has settles unknown when its wait or run
-    /// deadline passes (the journal has cancelled the node of a cancelled run). Its worker's claim
-    /// is refused if it comes after the request, so no program starts, and a session whose claim
-    /// came before it stays. Nothing is claimed about what a command did before it stopped.
+    /// worker. A `create_session` node is stopped only until its first admission has passed, and
+    /// the node of one that has settles unknown when its wait or run deadline passes (the journal
+    /// has cancelled the node of a cancelled run). Its worker's claim is refused if it comes after
+    /// the request, so no program starts, and a session whose claim came before it stays. Nothing
+    /// is claimed about what a command did before it stopped.
     ///
     /// Neither change-set kind can be stopped once it has begun: the change-set service offers no
     /// point inside a capture or a materialisation to stop at. A dispatch that has ended is no
