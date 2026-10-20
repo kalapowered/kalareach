@@ -983,11 +983,18 @@ fn a_vector_for_a_batch_program_has_a_line_only_when_cmd_exe_would_read_every_wo
         batch_launch::launch_all(separators.path(), &[(programs.each, words.clone())], true);
     assert_eq!(launched[0].received(), words, "{}", launched[0].describe());
 
-    for words in batch_launch::LEADING_SEPARATORS {
-        let leading = tempfile::tempdir().expect("a temporary directory");
-        let programs = write_show_each(leading.path());
-        let launched =
-            batch_launch::launch_all(leading.path(), &[(programs.each, words.to_vec())], true);
-        assert_eq!(launched[0].received(), *words, "{}", launched[0].describe());
-    }
+    let edges = tempfile::tempdir().expect("a temporary directory");
+    let programs = write_show_each(edges.path());
+    let cases: Vec<(String, Vec<&str>)> = batch_launch::EDGE_SEPARATORS
+        .iter()
+        .map(|words| (programs.each.clone(), words.to_vec()))
+        .collect();
+    let launched = batch_launch::launch_all(edges.path(), &cases, true);
+    let wrong: Vec<String> = cases
+        .iter()
+        .zip(&launched)
+        .filter(|((_, words), launch)| launch.received() != *words)
+        .map(|((_, words), launch)| format!("{words:?}: {}", launch.describe()))
+        .collect();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

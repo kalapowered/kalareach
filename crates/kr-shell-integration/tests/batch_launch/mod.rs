@@ -79,9 +79,16 @@ pub const CARRIED: &[&[&str]] = &[
 /// launch carries them; a program that reads the whole argument text gets them whole.
 pub const SEPARATORS: &[&str] = &["--model=x", "a,b", "c;d"];
 
-/// Words that start with, or are only, one of those separators, in the first place and after it.
-pub const LEADING_SEPARATORS: &[&[&str]] =
-    &[&[",a", "b"], &["=", "b"], &[";x"], &["a", ",b", "=c"]];
+/// Vectors with a separator at the edge of a word: the start of the first word, a word that is only
+/// a separator, the start of a later word, the end of a word, and the end of the line.
+pub const EDGE_SEPARATORS: &[&[&str]] = &[
+    &[",a", "b"],
+    &["=", "b"],
+    &[";x"],
+    &["a", ",b", "=c"],
+    &["--flag=", "b,"],
+    &["a;"],
+];
 
 /// What one launch did.
 pub struct Launched {
@@ -244,6 +251,16 @@ pub fn assert_nothing_is_started_that_cmd_exe_would_change(
     cases.push((
         programs.by_name.to_owned(),
         vec!["a&ver>kr-injected-name.txt"],
+    ));
+    labels.push("a second command, to a program named with a trailing dot".to_owned());
+    cases.push((
+        format!("{}.", programs.each),
+        vec!["a&ver>kr-injected-dot.txt"],
+    ));
+    labels.push("a second command, to a program named with a trailing space".to_owned());
+    cases.push((
+        format!("{} ", programs.each),
+        vec!["a&ver>kr-injected-space.txt"],
     ));
     labels.push("a percent sign in the program's path".to_owned());
     cases.push((programs.in_percent_directory.clone(), vec!["x"]));

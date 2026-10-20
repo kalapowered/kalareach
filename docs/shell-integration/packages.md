@@ -356,24 +356,25 @@ any vector it cannot build a line from. If an argument is exactly `--%`, the mod
 `@('--%')`. This is the stop-parsing token in PowerShell, which the shell otherwise leaves out of
 the program's arguments, wherever it appears.
 
-On Windows, if the target executable is a `.cmd` or `.bat` file, it will be run using `cmd.exe`,
-which reads the arguments a second time. With the default or `Legacy` setting for native arguments,
-PowerShell drops an empty word, leaves a double quote unescaped, and quotes a word only when it
-holds white space, so some words would reach the batch file changed or would be treated as commands.
-The module does not build a line for a vector that holds such a word, and it refuses the launch with
-`buffer_not_empty` before anything runs, whatever the setting for native arguments is. Specifically,
-the launch is refused if any word in the argument vector is empty, contains a control character or
-one of `"`, `%`, `!`, `^`, `&`, `|`, `<`, `>`, `(` or `)`, or contains white space and ends with a
-backslash (as PowerShell will double the backslash); or if the path to the program contains `%` or
-`!` (as `cmd.exe` will try to expand them). For any other argument vector, the module builds the
-line in the same way as it does for any other program.
+On Windows, if target executable is a `.cmd` or `.bat` file, it will be run using `cmd.exe` which
+reads arguments again for the second time. With the default or `Legacy` setting for native
+arguments, PowerShell drops an empty word, leaves a double quote unescaped, and quotes a word only
+when it holds white space, so some words may be modified or will be treated as commands when they
+reach the batch file. The module does not build a command line for an argument vector that contains
+such a word, and it refuses the launch with `buffer_not_empty` before anything runs, whatever the
+setting for native arguments is. Specifically, the module refuses the launch if any word after the
+program is empty, contains a control character or one of `"`, `%`, `!`, `^`, `&`, `|`, `<`, `>`, `(`
+or `)`, or contains white space and ends with a backslash (as PowerShell will double the backslash);
+or if the path to the program contains `%` or `!` (as `cmd.exe` will try to expand them). For any
+other argument vector, the module will build the command line in the same way as it does for any
+other program.
 
-The characters `=`, `,` and `;` are carried. They do not cause any injection, and they will be kept
-wherever they appear in a word when passed through `%*` (which is how package manager shims pass
-arguments). However, when such a word is retrieved by `%1` to `%9` in a batch file, it will be split
-by these characters, which is consistent with how any other arguments are handled. Note that
-PowerShell scripts are not batch files. PowerShell binds their arguments by itself, and the module
-does not refuse any of them.
+The characters `=`, `,` and `;` are safe to pass. They do not cause any injection and they will be
+kept regardless of where they appear in a word when passed through `%*` (which is how package
+manager's shims pass arguments). However, when such word has no white space and is retrieved by `%1`
+to `%9` in a batch file, it will be split by these characters, which is consistent with how any
+other arguments are handled. Note that PowerShell scripts are not batch files. PowerShell binds
+arguments by itself, and the module does not reject any of them.
 
 Losing the bridge does not turn a managed root shell back into an ordinary one. The handshake
 leaves a mark that is never cleared, so a shell whose worker has gone holds no fence, consumes an

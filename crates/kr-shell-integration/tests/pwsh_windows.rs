@@ -1159,17 +1159,19 @@ fn a_batch_program_is_given_separator_words_whole_through_the_argument_text() {
     );
 }
 
-/// KR-REQ-23.54: a separator at the start of a word reaches a batch program that reads the whole
-/// argument text as it was named, in the first place and after it.
+/// KR-REQ-23.54: a separator at the edge of a word reaches a batch program that reads the whole
+/// argument text as it was named: at the start of the first word, of a later word, at the end of a
+/// word and at the end of the line.
 ///
 /// `cmd.exe` skips blanks before the first argument, and the launch says it carries `=`, `,` and
-/// `;` whole, so a word that starts with one has to come through the argument text unchanged.
+/// `;` whole, so a word that starts or ends with one has to come through the argument text
+/// unchanged.
 #[test]
-fn a_batch_program_is_given_a_word_that_starts_with_a_separator_whole_through_the_argument_text() {
+fn a_batch_program_is_given_a_separator_at_the_edge_of_a_word_whole_through_the_argument_text() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     write_programs(directory.path());
     let program = directory.path().join("show-all.cmd").display().to_string();
-    let cases: Vec<(String, Vec<&str>)> = batch_launch::LEADING_SEPARATORS
+    let cases: Vec<(String, Vec<&str>)> = batch_launch::EDGE_SEPARATORS
         .iter()
         .map(|words| (program.clone(), words.to_vec()))
         .collect();
