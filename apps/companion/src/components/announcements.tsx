@@ -19,6 +19,7 @@
 
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useId,
@@ -76,29 +77,39 @@ export function useAnnouncer(): Announcer | null {
  * nobody listening.
  */
 export function useAnnounced(words: string): void {
-  useAnnouncedIn(useContext(Scope), words, 0)
+  const scope = useContext(Scope)
+  useAnnouncedIn(useCallback(() => scope, [scope]), words, 0)
 }
 
 /**
- * Says `words` in the region of `place`, for as long as the caller is on the screen.
+ * Says `words` in the region `place` names, for as long as the caller is on the screen.
+ *
+ * `place` is asked when the words are to be said, in the effect and not while the caller renders:
+ * what a render saw can be a place that goes in the same update, and words said in a region that is
+ * going are heard by nobody.
  *
  * The caller has one paragraph, in the region where its words were last said. A new `occasion` says
- * the words anew even when they read the same. When only `place` changes, as it does for a message
- * that is drawn in a dialog that opens over it, nothing is said: the person has heard the words,
- * and the paragraph stays where it is until the caller goes or has new words. New words are said in
- * the place the caller is in then, and the paragraph left behind is taken away, which a screen
- * reader does not say.
+ * the words anew even when they read the same. When only the place changes, as it does for a message
+ * that is drawn in a dialog that opens over it, nothing is said: the person has heard the words, and
+ * the paragraph stays where it is until the caller goes or has new words. New words are said in the
+ * place the caller is in then, and the paragraph left behind is taken away, which a screen reader
+ * does not say.
  */
-export function useAnnouncedIn(place: Announcer | null, words: string, occasion: number): void {
+export function useAnnouncedIn(
+  place: () => Announcer | null,
+  words: string,
+  occasion: number
+): void {
   const speaker = useId()
   const said = useRef<{ place: Announcer; words: string; occasion: number } | null>(null)
   useEffect(() => {
-    if (place === null) return
+    const now = place()
+    if (now === null) return
     const before = said.current
     if (before?.words === words && before.occasion === occasion) return
-    if (before !== null && before.place !== place) before.place.withdraw(speaker)
-    place.say(speaker, words, occasion)
-    said.current = { place, words, occasion }
+    if (before !== null && before.place !== now) before.place.withdraw(speaker)
+    now.say(speaker, words, occasion)
+    said.current = { place: now, words, occasion }
   }, [place, speaker, words, occasion])
   useEffect(
     () => () => {
@@ -112,10 +123,18 @@ export function useAnnouncedIn(place: Announcer | null, words: string, occasion:
 /**
  * A scope for the banners in `children`: the live region their words go into is drawn with it, as
  * its last child, and holds one paragraph for each speaker in the scope. A speaker that comes adds
- * one, and one whose words change changes its own.
+ * one, and one whose words change changes its own. A caller that has to say words into the region
+ * from outside the scope makes the `announcer` itself and gives it here.
  */
-export function AnnouncementScope({ children }: { readonly children: ReactNode }): ReactNode {
-  const [announcer] = useState(() => new Announcer())
+export function AnnouncementScope({
+  children,
+  announcer: given
+}: {
+  readonly children: ReactNode
+  readonly announcer?: Announcer
+}): ReactNode {
+  const [own] = useState(() => new Announcer())
+  const announcer = given ?? own
   const items = useSyncExternalStore(announcer.subscribe, announcer.heard)
   return (
     <Scope.Provider value={announcer}>

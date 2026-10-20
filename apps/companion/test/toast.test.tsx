@@ -403,26 +403,31 @@ describe('where a message is drawn', () => {
 })
 
 describe('a passing message is said to a screen reader', () => {
-  /** The application's scope with a message in it, and a sheet that has the scope of a dialog. */
+  /**
+   * The application's scope with a message in it, and a sheet that has the scope of a dialog: open,
+   * closed and still leaving, or not drawn at all (`null`).
+   */
   function Page({
     message,
     sheet = false
   }: {
     readonly message: ToastMessage | null
-    readonly sheet?: boolean
+    readonly sheet?: boolean | null
   }): ReactNode {
     return (
       <AnnouncementScope>
         <Toast message={message} onDismiss={() => undefined} />
-        <Sheet open={sheet} title="A sheet" closeLabel="Close the sheet" onClose={() => undefined}>
-          <p>The sheet’s body.</p>
-        </Sheet>
+        {sheet === null ? null : (
+          <Sheet open={sheet} title="A sheet" closeLabel="Close the sheet" onClose={() => undefined}>
+            <p>The sheet’s body.</p>
+          </Sheet>
+        )}
       </AnnouncementScope>
     )
   }
 
   /** Mounts the page and returns what a test reads: the holder, and the two regions as they are. */
-  function mount(message: ToastMessage | null, sheet = false) {
+  function mount(message: ToastMessage | null, sheet: boolean | null = false) {
     const holder = document.createElement('div')
     document.body.append(holder)
     const view = render(<Page message={message} sheet={sheet} />, { container: holder })
@@ -434,7 +439,7 @@ describe('a passing message is said to a screen reader', () => {
         sheet: all.find((region) => dialog?.contains(region) ?? false)
       }
     }
-    return { holder, regions, show: (next: ToastMessage | null, open = sheet) => {
+    return { holder, regions, show: (next: ToastMessage | null, open: boolean | null = sheet) => {
       view.rerender(<Page message={next} sheet={open} />)
     } }
   }
@@ -490,10 +495,11 @@ describe('a passing message is said to a screen reader', () => {
   })
 
   it('says new words in the region of the sheet it is in, and takes the old ones away', () => {
-    const { holder, regions, show } = mount(MESSAGE, true)
+    const { holder, regions, show } = mount(MESSAGE)
+    show(MESSAGE, true)
     const words = 'Different words.'
     const watching = watched(holder)
-    show({ ...MESSAGE, text: words })
+    show({ ...MESSAGE, text: words }, true)
     const now = regions()
     expect(now.sheet && heardIn(now.sheet)).toEqual([words])
     expect(now.page && heardIn(now.page), 'not the page’s').toEqual([])
@@ -520,8 +526,33 @@ describe('a passing message is said to a screen reader', () => {
     expect(now.page && heardIn(now.page)).toEqual([])
   })
 
+  it('is said in the region of the sheet that opens in the update it arrives in', () => {
+    const { regions, show } = mount(null, false)
+    show(MESSAGE, true)
+    const now = regions()
+    expect(now.sheet && heardIn(now.sheet)).toEqual([MESSAGE.text])
+    expect(now.page && heardIn(now.page), 'not behind the dialog').toEqual([])
+  })
+
+  it('is said on the page when it arrives in the update that closes the sheet, which is still on its way out', () => {
+    const { holder, regions, show } = mount(null, true)
+    show(MESSAGE, false)
+    expect(holder.querySelector('[data-testid="sheet"]'), 'the sheet is still leaving').not.toBeNull()
+    const now = regions()
+    expect(now.page && heardIn(now.page)).toEqual([MESSAGE.text])
+    expect(now.sheet && heardIn(now.sheet), 'not in the region that goes with the sheet').toEqual([])
+  })
+
+  it('is said on the page when it arrives in the update that takes the sheet away', () => {
+    const { holder, regions, show } = mount(null, true)
+    show(MESSAGE, null)
+    expect(holder.querySelector('[data-testid="sheet"]')).toBeNull()
+    expect(regions().page && heardIn(regions().page as HTMLElement)).toEqual([MESSAGE.text])
+  })
+
   it('leaves the region when it goes', () => {
-    const { regions, show } = mount(MESSAGE, true)
+    const { regions, show } = mount(null, true)
+    show(MESSAGE, true)
     expect(timesHeard(regions(), MESSAGE.text)).toBe(1)
     show(null, true)
     expect(timesHeard(regions(), MESSAGE.text)).toBe(0)

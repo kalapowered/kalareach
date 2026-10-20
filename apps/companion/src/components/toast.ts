@@ -63,6 +63,11 @@ export function offerToastDock(element: HTMLElement, announcer: Announcer): () =
   }
 }
 
+/** The place the newest open surface offers now, or null where none is open. */
+export function currentToastDock(): ToastDock | null {
+  return docks.at(-1) ?? null
+}
+
 function subscribe(watcher: () => void): () => void {
   watchers.add(watcher)
   return () => {
@@ -72,5 +77,5 @@ function subscribe(watcher: () => void): () => void {
 
 /** The place the newest open surface offers, or null where none is open. */
 export function useToastDock(): ToastDock | null {
-  return useSyncExternalStore(subscribe, () => docks.at(-1) ?? null)
+  return useSyncExternalStore(subscribe, currentToastDock)
 }

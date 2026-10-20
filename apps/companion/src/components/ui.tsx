@@ -23,9 +23,9 @@ import { createPortal } from 'react-dom'
 
 import markLight from '../assets/kala-mark.svg'
 import markDark from '../assets/kala-mark-dark.svg'
-import { AnnouncementScope, useAnnounced, useAnnouncedIn, useAnnouncer } from './announcements'
+import { Announcer, AnnouncementScope, useAnnounced, useAnnouncedIn, useAnnouncer } from './announcements'
 import { failureMessage, type HostPort } from '../host/port'
-import { offerToastDock, toastDwell, useToastDock } from './toast'
+import { currentToastDock, offerToastDock, toastDwell, useToastDock } from './toast'
 import { applyMode, modeApplications, shownMode, type ColourMode } from '../theme-init'
 import {
   animateSpring,
@@ -448,11 +448,15 @@ function HeldToast({
   const dock = useToastDock()
   const [holds, setHolds] = useState({ place: dock, pointer: false, focused: false })
   if (holds.place !== dock) setHolds({ place: dock, pointer: false, focused: false })
-  // The words are said once, in the region of the place the message is first drawn in. They are
-  // said again only when they are new, and then where the message is; a move between the page and
-  // a dialog says nothing.
+  // The words are said once, in the region of the place the message is first drawn in: the newest
+  // open surface's, or the page's. They are said again only when they are new, and then where the
+  // message is; a move between the page and a dialog says nothing.
   const page = useAnnouncer()
-  useAnnouncedIn(dock?.announcer ?? page, message.text, message.said ?? 0)
+  useAnnouncedIn(
+    useCallback(() => currentToastDock()?.announcer ?? page, [page]),
+    message.text,
+    message.said ?? 0
+  )
   const held = holds.pointer || holds.focused
   const hasAction = message.action !== undefined
   // The time is not started again by a new `onDismiss`, which the application makes of every change
@@ -731,8 +735,17 @@ export function Sheet({
   }, [open, close])
 
   // A message in passing is drawn inside an open surface, in the place the surface keeps for it, and
-  // goes back to the screen as the surface starts to leave.
-  const [dock, setDock] = useState<HTMLElement | null>(null)
+  // goes back to the screen as the surface starts to leave. The place is offered as the surface is
+  // drawn, before anything that is said in the same update asks where to say it, and it comes with the
+  // announcements of the surface: a screen reader inside a modal surface hears only the live region
+  // that is in it.
+  const dockRef = useRef<HTMLDivElement | null>(null)
+  const [announcements] = useState(() => new Announcer())
+  useLayoutEffect(() => {
+    const dock = dockRef.current
+    if (!open || dock === null) return
+    return offerToastDock(dock, announcements)
+  }, [open, announcements, messageAt])
 
   useEffect(() => {
     if (!mounted) {
@@ -1008,35 +1021,18 @@ export function Sheet({
             ×
           </IconButton>
         </header>
-        {messageAt === 'head' ? <div className="toast-dock" ref={setDock} /> : null}
+        {messageAt === 'head' ? <div className="toast-dock" ref={dockRef} /> : null}
         {/* A screen reader inside a modal dialog does not reach a region outside it, so the
             banners in the dialog, and a message drawn in its row, say their words to a region of
             its own. */}
         <div className="dialog-body">
-          <AnnouncementScope>
-            {children}
-            <DockOffer element={open ? dock : null} />
-          </AnnouncementScope>
+          <AnnouncementScope announcer={announcements}>{children}</AnnouncementScope>
         </div>
-        {messageAt === 'foot' ? <div className="toast-dock" ref={setDock} /> : null}
+        {messageAt === 'foot' ? <div className="toast-dock" ref={dockRef} /> : null}
         {footer ? <footer className="dialog-footer">{footer}</footer> : null}
       </div>
     </>
   )
-}
-
-/**
- * Offers `element` as the place for a passing message while it is not null, together with the
- * announcements of the scope this is drawn in, so that the words of a message in that place are
- * said in the dialog's own region.
- */
-function DockOffer({ element }: { readonly element: HTMLElement | null }): null {
-  const announcer = useAnnouncer()
-  useEffect(() => {
-    if (element === null || announcer === null) return
-    return offerToastDock(element, announcer)
-  }, [element, announcer])
-  return null
 }
 
 /* ---- Appearance ------------------------------------------------------------------------------ */
