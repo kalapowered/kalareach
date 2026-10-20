@@ -23,6 +23,8 @@
     "test:android-classes": "node scripts/android-classes-selftest.mjs",
     "identifiers": "node scripts/identifiers.mjs",
     "test:identifiers": "node scripts/identifiers-selftest.mjs",
+    "privacy-manifest": "node scripts/privacy-manifest.mjs",
+    "test:privacy-manifest": "node scripts/privacy-manifest-selftest.mjs",
     "test:preview": "node scripts/preview-selftest.mjs",
     "debug-code": "node scripts/debug-code.mjs",
     "test:debug-code": "node scripts/debug-code-selftest.mjs",
