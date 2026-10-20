@@ -34,6 +34,8 @@
   display: flex;
   flex-direction: column;
   gap: var(--gap-2);
+  /* The title is sized by this box's width. */
+  container-type: inline-size;
 }
 
 .setup-heading h1 {
@@ -41,10 +43,12 @@
   /*
    * At the largest text size the title's longest word is wider than a phone's window, and a word
    * broken in the middle of its name reads as a mistake. The title grows with the text until it
-   * would not fit, and from there it is a share of the window's width, which keeps each word
-   * whole.
+   * would not fit, and from there it is a share of the width of its own box, which keeps each word
+   * whole. The box's width, not the window's: beside the sidebar the box is 300 px narrower than
+   * the window. The size does not go under that of a card's heading, so the title stays the
+   * largest thing on the page.
    */
-  font-size: min(1.75rem, 11vw);
+  font-size: clamp(1rem, 12cqi, 1.75rem);
   /* Large text reads too loose at zero tracking, so it tightens as it grows. */
   letter-spacing: -0.02em;
   line-height: 1.1;

@@ -795,34 +795,26 @@ test.describe('the first-start assistant', () => {
     }
   }
 
-  // KR-REQ-03.28: the page's title shows each of its words whole, at each text size and on a wide
-  // window and a narrow one, in the runner's face. A word broken in the middle of a name reads as a
-  // mistake, so at the largest size on a phone the title is set smaller instead of breaking.
-  for (const [width, height] of WINDOWS) {
-    for (const [size, ratio] of TEXT_SIZES) {
-      test(`keeps each word of the page's title whole at the ${size} text size, ${width} wide`, async ({
-        page
-      }) => {
-        await openSetup(page)
-        await sizeTo(page, width, height, ratio)
-        const broken = await page.evaluate(() => {
-          const title = document.querySelector('.setup-heading h1')
-          const text = title?.firstChild
-          if (!(text instanceof Text)) return ['the title is not a line of text']
-          const found: string[] = []
-          for (const word of text.data.matchAll(/\S+/g)) {
-            const start = word.index ?? 0
-            const range = document.createRange()
-            range.setStart(text, start)
-            range.setEnd(text, start + word[0].length)
-            const lines = new Set(Array.from(range.getClientRects()).map((box) => Math.round(box.top)))
-            if (lines.size > 1) found.push(word[0])
-          }
-          return found
-        })
-        expect(broken, 'words of the title that are broken across lines').toEqual([])
-      })
-    }
+  // KR-REQ-03.28: the page's title shows each of its words whole, at each text size and at every
+  // width from a phone's to a desktop's, in the runner's face. A word broken in the middle of a name
+  // reads as a mistake. The widths include the ones just above the point where the sidebar returns
+  // and takes 300 px from the title's box, which a size taken from the window's width does not see.
+  for (const [size, ratio] of TEXT_SIZES) {
+    test(`keeps each word of the page's title whole at every width at the ${size} text size`, async ({
+      page
+    }) => {
+      await openSetup(page)
+      await sizeTo(page, 1280, 720, ratio)
+      const broken: string[] = []
+      for (const width of [390, 480, 720, 721, 768, 800, 1280]) {
+        await page.setViewportSize({ width, height: 844 })
+        expect(await page.locator('.setup-heading h1').count()).toBe(1)
+        for (const word of await brokenWords(page, '.setup-heading h1')) {
+          broken.push(`"${word}" at ${String(width)} px`)
+        }
+      }
+      expect(broken, 'words of the title that are broken across two lines').toEqual([])
+    })
   }
 
   // KR-REQ-03.28, KR-REQ-03.29: on every step of the path, at each text size and on a wide window
