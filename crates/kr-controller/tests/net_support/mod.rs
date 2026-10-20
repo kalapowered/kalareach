@@ -1605,9 +1605,7 @@ impl RawDevice {
             let frame = tokio::time::timeout_at(deadline, self.heard_next())
                 .await
                 .expect("the host answers in time");
-            let Some(frame) = frame else {
-                return None;
-            };
+            let frame = frame?;
             if let ControlFrame::Response(response) = frame
                 && response.request_id == request_id
             {
@@ -1720,9 +1718,7 @@ impl RawDevice {
             let frame = tokio::time::timeout_at(deadline, self.heard_next())
                 .await
                 .expect("the host answers in time");
-            let Some(frame) = frame else {
-                return None;
-            };
+            let frame = frame?;
             if let ControlFrame::Response(response) = frame
                 && response.request_id == request_id
             {
