@@ -4,14 +4,14 @@
 //! host, and the host a request is for decides which:
 //!
 //! * **The host on this computer** takes `device.revoke` over a connection it admits now: it
-//!   withdraws the ones it admitted before each revocation, so this computer opens another and sends
-//!   over the one it already holds only when no other opens. The method is the local owner's alone,
-//!   so a paired device never sends it, and the host's answer, with the state of its dispatch
-//!   barrier, is the acknowledgement.
-//! * **A host this computer is paired with as an owner** is reached through its authority feed. This
-//!   computer signs a revocation request with its authorisation key, publishes it at the sync service
-//!   it is set to use, and the host reads it at its next poll, carries it out and acknowledges it in
-//!   the same feed. Nothing is sent to the host itself.
+//!   withdraws the ones it admitted before each revocation, so this computer opens another and
+//!   sends over the one it already holds only when no other opens. The method is the local owner's
+//!   alone, so a paired device never sends it, and the host's answer, with the state of its
+//!   dispatch barrier, is the acknowledgement.
+//! * **A host this computer is paired with as an owner** is reached through its authority feed.
+//!   This computer signs a revocation request with its authorisation key, publishes it at the sync
+//!   service it is set to use, and the host reads it at its next poll, carries it out and
+//!   acknowledges it in the same feed. Nothing is sent to the host itself.
 //!
 //! # What is shown, and when it is called done
 //!
@@ -753,8 +753,8 @@ impl Revocations {
         });
     }
 
-    /// One host's view. The keys of the devices that this computer sent a request for, which no host
-    /// has refused, or that the host on this computer lists as revoked, go in `told`.
+    /// One host's view. The keys of the devices that this computer sent a request for, which no
+    /// host has refused, or that the host on this computer lists as revoked, go in `told`.
     fn host_view(&self, reading: &Reading, told: &mut Vec<AuthorisationKey>) -> HostView {
         let reference = reading.host.reference();
         let (devices, listed_at_ms, direct) = {

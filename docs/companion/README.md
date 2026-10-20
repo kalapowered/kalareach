@@ -499,10 +499,11 @@ reason “Share your settings with”, the device's name and “again”. If the
 computer will ask the hosts again and then, in one step, take back the membership's own record of
 the revoke and attempt to add the device again, just as if it were added for the first time. Again,
 this will succeed only if the device is still listed by at least one of its hosts and none of them
-lists it as revoked. A device that a host reports as revoked is not offered. If a view finds that a
-device is revoked, either because a host's feed contains a revocation signed by this computer or
-because the host on this computer lists it as revoked (regardless of who revoked it), the device is
-taken out as described above. Note that there is no way to stop a send of settings or drafts that is
+lists it as revoked. A device that a host reports as revoked is not offered, and neither is one
+whose revocation request is still in a feed that no host has refused. If a view finds that a device
+is revoked, either because a host's feed contains a revocation signed by this computer or because
+the host on this computer lists it as revoked (regardless of who revoked it), the device is taken
+out as described above. Note that there is no way to stop a send of settings or drafts that is
 already on its way.
 
 The Devices screen, which appears after the Hosts screen in the desktop navigation, shows one card

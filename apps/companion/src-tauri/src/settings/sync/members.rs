@@ -6,20 +6,21 @@
 //! device one of its hosts lists as paired and holding the right to manage the host. This module is
 //! the companion's half of that:
 //!
-//! * **The hosts' device lists** are asked of every host this computer owns ([`Hosts::device_lists`])
-//!   and handed to the membership as what each host says of each device's keys, its right to manage
-//!   the host and whether it was revoked. A host that revoked a device is how the membership learns
-//!   to take that device out. A host that does not answer, or will not list its devices to this
-//!   computer, says nothing about any device: the membership is told that one was silent. A device this computer's hosts vouched for before,
-//!   and that no answering host mentions, is then not taken out, and the next key is wrapped to it
-//!   as before; a device an answering host mentions is judged by what that host says. Silence
-//!   accepts, opens and adds nothing: a record, a key or an addition still needs a host that
-//!   answered to list the device. A device a host lists whose right to manage the host has run out
-//!   with its grant is not one to share with.
-//! * **The owner's presence** is asked for through the platform's ceremony, with what it would do as
-//!   its reason, before a device is added to the collection and before this computer joins one. The
-//!   page names a device by an opaque reference and never holds a key. Taking a device out needs no
-//!   ceremony: taking rights away asks for no new confirmation.
+//! * **The hosts' device lists** are asked of every host this computer owns
+//!   ([`Hosts::device_lists`]) and handed to the membership as what each host says of each device's
+//!   keys, its right to manage the host and whether it was revoked. A host that revoked a device is
+//!   how the membership learns to take that device out. A host that does not answer, or will not
+//!   list its devices to this computer, says nothing about any device: the membership is told that
+//!   one was silent. A device this computer's hosts vouched for before, and that no answering host
+//!   mentions, is then not taken out, and the next key is wrapped to it as before; a device an
+//!   answering host mentions is judged by what that host says. Silence accepts, opens and adds
+//!   nothing: a record, a key or an addition still needs a host that answered to list the device. A
+//!   device a host lists whose right to manage the host has run out with its grant is not one to
+//!   share with.
+//! * **The owner's presence** is asked for through the platform's ceremony, with what it would do
+//!   as its reason, before a device is added to the collection and before this computer joins one.
+//!   The page names a device by an opaque reference and never holds a key. Taking a device out
+//!   needs no ceremony: taking rights away asks for no new confirmation.
 //! * **The page is shown** [`DevicesView`], made at the end of each step from the membership's own
 //!   record, so showing it asks nobody anything.
 //!
@@ -709,9 +710,9 @@ impl SettingsSync {
     }
 
     /// Says which devices a revocation request of this computer's is in force for: those no host
-    /// has refused, which a feed holds for a host that has not acted on it yet. `complete` says that
-    /// every host and feed was read, so that a device absent from `devices` has none; otherwise the
-    /// devices named are added to what is known and nothing is let go.
+    /// has refused, which a feed holds for a host that has not acted on it yet. `complete` says
+    /// that every host and feed was read, so that a device absent from `devices` has none;
+    /// otherwise the devices named are added to what is known and nothing is let go.
     pub fn requests_in_force(&self, devices: &[AuthorisationKey], complete: bool) {
         let mut held = self
             .listed
