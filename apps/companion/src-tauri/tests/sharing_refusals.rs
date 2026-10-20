@@ -132,9 +132,10 @@ fn is_active(scene: &Scene, grant_id: GrantId) -> bool {
 }
 
 /// KR-REQ-18.13: the issuer withdraws an invitation after the device read its list. This shows the
-/// host's words where the host answers: the host is asked, refuses the acceptance, and the person is
-/// told so in the host's own words, that the invitation was withdrawn; nothing is accepted. An
-/// invitation that has already left the device's list is not sent to the host at all.
+/// host's words where the host answers: the host is asked, refuses the acceptance, and the person
+/// is told so in the host's own words, that the invitation was withdrawn; nothing is accepted. The
+/// acceptance of one that left the list before it was sent is asked of the host too, as the cases
+/// that follow show.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_invitation_withdrawn_after_the_device_read_its_list_is_refused_in_the_hosts_words() {
     let scene = Scene::start().await;
@@ -162,7 +163,8 @@ async fn an_invitation_withdrawn_after_the_device_read_its_list_is_refused_in_th
 /// KR-REQ-18.13: an invitation's time runs out on the host's clock after the device read its list.
 /// This shows the host's words where the host answers: the host is asked, refuses the acceptance,
 /// and the person is told so in the host's own words, that the invitation expired; nothing is
-/// accepted. An invitation that has already left the device's list is not sent to the host at all.
+/// accepted. The acceptance of one that left the list before it was sent is asked of the host too,
+/// as the cases that follow show.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_invitation_that_ran_out_after_the_device_read_its_list_is_refused_in_the_hosts_words() {
     let wall = MovedWall::new();
@@ -192,10 +194,11 @@ async fn an_invitation_that_ran_out_after_the_device_read_its_list_is_refused_in
 }
 
 /// KR-REQ-18.13: the device accepts an invitation from another connection of its own while the
-/// page's acceptance is on its way. This shows the host's words where the host answers: the host is
-/// asked, refuses the page's acceptance, and the person is told so in the host's own words, that the
-/// invitation was already used; the grant is active because of the other connection's acceptance
-/// alone. An invitation that has already left the device's list is not sent to the host at all.
+/// page's acceptance is on its way. This shows the host's words where the host answers: the host
+/// is asked, refuses the page's acceptance, and the person is told so in the host's own words, that
+/// the invitation was already used; the grant is active because of the other connection's
+/// acceptance alone. The acceptance of one that left the list before it was sent is asked of the
+/// host too, as the cases that follow show.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_invitation_used_after_the_device_read_its_list_is_refused_in_the_hosts_words() {
     let scene = Scene::start().await;
