@@ -138,6 +138,11 @@ for (const [surface, size] of [
         sync: { drafts: { enabled: true, kept_here: [], problem: null, arrivals: 0 } }
       })
     })
+    await expect(row).toBeVisible()
+    await expect(card.getByRole('switch', { name: 'Keep drafts in step' })).toHaveAttribute(
+      'aria-checked',
+      'true'
+    )
     await expect(card.getByTestId('drafts-kept-here')).toHaveCount(0)
     await expect(card.getByTestId('drafts-problem')).toHaveCount(0)
     expect(await overrunning(page, '[data-testid="drafts-sync"]')).toEqual([])
