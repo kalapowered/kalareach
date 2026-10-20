@@ -422,8 +422,33 @@ impl NodeTask {
         stopped
     }
 
-    /// Whether the node's session may start: not when the node was asked to stop. It is asked at
-    /// the launch transition and again at the worker's claim, under the registry guard.
+    /// Admits the start of the node's session: `checks` decide whether it may, and `stopped` is the
+    /// refusal of a node that was asked to stop. It is asked at the launch transition and again at
+    /// the worker's claim, under the registry guard.
+    ///
+    /// The node is committed only when its checks pass and no request to stop has come, and
+    /// `cancel` does not report a committed node as stopped unless the node closes its session
+    /// (a command's does). A refusal commits nothing, so a node whose wait ended before its first
+    /// admission passed is reported stopped, and not left unknown, by the engine's request to
+    /// stop, whichever of the two reaches it first while the dispatch is live. A later refusal
+    /// (the worker's claim) leaves the commitment of the first admission as it was.
+    fn admit<T, E>(
+        &self,
+        stopped: impl Fn() -> E,
+        checks: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        if self.cancelled() {
+            return Err(stopped());
+        }
+        let passed = checks()?;
+        if self.commit() {
+            Ok(passed)
+        } else {
+            Err(stopped())
+        }
+    }
+
+    /// Commits the node unless it was asked to stop, and answers whether it did.
     fn commit(&self) -> bool {
         let mut state = self.state();
         if state.cancelled {
@@ -866,31 +891,34 @@ fn node_admission(
     let held = Arc::clone(held);
     let task = Arc::clone(task);
     controller.workflow_admission(move || {
-        if !task.commit() {
-            return Err(
+        task.admit(
+            || {
                 held.refuse_session(kr_automation::AutomationError::AuthorityUnavailable(
                     "the node was asked to stop before its session could start".to_owned(),
-                )),
-            );
-        }
-        let grant_ends = held
-            .standing()
-            .map_err(|refusal| held.refuse_session(refusal))?;
-        let daemon = held
-            .daemon
-            .get()
-            .map_err(|refusal| held.refuse_session(refusal))?;
-        let (boot_ms, now_ms) = (daemon.boot_elapsed_ms(), held.daemon.now_ms());
-        if now_ms >= wait_until_ms {
-            return Err(
-                held.refuse_session(kr_automation::AutomationError::AuthorityUnavailable(
-                    "the wait for this node ended before its session could start".to_owned(),
-                )),
-            );
-        }
-        let wait_ends =
-            bounded_by_the_wait.then(|| wait_end_on_the_boot_clock(boot_ms, now_ms, wait_until_ms));
-        Ok(grant_ends.into_iter().chain(wait_ends).min())
+                ))
+            },
+            || {
+                let grant_ends = held
+                    .standing()
+                    .map_err(|refusal| held.refuse_session(refusal))?;
+                let daemon = held
+                    .daemon
+                    .get()
+                    .map_err(|refusal| held.refuse_session(refusal))?;
+                let (boot_ms, now_ms) = (daemon.boot_elapsed_ms(), held.daemon.now_ms());
+                if now_ms >= wait_until_ms {
+                    return Err(held.refuse_session(
+                        kr_automation::AutomationError::AuthorityUnavailable(
+                            "the wait for this node ended before its session could start"
+                                .to_owned(),
+                        ),
+                    ));
+                }
+                let wait_ends = bounded_by_the_wait
+                    .then(|| wait_end_on_the_boot_clock(boot_ms, now_ms, wait_until_ms));
+                Ok(grant_ends.into_iter().chain(wait_ends).min())
+            },
+        )
     })
 }
 
@@ -3579,6 +3607,59 @@ mod tests {
                 .expect("an answer")
                 .is_none(),
             "no reservation is granted"
+        );
+    }
+
+    /// A node whose admission refuses commits to nothing: a request to stop that comes after the
+    /// refusal still stops the node, so a wait that ended first leaves it cancelled and not
+    /// unknown, in whichever order the admission and the engine's request reach it. The controls
+    /// are a node whose admission passes, which a later request cannot stop, and a node that was
+    /// asked to stop first, which is refused.
+    #[test]
+    fn a_refused_admission_leaves_the_node_stoppable() {
+        let refused = NodeTask::default();
+        assert_eq!(
+            refused.admit(|| "asked to stop", || Err::<(), _>("the wait ended")),
+            Err("the wait ended")
+        );
+        assert!(
+            refused.cancel(false),
+            "the request to stop that follows a refusal stops the node"
+        );
+
+        let admitted = NodeTask::default();
+        assert_eq!(
+            admitted.admit(|| "asked to stop", || Ok::<_, &str>(7)),
+            Ok(7)
+        );
+        assert_eq!(
+            admitted.admit(|| "asked to stop", || Err::<(), _>("the wait ended")),
+            Err("the wait ended"),
+            "the worker's claim asks again, and a refusal there is a refusal"
+        );
+        assert!(
+            !admitted.cancel(false),
+            "a node whose session passed its admission cannot be stopped from here"
+        );
+
+        let stopped = NodeTask::default();
+        assert!(stopped.cancel(false));
+        assert_eq!(
+            stopped.admit(|| "asked to stop", || Ok::<_, &str>(7)),
+            Err("asked to stop")
+        );
+
+        let asked_meanwhile = NodeTask::default();
+        assert_eq!(
+            asked_meanwhile.admit(
+                || "asked to stop",
+                || {
+                    assert!(asked_meanwhile.cancel(false));
+                    Ok::<_, &str>(7)
+                }
+            ),
+            Err("asked to stop"),
+            "a request to stop that comes while the checks run is not overridden"
         );
     }
 

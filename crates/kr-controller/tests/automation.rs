@@ -184,12 +184,13 @@ async fn working_host() -> Host {
 }
 
 /// A supervisor that waits at the door of a launch until the test lets it through, and counts the
-/// launches that have reached the door.
+/// launches that have reached the door and the workers the platform then started.
 #[derive(Debug)]
 struct AtTheDoor {
     inner: Box<dyn WorkerSupervisor>,
     open: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     arrived: Arc<std::sync::atomic::AtomicUsize>,
+    started: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl WorkerSupervisor for AtTheDoor {
@@ -206,7 +207,12 @@ impl WorkerSupervisor for AtTheDoor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         drop(open);
-        self.inner.start(launch)
+        let outcome = self.inner.start(launch);
+        if matches!(outcome, LaunchOutcome::Started(_)) {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        outcome
     }
 
     fn describe(&self) -> &'static str {
@@ -4232,6 +4238,7 @@ async fn live_command_session(control: &mut LocalClient) -> kr_protocol::session
 struct Door {
     open: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     arrived: Arc<std::sync::atomic::AtomicUsize>,
+    started: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Door {
@@ -4239,16 +4246,22 @@ impl Door {
         Self {
             open: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
             arrived: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            started: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
     async fn host(&self) -> Host {
-        let (open, arrived) = (Arc::clone(&self.open), Arc::clone(&self.arrived));
+        let (open, arrived, started) = (
+            Arc::clone(&self.open),
+            Arc::clone(&self.arrived),
+            Arc::clone(&self.started),
+        );
         working_host_through(move |inner| {
             Box::new(AtTheDoor {
                 inner,
                 open,
                 arrived,
+                started,
             })
         })
         .await
@@ -4257,6 +4270,11 @@ impl Door {
     /// How many launches have reached the door.
     fn launches(&self) -> usize {
         self.arrived.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many workers the platform started once the door was open.
+    fn workers_started(&self) -> usize {
+        self.started.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn until_a_launch_arrives(&self) {
@@ -4756,11 +4774,13 @@ async fn a_wait_that_ends_before_the_session_comes_into_being_makes_no_session()
         let settled_before = node_statuses(&host).len();
         let registry = hold_the_registry(&host);
         let running = run_from_another_task(&host, &document, "evt-too-late");
-        until("the node's wait to end", || {
+        // A node that has not begun is `pending` and one waiting for its action is `running`: the
+        // wait has ended once the engine has settled the node, and only then is the registry freed.
+        until("the engine to stop waiting for the node", || {
             node_statuses(&host).len() > settled_before
-                && node_statuses(&host)
-                    .last()
-                    .is_some_and(|status| status != NodeStatus::Running.as_str())
+                && node_statuses(&host).last().is_some_and(|status| {
+                    status != NodeStatus::Pending.as_str() && status != NodeStatus::Running.as_str()
+                })
         })
         .await;
         registry
@@ -4878,6 +4898,105 @@ async fn a_grant_withdrawn_before_the_worker_claims_its_launch_starts_no_named_s
         38,
         &[ActionRight::SessionCreate, ActionRight::TerminalInput],
         |host, _| create_session_node(host, Some("/bin/sh")),
+    )
+    .await;
+}
+
+/// A node's launch has passed the launch transition and waits at the supervisor's door; the node's
+/// wait ends there, and the door opens afterwards. The engine's request to stop is asked of a node
+/// whose admission has passed, and the worker's claim, which comes after it, is refused: no program
+/// starts and no session is made. What the node settles as is the runner's answer to the request.
+async fn a_wait_that_ends_at_the_door_makes_no_session(
+    number: u8,
+    rights: &[ActionRight],
+    node: impl FnOnce(&Host, &Path) -> WorkflowNode,
+    settles: NodeStatus,
+) {
+    let door = Door::shut();
+    let host = door.host().await;
+    let mut control = client(&host).await;
+    let marker = host.work().join("a-command-ran");
+    host.issue(grant_id(number), rights);
+    let mut document = definition(
+        workflow_id(number),
+        grant_id(number),
+        "a node",
+        node(&host, &marker),
+    );
+    // Long enough for the launch to reach the door under load; the node's wait ends there.
+    document.deadlines = WorkflowDeadlines {
+        run_deadline_ms: U64::new(60_000),
+        action_wait_ms: U64::new(4_000),
+    };
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+
+    let running = run_from_another_task(&host, &document, "evt-at-the-door");
+    door.until_a_launch_arrives().await;
+    until("the engine to stop waiting for the node", || {
+        node_statuses(&host).last().is_some_and(|status| {
+            status != NodeStatus::Pending.as_str() && status != NodeStatus::Running.as_str()
+        })
+    })
+    .await;
+    door.let_through();
+    let run: WorkflowRunResult = typed(
+        &running
+            .await
+            .expect("the run answers")
+            .expect("the run is answered"),
+    );
+    assert_eq!(run.status, WorkflowRunStatus::Cancelled, "{run:?}");
+    assert_eq!(
+        node_statuses(&host),
+        [settles.as_str()],
+        "what the node settles as is the runner's answer to the request to stop"
+    );
+    until("the refused launch to have failed its reservation", || {
+        reservation_phases(&host, grant_id(number)) == ["failed"]
+    })
+    .await;
+    // The platform started a worker, so the reservation failed at that worker's claim and not at a
+    // launch that never started.
+    assert_eq!(
+        door.workers_started(),
+        1,
+        "a worker was started and refused"
+    );
+    assert!(!marker.exists(), "the command never ran");
+    assert!(
+        all_sessions(&mut control)
+            .await
+            .iter()
+            .all(|session| session.closure.0.is_some()),
+        "no session is live"
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-25.14 and KR-REQ-25.19: a `create_session` node whose admission passed cannot be
+/// stopped, so its wait ending at the door leaves it unknown, and the claim that follows makes no
+/// session. The control is the case below, a command, which is stopped and so settles cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_wait_that_ends_at_the_door_leaves_a_created_session_unknown_and_makes_none() {
+    a_wait_that_ends_at_the_door_makes_no_session(
+        39,
+        &[ActionRight::SessionCreate],
+        |host, _| create_session_node(host, None),
+        NodeStatus::Unknown,
+    )
+    .await;
+}
+
+/// KR-REQ-25.14 and KR-REQ-25.19: a command whose launch waits at the door when its node's wait
+/// ends is stopped, settles cancelled, and never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_wait_that_ends_at_the_door_cancels_a_command_that_never_runs() {
+    a_wait_that_ends_at_the_door_makes_no_session(
+        40,
+        &COMMAND_RIGHTS,
+        |host, marker| command_node(host, "command", &format!("touch {}", marker.display())),
+        NodeStatus::Cancelled,
     )
     .await;
 }
