@@ -70,8 +70,7 @@ pub enum PrivacyCompletion {
         outstanding: Vec<PrivacyOutstanding>,
     },
     /// Something is in the way: a subsystem could not take a step or cannot say where its cleanup
-    /// stands. The last change has not finished taking effect, and it is not merely waiting for
-    /// work to settle.
+    /// stands. Something is still owed, and it is not merely waiting for work to settle.
     Unavailable {
         /// Each subsystem that could not answer, with its reason.
         unavailable: Vec<PrivacyUnavailable>,

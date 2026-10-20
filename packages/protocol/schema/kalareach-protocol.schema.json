@@ -27797,7 +27797,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "Something is in the way: a subsystem could not take a step or cannot say where its cleanup\nstands. The last change has not finished taking effect, and it is not merely waiting for\nwork to settle.",
+          "description": "Something is in the way: a subsystem could not take a step or cannot say where its cleanup\nstands. Something is still owed, and it is not merely waiting for work to settle.",
           "properties": {
             "outstanding": {
               "description": "Each subsystem with work outstanding, and how much.",
