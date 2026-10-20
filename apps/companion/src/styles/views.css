@@ -116,7 +116,7 @@
 .approval-source .code-block {
   max-height: 240px;
   overflow: auto;
-  white-space: pre-wrap;
+  white-space: break-spaces;
   overflow-wrap: anywhere;
   font: 0.6875rem/1.6 var(--font-mono);
 }
@@ -161,7 +161,7 @@
   border: 1px solid var(--line);
   border-radius: 6px;
   font: inherit;
-  white-space: pre-wrap;
+  white-space: break-spaces;
   overflow-wrap: anywhere;
 }
 
@@ -223,7 +223,7 @@
 }
 
 .question-context {
-  white-space: pre-wrap;
+  white-space: break-spaces;
 }
 
 .question-choices {
@@ -635,7 +635,7 @@
 
 /* An entry of a kind the conversation has no drawing for is its text, as the agent wrote it. */
 .entry-text {
-  white-space: pre-wrap;
+  white-space: break-spaces;
   overflow-wrap: anywhere;
 }
 
@@ -671,7 +671,7 @@
 .output-page {
   margin: 0;
   font: 0.75rem/1.55 var(--font-mono);
-  white-space: pre-wrap;
+  white-space: break-spaces;
   overflow-wrap: anywhere;
 }
 
@@ -709,7 +709,7 @@
   /* The command is typed as it is shown, so a run of spaces in a word is kept, and the size is the
      labels' rather than the smaller one a line of small text gives code. */
   font-size: 0.8125rem;
-  white-space: pre-wrap;
+  white-space: break-spaces;
   overflow-wrap: anywhere;
 }
 
@@ -1652,7 +1652,7 @@
 .confirmation-fact dd {
   margin: 0;
   overflow-wrap: anywhere;
-  white-space: pre-wrap;
+  white-space: break-spaces;
   user-select: text;
 }
 
@@ -1690,7 +1690,7 @@
   padding-left: var(--gap-3);
   border-left: 2px solid var(--warning-line);
   overflow-wrap: anywhere;
-  white-space: pre-wrap;
+  white-space: break-spaces;
   user-select: text;
 }
 
@@ -1746,7 +1746,7 @@
   margin: 6px 0;
   user-select: text;
   overflow-wrap: anywhere;
-  white-space: pre-wrap;
+  white-space: break-spaces;
 }
 
 /* The picture of an attached image: small, inside its chip, and never wider than the chip. */
