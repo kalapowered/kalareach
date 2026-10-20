@@ -1326,6 +1326,25 @@ test.describe('a passing message that comes while a sheet is open', () => {
     })
   }
 
+  // The message's action takes the person to the request it announces. A sheet that is open is
+  // in the way of where that leads, so it closes, and the focus goes to the request, where the
+  // person can act on it, and is still there when the sheet has gone.
+  test('takes the person to the request it announces, out of the sheet that was open', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 })
+    await page.goto('/harness.html')
+    await page.waitForSelector('.app-shell')
+    await page.getByRole('button', { name: /^Account/ }).click()
+    const sheet = page.getByTestId('sheet')
+    await expect(sheet).toHaveAttribute('data-presentation', 'here', { timeout: PRESENTATION_DEADLINE })
+    await page.evaluate((view) => {
+      window.krTestHost?.setConfirmations(view)
+    }, REQUEST)
+    await page.getByRole('dialog').getByRole('button', { name: 'Review' }).click()
+    await expect(sheet).toBeHidden({ timeout: PRESENTATION_DEADLINE })
+    // The sheet's own return of the focus to the control that opened it does not take it from the row.
+    await expect(page.getByTestId('confirmation-row')).toBeFocused()
+  })
+
   // A sheet keeps the focus: a message that goes while it has the focus does not leave it on the page
   // behind. It goes back to where it came from in the sheet, and where that is gone (a press that
   // left the focus on nothing) to the control that closes the sheet, which commits nothing.

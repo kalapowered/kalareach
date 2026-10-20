@@ -633,6 +633,17 @@ const REDUCED_MOTION_FADE_MS = 120
  */
 export type SheetPresentation = 'arriving' | 'here' | 'leaving'
 
+/** The close of each sheet that is open, so that the application can ask them all to go. */
+const openSheets = new Set<() => void>()
+
+/**
+ * Asks every open sheet to close, as the control that closes it does. A request that takes the
+ * person to another screen uses it, so that what it shows is not behind a sheet.
+ */
+export function closeSheets(): void {
+  for (const close of Array.from(openSheets)) close()
+}
+
 /**
  * A surface that opens over the screen it belongs to, and can be dragged away.
  *
@@ -710,6 +721,14 @@ export function Sheet({
   const close = useCallback(() => {
     onClose()
   }, [onClose])
+
+  useEffect(() => {
+    if (!open) return
+    openSheets.add(close)
+    return () => {
+      openSheets.delete(close)
+    }
+  }, [open, close])
 
   // A message in passing is drawn inside an open surface, in the place the surface keeps for it, and
   // goes back to the screen as the surface starts to leave.
@@ -797,7 +816,11 @@ export function Sheet({
     document.addEventListener('keydown', onKey)
     return () => {
       document.removeEventListener('keydown', onKey)
-      restoreFocus.current?.focus()
+      // The control that opened the surface has the focus again, unless the focus is already
+      // somewhere the surface did not take it from: something put it there on purpose while the
+      // surface was going, and the surface's leaving does not take it away.
+      const active = document.activeElement
+      if (active === null || active === document.body) restoreFocus.current?.focus()
     }
   }, [mounted])
 

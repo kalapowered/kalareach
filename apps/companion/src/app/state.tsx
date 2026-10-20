@@ -22,7 +22,7 @@ import type { ActionRight } from '@kalareach/protocol'
 
 import type { HostPort } from '../host/port'
 import { AnnouncementScope } from '../components/announcements'
-import type { ToastAction, ToastMessage } from '../components/ui'
+import { closeSheets, type ToastAction, type ToastMessage } from '../components/ui'
 import { DraftBook } from '../model/draft-book'
 import { ManualPaths } from '../model/manual-paths'
 import { QuestionForms } from '../model/question-forms'
@@ -244,6 +244,9 @@ export function AppProvider({
         const action: ToastAction = {
           label: 'Review',
           act: () => {
+            // A sheet that is open is in the way of where this leads, and the row it focuses would
+            // be behind it.
+            closeSheets()
             go({ view: 'attention' })
             review()
           }
