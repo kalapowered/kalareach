@@ -618,7 +618,8 @@ impl Settings {
         &self.requests
     }
 
-    /// Whether the page was shown a device taken out by a revoke.
+    /// Whether the page is shown a device kept out because of a revoke: one taken out by it, or one
+    /// never shared with that a request on record keeps from being offered.
     #[must_use]
     pub fn shows_held_out(&self) -> bool {
         self.sync.get().is_some_and(SettingsSync::shows_held_out)

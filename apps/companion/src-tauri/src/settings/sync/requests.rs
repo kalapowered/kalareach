@@ -12,10 +12,10 @@
 //! which it makes before it acts, and the feed showing that the host refused it because this
 //! computer holds no owner authority there or the host does not know the device. Nothing else
 //! does. A feed that does not show the request, a restart, a host that is asleep, an answer that
-//! was lost, a host that refused it as covered by a later request and a service this computer no
-//! longer uses all leave it where it is, because none of them says the request cannot be carried
-//! out. Another request, however it ends, cannot release this one. A record that cannot be read
-//! holds every device.
+//! was lost, a host that refused it because an earlier revocation covers it and a service this
+//! computer no longer uses all leave it where it is, because none of them says the request cannot
+//! be carried out. Another request, however it ends, cannot release this one. A record that cannot
+//! be read holds every device.
 //!
 //! Two other ways out. A request that is not sent, because the hold on the settings could not be
 //! made durable first, is let go of at once. Forgetting a host lets go of what was recorded for its

@@ -1325,8 +1325,8 @@ fn own_requests<'a>(
 /// The identities of the requests the feed shows the host refused because it cannot carry them
 /// out: this computer holds no owner authority on the host, or the host does not know the device. A
 /// refusal names the request, so no list of the host's devices is needed to see it. A request the
-/// host refused as covered by a later one (`Superseded`) is not among them: what covers it has
-/// revoked the device or will, and a host that did so and is asleep again says nothing more.
+/// host refused because an earlier revocation covers it (`Superseded`) is not among them: the host
+/// found the device already revoked, and a host that did so and is asleep again says nothing more.
 fn refused_by_the_host(own: &[Verified<'_>]) -> Vec<String> {
     own.iter()
         .filter(|request| {
