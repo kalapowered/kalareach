@@ -254,9 +254,16 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--gap-3);
+  /* A name too long to leave its status room goes on a line of its own and the status under it,
+     rather than the status being squeezed until its word breaks. */
+  flex-wrap: wrap;
+  gap: var(--gap-1) var(--gap-3);
   padding: var(--gap-2) 0;
   border-bottom: 1px solid var(--line);
+}
+
+.setup-governs > li > .badge {
+  flex: none;
 }
 
 .setup-governs > li:last-child {

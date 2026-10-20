@@ -648,6 +648,35 @@ test.describe('the first-start assistant', () => {
       .toBe('1')
   }
 
+  /**
+   * The words of the text directly inside each element that `selector` finds that are drawn across
+   * two lines. A word is a run of letters, so a break at a hyphen or a slash is a break between
+   * words and not a broken one.
+   */
+  function brokenWords(page: Page, selector: string): Promise<string[]> {
+    return page.evaluate((found) => {
+      const broken: string[] = []
+      for (const element of document.querySelectorAll(found)) {
+        if (element.getBoundingClientRect().width === 0) continue
+        for (const text of Array.from(element.childNodes)) {
+          if (!(text instanceof Text)) continue
+          for (const word of text.data.matchAll(/\p{L}+/gu)) {
+            const start = word.index ?? 0
+            const range = document.createRange()
+            range.setStart(text, start)
+            range.setEnd(text, start + word[0].length)
+            const boxes = Array.from(range.getClientRects()).filter((box) => box.width > 0)
+            if (boxes.length === 0) continue
+            const top = Math.min(...boxes.map((box) => box.top))
+            const line = Math.min(...boxes.map((box) => box.height))
+            if (boxes.some((box) => box.top - top > line / 2)) broken.push(word[0])
+          }
+        }
+      }
+      return broken
+    }, selector)
+  }
+
   // KR-REQ-03.28: the permission cards' footers say where the switch is and open its pane, and at
   // the largest text size, on a wide window and a narrow one, in the runner's face, the footer and
   // its controls stay inside the card and the window.
@@ -798,7 +827,8 @@ test.describe('the first-start assistant', () => {
 
   // KR-REQ-03.28, KR-REQ-03.29: on every step of the path, at each text size and on a wide window
   // and a narrow one, in the runner's face, nothing is drawn past the window or past the box that
-  // holds it, and the page does not scroll sideways.
+  // holds it, the page does not scroll sideways, and no badge or capability name is broken in the
+  // middle of a word.
   for (const [width, height] of WINDOWS) {
     for (const [size, ratio] of TEXT_SIZES) {
       test(`draws nothing on any step past the window at the ${size} text size, ${width} wide`, async ({
@@ -821,6 +851,14 @@ test.describe('the first-start assistant', () => {
           if (sideways > 1) found.push(`the ${name} step scrolls sideways by ${String(sideways)} px`)
           for (const each of new Set(await overrunning(page, '.setup'))) {
             found.push(`the ${name} step: ${each}`)
+          }
+          // A badge and the name of a capability are short and say one thing: a word of either that
+          // is broken across two lines reads as a mistake, and is the way a row that squeezes its
+          // badge shows.
+          const short = '.setup .badge, .setup-governs > li > span:first-child'
+          expect(await page.locator(short).count(), `the ${name} step has badges`).toBeGreaterThan(0)
+          for (const word of new Set(await brokenWords(page, short))) {
+            found.push(`the ${name} step: "${word}" is broken across two lines`)
           }
           await capture(page, `setup-${name}-fits-${size}-${width}-03.28`)
         }
