@@ -111,6 +111,26 @@ async function withTextSize(page: Page, size: string): Promise<void> {
   }, size)
 }
 
+/**
+ * Sets the ratio the system gives the page, on the root before the page loads, as a phone that
+ * already had the setting opens it: the root's text is the platform's, multiplied by it.
+ */
+async function withSystemTextScale(page: Page, ratio: number): Promise<void> {
+  await page.addInitScript((value) => {
+    const apply = (): boolean => {
+      const root = document.documentElement as HTMLElement | null
+      if (root === null) return false
+      root.style.setProperty('--text-scale', String(value))
+      return true
+    }
+    if (!apply()) {
+      new MutationObserver((_, observer) => {
+        if (apply()) observer.disconnect()
+      }).observe(document, { childList: true })
+    }
+  }, ratio)
+}
+
 /** Where the focus is, as the element's tag and id, or `body` where nothing holds it. */
 async function focusedNow(page: Page): Promise<string> {
   return page.evaluate(() =>
@@ -3373,6 +3393,57 @@ test.describe('the keyboard', () => {
     await page.keyboard.type('typed with the keyboard')
     await expect(composer).toHaveValue('typed with the keyboard')
   })
+
+  // The skip link is there for a keyboard. Until it has focus it is out of sight, at every text size
+  // (it was parked a fixed 60 px above the window, which a link that grows with the text outgrows, so
+  // at the two largest sizes a strip of it lay over the first lines of the page); with focus it is
+  // wholly inside the window.
+  const SKIP_SIZES = [
+    ['default', 1],
+    ['one and a half times', 1.5],
+    ['twice', 2],
+    ['the second largest', 47 / 17],
+    ['the largest', 53 / 17]
+  ] as const
+  for (const [width, height] of [
+    [1280, 720],
+    [390, 844]
+  ] as const) {
+    for (const [size, ratio] of SKIP_SIZES) {
+      test(`keeps the skip link out of sight until it has focus, ${size} text, ${width} px wide`, async ({
+        page
+      }) => {
+        await withSystemTextScale(page, ratio)
+        await page.setViewportSize({ width, height })
+        await open(page)
+        const skip = page.getByRole('link', { name: 'Skip to content' })
+        const place = () =>
+          skip.evaluate((link) => {
+            const box = link.getBoundingClientRect()
+            return {
+              top: box.top,
+              bottom: box.bottom,
+              left: box.left,
+              right: box.right,
+              window: { width: window.innerWidth, height: window.innerHeight }
+            }
+          })
+        const before = await place()
+        expect(before.bottom, 'no part of the link lies in the window while it has no focus').toBeLessThanOrEqual(0)
+
+        await skip.focus()
+        const after = await place()
+        expect(after.top, 'the focused link starts inside the window').toBeGreaterThanOrEqual(0)
+        expect(after.left).toBeGreaterThanOrEqual(0)
+        expect(after.right, 'and ends inside it').toBeLessThanOrEqual(after.window.width)
+        await expect(skip).toBeInViewport({ ratio: 1 })
+        await page.screenshot({ path: shot(`skip-link-${ratio.toFixed(2)}-${width}-${test.info().project.name}`) })
+
+        await page.locator('#main').focus()
+        expect((await place()).bottom, 'it goes out of sight again when the focus leaves').toBeLessThanOrEqual(0)
+      })
+    }
+  }
 
   // KR-REQ-13.20: text streaming into a conversation carries no animation and no transition, of
   // any property, on the text or on anything that contains it, from the moment it is inserted and

@@ -156,19 +156,27 @@ main:focus {
   border: 0;
 }
 
+/* The link is for a keyboard: out of sight until it has focus, at every text size. It is parked by its
+   own height, above the window, and not by a distance: a link that grows with the text outgrows a
+   fixed one and shows over the page. With focus it comes to rest inside the window, and it wraps
+   inside it where its words are wider than the room. It does not move: a key arrives at once. */
 .skip-link {
   position: fixed;
-  top: -60px;
+  top: 0;
   left: 16px;
   z-index: 100;
+  max-inline-size: calc(100vw - 32px);
   padding: 10px 16px;
   background: var(--text);
   color: var(--bg);
   border-radius: 7px;
+  /* A pixel or two more than its height, so that a box of a fractional height rounds to above the window. */
+  transform: translateY(calc(-100% - 2px));
 }
 
 .skip-link:focus {
   top: 12px;
+  transform: none;
 }
 
 .eyebrow {
