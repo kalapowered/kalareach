@@ -796,6 +796,39 @@ test.describe('the first-start assistant', () => {
     }
   }
 
+  // KR-REQ-03.28, KR-REQ-03.29: on every step of the path, at each text size and on a wide window
+  // and a narrow one, in the runner's face, nothing is drawn past the window or past the box that
+  // holds it, and the page does not scroll sideways.
+  for (const [width, height] of WINDOWS) {
+    for (const [size, ratio] of TEXT_SIZES) {
+      test(`draws nothing on any step past the window at the ${size} text size, ${width} wide`, async ({
+        page
+      }) => {
+        await openSetup(page)
+        await sizeTo(page, width, height, ratio)
+        // Every step is measured before the case says what it found, so that one run names each
+        // thing that runs out of the window and not the first.
+        const found: string[] = []
+        for (const name of ['identity', 'permissions', 'capabilities', 'host', 'ready']) {
+          await step(page, name)
+          if (name === 'capabilities') await openEveryEvidence(page)
+          await page.evaluate(() => {
+            window.scrollTo(0, window.scrollY)
+          })
+          const sideways = await page.evaluate(
+            () => document.documentElement.scrollWidth - document.documentElement.clientWidth
+          )
+          if (sideways > 1) found.push(`the ${name} step scrolls sideways by ${String(sideways)} px`)
+          for (const each of new Set(await overrunning(page, '.setup'))) {
+            found.push(`the ${name} step: ${each}`)
+          }
+          await capture(page, `setup-${name}-fits-${size}-${width}-03.28`)
+        }
+        expect(found, 'what runs out of the window').toEqual([])
+      })
+    }
+  }
+
   test('draws in both colour modes from the same tokens', async ({ page }) => {
     await openSetup(page)
     await step(page, 'capabilities')

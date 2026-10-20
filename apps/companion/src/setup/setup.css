@@ -20,6 +20,10 @@
   max-width: 46rem;
   margin: 0 auto;
   padding-bottom: var(--gap-6);
+  /* A word wider than its line, such as a path or an identifier at a large text size, is broken
+     where it meets the edge of its box and does not run out of it. Every element below inherits
+     it. */
+  overflow-wrap: anywhere;
 }
 
 /*
@@ -58,6 +62,29 @@
  */
 .setup .card-header {
   flex-wrap: wrap;
+}
+
+/*
+ * A badge says where something stands, in a few words. One that is longer than the card's room
+ * wraps inside its own box instead of running past the card's edge, and the box is never wider
+ * than the card.
+ */
+.setup .badge {
+  white-space: normal;
+  max-inline-size: 100%;
+}
+
+/*
+ * The words of a banner take the width and a button that does not fit beside them wraps under
+ * them, inside the window, so that the words keep a readable measure at a large text size.
+ */
+.setup .banner {
+  flex-wrap: wrap;
+}
+
+.setup .banner > .spacer {
+  flex: 1 1 12rem;
+  min-width: 0;
 }
 
 /*
@@ -191,7 +218,11 @@
 .setup-controls {
   display: flex;
   align-items: center;
-  gap: var(--gap-3);
+  /* Back is at one edge and Continue at the other. At a large text size on a narrow window the two
+     do not fit on a line, and the second goes under the first, inside the window. */
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--gap-2) var(--gap-3);
   position: sticky;
   bottom: 0;
   padding: var(--gap-3) 0;

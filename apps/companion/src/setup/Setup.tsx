@@ -481,10 +481,10 @@ export function Setup(): ReactNode {
           onClick={() => {
             setStep((index) => Math.max(0, index - 1))
           }}
+          data-wraps
         >
           Back
         </Button>
-        <span className="spacer" />
         <Button
           tone="primary"
           disabled={step === STEPS.length - 1}
@@ -492,6 +492,7 @@ export function Setup(): ReactNode {
           onClick={() => {
             setStep((index) => Math.min(STEPS.length - 1, index + 1))
           }}
+          data-wraps
         >
           Continue
         </Button>
@@ -681,7 +682,7 @@ function PermissionsStep({
         title="These are four separate permissions"
         detail={CEILING}
         action={
-          <Button onClick={onExplainChecks} data-testid="setup-explain-checks">
+          <Button onClick={onExplainChecks} data-testid="setup-explain-checks" data-wraps>
             What the checks do
           </Button>
         }
