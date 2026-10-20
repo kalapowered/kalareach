@@ -320,11 +320,12 @@ jobs:
       #
       # It sits after every check that reads only this repository, so all of those have reported by
       # the time anything here contacts a service, and a deployment that is unreachable fails this
-      # job without taking their answers with it. Every step after it states `!cancelled()`.
+      # job without taking their answers with it. Every check after it states `!cancelled()`, except
+      # the step that keeps the legs' logs, which runs whatever happened.
       #
       # Each leg writes its whole output to a log of its own in a `deployment-*` directory under
-      # `KR_TEST_ARTIFACTS_DIR`, which "Keep the performance evidence" below uploads, so a leg that
-      # failed is read from its log in the `performance-evidence` artifact. The logs carry no
+      # `KR_TEST_ARTIFACTS_DIR`, which "Keep the deployment legs' logs" below uploads as the
+      # `deployment-legs` artifact, so a leg that failed is read from its log there. The logs carry no
       # credential: a leg prints the rule it proved, what it could not give back, the failure of its
       # own assertions and the error of a request it could not carry, which names the origin, the
       # path and the fault. It never prints a request, a token or a key, and the keys it holds print
@@ -332,6 +333,19 @@ jobs:
       - name: The deployment answers every leg
         if: ${{ !cancelled() }}
         run: bash scripts/e2e-deployment.sh "$KR_CHECKPOINT_ORIGIN"
+
+      # The log of every leg the step ran, kept whatever the step did: a leg that failed, a step that
+      # stopped before the legs and a step that was cancelled all leave what they wrote. It is an
+      # artifact of its own, named for what it holds, so a run's legs are found by name and not among
+      # the performance figures. A step that stopped before it made its directory leaves nothing,
+      # which the upload says and does not count as a second failure.
+      - name: Keep the deployment legs' logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deployment-legs
+          path: /tmp/kr-test-artifacts/deployment-*
+          if-no-files-found: warn
 
       # A collection key belongs in the operating system's own credential store, and on this system
       # that is the Secret Service. A headless runner has neither the service nor a session bus to
@@ -409,16 +423,17 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked --release -p kr-transport --test perf -- --nocapture --test-threads=1
 
-      # The figures and verdicts the two steps above wrote, and the log of every leg the deployment
-      # step ran, kept whether or not they met their targets or passed: a run that fell short is the
-      # evidence for how far short it fell, and on which processor, and a leg that failed is the
-      # evidence for what it saw.
+      # The figures and verdicts the two steps above wrote, kept whether or not they met their
+      # targets: a run that fell short is the evidence for how far short it fell, and on which
+      # processor. The deployment legs' logs are kept once, by their own step above.
       - name: Keep the performance evidence
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: performance-evidence
-          path: /tmp/kr-test-artifacts
+          path: |
+            /tmp/kr-test-artifacts
+            !/tmp/kr-test-artifacts/deployment-*
           if-no-files-found: error
 
       # What the disk had left once the build and every check above it were done, beside the
