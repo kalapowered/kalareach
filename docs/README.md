@@ -245,6 +245,10 @@ credential shapes by content, in the commits it is about to send, the packages i
 deployment bundle, and makes the same proof of its `.gitignore` in a repository of its own. The
 catalogue's `scripts/check-local-names.sh` makes that proof for the catalogue repository.
 
+Core and the catalogue check their locks against the RustSec advisory database on every push to
+main and every pull request, and the `advisories` workflow in each repeats the check daily on main.
+A finding fails the run.
+
 There is no second specification hierarchy. The protocol reference, its generated method index and
 glossary, and the generated schemas and vectors live beside the code they describe, in
 `docs/protocol/`, `packages/protocol/` and `fixtures/`, and each part's reference lives under
