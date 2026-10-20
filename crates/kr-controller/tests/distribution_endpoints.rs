@@ -4,8 +4,9 @@
 //! nothing by itself. These cases are the parts of that check that can only run inside a
 //! distribution, against the control daemon the distribution already runs, over the network that
 //! distribution has. `scripts/e2e-wsl.sh` runs them in each of two distributions in turn and hands
-//! one distribution's endpoint to the other, so every case is ignored here and does nothing in an
-//! ordinary test run: it needs a daemon this run did not start.
+//! one distribution's endpoint to the other, and `scripts/distribution-cases.sh` does the same for
+//! two installations on one Unix machine, which `scripts/end-to-end.sh` runs. Every case is ignored
+//! here and does nothing in an ordinary test run: it needs a daemon this run did not start.
 //!
 //! * `prepare_the_network` selects the loopback network in this installation's configuration
 //!   document, and refuses a document that already names a relay or a discovery service. The

@@ -189,6 +189,17 @@ for entry in "${suites[@]}"; do
   fi
 done
 
+# The pairing suite of kr-controller needs two installations with a control daemon each, which no
+# test of a single binary starts; the script starts them, runs the suite's cases in each and ends
+# them.
+echo
+echo "running the pairing suite across two installations"
+echo "  demonstrates: each installation has its own paired endpoint and its own grants, and a viewer paired with one is ended by the other"
+if ! bash "$root/scripts/distribution-cases.sh"; then
+  echo "FAILED: scripts/distribution-cases.sh"
+  failed=1
+fi
+
 echo
 if ! check_no_survivors; then
   failed=1
