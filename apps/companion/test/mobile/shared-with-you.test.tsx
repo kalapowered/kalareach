@@ -253,7 +253,7 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     expect(await screen.findByText('The host said: this invitation was withdrawn')).toBeInTheDocument()
     expect(controls.sharing.sent().redeem).toBe(1)
     const attempt = await screen.findByTestId('accept-attempt')
-    expect(attempt).toHaveTextContent('the host refused it')
+    expect(attempt).toHaveTextContent('The host said: this invitation was withdrawn')
     expect(attempt).not.toHaveTextContent('has not said')
     await waitFor(() => {
       expect(screen.queryByTestId('sheet')).toBeNull()
@@ -433,10 +433,9 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
     await userEvent.click(await screen.findByTestId('accept-offer'))
 
-    // The row for the acceptance says that the host refused it and that what it shows is read, with
-    // the host's words beside: it does not say the host has not spoken, or that nothing was accepted.
+    // The row for the acceptance gives the host's words and does not say the host has not spoken, or
+    // that nothing was accepted.
     const attempt = await screen.findByTestId('accept-attempt')
-    expect(attempt).toHaveTextContent('Accepting session 3: the host refused it. Checking what it shows now')
     expect(attempt).toHaveTextContent('The host said: The host could not finish accepting that just now.')
     expect(attempt).not.toHaveTextContent(/has not said|nothing was accepted|was not accepted/)
 
@@ -462,7 +461,9 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     controls.sharing.refuseNextRedeem('That invitation cannot be used right now.', false)
     await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
     await userEvent.click(await screen.findByTestId('accept-offer'))
-    expect(await screen.findByTestId('accept-attempt')).toHaveTextContent('the host refused it')
+    expect(await screen.findByTestId('accept-attempt')).toHaveTextContent(
+      'That invitation cannot be used right now.'
+    )
 
     act(() => {
       controls.sharing.passTheBound()

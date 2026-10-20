@@ -246,7 +246,8 @@ export function isOpen(attempt: AttemptView): boolean {
  *
  * An attempt that can still happen says until when; one that is over says how it ended, and never
  * says "not done" for a refusal or an unknown. An acceptance the host refused, which is read all the
- * same, says that the host refused it: the host's reason stands beside the words, as the host gave it.
+ * same, says that the host did not confirm it and that what it shows is being read: the host's
+ * reason stands beside the words, as the host gave it.
  */
 export function attemptWords(attempt: AttemptView, nowMs: number): string {
   const until =
@@ -258,11 +259,11 @@ export function attemptWords(attempt: AttemptView, nowMs: number): string {
     return `Waiting for an owner device to confirm: ${label}. Cancel it to ask again.`
   }
   if (attempt.phase !== 'closed') {
-    // The host refused the first send of an acceptance, and what it shows is read all the same, in
-    // case it wrote the share before it refused. The refusal is the host's word, so the words do
-    // not say it has not spoken.
+    // The host answered the send of an acceptance with an error, and what it shows is read all the
+    // same, in case it wrote the share before it answered. The error is the host's word, so the
+    // words do not say it has not spoken, and they claim no more of it than that it did not confirm.
     if (attempt.kind === 'redeem' && attempt.phase === 'checking' && attempt.refusal !== null) {
-      return `${label}: the host refused it. Checking what it shows now, in case it went through first.`
+      return `${label}: the host did not confirm it. Checking what it shows now, in case it went through first.`
     }
     // With no time to say, it can no longer be told by waiting: only the host can say.
     const asking = attempt.can_happen_until_ms === null ? ' It may have happened; ask the host.' : until

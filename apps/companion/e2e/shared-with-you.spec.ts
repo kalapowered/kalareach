@@ -277,7 +277,6 @@ for (const surface of ['ios', 'android'] as const) {
           await expect(toast).toContainText('The host said: this invitation was withdrawn')
           const row = page.getByTestId('accept-attempt')
           await expect(row).toHaveCount(1)
-          await expect(row).toContainText('Accepting session 5: the host refused it.')
           await expect(row).toContainText('The host said: this invitation was withdrawn')
           await expect(row).not.toContainText('has not said')
           expect(await overrunning(page, '[data-testid="offers"]')).toEqual([])

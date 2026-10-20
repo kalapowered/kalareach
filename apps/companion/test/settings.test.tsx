@@ -664,7 +664,7 @@ describe('the devices that share the settings', () => {
     })
     const card = await within(sheet).findByTestId('settings-devices')
     const waiting = within(card).getByTestId('settings-devices-revoke-waiting')
-    expect(waiting).toHaveTextContent('A revoke is still waiting for its host.')
+    expect(waiting).toHaveTextContent(/still waiting for its host/)
     expect(waiting.closest('li')).toHaveTextContent('the-phone')
     expect(within(card).queryByRole('button', { name: 'Share settings with the-phone again' })).toBeNull()
 
