@@ -866,7 +866,8 @@ async fn kr_req_18_13_a_session_that_closes_leaves_an_invitation_that_ran_out_as
 /// KR-REQ-18.13: an invitation that ran out on the host's continuous clock, while the wall clock
 /// still reads it as running, has ended too, and a close leaves it as it ended: a device that
 /// redeems it is told it ran out and not that it was withdrawn. The continuous clock is moved by
-/// hand, past the invitation's end, and the wall clock is not moved.
+/// hand, past the invitation's end, and the wall clock is not moved, so the host distrusts its
+/// clock and cannot show the invitation in force.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_18_13_a_session_that_closes_leaves_an_invitation_that_ran_out_on_the_continuous_clock()
  {
@@ -908,6 +909,112 @@ async fn kr_req_18_13_a_session_that_closes_leaves_an_invitation_that_ran_out_on
     assert!(refused.message.contains("expired"), "{refused:?}");
     assert!(!refused.message.contains("withdrawn"), "{refused:?}");
     connection.close();
+    host.stop().await;
+}
+
+/// KR-REQ-18.13: the same for an invitation whose grant the host had anchored on the continuous
+/// clock while the clock was trusted, which then ran out there: the close finds the end and writes
+/// it down, and leaves the invitation, so the device is told it ran out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_18_13_a_close_writes_down_the_end_of_an_anchored_invitation_and_leaves_it() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let continuous = kr_transport::clock::ManualClock::new();
+    let mut clocks = MovedWall::new().clocks();
+    clocks.continuous = std::sync::Arc::new(continuous.clone());
+    let host = Host::start_on_clocks(&owner, clocks).await;
+    let (device, record) = recipient(&host, &owner).await;
+    let connection = RawDevice::connect(&host, &device, &record).await;
+    let (session, _) = an_open_session(&host);
+    let short = share_with(
+        &host,
+        session,
+        record.device_id,
+        RoleSelection::plain(SessionRole::Viewer),
+        Some(60_000),
+    )
+    .await
+    .expect("a short share is written");
+    // The device asks what is offered to it, and the host anchors the offer's grant on the
+    // continuous clock while that clock is trusted.
+    assert_eq!(all_of_it(&connection).await.offers.len(), 1);
+    continuous.advance(Duration::from_secs(5 * 60));
+
+    host.controller()
+        .retire(&closed(session))
+        .await
+        .expect("the session closes");
+
+    let grants = host.controller().sharing().grants();
+    assert!(
+        grants
+            .grant_expired_at(short.grant.grant_id)
+            .expect("the end is read")
+            .is_some(),
+        "the close found the invitation's end and wrote it down"
+    );
+    let refused = connection
+        .mutate(
+            Method::GrantRedeem,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(&host),
+            &GrantRedeemParams {
+                invitation_id: short.preview.invitation_id,
+            },
+        )
+        .await
+        .expect_err("an invitation that ran out is not redeemed");
+    assert!(refused.message.contains("expired"), "{refused:?}");
+    assert!(!refused.message.contains("withdrawn"), "{refused:?}");
+    connection.close();
+    host.stop().await;
+}
+
+/// KR-REQ-18.13: a request that finds an invitation's end between the close's reading of it and
+/// its withdrawal has answered that the invitation ran out, and the withdrawal then leaves it as
+/// it ended. The request is stood in for by writing down the end, as a redeem does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_18_13_a_withdrawal_leaves_an_invitation_whose_end_was_found_since_it_was_read() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (_device, record) = recipient(&host, &owner).await;
+    let (session, _) = an_open_session(&host);
+    let waiting = share(&host, session, record.device_id).await;
+    let (other, _) = an_open_session(&host);
+    let untouched = share(&host, other, record.device_id).await;
+    let grants = host.controller().sharing().grants();
+    let now_ms = kr_ipc::now_ms().get();
+    let sessions = std::collections::BTreeSet::from([session, other]);
+
+    let read = grants
+        .waiting_invitations(&sessions, now_ms)
+        .expect("the waiting invitations are read");
+    assert_eq!(read.len(), 2);
+    // A redeem finds the end of the first between the reading and the withdrawal.
+    grants
+        .record_grant_expiry(waiting.grant.grant_id, now_ms)
+        .expect("the end is written down");
+    let ids: Vec<GrantId> = read.iter().map(|record| record.grant.grant_id).collect();
+
+    let withdrawn = grants
+        .withdraw_waiting_grants(&ids, now_ms)
+        .expect("the withdrawal runs");
+
+    assert_eq!(withdrawn, [untouched.grant.grant_id]);
+    let states = |grants: &[GrantSummary]| grants.iter().map(|g| g.state).collect::<Vec<_>>();
+    // Not withdrawn: the grant is not revoked and its invitation is not cancelled.
+    assert_eq!(
+        states(&issued_over(&host, session).await),
+        [GrantState::Pending]
+    );
+    let kept = grants
+        .invitation(waiting.preview.invitation_id)
+        .expect("the invitation is read")
+        .expect("the invitation is held");
+    assert_eq!(kept.state, kr_protocol::sharing::InvitationState::Open);
+    assert_eq!(
+        states(&issued_over(&host, other).await),
+        [GrantState::Revoked]
+    );
     host.stop().await;
 }
 
