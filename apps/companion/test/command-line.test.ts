@@ -46,13 +46,13 @@ describe('a command written for the shell that reads it', () => {
     expect(commandLine(['git', 'status'], 'powershell')).toBe('git status')
   })
 
-  it('quotes a PowerShell word that starts with a dash and holds a dot, which it cuts at the dot', () => {
-    for (const argument of ['-Dfoo.bar=baz', '-o.txt', '-a.b']) {
+  it('quotes a PowerShell word that starts with one dash and holds a dot, which it cuts at the dot', () => {
+    for (const argument of ['-Dfoo.bar=baz', '-o.txt', '-a.b', '-v1.2']) {
       expect(commandLine(['show', argument], 'powershell')).toBe(`show '${argument}'`)
     }
-    // Where the dot does not follow a single dash, or a word has none, the word is whole as it is.
-    expect(commandLine(['show', '--model=gpt-5.1', '-a:b', 'a.b'], 'powershell')).toBe(
-      'show --model=gpt-5.1 -a:b a.b'
+    // A word with two dashes, or none, is whole as it is.
+    expect(commandLine(['show', '--model=gpt-5.1', '--a.b', '-a:b', 'a.b'], 'powershell')).toBe(
+      'show --model=gpt-5.1 --a.b -a:b a.b'
     )
   })
 

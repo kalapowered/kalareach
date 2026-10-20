@@ -22,9 +22,10 @@ function word(argument: string, kind: ShellKind): string {
     // Its stop-parsing token is left out of a program's arguments wherever it is written, quoted or
     // not, and the array expression is the one spelling that passes it on.
     if (argument === '--%') return "@('--%')"
-    // `@` at the start of a word splats a variable, a comma makes a list, and a dash word that holds
-    // a dot is cut at the dot into a parameter and a number.
-    const dashWithDot = argument.startsWith('-') && argument.includes('.')
+    // `@` at the start of a word splats a variable, a comma makes a list, and a word that starts with
+    // one dash and holds a dot is cut at the dot into a parameter and the rest.
+    const dashWithDot =
+      argument.startsWith('-') && !argument.startsWith('--') && argument.includes('.')
     if (PLAIN.test(argument) && !/[@,]/.test(argument) && !dashWithDot) return argument
     return `'${argument.replace(POWERSHELL_QUOTES, '$&$&')}'`
   }
