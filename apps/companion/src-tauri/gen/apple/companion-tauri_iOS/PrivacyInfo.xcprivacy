@@ -12,8 +12,8 @@
 <dict>
 	<!--
 		Tracking. The application does not track. It links neither AdSupport nor
-		AppTrackingTransparency, carries no advertising or analytics library (Firebase Messaging is
-		the only Google library in it), and sends nothing to a data broker.
+		AppTrackingTransparency, carries no advertising library and no analytics product (the Google
+		libraries in it are Firebase Messaging and what it needs), and sends nothing to a data broker.
 	-->
 	<key>NSPrivacyTracking</key>
 	<false/>
@@ -21,11 +21,11 @@
 	<array/>
 	<!--
 		Data collected. Each entry is data that leaves the device to a service the application
-		reaches, in a form that service (or its provider) can read or keep beyond answering the
-		request. None is used for tracking, and each is tied to the account or installation that
-		sent it. Content the application seals on the device before sending (settings, drafts, the
-		recovery bundle, sealed mailbox items) is listed as Other User Content because the services
-		keep the sealed bytes, although they cannot read them.
+		reaches and that the service (or its provider) can read and keeps beyond answering the
+		request. Each is tied to the account or installation that sent it, and none is used for
+		tracking. Content the application seals on the device before sending (settings, drafts, the
+		recovery bundle) is not here: the sync service holds ciphertext it cannot read, and Apple
+		counts data stored in a readable form.
 	-->
 	<key>NSPrivacyCollectedDataTypes</key>
 	<array>
@@ -33,6 +33,20 @@
 		<dict>
 			<key>NSPrivacyCollectedDataType</key>
 			<string>NSPrivacyCollectedDataTypeEmailAddress</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<!-- An organisation's identity provider can supply a name at an organisation sign-in; the
+			account service keeps it and the application reads it back. -->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeName</string>
 			<key>NSPrivacyCollectedDataTypeLinked</key>
 			<true/>
 			<key>NSPrivacyCollectedDataTypeTracking</key>
@@ -57,8 +71,9 @@
 		</dict>
 		<!--
 			The keys that identify this device to the services (the endpoint key a relay and the
-			discovery service see, the installation key that signs requests), and the notification
-			registration token Firebase makes for the Apple push token.
+			discovery service see, the installation key that signs requests), the notification
+			registration token Firebase makes for the Apple push token, and the network address a
+			sign-in request carried, which the account service keeps in the session record.
 		-->
 		<dict>
 			<key>NSPrivacyCollectedDataType</key>
@@ -72,7 +87,8 @@
 				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
 			</array>
 		</dict>
-		<!-- A managed voice call: the person's speech goes from the device to the voice provider. -->
+		<!-- A managed voice call: the person's speech goes from the device to the voice provider, which
+			may keep it for 30 days for abuse monitoring (the service's provider profile says so). -->
 		<dict>
 			<key>NSPrivacyCollectedDataType</key>
 			<string>NSPrivacyCollectedDataTypeAudioData</string>
@@ -85,11 +101,9 @@
 				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
 			</array>
 		</dict>
-		<!--
-			What the person's own content becomes in a managed service: the text a voice call is given
-			and the transcript it returns, and the sealed settings, drafts, recovery bundle and
-			mailbox items that settings sync, recovery and the authority feed keep.
-		-->
+		<!-- The transcripts of a managed voice call, which the provider makes from the person's speech
+			and the model's replies and holds on the same terms as the audio. The managed broker
+			discards them before anything is written. -->
 		<dict>
 			<key>NSPrivacyCollectedDataType</key>
 			<string>NSPrivacyCollectedDataTypeOtherUserContent</string>
@@ -115,6 +129,35 @@
 				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
 			</array>
 		</dict>
+		<!-- How long the voice service took to create a call and to make it ready, kept with the call. -->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypePerformanceData</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<!--
+			The operational events of a voice call (error codes, usage counters), kept with the call, and
+			the user agent of the sign-in request, kept in the session record.
+		-->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeOtherDiagnosticData</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
 	</array>
 	<key>NSPrivacyAccessedAPITypes</key>
 	<array>
@@ -125,23 +168,24 @@
 			C617.1, "Declare this reason to access the timestamps, size, or other metadata of files
 			inside the app container, app group container, or the app’s CloudKit container.": the
 			standard library's file calls, which the pairing records, the attempt budget, the
-			descriptor directory, drafts, settings, the recovery record and the sync membership make
-			on files and directories in the application's own container (whether a path exists, is a
-			file or a directory, its size and its owner and mode), which Tauri makes on the
-			application's own resource directory, and which the standard library's backtrace
-			symbolizer makes on the application's own executable.
+			descriptor directory, the installation record, drafts, settings, the recovery record and
+			the sync membership make on files and directories in the application's own container
+			(whether a path exists, is a file or a directory, its size and its owner and mode), which
+			Tauri and its opener plugin make on the application's own resource directory and on the
+			paths they are asked to open, and which the standard library's backtrace symbolizer makes on
+			the application's own executable.
 
 			3B52.1, "Declare this reason to access the timestamps, size, or other metadata of files or
 			directories that the user specifically granted access to, such as using a document picker
 			view controller.": the dialog plugin's file picker reads the modification date of the file
 			the person chose, for the picker's result.
 
-			Two calls read a file that is neither in the container nor one the person chose, and
-			Apple's list has no reason for them. Each reads a size or a type and no timestamp.
-			libsodium's random source checks with fstat that /dev/urandom is a character device
-			(sodium_init, randombytes_stir, randombytes_sysrandom_stir). The Rust standard library
-			reads the system version property list at the first availability check (std::fs::read,
-			reached from __isPlatformVersionAtLeast).
+			Two uses have no reason in Apple's list. Each reads the type or the size of a file that is
+			neither in the container nor one the person chose, and no timestamp. libsodium's random
+			source checks with fstat that /dev/urandom is a character device (sodium_init,
+			randombytes_stir, randombytes_sysrandom_stir). The Rust standard library, asked the system
+			version, reads the system version property list under the Simulator, or when the
+			sysctlbyname it asks first fails (std::fs::read, reached from __isPlatformVersionAtLeast).
 		-->
 		<dict>
 			<key>NSPrivacyAccessedAPIType</key>
@@ -170,10 +214,11 @@
 		</dict>
 		<!--
 			User defaults. The executable imports NSUserDefaults for the Firebase and GoogleUtilities
-			packages linked into it, which keep their installation and heartbeat records there; the
-			application's own code does not use user defaults. CA92.1, "Declare this reason to access
-			user defaults to read and write information that is only accessible to the app itself."
-			Those packages declare their own reasons in their own manifests as well.
+			packages linked into it: Firebase Core keeps its data collection switch and its logging
+			mode there, and GoogleUtilities has a wrapper around it. The application's own code does
+			not use user defaults. CA92.1, "Declare this reason to access user defaults to read and
+			write information that is only accessible to the app itself." Those packages declare their
+			own reasons in their own manifests as well.
 		-->
 		<dict>
 			<key>NSPrivacyAccessedAPIType</key>
