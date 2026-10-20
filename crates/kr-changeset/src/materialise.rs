@@ -1490,8 +1490,9 @@ pub fn release(
 /// the same filesystem is another mount, and nothing in it is touched). The root's own mode is
 /// given back through the library's handle, which needs no right to search the directory. Only
 /// this host's own directories change. A directory below the root whose owner cannot read it, or
-/// that another account owns, cannot be changed, so it is left, and the removal that follows takes
-/// it away only if it holds nothing and otherwise fails and says why.
+/// that another account owns, cannot be changed, so it is left as it is, and the removal that
+/// follows takes it away only if this account's rights over it and over what it holds allow that,
+/// and otherwise fails and says why.
 #[cfg(unix)]
 fn make_removable(directory: &AuthorisedDirectory) {
     use cap_std::fs::Dir;
