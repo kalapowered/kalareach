@@ -2066,3 +2066,50 @@ async fn a_request_in_the_feed_of_a_host_that_was_forgotten_is_not_waited_for() 
     assert_eq!(devices["held_out"][0]["waiting"], false, "{devices}");
     share_again(&rig, &reference).expect("nothing waits for a host this computer forgot");
 }
+
+/// A request sent while the person is at the dialog for sharing again is a request in force by the
+/// time they confirm: the device is not given the key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_sent_while_the_person_is_at_the_dialog_for_sharing_again_stops_it() {
+    let rig = Rig::start().await;
+    rig.sharing_with_the_phone().await;
+    // The first request never reached the feed, so nothing waits and the person may share again.
+    revoke_with_the_publication(
+        &rig,
+        Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: None,
+        },
+    )
+    .await;
+    the_phone_is_taken_out(&rig).await;
+    let reference = the_device_held_out(&rig.devices());
+
+    // The person is at the dialog for sharing again, and sends the request again meanwhile.
+    let (shown, release) = rig.ceremony.hold_the_dialog();
+    let sharing = rig
+        .app
+        .start_call("settings_device_share", json!({ "reference": reference }));
+    tokio::time::timeout(WATCHDOG, shown.notified())
+        .await
+        .expect("the dialog is shown");
+    let host = host_by(&rig.view().await, "feed");
+    rig.revoke(
+        host["reference"].as_str().expect("a reference"),
+        the_phone(&host)["reference"].as_str().expect("a reference"),
+    )
+    .expect("the request is published");
+    release.notify_one();
+
+    tokio::time::timeout(WATCHDOG, sharing)
+        .await
+        .expect("the call ends")
+        .expect("the call ends")
+        .expect_err("a request is in force now, so the device is not given the key");
+    assert_eq!(
+        rig.devices()["members"].as_array().map(Vec::len),
+        Some(1),
+        "the phone holds no key"
+    );
+}
