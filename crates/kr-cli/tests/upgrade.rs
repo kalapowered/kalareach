@@ -10,6 +10,10 @@
 //!
 //! The release before is whatever `retained/<level>/RELEASE` of the retained surface names. A
 //! commit that is not there, or a build of it that fails, fails the suite: nothing here skips.
+//! The cases of a release at this build's own level (`inside_the_level`) update from and roll back to
+//! the newest release of that level in this commit's history that the record of exclusions does not
+//! name. A commit that moves the level has no release at its level, and those cases say so and end;
+//! a checkout with no release tags at all fails them, and nothing else is skipped.
 //! The suite is behind the `upgrade-suite` feature, because building a second tree takes minutes
 //! and a network.
 
@@ -20,6 +24,13 @@ mod stored_formats;
 mod support;
 #[path = "../../kr-controller/tests/teardown/mod.rs"]
 mod teardown;
+// The release tags and the record of the releases a level's contract does not cover: the same
+// selection that `kr-protocol-gen` makes, so the suite updates from the release the check holds
+// this commit to.
+#[path = "../../kr-protocol/src/bin/kr-protocol-gen/excluded.rs"]
+mod excluded;
+#[path = "../../kr-protocol/src/bin/kr-protocol-gen/releases.rs"]
+mod releases;
 // A device pairs with the installed host's daemon over the network. The pairing calls are the ones
 // the control daemon's own network suites make.
 #[path = "upgrade/door.rs"]
@@ -44,6 +55,9 @@ struct Previous {
     level: CompatibilityLevel,
     /// Its programs, copied once to the internal disk.
     programs: &'static [(&'static str, PathBuf, Digest256, u64)],
+    /// The stores the release declares it reads, taken from its tree while the cache was held:
+    /// another run may remove the tree afterwards.
+    stores: Vec<ReleaseStore>,
 }
 
 impl Previous {
@@ -77,7 +91,7 @@ impl Previous {
         // build raised or added is one the release before refuses or does not name, and a rollback
         // to it has to be decided by what the release says it reads, not left to a daemon that
         // cannot open it. They are the entries of the release's own stored-formats lock.
-        assembled.manifest.stores = stores_of_the_release_at(&self.commit);
+        assembled.manifest.stores = self.stores.clone();
         assembled
     }
 }
@@ -140,12 +154,89 @@ fn previous() -> &'static Previous {
             .max_by_key(|level| level.level)
             .expect("a level is retained");
         let record = level.release;
-        let commit = recorded(record, "commit");
-        let release = release(&recorded(record, "release"));
-        // Held until the programs are copied: another run for another commit removes this tree.
+        Previous::built(
+            recorded(record, "commit"),
+            release(&recorded(record, "release")),
+            level.level,
+        )
+    })
+}
+
+/// The newest release of this build's own level in this commit's history that the record of
+/// exclusions does not name, built; none where the commit has none, which is a commit that moves
+/// the level (and says so, on standard error).
+///
+/// The release tags are this checkout's, which the gates hold equal to origin's: a checkout with no
+/// release tag at all fails the suite, since an empty list is not the answer "no release at the
+/// level".
+fn inside_the_level() -> Option<&'static Previous> {
+    static INSIDE: OnceLock<Option<Previous>> = OnceLock::new();
+    INSIDE
+        .get_or_init(|| {
+            let repository = repository();
+            let head = releases::git_in(&repository, &["rev-parse", "--verify", "HEAD^{commit}"])
+                .expect("this checkout's head")
+                .trim()
+                .to_owned();
+            let all = releases::inventory(&repository).expect("the release tags");
+            assert!(
+                !all.is_empty(),
+                "this checkout has no release tags: fetch them (git fetch --force --prune origin \
+                 '+refs/tags/packages/v*:refs/tags/packages/v*'); the suite does not skip"
+            );
+            let exclusions =
+                excluded::Exclusions::read(&repository).expect("the record of exclusions");
+            exclusions
+                .validate(&repository, &all)
+                .expect("the record of exclusions holds");
+            let level = CompatibilityLevel::of(PACKAGE_VERSION);
+            let mut newest: Option<(usize, releases::Release)> = None;
+            for release in excluded::kept(&all, level, &exclusions, &head) {
+                if !releases::is_ancestor(&repository, &release.commit, &head)
+                    .expect("the history of this commit")
+                {
+                    continue;
+                }
+                let depth: usize =
+                    releases::git_in(&repository, &["rev-list", "--count", &release.commit])
+                        .expect("the depth of a release")
+                        .trim()
+                        .parse()
+                        .expect("a count");
+                if newest.as_ref().is_none_or(|(deepest, _)| depth > *deepest) {
+                    newest = Some((depth, release));
+                }
+            }
+            let Some((_, release)) = newest else {
+                eprintln!(
+                    "no kept release of level {level} is in the history of {head}: this commit \
+                     moves the level, so there is no release at its level to update from or roll \
+                     back to, and the cases inside the level end here"
+                );
+                return None;
+            };
+            let name = release
+                .tag
+                .strip_prefix("packages/v")
+                .expect("a release tag");
+            Some(Previous::built(
+                release.commit.clone(),
+                self::release(name),
+                level,
+            ))
+        })
+        .as_ref()
+}
+
+impl Previous {
+    /// The release at `commit`, built in a tree of its own under the cache and copied, with its
+    /// programs in a directory of their own: two releases a run builds do not share one.
+    fn built(commit: String, release: ReleaseName, level: CompatibilityLevel) -> Self {
+        // Held until the programs are copied and the stores read: another run for another commit
+        // removes a tree that has not been used for a week, and never one in use.
         let _held = cache_lock();
         let built = build_previous(&commit);
-        let directory = support::command_binaries().join("previous");
+        let directory = support::command_binaries().join("previous").join(&commit);
         std::fs::create_dir_all(&directory).expect("a directory for the programs");
         let mut copied = Vec::new();
         for name in PREVIOUS_PROGRAMS {
@@ -159,13 +250,15 @@ fn previous() -> &'static Previous {
             .find(|(name, ..)| *name == "kr-describe-inference")
             .expect("this build's description process");
         copied.push(placed("kr-describe-inference", ours, &directory));
-        Previous {
+        let stores = stores_of_the_release_at(&commit);
+        Self {
             release,
             commit,
-            level: level.level,
+            level,
             programs: Box::leak(copied.into_boxed_slice()),
+            stores,
         }
-    })
+    }
 }
 
 /// Copies one program to the internal disk and says what it is.
@@ -205,7 +298,8 @@ fn cache_lock() -> std::fs::File {
 /// The commit has to be in this checkout's repository, whether or not an earlier run built it: a
 /// checkout without it fails here, and so does a build that fails. A stamp of the commit and the
 /// compiler is written once the tree is extracted, so a tree is extracted once; the build is run
-/// every time, and takes seconds when nothing changed. Any other commit's tree is removed.
+/// every time, and takes seconds when nothing changed. A tree that no run has used for a week is
+/// removed; the others are kept, since another run may be using one.
 fn build_previous(commit: &str) -> PathBuf {
     let cache = cache_root();
     let present = Command::new("git")
@@ -231,14 +325,25 @@ fn build_previous(commit: &str) -> PathBuf {
     let place = cache.join(commit);
     let tree = place.join("tree");
     let programs = place.join("target/debug");
+    // Trees nobody has used for a week go, and a tree is never removed while it is in use: every
+    // use touches its stamp, and two releases are built in one run (the retained level's and the
+    // newest of this build's own level), and other runs on this machine build others.
+    let week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+    for entry in std::fs::read_dir(&cache).expect("the cache") {
+        let path = entry.expect("an entry").path();
+        let used = std::fs::metadata(path.join("stamp"))
+            .and_then(|stamp| stamp.modified())
+            .ok();
+        let idle = used.is_none_or(|used| used.elapsed().is_ok_and(|age| age > week));
+        if path.is_dir() && path != place && idle {
+            std::fs::remove_dir_all(&path).expect("an old tree goes");
+        }
+    }
     // The tree is the commit's, as extracted by a run with this compiler, or it is made again.
     if !std::fs::read_to_string(place.join("stamp")).is_ok_and(|kept| kept == stamp) {
-        // A tree of another commit, or an extraction that did not finish, goes.
-        for entry in std::fs::read_dir(&cache).expect("the cache") {
-            let path = entry.expect("an entry").path();
-            if path.is_dir() {
-                std::fs::remove_dir_all(&path).expect("an old tree goes");
-            }
+        // An extraction that did not finish, or one made with another compiler, goes.
+        if place.exists() {
+            std::fs::remove_dir_all(&place).expect("an old tree goes");
         }
         std::fs::create_dir_all(&tree).expect("the tree's directory");
         let mut archive = Command::new("git")
@@ -259,6 +364,12 @@ fn build_previous(commit: &str) -> PathBuf {
         );
         std::fs::write(place.join("stamp"), &stamp).expect("the stamp");
     }
+    // This use is the stamp's time, so a tree in use is not the one that goes.
+    std::fs::File::options()
+        .write(true)
+        .open(place.join("stamp"))
+        .and_then(|stamp| stamp.set_modified(std::time::SystemTime::now()))
+        .expect("the stamp is touched");
     {
         // The packages build every binary they have: the release before is these programs of it.
         // The environment is this process's without what a test run sets for this tree, so the
@@ -390,13 +501,17 @@ impl Updated {
 
     /// A host on the release before with its live session, not yet updated.
     async fn prepare(setup: Setup) -> Prepared {
+        Self::prepare_on(previous(), setup).await
+    }
+
+    /// A host on `before`, with its live session, not yet updated.
+    async fn prepare_on(before: &'static Previous, setup: Setup) -> Prepared {
         let Setup {
             network: on_the_network,
             contact,
             plugin,
             agent,
         } = setup;
-        let before = previous();
         let one = before.assembled(1);
         let two = Assembled::at_this_level(&format!("{PACKAGE_VERSION}+bbbbbbbbbbbb"), 2)
             .retaining_what_this_build_does();
@@ -1294,6 +1409,222 @@ async fn a_mutation_of_a_paired_device_is_performed_by_the_worker_of_the_release
     // device's connection after the worker ends: its link to the worker ends with it.
     updated.the_worker_is_as_it_was().await;
     host.close(&updated.kr_now(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+    drop(owner);
+}
+
+/// KR-REQ-26.06, KR-REQ-26.08, KR-REQ-09.10: a host on the newest release of this build's own level
+/// is updated to this build, by that release's own `kr`, while a session's worker still runs the
+/// release. The worker is the process it was; a device paired with the new daemon has the mutation
+/// it makes forwarded, with the dispatch lease this level's frames carry, to that worker, which
+/// admits it; and `kr attach` of this build reads that worker's frames directly, with no hand over,
+/// and a person types at the session. A level is one surface, so none of it needs a rewrite, and a
+/// release at the level that lacked a member of the level would fail here.
+#[tokio::test(flavor = "multi_thread")]
+async fn inside_the_level_an_update_leaves_the_worker_running_and_serves_a_device_and_kr_attach() {
+    use kr_protocol::attachment::{
+        AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
+    };
+    use kr_protocol::scalars::CanonicalSet;
+    use kr_protocol::session::Dimensions;
+
+    let Some(before) = inside_the_level() else {
+        return;
+    };
+    let updated = Updated::prepare_on(
+        before,
+        Setup {
+            network: true,
+            ..Setup::default()
+        },
+    )
+    .await
+    .update()
+    .await;
+    let host = &updated.host;
+    let owner = door::Door::pair_the_first_owner(
+        &host
+            .tree
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint"),
+        host.tree.environment_id(),
+    )
+    .await;
+    let session_id = updated.session_id;
+
+    // The device's mutation goes through the new daemon, with the lease, to the worker of the
+    // release before, which is at the same level and admits it.
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    let settled = owner
+        .session
+        .mutate(
+            Method::SessionAttach,
+            kr_protocol::envelope::ActionTarget {
+                environment_id: host.tree.environment_id(),
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            None,
+            &Empty {},
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(Dimensions::new(80, 24)),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested,
+            },
+            kr_protocol::scalars::DurationMs::new(120_000),
+        )
+        .await
+        .expect("the worker of the release at this level admits the device's attach");
+    let attached: SessionAttachResult = settled
+        .to_typed()
+        .expect("the worker answers with the attachment it made");
+    assert!(
+        attached
+            .attachment
+            .granted
+            .contains(&AttachmentCapability::ObserveTerminal),
+        "{attached:?}"
+    );
+    updated.the_worker_is_as_it_was().await;
+
+    // `kr attach` of this build is not handed to the release before: the frames are the same, and a
+    // person types at the session.
+    let typing = terminal_for(host, &updated.kr_now(), &["attach", &updated.display]);
+    typing.ready().await;
+    updated.the_worker_is_as_it_was().await;
+    drop(typing);
+
+    host.close(&updated.kr_now(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+    drop(owner);
+}
+
+/// KR-REQ-26.10, KR-REQ-26.08, KR-REQ-09.10: after an update inside a level, a session started by
+/// this build has a worker of this build; a rollback to the release at the level goes on beside it,
+/// without waiting, because the release speaks this level's frames; the workers of both releases are
+/// the processes they were; a device paired with the rolled-back daemon has the mutation it makes
+/// forwarded to this build's worker, which admits it; and the release's own `kr attach` reads that
+/// worker and a person types at it.
+#[tokio::test(flavor = "multi_thread")]
+async fn inside_the_level_a_rollback_goes_on_beside_a_worker_of_this_build_and_serves_a_device() {
+    use kr_protocol::attachment::{
+        AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
+    };
+    use kr_protocol::scalars::CanonicalSet;
+    use kr_protocol::session::Dimensions;
+
+    let Some(before) = inside_the_level() else {
+        return;
+    };
+    let updated = Updated::prepare_on(
+        before,
+        Setup {
+            network: true,
+            ..Setup::default()
+        },
+    )
+    .await
+    .update()
+    .await;
+    let host = &updated.host;
+
+    // A session of this build: its worker is the process the rollback has to leave running.
+    let (display, session_now) = host.new_session(&updated.kr_now());
+    let worker_now = host.worker_process(session_now);
+    assert_eq!(
+        host.worker_build(session_now).await,
+        format!("kr-worker/{}", updated.two.name()),
+        "the new session's worker is this build's"
+    );
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a rollback to a release at this level does not wait for a session of this build: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(updated.one.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", updated.one.name()),
+        "the daemon is the release at this level again"
+    );
+    updated.the_worker_is_as_it_was().await;
+    assert_eq!(host.worker_process(session_now), worker_now);
+    assert_eq!(
+        host.worker_build(session_now).await,
+        format!("kr-worker/{}", updated.two.name()),
+        "this build's worker still runs"
+    );
+
+    // A device paired with the rolled-back daemon reaches this build's worker through it.
+    let owner = door::Door::pair_the_first_owner(
+        &host
+            .tree
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint"),
+        host.tree.environment_id(),
+    )
+    .await;
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    let settled = owner
+        .session
+        .mutate(
+            Method::SessionAttach,
+            kr_protocol::envelope::ActionTarget {
+                environment_id: host.tree.environment_id(),
+                session_id: Nullable::some(session_now),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            None,
+            &Empty {},
+            &SessionAttachParams {
+                session_id: session_now,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(Dimensions::new(80, 24)),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested,
+            },
+            kr_protocol::scalars::DurationMs::new(120_000),
+        )
+        .await
+        .expect("this build's worker admits the device's attach through the rolled-back daemon");
+    let attached: SessionAttachResult = settled
+        .to_typed()
+        .expect("the worker answers with the attachment it made");
+    assert!(
+        attached
+            .attachment
+            .granted
+            .contains(&AttachmentCapability::ObserveTerminal),
+        "{attached:?}"
+    );
+
+    // The release's own `kr attach` reads this build's worker, which is at its level.
+    let typing = terminal_for(host, &updated.kr_before(), &["attach", &display]);
+    typing.ready().await;
+    drop(typing);
+    assert_eq!(host.worker_process(session_now), worker_now);
+
+    host.close(&updated.kr_before(), &display);
+    host.worker_ended(&worker_now).await;
+    host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
     drop(owner);
 }
