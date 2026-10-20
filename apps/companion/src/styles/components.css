@@ -1101,29 +1101,38 @@ textarea::placeholder {
 }
 
 /*
- * A switch with the words that say what it does, in the card it belongs to. The words take what
- * room there is and wrap, and the switch keeps its size at the first line, so no text size pushes
- * it out of the card.
+ * A switch with the words that say what it does, in the card it belongs to. The title and the switch
+ * share a line, the switch keeping its size at the title's first line; the notes under them take the
+ * card's whole width. A column of notes beside a switch is at most what the switch leaves of the card,
+ * which at the largest text size on the narrowest screen is a few letters to a line, and the notes
+ * break words that were never too long for the card. No text size pushes either out of the card.
  */
 .account-switch {
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: var(--gap-3);
+  flex-direction: column;
+  gap: var(--gap-2);
   padding-block-start: var(--gap-3);
   border-block-start: 1px solid var(--line);
 }
 
-.account-switch-words {
+.account-switch-head {
+  /* The height of one line of the title, which the switch is centred on whatever the text size. */
+  --title-line: calc(0.9375rem * 1.45);
   display: flex;
-  flex: 1 1 auto;
-  flex-direction: column;
-  gap: var(--gap-2);
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--gap-3);
   min-width: 0;
 }
 
-.account-switch .switch-control {
+.account-switch-head .account-lead {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.account-switch-head .switch-control {
   flex: none;
+  margin-block-start: max(0px, calc((var(--title-line) - 20px) / 2));
 }
 
 /*

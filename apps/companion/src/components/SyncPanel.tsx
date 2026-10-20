@@ -505,34 +505,34 @@ export function SyncPanel({
                   data-testid="drafts-sync"
                   data-state={settings.sync.drafts.enabled ? 'on' : 'off'}
                 >
-                  <div className="account-switch-words">
+                  <div className="account-switch-head">
                     <p className="account-lead">Keep drafts in step</p>
-                    <p className="account-note">{DRAFTS_SYNC_HELP}</p>
-                    {settings.sync.drafts.enabled
-                      ? settings.sync.drafts.kept_here.map((kept) => (
-                          <p
-                            className="account-note"
-                            data-testid="drafts-kept-here"
-                            key={`${kept.host ?? ''}/${kept.why}`}
-                          >
-                            {describeKeptHere(kept)}
-                          </p>
-                        ))
-                      : null}
-                    {settings.sync.drafts.enabled && settings.sync.drafts.problem !== null ? (
-                      <p className="account-note" data-testid="drafts-problem">
-                        {settings.sync.drafts.problem}
-                      </p>
-                    ) : null}
+                    <Switch
+                      checked={settings.sync.drafts.enabled}
+                      label="Keep drafts in step"
+                      disabled={busy}
+                      onChange={(next) => {
+                        step('settings', () => port.settingsDraftsSet(next).then(() => null))
+                      }}
+                    />
                   </div>
-                  <Switch
-                    checked={settings.sync.drafts.enabled}
-                    label="Keep drafts in step"
-                    disabled={busy}
-                    onChange={(next) => {
-                      step('settings', () => port.settingsDraftsSet(next).then(() => null))
-                    }}
-                  />
+                  <p className="account-note">{DRAFTS_SYNC_HELP}</p>
+                  {settings.sync.drafts.enabled
+                    ? settings.sync.drafts.kept_here.map((kept) => (
+                        <p
+                          className="account-note"
+                          data-testid="drafts-kept-here"
+                          key={`${kept.host ?? ''}/${kept.why}`}
+                        >
+                          {describeKeptHere(kept)}
+                        </p>
+                      ))
+                    : null}
+                  {settings.sync.drafts.enabled && settings.sync.drafts.problem !== null ? (
+                    <p className="account-note" data-testid="drafts-problem">
+                      {settings.sync.drafts.problem}
+                    </p>
+                  ) : null}
                 </div>
               ) : null}
               {choice !== null && (settings?.sync.conflicts ?? 0) > 0 ? (

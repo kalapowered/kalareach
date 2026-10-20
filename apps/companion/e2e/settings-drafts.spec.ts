@@ -12,7 +12,7 @@
 
 import { expect, test, type Page } from '@playwright/test'
 
-import { overrunning } from './layout'
+import { brokenWords, overrunning } from './layout'
 
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
 const LARGEST = 53 / 17
@@ -65,6 +65,26 @@ async function withTextScale(page: Page, ratio: number): Promise<void> {
       }).observe(document, { childList: true })
     }
   }, ratio)
+}
+
+/** Sets the page's face to one as wide as the Linux runner draws with, from the page's first frame. */
+async function withWideFace(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const css = ':root { --font-ui: Verdana, "DejaVu Sans", sans-serif !important; }'
+    const apply = (): boolean => {
+      const root = document.documentElement as HTMLElement | null
+      if (root === null) return false
+      const style = document.createElement('style')
+      style.textContent = css
+      root.append(style)
+      return true
+    }
+    if (!apply()) {
+      new MutationObserver((_, observer) => {
+        if (apply()) observer.disconnect()
+      }).observe(document, { childList: true })
+    }
+  })
 }
 
 /** Opens the account, with settings sync on, and returns the card. */
@@ -170,3 +190,97 @@ test('is reached and pressed from the keyboard alone, and says what it did', asy
   await expect(keep).toHaveAttribute('aria-checked', 'true')
   expect(await page.evaluate(() => window.krTestHost?.settings.draftsSetTo)).toEqual([true])
 })
+
+// KR-REQ-13.19: on the phone a switch keeps the shape it is drawn in everywhere, a switch, and is
+// pressed from a target of the platform's size around it.
+const PHONE_WINDOWS = [
+  [1280, 720],
+  [390, 844],
+  [320, 720]
+] as const
+
+const PHONE_SIZES = [
+  ['default', 1],
+  ['largest', LARGEST]
+] as const
+
+/** Opens the phone's account with the drafts row showing everything it can say, at a size and a window. */
+async function openPhoneCard(page: Page, width: number, height: number, ratio: number) {
+  await withTextScale(page, ratio)
+  await withWideFace(page)
+  await page.setViewportSize({ width, height })
+  const card = await openTheCard(page, 'ios')
+  await expect(card.getByTestId('drafts-sync')).toBeVisible()
+  await page.evaluate((kept) => {
+    window.krTestHost?.settings.change({ sync: { drafts: kept } })
+  }, KEPT)
+  await expect(card.getByTestId('drafts-kept-here')).toHaveCount(3)
+  await card.getByTestId('drafts-sync').scrollIntoViewIfNeeded()
+  return card
+}
+
+for (const [width, height] of PHONE_WINDOWS) {
+  for (const [size, ratio] of PHONE_SIZES) {
+    test(`draws the phone's switch as a switch, pressed across the platform's target, at the ${size} text size, ${width} px wide`, async ({
+      page
+    }) => {
+      const card = await openPhoneCard(page, width, height, ratio)
+      const keep = card.getByRole('switch', { name: 'Keep drafts in step' })
+      // Drawn as the desktop draws it, wider than it is tall, and not as a square the size of the
+      // finger's target: the target is the press area around it.
+      const drawn = await keep.evaluate((each) => {
+        const box = each.getBoundingClientRect()
+        return { width: box.width, height: box.height }
+      })
+      expect(drawn.width, 'the switch is wider than it is tall').toBeGreaterThan(drawn.height * 1.4)
+      // A press anywhere across a target of the platform's size around the switch lands on it.
+      const target = await page.evaluate(() =>
+        parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--target'))
+      )
+      const missed = await keep.evaluate((control, size) => {
+        control.scrollIntoView({ block: 'center', inline: 'center' })
+        const box = control.getBoundingClientRect()
+        const x = box.left + box.width / 2
+        const y = box.top + box.height / 2
+        const edge = size / 2 - 0.5
+        const missed: string[] = []
+        for (const [px, py, side] of [
+          [x, y - edge, 'top'],
+          [x, y + edge, 'bottom'],
+          [x - edge, y, 'left'],
+          [x + edge, y, 'right']
+        ] as const) {
+          const hit = document.elementFromPoint(px, py)
+          if (!hit || !control.contains(hit)) missed.push(side)
+        }
+        return missed
+      }, target)
+      expect(missed, `the sides of the ${String(target)} px target that miss the switch`).toEqual([])
+    })
+  }
+}
+
+// KR-REQ-13.19, KR-REQ-20.13: the card the drafts switch sits in gives its words a readable line at the
+// largest text size on the narrowest screen. The switch is beside the title and the notes take the
+// card's width under it, so no word that would fit a line is cut in two.
+for (const [width, height] of PHONE_WINDOWS) {
+  for (const [size, ratio] of PHONE_SIZES) {
+    test(`gives the drafts card's notes the card's width at the ${size} text size, ${width} px wide`, async ({
+      page
+    }) => {
+      const card = await openPhoneCard(page, width, height, ratio)
+      const row = card.getByTestId('drafts-sync')
+      const inner = await row.evaluate((each) => {
+        const own = getComputedStyle(each)
+        return each.getBoundingClientRect().width - parseFloat(own.paddingLeft) - parseFloat(own.paddingRight)
+      })
+      const notes = await row.locator('.account-note').first().evaluate((each) => each.getBoundingClientRect().width)
+      expect.soft(notes, 'the notes take the width of the card').toBeGreaterThanOrEqual(inner * 0.95)
+      expect.soft(await brokenWords(page, '[data-testid="drafts-sync"]'), 'words cut in two').toEqual([])
+      expect.soft(await overrunning(page, '[data-testid="drafts-sync"]')).toEqual([])
+      const held = Math.ceil((await card.boundingBox())?.height ?? 0)
+      await page.setViewportSize({ width, height: height + held })
+      await card.screenshot({ path: shot(`phone-${size}-${String(width)}`) })
+    })
+  }
+}

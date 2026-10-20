@@ -967,12 +967,14 @@
 
 /*
  * Every control inside the phone's shell is at least the platform's minimum in both dimensions,
- * including the shared components the desktop window sizes for a precise pointer.
+ * including the shared components the desktop window sizes for a precise pointer. A switch is the
+ * exception in what is drawn, not in what is pressed: it is drawn as a switch, and a press anywhere
+ * across a target of that size around it lands on it (its own rule, in the shared styles). A switch
+ * given the target as its drawn size is a rounded square.
  */
 .m-shell .segmented button,
 .m-shell .btn,
-.m-shell .icon-btn,
-.m-shell .switch-control {
+.m-shell .icon-btn {
   min-block-size: var(--target);
   min-inline-size: var(--target);
 }

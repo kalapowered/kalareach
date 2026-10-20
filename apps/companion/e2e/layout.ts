@@ -118,3 +118,50 @@ export async function stopWrapping(page: Page, roots: readonly string[]): Promis
   const rule = roots.map((root) => `${root}, ${root} *`).join(', ')
   await page.addStyleTag({ content: `${rule} { white-space: nowrap !important }` })
 }
+
+/**
+ * The words under each of `roots` that a line break has cut in two although the whole word would fit
+ * across the root: a column narrower than its text breaks words that were never too long for the
+ * card that holds them, and a word wider than the root itself is left out, since nothing can keep it
+ * whole. A word is a run of letters and digits between spaces and hyphens, with the punctuation
+ * after it; a name or a path with a dot or a slash in it is not one, since it has no place to end a
+ * line. A word is cut when the lines it is drawn on number more than one, and its whole width is the
+ * sum of its pieces.
+ */
+export function brokenWords(page: Page, roots: string): Promise<string[]> {
+  return page.evaluate((selector) => {
+    const found: string[] = []
+    for (const root of document.querySelectorAll(selector)) {
+      const own = getComputedStyle(root)
+      const room =
+        root.getBoundingClientRect().width -
+        parseFloat(own.paddingLeft) -
+        parseFloat(own.paddingRight) -
+        parseFloat(own.borderLeftWidth) -
+        parseFloat(own.borderRightWidth)
+      const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+      for (let node = walk.nextNode(); node !== null; node = walk.nextNode()) {
+        const parent = node.parentElement
+        if (parent === null) continue
+        const style = getComputedStyle(parent)
+        if (style.visibility === 'hidden' || style.display === 'none') continue
+        const text = node.textContent ?? ''
+        for (const word of text.matchAll(/[^\s\u2010-\u2015-]+/gu)) {
+          // Ordinary words only: a name or a path with a dot or a slash in it has no place to end a line.
+          if (!/^[\p{L}\p{N}]+[.,;:!?]*$/u.test(word[0])) continue
+          const range = document.createRange()
+          range.setStart(node, word.index)
+          range.setEnd(node, word.index + word[0].length)
+          const pieces = Array.from(range.getClientRects()).filter((piece) => piece.width > 0)
+          if (pieces.length < 2) continue
+          // Two rects on one line are one piece in two boxes; pieces are told apart by their line.
+          const lines = new Set(pieces.map((piece) => Math.round(piece.top)))
+          if (lines.size < 2) continue
+          const whole = pieces.reduce((sum, piece) => sum + piece.width, 0)
+          if (whole <= room) found.push(`${word[0]}: cut although ${whole.toFixed(0)} px fits in ${room.toFixed(0)}`)
+        }
+      }
+    }
+    return found
+  }, roots)
+}
