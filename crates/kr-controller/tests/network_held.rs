@@ -862,9 +862,9 @@ async fn kr_req_18_13_a_session_that_closes_leaves_an_invitation_that_ran_out_as
     host.stop().await;
 }
 
-/// KR-REQ-18.14: a daemon that starts and finds a session closed while it was down, with an
-/// invitation still waiting over it, withdraws the invitation before it serves, and leaves the
-/// invitation over a session that is still open.
+/// KR-REQ-18.14: a daemon that starts and finds a session closed while it was down, or one whose
+/// launch failed, with an invitation still waiting over it, withdraws the invitation before it
+/// serves, and leaves the invitation over a session that is still open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_18_14_a_daemon_that_finds_a_session_closed_withdraws_the_invitations_over_it() {
     use kr_controller::registry::Registry;
@@ -873,9 +873,14 @@ async fn kr_req_18_14_a_daemon_that_finds_a_session_closed_withdraws_the_invitat
     let host = Host::start(&owner).await;
     let (_device, record) = recipient(&host, &owner).await;
     let (closing, _) = an_open_session(&host);
+    let (failing, _) = an_open_session(&host);
     let (staying, _) = an_open_session(&host);
     share(&host, closing, record.device_id).await;
+    share(&host, failing, record.device_id).await;
     share(&host, staying, record.device_id).await;
+    // A launch that fails after the invitation was written is no closure, and its invitation is
+    // as unusable as a closed session's.
+    net_support::fail_session(&host, failing);
 
     let stopped = host.shut_down().await;
     let mut registry = Registry::open(
@@ -893,6 +898,10 @@ async fn kr_req_18_14_a_daemon_that_finds_a_session_closed_withdraws_the_invitat
     let states = |grants: Vec<GrantSummary>| grants.iter().map(|g| g.state).collect::<Vec<_>>();
     assert_eq!(
         states(issued_over(&host, closing).await),
+        [GrantState::Revoked]
+    );
+    assert_eq!(
+        states(issued_over(&host, failing).await),
         [GrantState::Revoked]
     );
     assert_eq!(

@@ -903,9 +903,10 @@ impl Controller {
             .len())
     }
 
-    /// Withdraws the invitations still waiting over every session that has closed, before the
-    /// daemon serves: a closure recorded by a daemon that stopped before it withdrew them. A
-    /// session the registry holds no reservation for is not one that closed, and is left alone.
+    /// Withdraws the invitations still waiting over every session that has closed or whose launch
+    /// failed, before the daemon serves: a closure recorded by a daemon that stopped before it
+    /// withdrew them, and an invitation written for a session while it was still launching. A
+    /// session the registry holds no reservation for is not one that ended, and is left alone.
     ///
     /// # Errors
     ///
@@ -926,13 +927,17 @@ impl Controller {
         {
             let registry = self.registry.lock().await;
             for session_id in waiting {
-                let has_closed =
+                let has_ended =
                     registry
                         .reservation_for_session(session_id)?
                         .is_some_and(|reservation| {
-                            matches!(reservation.phase, crate::registry::LaunchPhase::Closed)
+                            matches!(
+                                reservation.phase,
+                                crate::registry::LaunchPhase::Closed
+                                    | crate::registry::LaunchPhase::Failed
+                            )
                         });
-                if has_closed {
+                if has_ended {
                     closed.insert(session_id);
                 }
             }
