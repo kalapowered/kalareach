@@ -739,10 +739,10 @@ host is changing its privacy mode. Devices that do not have the `host.manage` ri
 Devices with the `host.manage` right read the rest in the report of `privacy.status`: when privacy
 mode last changed, whether its cleanup is complete, what each session still owes, what the host
 keeps and what had already left it. The host says it is changing privacy mode while a change to on
-waits for the messages in flight and records its state, while a change to off is about to publish
-its state, and, after a change that stopped part way, until the daemon starts again. A device reads
-the host as private while the host is changing its privacy mode. A host of an earlier build leaves
-this member out of `host.info`.
+waits for the deliveries in flight, records its state and raises the backup fence, while a change to
+off is about to publish its state, and, after a change that stopped part way, until the daemon
+starts again. A device reads the host as private while the host is changing its privacy mode. A host
+of an earlier build leaves this member out of `host.info`.
 
 The allowlist walk above has all four answers as roots, so a field added to one fails the build's
 own tests until it is classed.
