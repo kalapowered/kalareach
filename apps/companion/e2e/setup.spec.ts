@@ -507,7 +507,10 @@ test.describe('the first-start assistant', () => {
         })
         await page.getByTestId('setup-recheck').click()
         await expect(page.getByTestId('setup-checks-state')).toHaveAttribute('data-state', 'failed')
-        await expect(page.getByText('The checks did not run')).toBeVisible()
+        // The banner's words are also in the region the page keeps for a screen reader, so the
+        // banner is asked for by its own box.
+        const banner = page.locator('.banner').getByText('The checks did not run')
+        await expect(banner).toBeVisible()
 
         // What this change put on the page ends inside the window. The step list above it scrolls
         // on its own and is not the checks'.
@@ -524,7 +527,7 @@ test.describe('the first-start assistant', () => {
         const footer = page.getByTestId('setup-run-checks').locator('xpath=..')
         await inside('the card footer', footer)
         await inside('the line that says where the checks stand', page.getByTestId('setup-checks-state'))
-        await inside('the banner', page.getByText('The checks did not run'))
+        await inside('the banner', banner)
         const footerBox = await footer.boundingBox()
         for (const control of ['setup-recheck', 'setup-run-checks']) {
           const box = await page.getByTestId(control).boundingBox()
