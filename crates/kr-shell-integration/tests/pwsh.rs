@@ -807,3 +807,43 @@ fn a_wrapper_of_an_editor_operation_holds_the_state_it_is_given_as_a_value() {
         "script held in a wrapper's state ran when the key was pressed:\n{output}"
     );
 }
+
+/// KR-REQ-07.37: the probe that starts the package as a child of the managed shell names the
+/// package's executable as one word, whatever characters its path holds.
+///
+/// The case starts the package from a path with an apostrophe and a space in it, which is a home
+/// directory some people have, and reads the probe's answer from the child. A probe that put the
+/// path into the shell's text as it stood would end its string at the apostrophe.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_child_probe_starts_a_package_whose_path_holds_a_quote_and_a_space() {
+    let package = shellpkg::Package::built(PWSH);
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let awkward = directory.path().join("it's here");
+    std::fs::create_dir_all(&awkward).expect("a directory with a quote in its name");
+    // The launcher names the host and the module by absolute paths, so a copy of it starts the
+    // same package from wherever it lies.
+    let copy = awkward.join("pwsh");
+    std::fs::copy(&package.executable, &copy).expect("a copy of the package's launcher");
+    let probe = shellpkg::child_probe(PWSH, &copy);
+    let asked = std::process::Command::new(&package.executable)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &probe,
+        ])
+        .env_remove("KR_SHELL_BRIDGE")
+        .env_remove("KR_SHELL_BRIDGE_SECRET")
+        .env_remove("KR_SESSION")
+        .output()
+        .expect("the package's host runs");
+    let said = String::from_utf8_lossy(&asked.stdout);
+    assert!(
+        said.contains("kr-child=[unset]"),
+        "the probe did not start the package from {}:\n{said}\n{}",
+        copy.display(),
+        String::from_utf8_lossy(&asked.stderr)
+    );
+}
