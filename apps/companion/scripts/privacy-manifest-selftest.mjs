@@ -486,7 +486,7 @@ if (toolchain) {
     }
     for (const sdk of root) {
       mkdirSync(join(dir, sdk.name), { recursive: true })
-      if (sdk.raw !== undefined) writeFileSync(join(dir, sdk.name, 'PrivacyInfo.xcprivacy'), sdk.raw)
+      if (sdk.raw !== undefined) writeFileSync(join(dir, sdk.name, sdk.file ?? 'PrivacyInfo.xcprivacy'), sdk.raw)
       else if (sdk.manifest) plist(join(dir, sdk.name, 'PrivacyInfo.xcprivacy'), manifest())
     }
     if (nested) {
@@ -647,6 +647,30 @@ if (toolchain) {
     ['Watch/W.app/W uses FileTimestamp (stat) and the manifest of Watch/W.app is missing']
   )
   heldProblems(
+    'a nested application may not give a reason only a package may give',
+    examine(
+      bundle('nested-sdk-reason', {
+        app: whole,
+        framework: library_manifest,
+        nested: {
+          manifest: manifest(declares('FileTimestamp', '0A2A.1'), declares('SystemBootTime', '35F9.1'), declares('UserDefaults', 'CA92.1'))
+        }
+      })
+    ).problems,
+    ['the manifest of Watch/W.app: FileTimestamp is declared with 0A2A.1, which only a third-party SDK may give']
+  )
+  heldProblems(
+    'a nested application that declares a category it does not use fails',
+    examine(
+      bundle('nested-unused', {
+        app: whole,
+        framework: library_manifest,
+        nested: { manifest: manifest(...whole.NSPrivacyAccessedAPITypes, declares('ActiveKeyboards', '54BD.1')) }
+      })
+    ).problems,
+    ['the manifest of Watch/W.app declares ActiveKeyboards and no code in its executable uses it']
+  )
+  heldProblems(
     'a nested application that declares what it uses passes',
     examine(bundle('nested-ok', { app: whole, framework: library_manifest, nested: { manifest: whole } })).problems,
     []
@@ -662,6 +686,22 @@ if (toolchain) {
       })
     ).problems,
     ['the application names the executable Frameworks/Lib.framework/Lib and it is not a Mach-O file of that bundle']
+  )
+  heldProblems(
+    'the same bundle named with a trailing slash, as tab completion writes it, is the same bundle',
+    examine(`${bundle('slash', { app: whole, framework: library_manifest })}/`).problems,
+    []
+  )
+  heldProblems(
+    'a manifest whose name differs only in case is a problem, not a manifest',
+    examine(
+      bundle('case', {
+        app: whole,
+        framework: library_manifest,
+        root: [{ name: 'Firebase_FirebaseCore.bundle', raw: 'x', file: 'privacyinfo.xcprivacy' }]
+      })
+    ).problems,
+    ['is not spelt PrivacyInfo.xcprivacy', 'Firebase_FirebaseCore.bundle is FirebaseCore, which Apple lists as needing a privacy manifest, and ships none']
   )
   heldProblems(
     'a manifest that is not valid fails in a bundle that is not on Apple\'s list',

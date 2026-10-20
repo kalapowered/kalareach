@@ -7,8 +7,9 @@
 // changes, a Rust crate starts to read a file's metadata. So this reads the built product and not
 // the files that were meant to describe it:
 //
-//   - every Mach-O in the bundle (the application's executable, each framework, each extension)
-//     for the system calls and Foundation names that are in Apple's lists, and
+//   - every Mach-O in the bundle (the application's executable, each framework, each extension and
+//     each application nested in it) for the system calls and Foundation names that are in Apple's
+//     lists, and
 //   - the manifest of the bundle each one belongs to, for the categories and reasons it declares.
 //
 // The application's executable links its Rust code and its Swift packages statically, so a use in a
@@ -19,12 +20,15 @@
 // say what its upload validation does with a package's resource-bundle manifest for code linked
 // into the application. A package's own manifest, which ships in a resource bundle at the root of
 // the application, is checked for validity and for being there, and is not used to excuse the
-// executable. A framework and an extension are held to their own manifests.
+// executable. A framework, an extension and a nested application are held to their own manifests;
+// the application, the extensions and the nested applications are the project's own and are held
+// to the rules for an application's manifest, and a framework or a resource bundle is a package's.
 //
 // What fails, each with the binary and the name that shows it:
 //
 //   - a category a binary uses that the manifest of its bundle does not declare;
-//   - a category the application's manifest declares that its executable does not use;
+//   - a category the manifest of the application (or of an extension or a nested application)
+//     declares that its executable does not use;
 //   - a category declared with no reason, with a reason that is not Apple's for that category, or
 //     with a reason only a third-party SDK may give;
 //   - a manifest with a key or a value Apple does not define (the root, an accessed API dictionary,
@@ -67,7 +71,7 @@
 import { Buffer } from 'node:buffer'
 import { spawnSync } from 'node:child_process'
 import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from 'node:fs'
-import { basename, dirname, extname, join, relative } from 'node:path'
+import { basename, dirname, extname, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const ROOT = dirname(import.meta.dirname)
@@ -426,10 +430,12 @@ function strayKeys(entry, keys, what) {
 const isStringArray = (value) => Array.isArray(value) && value.every((each) => typeof each === 'string')
 
 /**
- * What a manifest says, or the problems with it. `own` is true for the application's manifest,
- * which may not give a reason only an SDK may give.
+ * What a manifest says, or the problems with it. `own` is true for the manifest of one of the
+ * project's own bundles (the application, its extensions, its nested applications): it has to say
+ * outright whether it tracks, may not be an empty list of accessed APIs, and may not give a reason
+ * only a third-party SDK may give.
  *
- * @returns {{ declared: Map<string, string[]>, problems: string[], tracking: boolean|null }}
+ * @returns {{ declared: Map<string, string[]>, problems: string[], notes: string[], tracking: boolean|null }}
  */
 export function readManifest(manifest, { own }) {
   const problems = []
@@ -540,6 +546,13 @@ export function readManifest(manifest, { own }) {
 
 // -- the bundle ----------------------------------------------------------------------------------
 
+const MANIFEST = 'PrivacyInfo.xcprivacy'
+
+/** Whether `directory` holds an entry named exactly `PrivacyInfo.xcprivacy`, by its listing and not by a lookup that ignores case. */
+function holdsManifest(directory) {
+  return readdirSync(directory).includes(MANIFEST)
+}
+
 /**
  * What a walk of the application found: its Mach-O files, its bundles (the application, each
  * framework, extension and nested application), every `PrivacyInfo.xcprivacy` and what it could
@@ -550,11 +563,13 @@ function walkBundle(app) {
   const bundles = [app]
   const manifests = []
   const links = []
+  const misspelt = []
   const walk = (directory) => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name)
       if (entry.isSymbolicLink()) links.push(path)
-      else if (entry.name === 'PrivacyInfo.xcprivacy') manifests.push(path)
+      else if (entry.name === MANIFEST) manifests.push(path)
+      else if (entry.name.toLowerCase() === MANIFEST.toLowerCase()) misspelt.push(path)
       else if (entry.isDirectory()) {
         if (/\.(app|framework|appex)$/.test(entry.name)) bundles.push(path)
         walk(path)
@@ -562,7 +577,7 @@ function walkBundle(app) {
     }
   }
   walk(app)
-  return { machO: machO.sort(), bundles: bundles.sort(), manifests: manifests.sort(), links: links.sort() }
+  return { machO: machO.sort(), bundles: bundles.sort(), manifests: manifests.sort(), links: links.sort(), misspelt: misspelt.sort() }
 }
 
 /**
@@ -614,7 +629,7 @@ export function sdksIn(app) {
         found.push({
           sdk: name,
           container: relative(app, path),
-          ships: existsSync(join(path, 'PrivacyInfo.xcprivacy'))
+          ships: holdsManifest(path)
         })
       }
       walk(path)
@@ -627,23 +642,27 @@ export function sdksIn(app) {
 /**
  * Holds a built application to its manifests.
  *
- * @returns {{ binaries: object[], declarations: object[], sdks: object[], problems: string[] }}
+ * @returns {{ binaries: object[], declarations: object[], sdks: object[], notes: string[], problems: string[] }}
  */
-export function examine(app) {
+export function examine(path) {
+  const app = resolve(path)
   const problems = []
   const notes = []
   const binaries = []
   const declarations = []
   const manifests = new Map()
+  // The project's own bundles are the application, the applications nested in it and its
+  // extensions; a framework or a resource bundle is a package's.
+  const isOwn = (bundle) => bundle === app || /\.(app|appex)$/.test(bundle)
   const manifestOf = (bundle) => {
     if (manifests.has(bundle)) return manifests.get(bundle)
     const path = join(bundle, 'PrivacyInfo.xcprivacy')
     let answer
-    if (!existsSync(path)) answer = { present: false, declared: new Map(), tracking: null, problems: [], notes: [] }
+    if (!holdsManifest(bundle)) answer = { present: false, declared: new Map(), tracking: null, problems: [], notes: [] }
     else {
       try {
         if (!statSync(path).isFile()) throw new Error('it is not a file')
-        answer = { present: true, ...readManifest(plistValue(path), { own: bundle === app }) }
+        answer = { present: true, ...readManifest(plistValue(path), { own: isOwn(bundle) }) }
       } catch (failure) {
         answer = { present: true, declared: new Map(), tracking: null, problems: [failure.message.split('\n')[0]], notes: [] }
       }
@@ -655,6 +674,9 @@ export function examine(app) {
   const found = walkBundle(app)
   for (const link of found.links) {
     problems.push(`${relative(app, link)} is a symbolic link, which this check does not follow`)
+  }
+  for (const name of found.misspelt) {
+    problems.push(`${relative(app, name)} is not spelt ${MANIFEST}, so it is not read as a privacy manifest`)
   }
   for (const file of found.machO) {
     const bundle = bundleOf(app, file)
@@ -713,11 +735,11 @@ export function examine(app) {
         problems.push(`${name} links ${tracks.join(' and ')} and the manifest of ${where} does not say the application tracks`)
       }
     }
-    // Only the application's own manifest is held to what is used: a framework's is its author's.
-    if (bundle === app) {
+    // The project's own manifests are held to what is used: a framework's is its author's.
+    if (isOwn(bundle)) {
       for (const category of manifest.declared.keys()) {
         if (!used.has(category)) {
-          problems.push(`the manifest of the application declares ${category} and no code in its executable uses it`)
+          problems.push(`the manifest of ${where} declares ${category} and no code in its executable uses it`)
         }
       }
     }
