@@ -29,6 +29,7 @@
 //! | A start whose answer was lost continues under the answer a repeat brings | `a_start_whose_answer_is_lost_continues_under_the_answer_a_repeat_brings` |
 //! | A start the host never answers is unknown, stays owed, and a stop during the repeats revokes what they find | `a_start_the_host_never_answers_is_unknown_and_stays_owed`, `a_stop_during_the_repeats_stops_the_media_and_revokes_what_the_repeats_find` |
 //! | A host that is forgotten, a host that is changed and a device the host revokes each end the call | `forgetting_the_host_ends_the_call_and_owes_the_revocation`, `choosing_another_host_ends_the_call`, `a_device_the_host_revokes_loses_the_call_it_holds` |
+//! | A device revocation whose record cannot be marked still ends the calls the device held, and completes once the record can be written | `a_device_revocation_whose_record_cannot_be_marked_still_ends_the_calls_it_held` |
 //! | A call the host cannot be told about is closed at the service over its own route | `a_call_the_host_cannot_be_told_about_is_closed_at_the_service_over_its_own_route` |
 //! | An owner that fails ends the call it held, in full | `an_owner_that_fails_ends_the_call_it_held_in_full` |
 //! | A file of what a call left owed that the system refuses to read at first is read again when the host is reached, and is not written over before | `a_record_the_system_refused_to_read_is_read_again_when_the_host_is_reached`, `a_record_the_system_refused_to_read_is_not_written_over_and_is_taken_up_with_what_this_launch_added` |
@@ -1866,6 +1867,106 @@ async fn a_device_the_host_revokes_loses_the_call_it_holds() {
     assert_eq!(ended["ended"]["cause"], "service_closed", "{ended}");
     assert_eq!(scene.stand_in.count("/api/voice/sessions/call-1/close"), 1);
     assert!(scene.platform.count("stop") >= 1, "the media stopped");
+    scene.stop_host().await;
+}
+
+/// The host's record of the phone cannot be marked revoked (a full disk, a locked file), and the
+/// host revokes the phone all the same. The grants are withdrawn by then, so the phone can do
+/// nothing under them, and the call it holds is ended all the same, at the service, instead of
+/// running to its deadline: a call that nothing ends would be the one left open. The revocation is
+/// answered with the error, and it is the host's to do again as a new act: once the record can be
+/// written, the revocation completes and marks it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_revocation_whose_record_cannot_be_marked_still_ends_the_calls_it_held() {
+    let mut scene = scene().await;
+    scene.stand_in.end_the_control_when_a_call_is_closed();
+    scene.start().await;
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    let phone = the_phone_of(scene.host());
+    // The registry refuses to mark any device revoked, as a full disk or a locked file would.
+    let registry =
+        rusqlite::Connection::open(scene.host().registry_database()).expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_to_mark_a_device_revoked
+                 BEFORE UPDATE OF revoked_at_ms ON network_devices
+                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("plants the fault");
+
+    let mut client = scene.host().client().await;
+    let refused = net_support::pairing::mutate::<_, kr_protocol::sharing::RevocationResult>(
+        scene.host().environment_id,
+        &mut client,
+        kr_protocol::method::Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams { device_id: phone },
+    )
+    .await
+    .expect_err("the record cannot be marked revoked");
+    drop(refused);
+
+    // The phone's call is ended all the same, and the service is told, once.
+    let ended = scene
+        .state_where("the end", |state| {
+            state["running"] == false && state["ended"].is_object()
+        })
+        .await;
+    assert_eq!(ended["ended"]["cause"], "service_closed", "{ended}");
+    assert_eq!(scene.stand_in.count("/api/voice/sessions/call-1/close"), 1);
+    // Every grant the device held is withdrawn, and the record is not marked.
+    let controller = scene.host().controller();
+    assert!(
+        controller
+            .sharing()
+            .grants()
+            .records_for_device(phone)
+            .expect("the grants")
+            .iter()
+            .all(|held| held.revoked_at_ms.is_some()),
+        "the device's grants are withdrawn"
+    );
+    assert!(
+        controller
+            .devices()
+            .record_for_device(phone)
+            .expect("the record")
+            .is_some_and(|record| record.revoked_at_ms.is_none()),
+        "the device's record could not be marked"
+    );
+
+    // Once the record can be written, a new act completes the revocation and marks it.
+    registry
+        .execute_batch("DROP TRIGGER refuse_to_mark_a_device_revoked;")
+        .expect("lifts the fault");
+    // The connection the first attempt was made on was fenced by the revocation, as every
+    // connection is; the host's owner opens another.
+    let mut client = scene.host().client().await;
+    let again: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+        scene.host().environment_id,
+        &mut client,
+        kr_protocol::method::Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams { device_id: phone },
+    )
+    .await
+    .expect("the revocation completes");
+    drop(again);
+    assert!(
+        scene
+            .host()
+            .controller()
+            .devices()
+            .record_for_device(phone)
+            .expect("the record")
+            .is_some_and(|record| record.revoked_at_ms.is_some()),
+        "the record is marked"
+    );
     scene.stop_host().await;
 }
 
