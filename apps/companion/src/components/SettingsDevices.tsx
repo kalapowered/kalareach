@@ -25,6 +25,7 @@ import {
   DEVICES_HELD_OUT,
   DEVICES_HELP,
   DEVICES_OFFER,
+  DEVICE_REVOKE_WAITING,
   DEVICES_WAITING,
   DEVICE_NOT_VOUCHED,
   describeDevices,
@@ -134,18 +135,25 @@ export function SettingsDevices({
               <li className="device-row" key={held.reference}>
                 <div className="device-words">
                   <p className="account-lead">{held.name}</p>
+                  {held.waiting ? (
+                    <p className="account-note" data-testid="settings-devices-revoke-waiting">
+                      {DEVICE_REVOKE_WAITING}
+                    </p>
+                  ) : null}
                 </div>
-                <Button
-                  data-wraps
-                  disabled={busy}
-                  aria-label={`Share settings with ${held.name} again`}
-                  style={{ minBlockSize: target }}
-                  onClick={() => {
-                    onShare(held.reference)
-                  }}
-                >
-                  Share again
-                </Button>
+                {held.waiting ? null : (
+                  <Button
+                    data-wraps
+                    disabled={busy}
+                    aria-label={`Share settings with ${held.name} again`}
+                    style={{ minBlockSize: target }}
+                    onClick={() => {
+                      onShare(held.reference)
+                    }}
+                  >
+                    Share again
+                  </Button>
+                )}
               </li>
             ))}
           </ul>

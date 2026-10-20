@@ -624,7 +624,7 @@ describe('the devices that share the settings', () => {
           devices: {
             ...sharing.devices,
             candidates: [],
-            held_out: [{ reference: 'phone', name: 'the-phone' }]
+            held_out: [{ reference: 'phone', name: 'the-phone', waiting: false }]
           }
         }
       })
@@ -643,6 +643,35 @@ describe('the devices that share the settings', () => {
       expect(within(card).getByTestId('settings-devices-members')).toHaveTextContent('the-phone')
     })
     expect(within(card).queryByTestId('settings-devices-held-out')).toBeNull()
+  })
+
+  it('names a device whose revoke is still waiting for its host, and offers nothing to share with it', async () => {
+    const { person, controls, sheet } = await openOnAccount()
+    act(() => {
+      controls.settings.change({
+        sync: {
+          ...sharing,
+          devices: {
+            ...sharing.devices,
+            candidates: [],
+            held_out: [
+              { reference: 'phone', name: 'the-phone', waiting: true },
+              { reference: 'tablet', name: 'the-tablet', waiting: false }
+            ]
+          }
+        }
+      })
+    })
+    const card = await within(sheet).findByTestId('settings-devices')
+    const waiting = within(card).getByTestId('settings-devices-revoke-waiting')
+    expect(waiting).toHaveTextContent('A revoke is still waiting for its host.')
+    expect(waiting.closest('li')).toHaveTextContent('the-phone')
+    expect(within(card).queryByRole('button', { name: 'Share settings with the-phone again' })).toBeNull()
+
+    // The other is offered as before, and sharing with it does not touch the first.
+    await person.click(within(card).getByRole('button', { name: 'Share settings with the-tablet again' }))
+    expect(controls.settings.devicesAsked).toContain('share tablet')
+    expect(controls.settings.devicesAsked).not.toContain('share phone')
   })
 
   it('asks once before taking a member out, names it in both answers, and keeps it on the safe one', async () => {

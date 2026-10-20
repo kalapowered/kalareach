@@ -139,9 +139,12 @@ export const DEVICES_HELP =
   'Your settings can follow you to your other devices. A device your hosts list as yours is given ' +
   'the key only when you confirm here, on this computer.'
 
-/** What is said of the devices this computer took out when the person revoked them. */
+/** What is said of the devices this computer kept out of the settings when the person revoked them. */
 export const DEVICES_HELD_OUT =
-  'Taken out when you revoked them. Your hosts still list them, so a revoke may not have gone through.'
+  'Kept out of your settings since you revoked them. Your hosts still list them, so a revoke may not have gone through.'
+
+/** What a device is told whose revoke a host has yet to carry out. */
+export const DEVICE_REVOKE_WAITING = 'A revoke is still waiting for its host.'
 
 /** The sentence a person reads first, for who shares the settings. */
 export function describeDevices(devices: DevicesView): string {

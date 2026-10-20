@@ -2545,6 +2545,12 @@ export function fakeHost(
         settings.sync.devices.candidates.find((one) => one.reference === reference) ??
         settings.sync.devices.held_out.find((one) => one.reference === reference)
       if (candidate === undefined) refuse('PERMISSION_DENIED', 'No host lists that device any more.')
+      if ('waiting' in candidate && candidate.waiting) {
+        refuse(
+          'PERMISSION_DENIED',
+          'A request to revoke that device is still waiting for its host, so nothing was shared with it.'
+        )
+      }
       if (!settings.sync.devices.can_confirm) {
         refuse('UNSUPPORTED_CAPABILITY', 'This computer has no way to ask you to confirm.')
       }
