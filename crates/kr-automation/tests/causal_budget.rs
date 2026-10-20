@@ -402,17 +402,34 @@ fn clock_now(clock: &ManualClock) -> u64 {
     kr_automation::HostClock::now_ms(clock)
 }
 
-/// A workflow cannot retrigger on its own descendants unless the reviewed definition says so.
+/// KR-REQ-25.15: a workflow does not retrigger on its own descendants unless the reviewed
+/// definition says so. A definition document that says nothing of recurrence, as a client sends one
+/// to `workflow.install`, reads as recurrence off, is refused another turn in its own chain, and
+/// nothing further runs; the same workflow with explicit recurrence takes it.
 #[tokio::test]
 async fn self_retrigger_is_refused_without_explicit_recurrence() {
     let service = in_memory();
-    let mut def = recurring_workflow(
-        3,
+    let mut written = create_workflow_definition(
+        test_wf_id(3),
+        1,
         "self-trigger",
-        "tests.passed",
-        WorkflowActionKind::RunTests,
+        test_grant_id(1),
+        vec![common::node("step", WorkflowActionKind::RunTests)],
+        vec![],
     );
-    def.explicit_recurrence = false;
+    written.trigger.event_type = "tests.passed".to_owned();
+    // The document as it travels, with the field a client leaves out left out.
+    let mut document = serde_json::to_value(&written).expect("a document");
+    document
+        .as_object_mut()
+        .expect("a document is an object")
+        .remove("explicit_recurrence")
+        .expect("the builder wrote the field");
+    let def: WorkflowDefinition = serde_json::from_value(document).expect("the document reads");
+    assert!(
+        !def.explicit_recurrence,
+        "recurrence is off until a definition asks for it"
+    );
     install_and_enable(&service, &def, 1_000);
 
     let first = service
@@ -434,6 +451,28 @@ async fn self_retrigger_is_refused_without_explicit_recurrence() {
         1,
         "nothing further ran under the chain"
     );
+
+    // The control: the same workflow with explicit recurrence takes another turn in its own chain.
+    let recurring_service = in_memory();
+    let recurring = recurring_workflow(
+        3,
+        "self-trigger",
+        "tests.passed",
+        WorkflowActionKind::RunTests,
+    );
+    install_and_enable(&recurring_service, &recurring, 1_000);
+    recurring_service
+        .submit_run(&run_params(&recurring, "evt-1"), 1_000)
+        .await
+        .expect("the first run is admitted");
+    only(
+        recurring_service
+            .dispatch_triggers(2_000)
+            .await
+            .expect("a pass"),
+    )
+    .outcome
+    .expect("explicit recurrence takes another turn");
 }
 
 /// A descendant's root, depth and parent are the journal's record of the node that produced its
