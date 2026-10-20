@@ -17,7 +17,7 @@ use kr_protocol::confirmation::{
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::SessionSelector;
-use kr_protocol::ids::{ActionId, DeviceId, RequestId, SessionId};
+use kr_protocol::ids::{ActionId, DeviceId, RequestId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Nullable;
@@ -83,7 +83,7 @@ async fn kr_req_18_03_a_transfer_hands_a_session_to_another_device_on_the_owners
     let (boss, boss_record) = recipient(&host, &owner).await;
     let (giver, giver_record) = recipient(&host, &owner).await;
     let (taker, taker_record) = recipient(&host, &owner).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
     let (above, above_connection) = owned_by(&host, session_id, &boss, &boss_record).await;
     let (held, giving) = delegated(
         &host,
@@ -258,7 +258,7 @@ async fn kr_req_18_03_a_transfer_the_owner_did_not_confirm_hands_nothing_over() 
     let (giver, giver_record) = recipient(&host, &owner).await;
     let (_taker, taker_record) = recipient(&host, &owner).await;
     let (_other, other_record) = recipient(&host, &owner).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
     let (held, giving) = owned_by(&host, session_id, &giver, &giver_record).await;
     let to_taker = GrantTransferParams {
         session_id,
@@ -375,7 +375,7 @@ async fn kr_req_18_03_a_transfer_to_a_device_whose_pairing_ends_first_is_not_des
     let (_taker, taker_record) =
         net_support::recipient_ending_in(&host, &owner, std::time::Duration::from_secs(5 * 60))
             .await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
     // An owner's share lasts an hour unless it is told otherwise: the taker's pairing has five
     // minutes of it.
     let (held, _giving) = owned_by(&host, session_id, &giver, &giver_record).await;
@@ -421,7 +421,7 @@ async fn kr_req_23_49_a_lost_reply_to_the_confirmation_request_is_repeated_and_o
     let (boss, boss_record) = recipient(&host, &owner).await;
     let (giver, giver_record) = recipient(&host, &owner).await;
     let (_taker, taker_record) = recipient(&host, &owner).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
     let (above, above_connection) = owned_by(&host, session_id, &boss, &boss_record).await;
     let (held, giving) = delegated(
         &host,

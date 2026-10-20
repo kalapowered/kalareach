@@ -86,7 +86,7 @@ async fn kr_req_25_10_a_device_redeems_its_invitation_once_and_a_repeat_of_the_a
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let (device, record) = recipient(&host, &owner).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
     let issued = shared(&host, session_id, record.device_id).await;
     assert!(
         !is_active(&host, issued.grant.grant_id),
@@ -159,7 +159,12 @@ async fn kr_req_25_10_a_withdrawn_invitation_activates_nothing() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let (device, record) = recipient(&host, &owner).await;
-    let issued = shared(&host, SessionId::new(kr_ipc::new_uuid()), record.device_id).await;
+    let issued = shared(
+        &host,
+        net_support::an_open_session(&host).0,
+        record.device_id,
+    )
+    .await;
 
     host.client()
         .await
@@ -221,7 +226,7 @@ async fn kr_req_25_10_an_expired_invitation_activates_nothing() {
                 invitation_id,
                 grant_id,
                 environment_id: host.environment_id,
-                session_id: SessionId::new(kr_ipc::new_uuid()),
+                session_id: net_support::an_open_session(&host).0,
                 issuer_device_id: host.controller().sharing().host_device_id(),
                 recipient_device_id: record.device_id,
                 parent_grant_id: None,
@@ -306,8 +311,13 @@ async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_p
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let (device, record) = recipient(&host, &owner).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
-    let other = shared(&host, SessionId::new(kr_ipc::new_uuid()), record.device_id).await;
+    let session_id = net_support::an_open_session(&host).0;
+    let other = shared(
+        &host,
+        net_support::an_open_session(&host).0,
+        record.device_id,
+    )
+    .await;
     let connection = RawDevice::connect(&host, &device, &record).await;
     // Written once the connection is up, so the share's life is spent on the exchange below and
     // not on setting the connection up. It lasts a third of the host's wait for an effect.
@@ -408,7 +418,7 @@ async fn kr_req_25_10_a_share_may_not_outlast_its_recipients_pairing() {
     let host = Host::start(&owner).await;
     let (_device, record) =
         net_support::recipient_ending_in(&host, &owner, Duration::from_secs(30 * 60)).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
 
     // The default lifetime is an hour, and the pairing has half of that.
     let refused = try_share(&host, session_id, record.device_id, None)
@@ -434,7 +444,7 @@ async fn kr_req_25_10_a_share_to_a_device_this_host_does_not_pair_with_is_refuse
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let (_device, record) = recipient(&host, &owner).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
 
     let unknown = try_share(&host, session_id, DeviceId::new(kr_ipc::new_uuid()), None)
         .await
@@ -472,7 +482,7 @@ async fn kr_req_25_10_a_pairing_that_has_run_out_takes_no_share_and_the_device_l
         net_support::recipient_ending_in(&host, &owner, Duration::from_secs(5 * 60)).await;
     let wide = Device::create().await;
     let wide_record = pair_with(&host, &wide, &owner, proposal(&[ActionRight::SessionView])).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
 
     let listed = devices(&host).await;
     let entry = |list: &DeviceListResult, device_id: DeviceId| {
@@ -518,7 +528,7 @@ async fn kr_req_18_03_a_device_that_delegates_learns_nothing_of_the_recipients_p
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let (boss, boss_record) = recipient(&host, &owner).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
     let (above, issuing) = owned_by(&host, session_id, &boss, &boss_record).await;
     let (_short, short_record) =
         net_support::recipient_ending_in(&host, &owner, Duration::from_secs(5 * 60)).await;
@@ -570,7 +580,7 @@ async fn kr_req_18_03_the_grant_list_carries_the_earlier_of_the_shares_end_and_t
     let (_short, short_record) =
         net_support::recipient_ending_in(&host, &owner, Duration::from_secs(30 * 60)).await;
     let (_long, long_record) = recipient(&host, &owner).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
     // Written below the host's checks, as a share was before they existed: an hour for a device
     // that has half of it.
     let write = |recipient: DeviceId| {
@@ -648,7 +658,7 @@ async fn kr_req_18_03_a_device_that_lists_its_delegations_is_not_told_the_recipi
     let (boss, boss_record) = recipient(&host, &owner).await;
     let (_short, short_record) =
         net_support::recipient_ending_in(&host, &owner, Duration::from_secs(10 * 60)).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
     let (above, issuing) = owned_by(&host, session_id, &boss, &boss_record).await;
 
     // Written below the host's checks, as a delegation was before they existed: the boss issued
@@ -733,7 +743,7 @@ async fn kr_req_25_10_a_pairing_that_runs_out_while_the_share_waits_takes_no_sha
     // minutes: the pairing ends while the request is held, and the request's own deadline does not.
     let (_device, record) =
         net_support::recipient_ending_in(&host, &owner, Duration::from_secs(70)).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
     let selection = RoleSelection::plain(SessionRole::Viewer);
     let params = GrantCreateParams {
         session_id,

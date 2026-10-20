@@ -16,7 +16,7 @@ use kr_crypto::keys::DeviceKeys;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::SessionSelector;
-use kr_protocol::ids::{ActionId, GrantId, SessionId, WorkflowId};
+use kr_protocol::ids::{ActionId, GrantId, WorkflowId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nullable, U64, Uuid};
@@ -144,7 +144,7 @@ async fn viewer_selecting(
     let mut grant = proposal(actions);
     grant.session_selector = selector;
     let record = pair_with(host, &device, owner, grant).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
     let selection = RoleSelection::plain(SessionRole::Viewer);
     let issued: GrantCreateResult = host
         .client()

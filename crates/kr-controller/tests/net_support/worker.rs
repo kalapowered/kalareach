@@ -588,13 +588,9 @@ pub struct Adopted {
 
 impl Adopted {
     /// Starts a daemon on a fresh environment, bootstraps its owner, stops it, starts `sessions`
-    /// workers on the tree and starts the daemon again, which adopts them.
+    /// workers on the tree, each reserved and open in the registry as every session a daemon
+    /// creates is, and starts the daemon again, which adopts them.
     pub async fn start(sessions: u64) -> Self {
-        Self::start_on(sessions, None, Clocks::system(), false).await
-    }
-
-    /// As [`Self::start`], with each session also reserved and open in the daemon's registry.
-    pub async fn start_reserved(sessions: u64) -> Self {
         Self::start_on(sessions, None, Clocks::system(), true).await
     }
 
@@ -603,12 +599,12 @@ impl Adopted {
         sessions: u64,
         document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
     ) -> Self {
-        Self::start_on(sessions, Some(document), Clocks::system(), false).await
+        Self::start_on(sessions, Some(document), Clocks::system(), true).await
     }
 
     /// As [`Self::start`], on the clocks a suite moves by hand.
     pub async fn start_on_clocks(sessions: u64, clocks: Clocks) -> Self {
-        Self::start_on(sessions, None, clocks, false).await
+        Self::start_on(sessions, None, clocks, true).await
     }
 
     async fn start_on(

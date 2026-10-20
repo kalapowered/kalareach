@@ -1517,7 +1517,7 @@ async fn the_screen_preview_is_read_from_a_real_worker_through_the_command() {
 /// was shown. The screen is a real worker's, and the issuer is shown its line.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_offer_to_a_guest_tells_what_it_carries_and_none_of_the_screen_the_issuer_was_shown() {
-    let adopted = Adopted::start_reserved(1).await;
+    let adopted = Adopted::start(1).await;
     let host = &adopted.host;
     let session_id = adopted.workers[0].session_id;
     let _typing = type_into(host, &adopted.owner, session_id, &format!("{MARKER}\n")).await;

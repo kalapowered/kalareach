@@ -116,7 +116,7 @@ impl Rig {
         }
         let record = pair_with(&host, &device, &owner, grant).await;
         let connection = RawDevice::connect(&host, &device, &record).await;
-        let elsewhere = SessionId::new(kr_ipc::new_uuid());
+        let elsewhere = net_support::an_open_session(&host).0;
         if only_here {
             let share = share_with(
                 &host,

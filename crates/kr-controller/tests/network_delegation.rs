@@ -86,7 +86,7 @@ async fn kr_req_18_03_a_device_delegates_a_narrower_grant_and_revokes_what_it_de
     let host = Host::start(&owner).await;
     let (boss, boss_record) = recipient(&host, &owner).await;
     let (friend, friend_record) = recipient(&host, &owner).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
     let (above, boss_connection) = owned_by(&host, session_id, &boss, &boss_record).await;
 
     let params = delegation(
@@ -193,7 +193,7 @@ async fn kr_req_10_45_a_device_cannot_delegate_past_the_limit_of_a_tree() {
     let host = Host::start(&owner).await;
     let (boss, boss_record) = recipient(&host, &owner).await;
     let (_friend, friend_record) = recipient(&host, &owner).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
     let (above, boss_connection) = owned_by(&host, session_id, &boss, &boss_record).await;
     let delegate_to = |lifetime_ms: u64| {
         delegation(
@@ -273,7 +273,7 @@ async fn kr_req_18_03_a_device_delegates_nothing_wider_than_it_holds_and_revokes
     let (boss, boss_record) = recipient(&host, &owner).await;
     let (friend, friend_record) = recipient(&host, &owner).await;
     let (stranger, stranger_record) = recipient(&host, &owner).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
     let (above, boss_connection) = owned_by(&host, session_id, &boss, &boss_record).await;
     let (strangers, stranger_connection) =
         owned_by(&host, session_id, &stranger, &stranger_record).await;
@@ -546,7 +546,7 @@ async fn kr_req_23_49_a_delegation_hands_on_no_right_the_configuration_removed()
         .expect("a ceiling that keeps viewing and sharing");
     let (boss, boss_record) = recipient(&host, &owner).await;
     let (_friend, friend_record) = recipient(&host, &owner).await;
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let session_id = net_support::an_open_session(&host).0;
     let (above, boss_connection) = owned_by(&host, session_id, &boss, &boss_record).await;
     let viewer = delegation(
         session_id,
