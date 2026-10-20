@@ -520,28 +520,30 @@ A test result is what this host observed, and nothing a caller reports.
   the copy, and records none. If the result or its line of evidence cannot be recorded, the node is
   left unknown, whatever the suite's status; a result can be recorded without its line of evidence.
   The exit status will be recorded; a signal is a suite something stopped, with no status, and its
-  detail and the line of evidence name the signal. The times the session was created and closed, the
-  session, workflow run and node it observed, and the digest of the command the suite's
-  configuration gave (never the command) will also be recorded. One line of evidence says how the
-  suite ended and whether the copy still held the version. A suite that never started, or that a
-  stop of its node or of its session ended, has no result to record. When the wait for its action or
-  the run's deadline expires, the node settles as cancelled and its answer says that its action was
-  asked to stop; when its run is cancelled, the node settles as cancelled with the reason "run
-  cancelled by request"; when its session closes in any other way before the node is settled, the
-  node's answer says how the session closed. A node settled as cancelled stays cancelled, whatever
-  the suite does afterwards. The node succeeds only when the suite exited with status zero and the
-  copy still holds exactly the version. If the suite exited with a non-zero exit status or was
-  stopped by a signal, the node will fail, once the host has recorded what it observed. If the suite
-  exited with status zero against a copy that was changed, or that cannot be read back, it attests
-  no version, so the node is left unknown. When the copy was changed and what it held can be read
-  completely, within the bounds of a capture and the rules for what a version may hold, that is
-  stored as a version of its own, which is a reading and not an attestation. When the copy cannot be
-  read back, or a file outside the declared outputs that the reading found has a modification time
-  in a later millisecond than the closure of the session, no version is stored (the files a reading
-  did store stay in the content store); a change after the closure that leaves no such time, such as
-  a deletion, cannot be told from a change the suite made. The host will record what it wrote when
-  it makes the copy and read the copy when it records the result of the suite, but will not monitor
-  the copy while the suite is running.
+  detail and the line of evidence say that a signal ended it and name the signal when the closure
+  does. The times the session was created and closed, the session, workflow run and node it
+  observed, and the digest of the command the suite's configuration gave (never the command) will
+  also be recorded. One line of evidence says how the suite ended and whether the copy still held
+  the version. A suite that never started, or that a stop of its node or of its session ended, has
+  no result to record. When the wait for its action or the run's deadline expires, the node settles
+  as cancelled and its answer says that its action was asked to stop (a node whose dispatch had
+  already ended when the wait was found to have lapsed is left unknown instead); when its run is
+  cancelled, the node settles as cancelled with the reason "run cancelled by request"; when its
+  session closes in any way but the suite's own end before the node is settled, the node's answer
+  says how the session closed. A node settled as cancelled stays cancelled, whatever the suite does
+  afterwards. The node succeeds only when the suite exited with status zero and the copy still holds
+  exactly the version. If the suite exited with a non-zero exit status or was stopped by a signal,
+  the node will fail, once the host has recorded what it observed. If the suite exited with status
+  zero against a copy that was changed, or that cannot be read back, it attests no version, so the
+  node is left unknown. When the copy was changed and what it held can be read completely, within
+  the bounds of a capture and the rules for what a version may hold, that is stored as a version of
+  its own, which is a reading and not an attestation. When the copy cannot be read back, or a file
+  outside the declared outputs that the reading found has a modification time in a later millisecond
+  than the closure of the session, no version is stored (the files a reading did store stay in the
+  content store); a change after the closure that leaves no such time, such as a deletion, cannot be
+  told from a change the suite made. The host will record what it wrote when it makes the copy and
+  read the copy when it records the result of the suite, but will not monitor the copy while the
+  suite is running.
 * **Declared outputs.** A suite may declare paths it intends to write, other than its source, such
   as a build directory. These paths are not compared, and each one the reading reaches is recorded
   in one reference; a reading that stops at a problem in the source records only the outputs before
@@ -550,20 +552,24 @@ A test result is what this host observed, and nothing a caller reports.
   followed), with the sum of the lengths it lists. The listing holds up to 50,000 entries, 64 levels
   and 16 MiB of path text; beyond this it is a truncated listing. A file is recorded as the digest
   of its first 64 MiB and its whole length. A symbolic link or other non-file, non-directory object
-  is recorded as such. If a directory in an output is a link, a mount, or has a name this host does
-  not carry, it is an entry of the listing and is not entered. Nothing in an output enters the
-  content store. A result that attests the version names the output paths it left out of the
-  comparison. A file the suite adds beside an output is not left out of the comparison and changes
-  the source (an added empty directory does not), so a tool that writes beside each source directory
-  (a compiled-code cache is the usual one) makes a run of that suite that exits with status zero
-  unknown and, where what the copy held can be read completely, stores what it wrote as a version of
-  its own. An output path must be exactly specified; it is not possible to use a pattern. An
-  ancestor of an output is entered to reach it, and its other entries follow the normal rules for
-  the source. Declarations that repeat, lie inside one another or contradict a path the version
-  holds are refused before the suite runs. So is a declaration with a name this host does not carry
-  as input (a colon, one of `< > " | ? *`, a trailing dot or space, a name a Windows device has with
-  or without an extension, a name over 255 bytes), which the configuration accepts and every
-  dispatch of that suite then refuses.
+  is recorded as such, and an output that cannot be read is recorded as an unreadable output with
+  the digest of no bytes (an entry of a listing that cannot be read is listed as unreadable). If a
+  directory in an output is a link, a mount, or has a name this host does not carry, it is an entry
+  of the listing and is not entered. Nothing in an output enters the content store. A result that
+  attests the version names the output paths it left out of the comparison. A file the suite adds
+  beside an output is not left out of the comparison and changes the source (an added empty
+  directory does not, unless the change set's rules keep its path out, which makes the source
+  indeterminate), so a tool that writes beside each source directory (a compiled-code cache is the
+  usual one) makes a run of that suite that exits with status zero unknown and, where what the copy
+  held can be read completely, stores what it wrote as a version of its own. An output path must be
+  exactly specified; it is not possible to use a pattern. An ancestor of an output is entered to
+  reach it, and its other entries follow the normal rules for the source. Declarations that repeat,
+  lie inside one another, or are or contain a path the version holds are refused before the suite
+  runs. So is a declaration with a name this host does not carry as input (a colon, one of `< > " |
+  ? *`, a trailing dot or space, a name a Windows device has with or without an extension, a name
+  over 255 bytes), which the configuration accepts and every dispatch of that suite then refuses. A
+  declaration beneath a file of the version is accepted, since writing there takes the file away
+  first, which reads as a change.
 * **The copy's release.** A copy is taken away by the dispatch at once when no suite ran (the copy
   could not be written whole, or its session could not be made), and otherwise once the session has
   closed and its worker is accounted for; the sweep takes away any other copy. A node that settles
