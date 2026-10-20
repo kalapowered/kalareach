@@ -20,10 +20,10 @@
 	<key>NSPrivacyTrackingDomains</key>
 	<array/>
 	<!--
-		Data collected. Each entry is data that leaves the device to a service the application
-		reaches and that the service (or its provider) can read and keeps beyond answering the
-		request. Each is tied to the account or installation that sent it, and none is used for
-		tracking. Content the application seals on the device before sending (settings, drafts, the
+		Data collected. Each entry is data about the person or the device that a service the
+		application reaches (or its provider) can read and keeps beyond answering the request,
+		whether the application sends it or the service records it. Each is tied to the account or
+		installation it came from, and none is used for tracking. Content the application seals on the device before sending (settings, drafts, the
 		recovery bundle) is not here: the sync service holds ciphertext it cannot read, and Apple
 		counts data stored in a readable form.
 	-->
@@ -129,7 +129,8 @@
 				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
 			</array>
 		</dict>
-		<!-- How long the voice service took to create a call and to make it ready, kept with the call. -->
+		<!-- How long the voice service took to create a call and to make it ready, which the service
+			measures and keeps with the call. -->
 		<dict>
 			<key>NSPrivacyCollectedDataType</key>
 			<string>NSPrivacyCollectedDataTypePerformanceData</string>
@@ -171,9 +172,10 @@
 			descriptor directory, the installation record, drafts, settings, the recovery record and
 			the sync membership make on files and directories in the application's own container
 			(whether a path exists, is a file or a directory, its size and its owner and mode), which
-			Tauri and its opener plugin make on the application's own resource directory and on the
-			paths they are asked to open, and which the standard library's backtrace symbolizer makes on
-			the application's own executable.
+			Tauri makes on the application's own resource directory, and which the standard library's
+			backtrace symbolizer makes on the application's own executable. Tauri's opener plugin is
+			linked and its path scope check imports lstat, but the application opens addresses only
+			and no capability grants the plugin's path commands.
 
 			3B52.1, "Declare this reason to access the timestamps, size, or other metadata of files or
 			directories that the user specifically granted access to, such as using a document picker
