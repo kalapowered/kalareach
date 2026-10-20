@@ -8,7 +8,8 @@
 //!
 //! It is also the one reader of Rust source in the release tooling: the lists and constants a release
 //! declares (`string_list`, `string_const`) are read with the same lexer, which takes comments out
-//! and masks literals, so no second reader has a second idea of what is code.
+//! and masks literals, so no second reader has a second idea of what is code. A raw string literal
+//! is refused, since its quotes would change what the lexer takes for code.
 //!
 //! This file is also read by the `kr-cli` tests that compare a record with the tree of the release
 //! it was cut from and choose the release the upgrade suite updates from, so it uses nothing but the
@@ -245,24 +246,6 @@ fn escaped_character_literal(characters: &[char], index: usize) -> Option<usize>
     (index + 3..characters.len().min(index + 14)).find(|at| characters[*at] == '\'')
 }
 
-/// Whether a raw string literal (`r"`, `r#"`, `br"`) begins at `index`.
-fn starts_a_raw_string(characters: &[char], index: usize) -> bool {
-    if characters[index] != 'r' {
-        return false;
-    }
-    let word = |at: Option<usize>| {
-        at.and_then(|at| characters.get(at))
-            .is_some_and(|c| c.is_alphanumeric() || *c == '_')
-    };
-    let before = index.checked_sub(1);
-    let begins = !word(before) || (characters[index - 1] == 'b' && !word(index.checked_sub(2)));
-    let mut after = index + 1;
-    while characters.get(after) == Some(&'#') {
-        after += 1;
-    }
-    begins && characters.get(after) == Some(&'"')
-}
-
 /// `source` without its `//` and `/* */` comments; text between double quotes is left alone.
 fn without_comments(source: &str) -> Result<String, String> {
     let characters: Vec<char> = source.chars().collect();
@@ -289,13 +272,16 @@ fn without_comments(source: &str) -> Result<String, String> {
             kept.extend(&characters[index..index + 3]);
             index += 3;
             continue;
-        } else if starts_a_raw_string(&characters, index) {
-            return Err(
-                "a raw string literal, which this reader does not read (its quotes would \
-                 change what it takes for code)"
-                    .to_owned(),
-            );
         } else if here == '"' {
+            // Every raw string literal (`r".."`, `r#".."#`, `br".."`, `cr".."`) opens with a quote
+            // that follows an `r` or a `#`, and no literal this reader reads does.
+            if index > 0 && matches!(characters[index - 1], 'r' | '#') {
+                return Err(
+                    "a raw string literal, which this reader does not read (its quotes would \
+                     change what it takes for code)"
+                        .to_owned(),
+                );
+            }
             quoted = true;
             kept.push(here);
         } else if here == '/' && next == Some('/') {
