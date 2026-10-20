@@ -51,18 +51,16 @@ function finish(): void {
 }
 
 describe('a sheet’s focus', () => {
-  it('goes back to the control that opened it when the sheet goes', () => {
+  it('is not modal once it is on its way out, so that what the focus went to is reachable', () => {
     const close = vi.fn()
-    const { rerender } = render(<Page open={false} onClose={close} />)
-    screen.getByRole('button', { name: 'Opener' }).focus()
-    rerender(<Page open onClose={close} />)
+    const { rerender } = render(<Page open onClose={close} />)
     finish()
-    expect(screen.getByRole('dialog').contains(document.activeElement), 'the sheet has the focus').toBe(true)
+    expect(screen.getByRole('dialog')).toHaveAttribute('aria-modal', 'true')
 
     rerender(<Page open={false} onClose={close} />)
-    finish()
-    expect(screen.queryByRole('dialog')).toBeNull()
-    expect(screen.getByRole('button', { name: 'Opener' })).toHaveFocus()
+    // Still drawn while it fades: a screen reader that stays inside a modal would not reach the
+    // control the focus went to when it was asked to close.
+    expect(screen.getByRole('dialog')).not.toHaveAttribute('aria-modal', 'true')
   })
 
   it('stays where something put it on purpose while the sheet was going', () => {

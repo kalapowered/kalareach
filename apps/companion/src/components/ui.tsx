@@ -925,7 +925,7 @@ export function Sheet({
         ref={sheetRef}
         className="sheet"
         role="dialog"
-        aria-modal="true"
+        aria-modal={open ? 'true' : 'false'}
         aria-labelledby={titleId}
         data-testid="sheet"
         data-open={open ? 'true' : 'false'}
