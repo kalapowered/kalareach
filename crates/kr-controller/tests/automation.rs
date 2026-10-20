@@ -4216,6 +4216,27 @@ fn reservation_phases(host: &Host, grant: GrantId) -> Vec<String> {
         .expect("rows")
 }
 
+/// Whether a worker's claim was committed on each reservation of the grant's sessions, oldest
+/// first.
+fn reservation_claims(host: &Host, grant: GrantId) -> Vec<bool> {
+    let registry = rusqlite::Connection::open(host._temp.environment().registry_database())
+        .expect("opens the registry");
+    let mut statement = registry
+        .prepare(
+            "SELECT claimed_key IS NOT NULL FROM reservations WHERE actor_id = ?1 \
+             ORDER BY created_at_ms",
+        )
+        .expect("prepares");
+    statement
+        .query_map(
+            [kr_automation::resources::session_principal(grant)],
+            |row| row.get::<_, bool>(0),
+        )
+        .expect("reads")
+        .collect::<std::result::Result<_, _>>()
+        .expect("rows")
+}
+
 /// The first live session whose root is a command, once there is one.
 async fn live_command_session(control: &mut LocalClient) -> kr_protocol::session::SessionSummary {
     let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -4956,12 +4977,14 @@ async fn a_wait_that_ends_at_the_door_makes_no_session(
         reservation_phases(&host, grant_id(number)) == ["failed"]
     })
     .await;
-    // The platform started a worker, so the reservation failed at that worker's claim and not at a
-    // launch that never started.
+    // The platform started a worker and the reservation failed with no claim committed: the
+    // worker's claim was refused, not admitted and then reported failed, and the launch did not
+    // fail before it started.
+    assert_eq!(door.workers_started(), 1, "a worker was started");
     assert_eq!(
-        door.workers_started(),
-        1,
-        "a worker was started and refused"
+        reservation_claims(&host, grant_id(number)),
+        [false],
+        "the worker's claim was refused"
     );
     assert!(!marker.exists(), "the command never ran");
     assert!(

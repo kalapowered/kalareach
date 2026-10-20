@@ -3612,9 +3612,9 @@ mod tests {
 
     /// A node whose admission refuses commits to nothing: a request to stop that comes after the
     /// refusal still stops the node, so a wait that ended first leaves it cancelled and not
-    /// unknown, in whichever order the admission and the engine's request reach it. The controls
-    /// are a node whose admission passes, which a later request cannot stop, and a node that was
-    /// asked to stop first, which is refused.
+    /// unknown, whichever of the admission and the engine's request reaches it first while the
+    /// dispatch is live. The controls are a node whose admission passes, which a later request
+    /// cannot stop, and a node that was asked to stop first, which is refused.
     #[test]
     fn a_refused_admission_leaves_the_node_stoppable() {
         let refused = NodeTask::default();
