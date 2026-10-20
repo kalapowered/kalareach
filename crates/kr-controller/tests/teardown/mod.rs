@@ -635,8 +635,14 @@ fn run_bounded(command: &mut Command) -> Result<ExitStatus, String> {
 /// Runs one of the platform's own tools to its end, for no longer than [`TOOL_BOUND`], and returns
 /// what it printed when it succeeded.
 fn run_bounded_output(command: &mut Command) -> Result<String, String> {
+    run_bounded_output_within(command, TOOL_BOUND)
+}
+
+/// Runs one of the platform's own tools to its end, for no longer than `bound`, and returns what it
+/// printed when it succeeded.
+fn run_bounded_output_within(command: &mut Command, bound: Duration) -> Result<String, String> {
     command.stdout(Stdio::piped());
-    let (status, printed) = finish_bounded(command)?;
+    let (status, printed) = finish_bounded_within(command, bound)?;
     if status.success() {
         Ok(printed)
     } else {
@@ -645,6 +651,13 @@ fn run_bounded_output(command: &mut Command) -> Result<String, String> {
 }
 
 fn finish_bounded(command: &mut Command) -> Result<(ExitStatus, String), String> {
+    finish_bounded_within(command, TOOL_BOUND)
+}
+
+fn finish_bounded_within(
+    command: &mut Command,
+    bound: Duration,
+) -> Result<(ExitStatus, String), String> {
     let mut child = command
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -662,7 +675,7 @@ fn finish_bounded(command: &mut Command) -> Result<(ExitStatus, String), String>
         });
         printed
     });
-    let deadline = Instant::now() + TOOL_BOUND;
+    let deadline = Instant::now() + bound;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -679,7 +692,7 @@ fn finish_bounded(command: &mut Command) -> Result<(ExitStatus, String), String>
             Ok(None) => {
                 let failed = end_and_collect(&mut child);
                 return Err(format!(
-                    "{command:?} did not finish within {TOOL_BOUND:?}{failed}"
+                    "{command:?} did not finish within {bound:?}{failed}"
                 ));
             }
             // This process's own child, so it is ended and collected here too.
@@ -823,7 +836,38 @@ const JOB_LABEL_PATTERNS: [&str; 2] = ["kr-worker-*.service", "kr-plugin-host-*.
 /// afterwards or that could not be established as gone.
 #[cfg(target_os = "linux")]
 fn remove_jobs(tree: &TempHost) -> Vec<String> {
-    remove_units_through(tree, std::path::Path::new("systemctl"))
+    remove_units_through(tree, std::path::Path::new("systemctl"), MANAGER_HUNG_AFTER)
+}
+
+/// How long the user manager is given to answer a question about its units, however often it is
+/// asked, before it is taken for a manager that does not answer.
+///
+/// The manager of a machine that runs many tests holds every unit they started, and answers a
+/// question about them late and then answers; a late answer says nothing about the units. A
+/// question is therefore given what is left of this to finish in, and asked again when it fails;
+/// it ends only for a manager that is hung.
+#[cfg(target_os = "linux")]
+const MANAGER_HUNG_AFTER: Duration = Duration::from_secs(60);
+
+/// What `ask` answers, where `ask` is given what is left of `give_up_after` to finish in, and never
+/// less than [`TOOL_BOUND`], asked again after a short pause for as long as it fails and time is
+/// left, and the last failure when none is.
+#[cfg(target_os = "linux")]
+fn asked_again_until_answered(
+    give_up_after: Duration,
+    mut ask: impl FnMut(Duration) -> Result<String, String>,
+) -> Result<String, String> {
+    let deadline = Instant::now() + give_up_after;
+    loop {
+        match ask(deadline
+            .saturating_duration_since(Instant::now())
+            .max(TOOL_BOUND))
+        {
+            Ok(answer) => return Ok(answer),
+            Err(error) if Instant::now() >= deadline => return Err(error),
+            Err(_) => std::thread::sleep(Duration::from_millis(250)),
+        }
+    }
 }
 
 /// Does what [`remove_jobs`] does, asking the user manager through `systemctl`, and returns each
@@ -835,9 +879,15 @@ fn remove_jobs(tree: &TempHost) -> Vec<String> {
 /// that runs anywhere else is never touched. An account with no user manager running has no unit
 /// to remove, and that is read from where every user manager listens, its private socket in the
 /// runtime directory, rather than from a question that fails: a manager that is there and does not
-/// answer leaves every unit it may hold not established as gone.
+/// answer for `give_up_after` leaves every unit it may hold not established as gone. A question
+/// the manager answers late, or fails once, is asked again, and a unit that is still loaded when
+/// `give_up_after` has passed is left.
 #[cfg(target_os = "linux")]
-pub fn remove_units_through(tree: &TempHost, systemctl: &std::path::Path) -> Vec<String> {
+pub fn remove_units_through(
+    tree: &TempHost,
+    systemctl: &std::path::Path,
+    give_up_after: Duration,
+) -> Vec<String> {
     let mut left = Vec::new();
     let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
         return left;
@@ -853,17 +903,20 @@ pub fn remove_units_through(tree: &TempHost, systemctl: &std::path::Path) -> Vec
         command.arg("--user");
         command
     };
-    let listed = match run_bounded_output(
-        manager()
-            .args([
-                "list-units",
-                "--all",
-                "--plain",
-                "--no-legend",
-                "--type=service",
-            ])
-            .args(JOB_LABEL_PATTERNS),
-    ) {
+    let listed = match asked_again_until_answered(give_up_after, |bound| {
+        run_bounded_output_within(
+            manager()
+                .args([
+                    "list-units",
+                    "--all",
+                    "--plain",
+                    "--no-legend",
+                    "--type=service",
+                ])
+                .args(JOB_LABEL_PATTERNS),
+            bound,
+        )
+    }) {
         Ok(listed) => listed,
         Err(error) => {
             left.push(format!(
@@ -879,11 +932,14 @@ pub fn remove_units_through(tree: &TempHost, systemctl: &std::path::Path) -> Vec
     if units.is_empty() {
         return left;
     }
-    let shown = match run_bounded_output(
-        manager()
-            .args(["show", "--property=Id,WorkingDirectory"])
-            .args(&units),
-    ) {
+    let shown = match asked_again_until_answered(give_up_after, |bound| {
+        run_bounded_output_within(
+            manager()
+                .args(["show", "--property=Id,WorkingDirectory"])
+                .args(&units),
+            bound,
+        )
+    }) {
         Ok(shown) => shown,
         Err(error) => {
             left.push(format!(
@@ -921,7 +977,7 @@ pub fn remove_units_through(tree: &TempHost, systemctl: &std::path::Path) -> Vec
         // unit that failed is kept listed until it is reset.
         let stopped = run_bounded(manager().args(["stop", unit]));
         let reset = run_bounded(manager().args(["reset-failed", unit]));
-        match unit_gone(&manager, unit) {
+        match unit_gone(&manager, unit, give_up_after) {
             Ok(true) => {}
             Ok(false) => left.push(format!(
                 "the systemd unit {unit} is still loaded after it was stopped ({stopped:?}) and \
@@ -933,14 +989,25 @@ pub fn remove_units_through(tree: &TempHost, systemctl: &std::path::Path) -> Vec
     left
 }
 
-/// Whether the user manager `manager` asks no longer has `unit`, given at most [`PATIENCE`] to
-/// collect it, or why that could not be established.
+/// Whether the user manager `manager` asks no longer has `unit`, given until `give_up_after` has
+/// passed to collect it, or why that could not be established.
 #[cfg(target_os = "linux")]
-fn unit_gone(manager: &dyn Fn() -> Command, unit: &str) -> Result<bool, String> {
-    let deadline = Instant::now() + PATIENCE;
+fn unit_gone(
+    manager: &dyn Fn() -> Command,
+    unit: &str,
+    give_up_after: Duration,
+) -> Result<bool, String> {
+    let deadline = Instant::now() + give_up_after;
     loop {
-        let state =
-            run_bounded_output(manager().args(["show", "--property=LoadState", "--value", unit]))?;
+        let state = asked_again_until_answered(
+            deadline.saturating_duration_since(Instant::now()),
+            |bound| {
+                run_bounded_output_within(
+                    manager().args(["show", "--property=LoadState", "--value", unit]),
+                    bound,
+                )
+            },
+        )?;
         if state.trim() == "not-found" {
             return Ok(true);
         }

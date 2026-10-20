@@ -249,7 +249,11 @@ fn a_manager_that_does_not_answer_leaves_the_trees_units_not_established_as_gone
     assert!(registered(&job.0), "{} was registered", job.0);
 
     // The system's own program that answers nothing and fails, in place of the manager's tool.
-    let left = teardown::remove_units_through(&tree, std::path::Path::new("/bin/false"));
+    let left = teardown::remove_units_through(
+        &tree,
+        std::path::Path::new("/bin/false"),
+        std::time::Duration::from_secs(2),
+    );
     assert!(
         left.iter().any(|what| what.contains("could not be listed")),
         "a manager that did not answer was counted as one with nothing to remove: {left:?}"
@@ -267,4 +271,83 @@ fn a_manager_that_does_not_answer_leaves_the_trees_units_not_established_as_gone
         "{} is still registered after the tree it was registered for has gone",
         job.0
     );
+}
+
+/// A stand-in for the manager's tool, in a directory of its own: it hands each question to the real
+/// `systemctl` after `before` has run in front of it, a script of the shell's own that sees the
+/// question as its arguments and the directory it can keep a mark in as `$here`.
+///
+/// The program is placed by another process, so that this one holds no open write handle on a file
+/// it then starts.
+#[cfg(target_os = "linux")]
+fn systemctl_after(before: &str) -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let source = directory.path().join("source");
+    std::fs::write(
+        &source,
+        format!("#!/bin/sh\nhere=\"$(dirname \"$0\")\"\n{before}\nexec systemctl \"$@\"\n"),
+    )
+    .expect("the script is written");
+    let tool = directory.path().join("systemctl");
+    kr_ipc::testing::place_program(&source, &tool);
+    (directory, tool)
+}
+
+/// A question to the manager that fails once, and then is answered late, as a manager busy with
+/// every unit a machine's tests have started answers one, is no sign that a unit is left: it is
+/// asked again and given the time to answer, and the tree's unit goes. The first question about
+/// the units' properties here fails, and the next takes longer than a question to a manager that
+/// answers is given.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI \
+            runner's account does not have; it runs with --ignored on a Linux host whose account \
+            has one"]
+fn a_question_the_manager_fails_or_answers_late_is_asked_again_and_leaves_no_unit_behind() {
+    let tree = teardown::Tree::create();
+    let job = register(&tree.environment());
+    assert!(registered(&job.0), "{} was registered", job.0);
+
+    let (_directory, tool) = systemctl_after(
+        "case \"$*\" in *--property=Id,WorkingDirectory*) \
+         if [ ! -e \"$here/failed\" ]; then : > \"$here/failed\"; exit 1; fi; \
+         if [ ! -e \"$here/late\" ]; then : > \"$here/late\"; sleep 15; fi;; esac",
+    );
+    let left = teardown::remove_units_through(&tree, &tool, std::time::Duration::from_secs(60));
+    assert!(
+        left.is_empty(),
+        "a failed or late answer was counted as a unit left behind: {left:?}"
+    );
+    assert!(
+        !registered(&job.0),
+        "{} is still registered although the manager answered in the end",
+        job.0
+    );
+    drop(tree);
+}
+
+/// A unit the manager still has when the tree's teardown has asked for as long as it will is left,
+/// whatever the questions before it came to: asking again hides no unit. The first question about
+/// the unit's state here fails, and every answer after it says the unit is loaded.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI \
+            runner's account does not have; it runs with --ignored on a Linux host whose account \
+            has one"]
+fn a_unit_the_manager_goes_on_having_is_left_however_often_it_is_asked() {
+    let tree = teardown::Tree::create();
+    let job = register(&tree.environment());
+    assert!(registered(&job.0), "{} was registered", job.0);
+
+    let (_directory, tool) = systemctl_after(
+        "case \"$*\" in *--property=LoadState*) \
+         if [ ! -e \"$here/failed\" ]; then : > \"$here/failed\"; exit 1; fi; \
+         echo loaded; exit 0;; esac",
+    );
+    let left = teardown::remove_units_through(&tree, &tool, std::time::Duration::from_secs(3));
+    assert!(
+        left.iter().any(|what| what.contains("is still loaded")),
+        "a unit the manager still had was not counted as left: {left:?}"
+    );
+    drop(tree);
 }
