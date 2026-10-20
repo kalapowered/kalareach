@@ -1902,14 +1902,20 @@ async fn a_device_revocation_whose_record_cannot_be_marked_still_ends_the_calls_
         .expect("plants the fault");
 
     let mut client = scene.host().client().await;
-    let refused = net_support::pairing::mutate::<_, kr_protocol::sharing::RevocationResult>(
-        scene.host().environment_id,
-        &mut client,
-        kr_protocol::method::Method::DeviceRevoke,
-        &kr_protocol::sharing::DeviceRevokeParams { device_id: phone },
-    )
-    .await
-    .expect_err("the record cannot be marked revoked");
+    let first = client
+        .compose(
+            kr_protocol::method::Method::DeviceRevoke,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            kr_protocol::envelope::ActionTarget::environment(scene.host().environment_id),
+            &kr_protocol::sharing::DeviceRevokeParams { device_id: phone },
+        )
+        .await
+        .expect("the revocation is composed");
+    let refused = client
+        .repeat(&first)
+        .await
+        .expect("the daemon answers")
+        .expect_err("the record cannot be marked revoked");
     drop(refused);
 
     // The phone's call is ended all the same, and the service is told, once.
@@ -1941,12 +1947,26 @@ async fn a_device_revocation_whose_record_cannot_be_marked_still_ends_the_calls_
         "the device's record could not be marked"
     );
 
+    // While the record cannot be marked, the same action sent again is not answered as done: the
+    // revocation it began is unfinished, and the host does not say otherwise. The connection the
+    // first attempt was made on was fenced by the revocation, as every connection is; the host's
+    // owner opens another.
+    let mut client = scene.host().client().await;
+    let repeated = client
+        .repeat(&first)
+        .await
+        .expect("the daemon answers")
+        .expect_err("the unfinished revocation is not answered as done");
+    assert_eq!(
+        repeated.code,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
+        "{repeated:?}"
+    );
+
     // Once the record can be written, a new act completes the revocation and marks it.
     registry
         .execute_batch("DROP TRIGGER refuse_to_mark_a_device_revoked;")
         .expect("lifts the fault");
-    // The connection the first attempt was made on was fenced by the revocation, as every
-    // connection is; the host's owner opens another.
     let mut client = scene.host().client().await;
     let again: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
         scene.host().environment_id,
@@ -3091,6 +3111,54 @@ async fn a_start_the_host_refuses_is_not_owed_while_the_media_stops() {
     scene.stop_host().await;
 }
 
+/// A start the host answers without making a call is owed nothing from that moment on, as one it
+/// refuses is: the host said what became of the request, so a process that ends while native code
+/// stops does not tell the next launch that the host never answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_the_host_declines_is_not_owed_while_the_media_stops() {
+    let timings = Timings {
+        local_within: Duration::from_secs(300),
+        ..quick()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.platform.hold("stop");
+    let _holding = scene.platform.release_when_done("stop");
+    let prepared = scene.prepared().await;
+    let mut request = scene.start_request(&prepared);
+    // A digest of a call that is not the one the host would make now: the host declines the start
+    // before it asks the service for anything.
+    request["prepared"] =
+        serde_json::to_value(kr_protocol::scalars::Digest256::from_bytes([9; 32]))
+            .expect("a digest");
+
+    let starting = scene.phone.companion.start_call("voice_start", request);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while scene.platform.count("stop") == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("native code was asked to stop");
+
+    // Native code is still stopping. The file, read once as it is on disk, owes nothing.
+    let file: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(scene.phone.data.path().join("voice-kept.json")).expect("the file"),
+    )
+    .expect("a file");
+    assert!(file["owed"].as_array().is_some_and(Vec::is_empty), "{file}");
+
+    scene.platform.release("stop");
+    let answer = starting
+        .await
+        .expect("the start ran")
+        .expect("the host answered");
+    assert!(
+        answer["value"]["outcome"]["preparation_changed"].is_object(),
+        "the host declined the start: {answer}"
+    );
+    scene.stop_host().await;
+}
+
 /// A call started while the file of what a call left owed cannot be read still stands on its
 /// entry: the entry is kept in memory, nothing is written over the file meanwhile, and the file is
 /// written the first time it can be read, with nothing else having changed.
@@ -3367,12 +3435,16 @@ async fn what_an_end_owed_while_the_record_could_not_be_read_is_written_by_the_s
         .write(&companion_tauri::voice::KeptVoice::default())
         .expect("the file is written");
     lock_the_kept_file(&directory);
+    // The close is held until the file can be read, so neither the call's bound for the service's
+    // answer nor the exchange's own deadlines may run out meanwhile; the host's bound stays short,
+    // so that the end owes the revocation.
+    let (waiting, deadlines) = waiting_on_the_service();
     let calls = Calls::on_phone(
         Arc::clone(&scene.platform) as Arc<dyn companion_platform::call::CallPlatform>,
-        service_at(scene.stand_in.origin()),
+        service_with(scene.stand_in.origin(), deadlines),
         Timings {
             host_within: Duration::from_secs(2),
-            ..quick()
+            ..waiting
         },
         Kept::at(&directory),
     );

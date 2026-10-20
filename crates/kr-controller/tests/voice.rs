@@ -1761,8 +1761,8 @@ async fn a_stop_for_a_voice_session_the_host_does_not_hold_is_refused_as_unknown
     )
     .await
     .expect("the voice grant is written");
-    let start = async || {
-        let prepared: VoicePrepareResult = session
+    let start = async |on: &kr_client::session::Session| {
+        let prepared: VoicePrepareResult = on
             .read(
                 Method::VoicePrepare,
                 &VoicePrepareParams {
@@ -1773,7 +1773,7 @@ async fn a_stop_for_a_voice_session_the_host_does_not_hold_is_refused_as_unknown
             .await
             .expect("the host answers what a call would be");
         let started: kr_protocol::voice::VoiceStartResult = remote_voice(
-            &session,
+            on,
             environment_id,
             Method::VoiceStart,
             &VoiceStartParams {
@@ -1811,7 +1811,7 @@ async fn a_stop_for_a_voice_session_the_host_does_not_hold_is_refused_as_unknown
         kr_protocol::error::ErrorCode::UnknownSession,
         "{never_held:?}"
     );
-    let first = start().await;
+    let first = start(&session).await;
     let _stopped = remote_voice(
         &session,
         environment_id,
@@ -1837,7 +1837,7 @@ async fn a_stop_for_a_voice_session_the_host_does_not_hold_is_refused_as_unknown
 
     // A store that cannot record the revocation refuses with its own code, and the call stays
     // known with its grant live, so a stop asked again is the one that ends it.
-    let second = start().await;
+    let second = start(&session).await;
     let registry =
         rusqlite::Connection::open(host.registry_database()).expect("opens the registry");
     registry
@@ -1883,6 +1883,73 @@ async fn a_stop_for_a_voice_session_the_host_does_not_hold_is_refused_as_unknown
     .to_typed()
     .expect("a stop result");
     assert_eq!(stopped.revoked_grant_id, second.grant_id);
+
+    // Another device's live call is as unknown to this device as a voice session the host never
+    // held: the answer does not say whether the host holds a call this device did not make, and
+    // that call stays live for the device that did.
+    let (_other_device, other_session) = net_support::paired_device(
+        &host,
+        &owner,
+        &[ActionRight::SessionView, ActionRight::AgentPrompt],
+    )
+    .await;
+    let other_device_id = host
+        .controller()
+        .devices()
+        .devices()
+        .expect("the device directory answers")
+        .into_iter()
+        .find(|record| {
+            let host_owner = host.owner.as_ref().map(|owner| owner.device_id);
+            record.is_paired()
+                && host_owner != Some(record.device_id)
+                && record.device_id != device_id
+        })
+        .expect("the second paired device")
+        .device_id;
+    let _granted = remote_voice(
+        &other_session,
+        environment_id,
+        Method::VoiceGrant,
+        &VoiceGrantParams {
+            device_id: other_device_id,
+            session_ids: [session_id].into_iter().collect(),
+            actions: Nullable::null(),
+        },
+    )
+    .await
+    .expect("the second device's voice grant is written");
+    let theirs = start(&other_session).await;
+    let not_theirs = refusal_of(
+        remote_voice(
+            &session,
+            environment_id,
+            Method::VoiceStop,
+            &stopping(theirs.voice_session_id),
+        )
+        .await,
+    );
+    assert_eq!(
+        not_theirs.code,
+        kr_protocol::error::ErrorCode::UnknownSession,
+        "{not_theirs:?}"
+    );
+    assert_eq!(
+        host.controller().voice().coordinator().live_sessions(),
+        1,
+        "the other device's call is still live"
+    );
+    let ended: kr_protocol::voice::VoiceStopResult = remote_voice(
+        &other_session,
+        environment_id,
+        Method::VoiceStop,
+        &stopping(theirs.voice_session_id),
+    )
+    .await
+    .expect("the device that made the call ends it")
+    .to_typed()
+    .expect("a stop result");
+    assert_eq!(ended.revoked_grant_id, theirs.grant_id);
     host.stop().await;
 }
 

@@ -1186,6 +1186,32 @@ mod tests {
         }
     }
 
+    /// What the screen reads of the record: whether any owner is still to say what the voice
+    /// service did.
+    fn finalising_as_read(shared: &Shared) -> bool {
+        let view = shared.view.lock().expect("the view lock");
+        serde_json::to_value(&*view).expect("the record serialises")["finalising"]
+            .as_bool()
+            .expect("the screen reads a boolean")
+    }
+
+    fn calls_with_owner_nine_after_seven_ended() -> Calls {
+        let calls = Calls::on_phone(
+            Arc::new(NoNativeCode),
+            Service::managed().expect("a service"),
+            Timings::default(),
+            Kept::nowhere(),
+        );
+        {
+            let shared = calls.shared.as_ref().expect("a phone holds calls");
+            let mut view = shared.view.lock().expect("the view lock");
+            // Owner 9 began after owner 7 ended its call and was finalising it.
+            view.begin(9);
+            view.finalising_owners.insert(7);
+        }
+        calls
+    }
+
     /// An owner that ended a call and was still finalising it when it failed is no longer
     /// finalising, whatever else has happened to the record since: a later call began and replaced
     /// the supervisor's emergency record, so the supervisor has nothing to end, and nothing else
@@ -1194,30 +1220,32 @@ mod tests {
     /// tasks of their own.
     #[tokio::test]
     async fn a_failed_owner_that_was_finalising_is_not_finalising_once_its_supervisor_is_done() {
-        let calls = Calls::on_phone(
-            Arc::new(NoNativeCode),
-            Service::managed().expect("a service"),
-            Timings::default(),
-            Kept::nowhere(),
-        );
+        let calls = calls_with_owner_nine_after_seven_ended();
         let shared = calls.shared.as_ref().expect("a phone holds calls");
-        {
-            let mut view = shared.view.lock().expect("the view lock");
-            // Owner 9 began after owner 7 ended its call and was finalising it.
-            view.begin(9);
-            view.finalising_owners.insert(7);
-            view.finalising_owners.insert(9);
-        }
+        assert!(finalising_as_read(shared));
 
         shared.after_failed_owner(7).await;
 
+        assert!(!finalising_as_read(shared));
         let view = shared.view.lock().expect("the view lock");
-        assert!(!view.finalising_owners.contains(&7));
-        assert!(
-            view.finalising_owners.contains(&9),
-            "another owner's finalisation is not the failed owner's to end"
-        );
         assert_eq!(view.owner, 9, "the later call's record is left as it is");
         assert!(view.ended.is_none());
+    }
+
+    /// Another owner's finalisation is not the failed owner's to end.
+    #[tokio::test]
+    async fn a_failed_owner_leaves_another_owners_finalisation_standing() {
+        let calls = calls_with_owner_nine_after_seven_ended();
+        let shared = calls.shared.as_ref().expect("a phone holds calls");
+        shared
+            .view
+            .lock()
+            .expect("the view lock")
+            .finalising_owners
+            .insert(9);
+
+        shared.after_failed_owner(7).await;
+
+        assert!(finalising_as_read(shared));
     }
 }
