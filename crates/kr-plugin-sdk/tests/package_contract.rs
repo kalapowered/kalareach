@@ -303,3 +303,98 @@ fn every_part_of_the_layout_is_a_declared_payload_with_its_hash() {
         validated.report.findings
     );
 }
+
+/// KR-REQ-11.19: a package that lists Windows does not write the forwarder as a line a POSIX shell
+/// runs.
+///
+/// The host writes the forwarder's path as one word in single quotes where the placeholder is
+/// followed by a space, which Windows' shells do not read as one word. The program form, the
+/// placeholder alone with its arguments beside it, is the same on every platform, so the same bridge
+/// in that form is accepted, and so is the line form in a package that does not list Windows.
+#[test]
+fn a_package_that_lists_windows_does_not_write_the_forwarder_as_a_line_a_posix_shell_runs() {
+    let package_with = |hooks: &str, windows: bool| {
+        let temporary = tempfile::tempdir().expect("a temporary directory");
+        let package = temporary.path().join("package");
+        std::fs::create_dir_all(&package).expect("the package directory");
+        write(
+            &package,
+            PRESENTATION_FILE,
+            example::example_presentation_json().as_bytes(),
+        );
+        write(&package, "bridge/hooks.json", hooks.as_bytes());
+        let digest = PayloadDigest::of(hooks.as_bytes()).to_string();
+        let mut manifest: Value =
+            serde_json::from_str(&example::example_manifest_json()).expect("the example manifest");
+        manifest["sdk_range"] = json!(">=0.1.3, <0.2.0");
+        manifest["capabilities"]
+            .as_array_mut()
+            .expect("the manifest requests capabilities")
+            .push(json!({
+                "capability": "native_bridge.install",
+                "reason": "Register the forwarder the example agent starts"
+            }));
+        manifest["payloads"]
+            .as_array_mut()
+            .expect("the manifest lists payloads")
+            .push(json!({
+                "role": "native_bridge",
+                "path": "bridge/hooks.json",
+                "digest": digest,
+                "size_bytes": hooks.len().to_string(),
+            }));
+        manifest["native_bridge"] = json!({
+            "application": "Example Agent",
+            "application_range": ">=1.0.0, <2.0.0",
+            "install": [{
+                "type": "install_file",
+                "source": "bridge/hooks.json",
+                "destination": "extensions/kalareach/hooks/hooks.json",
+                "digest": digest
+            }],
+            "remove": [{
+                "type": "remove_file",
+                "destination": "extensions/kalareach/hooks/hooks.json",
+                "digest": digest
+            }],
+            "grant_statement": "Installs one hooks file under the example agent's directory."
+        });
+        if !windows {
+            manifest["platforms"]
+                .as_array_mut()
+                .expect("the manifest lists platforms")
+                .retain(|platform| platform["os"] != "windows");
+        }
+        write(
+            &package,
+            MANIFEST_FILE,
+            serde_json::to_string_pretty(&manifest)
+                .expect("the manifest serialises")
+                .as_bytes(),
+        );
+        (temporary, validate_package_directory(&package))
+    };
+    let line = r#"{"hooks":[{"type":"command","command":"{kr_hook} example-agent hook"}]}"#;
+    let program =
+        r#"{"hooks":[{"type":"command","command":"{kr_hook}","args":["example-agent","hook"]}]}"#;
+
+    let (_directory, refused) = package_with(line, true);
+    assert!(
+        refused.report.findings.iter().any(|finding| {
+            finding.code == FindingCode::BridgeRecipeInvalid && finding.detail.contains("Windows")
+        }),
+        "{:?}",
+        refused.report.findings
+    );
+    for (what, hooks, windows) in [
+        ("the program form on Windows", program, true),
+        ("the line form where Windows is not listed", line, false),
+    ] {
+        let (_directory, accepted) = package_with(hooks, windows);
+        assert!(
+            accepted.report.is_valid(),
+            "{what}: {:?}",
+            accepted.report.findings
+        );
+    }
+}
