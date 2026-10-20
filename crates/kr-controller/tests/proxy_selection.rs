@@ -21,7 +21,7 @@ use kr_controller::config::Outbound;
 use kr_controller::push::transport::{DeliveryTransports, ManagedTransports};
 use kr_controller::service::net::NetworkSetup;
 use kr_controller::service::net::rendezvous::Rendezvous;
-use kr_controller::service::net::rendezvous_https::HttpsRendezvous;
+use kr_controller::service::net::rendezvous_https::{HttpsRendezvous, RETRY_BUDGET};
 use kr_crypto::secret::SymmetricKey;
 use kr_delivery::destination::{DestinationKind, ExternalDestination, Idempotency};
 use kr_delivery::external::{ExternalOutcome, ExternalSender as _};
@@ -97,6 +97,7 @@ async fn a_host_reaches_its_rendezvous_through_the_proxy_it_selected() {
             InvitationId::new(Uuid::from_bytes([1; 16])),
             TimestampMs::new(1_764_003_600_000),
             Digest256::from_bytes([2; 32]),
+            RETRY_BUDGET,
         ),
     )
     .await
