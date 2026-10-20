@@ -329,10 +329,11 @@ for (const surface of ['ios', 'android'] as const) {
             await page.getByRole('button', { name: new RegExp(`shared session ${session} with you`) }).click()
             await page.getByTestId('accept-offer').click()
             await expect(page.getByTestId('sheet')).toBeHidden()
+            // The message that says so rests above the tab bar and lies over the next row at the
+            // largest size: it is taken away.
+            await page.locator('.toast').getByRole('button', { name: 'Dismiss' }).click()
+            await expect(page.locator('.toast')).toBeHidden()
           }
-          // The toast that says so lies over the tab bar: it is taken away.
-          await page.locator('.toast').getByRole('button', { name: 'Dismiss' }).click()
-          await expect(page.locator('.toast')).toBeHidden()
           await page.getByRole('button', { name: 'Sessions', exact: true }).click()
           const shared = page.getByTestId('shared-with-you')
           await expect(shared.getByRole('button')).toHaveCount(2)
