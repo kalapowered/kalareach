@@ -807,9 +807,10 @@ test.describe('the first-start assistant', () => {
   }
 
   // KR-REQ-03.28: the page's title shows each of its words whole, at each text size and at every
-  // width from a phone's to a desktop's, in the runner's face. A word broken in the middle of a name
-  // reads as a mistake. The widths include the ones just above the point where the sidebar returns
-  // and takes 300 px from the title's box, which a size taken from the window's width does not see.
+  // width from a phone's to a desktop's, in the runner's face, and is never smaller than the
+  // headings of the cards under it. A word broken in the middle of a name reads as a mistake. The
+  // widths include the ones just above the point where the sidebar returns and takes 300 px from the
+  // title's box, which a size taken from the window's width does not see.
   for (const [size, ratio] of TEXT_SIZES) {
     test(`keeps each word of the page's title whole at every width at the ${size} text size`, async ({
       page
@@ -822,6 +823,15 @@ test.describe('the first-start assistant', () => {
         expect(await page.locator('.setup-heading h1').count()).toBe(1)
         for (const word of await brokenWords(page, '.setup-heading h1')) {
           broken.push(`"${word}" at ${String(width)} px`)
+        }
+        // And the title is never set smaller than the headings of the cards under it.
+        const [title, card] = await page.evaluate(() =>
+          ['.setup-heading h1', '.setup .card-header h2'].map((each) =>
+            parseFloat(getComputedStyle(document.querySelector(each) as Element).fontSize)
+          )
+        )
+        if (title < card) {
+          broken.push(`the title is ${String(title)} px, a card's heading ${String(card)} px, at ${String(width)} px`)
         }
       }
       expect(broken, 'words of the title that are broken across two lines').toEqual([])
