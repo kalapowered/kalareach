@@ -251,7 +251,9 @@ pub fn agree_with_origin(repository: &Path, local: &[Release], head: &str) -> Re
 /// When the file is there and declares the list in another form.
 pub fn surface_roots_at(repository: &Path, commit: &str) -> Result<Option<Vec<String>>, String> {
     let path = "crates/kr-protocol/src/retained.rs";
-    let Ok(source) = git_in(repository, &["show", &format!("{commit}:{path}")]) else {
+    let Some(source) = file_at(repository, commit, path)
+        .map_err(|error| format!("{path} at {commit} cannot be read: {error}"))?
+    else {
         return Ok(None);
     };
     surface_roots_in(&source)
@@ -270,7 +272,7 @@ pub fn surface_roots_in(source: &str) -> Result<Option<Vec<String>>, String> {
     let mut roots = Vec::new();
     while let Some(line) = lines.next() {
         if line.trim() != DECLARATION {
-            if line.contains("SURFACE_ROOTS: ") && !line.trim_start().starts_with("//") {
+            if declares(line) {
                 return Err("the list is declared in a form this reader does not read".to_owned());
             }
             continue;
@@ -304,4 +306,14 @@ pub fn surface_roots_in(source: &str) -> Result<Option<Vec<String>>, String> {
         1 => Ok(Some(roots)),
         _ => Err("the list is declared more than once".to_owned()),
     }
+}
+
+/// Whether a line of code declares the list, in whatever spacing: the name followed by a colon,
+/// where a use of the list is the name alone.
+fn declares(line: &str) -> bool {
+    if line.trim_start().starts_with("//") {
+        return false;
+    }
+    line.match_indices("SURFACE_ROOTS")
+        .any(|(at, name)| line[at + name.len()..].trim_start().starts_with(':'))
 }

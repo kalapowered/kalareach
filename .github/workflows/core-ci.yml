@@ -117,18 +117,25 @@ jobs:
       # A level is one surface: this commit has the surface of every release at its level that the
       # record of exclusions does not name, taken from origin's complete list of release tags, which
       # have to be this checkout's. A commit that moves the level runs the cut's own check here too.
-      # The tags are fetched first and a tag only this checkout has is removed, so the comparison
-      # is with origin as it is now. Before anything builds in the tree: the cut's check wants a
-      # clean one.
-      - name: Release tags are origin's
-        run: git fetch --force --prune origin '+refs/tags/packages/v*:refs/tags/packages/v*'
+      # The generator is built first, so that no tag can land between fetching the tags and
+      # comparing them with origin's while it compiles; each check then fetches first, and a tag only
+      # this checkout has is removed, so the comparison is with origin as it is now. All before
+      # anything else builds in the tree: the cut's check wants a clean one.
+      - name: Build the release checks
+        run: cargo build --locked -p kr-protocol --bin kr-protocol-gen
 
       - name: A level is one surface
-        run: cargo run --locked -p kr-protocol --bin kr-protocol-gen -- --in-level
+        run: |
+          set -euo pipefail
+          git fetch --force --prune origin '+refs/tags/packages/v*:refs/tags/packages/v*'
+          target/debug/kr-protocol-gen --in-level
 
       # Reports until public 1.0 freezes, at the first client release, and fails after.
       - name: The public contract against the releases a client may have been built from
-        run: cargo run --locked -p kr-protocol --bin kr-protocol-gen -- --public-contract
+        run: |
+          set -euo pipefail
+          git fetch --force --prune origin '+refs/tags/packages/v*:refs/tags/packages/v*'
+          target/debug/kr-protocol-gen --public-contract
 
       - name: Build the test components
         run: bash scripts/build-plugin-fixtures.sh

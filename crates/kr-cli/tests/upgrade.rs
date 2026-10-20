@@ -12,8 +12,9 @@
 //! commit that is not there, or a build of it that fails, fails the suite: nothing here skips.
 //! The cases of a release at this build's own level (`inside_the_level`) update from and roll back to
 //! the newest release of that level in this commit's history that the record of exclusions does not
-//! name. A commit that moves the level has no release at its level, and those cases say so and end;
-//! a checkout with no release tags at all fails them, and nothing else is skipped.
+//! name. A commit whose history has no such release says so and ends them, and nothing else is
+//! skipped; a checkout with no release tags at all fails them. They print `inside the level:` and
+//! the release they chose, or that they have none, so run them with `--nocapture` to see it.
 //! The suite is behind the `upgrade-suite` feature, because building a second tree takes minutes
 //! and a network.
 
@@ -163,8 +164,9 @@ fn previous() -> &'static Previous {
 }
 
 /// The newest release of this build's own level in this commit's history that the record of
-/// exclusions does not name, built; none where the commit has none, which is a commit that moves
-/// the level (and says so, on standard error).
+/// exclusions does not name, built; none where this commit's history has none, which is the case
+/// of a commit that moves the level. The release chosen, or that there is none, is printed on
+/// standard output, which a run shows with `--nocapture`.
 ///
 /// The release tags are this checkout's, which the gates hold equal to origin's: a checkout with no
 /// release tag at all fails the suite, since an empty list is not the answer "no release at the
@@ -208,10 +210,10 @@ fn inside_the_level() -> Option<&'static Previous> {
                 }
             }
             let Some((_, release)) = newest else {
-                eprintln!(
-                    "no kept release of level {level} is in the history of {head}: this commit \
-                     moves the level, so there is no release at its level to update from or roll \
-                     back to, and the cases inside the level end here"
+                println!(
+                    "inside the level: no kept release of level {level} is in the history of \
+                     {head}, so there is no release at this level to update from or roll back \
+                     to, and the cases inside the level end here"
                 );
                 return None;
             };
@@ -219,6 +221,10 @@ fn inside_the_level() -> Option<&'static Previous> {
                 .tag
                 .strip_prefix("packages/v")
                 .expect("a release tag");
+            println!(
+                "inside the level: the cases update from and roll back to {} ({})",
+                release.tag, release.commit
+            );
             Some(Previous::built(
                 release.commit.clone(),
                 self::release(name),
@@ -298,8 +304,7 @@ fn cache_lock() -> std::fs::File {
 /// The commit has to be in this checkout's repository, whether or not an earlier run built it: a
 /// checkout without it fails here, and so does a build that fails. A stamp of the commit and the
 /// compiler is written once the tree is extracted, so a tree is extracted once; the build is run
-/// every time, and takes seconds when nothing changed. A tree that no run has used for a week is
-/// removed; the others are kept, since another run may be using one.
+/// every time, and takes seconds when nothing changed. The three trees used most recently are kept.
 fn build_previous(commit: &str) -> PathBuf {
     let cache = cache_root();
     let present = Command::new("git")
@@ -325,19 +330,26 @@ fn build_previous(commit: &str) -> PathBuf {
     let place = cache.join(commit);
     let tree = place.join("tree");
     let programs = place.join("target/debug");
-    // Trees nobody has used for a week go, and a tree is never removed while it is in use: every
-    // use touches its stamp, and two releases are built in one run (the retained level's and the
-    // newest of this build's own level), and other runs on this machine build others.
-    let week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+    // Three trees are kept, this commit's and the two used most recently (a run builds two: the
+    // retained level's release and the newest of this build's own level, and another base's run
+    // may build a different one); the rest go before anything is extracted, since a tree and its
+    // build are about 12 GB. Each use touches the tree's stamp, and a tree is read only while the
+    // cache lock is held, so none that matters is removed from under a run.
+    let mut others: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(&cache).expect("the cache") {
         let path = entry.expect("an entry").path();
-        let used = std::fs::metadata(path.join("stamp"))
-            .and_then(|stamp| stamp.modified())
-            .ok();
-        let idle = used.is_none_or(|used| used.elapsed().is_ok_and(|age| age > week));
-        if path.is_dir() && path != place && idle {
-            std::fs::remove_dir_all(&path).expect("an old tree goes");
+        if !path.is_dir() || path == place {
+            continue;
         }
+        match std::fs::metadata(path.join("stamp")).and_then(|stamp| stamp.modified()) {
+            Ok(used) => others.push((used, path)),
+            // An extraction that did not finish has no stamp.
+            Err(_) => std::fs::remove_dir_all(&path).expect("an unfinished tree goes"),
+        }
+    }
+    others.sort_by_key(|(used, _)| std::cmp::Reverse(*used));
+    for (_, path) in others.into_iter().skip(2) {
+        std::fs::remove_dir_all(&path).expect("an old tree goes");
     }
     // The tree is the commit's, as extracted by a run with this compiler, or it is made again.
     if !std::fs::read_to_string(place.join("stamp")).is_ok_and(|kept| kept == stamp) {
@@ -1417,9 +1429,10 @@ async fn a_mutation_of_a_paired_device_is_performed_by_the_worker_of_the_release
 /// is updated to this build, by that release's own `kr`, while a session's worker still runs the
 /// release. The worker is the process it was; a device paired with the new daemon has the mutation
 /// it makes forwarded, with the dispatch lease this level's frames carry, to that worker, which
-/// admits it; and `kr attach` of this build reads that worker's frames directly, with no hand over,
-/// and a person types at the session. A level is one surface, so none of it needs a rewrite, and a
-/// release at the level that lacked a member of the level would fail here.
+/// admits it; and this build's `kr` reads that worker's frames itself (`kr status`, which never hands
+/// a session over) and a person types at the session through `kr attach`. A level is one surface,
+/// so none of it needs a rewrite, and a release at the level that lacked a member of the level
+/// would fail here.
 #[tokio::test(flavor = "multi_thread")]
 async fn inside_the_level_an_update_leaves_the_worker_running_and_serves_a_device_and_kr_attach() {
     use kr_protocol::attachment::{
@@ -1494,8 +1507,18 @@ async fn inside_the_level_an_update_leaves_the_worker_running_and_serves_a_devic
     );
     updated.the_worker_is_as_it_was().await;
 
-    // `kr attach` of this build is not handed to the release before: the frames are the same, and a
-    // person types at the session.
+    // This build's `kr` reads the worker's frames itself: `kr status` never hands a session to the
+    // `kr` of another release (it refuses a worker of another level, exit 8), so that it reads this
+    // one says the frames are the same. A person then types at the session through `kr attach`.
+    let read = host.run(&updated.kr_now(), &["--json", "status", &updated.display]);
+    assert!(
+        read.status.success(),
+        "this build's kr reads the worker of the release at its level: {}{}",
+        String::from_utf8_lossy(&read.stdout),
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let read: Value = serde_json::from_slice(&read.stdout).expect("a document");
+    assert_eq!(read["session_id"], updated.session_id.to_string(), "{read}");
     let typing = terminal_for(host, &updated.kr_now(), &["attach", &updated.display]);
     typing.ready().await;
     updated.the_worker_is_as_it_was().await;
@@ -1616,7 +1639,17 @@ async fn inside_the_level_a_rollback_goes_on_beside_a_worker_of_this_build_and_s
         "{attached:?}"
     );
 
-    // The release's own `kr attach` reads this build's worker, which is at its level.
+    // The release's own `kr` reads this build's worker, which is at its level: `kr status` reads
+    // it itself, and a person types at the session through `kr attach`.
+    let read = host.run(&updated.kr_before(), &["--json", "status", &display]);
+    assert!(
+        read.status.success(),
+        "the release's kr reads the worker of this build: {}{}",
+        String::from_utf8_lossy(&read.stdout),
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let read: Value = serde_json::from_slice(&read.stdout).expect("a document");
+    assert_eq!(read["session_id"], session_now.to_string(), "{read}");
     let typing = terminal_for(host, &updated.kr_before(), &["attach", &display]);
     typing.ready().await;
     drop(typing);

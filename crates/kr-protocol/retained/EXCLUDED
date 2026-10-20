@@ -3,8 +3,8 @@
 # The level's contract is the surface of the release at 5db0b32c6af4: every member the level's
 # planned changes added, among them `ForwardedMutation.lease`. These two releases were made before
 # the last of those changes landed, so each speaks a surface without it. They stay published, since
-# a published release stays where it is, and nothing built a host at either: they carry only the
-# TypeScript archives. Release selection, the cut's comparison, the in-level check and the upgrade
+# a published release stays where it is, and no host build was released from either: they carry only
+# the TypeScript archives. Release selection, the cut's comparison, the in-level check and the upgrade
 # suite skip them. A host built at one of these commits drains its workers before an update or a
 # rollback (docs/releases/packages.md).
 #

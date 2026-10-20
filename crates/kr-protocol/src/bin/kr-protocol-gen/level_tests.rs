@@ -22,6 +22,8 @@ struct Tree {
     worker: Option<Value>,
     host: &'static str,
     majors: &'static str,
+    /// The roots of the retained surface the release's own source declares.
+    roots: Vec<&'static str>,
 }
 
 fn schema(lease: bool, peer_member: &str, outside_member: &str) -> Value {
@@ -73,6 +75,7 @@ impl Tree {
             worker: None,
             host: "kr-plugin-host/2",
             majors: "major=1 versions=1.0 replaced=- supported_until=- retired=false\n",
+            roots: vec!["ControlFrame"],
         }
     }
 
@@ -160,11 +163,16 @@ impl Repo {
             "crates/kr-protocol/src/hello.rs",
             "pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);\n",
         );
+        let roots: String = tree
+            .roots
+            .iter()
+            .map(|root| format!("    \"{root}\",\n"))
+            .collect();
         self.write(
             "crates/kr-protocol/src/retained.rs",
             &format!(
                 "pub const PLUGIN_HOST_PROTOCOL: &str = \"{}\";\n\
-                 pub const SURFACE_ROOTS: &[&str] = &[\n    \"ControlFrame\",\n];\n",
+                 pub const SURFACE_ROOTS: &[&str] = &[\n{roots}];\n",
                 tree.host
             ),
         );
@@ -910,4 +918,241 @@ fn the_references_follow_the_freeze_and_a_bad_record_of_it_is_refused() {
     // A freeze made at a release the commit does not come after.
     std::fs::write(&path, format!("release={later_tag}\n")).expect("a record");
     assert!(freeze(&repo.directory, &early, &releases).is_err());
+}
+
+/// The decision after the comparison: a commit that moves the level has the cut's own check run, once,
+/// unless it is told to leave it; a commit that holds the surface does not run it.
+#[test]
+fn a_commit_that_moves_the_level_runs_the_cuts_check_once_and_one_that_holds_does_not() {
+    use crate::in_level::conclude;
+    use std::cell::Cell;
+
+    let repo = Repo::new("decision");
+    let old = Tree {
+        version: "0.75.0",
+        ..Tree::before_the_lease()
+    };
+    let first = repo.commit(&old, "an older level");
+    repo.release("0.75.0", &first);
+    let now = Tree::the_level();
+    let head = repo.commit(&now, "the next level");
+    let releases = inventory(&repo.directory).expect("an inventory");
+    let calls = Cell::new(0);
+    let cut = |_: &Path| {
+        calls.set(calls.get() + 1);
+        Ok(())
+    };
+    let data = repo.head(&now, &head);
+    conclude(
+        &repo.directory,
+        &data,
+        &releases,
+        &Exclusions::none(),
+        true,
+        &cut,
+    )
+    .expect("the cut's check passes");
+    assert_eq!(
+        calls.get(),
+        1,
+        "run once for the commit that moves the level"
+    );
+    conclude(
+        &repo.directory,
+        &data,
+        &releases,
+        &Exclusions::none(),
+        false,
+        &cut,
+    )
+    .expect("nothing to compare");
+    assert_eq!(calls.get(), 1, "not run when it is told to leave it");
+    let failing = |_: &Path| Err("the cut's check said no".to_owned());
+    let error = conclude(
+        &repo.directory,
+        &data,
+        &releases,
+        &Exclusions::none(),
+        true,
+        &failing,
+    )
+    .expect_err("its failure is the check's");
+    assert!(error.contains("said no"), "{error}");
+
+    // A commit at a level that has a release does not run it.
+    let level = Repo::new("decision-held");
+    let kept = level.commit(&now, "a release of the level");
+    level.release("0.76.0", &kept);
+    let after = level.commit(&now, "after");
+    let tags = inventory(&level.directory).expect("an inventory");
+    let calls = Cell::new(0);
+    let cut = |_: &Path| {
+        calls.set(calls.get() + 1);
+        Ok(())
+    };
+    conclude(
+        &level.directory,
+        &level.head(&now, &after),
+        &tags,
+        &Exclusions::none(),
+        true,
+        &cut,
+    )
+    .expect("the level holds");
+    assert_eq!(calls.get(), 0);
+}
+
+/// The cut compares every kept release of the retained level with what the level kept, from the
+/// tags: a root the release declares that the kept surface lacks, a root the release lacks, a
+/// plugin host protocol and a table of public majors that differ are each a difference, even in a
+/// release the checkout's history does not reach.
+#[test]
+fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_records() {
+    use crate::retained::kept_release_differences;
+    use kr_protocol::retained::Surface;
+
+    let kept_tree = Tree::the_level();
+    let repo = Repo::new("kept-release");
+    let base = repo.commit(&kept_tree, "the release the level was cut from");
+    let kept = Surface::cut(&kept_tree.schema, &["ControlFrame"]).expect("a surface");
+    let majors = Some(kept_tree.majors);
+    let release_of = |tree: &Tree, note: &str, aside: bool| {
+        if aside {
+            repo.git(&["checkout", "-q", "-b", "aside", &base]);
+        }
+        let commit = repo.commit(tree, note);
+        let tag = repo.tag_here("0.76.0", &commit);
+        if aside {
+            repo.git(&["checkout", "-q", "main"]);
+        }
+        crate::releases::release_of(&repo.directory, &tag).expect("a release")
+    };
+
+    // The same: nothing differs.
+    let same = release_of(&kept_tree, "the same", false);
+    assert!(
+        kept_release_differences(&repo.directory, &same, &kept, majors, "kr-plugin-host/2")
+            .expect("compared")
+            .is_empty()
+    );
+
+    // A root the release declares that the kept surface does not have, and a difference in it.
+    let mut more = kept_tree.clone();
+    more.roots = vec!["ControlFrame", "PeerParams"];
+    let extra = release_of(&more, "a root of its own", false);
+    let found =
+        kept_release_differences(&repo.directory, &extra, &kept, majors, "kr-plugin-host/2")
+            .expect("compared");
+    assert!(
+        found.iter().any(|line| line.contains("PeerParams")),
+        "{found:?}"
+    );
+
+    // A root that is not a definition of the release's own schema is refused, not cut around.
+    let mut misspelled = kept_tree.clone();
+    misspelled.roots = vec!["ControlFrame", "ControlFrme"];
+    let bad = release_of(&misspelled, "a misspelled root", false);
+    let error = kept_release_differences(&repo.directory, &bad, &kept, majors, "kr-plugin-host/2")
+        .expect_err("refused");
+    assert!(error.contains("ControlFrme"), "{error}");
+
+    // A release on a branch the history does not reach, whose plugin host protocol differs, held
+    // against a table of public majors that is not the one it has.
+    let aside = Tree {
+        host: "kr-plugin-host/3",
+        ..kept_tree.clone()
+    };
+    let beside = release_of(&aside, "on a branch", true);
+    let other_majors =
+        Some("major=1 versions=1.0,1.1 replaced=- supported_until=- retired=false\n");
+    let found = kept_release_differences(
+        &repo.directory,
+        &beside,
+        &kept,
+        other_majors,
+        "kr-plugin-host/2",
+    )
+    .expect("compared");
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found.iter().any(|line| line.contains("public majors")));
+    assert!(found.iter().any(|line| line.contains("kr-plugin-host/3")));
+}
+
+/// The list of roots is read in the one shape it is written in, wherever the declaration is spaced,
+/// and a source that declares it another way, twice, or not at all is told apart.
+#[test]
+fn the_list_of_surface_roots_is_read_strictly() {
+    use crate::releases::surface_roots_in;
+    let source = |declaration: &str| {
+        format!("// SURFACE_ROOTS: not this\n{declaration}\nuse(SURFACE_ROOTS);\n")
+    };
+    let good = source("pub const SURFACE_ROOTS: &[&str] = &[\n    \"A\",\n    \"B\",\n];");
+    assert_eq!(
+        surface_roots_in(&good).expect("a list"),
+        Some(vec!["A".to_owned(), "B".to_owned()])
+    );
+    assert_eq!(
+        surface_roots_in("fn nothing() { f(SURFACE_ROOTS); }").expect("none"),
+        None
+    );
+    for (what, text) in [
+        (
+            "no space before the colon is no other declaration",
+            source("pub const SURFACE_ROOTS:&[&str] = &[\n    \"A\",\n];"),
+        ),
+        (
+            "the name apart from its colon",
+            source("pub const SURFACE_ROOTS : &[&str] = &[\n    \"A\",\n];"),
+        ),
+        (
+            "an entry that is not a literal",
+            source("pub const SURFACE_ROOTS: &[&str] = &[\n    NAMED,\n];"),
+        ),
+        (
+            "a list that does not end",
+            source("pub const SURFACE_ROOTS: &[&str] = &[\n    \"A\",\n"),
+        ),
+        ("twice", format!("{good}{good}")),
+    ] {
+        assert!(surface_roots_in(&text).is_err(), "{what}");
+    }
+}
+
+/// A root a revision declares that its own schema does not define is refused, and is not cut around:
+/// the release's table lists one, and so does the head's.
+#[test]
+fn a_declared_root_that_is_no_definition_is_refused() {
+    let now = Tree::the_level();
+    let split = split("misspelled", &now);
+    let record = split.repo.record(&[
+        (&split.early.0, &split.early.1),
+        (&split.second.0, &split.second.1),
+    ]);
+    let mut bad = now.clone();
+    let mut table = worker("session.read", "session.output");
+    table["peer_roots"] = json!(["PeerParams", "PeerResult", "PeerParamz"]);
+    bad.worker = Some(table);
+    let commit = split
+        .repo
+        .commit(&bad, "a release that lists a root it lacks");
+    split.repo.release("0.76.0", &commit);
+    let head = split.repo.commit(&now, "after");
+    let releases = inventory(&split.repo.directory).expect("an inventory");
+    let error = check(
+        &split.repo.directory,
+        &split.repo.head(&now, &head),
+        &releases,
+        &record,
+    )
+    .expect_err("a release lists a root its schema lacks");
+    assert!(error.contains("PeerParamz"), "{error}");
+
+    let mut table = worker("session.read", "session.output");
+    table["peer_roots"] = json!(["PeerParams", "PeerResult", "PeerParamz"]);
+    let mut head_data = split.repo.head(&now, &head);
+    head_data.worker = WorkerSurface::parse(&table.to_string()).expect("a table");
+    let only_whole = inventory(&split.repo.directory).expect("an inventory");
+    let error = check(&split.repo.directory, &head_data, &only_whole, &record)
+        .expect_err("the head lists a root its schema lacks");
+    assert!(error.contains("this commit declares"), "{error}");
 }

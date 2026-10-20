@@ -58,7 +58,9 @@ release it just published and that the release cannot be replaced, and the last 
 asset back from the URL GitHub serves it at, holds it to the packed sha512, and writes those URLs
 into the notes.
 
-One publication runs at a time, whatever its tag. A second run waits for the first to finish
+From a tag whose commit has this workflow, one publication runs at a time, whatever its tag. (A run or a re-run of an
+older tag uses that tag's own workflow, which serialises per tag and runs no check; the first tag
+that has this one is the first to be held to it.) A second run waits for the first to finish
 rather than running beside it, and the run already under way is never cancelled for the one
 waiting; when the waiting run's turn comes, it finds whatever the run before it made and refuses to
 go on if that is a release or a draft of its own tag. A first run that failed before creating
@@ -153,7 +155,8 @@ the commit's history reaches it. It fails naming the release and each difference
 (cut over both revisions' roots, so that a root that was dropped cannot hide a change), in the
 tables of what the worker serves (renaming an event, or serving a method no longer, changes no
 definition of the schema), in the plugin host protocol and in the table of public majors. A release
-from before `worker-surface.json` is compared by schema alone, and the check says so. When no
+from before `worker-surface.json` has no table to compare, so its tables are left out and its schema, plugin
+host protocol and table of public majors are compared; the check says so. When no
 release is at the commit's level, the commit moves it, and the check runs
 `scripts/check-retained-release.sh` in the same run.
 
@@ -183,8 +186,8 @@ comparison, the in-level check and the upgrade suite skip what it names, and the
 report does not.
 
 The record is removed with every reader of it at the 0.78 cut, and `kr-protocol-gen --check` fails
-once its level is neither this build's nor a retained one. No host was built at either commit: they
-carry only the TypeScript archives. A host built at one of them drains its workers before an update
+once its level is neither this build's nor a retained one. No host build was released from either
+commit: they carry only the TypeScript archives. A host built at one of them drains its workers before an update
 or a rollback; see [the support window](support-window.md#a-host-built-at-an-excluded-release).
 The npm publish runs for the two tags were cancelled and nobody re-runs or approves them. npm takes
 one archive per version, and the three 0.76.0 plugin SDK archives are the same.

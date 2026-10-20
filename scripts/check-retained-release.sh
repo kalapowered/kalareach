@@ -7,12 +7,14 @@
 # release tags fetched (`git fetch --tags`): the tags are what say which release came before. It
 #
 #   1. takes the release before this one, the newest tag `packages/v<version>+<commit>` in the
-#      commit's history at the highest compatibility level below its own, and fails unless that
-#      level is the newest this build retains (`kr-protocol-gen --predecessor`);
-#   2. holds the schema of every release tagged at that level, and the table of public majors and
-#      the plugin host protocol of the newest, to the ones the level kept, and moves the level's
-#      record (`retained/<level>/RELEASE` and its row in docs/releases/support-window.md) to the
-#      newest when it names an earlier one of the level (`kr-protocol-gen --release-commit`);
+#      commit's history at the highest compatibility level below its own that
+#      `crates/kr-protocol/retained/EXCLUDED` does not name, and fails unless that level is the
+#      newest this build retains (`kr-protocol-gen --predecessor`);
+#   2. holds the schema, the table of public majors and the plugin host protocol of every release
+#      tagged at that level that the record does not name, whether or not the commit's history
+#      reaches it, to the ones the level kept, and moves the level's record
+#      (`retained/<level>/RELEASE` and its row in docs/releases/support-window.md) to the newest
+#      when it names an earlier one of the level (`kr-protocol-gen --release-commit`);
 #   3. checks the rules and limits the level kept against the source tree of the newest release,
 #      which the `retained_surface` test reads when `KR_RELEASE_TREE` names a checkout, and the
 #      rules on the table of public majors against the record as it now stands;

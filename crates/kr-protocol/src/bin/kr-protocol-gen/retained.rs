@@ -119,6 +119,62 @@ pub fn problems(directory: &Path) -> Vec<String> {
     problems
 }
 
+/// What differs between one release of a retained level and what the level kept: the schema, cut
+/// over both revisions' roots (the kept surface's, and the ones the release's own source declares),
+/// the table of public majors and the plugin host protocol. Each is a line.
+///
+/// # Errors
+///
+/// When the release's schema or sources cannot be read, or its declared roots are not definitions of
+/// its own schema.
+pub fn kept_release_differences(
+    repository: &Path,
+    release: &releases::Release,
+    kept: &Surface,
+    kept_majors: Option<&str>,
+    kept_host: &str,
+) -> Result<Vec<String>, String> {
+    let schema_text = releases::git_in(
+        repository,
+        &[
+            "show",
+            &format!(
+                "{}:packages/protocol/schema/kalareach-protocol.schema.json",
+                release.commit
+            ),
+        ],
+    )
+    .map_err(|error| format!("the schema of {} cannot be read: {error}", release.tag))?;
+    let schema: serde_json::Value = serde_json::from_str(&schema_text)
+        .map_err(|error| format!("the schema at {}: {error}", release.tag))?;
+    let declared: std::collections::BTreeSet<String> =
+        releases::surface_roots_at(repository, &release.commit)?
+            .map(|list| list.into_iter().collect())
+            .unwrap_or_default();
+    in_level::declared_in(&schema, &declared, &release.tag)?;
+    let mut roots: std::collections::BTreeSet<String> = kept.roots().iter().cloned().collect();
+    roots.extend(declared);
+    let surface = in_level::cut_over(&schema, &roots).map_err(|error| error.to_string())?;
+    let mut found: Vec<String> = kr_protocol::retained::differences(kept, &surface)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let majors = expected_public_majors_in(repository, &release.commit)?;
+    if kept_majors != Some(majors.as_str()) {
+        found.push(format!(
+            "the table of public majors is not the one kept\n  kept: {}\n  there: {majors}",
+            kept_majors.unwrap_or("none")
+        ));
+    }
+    let host = plugin_host_in(repository, &release.commit)?;
+    if host != kept_host {
+        found.push(format!(
+            "the plugin host protocol is {host} there and {kept_host} kept"
+        ));
+    }
+    Ok(found)
+}
+
 /// What is wrong with the record of excluded releases without asking git: it is malformed, or it
 /// names a level that this build neither is at nor retains, which is the 0.78 cut's to remove.
 pub fn exclusion_problems() -> Vec<String> {
@@ -338,53 +394,23 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
         "",
     );
     for release in &peers {
-        let schema_text = git(&[
-            "show",
-            &format!(
-                "{}:packages/protocol/schema/kalareach-protocol.schema.json",
-                release.commit
-            ),
-        ])?;
-        let schema: serde_json::Value = serde_json::from_str(&schema_text)
-            .map_err(|error| format!("the schema at {}: {error}", release.tag))?;
-        let roots: std::collections::BTreeSet<String> =
-            retained.surface().roots().iter().cloned().collect();
-        let surface = in_level::cut_over(&schema, &roots).map_err(|error| error.to_string())?;
-        let found = kr_protocol::retained::differences(retained.surface(), &surface);
+        let found = kept_release_differences(
+            &repository(),
+            release,
+            retained.surface(),
+            retained.public_majors,
+            retained.plugin_host.trim(),
+        )?;
         if !found.is_empty() {
             let mut lines = vec![format!(
-                "the schema at {} differs from the surface kept for {level}; rebase onto that release and cut the level again at the rebased commit:",
+                "{} differs from what is kept for {level}; rebase onto that release and cut the level again at the rebased commit:",
                 release.tag
             )];
-            lines.extend(found.iter().map(ToString::to_string));
+            lines.extend(found);
             return Err(lines.join("\n"));
         }
         println!(
-            "the schema at {} is the surface kept for {level}",
-            release.tag
-        );
-        // The table of public majors and the plugin host protocol are the level's too.
-        let found = expected_public_majors_at(&release.commit)?;
-        if retained.public_majors != Some(found.as_str()) {
-            return Err(format!(
-                "the table of public majors at {} is not the one recorded for {level}; rebase onto \
-                 that release and cut the level again at the rebased commit.\nrecorded: {}\nat \
-                 the commit: {found}",
-                release.tag,
-                retained.public_majors.unwrap_or("none"),
-            ));
-        }
-        let host = plugin_host_at(&release.commit)?;
-        if retained.plugin_host.trim() != host {
-            return Err(format!(
-                "{} spoke the plugin host protocol {host} and the record for {level} says {}; \
-                 rebase onto that release and cut the level again at the rebased commit",
-                release.tag,
-                retained.plugin_host.trim()
-            ));
-        }
-        println!(
-            "the table of public majors and the plugin host protocol at {} are the ones kept for {level}",
+            "{} has the surface, the table of public majors and the plugin host protocol kept for {level}",
             release.tag
         );
     }

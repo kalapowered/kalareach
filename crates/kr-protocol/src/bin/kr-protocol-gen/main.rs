@@ -149,7 +149,12 @@ fn main() -> ExitCode {
                     }
                 };
             }
-            "--without-the-cut" => {}
+            "--without-the-cut" => {
+                if !std::env::args().any(|argument| argument == "--in-level") {
+                    eprintln!("--without-the-cut goes with --in-level");
+                    return ExitCode::FAILURE;
+                }
+            }
             "--predecessor" => {
                 return match retained::release_before() {
                     Ok(line) => {

@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use kr_protocol::hello::PACKAGE_VERSION;
-use kr_protocol::retained::{PLUGIN_HOST_PROTOCOL, SURFACE_ROOTS, Surface, SurfaceError};
+use kr_protocol::retained::{PLUGIN_HOST_PROTOCOL, Surface, SurfaceError};
 use kr_protocol::update::CompatibilityLevel;
 use kr_protocol::worker_surface;
 use serde_json::Value;
@@ -187,6 +187,28 @@ pub fn cut_over(schema: &Value, roots: &BTreeSet<String>) -> Result<Surface, Sur
     Surface::cut(schema, &defined)
 }
 
+/// Fails unless every root a revision declares is a definition of that revision's own schema: a
+/// root that is not is a misspelling or a stale list, and cutting over it would hide it.
+///
+/// # Errors
+///
+/// Naming each root that is missing, and whose declaration it is.
+pub fn declared_in(schema: &Value, roots: &BTreeSet<String>, whose: &str) -> Result<(), String> {
+    let missing: Vec<&str> = roots
+        .iter()
+        .filter(|root| schema["$defs"].get(root.as_str()).is_none())
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{whose} declares the roots {} and its schema has no definition of them",
+            missing.join(", ")
+        ))
+    }
+}
+
 /// Compares `head` with every release at its level that is not excluded.
 ///
 /// # Errors
@@ -271,23 +293,25 @@ fn compare(
                 .map_err(|error| format!("{WORKER_SURFACE_PATH} of {tag}: {error}"))
         })
         .transpose()?;
-    // Both revisions' roots: what the build lists, and what the release listed.
-    let mut roots: BTreeSet<String> = SURFACE_ROOTS
-        .iter()
-        .map(|root| (*root).to_owned())
-        .collect();
+    // Both revisions' roots: what the build lists, and what the release listed. Each list has to
+    // name definitions of its own schema; only a root the other revision lists may be missing.
+    let mut roots: BTreeSet<String> = head.worker.surface_roots.iter().cloned().collect();
     roots.extend(head.worker.peer_roots.iter().cloned());
+    declared_in(&head.schema, &roots, "this commit")?;
+    let mut declared: BTreeSet<String> = BTreeSet::new();
     match &own {
         Some(worker) => {
-            roots.extend(worker.surface_roots.iter().cloned());
-            roots.extend(worker.peer_roots.iter().cloned());
+            declared.extend(worker.surface_roots.iter().cloned());
+            declared.extend(worker.peer_roots.iter().cloned());
         }
         None => {
             if let Some(list) = surface_roots_at(repository, &release.commit)? {
-                roots.extend(list);
+                declared.extend(list);
             }
         }
     }
+    declared_in(&schema, &declared, tag)?;
+    roots.extend(declared);
     let old = cut_over(&schema, &roots).map_err(|error| format!("the schema of {tag}: {error}"))?;
     let new =
         cut_over(&head.schema, &roots).map_err(|error| format!("this commit's schema: {error}"))?;
@@ -371,7 +395,32 @@ pub fn run(repository: &Path, cut: bool) -> Result<(), String> {
     let exclusions = Exclusions::read(repository)?;
     exclusions.validate(repository, &release_tags)?;
     let head = Head::of_this_build(repository, &commit)?;
-    match check(repository, &head, &release_tags, &exclusions)? {
+    conclude(
+        repository,
+        &head,
+        &release_tags,
+        &exclusions,
+        cut,
+        &run_cut_check,
+    )
+}
+
+/// Compares `head` and prints what it found; a commit that moves the level has its cut checked by
+/// `cut_check` when `cut` says so.
+///
+/// # Errors
+///
+/// Whatever the comparison or the cut's check fails on.
+pub fn conclude(
+    repository: &Path,
+    head: &Head,
+    release_tags: &[Release],
+    exclusions: &Exclusions,
+    cut: bool,
+    cut_check: &dyn Fn(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let commit = &head.commit;
+    match check(repository, head, release_tags, exclusions)? {
         Outcome::MovesTheLevel if !cut => {
             println!(
                 "no release is at level {}, so {commit} moves it; its cut is not checked in this run",
@@ -384,7 +433,7 @@ pub fn run(repository: &Path, cut: bool) -> Result<(), String> {
                 "no release is at level {}, so {commit} moves it: running the cut's own check",
                 head.level
             );
-            run_cut_check(repository)
+            cut_check(repository)
         }
         Outcome::Held { releases, notes } => {
             for note in &notes {

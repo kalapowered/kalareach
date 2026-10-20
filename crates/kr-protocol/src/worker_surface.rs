@@ -73,7 +73,7 @@ use crate::sharing::{SessionScreenPreviewParams, SessionScreenPreviewResult};
 
 /// A notification a worker sends, and the type of its payload.
 ///
-/// There is no way to make one outside this module's constants, and the worker writes a
+/// There is no way to make one outside the `worker_events!` list below, and the worker writes a
 /// notification only from one, so the set of events a worker sends is the set of rows here.
 pub struct WorkerEvent<T: ?Sized> {
     name: &'static str,
@@ -95,37 +95,51 @@ impl<T: ?Sized> WorkerEvent<T> {
     }
 }
 
-/// The frames of the output stream: bytes of a session's terminal.
-pub const SESSION_OUTPUT: WorkerEvent<OutputEvent> = WorkerEvent::named("session.output");
-/// The notice that opens a subscription whose start was not the one it asked for.
-pub const SESSION_GAP: WorkerEvent<HistoryGap> = WorkerEvent::named("session.gap");
-/// A projected attachment's reset.
-pub const PROJECTION_RESET: WorkerEvent<ProjectionReset> =
-    WorkerEvent::named(PROJECTION_RESET_EVENT);
-/// A projected attachment's snapshot header.
-pub const PROJECTION_SNAPSHOT: WorkerEvent<ProjectionSnapshot> =
-    WorkerEvent::named(PROJECTION_SNAPSHOT_EVENT);
-/// One page of a projected snapshot's rows.
-pub const PROJECTION_ROWS: WorkerEvent<ProjectionRowPage> =
-    WorkerEvent::named(PROJECTION_ROWS_EVENT);
-/// A projected attachment's delta.
-pub const PROJECTION_DELTA: WorkerEvent<ProjectionDelta> =
-    WorkerEvent::named(PROJECTION_DELTA_EVENT);
-/// A change to a session's agent resources.
-pub const SESSION_AGENT_RESOURCE: WorkerEvent<AgentResourceEvent> =
-    WorkerEvent::named(AGENT_RESOURCE_EVENT);
-/// A change to one of a session's agent instances.
-pub const SESSION_AGENT_INSTANCE: WorkerEvent<AgentInstanceEvent> =
-    WorkerEvent::named(AGENT_INSTANCE_EVENT);
-/// The root shell's editor is busy.
-pub const EDITOR_BUSY: WorkerEvent<EditorBusyEvent> = WorkerEvent::named(EDITOR_BUSY_EVENT);
-/// The subscription cannot go on from where it was and has to read again.
-pub const SESSION_RESYNC: WorkerEvent<ResyncRequired> = WorkerEvent::named("session.resync");
-/// The attachment has ended.
-pub const SESSION_DETACHED: WorkerEvent<SessionDetachParams> =
-    WorkerEvent::named("session.detached");
-/// The session has closed, and how.
-pub const SESSION_CLOSED: WorkerEvent<ClosureRecord> = WorkerEvent::named(SESSION_CLOSED_EVENT);
+/// Makes each notification's constant and the table of them from one list, so that a notification
+/// has a row because it can be sent at all: a [`WorkerEvent`] is made here and nowhere else.
+macro_rules! worker_events {
+    ($($(#[$doc:meta])* $constant:ident: $payload:ty = $name:expr;)+) => {
+        $(
+            $(#[$doc])*
+            pub const $constant: WorkerEvent<$payload> = WorkerEvent::named($name);
+        )+
+
+        /// Every notification a worker sends, in the order of their names.
+        #[must_use]
+        pub fn sent_events() -> Vec<EventRow> {
+            let mut rows = vec![$(event(&$constant)),+];
+            rows.sort_by(|left, right| left.name.cmp(right.name));
+            rows
+        }
+    };
+}
+
+worker_events! {
+    /// The frames of the output stream: bytes of a session's terminal.
+    SESSION_OUTPUT: OutputEvent = "session.output";
+    /// The notice that opens a subscription whose start was not the one it asked for.
+    SESSION_GAP: HistoryGap = "session.gap";
+    /// A projected attachment's reset.
+    PROJECTION_RESET: ProjectionReset = PROJECTION_RESET_EVENT;
+    /// A projected attachment's snapshot header.
+    PROJECTION_SNAPSHOT: ProjectionSnapshot = PROJECTION_SNAPSHOT_EVENT;
+    /// One page of a projected snapshot's rows.
+    PROJECTION_ROWS: ProjectionRowPage = PROJECTION_ROWS_EVENT;
+    /// A projected attachment's delta.
+    PROJECTION_DELTA: ProjectionDelta = PROJECTION_DELTA_EVENT;
+    /// A change to a session's agent resources.
+    SESSION_AGENT_RESOURCE: AgentResourceEvent = AGENT_RESOURCE_EVENT;
+    /// A change to one of a session's agent instances.
+    SESSION_AGENT_INSTANCE: AgentInstanceEvent = AGENT_INSTANCE_EVENT;
+    /// The root shell's editor is busy.
+    EDITOR_BUSY: EditorBusyEvent = EDITOR_BUSY_EVENT;
+    /// The subscription cannot go on from where it was and has to read again.
+    SESSION_RESYNC: ResyncRequired = "session.resync";
+    /// The attachment has ended.
+    SESSION_DETACHED: SessionDetachParams = "session.detached";
+    /// The session has closed, and how.
+    SESSION_CLOSED: ClosureRecord = SESSION_CLOSED_EVENT;
+}
 
 /// A method a worker serves, with the types of its parameters and its result, by schema name.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -233,27 +247,6 @@ pub fn serves(method: Method) -> bool {
             .collect()
     });
     SERVED.contains_key(&method)
-}
-
-/// Every notification a worker sends, in the order of their names.
-#[must_use]
-pub fn sent_events() -> Vec<EventRow> {
-    let mut rows = vec![
-        event(&SESSION_OUTPUT),
-        event(&SESSION_GAP),
-        event(&PROJECTION_RESET),
-        event(&PROJECTION_SNAPSHOT),
-        event(&PROJECTION_ROWS),
-        event(&PROJECTION_DELTA),
-        event(&SESSION_AGENT_RESOURCE),
-        event(&SESSION_AGENT_INSTANCE),
-        event(&EDITOR_BUSY),
-        event(&SESSION_RESYNC),
-        event(&SESSION_DETACHED),
-        event(&SESSION_CLOSED),
-    ];
-    rows.sort_by(|left, right| left.name.cmp(right.name));
-    rows
 }
 
 /// The frames a bridge helper exchanges with a caller. They belong to `kr bridge`, which reaches a
