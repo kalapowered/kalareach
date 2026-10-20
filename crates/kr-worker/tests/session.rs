@@ -2323,6 +2323,39 @@ async fn the_palette_a_create_request_names_reaches_the_launched_session() {
     }
 }
 
+/// A script that leaves `marker` behind when it runs, written for the POSIX shell a session is given
+/// on every machine this suite runs on.
+///
+/// The shell's own redirection makes the file, so no utility has to be on its path. The name is one
+/// single-quoted word, with a quote in it closed over, given as an escaped quote of its own and
+/// reopened. On Windows its separators are forward slashes: the command line that shell is given
+/// reads a pair of backslashes inside a quoted argument as one, so a UNC prefix would lose one of
+/// its two. The backslash of an escaped quote stands alone before a quote, which that reading keeps.
+/// A path that is not text is refused rather than named as some other path.
+fn leaves_mark(marker: &std::path::Path) -> String {
+    let text = marker
+        .to_str()
+        .expect("the host's temporary directory is text");
+    let text = if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.to_owned()
+    };
+    format!(": > '{}'", text.replace('\'', r"'\''"))
+}
+
+/// What a directory holds, for the message of a mark that is not where the command was to leave it.
+fn names_in(directory: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(directory)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// A session whose root is a command, opened and about to launch in `cwd` with `not_after_boot_ms`
 /// as the moment after which the command does not start. The command leaves a mark if it runs.
 fn command_session(
@@ -2331,7 +2364,7 @@ fn command_session(
     not_after_boot_ms: u64,
 ) -> (Session, std::path::PathBuf) {
     let marker = host.root().join("the-command-ran");
-    let mut config = configuration(host, &format!("touch {}", marker.display()));
+    let mut config = configuration(host, &leaves_mark(&marker));
     config.shell.cwd = cwd.display().to_string();
     let mut session = Session::open(config).expect("opens");
     session.start_under(kr_worker::session::StartTerms {
@@ -2371,7 +2404,7 @@ async fn a_shell_a_workflow_named_does_not_start_after_the_moment_it_was_accepte
     for (not_after_boot_ms, starts) in [(0, false), (u64::MAX, true)] {
         let host = kr_ipc::testing::TempHost::create();
         let marker = host.root().join("the-shell-ran");
-        let config = configuration(&host, &format!("touch {}; sleep 30", marker.display()));
+        let config = configuration(&host, &format!("{}; sleep 30", leaves_mark(&marker)));
         let mut session = Session::open(config).expect("opens");
         session.start_under(kr_worker::session::StartTerms {
             root_is_command: false,
@@ -2443,7 +2476,11 @@ async fn a_command_starts_in_time_in_a_directory_that_is_there() {
     );
     let record = closure_record(&runtime, "the command ends with its session").await;
     assert_eq!(record.reason, ClosureReason::RootExit);
-    assert!(marker.exists(), "the command ran");
+    assert!(
+        marker.exists(),
+        "the command ran; the directory holds {:?}",
+        names_in(host.root())
+    );
 }
 
 /// KR-REQ-07.15: silence is not a reason to close a session. A live session with no attachment, no
