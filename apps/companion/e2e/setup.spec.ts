@@ -11,9 +11,22 @@
 import { expect, test, type Locator, type Page } from '@playwright/test'
 
 import { PRESENTATION_DEADLINE } from './bounds'
+import { overrunning } from './layout'
 
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
 const LARGEST = 53 / 17
+
+/** The windows the layout cases are held in: a desktop's and a phone's. */
+const WINDOWS = [
+  [1280, 720],
+  [390, 844]
+] as const
+
+/** The text sizes they are held at. */
+const TEXT_SIZES = [
+  ['default', 1],
+  ['largest', LARGEST]
+] as const
 
 /** Where a screenshot for the evidence goes. */
 function shot(name: string): string {
@@ -539,6 +552,152 @@ test.describe('the first-start assistant', () => {
           await inside(control, page.getByTestId(control), true)
         }
         await capture(page, `setup-checks-sheet-${size}-${width}-03.29`)
+      })
+    }
+  }
+
+  /**
+   * Puts the window and the text size where a layout case holds a surface, in the face the Linux
+   * runner draws with. DejaVu Sans, which the runner draws the page in, sets the same text about a
+   * tenth wider than a Mac's face does, and a label that fits in the Mac's face is cut off in it.
+   * Verdana is as wide and every Mac has it, with DejaVu Sans after it for the machine that has
+   * none, so the case measures the runner's widths wherever it runs.
+   */
+  async function sizeTo(page: Page, width: number, height: number, ratio: number): Promise<void> {
+    await page.addStyleTag({
+      content: ':root { --font-ui: Verdana, "DejaVu Sans", sans-serif !important; }'
+    })
+    await page.setViewportSize({ width, height })
+    await page.evaluate((value) => {
+      document.documentElement.style.setProperty('--text-scale', String(value))
+    }, ratio)
+    expect(
+      await page.evaluate(() => parseFloat(getComputedStyle(document.documentElement).fontSize))
+    ).toBeCloseTo(16 * ratio, 1)
+  }
+
+  /**
+   * A card's footer and every control in it lie inside the window, the card does not draw anything
+   * past its edge, every control is a target of the token's size with its label inside it, and on a
+   * narrow window each control is as wide as the footer's room, so that a long label wraps in its
+   * button instead of being cut off at the card's edge.
+   */
+  async function footerHolds(
+    page: Page,
+    name: string,
+    card: Locator,
+    footer: Locator,
+    width: number
+  ): Promise<void> {
+    const box = await footer.boundingBox()
+    expect(box, `${name} footer is on the page`).not.toBeNull()
+    const scrolled = await page.evaluate(() => window.scrollX)
+    const left = (box?.x ?? 0) + scrolled
+    expect(left, `${name} footer left edge`).toBeGreaterThanOrEqual(-1)
+    expect(left + (box?.width ?? 0), `${name} footer right edge`).toBeLessThanOrEqual(width + 1)
+    const room = await footer.evaluate((node) => {
+      const style = getComputedStyle(node)
+      return node.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)
+    })
+    const controls = await footer.getByRole('button').all()
+    expect(controls.length, `${name} footer has a control`).toBeGreaterThan(0)
+    for (const control of controls) {
+      const at = await control.boundingBox()
+      const label = ((await control.textContent()) ?? '').trim()
+      expect(at?.height ?? 0, `${name}: ${label} height`).toBeGreaterThan(35.9)
+      expect(at?.x ?? -1, `${name}: ${label} left edge`).toBeGreaterThanOrEqual((box?.x ?? 0) - 1)
+      expect((at?.x ?? 0) + (at?.width ?? 0), `${name}: ${label} right edge`).toBeLessThanOrEqual(
+        (box?.x ?? 0) + (box?.width ?? 0) + 1
+      )
+      expect(
+        await control.evaluate((node) => node.scrollWidth - node.clientWidth),
+        `${name}: ${label} label past its button`
+      ).toBeLessThanOrEqual(1)
+      if (width < 640) {
+        expect(at?.width ?? 0, `${name}: ${label} width against the footer's room`).toBeGreaterThan(
+          room - 2
+        )
+      }
+    }
+    // Measured from the page's left edge, wherever a press has scrolled it to.
+    await page.evaluate(() => {
+      window.scrollTo(0, window.scrollY)
+    })
+    const id = await card.getAttribute('data-testid')
+    expect(
+      await overrunning(page, `[data-testid="${id ?? ''}"] > footer`),
+      `${name} footer draws past its edge`
+    ).toEqual([])
+  }
+
+  // KR-REQ-03.28: the permission cards' footers say where the switch is and open its pane, and at
+  // the largest text size, on a wide window and a narrow one, in the runner's face, the footer and
+  // its controls stay inside the card and the window.
+  for (const [width, height] of WINDOWS) {
+    for (const [size, ratio] of TEXT_SIZES) {
+      test(`keeps each permission card's footer inside the window at the ${size} text size, ${width} wide`, async ({
+        page
+      }) => {
+        await openSetup(page)
+        await step(page, 'permissions')
+        await sizeTo(page, width, height, ratio)
+        const opens = page.locator('[data-testid^="setup-open-"]')
+        const count = await opens.count()
+        expect(count, 'the permission cards that open a pane').toBeGreaterThanOrEqual(4)
+        for (let each = 0; each < count; each += 1) {
+          const open = opens.nth(each)
+          const pane = ((await open.getAttribute('data-testid')) ?? '').replace('setup-open-', '')
+          const card = page.getByTestId(`setup-permission-${pane}`)
+          await footerHolds(page, `the ${pane} card`, card, open.locator('xpath=..'), width)
+        }
+        await capture(page, `setup-permissions-footers-${size}-${width}-03.28`)
+      })
+    }
+  }
+
+  // KR-REQ-22.01: the descriptions card's footer holds one control whichever way the fetch stands
+  // (the fetch's, or the one that asks the host again), and each of them stays inside the card and
+  // the window at the largest text size, on a wide window and a narrow one, in the runner's face.
+  for (const [width, height] of WINDOWS) {
+    for (const [size, ratio] of TEXT_SIZES) {
+      test(`keeps the descriptions card's footer inside the window at the ${size} text size, ${width} wide`, async ({
+        page
+      }) => {
+        await openSetup(page)
+        await step(page, 'host')
+        await sizeTo(page, width, height, ratio)
+        const card = page.getByTestId('setup-model')
+        const footer = card.locator('footer')
+        const battery = card.getByRole('switch', { name: 'Keep going on battery power' })
+
+        // Before the fetch: the control that starts it.
+        await expect(card.getByTestId('setup-model-download')).toHaveText('Download it')
+        await footerHolds(page, 'the card before a fetch', card, footer, width)
+
+        // After one that failed: the longest words the control that starts it has.
+        await page.evaluate(() => {
+          window.krTestHost?.changeDescriptionSetup({
+            download: 'failed',
+            failure: 'The connection was cut before the files were whole.'
+          })
+        })
+        await battery.click()
+        await expect(card.getByTestId('setup-model-download')).toHaveText('Try the download again')
+        await footerHolds(page, 'the card after a failed fetch', card, footer, width)
+
+        // While one runs: the control that stops it.
+        await card.getByTestId('setup-model-download').click()
+        await expect(card.getByTestId('setup-model-cancel')).toHaveText('Cancel the download')
+        await footerHolds(page, 'the card during a fetch', card, footer, width)
+
+        // While the host does not answer: the control that asks again.
+        await page.evaluate(() => {
+          window.krTestHost?.setConnected(false)
+        })
+        await card.getByTestId('setup-model-cancel').click()
+        await expect(card.getByTestId('setup-model-retry')).toHaveText('Ask again')
+        await footerHolds(page, 'the card while the host does not answer', card, footer, width)
+        await capture(page, `setup-descriptions-footer-${size}-${width}-22.01`)
       })
     }
   }

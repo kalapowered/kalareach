@@ -786,6 +786,7 @@ function PermissionCard({
             onOpenPane(category)
           }}
           data-testid={`setup-open-${category.pane}`}
+          data-wraps
         >
           {visited ? 'Open it again' : 'Open System Settings'}
         </Button>
@@ -855,7 +856,7 @@ function CapabilitiesStep({
           </p>
           <ChecksLine checks={capabilities.checks} />
         </div>
-        <footer className="card-footer setup-route setup-route-pair">
+        <footer className="card-footer setup-route">
           <Button onClick={onRead} disabled={reading} data-testid="setup-recheck" data-wraps>
             {reading ? 'Reading…' : 'Read again'}
           </Button>
@@ -1309,7 +1310,7 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
       ) : null}
       <footer className="card-footer setup-route">
         {setup === null ? (
-          <Button data-testid="setup-model-retry" onClick={descriptions.reload}>
+          <Button data-testid="setup-model-retry" onClick={descriptions.reload} data-wraps>
             Ask again
           </Button>
         ) : null}
@@ -1320,6 +1321,7 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
             onClick={() => {
               descriptions.download(fetchButton.action)
             }}
+            data-wraps
           >
             {fetchButton.label}
           </Button>
