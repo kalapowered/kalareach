@@ -272,8 +272,9 @@ pub fn surface_roots_at(repository: &Path, commit: &str) -> Result<Option<Vec<St
 ///
 /// # Errors
 ///
-/// When the source holds a raw string or a comment that does not end, declares the list more than
-/// once or in a shape the reader does not know, or has an entry that is not a plain string literal.
+/// When the source cannot be lexed (it holds a raw string, a quote and a backslash that make no
+/// character literal, or a block comment that does not end), declares the list more than once or in
+/// a shape the reader does not know, or has an entry that is not a plain string literal.
 pub fn surface_roots_in(source: &str) -> Result<Option<Vec<String>>, String> {
     crate::public_majors::string_list(source, "SURFACE_ROOTS")
 }

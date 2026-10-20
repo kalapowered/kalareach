@@ -22,10 +22,10 @@ const PROTOCOL_DECLARATION: &str = "pub const PROTOCOL_VERSION: ProtocolVersion 
 ///
 /// # Errors
 ///
-/// Returns why when the source cannot be lexed (it holds a raw string, a character literal that is
-/// not well formed or a block comment that does not end), names the table in a form this reader does
-/// not read, or the table is not a list of `PublicMajor { .. }` literals of the five known fields
-/// with known values.
+/// Returns why when the source cannot be lexed (it holds a raw string, a quote and a backslash that
+/// make no character literal, or a block comment that does not end), names the table in a form this
+/// reader does not read, or the table is not a list of `PublicMajor { .. }` literals of the five
+/// known fields with known values.
 pub fn record_of(source: &str) -> Result<Option<String>, String> {
     // Comments are taken out before anything is looked for, so a bracket or a declaration inside
     // one is neither the end of the table nor the table.
@@ -87,9 +87,9 @@ pub fn record_of(source: &str) -> Result<Option<String>, String> {
 ///
 /// # Errors
 ///
-/// Returns why when the source cannot be lexed (it holds a raw string, a character literal that is
-/// not well formed or a block comment that does not end), or states no protocol version this reader
-/// knows.
+/// Returns why when the source cannot be lexed (it holds a raw string, a quote and a backslash that
+/// make no character literal, or a block comment that does not end), or states no protocol version
+/// this reader knows.
 pub fn record_without_a_table(source: &str) -> Result<String, String> {
     let code = without_comments(source)?;
     let version = version_of(&code, "PROTOCOL_VERSION")?;
@@ -113,9 +113,9 @@ pub fn record_without_a_table(source: &str) -> Result<String, String> {
 ///
 /// # Errors
 ///
-/// When the source cannot be lexed (it holds a raw string, a character literal that is not well
-/// formed or a block comment that does not end), or `NAME` is declared in a form this reader does not
-/// read, more than once, or with an entry that is not a plain string literal.
+/// When the source cannot be lexed (it holds a raw string, a quote and a backslash that make no
+/// character literal, or a block comment that does not end), or `NAME` is declared in a form this
+/// reader does not read, more than once, or with an entry that is not a plain string literal.
 #[allow(dead_code)]
 pub fn string_list(source: &str, name: &str) -> Result<Option<Vec<String>>, String> {
     let code = without_comments(source)?;
@@ -148,9 +148,9 @@ pub fn string_list(source: &str, name: &str) -> Result<Option<Vec<String>>, Stri
 ///
 /// # Errors
 ///
-/// When the source cannot be lexed (it holds a raw string, a character literal that is not well
-/// formed or a block comment that does not end), `NAME` is declared in another form or more than
-/// once, or the text holds an escape.
+/// When the source cannot be lexed (it holds a raw string, a quote and a backslash that make no
+/// character literal, or a block comment that does not end), `NAME` is declared in another form or
+/// more than once, or the text holds an escape.
 #[allow(dead_code)]
 pub fn string_const(source: &str, name: &str) -> Result<Option<String>, String> {
     let code = without_comments(source)?;
@@ -244,13 +244,15 @@ fn masked(code: &str) -> String {
 }
 
 /// Where the escaped character literal that begins at `index` ends (`'\n'`, `'\''`, `'\"'`,
-/// `'\x41'`, `'\u{1_F600}'`), the position of its closing quote; none where `index` begins no such
-/// literal.
+/// `'\x41'`, `'\u{1_F600}'`), the position of its closing quote; none where `index` is not a quote
+/// followed by a backslash.
 ///
-/// The escape is read as Rust spells it: a backslash and one character of `n r t \ 0 ' "`, or `x`
-/// and two hexadecimal digits, or `u{` and hexadecimal digits and underscores up to `}`, then the
-/// closing quote. A lifetime never begins with a backslash, so a quote and a backslash that do not
-/// make such a literal make a source this reader cannot read, and that is an error.
+/// The end of the escape is found by its form, with no search and no bound: a backslash and one
+/// character of `n r t \ 0 ' "`, or `x` and two hexadecimal digits, or `u{` and hexadecimal digits
+/// and underscores up to `}`, then the closing quote. This is where the literal ends, not a check
+/// of every rule Rust has for an escape (`'\u{}'` passes). A lifetime never begins with a backslash,
+/// so a quote and a backslash that make no such literal make a source this reader cannot read, and
+/// that is an error.
 fn escaped_character_literal(characters: &[char], index: usize) -> Result<Option<usize>, String> {
     if characters.get(index) != Some(&'\'') || characters.get(index + 1) != Some(&'\\') {
         return Ok(None);
@@ -271,7 +273,7 @@ fn escaped_character_literal(characters: &[char], index: usize) -> Result<Option
     after
         .filter(|at| characters.get(*at) == Some(&'\''))
         .map(Some)
-        .ok_or_else(|| "a character literal that is not well formed".to_owned())
+        .ok_or_else(|| "a quote and a backslash that make no character literal".to_owned())
 }
 
 /// `source` without its `//` and `/* */` comments; text between double quotes is left alone.

@@ -1335,9 +1335,10 @@ fn literals_that_look_like_code_do_not_change_what_is_read() {
          const EXAMPLE: &str = r#\"pub const SURFACE_ROOTS: &[&str] = &[\"ControlFrame\"]; \"#;\n\
          pub const SURFACE_ROOTS: &[&str] = &[\"ControlFrame\", \"PeerParams\"];\n\
          const QUOTE: &str = r#\"\"\"#;\n";
+    let error = string_list(after_literals, "SURFACE_ROOTS").expect_err("refused");
     assert!(
-        string_list(after_literals, "SURFACE_ROOTS").is_err(),
-        "a raw string after two character literals is refused"
+        error.contains("raw string"),
+        "a raw string after two character literals is refused as one: {error}"
     );
     // Every prefix a raw string has: the quote that opens it follows an `r` or a `#`.
     for opener in ["r\"", "r#\"", "r##\"", "br\"", "br#\"", "cr\"", "cr#\""] {
@@ -1365,6 +1366,9 @@ fn literals_that_look_like_code_do_not_change_what_is_read() {
         ("a unicode escape", "'\\u{1F600}'"),
         ("a unicode escape with underscores", "'\\u{1_F_6_0_0}'"),
         ("a hexadecimal escape", "'\\x41'"),
+        ("a null escape", "'\\0'"),
+        ("an escaped tab", "'\\t'"),
+        ("an escaped carriage return", "'\\r'"),
         ("an escaped backslash", "'\\\\'"),
         ("an escaped quote and a quote", "('\\'','\"')"),
         (
