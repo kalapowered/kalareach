@@ -1318,10 +1318,12 @@ impl GrantDirectory {
     ///
     /// A grant that was redeemed, revoked or found to have run out since it was read is left as it
     /// is, and so is one whose invitation is no longer open or whose end has come on the wall
-    /// clock, and one this host no longer holds. A request that found a grant's end on the
-    /// continuous clock owes the end its record until its own transaction is over, and the
-    /// withdrawal leaves that grant too: a request that found the end and answered that it had
-    /// ended is not made to have been withdrawn.
+    /// clock, decided now and under the host's floor and not at the reading the caller took, and
+    /// one this host no longer holds. A grant whose end a request found on the continuous clock
+    /// and has not written down yet (the request writes it once its own transaction is over) is
+    /// left too, and so is one whose wall-clock bound cannot be decided while the floor is owed
+    /// its record: a request that found the end and answered that it had ended is not made to have
+    /// been withdrawn.
     ///
     /// Nothing of a grant that is not yet in force was ever in force, so there is nothing to fence
     /// and no revision to advance, and no grant is delegated from one that is not yet in force, so
@@ -1333,6 +1335,10 @@ impl GrantDirectory {
     /// Returns an error when the rows cannot be read or written.
     pub fn withdraw_waiting_grants(&self, grants: &[GrantId], now_ms: u64) -> Result<Vec<GrantId>> {
         self.in_transaction(|connection| {
+            // The wall clock is read now, under the host's floor, as every effect of this store
+            // reads it: a grant that ran out since the caller read the time, and was reported
+            // run out by a request, has ended whether or not anything wrote that down.
+            let now_ms = self.bound_at_effect(GrantExpiry::Never, now_ms).at_ms;
             let moment = next_moment(connection, now_ms)?;
             let held = self.held_closes();
             let mut debt = None;
@@ -1341,11 +1347,13 @@ impl GrantDirectory {
                 let Some(record) = read_one(connection, *grant_id)? else {
                     continue;
                 };
+                let bound = self.bound_at_effect(record.grant.expiry, now_ms);
                 if record.is_active()
                     || record.revoked_at_ms.is_some()
-                    || !record.grant.expiry.is_valid_at(now_ms)
+                    || bound.passed
+                    || !bound.answerable()
                     || self.tombstone_owed(Some(*grant_id))
-                    || !Self::waits_still(connection, *grant_id, now_ms)?
+                    || !Self::waits_still(connection, *grant_id, bound.at_ms)?
                 {
                     continue;
                 }
