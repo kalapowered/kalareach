@@ -17,7 +17,7 @@
 #   pnpm -C apps/companion build:harness
 #   bash <lease script> <label> apps/companion/e2e/standing-emulator.sh
 #
-# Environment: KR_ANDROID_AVD names the virtual device (default: the first one listed);
+# Environment: KR_ANDROID_AVD names the virtual device (default: KalaReach_API_36_Play);
 # KR_STANDING_SHOTS is where its screenshots go (default /tmp). Every command goes to the one emulator
 # this script starts, named by its own serial: ANDROID_SERIAL is cleared, so a phone that is connected
 # is never touched, and an emulator that was already running is refused, because its settings are not
@@ -33,8 +33,8 @@ adb=$sdk/platform-tools/adb
 emulator=$sdk/emulator/emulator
 [ -x "$adb" ] && [ -x "$emulator" ] || { echo "no Android platform tools or emulator"; exit 3; }
 command -v timeout >/dev/null || { echo "the timeout command is needed (coreutils)"; exit 3; }
-avd=${KR_ANDROID_AVD:-$("$emulator" -list-avds | head -n 1)}
-[ -n "$avd" ] || { echo "no Android virtual device"; exit 3; }
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/scripts/lib/android-avd.sh"
+avd=$(kr_android_avd "$emulator") || { echo "$avd"; exit 3; }
 if timeout --foreground -k 10 60 "$adb" devices | grep -q '^emulator-'; then
   echo "an emulator is already running: its font scale is not this script's to change"
   exit 3

@@ -59,6 +59,9 @@ case "$want" in
     *) printf 'unknown target: %s\n' "$want" >&2; exit 2 ;;
 esac
 
+# shellcheck source=scripts/lib/android-avd.sh
+. "$here/scripts/lib/android-avd.sh"
+
 mkdir -p "${artefacts:?}"
 log="$artefacts/e2e-voice-device.log"
 : >"${log:?}"
@@ -618,10 +621,15 @@ run_android() {
         return 3
     fi
     if [ -z "$android_serial" ]; then
-        local avd="${KR_ANDROID_AVD:-Nines_API_36_Play}"
+        local avd
         if [ ! -x "$emulator" ]; then
             say "no Android emulator binary"
             missing_platforms+=("android: no emulator")
+            return 3
+        fi
+        if ! avd="$(kr_android_avd "$emulator")"; then
+            say "$avd"
+            missing_platforms+=("android: KalaReach's virtual device is not available")
             return 3
         fi
         # A console port of this run's own choosing, so the emulator this run started is named

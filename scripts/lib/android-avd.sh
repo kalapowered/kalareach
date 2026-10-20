@@ -18,8 +18,8 @@ kr_android_avd() {
         printf 'there is no Android emulator at %s\n' "$emulator"
         return 3
     fi
-    # Read whole before it is searched: a search that stops at the first match would end the
-    # emulator's output early, which a script that sets pipefail takes for a failure.
+    # Read whole and then searched: a pipe into a search that stops at the first match would end
+    # the emulator's output early, which a script that sets pipefail takes for a failure.
     listed="$("$emulator" -list-avds 2>/dev/null)" || true
     while IFS= read -r line; do
         if [ "${line%$'\r'}" = "$avd" ]; then
@@ -27,6 +27,6 @@ kr_android_avd() {
             return 0
         fi
     done <<<"$listed"
-    printf 'the Android virtual device %s is not available here: create it with avdmanager (API 36 with Google Play, 16 KB pages, a 16 GB data partition) or name another made for KalaReach in KR_ANDROID_AVD; no other virtual device is started\n' "$avd"
+    printf 'the Android virtual device %s is not available here (the emulator lists the ones under ANDROID_AVD_HOME): create it with avdmanager (API 36 with Google Play, 16 KB pages, a 16 GB data partition) or name another made for KalaReach in KR_ANDROID_AVD; no other virtual device is started\n' "$avd"
     return 3
 }

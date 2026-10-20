@@ -40,6 +40,9 @@ case "$platform" in
     *) printf 'usage: %s ios|android\n' "$0" >&2; exit 2 ;;
 esac
 
+# shellcheck source=scripts/lib/android-avd.sh
+. "$here/scripts/lib/android-avd.sh"
+
 artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/voice-call-device-$platform"
 mkdir -p "${artefacts:?}"
 run="$(uuidgen)"
@@ -284,10 +287,15 @@ run_ios() {
 }
 
 run_android() {
-    local sdk="${ANDROID_HOME:-$HOME/Library/Android/sdk}" avd="${KR_ANDROID_AVD:-Nines_API_36_Play}"
+    local sdk="${ANDROID_HOME:-$HOME/Library/Android/sdk}" avd
     local adb="${KR_ADB:-$sdk/platform-tools/adb}" serial_port=5586
     local serial="emulator-$serial_port"
     [ -x "$adb" ] || { say "no adb at $adb"; return 3; }
+    # Before the builds, so a machine without KalaReach's virtual device does not wait for one.
+    if ! avd="$(kr_android_avd "$sdk/emulator/emulator")"; then
+        say "$avd"
+        return 3
+    fi
 
     say "building the debug application for the emulator"
     ( cd "$companion" && pnpm android --debug --target aarch64 ) >"$artefacts/build.log" 2>&1 \

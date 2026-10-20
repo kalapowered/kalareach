@@ -9,7 +9,9 @@
 # software keyboard real rather than simulated in a desktop browser at a phone-sized window.
 #
 # It never starts a simulator or an emulator that is already running, and it stops only what it
-# started itself. Screenshots go under /tmp; everything else goes to the artefact directory.
+# started itself. The emulator is KalaReach's own virtual device (scripts/lib/android-avd.sh), and
+# one that is already running is used only when it is that device. Screenshots go under /tmp;
+# everything else goes to the artefact directory.
 #
 # A platform that is not available here is a run that did not happen: the script exits 3 and says
 # which one, rather than exiting 0 and leaving a reader to infer from missing files.
@@ -27,6 +29,9 @@ artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/companion-mobile"
 shots="${KR_MOBILE_SCREENSHOT_DIR:-/tmp}"
 port="${KR_MOBILE_PORT:-4188}"
 want="${1:-both}"
+
+# shellcheck source=scripts/lib/android-avd.sh
+. "$here/scripts/lib/android-avd.sh"
 
 mkdir -p "$artefacts"
 
@@ -109,18 +114,17 @@ run_ios() {
 run_android() {
     local sdk="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
     local adb="$sdk/platform-tools/adb" emulator="$sdk/emulator/emulator"
-    local serial started=0 pid=0
+    local serial avd running started=0 pid=0
     if [ ! -x "$adb" ]; then
         say "no Android platform tools"
         return 3
     fi
+    if ! avd="$(kr_android_avd "$emulator")"; then
+        say "$avd"
+        return 3
+    fi
     serial="$("$adb" devices | awk '/^emulator-[0-9]+\tdevice$/ {print $1; exit}')"
     if [ -z "$serial" ]; then
-        local avd="${KR_ANDROID_AVD:-$("$emulator" -list-avds | head -n 1)}"
-        if [ -z "$avd" ]; then
-            say "no Android virtual device"
-            return 3
-        fi
         say "starting the emulator $avd"
         "$emulator" -avd "$avd" -no-snapshot-save -no-boot-anim -netdelay none -netspeed full \
             >"$artefacts/emulator.log" 2>&1 &
@@ -133,6 +137,13 @@ run_android() {
         done
         serial="$("$adb" devices | awk '/^emulator-[0-9]+\tdevice$/ {print $1; exit}')"
     else
+        # Another virtual device that happens to be running is somebody else's: photographing it
+        # would open pages in its browser and forward a port into it.
+        running="$("$adb" -s "$serial" emu avd name 2>/dev/null | tr -d '\r' | sed -n 1p)" || true
+        if [ "$running" != "$avd" ]; then
+            say "the running emulator $serial is not $avd, so it is left alone"
+            return 3
+        fi
         say "using the already running $serial"
     fi
     if [ -z "$serial" ]; then
