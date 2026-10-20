@@ -960,6 +960,17 @@ function Send-KrLaunchRejection {
     }
 }
 
+# One argument of a launch as a word of the line.
+#
+# A word that is exactly `--%` is this shell's stop-parsing token wherever it stands, quoted or not,
+# and the shell leaves it out of the arguments it hands a native program. The array expression
+# `@('--%')` is the one spelling that passes it on as an argument, so that is the spelling it gets.
+function Get-KrLaunchWord {
+    param([string]$Argument)
+    if ($Argument -ceq '--%') { return "@('--%')" }
+    Get-KrQuotedArgument $Argument
+}
+
 # The line the reader installs: an argument vector quoted for this shell, or a command the caller
 # already quoted. Nothing is assembled by interpolation.
 function Get-KrLaunchText {
@@ -974,7 +985,7 @@ function Get-KrLaunchText {
     $parts = @()
     foreach ($argument in @($variant.Payload)) {
         if ($argument -isnot [string]) { return $null }
-        $parts += Get-KrQuotedArgument $argument
+        $parts += Get-KrLaunchWord $argument
     }
     if ($parts.Count -eq 0) { return '' }
     # The call operator, because the first argument is quoted like the rest: a quoted word at the
