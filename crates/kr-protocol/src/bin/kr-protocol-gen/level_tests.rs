@@ -1328,6 +1328,17 @@ fn literals_that_look_like_code_do_not_change_what_is_read() {
         string_list(raw, "SURFACE_ROOTS").is_err(),
         "a raw string is refused"
     );
+    // The same, after two character literals that a lexer reading a bounded stretch of an escape
+    // would take for one (`','` between a long unicode escape and a quote), so that the quote
+    // opens a false string and the raw string's opener is not seen.
+    let after_literals = "const PAIR: (char, char) = ('\\u{0__________}','\"');\n\
+         const EXAMPLE: &str = r#\"pub const SURFACE_ROOTS: &[&str] = &[\"ControlFrame\"]; \"#;\n\
+         pub const SURFACE_ROOTS: &[&str] = &[\"ControlFrame\", \"PeerParams\"];\n\
+         const QUOTE: &str = r#\"\"\"#;\n";
+    assert!(
+        string_list(after_literals, "SURFACE_ROOTS").is_err(),
+        "a raw string after two character literals is refused"
+    );
     // Every prefix a raw string has: the quote that opens it follows an `r` or a `#`.
     for opener in ["r\"", "r#\"", "r##\"", "br\"", "br#\"", "cr\"", "cr#\""] {
         let source =
@@ -1352,6 +1363,14 @@ fn literals_that_look_like_code_do_not_change_what_is_read() {
         ("an escaped single quote", "'\\''"),
         ("an escaped newline", "'\\n'"),
         ("a unicode escape", "'\\u{1F600}'"),
+        ("a unicode escape with underscores", "'\\u{1_F_6_0_0}'"),
+        ("a hexadecimal escape", "'\\x41'"),
+        ("an escaped backslash", "'\\\\'"),
+        ("an escaped quote and a quote", "('\\'','\"')"),
+        (
+            "a long unicode escape and a quote",
+            "('\\u{0__________}','\"')",
+        ),
         ("a non-ASCII character", "'é'"),
         ("a double quote", "'\"'"),
     ] {
@@ -1369,6 +1388,15 @@ fn literals_that_look_like_code_do_not_change_what_is_read() {
             string_list(&source, "SURFACE_ROOTS").expect(what),
             Some(vec!["A".to_owned()]),
             "{what}"
+        );
+    }
+    // A quote and a backslash that make no character literal are no valid source: refused.
+    for literal in ["'\\q'", "'\\u{12'", "'\\u12'", "'\\x4'", "'\\n"] {
+        let source =
+            format!("const C: char = {literal};\npub const SURFACE_ROOTS: &[&str] = &[\"A\"];\n");
+        assert!(
+            string_list(&source, "SURFACE_ROOTS").is_err(),
+            "{literal} is no character literal and is refused"
         );
     }
 }

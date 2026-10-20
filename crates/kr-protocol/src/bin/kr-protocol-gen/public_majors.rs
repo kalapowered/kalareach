@@ -22,8 +22,10 @@ const PROTOCOL_DECLARATION: &str = "pub const PROTOCOL_VERSION: ProtocolVersion 
 ///
 /// # Errors
 ///
-/// Returns why when the source names the table in a form this reader does not read, or the table
-/// is not a list of `PublicMajor { .. }` literals of the five known fields with known values.
+/// Returns why when the source cannot be lexed (it holds a raw string, a character literal that is
+/// not well formed or a block comment that does not end), names the table in a form this reader does
+/// not read, or the table is not a list of `PublicMajor { .. }` literals of the five known fields
+/// with known values.
 pub fn record_of(source: &str) -> Result<Option<String>, String> {
     // Comments are taken out before anything is looked for, so a bracket or a declaration inside
     // one is neither the end of the table nor the table.
@@ -85,7 +87,9 @@ pub fn record_of(source: &str) -> Result<Option<String>, String> {
 ///
 /// # Errors
 ///
-/// Returns why when the source states no protocol version this reader knows.
+/// Returns why when the source cannot be lexed (it holds a raw string, a character literal that is
+/// not well formed or a block comment that does not end), or states no protocol version this reader
+/// knows.
 pub fn record_without_a_table(source: &str) -> Result<String, String> {
     let code = without_comments(source)?;
     let version = version_of(&code, "PROTOCOL_VERSION")?;
@@ -109,8 +113,9 @@ pub fn record_without_a_table(source: &str) -> Result<String, String> {
 ///
 /// # Errors
 ///
-/// When `NAME` is declared in a form this reader does not read, more than once, or with an entry
-/// that is not a plain string literal.
+/// When the source cannot be lexed (it holds a raw string, a character literal that is not well
+/// formed or a block comment that does not end), or `NAME` is declared in a form this reader does not
+/// read, more than once, or with an entry that is not a plain string literal.
 #[allow(dead_code)]
 pub fn string_list(source: &str, name: &str) -> Result<Option<Vec<String>>, String> {
     let code = without_comments(source)?;
@@ -143,7 +148,9 @@ pub fn string_list(source: &str, name: &str) -> Result<Option<Vec<String>>, Stri
 ///
 /// # Errors
 ///
-/// When `NAME` is declared in another form or more than once, or the text holds an escape.
+/// When the source cannot be lexed (it holds a raw string, a character literal that is not well
+/// formed or a block comment that does not end), `NAME` is declared in another form or more than
+/// once, or the text holds an escape.
 #[allow(dead_code)]
 pub fn string_const(source: &str, name: &str) -> Result<Option<String>, String> {
     let code = without_comments(source)?;
@@ -216,7 +223,7 @@ fn masked(code: &str) -> String {
         } else if here == '"' {
             quoted = true;
             out.push('"');
-        } else if let Some(end) = escaped_character_literal(&characters, index) {
+        } else if let Ok(Some(end)) = escaped_character_literal(&characters, index) {
             out.push('\'');
             for inside in &characters[index + 1..end] {
                 out.extend(std::iter::repeat_n('x', inside.len_utf8()));
@@ -237,13 +244,34 @@ fn masked(code: &str) -> String {
 }
 
 /// Where the escaped character literal that begins at `index` ends (`'\n'`, `'\''`, `'\"'`,
-/// `'\u{1F600}'`), the position of its closing quote; none where `index` begins no such literal.
-fn escaped_character_literal(characters: &[char], index: usize) -> Option<usize> {
+/// `'\x41'`, `'\u{1_F600}'`), the position of its closing quote; none where `index` begins no such
+/// literal.
+///
+/// The escape is read as Rust spells it: a backslash and one character of `n r t \ 0 ' "`, or `x`
+/// and two hexadecimal digits, or `u{` and hexadecimal digits and underscores up to `}`, then the
+/// closing quote. A lifetime never begins with a backslash, so a quote and a backslash that do not
+/// make such a literal make a source this reader cannot read, and that is an error.
+fn escaped_character_literal(characters: &[char], index: usize) -> Result<Option<usize>, String> {
     if characters.get(index) != Some(&'\'') || characters.get(index + 1) != Some(&'\\') {
-        return None;
+        return Ok(None);
     }
-    // The escaped character comes first, so an escaped quote does not close the literal.
-    (index + 3..characters.len().min(index + 14)).find(|at| characters[*at] == '\'')
+    let hexadecimal = |at: usize| characters.get(at).is_some_and(char::is_ascii_hexdigit);
+    let after = match characters.get(index + 2) {
+        Some('n' | 'r' | 't' | '\\' | '0' | '\'' | '"') => Some(index + 3),
+        Some('x') => (hexadecimal(index + 3) && hexadecimal(index + 4)).then_some(index + 5),
+        Some('u') if characters.get(index + 3) == Some(&'{') => {
+            let mut at = index + 4;
+            while hexadecimal(at) || characters.get(at) == Some(&'_') {
+                at += 1;
+            }
+            (characters.get(at) == Some(&'}')).then_some(at + 1)
+        }
+        _ => None,
+    };
+    after
+        .filter(|at| characters.get(*at) == Some(&'\''))
+        .map(Some)
+        .ok_or_else(|| "a character literal that is not well formed".to_owned())
 }
 
 /// `source` without its `//` and `/* */` comments; text between double quotes is left alone.
@@ -254,6 +282,11 @@ fn without_comments(source: &str) -> Result<String, String> {
     while index < characters.len() {
         let here = characters[index];
         let next = characters.get(index + 1).copied();
+        let escaped = if quoted {
+            None
+        } else {
+            escaped_character_literal(&characters, index)?
+        };
         if quoted {
             kept.push(here);
             if here == '\\' {
@@ -264,7 +297,7 @@ fn without_comments(source: &str) -> Result<String, String> {
             } else if here == '"' {
                 quoted = false;
             }
-        } else if let Some(end) = escaped_character_literal(&characters, index) {
+        } else if let Some(end) = escaped {
             kept.extend(&characters[index..=end]);
             index = end + 1;
             continue;
