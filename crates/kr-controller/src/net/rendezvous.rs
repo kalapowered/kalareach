@@ -83,8 +83,8 @@ impl Bound {
         Self { within, life: None }
     }
 
-    /// A call made for a mutation: it takes no longer than the mutation has left now, and no
-    /// request is sent again once the mutation has less left than the request needs.
+    /// A call made for a mutation: no request after the first is sent past what the mutation has
+    /// left now, and none is sent again once it has less left than a wait and a whole attempt need.
     #[must_use]
     pub fn of_mutation(life: &Life) -> Self {
         Self {

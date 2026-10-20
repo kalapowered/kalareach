@@ -74,7 +74,7 @@ use kr_transport::listener::BoxFuture;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use super::rendezvous::{Bound, Life, NotAttached, OWNER_RELEASE, Rendezvous};
+use super::rendezvous::{Bound, NotAttached, OWNER_RELEASE, Rendezvous};
 
 /// Where a host reserves a locator for an invitation.
 pub const RESERVE_PATH: &str = "/api/pair/locator/reserve";
@@ -659,6 +659,7 @@ fn configuration(reason: impl std::fmt::Display) -> PairingError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::rendezvous::Life;
     use super::*;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::Arc;

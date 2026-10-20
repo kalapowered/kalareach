@@ -19,6 +19,8 @@ use crate::error::{ControllerError, Result};
 use crate::supervision::JobRetirement;
 
 use super::admission::remaining_deadline;
+use super::authority_changes::reservation_is_open;
+use super::net::lifetimes::GrantStanding;
 use super::workers::UNACCOUNTED_WORKER;
 use super::{Controller, encode, parse};
 
@@ -896,11 +898,19 @@ impl Controller {
             return Ok(0);
         }
         let now_ms = self.settled_now_ms();
-        Ok(self
-            .sharing
-            .grants()
-            .withdraw_waiting_invitations(sessions, now_ms)?
-            .len())
+        let grants = self.sharing.grants();
+        // An invitation whose end has come on either clock ended by itself, and is left as it
+        // ended: the host keeps telling a device that redeems it that it ran out.
+        let mut in_force = Vec::new();
+        for record in grants.waiting_invitations(sessions, now_ms)? {
+            if matches!(
+                self.lifetimes().stored_standing(grants, &record)?,
+                GrantStanding::InForce
+            ) {
+                in_force.push(record.grant.grant_id);
+            }
+        }
+        Ok(grants.withdraw_waiting_grants(&in_force, now_ms)?.len())
     }
 
     /// Withdraws the invitations still waiting over every session that has closed or whose launch
@@ -927,16 +937,9 @@ impl Controller {
         {
             let registry = self.registry.lock().await;
             for session_id in waiting {
-                let has_ended =
-                    registry
-                        .reservation_for_session(session_id)?
-                        .is_some_and(|reservation| {
-                            matches!(
-                                reservation.phase,
-                                crate::registry::LaunchPhase::Closed
-                                    | crate::registry::LaunchPhase::Failed
-                            )
-                        });
+                let has_ended = registry
+                    .reservation_for_session(session_id)?
+                    .is_some_and(|reservation| !reservation_is_open(&reservation));
                 if has_ended {
                     closed.insert(session_id);
                 }

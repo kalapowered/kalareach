@@ -1265,28 +1265,22 @@ impl GrantDirectory {
             .collect())
     }
 
-    /// Withdraws every invitation waiting over one of `sessions` at `now_ms`, and returns the
-    /// grants it withdrew.
+    /// The grants of the invitations waiting over one of `sessions` at `now_ms`: invitations nobody
+    /// has redeemed or withdrawn, whose end has not come, over grants that authorise nothing yet.
     ///
-    /// An invitation over a session that has closed can never be redeemed, so it is withdrawn as
-    /// its issuer would withdraw it: the grant is revoked and the invitation says it was
-    /// withdrawn. An invitation whose end has come, or whose grant's has, ended by itself and is
-    /// left as it ended, so the host keeps telling a device that redeems it that it ran out.
-    /// Nothing of a waiting invitation was ever in force, so there is nothing to fence and no
-    /// revision to advance, and no grant is delegated from one that is not yet in force, so the
-    /// grant is the whole of what is withdrawn and nothing else in the store is read.
+    /// Whether a grant is still in force on both clocks is for the caller to decide
+    /// ([`GrantLifetimes::stored_standing`]).
     ///
-    /// One transaction for the whole set, and idempotent: what is already withdrawn is left as it
-    /// was, and a repeat finds nothing.
+    /// [`GrantLifetimes::stored_standing`]: crate::service::net::lifetimes::GrantLifetimes::stored_standing
     ///
     /// # Errors
     ///
-    /// Returns an error when the rows cannot be read or written.
-    pub fn withdraw_waiting_invitations(
+    /// Returns an error when the rows cannot be read.
+    pub fn waiting_invitations(
         &self,
         sessions: &BTreeSet<SessionId>,
         now_ms: u64,
-    ) -> Result<Vec<GrantId>> {
+    ) -> Result<Vec<GrantRecord>> {
         let now = i64::try_from(now_ms).unwrap_or(i64::MAX);
         self.in_transaction(|connection| {
             let mut waiting = Vec::new();
@@ -1307,27 +1301,46 @@ impl GrantDirectory {
                     .map_err(ControllerError::registry)?
                     .collect::<rusqlite::Result<Vec<_>>>()
                     .map_err(ControllerError::registry)?;
-                waiting.extend(
-                    found
-                        .iter()
-                        .filter_map(|bytes| uuid_of(bytes))
-                        .map(GrantId::new),
-                );
+                for grant_id in found
+                    .iter()
+                    .filter_map(|bytes| uuid_of(bytes))
+                    .map(GrantId::new)
+                {
+                    waiting.extend(read_one(connection, grant_id)?);
+                }
             }
+            Ok(waiting)
+        })
+    }
+
+    /// Withdraws the waiting grants `grants` name, as their issuer would withdraw them: each grant
+    /// is revoked and its invitation says it was withdrawn. Returns the grants it withdrew.
+    ///
+    /// A grant that was redeemed or revoked since it was read is left as it is, and so is one
+    /// this host no longer holds. Nothing of a grant that is not yet in force was ever in force, so
+    /// there is nothing to fence and no revision to advance, and no grant is delegated from one
+    /// that is not yet in force, so the grant is the whole of what is withdrawn and nothing else in
+    /// the store is read. One transaction for the whole set, and idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the rows cannot be read or written.
+    pub fn withdraw_waiting_grants(&self, grants: &[GrantId], now_ms: u64) -> Result<Vec<GrantId>> {
+        self.in_transaction(|connection| {
             let moment = next_moment(connection, now_ms)?;
             let held = self.held_closes();
             let mut debt = None;
             let mut withdrawn = Vec::new();
-            for grant_id in waiting {
-                let Some(record) = read_one(connection, grant_id)? else {
+            for grant_id in grants {
+                let Some(record) = read_one(connection, *grant_id)? else {
                     continue;
                 };
-                if !record.grant.expiry.is_valid_at(now_ms) {
+                if record.is_active() || record.revoked_at_ms.is_some() {
                     continue;
                 }
                 let one = Self::revoke_subtree(
                     connection,
-                    grant_id,
+                    *grant_id,
                     &[record],
                     moment,
                     &mut debt,

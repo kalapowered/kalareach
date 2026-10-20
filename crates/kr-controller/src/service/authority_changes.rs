@@ -2415,7 +2415,7 @@ fn recipient_refusal(delegating: bool, detail: &str) -> ControllerError {
 }
 
 /// Whether a session's reservation is for a session that is open: neither closed nor failed.
-fn reservation_is_open(reservation: &crate::registry::Reservation) -> bool {
+pub(super) fn reservation_is_open(reservation: &crate::registry::Reservation) -> bool {
     !matches!(
         reservation.phase,
         crate::registry::LaunchPhase::Closed | crate::registry::LaunchPhase::Failed
