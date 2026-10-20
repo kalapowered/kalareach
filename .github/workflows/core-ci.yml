@@ -314,11 +314,13 @@ jobs:
 
       # Every crate in Cargo.lock, checked against the RustSec advisory database as it stands when
       # this step runs. The action is the one definition of the check, which the advisories
-      # workflow also runs once a day. It runs whatever the steps before it did, and every step
+      # workflow also runs once a day. It runs whatever the steps before it did, and every check
       # after it runs whatever this one does, so an advisory published since the last run fails the
-      # job without hiding any other result.
+      # job without hiding any other result. The time limit is for a download or a database fetch
+      # that stops answering.
       - name: Dependencies against the RustSec advisories
         if: ${{ !cancelled() }}
+        timeout-minutes: 10
         uses: ./.github/actions/rustsec-audit
 
       # The legs that check a client against a live deployment rather than against something this
