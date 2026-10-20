@@ -34,6 +34,13 @@
 
 .setup-heading h1 {
   margin: 0;
+  /*
+   * At the largest text size the title's longest word is wider than a phone's window, and a word
+   * broken in the middle of its name reads as a mistake. The title grows with the text until it
+   * would not fit, and from there it is a share of the window's width, which keeps each word
+   * whole.
+   */
+  font-size: min(1.75rem, 11vw);
   /* Large text reads too loose at zero tracking, so it tightens as it grows. */
   letter-spacing: -0.02em;
   line-height: 1.1;

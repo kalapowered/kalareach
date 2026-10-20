@@ -766,6 +766,36 @@ test.describe('the first-start assistant', () => {
     }
   }
 
+  // KR-REQ-03.28: the page's title shows each of its words whole, at each text size and on a wide
+  // window and a narrow one, in the runner's face. A word broken in the middle of a name reads as a
+  // mistake, so at the largest size on a phone the title is set smaller instead of breaking.
+  for (const [width, height] of WINDOWS) {
+    for (const [size, ratio] of TEXT_SIZES) {
+      test(`keeps each word of the page's title whole at the ${size} text size, ${width} wide`, async ({
+        page
+      }) => {
+        await openSetup(page)
+        await sizeTo(page, width, height, ratio)
+        const broken = await page.evaluate(() => {
+          const title = document.querySelector('.setup-heading h1')
+          const text = title?.firstChild
+          if (!(text instanceof Text)) return ['the title is not a line of text']
+          const found: string[] = []
+          for (const word of text.data.matchAll(/\S+/g)) {
+            const start = word.index ?? 0
+            const range = document.createRange()
+            range.setStart(text, start)
+            range.setEnd(text, start + word[0].length)
+            const lines = new Set(Array.from(range.getClientRects()).map((box) => Math.round(box.top)))
+            if (lines.size > 1) found.push(word[0])
+          }
+          return found
+        })
+        expect(broken, 'words of the title that are broken across lines').toEqual([])
+      })
+    }
+  }
+
   test('draws in both colour modes from the same tokens', async ({ page }) => {
     await openSetup(page)
     await step(page, 'capabilities')
