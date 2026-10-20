@@ -50,6 +50,9 @@ describe('a command written for the shell that reads it', () => {
     for (const argument of ['-Dfoo.bar=baz', '-o.txt', '-a.b', '-v1.2']) {
       expect(commandLine(['show', argument], 'powershell')).toBe(`show '${argument}'`)
     }
+    // A word with a colon at the end waits for a value, which no later word gives it where it is
+    // the last of the line.
+    expect(commandLine(['show', 'x', '-x:'], 'powershell')).toBe("show x '-x:'")
     // A word with two dashes, or none, is whole as it is.
     expect(commandLine(['show', '--model=gpt-5.1', '--a.b', '-a:b', 'a.b'], 'powershell')).toBe(
       'show --model=gpt-5.1 --a.b -a:b a.b'

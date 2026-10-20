@@ -22,11 +22,11 @@ function word(argument: string, kind: ShellKind): string {
     // Its stop-parsing token is left out of a program's arguments wherever it is written, quoted or
     // not, and the array expression is the one spelling that passes it on.
     if (argument === '--%') return "@('--%')"
-    // `@` at the start of a word splats a variable, a comma makes a list, and a word that starts with
-    // one dash and holds a dot is cut at the dot into a parameter and the rest.
-    const dashWithDot =
-      argument.startsWith('-') && !argument.startsWith('--') && argument.includes('.')
-    if (PLAIN.test(argument) && !/[@,]/.test(argument) && !dashWithDot) return argument
+    // `@` at the start of a word splats a variable and a comma makes a list. A word that starts with
+    // one dash is read as a parameter: one that holds a dot is cut at the dot, and one that ends in
+    // a colon waits for a value, which is a parse error where it ends the line.
+    const parameter = /^-[^-]/.test(argument) && (argument.includes('.') || argument.endsWith(':'))
+    if (PLAIN.test(argument) && !/[@,]/.test(argument) && !parameter) return argument
     return `'${argument.replace(POWERSHELL_QUOTES, '$&$&')}'`
   }
   // Zsh reads a word that starts with `=` as the path of a command, and Fish reads `%self` as a
