@@ -6501,6 +6501,23 @@ impl WorkerService {
             Method::ShellLaunch => {
                 let params: kr_protocol::root::ShellLaunchParams = parse(&mutation.params)?;
                 Self::check_session(session, params.session_id)?;
+                // Every shell and every exec reads a NUL as the end of a string, so a command that
+                // holds one would install and run as something shorter than the caller named.
+                let holds_nul = match &params.command {
+                    kr_protocol::root::LaunchCommand::Arguments(arguments) => {
+                        arguments.iter().any(|argument| argument.contains('\0'))
+                    }
+                    kr_protocol::root::LaunchCommand::QuotedCommand(command) => {
+                        command.contains('\0')
+                    }
+                };
+                if holds_nul {
+                    return Err(WorkerError::InvalidArgument(
+                        "a launch's command holds a NUL character, which a shell reads as the end \
+                         of the command"
+                            .to_owned(),
+                    ));
+                }
                 // Section 23's row for this method: the terminal-input right, the *current* input
                 // lease, a qualified root editor, an empty prompt behind a fence, the recorded
                 // working-directory revision and the session's launch profile. The first three are
