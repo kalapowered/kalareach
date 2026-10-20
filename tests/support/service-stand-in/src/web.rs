@@ -87,6 +87,14 @@ pub enum Moment {
     /// feed stored the change and did not answer in time. The caller is told it is not known
     /// whether the change took effect, and it did.
     ActedAndUnknown,
+    /// The service acts on the request and the answer that comes back is a plain page with this
+    /// status and none of the service's own envelope, as a platform's or a proxy's page after the
+    /// commit is. The caller cannot tell it from a page that came before the service read the
+    /// request.
+    ActedAndPage {
+        /// The HTTP status of the page.
+        status: u16,
+    },
     /// The service acts on the request and is slow to answer: the answer is given when
     /// [`ServiceWeb::release_held`] is called, and is the one the service would have given at once.
     Slow,
@@ -1021,6 +1029,12 @@ impl ServiceWeb {
                 "OUTCOME_UNKNOWN",
                 "The service did not answer in time, so it is not known whether the change took effect.",
             ));
+        }
+        if let Some(Moment::ActedAndPage { status }) = moment {
+            return Handled::Answer(ServiceHttpAnswer {
+                status,
+                body: b"<html><body>The page is not available.</body></html>".to_vec(),
+            });
         }
         if moment == Some(Moment::Slow) {
             return Handled::Slow(released, answer);
