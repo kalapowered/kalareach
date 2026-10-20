@@ -30,8 +30,10 @@ use crate::effect::{
     ActionDeclaration, ActionImplementation, AttachmentInsertion, MAX_PARAMETER_CHOICES,
     MAX_PARAMETERS, MAX_TEXT_SEGMENTS, ParameterKind, ParameterSchema,
 };
+use crate::forwarder;
 use crate::ids::ActionName;
 use crate::limits::MANIFEST_BYTES;
+use crate::matching::OperatingSystem;
 use crate::package::{
     CONNECTOR_FILE, MANIFEST_FILE, MAX_PACKAGE_BYTES, MAX_PACKAGE_FILES, PRESENTATION_FILE,
     Package, PackageFile,
@@ -354,7 +356,12 @@ pub struct Validated {
 #[must_use]
 pub fn validate_package_directory(directory: &Path) -> Validated {
     let mut report = Report::default();
-    let Some(Scanned { files, manifests }) = scan(directory, &mut report) else {
+    let Some(Scanned {
+        files,
+        manifests,
+        shell_forms,
+    }) = scan(directory, &mut report)
+    else {
         return Validated {
             package: None,
             report,
@@ -407,6 +414,7 @@ pub fn validate_package_directory(directory: &Path) -> Validated {
 
     check_manifest(&manifest, connector.as_ref(), &mut report);
     check_payloads(&manifest, &files, &mut report);
+    check_forwarder_forms(&manifest, &shell_forms, &mut report);
     if let Some(presentation) = &presentation {
         check_presentation(&manifest, presentation, &mut report);
     }
@@ -439,6 +447,8 @@ struct Scanned {
     /// two chances for it to be a different file, and the digest a package is pinned by would then
     /// cover something other than what was validated.
     manifests: BTreeMap<String, Vec<u8>>,
+    /// The paths of the files that write the forwarder as a line a POSIX shell runs.
+    shell_forms: BTreeSet<String>,
 }
 
 fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
@@ -460,6 +470,7 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
 
     let mut files = Vec::new();
     let mut manifests: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut shell_forms: BTreeSet<String> = BTreeSet::new();
     let mut total: u64 = 0;
     let mut queue: Vec<(Dir, Vec<String>)> = vec![(root, Vec::new())];
     while let Some((current, prefix)) = queue.pop() {
@@ -570,7 +581,11 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
                         "reading it would take the package past the {MAX_PACKAGE_BYTES} byte limit"
                     ),
                 ));
-                return Some(Scanned { files, manifests });
+                return Some(Scanned {
+                    files,
+                    manifests,
+                    shell_forms,
+                });
             }
             let limit = if is_manifest_name(path.as_str()) {
                 MANIFEST_BYTES
@@ -581,6 +596,8 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
                 Ok(bytes) => {
                     if is_manifest_name(path.as_str()) {
                         manifests.insert(path.to_string(), bytes.clone());
+                    } else if std::str::from_utf8(&bytes).is_ok_and(forwarder::holds_shell_form) {
+                        shell_forms.insert(path.to_string());
                     }
                     files.push(PackageFile {
                         path,
@@ -599,12 +616,20 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
                         "the package holds more than {MAX_PACKAGE_FILES} files; nothing past that was read"
                     ),
                 ));
-                return Some(Scanned { files, manifests });
+                return Some(Scanned {
+                    files,
+                    manifests,
+                    shell_forms,
+                });
             }
         }
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
-    Some(Scanned { files, manifests })
+    Some(Scanned {
+        files,
+        manifests,
+        shell_forms,
+    })
 }
 
 /// Names a directory inside the package for a message.
@@ -1755,6 +1780,69 @@ fn check_payloads(manifest: &PluginManifest, files: &[PackageFile], report: &mut
                 "the package expands to {actual_total} bytes against {declared_total} declared"
             ),
         ));
+    }
+}
+
+/// Checks that a package that lists Windows does not write the forwarder as a line a POSIX shell
+/// runs.
+///
+/// The host writes the forwarder's path as one word in single quotes where the placeholder is
+/// followed by a space. A POSIX shell reads that as the path, and Windows' shells do not, so the
+/// package writes the program form instead: the placeholder alone, with the arguments beside it.
+/// What a native bridge installs is read where the recipe names it: a file it installs, a
+/// configuration value it adds, and the flags of a command integration.
+fn check_forwarder_forms(
+    manifest: &PluginManifest,
+    shell_forms: &BTreeSet<String>,
+    report: &mut Report,
+) {
+    if !manifest
+        .platforms
+        .iter()
+        .any(|platform| platform.os == OperatingSystem::Windows)
+    {
+        return;
+    }
+    let refused = |what: String| {
+        format!(
+            "{what} writes the forwarder as a line a POSIX shell runs, and the package lists \
+             Windows, where its shells read the path differently; write the placeholder alone \
+             with its arguments beside it, or leave Windows out of the package's platforms"
+        )
+    };
+    if let Some(bridge) = &manifest.native_bridge.0 {
+        for step in &bridge.install {
+            match step {
+                BridgeStep::InstallFile { source, .. } if shell_forms.contains(source.as_str()) => {
+                    report.push(Finding::at(
+                        FindingCode::BridgeRecipeInvalid,
+                        MANIFEST_FILE,
+                        refused(format!("the file {source}")),
+                    ));
+                }
+                BridgeStep::AddConfigurationKey { file, key, value }
+                    if forwarder::holds_shell_form(value) =>
+                {
+                    report.push(Finding::at(
+                        FindingCode::BridgeRecipeInvalid,
+                        MANIFEST_FILE,
+                        refused(format!("the value the recipe adds to {file} {key}")),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(integration) = &manifest.command_integration {
+        for (index, flag) in integration.flags.iter().enumerate() {
+            if forwarder::holds_shell_form(flag) {
+                report.push(Finding::at(
+                    FindingCode::IntegrationInvalid,
+                    MANIFEST_FILE,
+                    refused(format!("flag {index}")),
+                ));
+            }
+        }
     }
 }
 

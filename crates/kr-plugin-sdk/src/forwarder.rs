@@ -11,7 +11,8 @@
 //!   application starts the program directly and reads no shell syntax.
 //! * `"command": "{kr_hook} gemini-cli hook"` is a line a POSIX shell runs. The path is written as
 //!   one word in single quotes, an apostrophe inside it as `'\''`, and then as the text of a JSON
-//!   string, so the shell reads the path as one word whatever characters it holds.
+//!   string, so the shell reads the path as one word whatever characters it holds. Windows' shells
+//!   do not read single quotes that way, so a package that lists Windows is refused this form.
 //!
 //! The placeholder stands at the start of a JSON string and nowhere else: a package that writes it
 //! in the middle of a word, or after anything but an opening quotation mark, has written something
@@ -93,6 +94,19 @@ pub enum ExpandError {
 #[must_use]
 pub fn mentions(text: &str) -> bool {
     text.contains(PLACEHOLDER) || unescaped(text).contains(PLACEHOLDER)
+}
+
+/// Returns true when `text` writes the placeholder as the start of a line a POSIX shell runs: the
+/// placeholder followed by a space, written out or spelt with JSON escapes.
+///
+/// [`expand`] writes the path of such a line as a word in single quotes, which a POSIX shell reads
+/// as one word and Windows' shells do not, so a package that lists Windows cannot use it.
+#[must_use]
+pub fn holds_shell_form(text: &str) -> bool {
+    let decoded = unescaped(text);
+    decoded
+        .match_indices(PLACEHOLDER)
+        .any(|(at, _)| decoded[at + PLACEHOLDER.len()..].starts_with(' '))
 }
 
 /// Returns `text` with every placeholder replaced by `forwarder`, quoted for where it stands.
