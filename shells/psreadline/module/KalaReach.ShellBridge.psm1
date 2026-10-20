@@ -668,8 +668,9 @@ function Install-KrObservedHandlers {
             continue
         }
         $pending = if ($pendingFor.PSBase.ContainsKey($name)) { $pendingFor[$name] } else { '' }
-        $block = [scriptblock]::Create(
-            "param(`$key, `$arg) Invoke-KalaReachPending -Function '$name' -Pending '$pending' -Key `$key -Argument `$arg")
+        # The operation and the state it waits in are values the block closes over, not text it is
+        # built from.
+        $block = { param($key, $arg) Invoke-KalaReachPending -Function $name -Pending $pending -Key $key -Argument $arg }.GetNewClosure()
         try {
             Set-PSReadLineKeyHandler -Chord $chord -ScriptBlock $block `
                 -BriefDescription $name -Description "KalaReach: $name"
