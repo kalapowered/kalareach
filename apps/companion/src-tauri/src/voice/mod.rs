@@ -224,6 +224,12 @@ pub(crate) struct Shared {
     /// Held from the moment what is kept is copied until it is written, so that what is written
     /// last is what was copied last: a copy taken earlier never replaces a later one.
     keeping: Mutex<()>,
+    /// What this process owes the host for the call it holds, which nothing else records yet: it
+    /// is kept in the file from the moment the host is asked to start the call, so that a process
+    /// that ends during the call leaves it owed, and it is not in `view`, so that the host being
+    /// reached while the call runs cannot ask to stop the call that is running. The end of the call
+    /// replaces it with what the end owes, and it is cleared only by the owner that opened it.
+    standing: Mutex<Option<(u64, OwedView)>>,
 }
 
 impl Shared {
@@ -256,15 +262,6 @@ impl Shared {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             *note = Some(key);
         }
-        self.keep();
-    }
-
-    /// Notes something owed, and keeps it for the next launch.
-    pub(crate) fn owe(&self, owed: OwedView) {
-        self.view
-            .lock()
-            .expect("the view lock is not poisoned")
-            .owe(now_ms(), owed);
         self.keep();
     }
 
@@ -316,6 +313,13 @@ impl Shared {
                 *note = before.note;
             }
         }
+        // What a call owes while it runs is kept in the file, and the file could not be read when
+        // it was opened: it is written when the file can be.
+        changed |= self
+            .standing
+            .lock()
+            .expect("the standing lock is not poisoned")
+            .is_some();
         self.unread.store(false, SeqCst);
         Some(changed)
     }
@@ -338,14 +342,91 @@ impl Shared {
         self.write_kept();
     }
 
+    /// Opens the entry this process owes the host for the call `owner` holds, in the file, replacing
+    /// the one an earlier step of the same call opened.
+    pub(crate) fn stand_open(&self, owner: u64, entry: OwedView) {
+        *self
+            .standing
+            .lock()
+            .expect("the standing lock is not poisoned") = Some((owner, entry));
+        self.keep();
+    }
+
+    /// Says that the host has answered the start `owner` sent in a way that makes no grant
+    /// (a refusal, a decline, a receipt), so nothing is owed for it: the start is no longer
+    /// pending, and the entry opened for it is closed before native code is asked to stop.
+    pub(crate) fn answered(&self, owner: u64) {
+        self.start_was_answered(owner);
+        self.record_end(owner, Vec::new());
+    }
+
+    /// Records how a call `owner` held ended, in one step: what the end owes is added to what is
+    /// owed, the host is no longer to be asked again by the supervisor, the entry the call stood on
+    /// is closed, and the file is written once. Recording and telling are one step, so an owner that
+    /// fails never leaves the supervisor without the host to ask and nothing owed.
+    ///
+    /// The file is written when it can be read and something changed: the take-up of what an earlier
+    /// launch kept, or an entry added or closed here. Whatever cannot be written is kept in memory
+    /// and written with the next use.
+    pub(crate) fn record_end(&self, owner: u64, entries: Vec<OwedView>) {
+        let _ordered = self
+            .keeping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let took = self.take_up_unread();
+        let mut changed = !entries.is_empty();
+        {
+            let now = now_ms();
+            let mut view = self.view.lock().expect("the view lock is not poisoned");
+            for each in entries {
+                view.owe(now, each);
+            }
+        }
+        {
+            let mut standing = self
+                .standing
+                .lock()
+                .expect("the standing lock is not poisoned");
+            if standing.as_ref().is_some_and(|(held, _)| *held == owner) {
+                *standing = None;
+                changed = true;
+            }
+        }
+        self.host_was_told(owner);
+        self.persist(took, changed);
+    }
+
+    /// Writes by the one rule: when the file could be read, and the take-up changed something or
+    /// the caller did. Called with `keeping` held.
+    fn persist(&self, took: Option<bool>, changed: bool) {
+        match took {
+            None => tracing::warn!(
+                "what a voice call left owed was not kept: what an earlier launch kept cannot be read yet"
+            ),
+            Some(took) => {
+                if took || changed {
+                    self.write_kept();
+                }
+            }
+        }
+    }
+
     /// Writes the record as it is in memory. Called with `keeping` held and nothing unread.
     fn write_kept(&self) {
-        let owed = self
+        let mut owed = self
             .view
             .lock()
             .expect("the view lock is not poisoned")
             .owed
             .clone();
+        if let Some((_, standing)) = self
+            .standing
+            .lock()
+            .expect("the standing lock is not poisoned")
+            .clone()
+        {
+            owed.push(standing);
+        }
         let note = self
             .note
             .lock()
@@ -448,7 +529,7 @@ impl Shared {
 
     /// Says that the owner has told the host to revoke the call's grant, so a supervisor that
     /// finishes the call after a failure does not ask the host again.
-    pub(crate) fn host_was_told(&self, owner: u64) {
+    fn host_was_told(&self, owner: u64) {
         let mut kept = self
             .emergency
             .lock()
@@ -655,9 +736,7 @@ impl Shared {
                 owed.push(OwedView::start_unknown(action_id, until_ms, host));
             }
         }
-        for each in owed {
-            self.owe(each);
-        }
+        self.record_end(owner, owed);
         self.release(owner);
     }
 }
@@ -711,6 +790,7 @@ impl Calls {
                 unread: std::sync::atomic::AtomicBool::new(unread),
                 note_changed: std::sync::atomic::AtomicBool::new(false),
                 keeping: Mutex::new(()),
+                standing: Mutex::new(None),
             })),
         }
     }

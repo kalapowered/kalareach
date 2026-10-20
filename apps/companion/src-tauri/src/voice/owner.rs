@@ -81,6 +81,11 @@ const HOST_LOST: &str = "The phone has lost contact with the person's computer. 
 const HOST_BACK: &str = "The phone is in contact with the person's computer again. Nothing was \
     done there while it was away.";
 
+/// What a person is told of a revocation a process left owed while a call ran: it ended, and may
+/// not have told the host.
+const STANDING_WORDS: &str = "This device was in this call when it last ran, and may not have told \
+    the host the call was over.";
+
 /// The most delegation identifiers a call remembers having answered.
 const ANSWERED: usize = 256;
 
@@ -338,6 +343,7 @@ impl Owner {
             host: HostEnd::NotNeeded,
         };
         self.close_inbox(&closed);
+        self.shared.record_end(self.id, Vec::new());
         self.shared.release(self.id);
     }
 
@@ -602,6 +608,10 @@ impl Owner {
             .saturating_add(u64::from(self.requested) * 1000)
             .saturating_add(MAX_CLOCK_SKEW_MS);
         self.shared.keep_start_pending(self.id, action_id, until_ms);
+        // From here the host may make a call, and a process that ends before the host answers
+        // leaves it owed: the start, under the action it was sent under.
+        self.shared
+            .stand_open(self.id, OwedView::start_unknown(action_id, until_ms, &host));
         let start_within = self.shared.timings.start_within;
         let sent = match self
             .wait_through(tokio::time::timeout(
@@ -630,16 +640,15 @@ impl Owner {
             }
             Err(error) => {
                 host.session.settle(action_id).await;
+                self.shared.answered(self.id);
                 self.stop_native(HostEnd::NotNeeded).await;
                 return Err(CommandError::from(error));
             }
         };
 
-        if !matches!(created, Reached::Unknown) {
-            self.shared.start_was_answered(self.id);
-        }
         let result = match created {
             Reached::Receipt(receipt) => {
+                self.shared.answered(self.id);
                 self.stop_native(HostEnd::NotNeeded).await;
                 return Ok(Outcome::Over(Started::Receipt(receipt)));
             }
@@ -674,14 +683,17 @@ impl Owner {
                         broker: "unknown".to_owned(),
                     });
                 });
-                self.shared
-                    .owe(OwedView::start_unknown(action_id, until_ms, &host));
+                self.shared.record_end(
+                    self.id,
+                    vec![OwedView::start_unknown(action_id, until_ms, &host)],
+                );
                 self.shared.start_was_answered(self.id);
                 return Ok(Outcome::Over(Started::Unknown { action_id }));
             }
             Reached::Result(result) => result,
         };
         let VoiceStartOutcome::Started { session } = &result.outcome else {
+            self.shared.answered(self.id);
             self.stop_native(HostEnd::NotNeeded).await;
             return Ok(Outcome::Over(Started::Result(result)));
         };
@@ -694,6 +706,17 @@ impl Owner {
             Some(&descriptor),
             &self.reach,
             &self.tokens,
+        );
+        // The host has made the call and named it: what the process owes the host is now the
+        // revocation of its grant, for as long as the call runs.
+        self.shared.stand_open(
+            self.id,
+            OwedView::revocation(
+                STANDING_WORDS.to_owned(),
+                descriptor.voice_session_id,
+                owed_until(descriptor.closes_at_ms.get()),
+                &host,
+            ),
         );
         // The call can be named from here on: a stop that names it reaches this owner.
         let mut shown = descriptor.clone();
@@ -1424,7 +1447,6 @@ impl Owner {
         let (closed_locally, host_end) = tokio::join!(local, toward_host);
         self.events = None;
         self.media_stopped = Some(closed_locally);
-        self.shared.host_was_told(self.id);
         let host_end = host_end.unwrap_or(HostEnd::NotNeeded);
         let closed = Closed {
             local: closed_locally,
@@ -1451,19 +1473,19 @@ impl Owner {
                 .to_owned(),
             });
         });
-        if let (Some(words), Some(descriptor), Some(host)) =
-            (host_end.owed_reason(), &self.descriptor, &self.host)
-        {
-            // The grant may be live at the host until the moment the call was to close, by the
-            // host's reading of the clock.
-            let owed = OwedView::revocation(
+        // What the end owes is recorded with the host being told, in one step. The grant may be
+        // live at the host until the moment the call was to close, by the host's reading of the
+        // clock.
+        let owed = match (host_end.owed_reason(), &self.descriptor, &self.host) {
+            (Some(words), Some(descriptor), Some(host)) => vec![OwedView::revocation(
                 words,
                 descriptor.voice_session_id,
                 owed_until(descriptor.closes_at_ms.get()),
                 host,
-            );
-            self.shared.owe(owed);
-        }
+            )],
+            _ => Vec::new(),
+        };
+        self.shared.record_end(self.id, owed);
         if matches!(cause, Cause::Control(ControlEnd::NoSuchCall)) {
             self.shared.remember_no_such_call(self.note_key());
         }

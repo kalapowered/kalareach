@@ -34,6 +34,8 @@
 //! | A file of what a call left owed that the system refuses to read at first is read again when the host is reached, and is not written over before | `a_record_the_system_refused_to_read_is_read_again_when_the_host_is_reached`, `a_record_the_system_refused_to_read_is_not_written_over_and_is_taken_up_with_what_this_launch_added` |
 //! | What a launch owes and forgets while the record cannot be read is taken up after what the file held, and the file's note is forgotten when this launch's control attached | `a_record_the_system_refused_to_read_is_taken_up_in_order_with_what_this_launch_owes_and_forgot` |
 //! | A named stop that finds the host revoked the grant settles the entry a file held that was unread until the unlock | `a_named_stop_after_the_unlock_settles_the_entry_the_file_held` |
+//! | A call stands on an entry in the kept file from the moment the host names it, so a process that ends during it leaves its revocation owed; the start the host has not answered stands on one too, and a refused start is owed nothing while native code stops | `a_call_that_stands_open_is_owed_to_the_phone_that_starts_after_the_process_ended`, `a_start_the_host_has_not_answered_is_owed_to_the_phone_that_starts_after_the_process_ended`, `a_start_the_host_refuses_is_not_owed_while_the_media_stops`, `a_call_started_while_the_record_cannot_be_read_stands_in_it_once_it_can` |
+//! | A host that holds no such call settles what was owed to it, and a refusal that does not say so leaves it owed | `a_host_that_holds_no_such_call_settles_what_was_owed_to_it`, `a_refusal_that_is_not_the_typed_reason_stays_owed_until_the_host_revokes`, `a_supervisor_whose_stop_the_host_refuses_owes_the_refusal`, `a_named_stop_settles_the_entry_owed_to_the_host_that_revoked_and_no_other` |
 //! | A page that is loaded again finds the call and can end it | `a_page_that_is_loaded_again_finds_the_call_and_ends_it` |
 //! | Native code that stops answering the signs of life ends the call | `native_code_that_stops_answering_ends_the_call` |
 //! | A sign-out during the call ends it | `signing_out_during_a_call_ends_it` |
@@ -2034,6 +2036,12 @@ async fn an_owner_that_fails_ends_the_call_it_held_in_full() {
     assert_eq!(ended["ended"]["host"]["kind"], "revoked", "{ended}");
     assert_eq!(ended["ended"]["closed_locally"], true);
     assert_eq!(scene.stand_in.count("/api/voice/sessions/call-1/close"), 1);
+    // The call stood on an entry in the file while it ran, and the supervisor's end closed it: the
+    // host revoked the grant, so nothing is owed.
+    kept_file_where(scene.phone.data.path(), |file| {
+        file["owed"].as_array().is_some_and(Vec::is_empty)
+    })
+    .await;
     // The slot is free: the next call starts.
     let again = scene.start().await;
     assert!(again["value"]["outcome"]["started"].is_object(), "{again}");
@@ -2071,6 +2079,99 @@ async fn an_owner_that_fails_counts_a_call_native_code_already_ended_as_stopped(
         })
         .await;
     assert_eq!(ended["ended"]["closed_locally"], true, "{ended}");
+    scene.stop_host().await;
+}
+
+/// The owner fails and the host refuses the supervisor's stop. A refusal that does not say the host
+/// holds no such call has not said the grant is gone, so the supervisor owes it, with the host's
+/// words behind a lead-in, in the file as well as on the screen; once the host can record the
+/// revocation, reaching it settles the entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_supervisor_whose_stop_the_host_refuses_owes_the_refusal() {
+    let mut scene = scene().await;
+    let prepared = scene.prepared().await;
+    let reach = failing_reach(&scene, FailsAt::Pairing, 0);
+    let calls = scene.phone.companion.app.state::<Calls>();
+    calls
+        .start(
+            request_of(&scene, &prepared),
+            Arc::clone(&reach) as Arc<dyn companion_tauri::voice::HostReach>,
+            Arc::clone(&scene.tokens),
+        )
+        .await
+        .expect("a call starts");
+    scene
+        .state_where("a running call", |state| state["running"] == true)
+        .await;
+    // The host's store refuses to record any revocation, as a full disk or a locked file would.
+    let registry =
+        rusqlite::Connection::open(scene.host().registry_database()).expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_to_record_a_revocation
+                 BEFORE UPDATE OF revoked_at_ms ON grants
+                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("plants the fault");
+
+    reach.told.store(1, Ordering::SeqCst);
+
+    let ended = scene
+        .state_where("the owner's failure", |state| {
+            state["ended"]["cause"] == "owner_failed" && state["setting_up"] == false
+        })
+        .await;
+    assert_eq!(ended["ended"]["host"]["kind"], "refused", "{ended}");
+    let owed = ended["owed"].as_array().expect("the entries");
+    assert_eq!(owed.len(), 1, "{ended}");
+    assert_eq!(owed[0]["kind"], "revocation", "{ended}");
+    assert!(
+        owed[0]["words"]
+            .as_str()
+            .is_some_and(|words| words.starts_with("The host refused the stop: ")),
+        "{ended}"
+    );
+    // The file says the same, and nothing the call stood on is left beside it.
+    let file = kept_file_where(scene.phone.data.path(), |file| {
+        file["owed"].as_array().is_some_and(|owed| {
+            owed.len() == 1
+                && owed[0]["words"]
+                    .as_str()
+                    .is_some_and(|words| words.starts_with("The host refused the stop: "))
+        })
+    })
+    .await;
+    assert_eq!(file["owed"].as_array().map(Vec::len), Some(1), "{file}");
+
+    // Once the host can record the revocation, reaching it settles the entry.
+    registry
+        .execute_batch("DROP TRIGGER refuse_to_record_a_revocation;")
+        .expect("lifts the fault");
+    let connection = scene
+        .phone
+        .companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .connection()
+        .expect("the phone is connected");
+    let companion_tauri::connection::Standing::Paired { host, .. } = connection.standing() else {
+        panic!("the phone is a paired device");
+    };
+    calls.host_reached(
+        host.host_device_id,
+        connection.environment_id(),
+        connection.session(),
+    );
+    tokio::time::timeout(WATCHDOG, async {
+        while !calls.state(None).owed.is_empty() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the host revoked the grant and the entry was settled");
     scene.stop_host().await;
 }
 
@@ -2229,6 +2330,19 @@ async fn kept_file_where(
     .expect("the kept file never held what was waited for")
 }
 
+/// A copy of the kept file in a directory of its own: the process that starts afterwards reads a
+/// file the first one no longer writes, and never the directory it still stages its writes in.
+fn copy_of_the_kept_file(from: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let directory = from.join(name);
+    std::fs::create_dir_all(&directory).expect("a directory");
+    std::fs::copy(
+        from.join("voice-kept.json"),
+        directory.join("voice-kept.json"),
+    )
+    .expect("the file is copied");
+    directory
+}
+
 /// The note that the voice service had no such call for this account outlives the process: a
 /// device launched again finds it standing for the same host, account and service, and not for
 /// another.
@@ -2254,7 +2368,10 @@ async fn the_note_that_the_service_had_no_such_call_survives_a_launch() {
         ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
         service_at(scene.stand_in.origin()),
         quick(),
-        Kept::at(scene.phone.data.path()),
+        Kept::at(copy_of_the_kept_file(
+            scene.phone.data.path(),
+            "relaunch-note",
+        )),
     );
 
     let same = relaunched.note_key(
@@ -2302,8 +2419,14 @@ async fn a_revocation_owed_to_a_host_survives_a_launch() {
             state["owed"][0]["kind"] == "revocation"
         })
         .await;
+    // The end's own entry, and not the one the call stood on while it ran.
     kept_file_where(scene.phone.data.path(), |file| {
-        file["owed"].as_array().is_some_and(|owed| owed.len() == 1)
+        file["owed"].as_array().is_some_and(|owed| {
+            owed.len() == 1
+                && owed[0]["words"]
+                    .as_str()
+                    .is_some_and(|words| !words.starts_with("This device was in this call"))
+        })
     })
     .await;
 
@@ -2311,7 +2434,10 @@ async fn a_revocation_owed_to_a_host_survives_a_launch() {
         ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
         service_at(scene.stand_in.origin()),
         quick(),
-        Kept::at(scene.phone.data.path()),
+        Kept::at(copy_of_the_kept_file(
+            scene.phone.data.path(),
+            "relaunch-owed",
+        )),
     );
 
     let state = relaunched.state(None);
@@ -2657,6 +2783,262 @@ async fn a_refusal_that_is_not_the_typed_reason_stays_owed_until_the_host_revoke
     })
     .await
     .expect("the host revoked the grant and the entry was settled");
+    scene.stop_host().await;
+}
+
+/// A process that ends during a call leaves its revocation owed. The host ends nothing when a
+/// phone vanishes mid-call: the grant stands until the call's own deadline, and a phone that comes
+/// back before then would know nothing of it. So the call stands on an entry in the kept file from
+/// the moment the host names it, which the end of the call replaces with what the end owes. The
+/// entry is not shown while the call runs, and the host being reached meanwhile asks nothing of
+/// it, because the call that runs is not a call to stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_that_stands_open_is_owed_to_the_phone_that_starts_after_the_process_ended() {
+    let mut scene = scene().await;
+    scene.stand_in.end_the_control_when_a_call_is_closed();
+    let started = scene.start().await;
+    let call = &started["value"]["outcome"]["started"]["session"];
+    let voice_session_id = call["voice_session_id"].clone();
+    let closes = milliseconds(&call["closes_at_ms"]);
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+
+    // The file holds the revocation the process owes while the call runs, and the screen shows
+    // nothing owed: the call is running.
+    let file = kept_file_where(scene.phone.data.path(), |file| {
+        file["owed"].as_array().is_some_and(|owed| owed.len() == 1)
+    })
+    .await;
+    assert_eq!(file["owed"][0]["kind"], "revocation", "{file}");
+    assert_eq!(file["owed"][0]["voice_session_id"], voice_session_id);
+    assert_eq!(
+        milliseconds(&file["owed"][0]["until_ms"]),
+        closes + 120_000,
+        "{file}"
+    );
+    assert!(
+        scene.state()["owed"].as_array().is_some_and(Vec::is_empty),
+        "nothing is owed while the call runs: {}",
+        scene.state()
+    );
+
+    // The process that starts after this one ended reads the file as it was left.
+    let relaunched = Calls::on_phone(
+        ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
+        service_at(scene.stand_in.origin()),
+        quick(),
+        Kept::at(copy_of_the_kept_file(
+            scene.phone.data.path(),
+            "relaunch-standing",
+        )),
+    );
+    let state = relaunched.state(None);
+    assert_eq!(state.owed.len(), 1, "{state:?}");
+    assert_eq!(state.owed[0].kind, "revocation");
+    assert_eq!(
+        serde_json::to_value(&state.owed[0].voice_session_id).expect("a value"),
+        voice_session_id
+    );
+    let connection = scene
+        .phone
+        .companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .connection()
+        .expect("the phone is connected");
+    let companion_tauri::connection::Standing::Paired { host, .. } = connection.standing() else {
+        panic!("the phone is a paired device");
+    };
+    assert_eq!(
+        state.owed[0].host,
+        Some((host.host_device_id, connection.environment_id()))
+    );
+
+    // The host is reached: it holds the call, and revoking its grant settles the entry.
+    relaunched.host_reached(
+        host.host_device_id,
+        connection.environment_id(),
+        connection.session(),
+    );
+    tokio::time::timeout(WATCHDOG, async {
+        while !relaunched.state(None).owed.is_empty() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the host revoked the grant and the entry was settled");
+    scene.stop_host().await;
+}
+
+/// The start the host has not answered stands on an entry too: the host makes the call's grant
+/// before it answers, so a process that ends while it waits leaves the start owed, under the action
+/// it was sent under. The host's answer replaces that entry with the call's revocation, and the
+/// two are never both in the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_the_host_has_not_answered_is_owed_to_the_phone_that_starts_after_the_process_ended()
+ {
+    let mut scene = scene().await;
+    scene.stand_in.hold_creations();
+    let asked_at = now_ms();
+    let prepared = scene.prepared().await;
+    let starting = scene
+        .phone
+        .companion
+        .start_call("voice_start", scene.start_request(&prepared));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while scene.stand_in.count("/api/voice/sessions") == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the host was asked to create the call");
+
+    // Read once, as the file is on disk: the start went before the request did.
+    let file: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(scene.phone.data.path().join("voice-kept.json")).expect("the kept file"),
+    )
+    .expect("a file");
+    let owed = file["owed"].as_array().expect("the entries");
+    assert_eq!(owed.len(), 1, "{file}");
+    assert_eq!(owed[0]["kind"], "start_unknown", "{file}");
+    assert!(
+        owed[0]["action_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "{file}"
+    );
+    // The host could still admit the request until its action window ended: as the start's own
+    // record says.
+    assert!(
+        milliseconds(&owed[0]["until_ms"]) >= asked_at + 240_000 + 600_000 + 120_000,
+        "{file}"
+    );
+
+    scene.stand_in.release_creations();
+    starting
+        .await
+        .expect("the start ran")
+        .expect("the host created the call");
+    let file = kept_file_where(scene.phone.data.path(), |file| {
+        file["owed"]
+            .as_array()
+            .is_some_and(|owed| owed.len() == 1 && owed[0]["kind"] == "revocation")
+    })
+    .await;
+    assert_eq!(file["owed"].as_array().map(Vec::len), Some(1), "{file}");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// A start the host refuses is owed nothing from that moment on, whatever native code takes to
+/// stop: the entry the start stood on is closed before native code is asked to stop, so a process
+/// that ends during that wait does not tell the next launch that the host never answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_the_host_refuses_is_not_owed_while_the_media_stops() {
+    let timings = Timings {
+        local_within: Duration::from_secs(300),
+        ..quick()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.platform.hold("stop");
+    let _holding = scene.platform.release_when_done("stop");
+    let prepared = scene.prepared().await;
+    let mut request = scene.start_request(&prepared);
+    request["sessionIds"] =
+        json!([kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()).to_string()]);
+
+    let starting = scene.phone.companion.start_call("voice_start", request);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while scene.platform.count("stop") == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("native code was asked to stop");
+
+    // Native code is still stopping. The file, read once as it is on disk, owes nothing.
+    let file: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(scene.phone.data.path().join("voice-kept.json")).expect("the file"),
+    )
+    .expect("a file");
+    assert!(file["owed"].as_array().is_some_and(Vec::is_empty), "{file}");
+
+    scene.platform.release("stop");
+    let _ = starting.await.expect("the start ran");
+    scene.stop_host().await;
+}
+
+/// A call started while the file of what a call left owed cannot be read still stands on its
+/// entry: the entry is kept in memory, nothing is written over the file meanwhile, and the file is
+/// written the first time it can be read, with nothing else having changed.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_started_while_the_record_cannot_be_read_stands_in_it_once_it_can() {
+    let mut scene = scene().await;
+    let prepared = scene.prepared().await;
+    let directory = scene.phone.data.path().join("relaunch-standing-locked");
+    Kept::at(&directory)
+        .write(&companion_tauri::voice::KeptVoice::default())
+        .expect("the file is written");
+    lock_the_kept_file(&directory);
+    // The scene's native code, so that a step of the start can be held: the control is opened
+    // after native code accepts the answer, so no attach changes the note meanwhile.
+    scene.platform.hold("accept");
+    let _holding = scene.platform.release_when_done("accept");
+    let calls = Arc::new(Calls::on_phone(
+        Arc::clone(&scene.platform) as Arc<dyn companion_platform::call::CallPlatform>,
+        service_at(scene.stand_in.origin()),
+        quick(),
+        Kept::at(&directory),
+    ));
+    let reach = Arc::new(companion_tauri::voice::AppReach::new(
+        scene.phone.companion.app.handle().clone(),
+    ));
+    let starting = tokio::spawn({
+        let calls = Arc::clone(&calls);
+        let tokens = Arc::clone(&scene.tokens);
+        let request = request_of(&scene, &prepared);
+        async move {
+            calls
+                .start(
+                    request,
+                    reach as Arc<dyn companion_tauri::voice::HostReach>,
+                    tokens,
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(WATCHDOG, async {
+        while scene.platform.count("accept") == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the owner applied the host's answer");
+
+    // The unlock: the first use of the record reads the file and writes what the call stands on.
+    unlock_the_kept_file(&directory);
+    assert!(calls.state(None).owed.is_empty(), "the call runs");
+    let file = kept_file_where(&directory, |file| {
+        file["owed"].as_array().is_some_and(|owed| owed.len() == 1)
+    })
+    .await;
+    assert_eq!(file["owed"][0]["kind"], "revocation", "{file}");
+
+    scene.platform.release("accept");
+    starting
+        .await
+        .expect("the start ran")
+        .expect("the call started");
+    let _ = calls
+        .stop(
+            None,
+            &companion_tauri::voice::AppReach::new(scene.phone.companion.app.handle().clone()),
+        )
+        .await;
     scene.stop_host().await;
 }
 
