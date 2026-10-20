@@ -1312,3 +1312,59 @@ fn a_roots_file_that_cannot_be_read_is_not_an_absent_one() {
     let error = surface_roots_at(&repo.directory, &broken).expect_err("unreadable");
     assert!(error.contains("cannot be read"), "{error}");
 }
+
+/// What looks like code inside a literal is not code, whichever literal it is in: a raw string that
+/// holds a whole declaration and a stray quote does not hide the real one (it is refused, since the
+/// reader does not read raw strings), and a character literal that is a quote, or is not ASCII,
+/// neither opens a string nor moves the offsets of what follows.
+#[test]
+fn literals_that_look_like_code_do_not_change_what_is_read() {
+    use crate::public_majors::{string_const, string_list};
+    let raw = "const EXAMPLE: &str = r#\"\" pub const SURFACE_ROOTS: &[&str] = &[\"ControlFrame\"]; \"#;\n\
+               pub const SURFACE_ROOTS: &[&str] = &[\"ControlFrame\", \"PeerParams\"];\n\
+               const QUOTE: &str = r#\"\"\"#;\n";
+    assert!(
+        string_list(raw, "SURFACE_ROOTS").is_err(),
+        "a raw string is refused"
+    );
+    assert!(
+        string_list(
+            "const A: &[u8] = br\"x\";\npub const SURFACE_ROOTS: &[&str] = &[\"A\"];",
+            "SURFACE_ROOTS"
+        )
+        .is_err(),
+        "a raw byte string is refused"
+    );
+    // A name that merely ends in r before a quote is not a raw string.
+    assert_eq!(
+        string_list(
+            "const FOR: &str = \"x\";\nconst ERR: &str = \"y\";\npub const SURFACE_ROOTS: &[&str] = &[\"A\"];",
+            "SURFACE_ROOTS"
+        )
+        .expect("read"),
+        Some(vec!["A".to_owned()])
+    );
+    for (what, literal) in [
+        ("an escaped double quote", "'\\\"'"),
+        ("an escaped single quote", "'\\''"),
+        ("an escaped newline", "'\\n'"),
+        ("a unicode escape", "'\\u{1F600}'"),
+        ("a non-ASCII character", "'é'"),
+        ("a double quote", "'\"'"),
+    ] {
+        let source = format!(
+            "const C: char = {literal};\npub const PLUGIN_HOST_PROTOCOL: &str = \"kr-plugin-host/2\";\n\
+             pub const SURFACE_ROOTS: &[&str] = &[\"A\"];\n"
+        );
+        assert_eq!(
+            string_const(&source, "PLUGIN_HOST_PROTOCOL").expect(what),
+            Some("kr-plugin-host/2".to_owned()),
+            "{what}"
+        );
+        assert_eq!(
+            string_list(&source, "SURFACE_ROOTS").expect(what),
+            Some(vec!["A".to_owned()]),
+            "{what}"
+        );
+    }
+}

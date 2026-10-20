@@ -215,8 +215,17 @@ fn masked(code: &str) -> String {
         } else if here == '"' {
             quoted = true;
             out.push('"');
+        } else if let Some(end) = escaped_character_literal(&characters, index) {
+            out.push('\'');
+            for inside in &characters[index + 1..end] {
+                out.extend(std::iter::repeat_n('x', inside.len_utf8()));
+            }
+            out.push('\'');
+            index = end;
         } else if here == '\'' && characters.get(index + 2) == Some(&'\'') {
-            out.push_str("'x'");
+            out.push('\'');
+            out.extend(std::iter::repeat_n('x', characters[index + 1].len_utf8()));
+            out.push('\'');
             index += 2;
         } else {
             out.push(here);
@@ -224,6 +233,34 @@ fn masked(code: &str) -> String {
         index += 1;
     }
     out
+}
+
+/// Where the escaped character literal that begins at `index` ends (`'\n'`, `'\''`, `'\"'`,
+/// `'\u{1F600}'`), the position of its closing quote; none where `index` begins no such literal.
+fn escaped_character_literal(characters: &[char], index: usize) -> Option<usize> {
+    if characters.get(index) != Some(&'\'') || characters.get(index + 1) != Some(&'\\') {
+        return None;
+    }
+    // The escaped character comes first, so an escaped quote does not close the literal.
+    (index + 3..characters.len().min(index + 14)).find(|at| characters[*at] == '\'')
+}
+
+/// Whether a raw string literal (`r"`, `r#"`, `br"`) begins at `index`.
+fn starts_a_raw_string(characters: &[char], index: usize) -> bool {
+    if characters[index] != 'r' {
+        return false;
+    }
+    let word = |at: Option<usize>| {
+        at.and_then(|at| characters.get(at))
+            .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+    };
+    let before = index.checked_sub(1);
+    let begins = !word(before) || (characters[index - 1] == 'b' && !word(index.checked_sub(2)));
+    let mut after = index + 1;
+    while characters.get(after) == Some(&'#') {
+        after += 1;
+    }
+    begins && characters.get(after) == Some(&'"')
 }
 
 /// `source` without its `//` and `/* */` comments; text between double quotes is left alone.
@@ -244,10 +281,20 @@ fn without_comments(source: &str) -> Result<String, String> {
             } else if here == '"' {
                 quoted = false;
             }
+        } else if let Some(end) = escaped_character_literal(&characters, index) {
+            kept.extend(&characters[index..=end]);
+            index = end + 1;
+            continue;
         } else if here == '\'' && characters.get(index + 2) == Some(&'\'') {
             kept.extend(&characters[index..index + 3]);
             index += 3;
             continue;
+        } else if starts_a_raw_string(&characters, index) {
+            return Err(
+                "a raw string literal, which this reader does not read (its quotes would \
+                 change what it takes for code)"
+                    .to_owned(),
+            );
         } else if here == '"' {
             quoted = true;
             kept.push(here);

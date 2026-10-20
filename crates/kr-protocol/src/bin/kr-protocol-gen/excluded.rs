@@ -270,8 +270,9 @@ pub fn surface_digest(repository: &Path, commit: &str) -> Result<String, String>
     )?;
     let schema: serde_json::Value =
         serde_json::from_str(&text).map_err(|error| format!("the schema at {commit}: {error}"))?;
-    let roots = surface_roots_at(repository, commit)?
-        .ok_or_else(|| format!("{commit} declares no SURFACE_ROOTS"))?;
+    let roots = surface_roots_at(repository, commit)?.ok_or_else(|| {
+        format!("{commit} has no crates/kr-protocol/src/retained.rs to read SURFACE_ROOTS from")
+    })?;
     let roots: Vec<&str> = roots.iter().map(String::as_str).collect();
     let surface = Surface::cut(&schema, &roots).map_err(|error| format!("{commit}: {error}"))?;
     Ok(kr_cbor::sha256(surface.render().as_bytes())

@@ -249,7 +249,8 @@ pub fn agree_with_origin(repository: &Path, local: &[Release], head: &str) -> Re
 ///
 /// # Errors
 ///
-/// When the file is there and declares the list in another form.
+/// When the file cannot be read, is there and declares no list, or declares it in a form
+/// [`surface_roots_in`] refuses.
 pub fn surface_roots_at(repository: &Path, commit: &str) -> Result<Option<Vec<String>>, String> {
     let path = "crates/kr-protocol/src/retained.rs";
     let Some(source) = file_at(repository, commit, path)
@@ -271,7 +272,8 @@ pub fn surface_roots_at(repository: &Path, commit: &str) -> Result<Option<Vec<St
 ///
 /// # Errors
 ///
-/// When the declaration is there more than once, or is not in the shape the reader knows.
+/// When the source holds a raw string or a comment that does not end, declares the list more than
+/// once or in a shape the reader does not know, or has an entry that is not a plain string literal.
 pub fn surface_roots_in(source: &str) -> Result<Option<Vec<String>>, String> {
     crate::public_majors::string_list(source, "SURFACE_ROOTS")
 }
