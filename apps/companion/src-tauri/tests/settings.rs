@@ -3409,29 +3409,8 @@ async fn a_device_taken_out_by_a_revoke_that_did_not_go_through_is_given_the_set
         "it is named as taken out by a revoke: {view}"
     );
 
-    // A request of this computer's that a host may yet act on is in force: the device is not
-    // offered to be shared with again while it is, and is again once the look at the hosts and
-    // their feeds finds no request in force.
-    let settings = page
-        .app
-        .state::<AppState>()
-        .settings()
-        .expect("settings are open");
-    let key = *other.identity().keys.authorisation.public();
-    settings.requests_in_force(&[key], false);
-    assert_eq!(
-        page.devices_refresh()["held_out"],
-        json!([]),
-        "not offered while a request is in force"
-    );
-    assert!(
-        page.share(&first_reference(&devices["held_out"])).is_err(),
-        "and not shared with while a request is in force"
-    );
-    settings.requests_in_force(&[], true);
-    let devices = page.devices_refresh();
-    assert_eq!(devices["held_out"].as_array().expect("held out").len(), 1);
-
+    // No request of this computer's waits in a feed (one that does is held by the revocation suite,
+    // against a host and its feed), so the person may share with it again.
     page.share(&first_reference(&devices["held_out"]))
         .expect("the person shares with it again");
     assert_eq!(

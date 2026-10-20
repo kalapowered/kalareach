@@ -4454,13 +4454,26 @@ pub async fn settings_drafts_set(
     state.settings()?.drafts_set(enabled).await
 }
 
+/// Looks at the hosts and their feeds before the settings are read, when a request of this
+/// computer's to revoke a device may still be waiting in one: a request a host has since refused,
+/// or that is gone, then no longer keeps a device from being offered to be shared with again.
+async fn looked_at_for_requests(state: &State<'_, AppState>, settings: &crate::settings::Settings) {
+    if settings.requests().any()
+        && let Ok(revocations) = state.revocations()
+    {
+        revocations.view(&state.revocation_context()).await;
+    }
+}
+
 /// Asks every host who it lists, brings this computer and the sync service to the same settings, and
 /// on a computer that shares none, looks for collections other devices share with it.
 #[tauri::command]
 pub async fn settings_devices_refresh(
     state: State<'_, AppState>,
 ) -> Result<crate::settings::SettingsView> {
-    state.settings()?.devices_refresh().await
+    let settings = state.settings()?;
+    looked_at_for_requests(&state, &settings).await;
+    settings.devices_refresh().await
 }
 
 /// A device the person's hosts list is given the settings' key, once the person confirms it on this
@@ -4471,13 +4484,7 @@ pub async fn settings_device_share(
     reference: String,
 ) -> Result<crate::settings::SettingsView> {
     let settings = state.settings()?;
-    // A device the page showed as taken out by a revoke is shared with again only when no request
-    // of this computer's for it is in force, so the hosts and their feeds are looked at first.
-    if settings.names_held_out(&reference)
-        && let Ok(revocations) = state.revocations()
-    {
-        revocations.view(&state.revocation_context()).await;
-    }
+    looked_at_for_requests(&state, &settings).await;
     settings.device_share(&reference).await
 }
 

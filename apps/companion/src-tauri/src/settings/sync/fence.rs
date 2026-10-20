@@ -23,7 +23,9 @@
 //! and was told the request failed finds it on the account sheet, apart from the devices never
 //! shared with, as long as a host still lists it as unrevoked, and shares with it again there: the
 //! confirmation takes back what the membership recorded, and the hosts' answers decide the device
-//! from then on.
+//! from then on. Not while a request for it may still be carried out: one put in a host's feed is
+//! recorded apart ([`super::Requests`]) until a read of that feed shows it settled, and the device
+//! is named on the sheet with the reason and not offered.
 //!
 //! The record is a file beside the other records of settings sync, so it is kept across a restart
 //! and seen by a second companion over the same data directory: each step takes in what it finds
@@ -35,16 +37,14 @@
 //! then holds this process only, until it can be.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
 use kr_client::sync::PublishGate;
-use kr_ipc::paths::{
-    create_private_directory, flush_path_names, read_owner_only_file, write_owner_only_file,
-};
 use kr_protocol::scalars::AuthorisationKey;
 
-use crate::error::{CommandError, Result};
+use super::kept::{Kept, Unwritten};
+use crate::error::Result;
 
 /// The file the revocations not yet recorded are kept in.
 const FILE: &str = "revoking.json";
@@ -52,25 +52,15 @@ const FILE: &str = "revoking.json";
 /// The file whose lock makes a change to [`FILE`] one act across companions.
 const LOCK: &str = "revoking.lock";
 
-/// The most bytes of [`FILE`] that are read: far more than this computer's devices come to.
-const LIMIT: u64 = 1 << 20;
-
 /// The devices whose revocation is known here and the membership has not recorded yet: those this
 /// computer sent a request for, whatever became of it, and those the host on this computer lists as
 /// revoked.
 #[derive(Debug)]
 pub struct Fence {
-    directory: PathBuf,
+    kept: Kept,
     /// The same devices as this process knows them, so that a record that cannot be written down
     /// still holds this process's sends.
     held: Mutex<BTreeSet<AuthorisationKey>>,
-}
-
-/// A change of the record that did not end well.
-struct Unwritten {
-    error: CommandError,
-    /// Whether the record may name the change all the same.
-    landed: bool,
 }
 
 impl Fence {
@@ -78,7 +68,12 @@ impl Fence {
     #[must_use]
     pub(in crate::settings) fn in_directory(directory: &Path) -> Self {
         Self {
-            directory: directory.to_path_buf(),
+            kept: Kept::in_directory(
+                directory,
+                FILE,
+                LOCK,
+                "this computer's record of revocations not yet taken in",
+            ),
             held: Mutex::new(BTreeSet::new()),
         }
     }
@@ -89,81 +84,16 @@ impl Fence {
 
     /// What the file holds.
     fn on_disk(&self) -> Result<BTreeSet<AuthorisationKey>> {
-        let path = self.directory.join(FILE);
-        let bytes = read_owner_only_file(&path, LIMIT).map_err(|error| {
-            CommandError::local_failure(format!(
-                "this computer's record of revocations not yet taken in could not be read: {error}"
-            ))
-        })?;
-        match bytes {
-            None => Ok(BTreeSet::new()),
-            Some(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
-                CommandError::local_failure(format!(
-                    "this computer's record of revocations not yet taken in is not one it can \
-                     read: {error}"
-                ))
-            }),
-        }
+        self.kept.on_disk()
     }
 
-    /// Changes the file under its lock. `landed_if` says, of what the file holds after a write that
-    /// failed, whether the change is in it: it is asked under the same lock, so no other companion
-    /// has changed the file between the write and the question.
+    /// Changes the file under its lock ([`Kept::change`]).
     fn change(
         &self,
         change: impl FnOnce(&mut BTreeSet<AuthorisationKey>),
         landed_if: impl Fn(&BTreeSet<AuthorisationKey>) -> bool,
     ) -> std::result::Result<(), Unwritten> {
-        let before_the_write = |error: CommandError| Unwritten {
-            error,
-            landed: false,
-        };
-        // The directory is made, then locked, and only then are its names made durable: a flush
-        // under the lock covers every rename the read below can see, whoever made it, so a change
-        // with nothing to write stands on a record that is durable too.
-        create_private_directory(&self.directory).map_err(|error| {
-            before_the_write(CommandError::local_failure(format!(
-                "this computer's record of revocations not yet taken in could not be made: \
-                 {error}"
-            )))
-        })?;
-        let _lock = crate::settings::locked_file(&self.directory.join(LOCK)).map_err(|error| {
-            before_the_write(CommandError::local_failure(format!(
-                "this computer's record of revocations not yet taken in could not be locked: \
-                 {error}"
-            )))
-        })?;
-        flush_path_names(&self.directory).map_err(|error| {
-            before_the_write(CommandError::local_failure(format!(
-                "this computer's record of revocations not yet taken in could not be made \
-                 durable: {error}"
-            )))
-        })?;
-        let mut devices = self.on_disk().map_err(before_the_write)?;
-        let before = devices.clone();
-        change(&mut devices);
-        if devices == before {
-            return Ok(());
-        }
-        let text = serde_json::to_vec(&devices).map_err(|error| {
-            before_the_write(CommandError::local_failure(format!(
-                "this computer's record of revocations not yet taken in could not be written: \
-                 {error}"
-            )))
-        })?;
-        write_owner_only_file(&self.directory.join(FILE), &text).map_err(|error| {
-            // The file is renamed into place and then its directory is flushed, so a failure can
-            // come after the record already names the change. A record that cannot be read to say
-            // is taken to name it: what is uncertain is held, not forgotten.
-            let landed = self.on_disk().map_or(true, |kept| landed_if(&kept));
-            Unwritten {
-                error: CommandError::local_failure(format!(
-                    "this computer's record of revocations not yet taken in could not be kept: \
-                     {error}"
-                )),
-                landed,
-            }
-        })
+        self.kept.change(change, landed_if)
     }
 
     /// Holds everything sent until `devices` are taken out of the shared settings, for a revocation

@@ -330,6 +330,10 @@ pub struct Settings {
     /// The revocations that settings sync has not taken in. It is here and not in settings sync,
     /// so that settings are held back for a revocation even where settings sync did not start.
     fence: Arc<sync::Fence>,
+    /// The revocation requests this computer has in hosts' feeds that may still be carried out. It
+    /// is here for the same reason as the fence: a request is recorded whether or not settings sync
+    /// started, and a later start finds it.
+    requests: Arc<sync::Requests>,
     /// Where the settings and settings sync keep their records.
     data: PathBuf,
 }
@@ -343,6 +347,7 @@ impl Settings {
             sync: OnceLock::new(),
             told: Arc::new(Told::default()),
             fence: Arc::new(sync::Fence::in_directory(&data.join(sync::DIRECTORY))),
+            requests: Arc::new(sync::Requests::in_directory(&data.join(sync::DIRECTORY))),
             data: data.to_path_buf(),
         }
     }
@@ -381,6 +386,7 @@ impl Settings {
             hosts,
             ceremony,
             Arc::clone(&self.fence),
+            Arc::clone(&self.requests),
         )?;
         let _ = self.sync.set(sync);
         Ok(())
@@ -606,24 +612,11 @@ impl Settings {
         self.fence.raise(devices)
     }
 
-    /// Says which devices a revocation request of this computer's is in force for, as far as the
-    /// last look at the hosts and their feeds showed ([`SettingsSync::requests_in_force`]).
-    pub fn requests_in_force(
-        &self,
-        devices: &[kr_protocol::scalars::AuthorisationKey],
-        complete: bool,
-    ) {
-        if let Some(sync) = self.sync.get() {
-            sync.requests_in_force(devices, complete);
-        }
-    }
-
-    /// Whether the page was shown the device `reference` names as taken out by a revoke.
+    /// The revocation requests this computer has in hosts' feeds that may still be carried out
+    /// ([`sync::Requests`]).
     #[must_use]
-    pub fn names_held_out(&self, reference: &str) -> bool {
-        self.sync
-            .get()
-            .is_some_and(|sync| sync.names_held_out(reference))
+    pub fn requests(&self) -> &sync::Requests {
+        &self.requests
     }
 
     /// Tells settings sync that revocations of `devices` are known here, so that it takes them out

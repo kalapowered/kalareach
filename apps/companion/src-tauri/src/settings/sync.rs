@@ -98,11 +98,16 @@ use kr_protocol::sync::SyncObjectKind;
 use serde::{Deserialize, Serialize};
 
 mod fence;
+mod kept;
 mod members;
+mod requests;
 
 pub use fence::Fence;
 use members::{Ask, Listed};
-pub use members::{Candidate as DeviceCandidate, DevicesView, Happened, Member, Offer};
+pub use members::{
+    Candidate as DeviceCandidate, DevicesView, Happened, HeldOut as DeviceHeldOut, Member, Offer,
+};
+pub use requests::Requests;
 
 use super::{ColourMode, Hosts, LocalSettings};
 use crate::error::{CommandError, Result};
@@ -398,6 +403,9 @@ pub struct SettingsSync {
     waiting: std::sync::atomic::AtomicBool,
     /// The revocations that the membership has not recorded, which hold back everything sent.
     fence: Arc<Fence>,
+    /// The requests this computer has in hosts' feeds that may still be carried out, which keep a
+    /// device the settings were taken away from out of the offers to share with it again.
+    requests: Arc<Requests>,
 }
 
 impl std::fmt::Debug for SettingsSync {
@@ -439,6 +447,7 @@ impl SettingsSync {
         hosts: Arc<dyn Hosts>,
         ceremony: Arc<dyn Ceremony>,
         fence: Arc<Fence>,
+        requests: Arc<Requests>,
     ) -> Result<Self> {
         let directory = data.join(DIRECTORY);
         create_private_directory(&directory)
@@ -472,6 +481,7 @@ impl SettingsSync {
             offered: Mutex::new(Vec::new()),
             waiting: std::sync::atomic::AtomicBool::new(false),
             fence,
+            requests,
         })
     }
 

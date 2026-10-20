@@ -79,6 +79,13 @@ pub fn forget_host<R: Runtime>(app: &AppHandle<R>, host: &PairedHost) -> Result<
         "no host is in use: you forgot the one this application was reaching",
         || device.forget_host(host.host_device_id),
     )?;
+    // The feed of a host this computer no longer reaches is one it no longer reads, so a request
+    // it left there is not waited for: nothing could say it is settled.
+    if let Ok(settings) = state.settings() {
+        settings
+            .requests()
+            .forget_host(&crate::device::hosts::reference_of(host));
+    }
     let _ = app.emit(CONNECTION_EVENT, state.connection_state());
     Ok(state.connection_state())
 }

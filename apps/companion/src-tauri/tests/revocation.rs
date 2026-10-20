@@ -2040,3 +2040,29 @@ async fn a_look_that_began_before_a_request_was_sent_does_not_let_its_device_go(
         .expect_err("a device a request may still revoke is not shared with");
     assert_eq!(devices["held_out"][0]["waiting"], true, "{devices}");
 }
+
+/// A host the person forgets is one whose feed this computer no longer reads, so a request it left
+/// there is not waited for: nothing could ever say it is settled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_in_the_feed_of_a_host_that_was_forgotten_is_not_waited_for() {
+    let rig = Rig::start().await;
+    rig.sharing_with_the_phone().await;
+    let host = host_by(&rig.view().await, "feed");
+    rig.revoke(
+        host["reference"].as_str().expect("a reference"),
+        the_phone(&host)["reference"].as_str().expect("a reference"),
+    )
+    .expect("the request is published");
+    the_phone_is_taken_out(&rig).await;
+    let devices = rig.devices();
+    the_device_held_out(&devices);
+    assert_eq!(devices["held_out"][0]["waiting"], true, "{devices}");
+
+    rig.app
+        .call("hosts_forget", json!({ "reference": host["reference"] }))
+        .expect("the host is forgotten");
+    let devices = rig.devices();
+    let reference = the_device_held_out(&devices);
+    assert_eq!(devices["held_out"][0]["waiting"], false, "{devices}");
+    share_again(&rig, &reference).expect("nothing waits for a host this computer forgot");
+}

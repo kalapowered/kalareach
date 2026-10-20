@@ -73,8 +73,9 @@ pub struct DevicesView {
     pub candidates: Vec<Candidate>,
     /// The devices this computer took out when the person revoked them, that the hosts still list
     /// as unrevoked: the revoke may not have gone through. Sharing with one again is the person's
-    /// choice, and is asked for as sharing with any device is.
-    pub held_out: Vec<Candidate>,
+    /// choice, and is asked for as sharing with any device is, unless a request to revoke it may
+    /// still be carried out.
+    pub held_out: Vec<HeldOut>,
     /// The collections other devices share with this one, which it could join.
     pub offers: Vec<Offer>,
     /// What happened to changes the person asked for, until they dismiss it.
@@ -105,6 +106,22 @@ pub struct Candidate {
     pub name: String,
 }
 
+/// A device this computer took out when the person revoked it, that the hosts still list.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HeldOut {
+    /// What a command names it by.
+    pub reference: String,
+    /// What it is called.
+    pub name: String,
+    /// Whether a request of this computer's to revoke it may still be carried out by a host: one in
+    /// a feed no read has shown refused, acted on or gone. Sharing with it again is not offered
+    /// then, and not known to be allowed either: a request not known to be settled is in force.
+    pub waiting: bool,
+    /// The key the device is known by, which decides whether a request is in force for it.
+    #[serde(skip)]
+    key: AuthorisationKey,
+}
+
 /// A collection another device shares with this one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Offer {
@@ -124,6 +141,15 @@ pub struct Happened {
     pub ended: &'static str,
     /// The device, when there is one to name.
     pub name: Option<String>,
+}
+
+/// What the person is told when a device that was taken out when they revoked it is not shared
+/// with, because the revoke may still be carried out.
+fn revoke_waiting() -> CommandError {
+    CommandError::refused(
+        "a request to revoke that device is still waiting for its host, so nothing was shared with \
+         it",
+    )
 }
 
 /// How much of the hosts' answer a step wants.
@@ -148,10 +174,6 @@ pub(super) struct Listed {
     /// The devices a host lists on a platform that has no ceremony to join with: a phone, or a
     /// Linux computer. Settings are not shared with one, because it could never join them.
     cannot_join: Mutex<BTreeSet<AuthorisationKey>>,
-    /// The devices a revocation request of this computer's is known to be in force for, in a feed
-    /// that no host has refused: a device kept out by one that may yet take effect is not offered
-    /// to be shared with again.
-    in_force: Mutex<BTreeSet<AuthorisationKey>>,
     last: Mutex<Option<(Instant, HostAnswers)>>,
 }
 
@@ -176,13 +198,6 @@ impl Listed {
 
     fn cannot_join(&self, device: &AuthorisationKey) -> bool {
         self.cannot_join
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(device)
-    }
-
-    fn in_force(&self, device: &AuthorisationKey) -> bool {
-        self.in_force
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .contains(device)
@@ -337,6 +352,11 @@ impl SettingsSync {
             .clone();
         view.can_confirm = self.ceremony.kind() != CeremonyKind::None;
         view.waiting = self.waiting.load(std::sync::atomic::Ordering::Relaxed);
+        // A request in a feed is let go of, or put there, between two steps: what it says of a
+        // device is read when the view is asked for, not when the step noted the devices.
+        for held in &mut view.held_out {
+            held.waiting = self.requests.holds(&held.key);
+        }
         view
     }
 
@@ -406,11 +426,12 @@ impl SettingsSync {
             .filter(|device| {
                 !self.listed.is_disputed(&device.authorisation)
                     && !self.listed.cannot_join(&device.authorisation)
-                    && !self.listed.in_force(&device.authorisation)
             })
-            .map(|device| Candidate {
+            .map(|device| HeldOut {
                 reference: installation_id_of(device),
                 name: name(device),
+                waiting: false,
+                key: device.authorisation,
             })
             .collect();
         let mut cached = self.devices.lock().unwrap_or_else(PoisonError::into_inner);
@@ -583,15 +604,10 @@ impl SettingsSync {
                 .find(|device| installation_id_of(device) == reference)
                 .ok_or_else(|| CommandError::refused("no host lists that device any more"))
                 .and_then(|device| {
-                    if self.fence.holds_none_of(&[device.authorisation])
-                        && !self.listed.in_force(&device.authorisation)
-                    {
-                        Ok(device)
+                    if self.revoke_may_be_carried_out(&device.authorisation) {
+                        Err(revoke_waiting())
                     } else {
-                        Err(CommandError::refused(
-                            "a request to revoke that device is still waiting for its host, so \
-                             nothing was shared with it",
-                        ))
+                        Ok(device)
                     }
                 })?,
         };
@@ -635,6 +651,11 @@ impl SettingsSync {
             Ok(refreshed) => Self::answered(refreshed),
             Err(error) => Err(member_failure(error)),
         };
+        // A request may have been sent while the person was at the dialog.
+        if sharing_again && self.revoke_may_be_carried_out(&device.authorisation) {
+            membership.cancel(&plan);
+            return Err(revoke_waiting());
+        }
         let still = if sharing_again {
             membership
                 .held_out()
@@ -717,30 +738,11 @@ impl SettingsSync {
             .map(|_| ())
     }
 
-    /// Says which devices a revocation request of this computer's is in force for: those no host
-    /// has refused, which a feed holds for a host that has not acted on it yet. `complete` says
-    /// that every host and feed was read, so that a device absent from `devices` has none;
-    /// otherwise the devices named are added to what is known and nothing is let go.
-    pub fn requests_in_force(&self, devices: &[AuthorisationKey], complete: bool) {
-        let mut held = self
-            .listed
-            .in_force
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if complete {
-            held.clear();
-        }
-        held.extend(devices.iter().copied());
-    }
-
-    /// Whether the device `reference` names is one the page was shown as taken out by a revoke.
-    pub fn names_held_out(&self, reference: &str) -> bool {
-        self.devices
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .held_out
-            .iter()
-            .any(|held| held.reference == reference)
+    /// Whether a request of this computer's to revoke `device` may still be carried out: it was
+    /// sent and the hosts have not been seen to settle it, or the revocation is not yet recorded
+    /// here.
+    fn revoke_may_be_carried_out(&self, device: &AuthorisationKey) -> bool {
+        !self.fence.holds_none_of(&[*device]) || self.requests.holds(device)
     }
 
     /// Takes devices whose revocation is known here out of the shared settings, as far as the hosts
