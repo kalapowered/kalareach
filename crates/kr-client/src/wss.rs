@@ -21,7 +21,7 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
@@ -308,11 +308,12 @@ async fn open_now(tls: &Arc<ClientConfig>, upgrade: &Upgrade<'_>) -> Result<Sock
             )
             .map_err(|_| Failure::Configuration(NO_TOKEN_HEADER))?;
     }
+    let retry_after = Arc::new(OnceLock::new());
     let (socket, _) = builder
         .limits(Limits::default().max_payload_len(Some(upgrade.max_payload)))
-        .connect_on(UpgradeGuard::new(wire))
+        .connect_on(UpgradeGuard::new(wire, Arc::clone(&retry_after)))
         .await
-        .map_err(|error| upgrade_failed(error, None))?;
+        .map_err(|error| upgrade_failed(error, retry_after.get().copied()))?;
     Ok(socket)
 }
 
@@ -372,6 +373,9 @@ fn upgrade_failed(error: tokio_websockets::Error, retry_after: Option<Duration>)
 pub(crate) struct UpgradeGuard<S> {
     stream: S,
     answer: Answered,
+    /// The wait the answer's `Retry-After` named, once its head is whole. The library reports a
+    /// refused upgrade by its status alone, so a refusal's wait is kept here for the caller.
+    retry_after: Arc<OnceLock<Duration>>,
 }
 
 /// The guard refusing the answer to the upgrade.
@@ -418,10 +422,11 @@ enum Answered {
 }
 
 impl<S> UpgradeGuard<S> {
-    const fn new(stream: S) -> Self {
+    const fn new(stream: S, retry_after: Arc<OnceLock<Duration>>) -> Self {
         Self {
             stream,
             answer: Answered::Reading(Vec::new()),
+            retry_after,
         }
     }
 }
@@ -462,6 +467,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for UpgradeGuard<S> {
                     }
                     if let Some(end) = head.windows(4).position(|window| window == b"\r\n\r\n") {
                         check_upgrade_head(&head[..end + 4])?;
+                        if let Some(wait) = retry_after_of(&head[..end + 4]) {
+                            let _ = this.retry_after.set(wait);
+                        }
                         let read = std::mem::take(head);
                         this.answer = Answered::Handing { read, at: 0 };
                     } else if head.len() >= MAX_UPGRADE_ANSWER_BYTES {
@@ -543,6 +551,28 @@ fn check_upgrade_head(head: &[u8]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The wait a head names in `Retry-After`, when it names one as whole seconds.
+///
+/// A date, a fraction, a sign and a figure too large to count name none: a caller that waits as it
+/// was told reads only what it can count.
+fn retry_after_of(head: &[u8]) -> Option<Duration> {
+    head.split(|byte| *byte == b'\n').find_map(|line| {
+        let colon = line.iter().position(|byte| *byte == b':')?;
+        if !line[..colon]
+            .trim_ascii()
+            .eq_ignore_ascii_case(b"retry-after")
+        {
+            return None;
+        }
+        let value = line[colon + 1..].trim_ascii();
+        if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let seconds = std::str::from_utf8(value).ok()?.parse().ok()?;
+        Some(Duration::from_secs(seconds))
+    })
 }
 
 /// Splits an origin's authority into its host, without an IPv6 literal's brackets, and its port,

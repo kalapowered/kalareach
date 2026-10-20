@@ -43,6 +43,9 @@ use super::pairing::PairingHost;
 use super::rendezvous_https::RETRY_BUDGET;
 
 /// How long the host waits before attaching to its room again after the socket ended.
+///
+/// A service that refuses the attachment and names a longer wait is waited for instead
+/// ([`NotAttached::retry_after`]), for as long as the invitation is on offer.
 pub const REATTACH_DELAY: Duration = Duration::from_secs(1);
 
 /// How long a release made while an owner waits for the answer to a request may take.
@@ -282,7 +285,8 @@ enum Ended {
 /// Relays one code invitation's room to the pairing service until the invitation ends.
 ///
 /// The host attaches with its control token, and attaches again [`REATTACH_DELAY`] after the
-/// socket ends while the invitation is still on offer: the room keeps candidates that arrive
+/// socket ends while the invitation is still on offer, or the wait the service named when it
+/// refused the attachment, if that is longer: the room keeps candidates that arrive
 /// meanwhile and tells the host about them when it is back. Every wait on the room, the pause
 /// before attaching again included, goes through one `Watch`, which watches the owner ending the
 /// invitation through `stop` and asks the host whether the invitation is still on offer: the relay
@@ -318,9 +322,11 @@ async fn attend<H: RoomHost>(
     loop {
         watch.on_offer().await?;
         let attaching = service.attach(&ticket.origin, &ticket.locator, &ticket.control_token);
-        let pause = REATTACH_DELAY;
-        if let Ok(socket) = watch.until(attaching).await? {
-            relay(watch, socket).await?;
+        let mut pause = REATTACH_DELAY;
+        match watch.until(attaching).await? {
+            Ok(socket) => relay(watch, socket).await?,
+            // The pause is the service's own when it names a longer one.
+            Err(refused) => pause = pause.max(refused.retry_after.unwrap_or_default()),
         }
         // The socket ended, or never opened. An invitation that ended meanwhile ends the relay
         // now; one still on offer is attached again after the pause.
