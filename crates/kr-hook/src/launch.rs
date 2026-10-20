@@ -598,11 +598,11 @@ fn connect_by(
     deadline: Instant,
 ) -> Result<std::os::unix::net::UnixStream, String> {
     use rustix::io::Errno;
-    use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
+    use rustix::net::SocketAddrUnix;
     let address = SocketAddrUnix::new(endpoint)
         .map_err(|error| format!("the endpoint cannot be named: {error}"))?;
     loop {
-        let socket = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)
+        let socket = kr_ipc::endpoint::stream_socket()
             .map_err(|error| format!("no socket could be made: {error}"))?;
         rustix::io::ioctl_fionbio(&socket, true)
             .map_err(|error| format!("the socket cannot be made non-blocking: {error}"))?;
@@ -891,6 +891,24 @@ mod tests {
                 "{gateway}"
             ]),
             "the operand after the added run is the person's own"
+        );
+    }
+
+    /// The connection the launcher makes to the backend is not handed to a program started while
+    /// it is open: a program that held it would keep the backend's end open after the launcher
+    /// had gone, and the backend would take the launch to be still going.
+    #[cfg(unix)]
+    #[test]
+    fn a_program_started_beside_the_connection_to_the_backend_is_not_handed_it() {
+        let tree = kr_ipc::testing::TempHost::create();
+        let path = tree.root().join("backend");
+        let _listening = std::os::unix::net::UnixListener::bind(&path).expect("a listener");
+        let connection = connect_by(&path, Instant::now() + Duration::from_secs(60))
+            .expect("the connection is made");
+        let number = u32::try_from(std::os::fd::AsRawFd::as_raw_fd(&connection)).expect("a number");
+        assert!(
+            !kr_ipc::testing::descriptors_a_started_program_holds().contains(&number),
+            "a program started beside the connection holds it"
         );
     }
 

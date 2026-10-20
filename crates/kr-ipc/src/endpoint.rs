@@ -137,6 +137,39 @@ impl Listener {
     }
 }
 
+/// Makes a stream socket on the Unix family that a program this process starts later does not
+/// inherit.
+///
+/// A descriptor that is not marked to close when a program takes over stays open in every child
+/// started while it is open, and keeps the connection's other end alive for as long as that child
+/// runs. The mark is set as the socket is made where the platform allows it. macOS has no such
+/// flag, so there it is set on the next call, and a child another thread starts between the two
+/// calls inherits the socket; no call on that platform closes that gap.
+///
+/// # Errors
+///
+/// Returns the operating system's error when the socket cannot be made.
+#[cfg(unix)]
+pub fn stream_socket() -> std::io::Result<std::os::fd::OwnedFd> {
+    use rustix::net::{AddressFamily, SocketType};
+
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        Ok(rustix::net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            rustix::net::SocketFlags::CLOEXEC,
+            None,
+        )?)
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        let socket = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
+        rustix::io::fcntl_setfd(&socket, rustix::io::FdFlags::CLOEXEC)?;
+        Ok(socket)
+    }
+}
+
 /// One local connection.
 #[derive(Debug)]
 pub struct Connection(platform::Connection);
@@ -337,10 +370,7 @@ mod platform {
     /// answers immediately instead of holding this call. For a Unix socket that is the whole
     /// bound: there is no network round trip to time out.
     fn probe(path: &std::path::Path) -> Result<Probe> {
-        use rustix::net::{AddressFamily, SocketType};
-
-        let socket = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)
-            .map_err(|error| IpcError::socket("probe", std::io::Error::from(error)))?;
+        let socket = super::stream_socket().map_err(|error| IpcError::socket("probe", error))?;
         // `SOCK_NONBLOCK` is a Linux extension, so the mode is set on the descriptor instead.
         rustix::io::ioctl_fionbio(&socket, true)
             .map_err(|error| IpcError::socket("probe", std::io::Error::from(error)))?;

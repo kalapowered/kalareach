@@ -303,6 +303,38 @@ pub fn place_program(source: &Path, destination: &Path) {
     }
 }
 
+/// The descriptor numbers a program started by this process holds when it begins, from 3 up.
+///
+/// A child is handed a copy of every descriptor of this process that is not marked to close when a
+/// program takes over. The child asked here is a shell that looks at the numbers one by one, so
+/// what it reports is what the operating system let through. Numbers from 1024 up are not looked
+/// at.
+///
+/// # Panics
+///
+/// Panics when the shell cannot be started or does not answer with numbers.
+#[cfg(unix)]
+#[must_use]
+pub fn descriptors_a_started_program_holds() -> std::collections::BTreeSet<u32> {
+    let looked = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(
+            "n=3; while [ $n -lt 1024 ]; do [ -e /dev/fd/$n ] && echo $n; n=$((n+1)); done; exit 0",
+        )
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("a shell to ask which descriptors a started program holds");
+    assert!(
+        looked.status.success(),
+        "the shell ended with {}",
+        looked.status
+    );
+    String::from_utf8_lossy(&looked.stdout)
+        .lines()
+        .map(|line| line.parse().expect("a descriptor number"))
+        .collect()
+}
+
 /// How long the first start of a placed program is given to end.
 ///
 /// A bound on what the operating system does before the program runs at all, and a wide one: a
@@ -393,6 +425,25 @@ mod tests {
     /// at once on Linux and macOS, and on Windows after the system's own retries, about two
     /// seconds.
     const WATCHDOG: Duration = Duration::from_secs(60);
+
+    /// A descriptor reaches a program this process starts when it is not marked to close as the
+    /// program takes over, and the check that says so sees both: it is what the cases that ask
+    /// whether a descriptor is handed to a child rely on.
+    #[cfg(unix)]
+    #[test]
+    fn a_descriptor_is_held_by_a_started_program_only_when_it_is_not_marked_to_close() {
+        let socket = crate::endpoint::stream_socket().expect("a socket");
+        let number = u32::try_from(std::os::fd::AsRawFd::as_raw_fd(&socket)).expect("a number");
+        assert!(
+            !super::descriptors_a_started_program_holds().contains(&number),
+            "a socket made to close on execution is not handed to a program"
+        );
+        rustix::io::fcntl_setfd(&socket, rustix::io::FdFlags::empty()).expect("the mark comes off");
+        assert!(
+            super::descriptors_a_started_program_holds().contains(&number),
+            "a socket without the mark is handed to a program"
+        );
+    }
 
     /// A private directory is made only where nothing is. A name that is already taken is another
     /// directory's, which two owners would share and either could remove, so the second maker is

@@ -645,6 +645,25 @@ mod tests {
         assert_eq!(result, Err(std::io::ErrorKind::WouldBlock));
     }
 
+    /// The copies of the terminal's master side that the waiters hold are not handed to a program
+    /// started beside them: a program that held one would keep the terminal's other side open, and
+    /// the session's end would not reach the writer waiting on it.
+    #[cfg(unix)]
+    #[test]
+    fn a_program_started_beside_the_terminals_waiters_is_not_handed_their_descriptors() {
+        let pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
+        let input = pty.input_waiter().expect("a waiter for input");
+        let output = pty.output_waiter().expect("a waiter for output");
+        let held = kr_ipc::testing::descriptors_a_started_program_holds();
+        for (what, handle) in [("input", &input.handle), ("output", &output.handle)] {
+            let number = u32::try_from(std::os::fd::AsRawFd::as_raw_fd(handle)).expect("a number");
+            assert!(
+                !held.contains(&number),
+                "a program started beside the {what} waiter holds its descriptor"
+            );
+        }
+    }
+
     #[test]
     fn an_invalid_geometry_never_allocates_a_terminal() {
         assert!(matches!(
