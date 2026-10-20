@@ -1340,6 +1340,11 @@ impl Controller {
         // Every closure the registry holds is known to the transfer journal before anything is
         // served, so a binding for a closed session is refused from the first request.
         crate::transfer::end_the_insertions_of_closed_sessions(&controller).await?;
+        // And no invitation waits over a session that has closed, so an issuer is told which
+        // are withdrawn from the first request.
+        controller
+            .withdraw_the_invitations_of_closed_sessions()
+            .await?;
         crate::transfer::serve(&controller)?;
         // The owner's setting is the owner's setting across a restart. A daemon that waited for a
         // client to ask before it looked would leave an enabled setting doing nothing until

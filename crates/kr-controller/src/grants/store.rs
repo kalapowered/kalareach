@@ -1238,6 +1238,95 @@ impl GrantDirectory {
         })
     }
 
+    /// The sessions an invitation is waiting over: one nobody has redeemed or withdrawn, whose
+    /// grant authorises nothing yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the rows cannot be read.
+    pub fn sessions_with_waiting_invitations(&self) -> Result<BTreeSet<SessionId>> {
+        let sessions: Vec<Vec<u8>> = self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT g.session_id
+                 FROM session_invitations i JOIN grants g ON g.grant_id = i.grant_id
+                 WHERE i.state = 'open' AND g.session_id IS NOT NULL
+                   AND g.revoked_at_ms IS NULL AND g.activated_at_ms IS NULL",
+            )?;
+            let sessions = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(sessions)
+        })?;
+        Ok(sessions
+            .iter()
+            .filter_map(|bytes| uuid_of(bytes))
+            .map(SessionId::new)
+            .collect())
+    }
+
+    /// Withdraws every invitation waiting over one of `sessions`, and returns the grants it
+    /// withdrew.
+    ///
+    /// An invitation over a session that has closed can never be redeemed, so it is withdrawn as
+    /// its issuer would withdraw it: the grant is revoked and the invitation says it was
+    /// withdrawn. Nothing of it was ever in force, so there is nothing to fence and no revision
+    /// to advance. One transaction for the whole set, and idempotent: what is already withdrawn
+    /// is left as it was, and a repeat finds nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the rows cannot be read or written.
+    pub fn withdraw_waiting_invitations(
+        &self,
+        sessions: &BTreeSet<SessionId>,
+        now_ms: u64,
+    ) -> Result<Vec<GrantId>> {
+        self.in_transaction(|connection| {
+            let mut waiting = Vec::new();
+            for session_id in sessions {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT g.grant_id
+                         FROM session_invitations i JOIN grants g ON g.grant_id = i.grant_id
+                         WHERE i.state = 'open' AND g.session_id = ?1
+                           AND g.revoked_at_ms IS NULL AND g.activated_at_ms IS NULL",
+                    )
+                    .map_err(ControllerError::registry)?;
+                let found = statement
+                    .query_map(params![session_id.get().as_bytes().as_slice()], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })
+                    .map_err(ControllerError::registry)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(ControllerError::registry)?;
+                waiting.extend(
+                    found
+                        .iter()
+                        .filter_map(|bytes| uuid_of(bytes))
+                        .map(GrantId::new),
+                );
+            }
+            let now_ms = next_moment(connection, now_ms)?;
+            let held = self.held_closes();
+            let mut debt = None;
+            let mut withdrawn = Vec::new();
+            for grant_id in waiting {
+                let subtree = Self::subtree_to_revoke(connection, grant_id)?;
+                let one = Self::revoke_subtree(
+                    connection,
+                    grant_id,
+                    &subtree,
+                    now_ms,
+                    &mut debt,
+                    "the withdrawal of the invitations over a closed session",
+                    &held,
+                )?;
+                withdrawn.extend(one.revoked);
+            }
+            Ok(withdrawn)
+        })
+    }
+
     /// One revocation, inside a transaction the caller is already holding.
     ///
     /// [`GrantRevocation::revoked`] names only what **this** call revoked. A repeat finds the

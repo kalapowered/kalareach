@@ -1,5 +1,6 @@
 //! Closing a session, and recording how it ended, once.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -814,6 +815,22 @@ impl Controller {
         // the worker is out of the directory, so a link opened since is refused rather than missed.
         self.end_proxies_of(record.session_id);
         self.connections.lock().await.remove(&record.session_id);
+        // The invitations still waiting over the session can never be redeemed, so they are
+        // withdrawn with it and its issuer is told so. A withdrawal that fails does not hold up
+        // the rest of the tidying: the next start withdraws what is left.
+        if let Some(controller) = self.me.upgrade() {
+            let session_id = record.session_id;
+            let withdrawn = tokio::task::spawn_blocking(move || {
+                controller.withdraw_waiting_invitations(&BTreeSet::from([session_id]))
+            })
+            .await;
+            if !matches!(withdrawn, Ok(Ok(_))) {
+                eprintln!(
+                    "kr-controller: the invitations waiting over a closed session could not be \
+                     withdrawn; the next start withdraws them"
+                );
+            }
+        }
         // The attention store reads what is left of the session's sources from its journal and
         // then ends its live conditions, on a task of its own: a closure is not held up by it.
         {
@@ -858,6 +875,72 @@ impl Controller {
         // where that refuses the removal, the next start writes the directory again.
         let _ = std::fs::remove_dir_all(self.paths.worker_dir(record.session_id));
         self.retire_descriptor(record.session_id)
+    }
+
+    /// Withdraws the invitations waiting over `sessions`, which have closed, as their issuer would
+    /// withdraw them: the grant is revoked and the invitation says it was withdrawn. Returns how
+    /// many it withdrew.
+    ///
+    /// Nothing of a waiting invitation was ever in force, so the withdrawal fences nothing and
+    /// advances no revision. An issuer who withdraws one this has withdrawn is answered as for any
+    /// withdrawal that finds its work done: the revision in force and where the workers stand.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the grant store cannot be read or written.
+    pub(crate) fn withdraw_waiting_invitations(
+        &self,
+        sessions: &BTreeSet<SessionId>,
+    ) -> Result<usize> {
+        if sessions.is_empty() {
+            return Ok(0);
+        }
+        let now_ms = self.settled_now_ms();
+        Ok(self
+            .sharing
+            .grants()
+            .withdraw_waiting_invitations(sessions, now_ms)?
+            .len())
+    }
+
+    /// Withdraws the invitations still waiting over every session that is not open, before the
+    /// daemon serves: a closure recorded by a daemon that stopped before it withdrew them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the grant store or the registry cannot
+    /// be read, or the store cannot be written; the start does not go on then, as it does not for
+    /// the transfer journal's closures.
+    pub async fn withdraw_the_invitations_of_closed_sessions(self: &Arc<Self>) -> Result<usize> {
+        let owner = Arc::clone(self);
+        let waiting = tokio::task::spawn_blocking(move || {
+            owner.sharing.grants().sessions_with_waiting_invitations()
+        })
+        .await
+        .map_err(|_| stopped_before_withdrawing())??;
+        let mut closed = BTreeSet::new();
+        {
+            let registry = self.registry.lock().await;
+            for session_id in waiting {
+                let open =
+                    registry
+                        .reservation_for_session(session_id)?
+                        .is_some_and(|reservation| {
+                            !matches!(
+                                reservation.phase,
+                                crate::registry::LaunchPhase::Closed
+                                    | crate::registry::LaunchPhase::Failed
+                            )
+                        });
+                if !open {
+                    closed.insert(session_id);
+                }
+            }
+        }
+        let owner = Arc::clone(self);
+        tokio::task::spawn_blocking(move || owner.withdraw_waiting_invitations(&closed))
+            .await
+            .map_err(|_| stopped_before_withdrawing())?
     }
 
     /// Removes the job a worker was started as, once that worker has ended.
@@ -954,4 +1037,12 @@ async fn retire_worker_job_aside(
     .await
     .ok()
     .flatten()
+}
+
+/// The refusal for a withdrawal whose thread stopped before it answered.
+fn stopped_before_withdrawing() -> ControllerError {
+    ControllerError::RegistryUnavailable {
+        detail: "this daemon stopped before it withdrew the invitations of a closed session"
+            .to_owned(),
+    }
 }
