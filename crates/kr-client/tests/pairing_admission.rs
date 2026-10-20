@@ -301,9 +301,9 @@ fn scripted_admissions(service: Arc<Scripted>, clock: &AdmissionClock) -> Pairin
         .waiting(Duration::from_millis(200))
 }
 
-/// KR-REQ-10.39: an invitation that names a managed relay causes one request for it before the dial
-/// and none for a relay that is not the service's: a self-hosted relay, an unrelated name, an address
-/// where the service has a name, and names that only look like the service's.
+/// KR-REQ-10.39, KR-REQ-10.54: an invitation that names a managed relay causes one request for it
+/// before the dial and none for a relay that is not the service's: a self-hosted relay, an unrelated
+/// name, an address where the service has a name, and names that only look like the service's.
 #[tokio::test]
 async fn only_a_relay_of_the_managed_service_is_ever_named_to_it() {
     let service = Service::start();
