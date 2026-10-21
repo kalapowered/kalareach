@@ -927,6 +927,49 @@ mod unix {
             answer
         }
 
+        /// Waits until the terminal can be read or written, for as long as the exchange has left.
+        ///
+        /// The terminal wakes this wait itself, the moment an answer arrives. A sleep between
+        /// looks would be a timer, and the system wakes the timers of a process it runs at
+        /// background priority late, by as much as the second the whole exchange has: an answer
+        /// that was there in a few milliseconds would be read after the deadline.
+        ///
+        /// A terminal that cannot be waited for (a device the system answers a poll of at once,
+        /// as it does `/dev/tty` on macOS) is paused for a millisecond instead, as is one that
+        /// has hung up, so that neither makes the loop spin.
+        fn pause(
+            &self,
+            interest: rustix::event::PollFlags,
+            started: std::time::Instant,
+            pollable: &mut bool,
+        ) {
+            let millisecond = std::time::Duration::from_millis(1);
+            if !*pollable {
+                std::thread::sleep(millisecond);
+                return;
+            }
+            let left = kr_term::probe::PROBE_DEADLINE_MS.saturating_sub(elapsed_ms(started));
+            let timeout = rustix::event::Timespec {
+                tv_sec: i64::try_from(left / 1000).unwrap_or(0),
+                tv_nsec: i64::try_from(left % 1000 * 1_000_000).unwrap_or(0),
+            };
+            let mut waiting = [rustix::event::PollFd::new(&self.handle, interest)];
+            match rustix::event::poll(&mut waiting, Some(&timeout)) {
+                Ok(_) => {
+                    let events = waiting[0].revents();
+                    *pollable = !events.contains(rustix::event::PollFlags::NVAL);
+                    if !events.contains(interest) {
+                        std::thread::sleep(millisecond);
+                    }
+                }
+                Err(rustix::io::Errno::INTR) => {}
+                Err(_) => {
+                    *pollable = false;
+                    std::thread::sleep(millisecond);
+                }
+            }
+        }
+
         /// The exchange itself, with the terminal in non-blocking mode.
         fn exchange(
             &self,
@@ -936,17 +979,17 @@ mod unix {
         ) -> Result<()> {
             use std::io::Read as _;
 
+            let mut pollable = true;
             let mut written = 0_usize;
             while written < request.len() {
                 if elapsed_ms(started) > kr_term::probe::PROBE_DEADLINE_MS {
                     return Ok(());
                 }
                 match rustix::io::write(&self.handle, &request[written..]) {
-                    Ok(0) => std::thread::sleep(std::time::Duration::from_millis(1)),
-                    Ok(taken) => written += taken,
-                    Err(rustix::io::Errno::AGAIN) => {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    Ok(0) | Err(rustix::io::Errno::AGAIN) => {
+                        self.pause(rustix::event::PollFlags::OUT, started, &mut pollable);
                     }
+                    Ok(taken) => written += taken,
                     Err(rustix::io::Errno::INTR) => {}
                     Err(error) => {
                         return Err(CliError::Terminal(shown!(
@@ -970,12 +1013,12 @@ mod unix {
                 // this loop's: the exchange fails, and it never becomes live forwarding on a
                 // stream a late reply could still reach.
                 match handle.read(&mut buffer) {
-                    // Nothing has arrived yet. A moment's wait, rather than a spin that would
-                    // read a thousand times for every answer.
-                    Ok(0) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                    // Nothing has arrived yet, which is also what a descriptor that does not wait
+                    // says when there is nothing to read. The terminal says when something has,
+                    // rather than a spin that would read a thousand times for every answer.
+                    Ok(0) => self.pause(rustix::event::PollFlags::IN, started, &mut pollable),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        // The same thing said another way, now that the descriptor does not wait.
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        self.pause(rustix::event::PollFlags::IN, started, &mut pollable);
                     }
                     Ok(read) => {
                         if session
