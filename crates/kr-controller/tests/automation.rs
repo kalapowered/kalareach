@@ -2438,8 +2438,8 @@ async fn device_mutation<P: serde::Serialize + ?Sized>(
 /// one this daemon serves: each method is called here from a paired device over the network, and
 /// the owner's own socket serves all five in the tests above. A device reaches only the workflows
 /// that act under the grant it holds, so a workflow cannot give it rights its grant does not carry.
-/// Each of the five methods needs the workflow-management grant: a device that holds none is
-/// refused every one of them.
+/// Each of the five methods needs the workflow-management grant: a device that holds every other
+/// right the workflow needs, and not that grant, is refused every one of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
     use kr_protocol::actor::ActorIngress;
@@ -2571,26 +2571,42 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
         "every method the registry lists for a paired device was served to one"
     );
 
-    // The control: a device that holds no workflow-management grant is refused each of the five,
-    // for the very workflow the first device was served.
+    // The control: a device that holds every right the first device's workflow needs except the
+    // workflow-management grant is refused each of the five. It installs under its own grant, so
+    // the one thing it lacks is the management grant; the other four name the first device's
+    // workflow.
     let viewer = net_support::Device::create().await;
     let viewer_record = net_support::pair_with(
         &host,
         &viewer,
         &owner,
-        net_support::proposal(&[ActionRight::SessionView]),
+        net_support::proposal(&[
+            ActionRight::SessionView,
+            ActionRight::TerminalInput,
+            ActionRight::SessionCreate,
+            ActionRight::SessionClose,
+            ActionRight::WorkspaceManage,
+        ]),
     )
     .await;
     let viewer_session = net_support::connect(&host, &viewer, &viewer_record).await;
     let mut refused_without_the_grant = std::collections::BTreeSet::new();
-    let installs = WorkflowInstallParams {
-        workflow_id: document.workflow_id,
-        revision: U64::new(2),
-        definition: WorkflowDefinition {
-            revision: U64::new(2),
-            ..document.clone()
+    let viewers = definition(
+        workflow_id(22),
+        viewer_record.grant.grant_id,
+        "a device's own, without the management grant",
+        WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: tests_params(),
+            declared_environment: Nullable::null(),
         },
-        grant_reference: document.grant_reference,
+    );
+    let installs = WorkflowInstallParams {
+        workflow_id: viewers.workflow_id,
+        revision: viewers.revision,
+        definition: viewers.clone(),
+        grant_reference: viewers.grant_reference,
     };
     let enables = WorkflowEnableParams {
         workflow_id: document.workflow_id,
