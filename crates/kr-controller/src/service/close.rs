@@ -456,7 +456,7 @@ impl Controller {
 
     /// The closure of a session whose worker could not be reached, for a caller that is owed the
     /// session's state: the closure recorded, or the closure of a worker the kernel says has ended
-    /// ([`Self::workflow_session_closure`]). `None` where neither is established.
+    /// ([`Self::recorded_or_established_closure`]). `None` where neither is established.
     ///
     /// A worker that has finished its closure stops accepting connections, and takes its endpoint
     /// away, before the kernel says its process has ended, and a command that ends at once takes
@@ -480,7 +480,7 @@ impl Controller {
     ) -> Result<Option<ClosureRecord>> {
         let deadline = tokio::time::Instant::now() + super::workers::WORKER_EXCHANGE;
         loop {
-            if let Some(closure) = self.workflow_session_closure(session_id).await? {
+            if let Some(closure) = self.recorded_or_established_closure(session_id).await? {
                 return Ok(Some(closure));
             }
             if !a_worker_is_on_its_way_out(error) || tokio::time::Instant::now() >= deadline {

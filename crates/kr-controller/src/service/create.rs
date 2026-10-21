@@ -29,6 +29,16 @@ const NO_DESKTOP_TO_BIND: &str = "this host has no graphical login session to bi
 /// How long a create waits for its worker to report itself.
 pub const RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a create gives its worker to describe the session it has made, the wait for this
+/// daemon's one link to the worker included.
+///
+/// Two exchanges, as a listing of sessions gives each worker: the link can be held by an exchange
+/// of the daemon's own, which takes up to one, and the read then waits for its turn and for the
+/// answer. A worker that has reported itself and then does not answer is not a reason to hold the
+/// create for ever.
+const CREATE_READ_PATIENCE: std::time::Duration =
+    std::time::Duration::from_secs(super::workers::WORKER_EXCHANGE.as_secs() * 2);
+
 /// Decides whose environment a session is started with, for a create that came through `door`.
 ///
 /// Decided by where the create came through, what the client says it is and what the session is
@@ -776,27 +786,7 @@ impl Controller {
         #[cfg(test)]
         self.before_a_created_session_is_read.wait().await;
         let described = match worker {
-            Some(worker) => match self.read_from_worker(&worker).await {
-                Ok(read) => Some(read.session),
-                // The worker left the directory between the two: its session closed.
-                Err(ControllerError::UnknownSession { .. }) => None,
-                // A worker that cannot be reached is not necessarily gone, and one that is on its
-                // way out has not necessarily had its closure recorded: a command that ends at
-                // once takes its worker with it first. As a read of the session does, this asks
-                // for the closure of a worker that has ended, and answers from it. Where none is
-                // established the connection's failure stands, with its cause; a failure of the
-                // registry, or of the closure's own write, is returned in its place.
-                Err(error) => {
-                    if self
-                        .closure_after_a_worker_could_not_be_reached(reservation.session_id, &error)
-                        .await?
-                        .is_none()
-                    {
-                        return Err(error);
-                    }
-                    None
-                }
-            },
+            Some(worker) => self.describe_a_created_session(&worker).await?,
             None => None,
         };
         let Some(summary) = described else {
@@ -820,6 +810,47 @@ impl Controller {
             deduplicated: false,
             presentation_error: Nullable(presentation_error),
         })
+    }
+
+    /// The session as its worker describes it, for a create's answer, or `None` where the session's
+    /// closure is the answer.
+    ///
+    /// The one place a create reads its worker, whether it is the create itself or the same create
+    /// asked again. The read is bounded ([`CREATE_READ_PATIENCE`]). A worker that left the directory
+    /// since the create looked for it has closed its session. A worker that cannot be reached is
+    /// not necessarily gone, and one that is on its way out has not necessarily had its closure
+    /// recorded: a command that ends at once takes its worker with it first. As a read of the
+    /// session does, this asks for the closure of a worker that has ended, and answers from it.
+    /// Where none is established the failure stands, with its cause.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of the read where no closure is recorded, nor established for a worker
+    /// that has ended; and a failure of the registry, or of the closure's own write, in its place.
+    async fn describe_a_created_session(
+        self: &Arc<Self>,
+        worker: &crate::directory::KnownWorker,
+    ) -> Result<Option<kr_protocol::session::SessionSummary>> {
+        match self
+            .read_from_worker_within(worker, Some(CREATE_READ_PATIENCE))
+            .await
+        {
+            Ok(read) => Ok(Some(read.session)),
+            Err(ControllerError::UnknownSession { .. }) => Ok(None),
+            Err(error) => {
+                if self
+                    .closure_after_a_worker_could_not_be_reached(
+                        worker.descriptor.session_id,
+                        &error,
+                    )
+                    .await?
+                    .is_none()
+                {
+                    return Err(error);
+                }
+                Ok(None)
+            }
+        }
     }
 
     /// Opens the local terminal a `terminal` presentation asks for.
@@ -937,7 +968,7 @@ impl Controller {
     }
 
     pub(super) async fn replay_create(
-        &self,
+        self: &Arc<Self>,
         reservation: &crate::registry::Reservation,
     ) -> Result<ParamsValue> {
         // A retry can arrive before this daemon has adopted the worker its first attempt started,
@@ -963,23 +994,18 @@ impl Controller {
             .create_intent
             .as_deref()
             .and_then(|recorded| recorded_create(recorded).ok());
-        if let Some(worker) = worker {
-            match self.read_from_worker(&worker).await {
-                Ok(read) => {
-                    return encode(&SessionCreateResult {
-                        session: read.session,
-                        endpoint: Nullable::some(worker.endpoint.as_text()),
-                        deduplicated: true,
-                        presentation_error: Nullable(
-                            self.replayed_presentation(requested.as_ref(), reservation.session_id)
-                                .await,
-                        ),
-                    });
-                }
-                // The worker left the directory between the two: its session closed.
-                Err(ControllerError::UnknownSession { .. }) => {}
-                Err(error) => return Err(error),
-            }
+        if let Some(worker) = worker
+            && let Some(session) = self.describe_a_created_session(&worker).await?
+        {
+            return encode(&SessionCreateResult {
+                session,
+                endpoint: Nullable::some(worker.endpoint.as_text()),
+                deduplicated: true,
+                presentation_error: Nullable(
+                    self.replayed_presentation(requested.as_ref(), reservation.session_id)
+                        .await,
+                ),
+            });
         }
         self.closed_create(reservation, true).await?.ok_or_else(|| {
             ControllerError::supervision(format!(

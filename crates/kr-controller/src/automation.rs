@@ -1963,7 +1963,7 @@ async fn wait_for_closure(
                 );
             }
         }
-        match controller.workflow_session_closure(session_id).await {
+        match controller.recorded_or_established_closure(session_id).await {
             Ok(Some(closure)) => return Some(closure),
             Ok(None) => {}
             Err(error) => {
@@ -2214,7 +2214,7 @@ impl HostActions {
                             ),
                         }
                     }
-                    match controller.workflow_session_closure(session_id).await {
+                    match controller.recorded_or_established_closure(session_id).await {
                         Ok(Some(closure)) if !left_unaccounted(&closure) => {}
                         Ok(Some(_)) if worker_has_ended(&row, controller.boot()) => {}
                         Ok(Some(_)) => {
