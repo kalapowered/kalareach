@@ -107,6 +107,8 @@ fn as_an_earlier_host_wrote_it(host: &Host, device_id: kr_protocol::ids::DeviceI
     assert_eq!(changed, 1, "the device has a row");
 }
 
+/// KR-REQ-23.27: `device.list` is served to an owner's device over its own connection, with every
+/// key the pairing bound and the fact that its grant manages this host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pairing_keeps_all_four_keys_and_an_owner_device_reads_them() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -124,6 +126,8 @@ async fn a_pairing_keeps_all_four_keys_and_an_owner_device_reads_them() {
     assert!(own.manages_host);
 }
 
+/// KR-REQ-23.27: `device.list` needs the authority to manage the host: a device without it is
+/// listed as one that does not manage it, and over its own connection it is refused the list.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_without_host_manage_is_listed_as_such_and_is_not_served_the_list() {
     let owner = DeviceKeys::generate().expect("owner keys");

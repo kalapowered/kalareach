@@ -7,9 +7,8 @@
 //! still dispatching, an admission that lapses before the first write, a refusal repeated after the
 //! world changed, and a cancellation that lands while an action is running.
 //!
-//! Requirement rows: KR-REQ-23.52 (the method group's action idempotency), KR-REQ-25.19 (a run is
-//! persisted before it dispatches, and cancellation stops undispatched work without claiming
-//! anything about what already ran).
+//! Requirement rows: KR-REQ-25.19 (a run is persisted before it dispatches, and cancellation stops
+//! undispatched work without claiming anything about what already ran).
 
 use std::sync::{Arc, OnceLock};
 
@@ -500,9 +499,9 @@ async fn an_external_trigger_cannot_use_a_derived_trigger_identifier() {
     );
 }
 
-/// Accepting a trigger commits an event with the run, the chain it belongs to and the envelope
-/// every event carries: where it comes from, which actor caused it, and that it carries
-/// identifiers and no content.
+/// KR-REQ-19.04: accepting a trigger commits an event with the run, the chain it belongs to and the
+/// envelope every event carries: where it comes from, which actor caused it, and that it carries
+/// identifiers and no content. The run records the trigger event it answers.
 #[tokio::test]
 async fn an_admitted_run_commits_its_event_with_the_run() {
     use kr_automation::store::{EVENT_CONTENT, EVENT_RUN_ADMITTED, EVENT_SOURCE};

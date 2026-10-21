@@ -1,10 +1,10 @@
 //! The "Automation" method group through the real control daemon.
 //!
-//! Requirement rows exercised here: KR-REQ-23.52 (the five methods under the daemon's own
-//! admission, each naming the exact definition revision), KR-REQ-18.04 (a workflow node that is a
-//! real host action, carried out and bound to the run that asked for it), KR-REQ-19.04 (a
-//! revoked grant runs nothing, and the grant is this host's rather than the request's) and
-//! KR-REQ-25.19 (a redelivered trigger produces one run, not two).
+//! Requirement rows exercised here: KR-REQ-18.04 (a workflow node that is a real host action,
+//! carried out and bound to the run that asked for it) and KR-REQ-25.19 (a redelivered trigger
+//! produces one run, not two). The cases that show a workflow method's management-grant and
+//! revision rules, or a workflow's versioned definition and declared grant, carry the keys of
+//! those rows themselves, each in its own comment.
 //!
 //! These run the real endpoint, the real handshake, the real envelope checks and real
 //! repositories built with installed Git. The daemon starts on an environment under the
@@ -757,6 +757,26 @@ async fn install(
     )
 }
 
+/// The refusal a mutation is answered with.
+async fn refused_mutation<P: serde::Serialize + ?Sized>(
+    control: &mut LocalClient,
+    host: &Host,
+    method: Method,
+    params: &P,
+) -> ProtocolError {
+    failure(
+        control
+            .mutate(
+                method,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                params,
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    )
+}
+
 async fn enable(
     control: &mut LocalClient,
     host: &Host,
@@ -1209,7 +1229,8 @@ async fn a_node_this_host_cannot_carry_out_fails_rather_than_succeeding() {
     host.clients.abort();
 }
 
-/// A replayed mutation is answered from what the first attempt came to, not performed again.
+/// KR-REQ-19.04: a replayed mutation is answered from what the first attempt came to, not
+/// performed again.
 ///
 /// Section 23 gives these four methods `ACTION` idempotency. Without a record of what an action
 /// identifier already did, a replayed enable would undo a pause decided after it, and a replayed
@@ -1309,7 +1330,8 @@ async fn a_replayed_mutation_is_answered_from_its_record() {
     host.clients.abort();
 }
 
-/// A caller that lost its reply and asks again over a new connection is answered from the record.
+/// KR-REQ-19.04: a caller that lost its reply and asks again over a new connection is answered
+/// from the record.
 ///
 /// The retry is the original mutation, window and all, and the new connection holds a newer
 /// window. The record is read before any freshness is considered, so the caller gets its own
@@ -1389,8 +1411,9 @@ async fn a_repeat_over_a_new_connection_is_answered_from_its_record() {
     host.clients.abort();
 }
 
-/// A grant stands only as this host's policy leaves it. One that claims an authority revision this
-/// host never issued is refused before anything is installed, although its own record says active.
+/// KR-REQ-19.04: a grant stands only as this host's policy leaves it. One that claims an authority
+/// revision this host never issued is refused before anything is installed, although its own
+/// record says active.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_grant_the_host_policy_refuses_installs_no_workflow() {
     let host = host().await;
@@ -1491,12 +1514,15 @@ async fn first_run_of(
     })
 }
 
-/// KR-REQ-25.15: a workflow triggered by another's node descends from that node, and the daemon,
-/// not the caller, says so.
+/// KR-REQ-25.15, KR-REQ-19.04: a workflow triggered by another's node descends from that node, and
+/// the daemon, not the caller, says so, and each run records the event that triggered it, the
+/// definition revision it ran and the action identifier of the node it ran.
 ///
 /// The capture succeeds and commits the event its action kind fixes. The daemon's dispatcher reads
 /// it and starts the workflow whose trigger names that event, with the chain's root, one more level
-/// of depth and the capture node as its parent, all taken from the journal's own record.
+/// of depth and the capture node as its parent, all taken from the journal's own record. The run
+/// the caller started records the event the caller named and the revision it was installed at;
+/// the run it triggered records the capture node's own action identifier as its trigger.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_triggered_workflow_descends_from_the_node_that_triggered_it() {
     let host = host().await;
@@ -1546,6 +1572,191 @@ async fn a_triggered_workflow_descends_from_the_node_that_triggered_it() {
     assert_eq!(descendant.depth.get(), 2);
     assert_eq!(descendant.parent_run_id.0, Some(captured.run_id));
     assert_eq!(descendant.parent_node_id.0.as_deref(), Some("capture"));
+
+    // What each run records of why it ran: the caller's run names the event the caller gave and the
+    // revision it ran, and the node it ran carries an action identifier of its own, which the
+    // descendant records as its trigger.
+    let read: WorkflowReadResult = typed(
+        &control
+            .request(
+                Method::WorkflowRead,
+                &WorkflowReadParams {
+                    workflow_id: Nullable::some(capturing.workflow_id),
+                    revision: Nullable::some(capturing.revision),
+                    run_id: Nullable::some(captured.run_id),
+                    causal_root_id: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workflow.read succeeds"),
+    );
+    assert_eq!(read.runs.len(), 1);
+    assert_eq!(read.runs[0].trigger_event_id, "evt-capture");
+    assert_eq!(read.runs[0].revision, capturing.revision);
+    assert_eq!(read.node_receipts.len(), 1);
+    let capture_action = read.node_receipts[0].action_id;
+    assert_eq!(
+        descendant.trigger_event_id,
+        format!("node:{capture_action}"),
+        "the triggered run records the action identifier of the node that produced its event"
+    );
+    assert_eq!(descendant.revision, tests.revision);
+
+    host.clients.abort();
+}
+
+/// KR-REQ-19.04, KR-REQ-23.52: a workflow definition is versioned, and each method names the
+/// revision it is about. A revision installs only above the latest, so a repeated or lower one is
+/// refused as a conflict; every installed revision is its own and is read back with the runs made
+/// under it, each of which records the revision it ran and the event that triggered it; and a
+/// method that names a revision nobody installed is refused as an invalid argument.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_names_the_revision_it_executed_and_a_revision_never_installed_is_refused() {
+    let host = host().await;
+    let mut control = client(&host).await;
+
+    host.issue(
+        grant_id(33),
+        &[ActionRight::AgentPrompt, ActionRight::SessionView],
+    );
+    let review = WorkflowNode {
+        node_id: "review".to_owned(),
+        action_kind: WorkflowActionKind::RequestReview,
+        action_params: review_params(),
+        declared_environment: Nullable::null(),
+    };
+    let first = definition(workflow_id(33), grant_id(33), "versioned", review);
+    let second = WorkflowDefinition {
+        revision: U64::new(2),
+        name: "versioned, changed".to_owned(),
+        ..first.clone()
+    };
+    for (document, event) in [(&first, "evt-first"), (&second, "evt-second")] {
+        let installed = install(&mut control, &host, document).await;
+        assert_eq!(installed.revision, document.revision);
+        enable(&mut control, &host, document).await;
+        typed::<WorkflowRunResult>(
+            &start(&mut control, &host, document, event)
+                .await
+                .expect("the run is admitted"),
+        );
+    }
+    // The first revision is installed and enabled in its own right, and still runs.
+    typed::<WorkflowRunResult>(
+        &start(&mut control, &host, &first, "evt-first-again")
+            .await
+            .expect("the run is admitted"),
+    );
+
+    let read: WorkflowReadResult = typed(
+        &control
+            .request(
+                Method::WorkflowRead,
+                &WorkflowReadParams {
+                    workflow_id: Nullable::some(first.workflow_id),
+                    revision: Nullable::null(),
+                    run_id: Nullable::null(),
+                    causal_root_id: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workflow.read succeeds"),
+    );
+    let mut revisions: Vec<u64> = read
+        .definitions
+        .iter()
+        .map(|installed| installed.revision.get())
+        .collect();
+    revisions.sort_unstable();
+    assert_eq!(revisions, [1, 2], "both revisions are installed");
+    let ran: std::collections::BTreeMap<String, u64> = read
+        .runs
+        .iter()
+        .map(|run| (run.trigger_event_id.clone(), run.revision.get()))
+        .collect();
+    assert_eq!(
+        ran,
+        std::collections::BTreeMap::from([
+            ("evt-first".to_owned(), 1),
+            ("evt-second".to_owned(), 2),
+            ("evt-first-again".to_owned(), 1),
+        ]),
+        "each run records the event that triggered it and the revision it ran"
+    );
+
+    // A revision installs only above the latest: the repeated one and a lower one are conflicts.
+    for document in [&second, &first] {
+        let refused = refused_mutation(
+            &mut control,
+            &host,
+            Method::WorkflowInstall,
+            &WorkflowInstallParams {
+                workflow_id: document.workflow_id,
+                revision: document.revision,
+                definition: document.clone(),
+                grant_reference: document.grant_reference,
+            },
+        )
+        .await;
+        assert_eq!(refused.code, ErrorCode::DraftConflict, "{refused:?}");
+    }
+
+    // A revision nobody installed is not found, by whichever method names it.
+    let third = U64::new(3);
+    let refusals = [
+        (
+            Method::WorkflowEnable,
+            refused_mutation(
+                &mut control,
+                &host,
+                Method::WorkflowEnable,
+                &WorkflowEnableParams {
+                    workflow_id: first.workflow_id,
+                    revision: third,
+                },
+            )
+            .await,
+        ),
+        (
+            Method::WorkflowPause,
+            refused_mutation(
+                &mut control,
+                &host,
+                Method::WorkflowPause,
+                &WorkflowPauseParams {
+                    workflow_id: first.workflow_id,
+                    revision: third,
+                    reason: Nullable::null(),
+                },
+            )
+            .await,
+        ),
+        (
+            Method::WorkflowRun,
+            refused_mutation(
+                &mut control,
+                &host,
+                Method::WorkflowRun,
+                &WorkflowRunParams {
+                    workflow_id: first.workflow_id,
+                    revision: third,
+                    event_id: "evt-third".to_owned(),
+                    event_type: "manual".to_owned(),
+                    event_payload: Nullable::null(),
+                },
+            )
+            .await,
+        ),
+    ];
+    for (method, refused) in refusals {
+        assert_eq!(
+            refused.code,
+            ErrorCode::InvalidArgument,
+            "{method:?}: {refused:?}"
+        );
+    }
 
     host.clients.abort();
 }
@@ -2199,6 +2410,8 @@ async fn device_mutation<P: serde::Serialize + ?Sized>(
 /// one this daemon serves: each method is called here from a paired device over the network, and
 /// the owner's own socket serves all five in the tests above. A device reaches only the workflows
 /// that act under the grant it holds, so a workflow cannot give it rights its grant does not carry.
+/// Each of the five methods needs the workflow-management grant: a device that holds none is
+/// refused every one of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
     use kr_protocol::actor::ActorIngress;
@@ -2328,6 +2541,109 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
         served,
         listed.iter().map(|entry| entry.method).collect(),
         "every method the registry lists for a paired device was served to one"
+    );
+
+    // The control: a device that holds no workflow-management grant is refused each of the five,
+    // for the very workflow the first device was served.
+    let viewer = net_support::Device::create().await;
+    let viewer_record = net_support::pair_with(
+        &host,
+        &viewer,
+        &owner,
+        net_support::proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    let viewer_session = net_support::connect(&host, &viewer, &viewer_record).await;
+    let mut refused_without_the_grant = std::collections::BTreeSet::new();
+    let installs = WorkflowInstallParams {
+        workflow_id: document.workflow_id,
+        revision: U64::new(2),
+        definition: WorkflowDefinition {
+            revision: U64::new(2),
+            ..document.clone()
+        },
+        grant_reference: document.grant_reference,
+    };
+    let enables = WorkflowEnableParams {
+        workflow_id: document.workflow_id,
+        revision: document.revision,
+    };
+    let pauses = WorkflowPauseParams {
+        workflow_id: document.workflow_id,
+        revision: document.revision,
+        reason: Nullable::null(),
+    };
+    let runs = WorkflowRunParams {
+        workflow_id: document.workflow_id,
+        revision: document.revision,
+        event_id: "evt-without-the-grant".to_owned(),
+        event_type: "manual".to_owned(),
+        event_payload: Nullable::null(),
+    };
+    for (method, refusal) in [
+        (
+            Method::WorkflowInstall,
+            device_mutation(
+                &viewer_session,
+                host.environment_id,
+                Method::WorkflowInstall,
+                &installs,
+            )
+            .await
+            .expect_err("install needs the management grant")
+            .code,
+        ),
+        (
+            Method::WorkflowEnable,
+            device_mutation(
+                &viewer_session,
+                host.environment_id,
+                Method::WorkflowEnable,
+                &enables,
+            )
+            .await
+            .expect_err("enable needs the management grant")
+            .code,
+        ),
+        (
+            Method::WorkflowPause,
+            device_mutation(
+                &viewer_session,
+                host.environment_id,
+                Method::WorkflowPause,
+                &pauses,
+            )
+            .await
+            .expect_err("pause needs the management grant")
+            .code,
+        ),
+        (
+            Method::WorkflowRun,
+            device_mutation(
+                &viewer_session,
+                host.environment_id,
+                Method::WorkflowRun,
+                &runs,
+            )
+            .await
+            .expect_err("run needs the management grant")
+            .code,
+        ),
+        (
+            Method::WorkflowRead,
+            viewer_session
+                .read::<_, WorkflowReadResult>(Method::WorkflowRead, &WorkflowReadParams::default())
+                .await
+                .expect_err("read needs the management grant")
+                .code(),
+        ),
+    ] {
+        assert_eq!(refusal, ErrorCode::PermissionDenied, "{method:?}");
+        refused_without_the_grant.insert(method);
+    }
+    assert_eq!(
+        refused_without_the_grant, served,
+        "each of the five methods needs the grant, and none was left out"
     );
 
     // A workflow under the owner's grant is not the device's: it cannot install one under that
@@ -3117,9 +3433,9 @@ async fn an_expiring_grant_is_decided_while_the_floor_is_written() -> kr_automat
     decided
 }
 
-/// A workflow's grant is decided as a device's request is: narrowed to the rights this host's
-/// configuration allows a grant to carry. A node that needs a right the configuration removed is
-/// refused, whatever the grant was issued with.
+/// KR-REQ-19.04: a workflow's grant is decided as a device's request is: narrowed to the rights
+/// this host's configuration allows a grant to carry. A node that needs a right the configuration
+/// removed is refused, whatever the grant was issued with.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_workflow_grant_is_narrowed_by_the_configured_rights_ceiling() {
     let host = host().await;
@@ -4953,7 +5269,7 @@ fn hold_the_registry(host: &Host) -> rusqlite::Connection {
     registry
 }
 
-/// KR-REQ-25.14 and KR-REQ-19.04: the moment the engine stops waiting for a node is asked where
+/// KR-REQ-25.14: the moment the engine stops waiting for a node is asked where
 /// the node's session comes into being, and not only before the runner is called. The create waits
 /// for the registry, as it does behind another writer, until the node's wait has ended; when it
 /// reaches its launch it is refused there, its reservation fails, and nothing is left counting

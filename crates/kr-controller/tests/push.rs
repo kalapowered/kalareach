@@ -4456,6 +4456,11 @@ async fn a_runtime_recovers_first_and_then_drives_the_outbox_on_its_own_cadence(
     );
 }
 
+/// KR-REQ-23.27: a paired device rotates its own notification-preview key through its own paired
+/// channel, and both stores that hold the key take the rotation; a registration that does not
+/// follow the recorded revision is refused and changes neither; a device cannot rotate the key of
+/// another device that is paired and live, and an actor that is not a paired device rotates no
+/// key at all.
 #[tokio::test]
 async fn device_preview_key_update_via_controller() {
     let (temp, controller) = start_controller().await;
@@ -4622,12 +4627,33 @@ async fn device_preview_key_update_via_controller() {
         "a refused registration leaves the recorded key alone"
     );
 
-    // Verify another device cannot rotate
+    // Another device that is paired and live, with a key of its own at revision 1. The first
+    // device's channel is not its channel: asking, with a revision that would follow, to rotate
+    // its key is refused, and its record is left as it was.
     let other_device_id = DeviceId::new(uuid(77));
+    let other_key = kr_crypto::keys::NotificationPreviewKeyPair::generate().unwrap();
+    controller
+        .devices()
+        .commit(&DeviceRecord {
+            device_id: other_device_id,
+            endpoint_id: EndpointKey::from_bytes([3; 32]),
+            device_key_revision: DeviceKeyRevision::new(1),
+            authorisation: AuthorisationKey::from_bytes([4; 32]),
+            stored_envelope: None,
+            device_name: DeviceName::new("tablet").unwrap(),
+            platform: DevicePlatform::Ios,
+            grant: dummy_grant(other_device_id),
+            paired_at_ms: TimestampMs::new(NOW),
+            revoked_at_ms: None,
+            expired_at_ms: None,
+            committed_invitation_id: None,
+            notification_preview: Some(*other_key.public()),
+        })
+        .expect("commit the other device");
     let forbidden_params = kr_protocol::sharing::DevicePreviewKeyUpdateParams {
         device_id: other_device_id,
         notification_preview: *new_key.public(),
-        revision: DeviceKeyRevision::new(3),
+        revision: DeviceKeyRevision::new(2),
     };
     let forbidden_mutation = MutationRequest {
         action_id: kr_protocol::ids::ActionId::new(uuid(101)),
@@ -4645,8 +4671,16 @@ async fn device_preview_key_update_via_controller() {
         controller
             .device_preview_key_update(&actor_id, &forbidden_mutation, admission.carried)
             .await
-            .is_err()
+            .is_err(),
+        "a device does not rotate another device's key"
     );
+    let untouched = controller
+        .devices()
+        .record_for_device(other_device_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(untouched.notification_preview, Some(*other_key.public()));
+    assert_eq!(untouched.device_key_revision, DeviceKeyRevision::new(1));
 
     // An actor this host cannot resolve to a paired device is not a paired device. A revocation
     // between the connection's admission and this write leaves exactly that, and the registration
