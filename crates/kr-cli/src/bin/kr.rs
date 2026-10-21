@@ -6,7 +6,9 @@ use std::process::ExitCode;
 
 use clap::Parser as _;
 use kr_cli::bridge::environments::Selected;
-use kr_cli::cli::{AccountCommand, Cli, Command, HostCommand, ShellArguments, ShellCommand};
+use kr_cli::cli::{
+    AccountCommand, Cli, Command, HostArguments, HostCommand, ShellArguments, ShellCommand,
+};
 use kr_cli::error::{CliError, Result};
 use kr_cli::output::{self, Asked, Document, Request};
 use kr_cli::report::Completion;
@@ -110,6 +112,18 @@ fn usage(error: &clap::Error, json: bool) -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<Completion> {
+    // A kr a package manager put on the search path runs as the store's own copy of its release,
+    // admitted there by its first command. Installing it by hand is a command of its own.
+    #[cfg(unix)]
+    if !matches!(
+        &cli.command,
+        Command::Host(HostArguments {
+            command: HostCommand::Install(_)
+        })
+    ) && let Some((tree, installer)) = kr_cli::update::admit::unadmitted()
+    {
+        match kr_cli::update::admit::admit(&tree, installer).await? {}
+    }
     let paths = HostPaths::discover()?;
     match cli.command {
         Command::New(arguments) => {
@@ -1081,9 +1095,12 @@ async fn run(cli: Cli) -> Result<Completion> {
             }
             HostCommand::ImportJournals => kr_cli::import::run(&paths, cli.json),
             HostCommand::Install(install) => {
-                let installed =
-                    kr_cli::update::install(install.release.as_deref(), install.store.as_deref())
-                        .await?;
+                let installed = kr_cli::update::install(
+                    install.release.as_deref(),
+                    install.store.as_deref(),
+                    install.installer.as_deref(),
+                )
+                .await?;
                 if cli.json {
                     output::document(&installed.document());
                 } else {
@@ -1094,8 +1111,12 @@ async fn run(cli: Cli) -> Result<Completion> {
                 Ok(Completion::Done)
             }
             HostCommand::Update(update) => {
-                let updated =
-                    kr_cli::update::update(update.archive.as_deref(), update.check).await?;
+                let updated = kr_cli::update::update(
+                    update.archive.as_deref(),
+                    update.check,
+                    update.installer.as_deref(),
+                )
+                .await?;
                 if cli.json {
                     output::document(&updated.document());
                 } else {

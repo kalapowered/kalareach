@@ -272,10 +272,10 @@
           "member": "format",
           "absent": 0
         },
-        "version": 2,
-        "migrates_from": 1
+        "version": 3,
+        "migrates_from": 2
       },
-      "digest": "24a123807a5adb9584e8b4bfe12198ceed995766ca96c72126ac35900b97245a",
+      "digest": "c1d7525fde88606a2201d7db45fb5449b0571d09e4d315e1b3c8f59d96ab0b38",
       "kept": [
         "Record, Transaction, Abandoned, TransactionState, Restart, Start (crates/kr-cli/src/update/mod.rs)",
         "PathVariable"
