@@ -2280,11 +2280,7 @@ async fn a_question_asked_for_a_launched_agent_ends_with_the_agents_instance() {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(
-        broker
-            .end(instance, kr_worker::broker::InstanceEnding::NativeExit)
-            .instance_ended
-    );
+    assert!(broker.end(instance));
 
     // Every client reads the invalidation, and the other question is untouched.
     let after = every_question(&hosted).await;

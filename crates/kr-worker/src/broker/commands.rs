@@ -1648,10 +1648,7 @@ impl Backend {
         &self,
         broker: &Broker,
     ) -> Option<kr_protocol::projection::AgentInstanceSummary> {
-        let _ = broker.end(
-            self.application_instance_id,
-            crate::broker::InstanceEnding::NativeExit,
-        );
+        let _ = broker.end(self.application_instance_id);
         self.announced
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3052,10 +3049,7 @@ async fn supervise(backend: Arc<Backend>, broker: Arc<Broker>, process: ProcessS
             kr_ipc::identity::process_state(&process),
             kr_ipc::identity::ProcessState::Ended
         ) {
-            let _ = broker.end(
-                backend.application_instance_id,
-                crate::broker::InstanceEnding::NativeExit,
-            );
+            let _ = broker.end(backend.application_instance_id);
             // The program is gone: its server is ended too, and the connection with it, unless the
             // session is closing, whose closure ends the servers once the acceptance of its close
             // has been delivered.

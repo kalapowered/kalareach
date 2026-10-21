@@ -77,6 +77,83 @@ fn kr_req_12_07_a_plain_launch_of_a_terminal_with_a_server_is_served_by_a_gatewa
     assert!(ended.instance.ended_at.is_present(), "{ended:?}");
 }
 
+/// KR-REQ-07.67: closing an attachment ends nothing of a gateway-served session, and the program's
+/// exit still ends the whole of it. The session has a real attachment, the one a client holds
+/// while it watches. The program is in the middle of its turn, waiting on an approval, when that
+/// attachment is closed the way the session's own request closes it. The program is then released
+/// and finishes its turn through the same server, which has run throughout, and the instance has
+/// stayed registered. Only the program's exit ends the instance and the server.
+///
+/// The program here is the test's child, not a process in the worker's pseudo-terminal, so the
+/// terminal half of the clause is not claimed. Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_07_67_closing_an_attachment_leaves_a_gateway_served_session_running() {
+    let shell = Gateway::new();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let release = shell.placed.host.root().join("answer");
+    let mut launched = shell.launch(
+        &answer,
+        "attachment",
+        &[
+            ("KR_STAND_IN", "stay,answer-when-released"),
+            ("KR_STAND_IN_COMMAND", COMMAND),
+            (
+                "KR_STAND_IN_RELEASE",
+                release.to_str().expect("a text path"),
+            ),
+        ],
+    );
+    launched.prints("TUI: the server asks for item/commandExecution/requestApproval");
+    let instance = shell.announcement().instance.application_instance_id;
+    let servers = shell.servers();
+    assert_eq!(servers.len(), 1, "{servers:?}");
+    let server = servers[0].clone();
+
+    // The attachment closes, through the session's own call for it, as a client's request to
+    // detach does.
+    let detached = shell
+        .view
+        .runtime
+        .session()
+        .detach(shell.view.attachment_id)
+        .expect("the attachment closes");
+    shell.view.runtime.flush_input();
+    assert_eq!(detached.remaining.get(), 0, "it was the session's only one");
+
+    // Nothing ended: the instance is registered, the server runs, and the program goes on to the
+    // end of its turn through that server.
+    shell
+        .broker
+        .binding_state(instance)
+        .expect("the instance is still running");
+    assert_eq!(
+        kr_ipc::identity::process_state(&server),
+        kr_ipc::identity::ProcessState::Running
+    );
+    std::fs::write(&release, b"answer").expect("the program is released");
+    launched.prints("TUI: turn/completed");
+    shell
+        .broker
+        .binding_state(instance)
+        .expect("the instance ran on after its attachment closed");
+    assert_eq!(
+        kr_ipc::identity::process_state(&server),
+        kr_ipc::identity::ProcessState::Running
+    );
+
+    // The program's exit is what ends them.
+    let _ = launched.child.kill();
+    let _ = launched.ends();
+    eventually("the server ended with the program", || {
+        kr_ipc::identity::process_state(&server) == kr_ipc::identity::ProcessState::Ended
+    });
+    eventually("the instance ended with the program", || {
+        shell.broker.binding_state(instance).is_err()
+    });
+}
+
 /// KR-REQ-11.32 and KR-REQ-12.07: only the process the launch registered reaches the gateway, and
 /// an upgrade a browser could have sent does not use the admission: another process that speaks a
 /// plain upgrade to the socket, while the program has become the terminal and not yet connected, is

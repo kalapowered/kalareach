@@ -48,9 +48,9 @@ use kr_worker::broker::connectors::{
 };
 use kr_worker::broker::ledger::{BindingRecord, BoundExecutable};
 use kr_worker::broker::{
-    Broker, BrokerError, BrokerTransport, Caller, Credential, ForegroundMark, InstanceEnding,
-    Invocation, Ledger, ManagedProcess, PendingTransmission, TransportHandle, UpstreamArrival,
-    UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest,
+    Broker, BrokerError, BrokerTransport, Caller, Credential, ForegroundMark, Invocation, Ledger,
+    ManagedProcess, PendingTransmission, TransportHandle, UpstreamArrival, UpstreamBody,
+    UpstreamDispatch, UpstreamOutcome, UpstreamRequest,
 };
 use kr_worker::persistence::JournalHealth;
 
@@ -1814,8 +1814,7 @@ fn kr_req_11_13_rows_go_with_the_process_that_held_them_and_with_a_native_exit()
         .bind(2, 2, source.package_digest, frame)
         .expect("binds");
 
-    let ended = worker.broker.end(instance(2), InstanceEnding::NativeExit);
-    assert!(ended.instance_ended);
+    assert!(worker.broker.end(instance(2)));
     assert!(worker.broker.binding_record(binding(2)).is_none());
     assert!(worker.row(2).is_none(), "a native exit removes its rows");
 

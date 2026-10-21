@@ -368,10 +368,7 @@ pub(super) async fn accept(
 /// Ends what a program that never connected leaves: it ran as typed, so there is nothing for the
 /// server to serve, and the instance names a program that has no gateway.
 fn end_unconnected(backend: &Arc<Backend>, broker: &Arc<Broker>) {
-    let _ = broker.end(
-        backend.application_instance_id,
-        crate::broker::InstanceEnding::NativeExit,
-    );
+    let _ = broker.end(backend.application_instance_id);
     backend.end_unless_closing();
     backend.announce_ended();
 }

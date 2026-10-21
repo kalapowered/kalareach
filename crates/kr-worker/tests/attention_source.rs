@@ -1509,11 +1509,7 @@ async fn an_adapter_transition_travels_with_its_package_whether_or_not_its_words
         "and the transition still travels"
     );
 
-    let ended = broker.end(
-        bound.instance,
-        kr_worker::broker::InstanceEnding::NativeExit,
-    );
-    assert!(ended.instance_ended);
+    assert!(broker.end(bound.instance));
     let cleared = page_of(&mut link, 3).await;
     assert_eq!(
         cleared.host_events.records[2].adapter.0,
@@ -1608,11 +1604,7 @@ async fn an_adapter_transition_the_journal_refuses_is_written_once_the_journal_r
     // The broker's half of the recovery, as the host's maintenance takes it.
     host.service.recover_storage_now();
 
-    let ended = host.service.broker().end(
-        bound.instance,
-        kr_worker::broker::InstanceEnding::NativeExit,
-    );
-    assert!(ended.instance_ended);
+    assert!(host.service.broker().end(bound.instance));
     let lock = WriteLock::take(&host);
     faults_opened(&health, opened + 2).await;
     drop(lock);

@@ -291,10 +291,7 @@ impl Adoptions {
 
     /// Ends one adopted instance on the broker and returns its end.
     fn ended(&self, held: Adopted) -> AgentInstanceSummary {
-        let _ = self.broker.end(
-            held.summary.application_instance_id,
-            crate::broker::InstanceEnding::NativeExit,
-        );
+        let _ = self.broker.end(held.summary.application_instance_id);
         let mut summary = held.summary;
         summary.ended_at = Nullable::some(kr_ipc::now_ms());
         summary
@@ -428,10 +425,7 @@ impl Adoptions {
                 now,
             );
             if bound.is_err() {
-                let _ = self.broker.end(
-                    application_instance_id,
-                    crate::broker::InstanceEnding::NativeExit,
-                );
+                let _ = self.broker.end(application_instance_id);
                 return Vec::new();
             }
             adopted.insert(

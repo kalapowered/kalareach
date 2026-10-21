@@ -32,7 +32,6 @@ use kr_protocol::ids::{
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, Nullable, TimestampMs, U64, Uuid};
-use kr_worker::broker::InstanceEnding;
 use kr_worker::broker::bridge::BridgeProcess;
 use kr_worker::broker::connectors::{DECISION_SCHEMA, InstalledConnector, decoding_trust, fixture};
 use kr_worker::broker::{
@@ -2723,8 +2722,7 @@ fn kr_req_12_02_a_launch_holds_its_identifier_until_its_guard_finishes() {
         .expect("the launch runs")
         .register(IntegrationMode::Gateway, Some(managed(instance(2))))
         .expect("the instance is registered");
-    let ended = broker.end(instance(2), kr_worker::broker::InstanceEnding::NativeExit);
-    assert!(ended.instance_ended);
+    assert!(broker.end(instance(2)));
     broker
         .register_instance(instance(2), IntegrationMode::NativeTerminal, None, None)
         .expect_err("the launch still holds the identifier");
@@ -3050,11 +3048,12 @@ fn kr_req_01_02_the_capability_map_is_per_installation() {
     assert!(!InstanceEvidenceSource::PackageDeclaration.can_establish_qualified());
 }
 
-/// KR-REQ-07.67: a native exit ends the instance, and closing an attachment ends nothing: the
-/// instance is still running with an attachment fewer, and one that has no process of its own ends
-/// the same way.
+/// KR-REQ-07.67: a native exit ends the instance, whether or not it has a process of its own. The
+/// other half of the row, that closing an attachment ends nothing, is shown on a gateway-served
+/// session in `kr-hook`'s `gateway_launch` suite: attachments are the worker session's own table
+/// and this broker never sees one close.
 #[test]
-fn kr_req_07_67_a_native_exit_ends_the_instance_and_closing_an_attachment_does_not() {
+fn kr_req_07_67_a_native_exit_ends_the_instance() {
     let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     broker
         .register_instance(
@@ -3064,27 +3063,20 @@ fn kr_req_07_67_a_native_exit_ends_the_instance_and_closing_an_attachment_does_n
             Some(managed(instance(2))),
         )
         .expect("the instance is registered");
-    broker.attach(instance(2));
-    broker.attach(instance(2));
-
-    let closed = broker.end(instance(2), InstanceEnding::AttachmentClosed);
-    assert!(!closed.instance_ended);
-    assert_eq!(closed.attachments_remaining, 1);
     broker
         .binding_state(instance(2))
-        .expect("the instance is still running");
+        .expect("the instance is running");
 
-    let exited = broker.end(instance(2), InstanceEnding::NativeExit);
-    assert!(exited.instance_ended);
+    assert!(broker.end(instance(2)));
     assert!(broker.binding_state(instance(2)).is_err());
+    assert!(!broker.end(instance(2)), "an instance ends once");
 
     let bypassed =
         Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     bypassed
         .register_instance(instance(4), IntegrationMode::NativeTerminal, None, None)
         .expect("the instance is registered");
-    let ended = bypassed.end(instance(4), InstanceEnding::NativeExit);
-    assert!(ended.instance_ended);
+    assert!(bypassed.end(instance(4)));
 }
 
 /// KR-REQ-19.05: upstream bytes are data. Nothing a source frame contains changes a grant, and a

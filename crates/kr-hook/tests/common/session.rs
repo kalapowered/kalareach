@@ -70,6 +70,8 @@ impl Drop for LaunchGroup {
 pub struct View {
     /// The session.
     pub runtime: Arc<kr_worker::runtime::SessionRuntime>,
+    /// The attachment the view holds.
+    pub attachment_id: kr_protocol::ids::AttachmentId,
     /// The attached view's stream.
     pub stream: std::sync::Mutex<kr_worker::output::OutputStream>,
 }
@@ -130,6 +132,7 @@ impl View {
         );
         Self {
             runtime,
+            attachment_id,
             stream: std::sync::Mutex::new(stream),
         }
     }

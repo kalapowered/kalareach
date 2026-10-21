@@ -344,11 +344,6 @@ pub struct Instance {
     pub rich_suspension: Option<String>,
     /// What carries a prepared operation to this instance's upstream, where anything does.
     dispatch: Option<std::sync::Arc<dyn crate::broker::methods::UpstreamDispatch>>,
-    /// How many KalaReach attachments are watching it.
-    ///
-    /// Closing one does not end the process. Section 7: "Closing a KR attachment does not end the
-    /// TUI process in the worker PTY."
-    pub attachments: usize,
     /// What this instance has been observed doing, and the cursor an adapter replays from.
     semantic: crate::broker::semantic::SemanticLog,
     /// The commands the upstream advertises.
@@ -480,19 +475,6 @@ impl Instance {
         self.frame_order.clear();
         self.frame_bytes = 0;
     }
-}
-
-/// What ended an instance.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InstanceEnding {
-    /// The native terminal application exited on purpose.
-    ///
-    /// This ends the instance.
-    NativeExit,
-    /// A KalaReach attachment was closed.
-    ///
-    /// This ends nothing. The terminal application keeps running in the worker's pseudo-terminal.
-    AttachmentClosed,
 }
 
 /// One resource's single transmission, reserved, with the answer that will go.
@@ -636,15 +618,6 @@ pub struct ClaimedAttachment {
     pub expires_at_ms: kr_protocol::scalars::TimestampMs,
     /// The environment the grant is valid in.
     pub environment_id: kr_protocol::ids::EnvironmentId,
-}
-
-/// What stopping an instance actually does.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StopOutcome {
-    /// True when the instance's record was removed.
-    pub instance_ended: bool,
-    /// How many attachments are still watching.
-    pub attachments_remaining: usize,
 }
 
 /// How many transitions one replay page carries at most.
@@ -1379,54 +1352,32 @@ impl Broker {
         Ok(())
     }
 
-    /// Records that another attachment is watching one instance.
-    pub fn attach(&self, application_instance_id: ApplicationInstanceId) {
-        if let Some(instance) = self.state().instances.get_mut(&application_instance_id) {
-            instance.attachments = instance.attachments.saturating_add(1);
-        }
-    }
-
-    /// Ends an instance, or does not, depending on what ended.
+    /// Ends an instance: its native terminal application is gone, whichever way it went (it exited
+    /// on purpose, its session closed, it never connected to its backend, or it could not be
+    /// adopted).
     ///
     /// Section 7 draws the line here and it is the line users notice: quitting the agent ends the
-    /// agent, and closing the window you were watching it through does not.
-    pub fn end(
-        &self,
-        application_instance_id: ApplicationInstanceId,
-        ending: InstanceEnding,
-    ) -> StopOutcome {
+    /// agent, and closing the window you were watching it through does not. The second half is the
+    /// session's attachments, which are the worker session's own table and which this broker
+    /// never sees, so nothing here can end an instance because one was closed.
+    ///
+    /// Returns true when an instance was registered under `application_instance_id` and its
+    /// record was removed.
+    pub fn end(&self, application_instance_id: ApplicationInstanceId) -> bool {
         let mut state = self.state();
-        let Some(instance) = state.instances.get_mut(&application_instance_id) else {
-            return StopOutcome {
-                instance_ended: false,
-                attachments_remaining: 0,
-            };
+        let Some(ended) = state.instances.remove(&application_instance_id) else {
+            return false;
         };
-        match ending {
-            InstanceEnding::AttachmentClosed => {
-                instance.attachments = instance.attachments.saturating_sub(1);
-                StopOutcome {
-                    instance_ended: false,
-                    attachments_remaining: instance.attachments,
-                }
-            }
-            InstanceEnding::NativeExit => {
-                let ended = state.instances.remove(&application_instance_id);
-                if let Some(agent) = ended.and_then(|instance| instance.process) {
-                    release_agent_job(&state.instances, &agent.process);
-                }
-                state.tokens.withdraw(application_instance_id);
-                state.profiles.release(application_instance_id);
-                state.capabilities.forget(application_instance_id);
-                state.forget_instance(application_instance_id, kr_ipc::now_ms());
-                drop(state);
-                self.notices_ready.notify_one();
-                StopOutcome {
-                    instance_ended: true,
-                    attachments_remaining: 0,
-                }
-            }
+        if let Some(agent) = ended.process {
+            release_agent_job(&state.instances, &agent.process);
         }
+        state.tokens.withdraw(application_instance_id);
+        state.profiles.release(application_instance_id);
+        state.capabilities.forget(application_instance_id);
+        state.forget_instance(application_instance_id, kr_ipc::now_ms());
+        drop(state);
+        self.notices_ready.notify_one();
+        true
     }
 
     /// Gives back everything one launch took, because it failed before it was committed.
@@ -4352,7 +4303,6 @@ impl BrokerState {
                 profile_id,
                 rich_suspension: None,
                 dispatch: None,
-                attachments: 0,
                 semantic,
                 commands: Vec::new(),
                 frames: BTreeMap::new(),

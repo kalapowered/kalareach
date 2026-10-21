@@ -34,9 +34,7 @@ use kr_protocol::question::{
     QuestionReadParams, QuestionState,
 };
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
-use kr_worker::broker::{
-    Broker, BrokerTransport, Credential, InstanceEnding, ManagedProcess, TransportHandle,
-};
+use kr_worker::broker::{Broker, BrokerTransport, Credential, ManagedProcess, TransportHandle};
 use kr_worker::ownership::OwnershipBoundary;
 use kr_worker::persistence::JournalHealth;
 use kr_worker::questions::{Now, QuestionError, Questions, SessionBoundary, VerifiedSource};
@@ -275,8 +273,7 @@ fn a_launched_agents_questions_are_application_scoped_and_end_with_its_instance(
     );
 
     // The agent's instance ends.
-    let ended = broker.end(instance, InstanceEnding::NativeExit);
-    assert!(ended.instance_ended);
+    assert!(broker.end(instance));
 
     let read = every_question(&questions, 2_000);
     assert_eq!(
@@ -956,7 +953,7 @@ fn an_agents_job_is_let_go_of_with_the_last_instance_that_names_it() {
     };
     verify().expect("admitted through the job the agent was started in");
 
-    assert!(broker.end(first, InstanceEnding::NativeExit).instance_ended);
+    assert!(broker.end(first));
     assert!(
         kr_worker::windows::job::agent_job(&started.identity)
             .is_some_and(|job| Arc::ptr_eq(&job, &started.running.job)),
@@ -964,11 +961,7 @@ fn an_agents_job_is_let_go_of_with_the_last_instance_that_names_it() {
     );
     verify().expect("and the helper is still bound through it");
 
-    assert!(
-        broker
-            .end(second, InstanceEnding::NativeExit)
-            .instance_ended
-    );
+    assert!(broker.end(second));
     assert!(
         kr_worker::windows::job::agent_job(&started.identity).is_none(),
         "no instance names the agent any more, so nothing keeps its job"
