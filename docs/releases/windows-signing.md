@@ -48,67 +48,69 @@ certificate chain root-first and the timestamp certificate subject from the rele
 
 ## What a release carries
 
-The `.github/workflows/release-windows.yml` workflow runs on the `windows-2025` (GitHub-hosted)
-runner and signs the `kr.exe`, `kr-attach-guard.exe`, `kr-worker.exe`, `kr-controller.exe`,
-`kr-describe-inference.exe`, `kr-hook.exe` and `kr-plugin-host.exe` executables, and the
-`KalaReach.ShellBridge.psd1`, `KalaReach.ShellBridge.psm1`, `KrBridge.ps1`, `KrCbor.ps1` and
-`KrReader.ps1` PowerShell module scripts, and the `shells/psreadline/startup/kr-profile.ps1` startup
-script. All the scripts need to be signed if they are to be loadable with an all-signed execution
-policy, so they are signed together or not at all.
+A Windows release is one archive for each Windows target, `kalareach-x86_64-pc-windows-msvc-<release>.zip`
+and `kalareach-aarch64-pc-windows-msvc-<release>.zip`, and one `SHA256SUMS` that names both. An archive
+holds one directory, named as the archive is, and that directory is the release tree: `bin/` with the
+host's programs, `shells/psreadline/` with the PowerShell package, `share/` with the update channel's
+root, the release record, `signatures.txt` and the licence, and `release.json`, the manifest.
+[manifest.md](manifest.md) says what the manifest and the record state.
 
-The archive also carries `LICENSE`, the package manifest `shells/psreadline/manifest.json`, and
-`shells/psreadline/LICENSE`. These files are data rather than executable code; they are not sent to
-SignTool. The archive itself (`.zip`), the gate receipt (`signatures.txt`), and the checksum file
-(`SHA256SUMS`) are likewise unsigned data files.
+Two kinds of signature hold it. Authenticode signs the executables, `bin\kr.exe`, `kr-attach-guard.exe`,
+`kr-worker.exe`, `kr-controller.exe`, `kr-hook.exe`, `kr-plugin-host.exe` and, on x64, `kr-describe-inference.exe`,
+and every file of the PowerShell package that runs: the five module scripts and
+`shells\psreadline\startup\kr-profile.ps1`. All the scripts need to be signed if they are to be loadable
+with an all-signed execution policy, so they are signed together or not at all. The update channel's release
+keys sign `release.json`, which lists every other file with its length and digest, so the files that carry no
+Authenticode signature (the licences, the package manifest, the record and the channel's root) are held by
+that one. `scripts/stage-windows-signing.py` is what says which files are which.
 
 The workflow reads all the programs that need to be included in the release from the
 `scripts/release-programs.json` file. There's only one list of programs to maintain, which is used
-by the workflow, the archive check below and the host's own check of an update. Then it builds each
-of the programs one at a time by building each as a `--bin` target using the MSVC toolchain. The
-executables, and the crates they come from, are `kr` and `kr-attach-guard` from `kr-cli`,
+by the workflow, the tree assembly and the host's own check of an update. Each target's `build` job
+builds each of them one at a time as a `--bin` target using the MSVC toolchain, natively: x64 on
+`windows-2025` and Arm on `windows-11-arm`. The description process is not built for Arm, because
+llama.cpp's CPU backend does not build with MSVC for Arm and no shipped model profile lists that target.
+The executables, and the crates they come from, are `kr` and `kr-attach-guard` from `kr-cli`,
 `kr-worker` from `kr-worker`, `kr-controller` from `kr-controller`, `kr-describe-inference` from
 `kr-describe-model`, `kr-hook` from `kr-hook` and `kr-plugin-host` from `kr-plugin-host`. `kr-hook`
 is the forwarder that an agent's hooks start and the relay a launched agent reaches its worker
 through, and `kr-plugin-host` runs plugin components, one process per environment. Without them a
-host installed from the archive cannot run agent hooks or plugins. The workflow checks against the
-workspace package metadata that these are all the binaries those six crates declare (except for the
+host installed from the archive cannot run agent hooks or plugins. The job checks against the
+workspace package metadata that these are all the binaries those crates declare (except for the
 model description test stub and the benchmark using real weights, which aren't included in the
-release). They are then copied, by specific name, from the `target\release` directory to the staging
-directory. It's important to copy them by specific name, so that the list alone decides what the
-archive holds and an executable that is missing stops the copy by its name.
+release). `scripts/build-release.sh` then copies them, by specific name, from the `target\release`
+directory into the tree's `bin\`. It's important to copy them by specific name, so that the list alone
+decides what the archive holds and an executable that is missing stops the copy by its name.
 
 The included prebuilt libsodium is built to use the static C runtime, and the Rust MSVC targets use
 the dynamic C runtime. Including both in the same executable causes issues with the two different
 heaps, and the linker reports `LNK4098`. To avoid including the static C runtime when linking, the
 `.cargo/config.toml` file excludes it. However, if `RUSTFLAGS` is set, that replaces the flags which
 exclude the static C runtime. So the job doesn't set `RUSTFLAGS`, and will stop before it builds if
-it finds it set. Additionally, after the seven builds, the job reads the build logs and will stop if
-it finds that any link reported `LNK4098`, before anything is staged or signed.
+it finds it set. Additionally, after the builds, the job reads the build logs and will stop if
+it finds that any link reported `LNK4098`, before anything is assembled or signed.
 
-The archive holds a `signatures.txt` written by the verification step, not by the build. It records
-one line per artefact: the SHA-256 of the bytes that were verified, the certificate that signed
-them, its thumbprint, when it expires, the timestamping authority that countersigned, and the
-certificate chain from the root. It also records the SHA-256 digests of the data files. Beside the
-archive is a `SHA256SUMS` covering the archive itself.
+The archive holds a `share\signatures.txt` written by the verification step, not by the build. It
+records one line per signed artefact: the SHA-256 of the bytes that were verified, the certificate
+that signed them, its thumbprint, when it expires, the timestamping authority that countersigned, and
+the certificate chain from the root. Beside the archives is a `SHA256SUMS` covering them.
 
-After the pack step, which holds the archive to its own inventory (a build that left an executable
-out would still match that), the release job checks that all seven executables are files at the top
-level of the archive, using the `scripts/check-windows-archive.ps1` script. This lists every
-executable the archive lacks and fails if the archive doesn't include them all, or if it can't be
-read at all. The gate job, which runs before the release job, tests the script with archives missing
-each of the executables, one with an executable below the top level, one which isn't an archive at
-all, and one which doesn't exist, as well as a control archive which should pass the check. The
-check reads the same list, so for Windows on Arm it asks for every executable but the description
-process, which that target does not build, and the gate job tests that as well.
+The archive is held to its own manifest before it can be uploaded. `scripts/check-release-archive.py`
+reads it as a host stages one: one top directory, no path that climbs out of it, no link or device,
+every file the manifest lists present at its length and digest, and nothing the manifest does not
+list. A build that left an executable out could not reach the archive, because the tool that writes the
+manifest refuses a tree that lacks one. The gate job, which runs before the build, tests the check
+against archives with each of those faults planted in them, beside a control that has to pass.
 
 Both records end every line in a line feed alone, although the runner that writes them is Windows.
 A carriage return would break the sum on macOS: `shasum` and the `sha256sum` macOS ships read it as
 part of the file name and report the archive missing, while GNU `sha256sum` drops it and passes.
 Before anything is uploaded, the release job holds both records to line feeds and runs
-`sha256sum -c` over the archive (`scripts/check-release-sums.sh`). The gate job first drives that
+`sha256sum -c` over the archives (`scripts/check-release-sums.sh`). The gate job first drives that
 check with records made to fail, a carriage return among them.
 
-Checking the archive takes one command on Linux or macOS, in the directory that holds both files:
+Checking the archives takes one command on Linux or macOS, in the directory that holds them and
+the sums:
 
 ```bash
 sha256sum -c SHA256SUMS        # or: shasum -a 256 -c SHA256SUMS
@@ -117,8 +119,8 @@ sha256sum -c SHA256SUMS        # or: shasum -a 256 -c SHA256SUMS
 Checking a signature after unpacking takes two commands:
 
 ```powershell
-Get-AuthenticodeSignature .\kr.exe | Format-List
-signtool verify /pa /v .\kr.exe
+Get-AuthenticodeSignature .\bin\kr.exe | Format-List
+signtool verify /pa /v .\bin\kr.exe
 ```
 
 The first prints `Valid` and names the timestamper. The second walks the chain against the policy
@@ -141,16 +143,24 @@ the runner and refuses a tag that names either the version or the commit wrongly
 happens before anything is built.
 
 Pushing the tag starts the run. The initial `gate` job settles the exact 40-character commit SHA
-from `github.sha` (or `inputs.ref`), records it in the job summary and outputs, and the `release`
-job checks out that exact SHA and verifies it matches. The release job waits, because it declares the
-`release-signing` environment and that environment has a required reviewer, so a person approves every
-signature this project ever makes. Approve it and the run builds, signs, verifies, packs, and
-publishes a release carrying the archive and its sum.
+from `github.sha` (or `inputs.ref`) and records it in the job summary and outputs. The `build` job,
+once for each Windows target and with no environment and no secret, checks out that exact SHA, builds,
+assembles the tree, and proves it: it signs the manifest with keys of its own, packs it, and holds
+the archive to what a host stages. What it signs is no release, and the archive it keeps says so in
+its name. The `release` job takes the two trees. It waits, because it declares the `release-signing`
+environment and that environment has a required reviewer, so a person approves every signature this
+project ever makes. It runs for a release tag and for the default branch only, and a run on any other
+ref shows it skipped. Approve it and the run signs the files of each tree that carry a signature,
+verifies each of them, puts them back, and then stops, naming the reason: the update channel's release
+keys do not exist yet, so `release.json` cannot be signed again after the signatures changed the files.
+Publishing a release waits for the key ceremony, which is the project owner's to hold, on every
+platform. When the keys exist, that step is replaced by the one that signs, and the run goes on to pack
+both archives, hold them to what a host stages, and publish a release carrying them and their sums.
 
 To sign a commit without releasing it, start the workflow by hand and give it a ref. The gate job
 settles that commit and records it in the Step Summary. The reviewer in the `release-signing`
 environment must check that exact commit SHA in the summary before approving. A run started that way
-signs and keeps the archive as a workflow artefact; it creates no release, because the step that
+signs and keeps the archives as a workflow artefact; it creates no release, because the step that
 publishes one runs on a tag push and on nothing else.
 
 One tag is one run at a time. A second run for a tag already being released waits for the first
@@ -162,7 +172,7 @@ workflow follows it.
 ## The refusal
 
 `scripts/verify-windows-signatures.ps1` runs between signing and everything that could publish. It
-takes every file under the staging directory, at any depth, runs `signtool verify /pa /v` over it,
+takes every file under the directory of files set apart for signing, at any depth, runs `signtool verify /pa /v` over it,
 prints the whole of that output into the run's log, and then holds it to four conditions. A file that
 fails any of them is named in the log with the condition it failed, and the job stops.
 
@@ -182,16 +192,16 @@ another party has no business in this release.
 certificate expires in three days and the signature dies with it. A file can be refused for this and
 for being untrusted or having the wrong publisher at once, and all are reported.
 
-An empty staging directory is refused as well. A build that produced nothing must not read as a run
+An empty directory is refused as well. A build that produced nothing must not read as a run
 that verified everything it built.
 
-What the gate accepts, it records, and the step that builds the archive works only from that record:
-it hashes each file after copying it into the payload, holds it to the digest the gate wrote down,
-and stops if the number of files copied does not match the number the gate accepted. Unsigned data
-files are copied through an explicit inventory and added to the record. The finished archive is
-opened, and every entry is hashed and verified against the inventory before anything can upload it.
-So an artefact that did not pass through the gate has no route into an archive, and a file that
-changed between steps stops the run.
+What the gate accepts, it records, and the step that puts the signed files back works only from that
+record: `scripts/stage-windows-signing.py restore` refuses unless the record lists exactly the files
+that were set apart for signing and each has the digest the record gives, and only then copies each
+one over its file in the tree and writes the record into the tree as `share/signatures.txt`. So an
+artefact that did not pass through the gate has no route into a release, and a file that changed
+between steps stops the run. The manifest is written after that, because a signature changes the
+bytes it covers, and the finished archive is read against that manifest before anything can upload it.
 
 `scripts/check-windows-signature-gate.ps1` is the gate's own test. It verifies an empty directory
 refusal, requires positive controls for signed executables and PowerShell files, tests an unsigned
