@@ -907,33 +907,34 @@ impl Controller {
         use crate::registry::LaunchPhase;
         let mut open = Vec::new();
         let mut unaccounted = Vec::new();
-        {
-            let registry = self.registry.lock().await;
-            for phase in [
-                LaunchPhase::Spawned,
-                LaunchPhase::Claimed,
-                LaunchPhase::Live,
-                LaunchPhase::Fenced,
-            ] {
-                open.extend(registry.reservations_in(phase)?);
+        // The registry is held from the reading of the reservations to the last registration, so a
+        // closure written meanwhile waits for it and ends the session this has registered, instead
+        // of ending nothing and leaving the registration behind.
+        let registry = self.registry.lock().await;
+        for phase in [
+            LaunchPhase::Spawned,
+            LaunchPhase::Claimed,
+            LaunchPhase::Live,
+            LaunchPhase::Fenced,
+        ] {
+            open.extend(registry.reservations_in(phase)?);
+        }
+        for (session_id, closure) in registry.closures()? {
+            if !closure
+                .surviving
+                .iter()
+                .any(|resource| resource.kind == UNACCOUNTED_WORKER)
+            {
+                continue;
             }
-            for (session_id, closure) in registry.closures()? {
-                if !closure
-                    .surviving
-                    .iter()
-                    .any(|resource| resource.kind == UNACCOUNTED_WORKER)
-                {
-                    continue;
-                }
-                if let Some(reservation) = registry.reservation_for_session(session_id)?
-                    && let Some(identity) = reservation.launcher_identity.clone()
-                    && !matches!(
-                        kr_ipc::identity::process_state(&identity),
-                        kr_ipc::identity::ProcessState::Ended
-                    )
-                {
-                    unaccounted.push((reservation, identity));
-                }
+            if let Some(reservation) = registry.reservation_for_session(session_id)?
+                && let Some(identity) = reservation.launcher_identity.clone()
+                && !matches!(
+                    kr_ipc::identity::process_state(&identity),
+                    kr_ipc::identity::ProcessState::Ended
+                )
+            {
+                unaccounted.push((reservation, identity));
             }
         }
         let project = Arc::clone(self.project().service());
@@ -977,6 +978,7 @@ impl Controller {
             project.holds().adopt_session(session_id, place);
             end_session_when_worker_ended(Arc::clone(project.holds()), session_id, identity);
         }
+        drop(registry);
         Ok(())
     }
 
@@ -1211,6 +1213,23 @@ impl Controller {
                 );
             }
         });
+    }
+}
+
+impl Controller {
+    /// Ends a session's registration as a writer once the kernel says its worker's process has
+    /// ended, looking until [`CLOSURE_WATCH_TIMEOUT`] has passed. A worker still running after
+    /// that keeps the registration until its closure or until the daemon restarts.
+    pub(super) fn end_session_when_ended(
+        &self,
+        session_id: SessionId,
+        identity: kr_protocol::identity::ProcessStartIdentity,
+    ) {
+        end_session_when_worker_ended(
+            Arc::clone(self.project().service().holds()),
+            session_id,
+            identity,
+        );
     }
 }
 

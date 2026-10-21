@@ -759,6 +759,10 @@ impl Controller {
                 if let Some(identity) = &launched {
                     let mut registry = self.registry.lock().await;
                     registry.record_launch(reservation.reservation_id, identity)?;
+                    // The kernel is asked whether that process has ended, and the session stops
+                    // being a writer when it has. Without an identity there is nothing to ask,
+                    // and the registration stays until the daemon restarts.
+                    self.end_session_when_ended(reservation.session_id, identity.clone());
                 }
                 self.retire_job_when_ended(reservation.reservation_id, launched);
                 return Err(ControllerError::Supervision { detail });
@@ -774,12 +778,11 @@ impl Controller {
             // A worker that failed its rendezvous, or never reported, has no session to close, so
             // no closure removes its job. It goes once the worker has ended.
             Ok(Ok(Err(error))) => {
-                // The worker was refused its claim or reported that it could not start, so no
-                // shell ran and the session writes nowhere.
-                self.project()
-                    .service()
-                    .holds()
-                    .end_session(reservation.session_id);
+                // The worker was refused its claim or reported that it could not start, and a
+                // worker that fails its qualification reports that while its shell is still
+                // alive, so the session stops being a writer when the kernel says the worker's
+                // process has ended and not before.
+                self.end_session_when_ended(reservation.session_id, identity.clone());
                 self.retire_job_when_ended(reservation.reservation_id, Some(identity));
                 // A refusal of the authority the create stood on is that, and not a launch that
                 // failed: the caller pauses on the one and fails on the other.
@@ -795,6 +798,10 @@ impl Controller {
             }
             Ok(Err(_)) | Err(_) => {
                 let claimed = hold.end_wait().await;
+                // The worker may yet report itself and the session may yet run, so the session
+                // stays a writer until its closure or until the kernel says the worker's process
+                // has ended.
+                self.end_session_when_ended(reservation.session_id, identity.clone());
                 self.retire_job_when_ended(reservation.reservation_id, Some(identity));
                 // A claim that took the variables has a launch that may still complete, and its
                 // worker may yet report itself: what became of this create is not known, and its

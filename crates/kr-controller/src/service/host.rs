@@ -101,7 +101,11 @@ impl Controller {
                 self.project()
                     .service()
                     .writer_in_directory(
-                        "an agent-tool installation",
+                        if method == Method::AgentToolsInstall {
+                            "an agent-tool installation"
+                        } else {
+                            "an agent-tool removal"
+                        },
                         std::path::Path::new(directory),
                     )
                     .map_err(|error| ControllerError::Refused {
