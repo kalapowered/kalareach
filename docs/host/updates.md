@@ -22,7 +22,7 @@ Each user has one store of releases:
 | `staging/` | A release being unpacked and checked before it is renamed into `versions/` |
 | `trash/` | A release being removed, moved out of `versions/` before anything of it is deleted |
 | `roots/` | The runtime and state roots each control daemon of the store has served, those a command of the store has worked in, and the configuration documents either has read or written |
-| `install.json` | The store's record: the release current before the last switch, a release staged for a later update, and an update under way |
+| `install.json` | The store's record: the release current before the last switch, a release staged for a later update, an update under way, and the package manager that put the releases there, if one did |
 | `update.lock`, `install.lock`, `writers.lock` | The locks an update, a starting control daemon and a command that writes a stored record take |
 
 A release is named by its version and the first twelve hexadecimal digits of its commit, as its tag
@@ -110,6 +110,32 @@ its version is given ten seconds and is ended if it prints more than 4096 bytes,
 program it starts does; and a program that starts in a release that is being removed or replaced
 waits for that removal for at most thirty seconds.
 
+## A release a package manager keeps
+
+A package manager unpacks the signed release under a prefix of its own (Homebrew's `Cellar` or
+`Caskroom`) and puts that release's `kr` on the search path. The prefix is never what the host runs
+from, because the store keeps every release a live worker runs from and a package manager's upgrade
+deletes the one before it. So the first command of such a `kr` admits its release into the store,
+and the command then runs as the store's own copy of that release.
+
+With no release in the store, the release is installed as `kr host install` installs one. With
+another release current, the current release's `kr` is asked to take this one in as an update
+(`kr host update --archive <directory>`, which takes the directory a package manager keeps a
+release unpacked in as well as an archive), so the release is checked against the update channel's
+root, the daemons are handed over and `current` is switched under the same rules. An update that
+waits for a live worker, exit 9, is not a failure: its reason is said on standard error and the
+command goes on with the release that is still current. A release that cannot be checked is
+refused with the reason, and the command does not run. Two first commands at once take the
+store's locks in turn, and the one that does not get them goes on with the release that is
+current.
+
+The store's record names the package manager, and the package manager owns which release is
+current from then on. Removing the prefix leaves `versions/` as it is. `kr --help`, `kr --version`
+and a mistake in the arguments read nothing of the host and admit nothing, and neither does a `kr`
+of the store, an unpacked release that no package manager keeps (which `kr host install` installs
+on request) or a build outside a release. The store keeps no release on Windows, so none of this
+applies there.
+
 ## Updating
 
 ```sh
@@ -172,8 +198,11 @@ A release archive is `kalareach-<target>-<release>.tar.gz`: one top directory ho
 Framework's signed envelope: its release name and sequence, its commit, the target and the oldest
 operating system it runs on, the protocol package version its programs were built from, the public
 protocol majors it accepts, the compatibility levels its control daemon speaks to a worker at, its
-shell packages, the stores its programs read with the versions of each it reads (see "Stored
-formats"), and every file with its length, SHA-256 digest and whether it is a program.
+shell packages with what each is made of, the agent builds it is qualified against, the
+cryptographic libraries it is built with, the stores its programs read with the versions of each it
+reads (see "Stored formats"), and every file with its length, SHA-256 digest and whether it is a
+program. [The release manifest](../releases/manifest.md) says what each member states and where its
+value is read from.
 
 A release is taken in only whole and checked:
 

@@ -50,6 +50,8 @@
 //! went on past one that had, and the run asks whether the daemon answers.
 
 #[cfg(unix)]
+pub mod admit;
+#[cfg(unix)]
 mod formats;
 #[cfg(unix)]
 mod handover;
@@ -108,15 +110,14 @@ pub fn said(error: &InstallError) -> Shown {
 
 /// The store record's format this build writes, and the newest it reads.
 ///
-/// Format 2 records the update channel root this host trusts, and the root an update under way
-/// settles on. A record of format 1 holds neither; it reads as it is and is written as format 2
-/// the next time it is written.
-pub const RECORD_FORMAT: u32 = 2;
+/// Format 3 records which package manager put the host's releases there, if one did. A record of
+/// format 2 holds none; it reads as it is and is written as format 3 the next time it is written.
+pub const RECORD_FORMAT: u32 = 3;
 
 /// The oldest store record format this build reads. Raise it, and remove the step in
 /// [`Record::read`] that brings an earlier record forward, once no supported upgrade starts from
 /// one.
-pub const OLDEST_RECORD_FORMAT: u32 = 1;
+pub const OLDEST_RECORD_FORMAT: u32 = 2;
 
 /// The longest store record this build reads: it holds the channel roots of the host and of an
 /// update under way, of which a release may carry one up to 1 MiB each, written out in the
@@ -151,6 +152,10 @@ pub struct Record {
     /// Absent until the first switch settles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_root: Option<tough::schema::Signed<tough::schema::Root>>,
+    /// The package manager that put this host's releases here, when one did: it owns which
+    /// release is current, and this host's own update channel stays off for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installer: Option<String>,
 }
 
 kr_client::debug_as_name!(Record);
@@ -413,8 +418,16 @@ impl Record {
                 RECORD_FORMAT
             )));
         }
-        // The step from an earlier format: what a record of format 1 holds is all that format 2
-        // holds before it records a root, so it reads as format 2 and the next write says so.
+        if record.format < OLDEST_RECORD_FORMAT {
+            return Err(CliError::Other(shown!(
+                "the store's record {} is of format {}, and this kr reads format {} at the oldest",
+                Shown::root(&path),
+                record.format,
+                OLDEST_RECORD_FORMAT
+            )));
+        }
+        // The step from an earlier format: what a record of format 2 holds is all that format 3
+        // holds before it records an installer, so it reads as format 3 and the next write says so.
         Ok(Self {
             format: RECORD_FORMAT,
             ..record
@@ -793,6 +806,7 @@ fn ensure_current(store: &Store, release: &ReleaseName) -> Result<()> {
 pub async fn install(
     tree: Option<&std::path::Path>,
     root: Option<&std::path::Path>,
+    installer: Option<&str>,
 ) -> Result<Installed> {
     let running = kr_ipc::install::this_process().map_err(|error| CliError::Other(said(error)))?;
     if running.store().is_some() {
@@ -856,6 +870,7 @@ pub async fn install(
     // `versions/` holds the release it is of.
     Record {
         format: RECORD_FORMAT,
+        installer: installer.map(str::to_owned),
         ..Record::default()
     }
     .write(&store)?;
@@ -1039,7 +1054,11 @@ pub fn versions() -> Result<Vec<Kept>> {
 /// and what to do, with every daemon it stopped started again from the release still current; and
 /// a refusal or a failure otherwise.
 #[cfg(unix)]
-pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Updated> {
+pub async fn update(
+    archive: Option<&std::path::Path>,
+    check: bool,
+    installer: Option<&str>,
+) -> Result<Updated> {
     let (store, source) = this_release_store()?;
     let Some(archive) = archive else {
         return Err(CliError::Usage(Shown::said(
@@ -1084,6 +1103,15 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
     );
     let _ = remove_staging(&staging);
     let target = staged?;
+    // A release the package manager's tree holds is checked and in the store: the manager owns
+    // which release is current from here, whether this run switches to it or waits.
+    if let Some(installer) = installer
+        && !check
+        && record.installer.as_deref() != Some(installer)
+    {
+        record.installer = Some(installer.to_owned());
+        record.write(&store)?;
+    }
     if target.release == source {
         // The release that is current is not an update to go on past a failed one with: the daemons
         // it left unstarted are owed their start from it. An archive of any other release is
@@ -1461,7 +1489,13 @@ fn stage_archive(
     check: bool,
 ) -> Result<kr_protocol::update::ReleaseManifest> {
     kr_ipc::paths::create_private_tree(store.root(), staging)?;
-    let (staged, written) = release::unpack(archive, staging)?;
+    // An archive is unpacked; a release already unpacked, as a package manager keeps one, is
+    // copied. Either is held to the same checks before anything of it is trusted.
+    let (staged, written) = if archive.is_dir() {
+        release::copy_tree(archive, staging)?
+    } else {
+        release::unpack(archive, staging)?
+    };
     let document = release::manifest_document(&staged)?;
     let manifest = trusted.verify(&document)?;
     release::check_files(&manifest, &written)?;
@@ -2484,6 +2518,7 @@ fn collect(
 pub async fn install(
     _tree: Option<&std::path::Path>,
     _root: Option<&std::path::Path>,
+    _installer: Option<&str>,
 ) -> Result<Installed> {
     Err(unsupported())
 }
@@ -2496,7 +2531,11 @@ pub fn versions() -> Result<Vec<Kept>> {
 
 /// `kr host update` on a platform that keeps no store.
 #[cfg(not(unix))]
-pub async fn update(_archive: Option<&std::path::Path>, _check: bool) -> Result<Updated> {
+pub async fn update(
+    _archive: Option<&std::path::Path>,
+    _check: bool,
+    _installer: Option<&str>,
+) -> Result<Updated> {
     Err(unsupported())
 }
 
