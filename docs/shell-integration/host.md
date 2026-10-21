@@ -358,7 +358,7 @@ The resolve hook runs in front of an interactive invocation, before the command 
 session answers with the argument vector to run: the command name and the vector the person typed,
 plus the flags an enabled integration for that command adds. Several things bypass it, and each
 keeps the invocation exactly as typed, is given no backend at all, and is named in the answer's
-`bypass`: a command invoked by absolute path (`absolute_path`), a command no integration names
+`bypass`: a command named by a path, absolute or relative (`absolute_path`), a command no integration names
 (`not_integrated`), an integration the user has not enabled (`disabled`), a line of a script
 rather than an interactive invocation (`not_interactive`), a shell whose integration is not a
 managed KalaReach root shell yet (`unmanaged_shell`), a session that is closing
@@ -372,9 +372,9 @@ An invocation that would take the integration is answered as a bypass too, as `b
 when the worker cannot establish the backend that has to exist before the native program does
 (section 12). Among the reasons are a session with no command backends, no installed connector
 that integrates the command or recognises where the shell found it, a platform that cannot
-publish a credential file, and a runtime directory too long for the socket a backend binds. The
-worker records the reason in its own diagnostics, and the shell is told only that none could be
-established. Adding the flags without a backend would start an agent that expects a gateway and
+publish a credential file, and a runtime directory too long for the socket a backend binds. When
+the backends refuse the invocation, the worker records the reason in its own diagnostics; the shell
+is told only that none could be established. Adding the flags without a backend would start an agent that expects a gateway and
 has none, so the flags are not added.
 
 The block hook reports one command block: the command line the editor accepted, when it

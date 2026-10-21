@@ -569,15 +569,18 @@ Two secret buffers in this path are not cleared, and neither is reachable from t
    canonical form, plus those output bytes. This crate clears the tree it is handed back; it cannot
    reach the rest. Closing it means the same thing as the envelope case: a value tree whose
    temporaries clear themselves, in `crates/kr-cbor`, which owns the decoder.
-2. **`hkdf` 0.13.0 keeps its pseudorandom key and expansion buffers uncleared, and so do the
-   older `hkdf`, `hmac` and `sha2` that `spake2` brings.** `hkdf` has no `zeroize` feature in
+2. **`hkdf` 0.13.0 keeps its pseudorandom key and expansion buffers uncleared, and `spake2` clears
+   nothing of its own or of the older crates it builds on.** `hkdf` has no `zeroize` feature in
    either version. The `hmac` 0.13.0 and `sha2` 0.11.0 this workspace pins are built with theirs.
-   `spake2` 0.4.0 depends on `hkdf` 0.12.4, `hmac` 0.12.1 and `sha2` 0.10.9, which have none, and
-   builds the password scalar from an HKDF and the shared key from a SHA-256 transcript hash of the
-   password, the two identities and both messages with them. The buffers of those two steps are not
-   cleared. Closing this means a maintained `spake2` release that depends on versions that clear
-   them, or a reviewed patch. Section 20 requires a maintained implementation, so a private fork is
-   not the answer.
+   `spake2` 0.4.0 resolves `hkdf` 0.12.4, `hmac` 0.12.1 and `sha2` 0.10.9, which have none. It
+   derives the password scalar with that HKDF, and the shared key from a SHA-256 hash of a
+   transcript of the password's hash, the two identities' hashes, both messages and the shared
+   group element. The code and the ephemeral scalar stay in its state, and the arrays it fills
+   along the way are ordinary ones, so the pairing code and the shared element are not cleared.
+   Closing this means a maintained `spake2` release that clears its own state and builds on
+   versions that clear theirs, and a maintained `hkdf` release or a reviewed patch for this
+   workspace's own use. Section 20 requires a maintained implementation, so a private fork is not
+   the answer.
 
 Both are recorded here with the versions pinned below, because no external cryptographic review has
 examined them. The release's statement of that exception is in
@@ -611,4 +614,5 @@ rather than of this wrapper. `spake2` 0.4.0 also resolves `hkdf` 0.12.4, `hmac` 
 `ciborium` value trees an envelope's payload passes through on its way to and from canonical
 bytes. The paths that carry key material avoid both: a key wrap is assembled and read
 without a value tree, and every key lives in a `Secret`. The short-code exchange is the one path
-whose secret, the pairing code, passes through the uncleared `spake2` buffers.
+whose secrets, the pairing code and the shared group element, pass through the uncleared `spake2`
+state and buffers.
