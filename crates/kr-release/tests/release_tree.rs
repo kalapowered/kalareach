@@ -375,6 +375,33 @@ fn a_tree_that_disagrees_with_the_pins_is_refused_before_it_is_signed() {
     let refused = assemble(&inputs(&release.tree())).expect_err("an edited entry");
     assert!(refused.to_string().contains("startup entry"), "{refused}");
 
+    // The stable copy of the startup entry, which an installed host's startup files source: edited
+    // after the script copied it, though the package's own copy is the checkout's.
+    let release = tree_of();
+    let stable = release.tree().join("shells/zsh/kr-zshrc.zsh");
+    let mut edited = std::fs::read_to_string(&stable).expect("the stable entry");
+    edited.push_str("exec kr\n");
+    std::fs::write(&stable, edited).expect("the stable entry");
+    let refused = assemble(&inputs(&release.tree())).expect_err("an edited stable entry");
+    assert!(
+        refused.to_string().contains("stable startup entry"),
+        "{refused}"
+    );
+
+    // A package that states no module, with its module directory in place: the pins name one.
+    let release = tree_of();
+    edit_record(&release, &|record| {
+        record["shell"]["modules"] = serde_json::json!([]);
+    });
+    let refused = assemble(&inputs(&release.tree())).expect_err("no module stated");
+    assert!(refused.to_string().contains("modules"), "{refused}");
+
+    // A Unix release that lacks one of the three shell packages.
+    let release = tree_of();
+    std::fs::remove_dir_all(release.tree().join("shells/bash")).expect("a package goes");
+    let refused = assemble(&inputs(&release.tree())).expect_err("a package short");
+    assert!(refused.to_string().contains("packages"), "{refused}");
+
     // A module directory that is not there.
     let release = tree_of();
     let package = record_of(&release)
@@ -584,9 +611,9 @@ fn a_signed_tree_verifies_and_a_changed_or_short_signed_one_does_not() {
 }
 
 /// KR-REQ-07.86: a Windows release carries the PowerShell package as files, with no shell build to
-/// state, and its executables are the `.exe` programs of `bin/`; a directory under `shells/` that is
-/// not a package this tool knows is refused, which is the control that the package is let through
-/// for what it is and not because nothing under `shells/` is held to anything.
+/// state, and its executables are the `.exe` programs of `bin/`; a file of the package that is not
+/// the checkout's, and a directory under `shells/` that is no part of it, are refused, and the
+/// unedited tree is the control.
 #[test]
 fn a_windows_tree_carries_the_powershell_package_as_files() {
     const WINDOWS: &str = "x86_64-pc-windows-msvc";
@@ -644,12 +671,31 @@ fn a_windows_tree_carries_the_powershell_package_as_files() {
     );
     assert!(listed("shells/psreadline/startup/kr-profile.ps1").is_some());
 
+    // A file of the PowerShell package that is not the checkout's: the module a policy that asks for
+    // signed scripts would load, edited after it was copied.
+    let module = tree.join("shells/psreadline/module/KrBridge.ps1");
+    let original = std::fs::read(&module).expect("a module script");
+    let mut edited = original.clone();
+    edited.extend_from_slice(b"\n# another\n");
+    std::fs::write(&module, edited).expect("edited");
+    let refused = run(&manifest_arguments_for(&tree, WINDOWS, "windows=10.0"));
+    assert!(!refused.status.success());
+    assert!(
+        why(&refused).contains("shells/psreadline"),
+        "{}",
+        why(&refused)
+    );
+    std::fs::write(&module, original).expect("put back");
+    let again = run(&manifest_arguments_for(&tree, WINDOWS, "windows=10.0"));
+    assert!(again.status.success(), "{}", why(&again));
+
+    // Another directory under `shells/` is no shell package of a Windows release.
     std::fs::create_dir_all(tree.join("shells/another")).expect("a directory");
     std::fs::write(tree.join("shells/another/file"), "x").expect("a file");
     let refused = run(&manifest_arguments_for(&tree, WINDOWS, "windows=10.0"));
     assert!(!refused.status.success());
     assert!(
-        why(&refused).contains("shells/another is not a shell package this tool assembles"),
+        why(&refused).contains("shells/psreadline"),
         "{}",
         why(&refused)
     );

@@ -21,37 +21,95 @@ use crate::refusal::{
     Refusal, Result, digest_file, digest_from_hex, hex, read_json, read_text, refuse, scalar,
 };
 
-/// The shells whose packages this tool builds a release from.
-const BUILT: [&str; 3] = ["zsh", "bash", "fish"];
+/// The shells whose packages a Unix release is built from, in the order the tree lists them.
+const BUILT: [&str; 3] = ["bash", "fish", "zsh"];
 
 /// Every shell package of the tree, sorted by shell.
+///
+/// A Unix release carries the three built shells and no more. A Windows release carries the
+/// PowerShell package, which has no build to state: its files are held to the checkout's, and the
+/// release states no shell.
 ///
 /// # Errors
 ///
 /// Returns a refusal naming the package and the first thing it disagrees with.
-pub fn packages(tree: &Path, checkout: &Path) -> Result<Vec<ReleaseShell>> {
+pub fn packages(tree: &Path, checkout: &Path, target: &str) -> Result<Vec<ReleaseShell>> {
     let directory = tree.join("shells");
-    let mut shells = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&directory) else {
-        return Ok(shells);
-    };
-    let mut names: Vec<String> = entries
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    for name in names {
-        // The PowerShell package is files only: a host qualifies it against the editor it finds, so
-        // there is no build to state, and its files are listed with the release's own.
-        if name == "psreadline" {
-            continue;
+    let mut found: Vec<String> = std::fs::read_dir(&directory)
+        .map(|entries| {
+            entries
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    if target.contains("windows") {
+        if found.as_slice() != ["psreadline"] {
+            refuse!("a Windows release carries shells/psreadline and nothing else under shells/");
         }
-        if !BUILT.contains(&name.as_str()) {
-            refuse!("shells/{name} is not a shell package this tool assembles");
-        }
-        shells.push(package(tree, checkout, &name)?);
+        powershell_package(tree, checkout)?;
+        return Ok(Vec::new());
     }
-    Ok(shells)
+    if found.as_slice() != BUILT.as_slice() {
+        refuse!(
+            "a release for {target} carries the packages {BUILT:?} under shells/, and this tree has \
+             {found:?}"
+        );
+    }
+    BUILT
+        .iter()
+        .map(|shell| package(tree, checkout, shell))
+        .collect()
+}
+
+/// Holds the PowerShell package of a tree to the checkout's: the same files, byte for byte, and no
+/// other.
+fn powershell_package(tree: &Path, checkout: &Path) -> Result<()> {
+    let in_tree = files_under(&tree.join("shells/psreadline"))?;
+    let in_checkout = files_under(&checkout.join("shells/psreadline"))?;
+    if in_tree != in_checkout {
+        let names = |files: &[(String, [u8; 32])]| -> Vec<String> {
+            files.iter().map(|(name, _)| name.clone()).collect()
+        };
+        refuse!(
+            "shells/psreadline is not the checkout's package: the tree holds {:?} and the checkout \
+             {:?}, or a file differs",
+            names(&in_tree),
+            names(&in_checkout)
+        );
+    }
+    Ok(())
+}
+
+/// Every file under `directory`, by its path from it and its digest, sorted.
+fn files_under(directory: &Path) -> Result<Vec<(String, [u8; 32])>> {
+    fn walk(base: &Path, directory: &Path, found: &mut Vec<(String, [u8; 32])>) -> Result<()> {
+        let entries = std::fs::read_dir(directory)
+            .map_err(|error| crate::refusal::unreadable(directory, &error))?;
+        for entry in entries {
+            let path = entry
+                .map_err(|error| crate::refusal::unreadable(directory, &error))?
+                .path();
+            if path.is_dir() {
+                walk(base, &path, found)?;
+            } else {
+                let relative = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                found.push((relative, digest_file(&path)?));
+            }
+        }
+        Ok(())
+    }
+    let mut found = Vec::new();
+    walk(directory, directory, &mut found)?;
+    found.sort();
+    Ok(found)
 }
 
 /// One package, held to its pins.
@@ -142,17 +200,51 @@ fn package(tree: &Path, checkout: &Path, shell: &str) -> Result<ReleaseShell> {
     held_to_the_checkout(checkout, &pins_directory, shell, &pins, &record)
         .map_err(|Refusal(why)| Refusal(at(&why)))?;
 
-    // The startup entry in the tree is the checkout's.
+    // The startup entry in the tree is the checkout's, in the package and in the stable place an
+    // installed host's startup files source it from.
     let entry = text(&pins["startup"]["file"])?;
-    if digest_file(&package_directory.join(&entry))? != digest_file(&pins_directory.join(&entry))? {
+    let checkouts = digest_file(&pins_directory.join(&entry))?;
+    if digest_file(&package_directory.join(&entry))? != checkouts {
         refuse!(
             "{}",
             at(&format!("its startup entry {entry} is not the checkout's"))
         );
     }
+    let stable = shell_directory.join(
+        Path::new(&entry)
+            .file_name()
+            .ok_or_else(|| Refusal(at("its startup entry names no file")))?,
+    );
+    match digest_file(&stable) {
+        Ok(found) if found == checkouts => {}
+        _ => refuse!(
+            "{}",
+            at(&format!(
+                "the stable startup entry beside it is missing or is not the checkout's {entry}"
+            ))
+        ),
+    }
 
-    // The module trees, where the shell searches for them.
+    // The module trees, where the shell searches for them: the ones the pins name, and no others.
     let build_root = build_root(&record, shell, &identity)?;
+    let mut recorded_names: Vec<String> = array(&record["shell"]["modules"])?
+        .iter()
+        .map(|module| text(&module["name"]))
+        .collect::<Result<_>>()?;
+    let mut pinned_names: Vec<String> = array(&pins["modules"])?
+        .iter()
+        .map(text)
+        .collect::<Result<_>>()?;
+    recorded_names.sort();
+    pinned_names.sort();
+    if recorded_names != pinned_names {
+        refuse!(
+            "{}",
+            at(&format!(
+                "it states the modules {recorded_names:?} and the pins name {pinned_names:?}"
+            ))
+        );
+    }
     let mut modules = Vec::new();
     for module in array(&record["shell"]["modules"])? {
         let recorded = PathBuf::from(text(&module["search_path"])?);
