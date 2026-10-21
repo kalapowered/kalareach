@@ -599,11 +599,26 @@ impl Device {
     }
 
     /// Begins taking an invitation in. Any intake still waiting is void from now on, and holds
-    /// nothing when its text arrives.
+    /// nothing when its text arrives. The invitation already held is let go of: a person has one
+    /// in hand at a time, so closing the scanner or the picker leaves none rather than the one
+    /// before it.
     pub fn begin_intake(&self) -> Intake {
         let mut number = lock(&self.intake);
         *number += 1;
-        Intake(*number)
+        let intake = Intake(*number);
+        let let_go = lock(&self.held).take().is_some();
+        drop(number);
+        if let_go {
+            (self.changed)();
+        }
+        intake
+    }
+
+    /// Whether `intake` is still the one under way: nothing newer, no stop and no attempt has
+    /// voided it.
+    #[must_use]
+    pub fn owns(&self, intake: Intake) -> bool {
+        *lock(&self.intake) == intake.0
     }
 
     /// Voids the intake under way, when there is one.
@@ -732,8 +747,10 @@ impl Device {
         {
             return Err(CommandError::refused("an attempt is already running"));
         }
-        // What an intake still waiting would hold is no longer wanted: an attempt has begun.
+        // What an intake still waiting would hold is no longer wanted: an attempt has begun, and an
+        // invitation held beside it is not the one this attempt uses.
         self.void_intakes();
+        *lock(&self.held) = None;
         let pairing = Arc::clone(&self.pairing);
         let progress = self.progress.clone();
         let device = Arc::downgrade(self);

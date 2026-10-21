@@ -900,7 +900,8 @@ fn quiet_device(data: &std::path::Path) -> (Arc<Device>, Arc<CountingRoom>) {
 /// platform's own alert, which names both services, and a declined one holds nothing and contacts
 /// nothing; the text of a read code never reaches the page; what is not an invitation, a picture
 /// with no code and a camera that is not allowed are three different words; and a scanner or a
-/// picker the person closes is no failure and leaves a held invitation as it was.
+/// picker the person closes is no failure, and leaves nothing held, since a new intake lets go of
+/// the invitation held before it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_code_the_camera_or_the_picker_reads_is_taken_in_as_a_pasted_one_is() {
     use companion_tauri::pairing::take_in;
@@ -946,11 +947,23 @@ async fn a_code_the_camera_or_the_picker_reads_is_taken_in_as_a_pasted_one_is() 
         vec![Source::Camera, Source::Photo]
     );
 
-    // Closing the scanner is no failure, and the invitation already held stays.
+    // Closing the scanner is no failure, and the invitation held before it is let go of: a person
+    // has one in hand, so a scan that ends with nothing leaves nothing to start with.
+    assert!(
+        device.view().invitation.is_some(),
+        "one is held before the scan"
+    );
     intake.will_answer(Scan::Cancelled);
     let view = take_in(&*intake, &device, Source::Camera).await;
     assert!(view.cancelled && view.failure.is_none());
-    assert!(device.view().invitation.is_some(), "the held one stays");
+    assert!(
+        device.view().invitation.is_none(),
+        "a new intake let go of the one held"
+    );
+    assert!(
+        device.start_held().is_err(),
+        "nothing is waiting to be used"
+    );
 
     // What is not a KalaReach invitation is refused whatever read it, and holds nothing new.
     intake.will_read(r#"{"mode":"direct"}"#);
@@ -1054,6 +1067,46 @@ async fn an_intake_that_was_overtaken_holds_nothing() {
     assert!(view.cancelled && view.invitation.is_none());
     assert!(device.view().invitation.is_none(), "nothing was restored");
     device.stop().await;
+
+    // A reader that answers after it was overtaken says nothing, whatever it answered: no word of
+    // failure on the page, and no alert for a code that names another service.
+    let asked_of_reader = |intake: &Arc<StubIntake>, before: usize| {
+        let intake = Arc::clone(intake);
+        async move {
+            tokio::time::timeout(WATCHDOG, async {
+                while intake.read_from.lock().expect("the record").len() == before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the reader is asked");
+        }
+    };
+    for late in [
+        Ok(Scan::NoCode),
+        Ok(Scan::CameraDenied),
+        Err(companion_platform::PlatformError(
+            "the scanner could not start".to_owned(),
+        )),
+        Ok(Scan::Text(zeroize::Zeroizing::new(text.clone()))),
+    ] {
+        intake.asked.lock().expect("the record").clear();
+        let before = intake.read_from.lock().expect("the record").len();
+        let reading = intake.hold_the_read();
+        let (view, ()) = tokio::join!(take_in(&*intake, &device, Source::Camera), async {
+            asked_of_reader(&intake, before).await;
+            device.stop().await;
+            reading.send(late).expect("the intake waits");
+        });
+        assert!(
+            view.cancelled && view.failure.is_none() && view.invitation.is_none() && !view.declined,
+            "an overtaken reading says nothing"
+        );
+        assert!(
+            intake.asked.lock().expect("the record").is_empty(),
+            "no alert was raised for it"
+        );
+    }
 }
 
 /// The page is told which sources this device reads a code from: a desktop none, a phone the camera

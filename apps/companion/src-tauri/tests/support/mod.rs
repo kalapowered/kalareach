@@ -359,6 +359,9 @@ pub struct StubIntake {
     offered: Mutex<Sources>,
     /// An alert held until the test answers it, instead of answered at once.
     held_alert: Mutex<Option<tokio::sync::oneshot::Receiver<bool>>>,
+    /// A reading held until the test answers it, instead of answered at once.
+    held_read:
+        Mutex<Option<tokio::sync::oneshot::Receiver<std::result::Result<Scan, PlatformError>>>>,
     /// The services the person was asked about, each with the one this computer is set to use.
     pub asked: Mutex<Vec<(String, String)>>,
     /// Each source a code was read from.
@@ -413,6 +416,15 @@ impl StubIntake {
             .push_back(Err(PlatformError("the scanner could not start".to_owned())));
     }
 
+    /// The next reading by the scanner or the picker waits until the returned sender answers it.
+    pub fn hold_the_read(
+        &self,
+    ) -> tokio::sync::oneshot::Sender<std::result::Result<Scan, PlatformError>> {
+        let (answer, held) = tokio::sync::oneshot::channel();
+        *self.held_read.lock().expect("the reading") = Some(held);
+        answer
+    }
+
     /// The next alert waits until the returned sender answers it.
     pub fn hold_the_alert(&self) -> tokio::sync::oneshot::Sender<bool> {
         let (answer, held) = tokio::sync::oneshot::channel();
@@ -441,13 +453,19 @@ impl companion_tauri::pairing::IntakePlatform for StubIntake {
         source: Source,
     ) -> kr_client::pairing::BoxFuture<'_, std::result::Result<Scan, PlatformError>> {
         self.read_from.lock().expect("the record").push(source);
+        let held = self.held_read.lock().expect("the reading").take();
         let answer = self
             .scans
             .lock()
             .expect("the scans")
             .pop_front()
             .unwrap_or(Ok(Scan::Cancelled));
-        Box::pin(async move { answer })
+        Box::pin(async move {
+            match held {
+                Some(held) => held.await.unwrap_or(Ok(Scan::Cancelled)),
+                None => answer,
+            }
+        })
     }
 
     fn use_another_service<'a>(
