@@ -11,8 +11,9 @@ refuse, from the archive alone and never from a host:
   * an entry that is a link, a hard link, a device, a pipe or a sparse file, or anything but a file
     or a directory;
   * an absolute path, a path that climbs out of the top directory (`..`), a path with a backslash,
-    a NUL or a drive letter, a path outside the one top directory, and two paths that are one path
-    on a system that folds case;
+    a NUL or a drive letter, a path outside the one top directory, a file where the top directory
+    is, a path that is a file and a directory, and two paths that are one path on a system that
+    folds case;
   * a file the manifest in the archive does not list, a listed file that is missing, and a listed
     file whose length or SHA-256 digest differs;
   * a top directory that is not the one the manifest's target and release name;
@@ -111,17 +112,33 @@ def check(archive, sums=None):
         raise Refused(f"{base} is not a .tar.gz or a .zip")
 
     files = {}
+    # Every path the archive names, file or directory, explicit or as the parent of another: a path
+    # is one or the other, and two spellings that a system folding case reads as one are refused.
+    kinds = {}
     folded = {}
+
+    def note(path, kind):
+        lowered = path.lower()
+        if lowered in folded and folded[lowered] != path:
+            raise Refused(f"{path!r} and {folded[lowered]!r} are one path on a system that folds case")
+        folded[lowered] = path
+        if kinds.setdefault(path, kind) != kind:
+            raise Refused(f"{path!r} is a file and a directory in the archive")
+
     for name, kind, data in members(archive):
         relative = check_name(name, top) if name.rstrip("/") != top else ""
-        if kind == "dir" or relative == "":
+        if relative == "":
+            if kind == "file":
+                raise Refused(f"{name!r} is a file where the top directory is")
+            continue
+        parts = relative.split("/")
+        for depth in range(1, len(parts)):
+            note("/".join(parts[:depth]), "dir")
+        note(relative, kind)
+        if kind == "dir":
             continue
         if relative in files:
             raise Refused(f"{name!r} is in the archive twice")
-        lowered = relative.lower()
-        if lowered in folded and folded[lowered] != relative:
-            raise Refused(f"{relative!r} and {folded[lowered]!r} are one path on a system that folds case")
-        folded[lowered] = relative
         files[relative] = data
 
     if MANIFEST not in files:
@@ -205,6 +222,19 @@ def write_tar(path, top, files, extra=(), manifest=None):
             archive.addfile(info, io.BytesIO(data) if info.size else None)
 
 
+def write_zip(path, top, files, extra=()):
+    """A zip of `files` under `top`, with each of `extra` added: (name, unix mode, data)."""
+    with zipfile.ZipFile(path, "w") as archive:
+        body = dict(files)
+        body[MANIFEST] = manifest_for(files, target="x86_64-pc-windows-msvc")
+        for name, data in sorted(body.items()):
+            archive.writestr(f"{top}/{name}", data)
+        for name, mode, data in extra:
+            info = zipfile.ZipInfo(name)
+            info.external_attr = mode << 16
+            archive.writestr(info, data)
+
+
 def self_test():
     failures = 0
     with tempfile.TemporaryDirectory() as scratch:
@@ -272,7 +302,48 @@ def self_test():
                 files={**good_files(), "share/A": b"x", "share/a": b"y"},
             ),
         )
+        expect(
+            "a file where the top directory is",
+            True,
+            lambda: made(extra=[(top, tarfile.REGTYPE, b"x", None)]),
+        )
+        expect(
+            "a path that is a file and a directory",
+            True,
+            lambda: made(extra=[(f"{top}/bin/kr/", tarfile.DIRTYPE, b"", None)]),
+        )
+        expect(
+            "a file that is the parent of another",
+            True,
+            lambda: made(files={**good_files(), "share": b"x"}),
+        )
         expect("a top directory the manifest does not name", True, lambda: made(top_name="kalareach-other", name=top + ".tar.gz"))
+
+        # The same faults in a zip, which is what a Windows release is.
+        ztop = "kalareach-x86_64-pc-windows-msvc-0.1.0+aaaaaaaaaaaa"
+
+        def zipped(extra=(), files=None):
+            path = os.path.join(scratch, ztop + ".zip")
+            write_zip(path, ztop, files if files is not None else good_files(), extra)
+            return path
+
+        def expect_zip(label, refused, build):
+            nonlocal failures
+            try:
+                check(build())
+                outcome = "passed"
+            except Refused as error:
+                outcome = f"refused: {error}"
+            ok = (outcome != "passed") if refused else (outcome == "passed")
+            print(f"{'ok  ' if ok else 'FAIL'} {label}: {outcome}")
+            if not ok:
+                failures += 1
+
+        expect_zip("a zip release of regular files", False, lambda: zipped())
+        expect_zip("a zip with a link", True, lambda: zipped([(f"{ztop}/bin/link", 0o120777, b"kr")]))
+        expect_zip("a zip with a file where the top directory is", True, lambda: zipped([(ztop, 0o100644, b"x")]))
+        expect_zip("a zip with a file that is also a directory", True, lambda: zipped([(f"{ztop}/bin/kr/", 0o040755, b"")]))
+        expect_zip("a zip with a path that climbs out", True, lambda: zipped([(f"{ztop}/../x", 0o100644, b"x")]))
 
         sums = os.path.join(scratch, "SHA256SUMS")
         made()
