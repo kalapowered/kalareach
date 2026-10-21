@@ -520,6 +520,8 @@ export type FailureKind =
   | 'not_an_invitation'
   | 'newer_invitation'
   | 'nothing_to_paste'
+  | 'camera_denied'
+  | 'no_code_found'
   | 'store_failed'
   | 'approval_unknown'
 
@@ -598,12 +600,21 @@ export interface HostRow {
   readonly in_contact: boolean | null
 }
 
+/** Where this device reads a code from, besides the pasteboard. A computer reads from neither. */
+export interface PairingSources {
+  /** The device has a camera the scanner can use. */
+  readonly camera: boolean
+  /** The device offers a picker for pictures. */
+  readonly photo: boolean
+}
+
 /** Everything the pairing screen shows. */
 export interface PairingView {
   readonly origin: PairingOrigin
   readonly device_name: string
   readonly state: AttemptState
   readonly invitation: InvitationSummary | null
+  readonly sources: PairingSources
   readonly hosts: readonly HostRow[]
 }
 
@@ -616,12 +627,17 @@ export interface PairingUnavailable {
   readonly unavailable: string
 }
 
-/** What reading the pasteboard found. */
-export interface PasteView {
+/** What taking an invitation in from the pasteboard, the camera or a picture found. */
+export interface IntakeView {
   readonly invitation: InvitationSummary | null
   readonly failure: FailureKind | null
   readonly cleared: boolean
   readonly declined: boolean
+  /**
+   * Nothing was taken in, and nothing is wrong: the person closed the scanner or the picker, or a
+   * newer intake, a stop or an attempt came first.
+   */
+  readonly cancelled: boolean
 }
 
 /** The ceremony this computer offers an owner. */
@@ -1774,7 +1790,19 @@ export interface HostPort {
   /** Starts pairing with a code the person typed. Native code parses it and never hands it back. */
   pairingStartCode(code: string): Promise<void>
   /** Reads an invitation from the pasteboard in native code, and holds it. */
-  pairingPaste(): Promise<PasteView>
+  pairingPaste(): Promise<IntakeView>
+  /**
+   * Shows the phone's scanner and reads an invitation from the code it sees, in native code, and
+   * holds it. Resolves when the scanner closes.
+   */
+  pairingScan(): Promise<IntakeView>
+  /**
+   * Shows the system's picker and reads an invitation from the code in the picture the person
+   * chose, in native code, and holds it. Resolves when the picker closes.
+   */
+  pairingScanPhoto(): Promise<IntakeView>
+  /** Opens this application's page in the system's settings, where the camera is allowed. */
+  pairingOpenSettings(): Promise<void>
   /** Starts pairing with the invitation read from the pasteboard. */
   pairingStartRead(): Promise<void>
   /** Ends the attempt on this computer, or drops a pasted invitation. */

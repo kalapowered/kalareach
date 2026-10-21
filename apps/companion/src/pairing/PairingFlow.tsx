@@ -22,6 +22,7 @@ import {
   type AttemptState,
   type FailureKind,
   type HostRow,
+  type IntakeView,
   type InvitationSummary,
   type PairingFailure,
   type PairingView
@@ -35,10 +36,12 @@ import {
   failureSentence,
   failureWords,
   minutesLeft,
+  readingFrom,
   timeLeft,
   triesTheCodeAgain,
   type AttemptMode,
-  type NextAction
+  type NextAction,
+  type Reading
 } from './words'
 
 /** Which of the column's states is showing. */
@@ -82,6 +85,11 @@ function until(ms: number | null): string {
   return ms === null ? '' : ` until ${clockTime(ms)}`
 }
 
+/** The first letter of `words` as a capital, for a sentence that starts with it. */
+function capitalised(words: string): string {
+  return words.charAt(0).toUpperCase() + words.slice(1)
+}
+
 /**
  * The pairing screen's column.
  *
@@ -93,7 +101,8 @@ function until(ms: number | null): string {
 export function PairingFlow({
   chooseHost,
   forgetHost,
-  focusTheField = true
+  focusTheField = true,
+  device = 'computer'
 }: {
   readonly chooseHost?: (reference: string) => Promise<void>
   readonly forgetHost?: (reference: string) => Promise<void>
@@ -103,6 +112,8 @@ export function PairingFlow({
    * focusing a field there would raise the keyboard over a screen the person only opened.
    */
   readonly focusTheField?: boolean
+  /** What the person calls the device the application runs on, in the words that name it. */
+  readonly device?: 'phone' | 'computer'
 } = {}): ReactNode {
   const { port, say } = useApp()
   const [view, setView] = useState<PairingView | null>(null)
@@ -193,6 +204,7 @@ export function PairingFlow({
     expiresAt !== null && minutesLeft(expiresAt, now) <= 1 ? 'One minute left' : ''
 
   const service = view?.origin.host ?? 'the pairing service'
+  const thisDevice = device === 'phone' ? 'this phone' : 'this computer'
 
   const stop = useCallback(
     (afterwards?: () => void) => {
@@ -220,10 +232,12 @@ export function PairingFlow({
     })
   }
 
-  const paste = () => {
+  // Taking an invitation in: from the pasteboard, from the phone's scanner or from a picture. What
+  // comes back says what it was, never what it says; a scanner or a picker the person closed is no
+  // failure and says nothing.
+  const takeIn = (take: () => Promise<IntakeView>) => {
     setPasteFailure(null)
-    port
-      .pairingPaste()
+    take()
       .then((result) => {
         if (result.failure !== null) setPasteFailure(result.failure)
         if (result.cleared) say('The invitation was taken from the clipboard and cleared from it.')
@@ -232,6 +246,27 @@ export function PairingFlow({
       .catch((error: unknown) => {
         say(failureMessage(error), 'danger')
       })
+  }
+  const paste = () => {
+    takeIn(() => port.pairingPaste())
+  }
+  const scan = () => {
+    takeIn(() => port.pairingScan())
+  }
+  const choosePhoto = () => {
+    takeIn(() => port.pairingScanPhoto())
+  }
+  const reading: Reading = readingFrom(view?.sources)
+  // The same invitation brought in again, the way this device brings one in first.
+  const again = () => {
+    if (reading === 'camera') scan()
+    else if (reading === 'photo') choosePhoto()
+    else paste()
+  }
+  const openSettings = () => {
+    port.pairingOpenSettings().catch((error: unknown) => {
+      say(failureMessage(error), 'danger')
+    })
   }
 
   const next = (action: NextAction) => {
@@ -246,8 +281,11 @@ export function PairingFlow({
           setChanging(true)
         })
         return
-      case 'paste_again':
-        stop(paste)
+      case 'new_invitation':
+        stop(again)
+        return
+      case 'open_settings':
+        openSettings()
         return
       case 'new_code':
       case 'try_again':
@@ -285,9 +323,18 @@ export function PairingFlow({
             Pair with a host
           </h1>
           <p className="muted">
-            Enter the pairing code your host shows. On the host, <code>kr pair invite</code> makes
-            one.
+            {view.sources.camera
+              ? 'Scan the QR code your host shows, or enter its pairing code. '
+              : 'Enter the pairing code your host shows. '}
+            On the host, <code>kr pair invite</code> makes one.
           </p>
+          {view.sources.camera ? (
+            <div className="pairing-scan">
+              <Button data-wraps tone="primary" data-testid="scan-code" onClick={scan}>
+                Scan code
+              </Button>
+            </div>
+          ) : null}
           <form
             className="pairing-entry"
             onSubmit={(event) => {
@@ -331,17 +378,29 @@ export function PairingFlow({
               ) : null}
             </div>
             <div className="row wrap">
-              <Button type="submit" tone="primary" data-testid="pair" disabled={!codeComplete(code)}>
+              <Button data-wraps type="submit" tone="primary" data-testid="pair" disabled={!codeComplete(code)}>
                 Pair
               </Button>
-              <Button tone="quiet" data-testid="paste-invitation" onClick={paste}>
+              {view.sources.photo ? (
+                <Button data-wraps tone="quiet" data-testid="choose-photo" onClick={choosePhoto}>
+                  Choose a photo
+                </Button>
+              ) : null}
+              <Button data-wraps tone="quiet" data-testid="paste-invitation" onClick={paste}>
                 Paste invitation
               </Button>
             </div>
             {pasteFailure !== null ? (
               <p className="small danger-text" role="alert" data-testid="paste-failure">
-                {failureWords(pasteFailure, service).sentence}
+                {failureWords(pasteFailure, service, 'code', reading).sentence}
               </p>
+            ) : null}
+            {pasteFailure === 'camera_denied' ? (
+              <div className="row">
+                <Button data-wraps tone="quiet" data-testid="open-settings" onClick={openSettings}>
+                  Open Settings
+                </Button>
+              </div>
             ) : null}
           </form>
           <div className="pairing-settings">
@@ -349,7 +408,7 @@ export function PairingFlow({
               <p className="small">
                 Codes go through <strong data-testid="pairing-service">{view.origin.host}</strong>
               </p>
-              <Button
+              <Button data-wraps
                 tone="quiet"
                 data-testid="change-service"
                 aria-expanded={changing}
@@ -391,14 +450,14 @@ export function PairingFlow({
                 />
                 <p className="form-hint">An https address, like https://reach.kala.to.</p>
                 <div className="row">
-                  <Button type="submit" tone="primary" data-testid="save-service">
+                  <Button data-wraps type="submit" tone="primary" data-testid="save-service">
                     Use this service
                   </Button>
                 </div>
               </form>
             ) : null}
             <p className="small muted" data-testid="device-name">
-              This computer appears as “{view.device_name}”
+              {capitalised(thisDevice)} appears as “{view.device_name}”
             </p>
           </div>
         </section>
@@ -406,6 +465,7 @@ export function PairingFlow({
 
       {screen === 'pasted' && view.invitation ? (
         <Pasted
+          thisDevice={thisDevice}
           invitation={view.invitation}
           heading={heading}
           now={now}
@@ -437,9 +497,9 @@ export function PairingFlow({
             Check this value on the host
           </h1>
           <VerificationValue value={view.state.value} />
-          <p>Approve this computer on the host only if it shows the same value.</p>
+          <p>Approve {thisDevice} on the host only if it shows the same value.</p>
           <p className="muted" data-testid="grant-line">
-            If approved, this computer can {view.state.authority}
+            If approved, {thisDevice} can {view.state.authority}
             {until(view.state.grant_expires_at_ms)}.
           </p>
           <p className="small muted tabular" data-testid="waiting-line">
@@ -447,7 +507,7 @@ export function PairingFlow({
             {view.state.expires_at_ms !== null ? `, ${timeLeft(view.state.expires_at_ms, now)}` : ''}
           </p>
           <div className="row">
-            <Button
+            <Button data-wraps
               data-testid="stop-waiting"
               onClick={() => {
                 setCode('')
@@ -472,7 +532,7 @@ export function PairingFlow({
             Connection lost. Reconnecting.
           </p>
           <div className="row">
-            <Button
+            <Button data-wraps
               data-testid="stop-waiting"
               onClick={() => {
                 setCode('')
@@ -494,11 +554,11 @@ export function PairingFlow({
           </h1>
           <p data-testid="paired-line">
             {view.state.host.owner
-              ? `This computer is an owner of ${view.state.host.name ?? 'your host'}. It will ask you to confirm changes there.`
-              : `This computer can ${view.state.host.authority} on ${view.state.host.name ?? 'your host'}${until(view.state.host.grant_expires_at_ms)}.`}
+              ? `${capitalised(thisDevice)} is an owner of ${view.state.host.name ?? 'your host'}. It will ask you to confirm changes there.`
+              : `${capitalised(thisDevice)} can ${view.state.host.authority} on ${view.state.host.name ?? 'your host'}${until(view.state.host.grant_expires_at_ms)}.`}
           </p>
           <div className="row">
-            <Button
+            <Button data-wraps
               tone="primary"
               data-testid="pairing-done"
               onClick={() => {
@@ -516,6 +576,7 @@ export function PairingFlow({
           failure={view.state.failure}
           mode={view.state.mode}
           service={view.state.service ?? service}
+          reading={reading}
           heading={heading}
           onAction={next}
         />
@@ -549,33 +610,35 @@ function Ended({
   failure,
   mode,
   service,
+  reading,
   heading,
   onAction
 }: {
   readonly failure: PairingFailure
   readonly mode: AttemptMode
   readonly service: string
+  readonly reading: Reading
   readonly heading: RefObject<HTMLHeadingElement | null>
   readonly onAction: (action: NextAction) => void
 }): ReactNode {
-  const { action } = failureWords(failure.kind, service, mode)
+  const { action } = failureWords(failure.kind, service, mode, reading)
   return (
     <section aria-labelledby="pairing-ended" className="pairing-section">
       <h1 id="pairing-ended" ref={heading} tabIndex={-1}>
         Pairing did not finish
       </h1>
       <p role="alert" data-testid="failure-sentence">
-        {failureSentence(failure, service, mode)}
+        {failureSentence(failure, service, mode, reading)}
       </p>
       <div className="row">
-        <Button
+        <Button data-wraps
           tone="primary"
           data-testid="failure-action"
           onClick={() => {
             onAction(action)
           }}
         >
-          {actionLabel(action)}
+          {actionLabel(action, reading)}
         </Button>
       </div>
     </section>
@@ -597,12 +660,14 @@ function workingLine(state: AttemptState): string {
 
 /** The summary of an invitation read from the clipboard, before the person uses it. */
 function Pasted({
+  thisDevice,
   invitation,
   heading,
   now,
   onPair,
   onCancel
 }: {
+  readonly thisDevice: string
   readonly invitation: InvitationSummary
   readonly heading: RefObject<HTMLHeadingElement | null>
   readonly now: number
@@ -624,7 +689,7 @@ function Pasted({
         <div className="card-body">
           <p data-testid="invitation-summary">
             {invitation.mode === 'direct'
-              ? `Invitation from a host on this network. If approved, this computer can ${invitation.authority ?? 'view sessions'}${until(invitation.grant_expires_at_ms)}.${
+              ? `Invitation from a host on this network. If approved, ${thisDevice} can ${invitation.authority ?? 'view sessions'}${until(invitation.grant_expires_at_ms)}.${
                   invitation.expires_at_ms !== null
                     ? ` It expires in ${timeLeft(invitation.expires_at_ms, now).replace(' left', '')}.`
                     : ''
@@ -633,10 +698,10 @@ function Pasted({
           </p>
         </div>
         <div className="card-footer">
-          <Button onClick={onCancel} data-testid="cancel-invitation">
+          <Button data-wraps onClick={onCancel} data-testid="cancel-invitation">
             Cancel
           </Button>
-          <Button tone="primary" onClick={onPair} data-testid="pair-invitation">
+          <Button data-wraps tone="primary" onClick={onPair} data-testid="pair-invitation">
             Pair
           </Button>
         </div>
@@ -712,7 +777,7 @@ function PairedHosts({
                   {host.owner ? ' This phone also stops confirming requests from it.' : ''}
                 </p>
                 <div className="row wrap">
-                  <Button
+                  <Button data-wraps
                     ref={keep}
                     data-testid="keep-host"
                     onClick={() => {
@@ -722,7 +787,7 @@ function PairedHosts({
                   >
                     Keep it
                   </Button>
-                  <Button
+                  <Button data-wraps
                     tone="danger"
                     data-testid="forget-host-confirm"
                     aria-disabled={forgetting !== null}
@@ -756,7 +821,7 @@ function PairedHosts({
                     In use
                   </span>
                 ) : (
-                  <Button
+                  <Button data-wraps
                     disabled={using !== null}
                     data-testid="use-host"
                     onClick={() => {
@@ -775,7 +840,7 @@ function PairedHosts({
                   </Button>
                 )}
                 {forgetHost === undefined ? null : (
-                  <Button
+                  <Button data-wraps
                     ref={(button) => {
                       if (button === null) forgetButtons.current.delete(host.reference)
                       else forgetButtons.current.set(host.reference, button)

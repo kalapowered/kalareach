@@ -61,8 +61,9 @@ import type {
   OpenRequest,
   OwnerView,
   PairingUnavailable,
+  PairingSources,
   PairingView,
-  PasteView,
+  IntakeView,
   RecoveryView,
   RevocationStanding,
   RevocationView,
@@ -697,8 +698,12 @@ export interface FakeHostControls {
    * can read, as a host older than the one that added it does.
    */
   leaveNextVoiceAllowFenceUnreadable(): void
-  /** What the next paste from the clipboard finds. */
-  setPasteboard(result: PasteView): void
+  /** What the next intake from `source` finds. */
+  setIntake(source: IntakeSource, result: IntakeView): void
+  /** The sources the page took an invitation in from, in order. */
+  readonly intakes: IntakeSource[]
+  /** How many times the page asked to open this application's page in the system's settings. */
+  readonly settingsOpened: { count: number }
   /** The codes the page started pairing with, in order. */
   readonly startedCodes: string[]
   /** Sets the confirmations the hosts ask for, as native code would publish them. */
@@ -859,6 +864,9 @@ const STOCK_SHELL_PATHS: Readonly<Record<ShellKind, string>> = {
   powershell: '/usr/local/bin/pwsh'
 }
 
+/** Where an invitation is taken in from. */
+export type IntakeSource = 'pasteboard' | 'camera' | 'photo'
+
 /** The fake host, and the controls a test drives it with. */
 export function fakeHost(
   options: { readonly drafts?: FakeDraftStore; readonly stockShell?: ShellKind } = {}
@@ -890,6 +898,12 @@ export function fakeHost(
     device_name: 'studio-mbp',
     state: { state: 'idle' },
     invitation: null,
+    sources: ((): PairingSources => {
+      // What the address asks this host to offer: `scan=camera`, `scan=photo` or `scan=both`.
+      if (typeof window === 'undefined') return { camera: false, photo: false }
+      const asked = new URLSearchParams(window.location.search).get('scan')
+      return { camera: asked === 'camera' || asked === 'both', photo: asked === 'photo' || asked === 'both' }
+    })(),
     hosts: []
   }
   /**
@@ -915,11 +929,25 @@ export function fakeHost(
     pairing = { ...pairing, ...change }
     for (const listener of pairingListeners) listener(pairing)
   }
-  let pasteboard: PasteView = {
+  const NOTHING_TO_PASTE: IntakeView = {
     invitation: null,
     failure: 'nothing_to_paste',
     cleared: false,
-    declined: false
+    declined: false,
+    cancelled: false
+  }
+  const intakeResults: Record<IntakeSource, IntakeView> = {
+    pasteboard: NOTHING_TO_PASTE,
+    camera: { ...NOTHING_TO_PASTE, failure: null, cancelled: true },
+    photo: { ...NOTHING_TO_PASTE, failure: null, cancelled: true }
+  }
+  const intakes: IntakeSource[] = []
+  const settingsOpened = { count: 0 }
+  const takeIn = (source: IntakeSource): Promise<IntakeView> => {
+    intakes.push(source)
+    const result = intakeResults[source]
+    if (result.invitation !== null) publishPairing({ invitation: result.invitation })
+    return Promise.resolve(result)
   }
   const startedCodes: string[] = []
   let owner: OwnerView = { ceremony: 'touch_id', requests: [] }
@@ -2107,9 +2135,12 @@ export function fakeHost(
       publishPairing({ state: { state: 'working', stage: 'reaching_service' } })
       return Promise.resolve()
     },
-    pairingPaste: () => {
-      if (pasteboard.invitation !== null) publishPairing({ invitation: pasteboard.invitation })
-      return Promise.resolve(pasteboard)
+    pairingPaste: () => takeIn('pasteboard'),
+    pairingScan: () => takeIn('camera'),
+    pairingScanPhoto: () => takeIn('photo'),
+    pairingOpenSettings: () => {
+      settingsOpened.count += 1
+      return Promise.resolve()
     },
     pairingStartRead: () => {
       if (pairing.invitation === null) refuse('PERMISSION_DENIED', 'No invitation is waiting.')
@@ -3180,9 +3211,11 @@ export function fakeHost(
     setPairing(change) {
       publishPairing(change)
     },
-    setPasteboard(result) {
-      pasteboard = result
+    setIntake(source, result) {
+      intakeResults[source] = result
     },
+    intakes,
+    settingsOpened,
     startedCodes,
     setConfirmations(view) {
       publishOwner(view)
