@@ -64,10 +64,15 @@ fn session(number: u8) -> SessionId {
 
 /// The authority a host builds from its project service, with something a test does the moment a
 /// grant is made: the interval a capture then reads across.
-#[derive(Debug)]
 struct Probing<'a> {
     inner: ProjectQuiescence<'a>,
     probe: Box<dyn Fn() + Send + Sync + 'a>,
+}
+
+impl std::fmt::Debug for Probing<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Probing")
+    }
 }
 
 impl QuiescenceAuthority for Probing<'_> {
@@ -250,13 +255,23 @@ fn a_capture_under_the_projects_authority_is_quiesced_and_the_hosts_writers_are_
         probe: Box::new({
             let refused = Arc::clone(&refused);
             let project = Arc::clone(&project);
-            let apply_order = order(&scene, scene.shared, &affected, &limitations);
+            let apply_affected = affected.clone();
+            let apply_limitations = limitations.clone();
+            let version = scene.version;
+            let shared = scene.shared;
             let service_for_apply = scene.fixture.service();
             let work = scene.fixture.work().to_path_buf();
             let environment_id = scene.fixture.environment_id();
             let source_project = scene.project;
             move || {
                 let mut seen = refused.lock().expect("the lock");
+                let apply_order = support::apply_order(
+                    version,
+                    DestinationClass::SharedExisting,
+                    shared,
+                    &apply_affected,
+                    &apply_limitations,
+                );
                 if let Err(error) = apply::apply(service_for_apply, &apply_order) {
                     seen.push(("diff.apply", error.code()));
                 }
