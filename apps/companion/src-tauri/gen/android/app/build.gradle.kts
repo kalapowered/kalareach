@@ -125,34 +125,41 @@ dependencies {
  * What this build is allowed to link.
  *
  * A version number selects an artefact; it does not establish that the same bytes arrive next
- * time. The media library carries native code into the packaged application, so its bytes are
- * checked as well as its version. Gradle's own `verification-metadata.xml` is deliberately not
- * used: once that file exists Gradle verifies every artefact in the graph and fails on any without
- * an entry, which would make one pinned library the whole build's problem. This checks the one
- * artefact this task pinned, and says plainly when it cannot find it.
+ * time. The libraries below carry native code into the packaged application, so their bytes are
+ * checked as well as their versions: the media library, and the camera library whose two native
+ * libraries the scanner loads (every one of their segments aligns to 16 KiB, which Android 15 and
+ * later require). Gradle's own `verification-metadata.xml` is deliberately not used: once that file
+ * exists Gradle verifies every artefact in the graph and fails on any without an entry, which would
+ * make one pinned library the whole build's problem. This checks the artefacts this build pinned,
+ * and says plainly when it cannot find one.
  */
-val voiceMediaSha256 = "0a1627b1a48c2bc17d9a40d62fc47bd45166f44a311e95917f147c402de379b0"
+val pinnedNativeLibraries = mapOf(
+    "io.github.webrtc-sdk:android:150.7871.01" to
+        "0a1627b1a48c2bc17d9a40d62fc47bd45166f44a311e95917f147c402de379b0",
+    "androidx.camera:camera-core:1.4.2@aar" to
+        "bbca13760ce1587502eb15723d0e17fa0a3495d084e609c4e4c8d3c2e1c85cf8",
+)
 
 afterEvaluate {
-    val verifyVoiceMedia by tasks.registering {
-        description = "Checks the native media library's bytes against the digest this build pins."
+    val verifyNativeLibraries by tasks.registering {
+        description = "Checks each native library's bytes against the digest this build pins."
         doLast {
-            val detached = configurations.detachedConfiguration(
-                dependencies.create("io.github.webrtc-sdk:android:150.7871.01")
-            )
-            val file = detached.singleFile
-            val digestBytes = MessageDigest.getInstance("SHA-256").digest(file.readBytes())
-            val digest = digestBytes.joinToString("") { b -> "%02x".format(b) }
-            if (digest != voiceMediaSha256) {
-                throw GradleException(
-                    "the native media library's bytes are not the ones this build pins: expected " +
-                        "$voiceMediaSha256, found $digest"
-                )
+            for ((coordinates, pinned) in pinnedNativeLibraries) {
+                val detached = configurations.detachedConfiguration(dependencies.create(coordinates))
+                detached.isTransitive = false
+                val digestBytes = MessageDigest.getInstance("SHA-256").digest(detached.singleFile.readBytes())
+                val digest = digestBytes.joinToString("") { b -> "%02x".format(b) }
+                if (digest != pinned) {
+                    throw GradleException(
+                        "the bytes of $coordinates are not the ones this build pins: expected " +
+                            "$pinned, found $digest"
+                    )
+                }
             }
         }
     }
 
-    tasks.named("preBuild") { dependsOn(verifyVoiceMedia) }
+    tasks.named("preBuild") { dependsOn(verifyNativeLibraries) }
 }
 
 apply(from = "tauri.build.gradle.kts")

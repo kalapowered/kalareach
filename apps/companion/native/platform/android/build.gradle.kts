@@ -39,11 +39,12 @@ dependencies {
     // own version.
     implementation("androidx.activity:activity:1.10.1")
     implementation("androidx.browser:browser:1.9.0")
-    // The camera behind the scanner that reads a pairing code.
-    implementation("androidx.camera:camera-core:1.6.1")
-    implementation("androidx.camera:camera-camera2:1.6.1")
-    implementation("androidx.camera:camera-lifecycle:1.6.1")
-    implementation("androidx.camera:camera-view:1.6.1")
+    // The camera behind the scanner that reads a pairing code. The library with the native code is
+    // pinned by version here and by bytes in the application's build.
+    implementation("androidx.camera:camera-core") { version { strictly("1.4.2") } }
+    implementation("androidx.camera:camera-camera2:1.4.2")
+    implementation("androidx.camera:camera-lifecycle:1.4.2")
+    implementation("androidx.camera:camera-view:1.4.2")
     // The platform TLS verifier's Kotlin half, from the local Maven repository inside its Rust
     // crate, which the application's root build declares for every project.
     implementation("rustls:rustls-platform-verifier:0.1.1")
