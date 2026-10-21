@@ -15,7 +15,8 @@
 //! * A **session** names the identities of the directory it started in and of every parent above
 //!   it, or says it does not know where it started.
 //! * A **hold** names the working tree held, its repository's Git directory and every tree this
-//!   host records for that repository (`covers`), and the parents of the held tree (`ancestors`).
+//!   host records for that repository (`covers`), and the parents of every one of those trees
+//!   (`ancestors`).
 //!
 //! A writer conflicts with a hold when its `touch` meets `covers`, or when its `deletes` meets
 //! `covers` or `ancestors` (removing a tree removes the registered trees inside it). A session
@@ -135,7 +136,8 @@ pub struct Reach {
     /// The working tree, its repository's Git directory and every tree recorded for that
     /// repository.
     pub covers: Identities,
-    /// The parents of the held working tree, which a writer that removes a tree meets.
+    /// The parents of the held working tree and of every tree recorded for its repository, which a
+    /// writer that removes a directory meets.
     pub ancestors: Identities,
 }
 
@@ -576,8 +578,8 @@ fn footprint_of_chain(chain: Option<Vec<ObjectIdentity>>) -> Footprint {
 struct KnownTree {
     tree: Option<ObjectIdentity>,
     repository: Option<ObjectIdentity>,
-    /// The directories above the tree, which removing one of them removes the tree with.
-    parents: Vec<ObjectIdentity>,
+    /// Where the host recorded the tree, for the directories above it.
+    display_path: String,
 }
 
 /// The identities of the directories above the working tree a record names at `path`, nearest
@@ -688,7 +690,7 @@ impl ProjectService {
             .map(|project| KnownTree {
                 tree: Some(project.identity.work_tree.object),
                 repository: Some(project.identity.git_dir.object),
-                parents: parents_of(self.environment_id, &project.display_path),
+                display_path: project.display_path.clone(),
             })
             .collect();
         for row in workspaces
@@ -703,7 +705,7 @@ impl ProjectService {
                     }
                     _ => project_git_dir(row.project_repository_id),
                 },
-                parents: parents_of(self.environment_id, &row.display_path),
+                display_path: row.display_path.clone(),
             });
         }
         Ok(known)
@@ -794,7 +796,7 @@ impl ProjectService {
         for known in self.known_trees()? {
             if known.repository == Some(git_dir) {
                 more.extend(known.tree);
-                more_ancestors.extend(known.parents);
+                more_ancestors.extend(parents_of(self.environment_id, &known.display_path));
             }
         }
         Ok(hold.widen(more, more_ancestors).map(|()| hold))
