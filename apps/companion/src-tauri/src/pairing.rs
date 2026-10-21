@@ -1,14 +1,21 @@
-//! The pairing screen's native half: the pasteboard, the question before another service is
-//! contacted, and the events that tell the page where an attempt has got to.
+//! The pairing screen's native half: where an invitation is taken in from, the question before
+//! another service is contacted, and the events that tell the page where an attempt has got to.
 //!
-//! An invitation's text is read from the pasteboard here, by the official clipboard plugin, which
-//! the page holds no permission for, so the text and the secret a direct invitation carries never
-//! reach the page. When the pasteboard held an invitation it is cleared. A code whose invitation
-//! names another service than the one this computer uses is not used until the person accepts it
-//! in the platform's own dialog, which shows the service's full name; declining contacts nothing.
+//! An invitation's text is taken in here, in native code, from the pasteboard (read by the official
+//! clipboard plugin, which the page holds no permission for), from the phone's camera or from a
+//! picture the person chose, so the text and the secret a direct invitation carries never reach the
+//! page. When the pasteboard held an invitation it is cleared. A code whose invitation names
+//! another service than the one this device uses is not used until the person accepts it in the
+//! platform's own dialog, which shows the service's full name; declining contacts nothing.
+//!
+//! One intake is under way at a time. A newer one, a stop, or the start of an attempt voids the one
+//! that waits, so a camera frame, a picture or an alert's answer that arrives afterwards holds
+//! nothing.
 
 use std::sync::Arc;
 
+use companion_platform::PlatformError;
+use companion_platform::scan::{Scan, Sources};
 use kr_client::pairing::invitation::Invitation;
 use kr_client::pairing::{BoxFuture, FailureKind};
 use kr_protocol::pairing::RendezvousOrigin;
@@ -16,7 +23,7 @@ use tauri::{AppHandle, Runtime};
 use tauri_plugin_clipboard_manager::ClipboardExt as _;
 use tauri_plugin_dialog::{DialogExt as _, MessageDialogButtons, MessageDialogKind};
 
-use crate::device::{Device, PasteView};
+use crate::device::{Device, IntakeView};
 
 /// The event the page is told the pairing screen's state on.
 pub const PAIRING_EVENT: &str = "kr://pairing";
@@ -33,15 +40,33 @@ pub struct PairingUnavailable {
     pub unavailable: String,
 }
 
-/// What pasting an invitation asks of the platform: the pasteboard's text, emptying it, and the
-/// person's answer before another service is contacted. The product's is [`NativePaste`]; a test
-/// gives its own.
-pub trait PastePlatform: Send + Sync + std::fmt::Debug {
+/// Where an invitation is taken in from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// The pasteboard.
+    Pasteboard,
+    /// The phone's camera, in the scanner native code shows.
+    Camera,
+    /// A picture the person chooses in the system's picker.
+    Photo,
+}
+
+/// What taking an invitation in asks of the platform: the pasteboard's text, emptying it, reading a
+/// code from the camera or from a picture, and the person's answer before another service is
+/// contacted. The product's is [`NativeIntake`]; a test gives its own.
+pub trait IntakePlatform: Send + Sync + std::fmt::Debug {
     /// The text the pasteboard holds, when it holds any.
     fn text(&self) -> Option<String>;
 
     /// Empties the pasteboard. True when it was emptied.
     fn clear(&self) -> bool;
+
+    /// Which sources besides the pasteboard this device reads a code from.
+    fn sources(&self) -> BoxFuture<'_, Sources>;
+
+    /// Reads a code from the camera or from a picture, and answers when the scanner or the picker
+    /// closes. The text it answers with clears itself when it is dropped.
+    fn read_code(&self, source: Source) -> BoxFuture<'_, Result<Scan, PlatformError>>;
 
     /// Asks the person, in the platform's own dialog, whether to contact `named` for this attempt
     /// instead of `configured`, the service this computer is set to use.
@@ -52,33 +77,49 @@ pub trait PastePlatform: Send + Sync + std::fmt::Debug {
     ) -> BoxFuture<'a, bool>;
 }
 
-/// The platform's pasteboard, through the official clipboard plugin, and the platform's own alert,
-/// modal to the companion's window.
-pub struct NativePaste<R: Runtime> {
+/// The platform's pasteboard, through the official clipboard plugin, the phone's scanner and
+/// picker, and the platform's own alert, modal to the companion's window.
+pub struct NativeIntake<R: Runtime> {
     app: AppHandle<R>,
 }
 
-impl<R: Runtime> NativePaste<R> {
-    /// The pasteboard and alerts of the application `app` runs.
+impl<R: Runtime> NativeIntake<R> {
+    /// The pasteboard, scanner and alerts of the application `app` runs.
     #[must_use]
     pub const fn new(app: AppHandle<R>) -> Self {
         Self { app }
     }
 }
 
-impl<R: Runtime> std::fmt::Debug for NativePaste<R> {
+impl<R: Runtime> std::fmt::Debug for NativeIntake<R> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("NativePaste")
+        formatter.write_str("NativeIntake")
     }
 }
 
-impl<R: Runtime> PastePlatform for NativePaste<R> {
+impl<R: Runtime> IntakePlatform for NativeIntake<R> {
     fn text(&self) -> Option<String> {
         self.app.clipboard().read_text().ok()
     }
 
     fn clear(&self) -> bool {
         self.app.clipboard().clear().is_ok()
+    }
+
+    fn sources(&self) -> BoxFuture<'_, Sources> {
+        Box::pin(companion_platform::scan::sources(&self.app))
+    }
+
+    fn read_code(&self, source: Source) -> BoxFuture<'_, Result<Scan, PlatformError>> {
+        Box::pin(async move {
+            match source {
+                Source::Camera => companion_platform::scan::camera(&self.app).await,
+                Source::Photo => companion_platform::scan::photo(&self.app).await,
+                Source::Pasteboard => Err(PlatformError(
+                    "the pasteboard is read as text, not scanned".to_owned(),
+                )),
+            }
+        })
     }
 
     fn use_another_service<'a>(
@@ -118,23 +159,54 @@ impl<R: Runtime> PastePlatform for NativePaste<R> {
     }
 }
 
-/// Reads an invitation from the pasteboard and holds it for the person to use.
-pub async fn paste(platform: &dyn PastePlatform, device: &Arc<Device>) -> PasteView {
-    let nothing = |failure| PasteView {
+/// What taking an invitation in found, for the page.
+fn nothing(failure: FailureKind) -> IntakeView {
+    IntakeView {
         invitation: None,
         failure: Some(failure),
         cleared: false,
         declined: false,
-    };
-    let Some(text) = platform.text().filter(|text| !text.trim().is_empty()) else {
-        return nothing(FailureKind::NothingToPaste);
+        cancelled: false,
+    }
+}
+
+/// Takes an invitation in from `source` and holds it for the person to use.
+///
+/// The text is read in native code and never reaches the page. An invitation that was read is
+/// held only while this intake is the one under way: when a newer one, a stop or the start of an
+/// attempt came first, nothing is held and the person is told nothing happened.
+pub async fn take_in(
+    platform: &dyn IntakePlatform,
+    device: &Arc<Device>,
+    source: Source,
+) -> IntakeView {
+    let intake = device.begin_intake();
+    let text = match source {
+        Source::Pasteboard => match platform.text().filter(|text| !text.trim().is_empty()) {
+            Some(text) => zeroize::Zeroizing::new(text),
+            None => return nothing(FailureKind::NothingToPaste),
+        },
+        Source::Camera | Source::Photo => match platform.read_code(source).await {
+            Ok(Scan::Text(text)) => text,
+            Ok(Scan::Cancelled) => return IntakeView::cancelled(),
+            Ok(Scan::NoCode) => return nothing(FailureKind::NoCodeFound),
+            Ok(Scan::CameraDenied) => return nothing(FailureKind::CameraDenied),
+            Err(error) => {
+                tracing::warn!(%error, ?source, "the platform could not read a code");
+                return nothing(match source {
+                    Source::Photo => FailureKind::NoCodeFound,
+                    Source::Camera | Source::Pasteboard => FailureKind::CameraDenied,
+                });
+            }
+        },
     };
     let invitation = match device.read(&text) {
         Ok(invitation) => invitation,
         Err(failure) => return nothing(failure.kind),
     };
-    // It was an invitation, so it leaves the pasteboard, where anything could read it.
-    let cleared = platform.clear();
+    drop(text);
+    // Taken from the pasteboard, it leaves the pasteboard, where anything could read it.
+    let cleared = source == Source::Pasteboard && platform.clear();
     if let Invitation::Code(code) = &invitation
         && code.names_another_origin
     {
@@ -143,19 +215,27 @@ pub async fn paste(platform: &dyn PastePlatform, device: &Arc<Device>) -> PasteV
             .use_another_service(&code.origin, &configured.origin)
             .await
         {
-            return PasteView {
+            return IntakeView {
                 invitation: None,
                 failure: None,
                 cleared,
                 declined: true,
+                cancelled: false,
             };
         }
     }
-    PasteView {
-        invitation: Some(device.hold(invitation)),
-        failure: None,
-        cleared,
-        declined: false,
+    match device.hold_for(intake, invitation) {
+        Some(summary) => IntakeView {
+            invitation: Some(summary),
+            failure: None,
+            cleared,
+            declined: false,
+            cancelled: false,
+        },
+        None => IntakeView {
+            cleared,
+            ..IntakeView::cancelled()
+        },
     }
 }
 

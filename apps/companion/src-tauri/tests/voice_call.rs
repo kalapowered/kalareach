@@ -72,7 +72,7 @@ use kr_protocol::scalars::Nullable;
 use net_support::Host;
 use serde_json::json;
 use support::call::{OFFER, ScriptedCalls};
-use support::{Companion, NoOwner, Phone, StubPaste, WATCHDOG, pair, parts};
+use support::{Companion, NoOwner, Phone, StubIntake, WATCHDOG, pair, parts};
 use tauri::Manager as _;
 use tokio::sync::watch;
 use voice_support::StandIn;
@@ -350,12 +350,12 @@ async fn scene_over(
 
     let secrets: Arc<dyn kr_crypto::store::SecretStore> = Arc::new(MemoryStore::new());
     let room: Arc<dyn kr_client::pairing::candidate::CandidateRoom> = Arc::new(host.room.clone());
-    let paste = StubPaste::holding("", false);
+    let paste = StubIntake::holding("", false);
     let companion = Companion::start_with_voice(
         data.path(),
         parts(Arc::clone(&secrets), Arc::clone(&room)),
         Arc::new(NoOwner),
-        Arc::clone(&paste) as Arc<dyn companion_tauri::pairing::PastePlatform>,
+        Arc::clone(&paste) as Arc<dyn companion_tauri::pairing::IntakePlatform>,
         calls,
         AccountSlot::ready(account),
     );

@@ -61,6 +61,8 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 ureq.workspace = true
+# The text of an invitation read from a code is cleared when it is dropped.
+zeroize.workspace = true
 
 # The desktop sign-in's loopback listener, which a phone does not link.
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
