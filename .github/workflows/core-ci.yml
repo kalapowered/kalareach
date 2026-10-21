@@ -563,6 +563,10 @@ jobs:
       #     pairing against a real control daemon on loopback: all of `kr-term`, `kr-project` and
       #     `kr-cli`;
       #   - the worker's library and the protocol's library;
+      #   - the platform time adapter's reading of this machine's time service, and the recorded
+      #     readings every platform's classifier is held to, and that retrust needs the host's time
+      #     authority or its owner and never a paired peer: the three `receipts` cases of the
+      #     worker that name them, the first of which prints the reading it took;
       #   - the worker's `binder`, `channels`, `connectors` and `attention_source` suites;
       #   - the control daemon's library filters `config::`, `bridge::store::`,
       #     `a_create_that_launches_nothing::`, `attention::`, `a_share_that_names_a_current_decision::`,
@@ -598,6 +602,9 @@ jobs:
       #     suites and the collection key kept in the runner's credential store, `kr-plugin-sdk`'s
       #     forwarder placeholder, and `kr-shell-integration`'s `host::command`, `pwsh_windows` and
       #     `host::scripted::`;
+      #   - the terminal a session opens in: `kr-shell-integration`'s
+      #     `host::terminal::tests::native_windows::`, what is detected and what the console
+      #     launcher runs;
       #   - the plugin catalogue's package store, `kr-plugin-catalogue`, with the daemon's catalogue
       #     and plugin groups over it;
       #   - the directory secret store and the libsodium boundary (`kr-crypto`), the attention
@@ -649,6 +656,15 @@ jobs:
       - name: Test the worker's library
         if: ${{ !cancelled() && matrix.part == 'first' }}
         run: cargo test --locked -p kr-worker --lib
+
+      # The platform time adapter against this machine's own time service, the recorded readings
+      # every platform's classifier is held to, and the rule that retrust needs the host's time
+      # authority or its owner and never a paired peer. The first case prints the reading it took
+      # (the source, the status and the bound the service gave), so this log shows what `w32tm`
+      # answered here. Only these three cases of the suite are qualified on this platform.
+      - name: Test the platform time adapter
+        if: ${{ !cancelled() && matrix.part == 'first' }}
+        run: cargo test --locked -p kr-worker --test receipts -- --nocapture --exact the_platform_time_adapter_reads_this_machines_own_time_service every_recorded_platform_reading_classifies_the_way_the_fixture_states retrust_needs_the_host_time_authority_or_the_owner_and_never_a_paired_peer
 
       # The protocol crate's own tests. Among them the configuration document's validation, which
       # takes a certificate path only as this platform writes an absolute one, and the lock a
@@ -794,6 +810,16 @@ jobs:
       - name: Test the command a typed name is looked up by
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-shell-integration --lib host::command
+
+      # What a Windows host detects to open a session's terminal in, and the console launcher that
+      # runs the command it is given, both run here and not read from the code: Windows Terminal
+      # when it is on `PATH` and the console after it, and a command the console is asked to run
+      # that makes what it was told to make. The saved preference's files and locks, the rest of
+      # this module's units, have never run on this platform and are not claimed by this filter.
+      - name: Test the terminal a session opens in
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        # Quoted: a plain YAML scalar cannot end in a colon, and the filter does.
+        run: "cargo test --locked -p kr-shell-integration --lib host::terminal::tests::native_windows::"
 
       # What the doctor reads of this platform: the worker's own answer to whether its command
       # backends run, which is a fact apart from whether it can publish a credential file.

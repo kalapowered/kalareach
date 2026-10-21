@@ -3587,6 +3587,18 @@ async fn an_expired_window_first_admits_nothing_at_the_endpoint_even_after_reten
 #[test]
 fn the_platform_time_adapter_reads_this_machines_own_time_service() {
     let reading = PlatformTimeAdapter::new().read();
+    // What the machine's service answered, so that a log of this case shows it: a case that
+    // accepts every status would otherwise pass without saying whether the service answered.
+    println!(
+        "the platform time adapter read: platform {}, interface {}, source {}, status {}, \
+         uncertainty {:?} us, qualified {}",
+        reading.platform,
+        reading.api,
+        reading.source.as_str(),
+        reading.status.as_str(),
+        reading.uncertainty_us.as_ref().map(|bound| bound.get()),
+        reading.is_qualified(),
+    );
     assert_eq!(reading.platform, platform_name());
     assert!(
         matches!(reading.platform.as_str(), "macos" | "linux" | "windows"),
