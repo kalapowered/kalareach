@@ -79,8 +79,8 @@ public keys. It receives no stored-envelope, archive, recovery or control-signin
 Every sealing function generates its own 24-byte nonce from libsodium's random generator and
 returns it alongside the ciphertext. No public function accepts a nonce for encryption, so no
 caller can repeat one. That covers mailbox envelopes, notification previews, backup key wraps and
-the pairing bundle exchange. Resuming an upload reuses stored ciphertext; it never reuses a nonce
-for a new wrap, because a new wrap is a new call.
+the pairing bundle exchange. Sealing a generation again over ciphertext that is already staged
+never reuses a nonce for a new wrap, because a new wrap is a new call.
 
 The cross-language vectors need reproducible output, so they call the libsodium wrapper directly
 with a fixed nonce. The fixture documents say so, and nothing else does it.
@@ -149,22 +149,15 @@ signing key is rejected even if it reaches the trusted list.
 producer does not have to remember it, and it is the only thing in the tree that writes an archive.
 
 1. **Stage each object.** One random 256-bit key, `secretstream` in 1 MiB records, the final
-   authenticated record required. A staged object also holds the SHA-256 of the plaintext it was
-   made from; that digest and the object key are encryption state, they stay on the device, and a
-   producer uploads the ciphertext and nothing else from it.
-2. **Resume by reusing ciphertext.** An upload that stopped is continued with the bytes already
-   created when the source digest still matches, and encryption restarts under a *new* key when it
-   does not: continuing the old ciphertext would produce an object whose records came from two
-   different sources under one key. A source that was only renamed keeps its ciphertext and records
-   the name it has now. A resume never reuses a wrap nonce, because sealing a generation is a new
-   call and every call draws a fresh nonce.
-3. **Seal the generation.** The manifest is signed, every member key is wrapped once per recipient,
+   authenticated record required. A staged object holds its object key, which is encryption state:
+   it stays on the device, and a producer uploads the ciphertext and nothing else from it.
+2. **Seal the generation.** The manifest is signed, every member key is wrapped once per recipient,
    the signed manifest *and those wraps* become the plaintext of one more encrypted object, and the
    manifest key is wrapped once per recipient into the public descriptor. The member wraps travel
    inside the manifest object because each one names an object identifier and an encrypted hash,
    and section 20 keeps both inside the encrypted manifest: only the opaque archive identifier and
    the encrypted-object references stay outside.
-4. **Open it again.** The descriptor is bounded and validated before anything is allocated; it is
+3. **Open it again.** The descriptor is bounded and validated before anything is allocated; it is
    checked against the archive the caller said it was restoring and against the generation the
    owner's checkpoint admits; the manifest is decrypted and its signature verified against the
    owner's trusted writers; the manifest is checked against the descriptor it came with and against
@@ -195,12 +188,11 @@ Revoking recipients removes them from every future wrap, and for a mutable share
 rotates the keys as well. `ArchiveRecipients::revoke` takes every recipient that leaves in one step
 and advances the rotation once for all of them. The rotation is a rule rather than a report:
 revoking advances `ArchiveRecipients::rotation`, every staged object carries the rotation it was
-made under, and `seal_archive` refuses one from before the current rotation. Resuming it makes it
-again under a new key. `StagedObject`'s fields are private for that reason: the only ways to obtain
-one are `stage_object` and `resume_object`, both of which take the rotation as an argument, so a
-caller cannot revoke and then relabel and seal the ciphertext that revocation invalidated, whatever
-it does with `Revocation::may_reuse_staged_ciphertext`. A device that kept reading what the others
-wrote after it left would have lost nothing by being removed. Nothing here claims retroactive
+made under, and `seal_archive` refuses one from before the current rotation. Staging the object
+again draws a new key. `StagedObject`'s fields are private for that reason: the only way to obtain
+one is `stage_object`, which takes the rotation as an argument, so a caller cannot revoke and then
+relabel and seal the ciphertext that revocation invalidated. A device that kept reading what the
+others wrote after it left would have lost nothing by being removed. Nothing here claims retroactive
 secrecy. `still_readable_after_revocation` computes what the removed device keeps, every generation
 published before the revocation, so a host shows a person that rather than implying otherwise, and
 `Revocation::describe` says it in a sentence.

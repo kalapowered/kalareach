@@ -47,7 +47,7 @@
 //! | [`connect`] | The `kr-connect/1` mutual proof |
 //! | [`envelope`] | Mailbox envelopes |
 //! | [`archive`] | Backup objects, key wraps, signed manifests and recovery bundles |
-//! | [`backup`] | The backup producer: staging, resume, sealing one generation and opening it |
+//! | [`backup`] | The backup producer: staging, sealing one generation and opening it |
 //!
 //! # Example
 //!

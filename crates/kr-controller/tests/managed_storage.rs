@@ -272,8 +272,13 @@ impl Rig {
 
     /// Seals one generation as the daemon's writer would, and admits it to the daemon's outbox.
     /// The first generation also enrols the daemon's writer for the archive, which wakes the
-    /// carrier once and the admission a second time.
-    fn admit(&self, generation: u64, objects: &[(u8, Vec<u8>)]) {
+    /// carrier once and the admission a second time. Returns the sealed archive and the ciphertext
+    /// that was admitted, which the carrier gives back from its disk once the generation is done.
+    fn admit(
+        &self,
+        generation: u64,
+        objects: &[(u8, Vec<u8>)],
+    ) -> (SealedArchive, Vec<StagedObject>) {
         admit(
             &self.controller,
             &self.writer,
@@ -281,7 +286,7 @@ impl Rig {
             archive_id(),
             generation,
             objects,
-        );
+        )
     }
 
     /// Enrols the daemon's writer for the archive, and returns once the carrier has looked at it
@@ -846,7 +851,7 @@ fn admit(
     archive: ArchiveId,
     generation: u64,
     objects: &[(u8, Vec<u8>)],
-) {
+) -> (SealedArchive, Vec<StagedObject>) {
     seal_and_admit(
         controller,
         writer,
@@ -855,7 +860,7 @@ fn admit(
         generation,
         objects,
         generation == 1,
-    );
+    )
 }
 
 /// Seals one generation as `writer` would and admits it, enrolling the writer first when asked.
@@ -867,7 +872,7 @@ fn seal_and_admit(
     generation: u64,
     objects: &[(u8, Vec<u8>)],
     enrolling: bool,
-) {
+) -> (SealedArchive, Vec<StagedObject>) {
     let (sealed, staged) = seal_generation(writer, sealing, archive, generation, objects);
     let backup = controller.backup();
     let now = kr_ipc::now_ms();
@@ -879,6 +884,7 @@ fn seal_and_admit(
     backup
         .admit(&sealed, &staged, writer.key_id(), now)
         .expect("the generation is admitted");
+    (sealed, staged)
 }
 
 /// One generation as `writer` would seal it: the sealed archive and the objects it names.
@@ -954,8 +960,10 @@ async fn a_generation_admitted_to_a_running_daemon_reaches_the_service_and_settl
     assert!(detail.contains("backup storage is on"), "{detail}");
 }
 
-/// A daemon stopped part way through an upload goes on at the next part when it starts again, and
-/// sends no part the service acknowledged.
+/// KR-REQ-20.07: an upload stopped part way goes on with the ciphertext already made. A daemon
+/// stopped part way through an upload goes on at the next part when it starts again, sends no part
+/// the service acknowledged, and what the service holds at the end is the ciphertext that was
+/// admitted, byte for byte.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_restarted_part_way_through_an_upload_goes_on_at_the_next_part() {
     let rig = Rig::start(Arrangement::NORMAL, HeldTimer::automatic()).await;
@@ -963,7 +971,7 @@ async fn a_daemon_restarted_part_way_through_an_upload_goes_on_at_the_next_part(
     // Three parts: 8 MiB, 8 MiB and what is left. The second is held open, so the first has been
     // acknowledged and the daemon is stopped while the second is on its way.
     web.fail(PART, 2, Moment::Hold);
-    rig.admit(1, &[(1, plaintext(17 * 1024 * 1024))]);
+    let (sealed, staged) = rig.admit(1, &[(1, plaintext(17 * 1024 * 1024))]);
     within("the second part is on its way", web.requests_reach(PART, 2)).await;
 
     let (host, served, timer) = rig.stop().await;
@@ -995,6 +1003,23 @@ async fn a_daemon_restarted_part_way_through_an_upload_goes_on_at_the_next_part(
          the encrypted manifest's only part"
     );
     assert_eq!(served.web().generations(&archive_id().to_string()), vec![1]);
+
+    // The carrier gives a finished generation's ciphertext back from its disk, so the comparison
+    // is with the bytes the test admitted: the object the service put together from the parts sent
+    // before the stop and the parts sent after it is that ciphertext, and so is the manifest.
+    let held = |object: BackupObjectId| {
+        served
+            .web()
+            .stored(&archive_id().to_string(), &object.to_string())
+            .expect("the service holds the object")
+    };
+    for object in &staged {
+        assert_eq!(held(object.object_id()), object.bytes());
+    }
+    assert_eq!(
+        held(sealed.descriptor.encrypted_manifest.object_id),
+        sealed.encrypted_manifest
+    );
 }
 
 /// A publication the service acted on and whose answer was lost is found by asking the service,

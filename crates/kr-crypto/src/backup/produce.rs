@@ -1,4 +1,4 @@
-//! Staging, resuming and sealing one backup generation.
+//! Staging and sealing one backup generation.
 
 use kr_protocol::archive::{
     ARCHIVE_MANIFEST_SCHEMA_VERSION, ArchiveDescriptor, ArchiveManifest, EncryptedObjectRef,
@@ -7,7 +7,7 @@ use kr_protocol::archive::{
     ManifestPayload, SealedKeyWrap, SignedArchiveManifest,
 };
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, DeviceId};
-use kr_protocol::scalars::{Digest256, TimestampMs, U64};
+use kr_protocol::scalars::{TimestampMs, U64};
 
 use crate::archive;
 use crate::backup::recipients::{ArchiveRecipients, KeyRotation};
@@ -51,27 +51,25 @@ pub struct ObjectSource<'a> {
     pub plaintext: &'a [u8],
 }
 
-/// One encrypted object, the key that opens it and what it was made from.
+/// One encrypted object and the key that opens it.
 ///
-/// The key and the source digest are encryption state. Section 20 keeps both out of service
-/// storage: a producer uploads [`Self::bytes`] and publishes [`Self::reference`], and everything
-/// else here stays on the device that made it.
+/// The key is encryption state. Section 20 keeps it out of service storage: a producer uploads
+/// [`Self::bytes`] and publishes [`Self::reference`], and everything else here stays on the device
+/// that made it.
 ///
-/// **Its fields are private, and that is the rotation rule.** The only ways to obtain one are
-/// [`stage_object`] and [`resume_object`], which set the rotation from the argument they were
-/// given and re-encrypt when it has moved. A caller that could write the rotation could relabel
-/// ciphertext a revocation invalidated and seal it into the next generation, which is the one
-/// thing rotating a mutable shared collection's keys exists to prevent.
+/// **Its fields are private, and that is the rotation rule.** The only way to obtain one is
+/// [`stage_object`], which sets the rotation from the argument it was given. A caller that could
+/// write the rotation could relabel ciphertext a revocation invalidated and seal it into the next
+/// generation, which is the one thing rotating a mutable shared collection's keys exists to
+/// prevent.
 ///
-/// `Debug` is written rather than derived for the same reason the fields are private: the key
-/// redacts itself, but the source digest is a fingerprint of the plaintext and a derived `Debug`
-/// would print it.
+/// `Debug` is written rather than derived. It names the object and says how many bytes there are,
+/// and it never prints the ciphertext or the key.
 pub struct StagedObject {
     reference: EncryptedObjectRef,
     filename: String,
     bytes: Vec<u8>,
     key: SymmetricKey,
-    source_digest: Digest256,
     rotation: KeyRotation,
 }
 
@@ -94,7 +92,6 @@ impl std::fmt::Debug for StagedObject {
             .field("filename", &self.filename)
             .field("encrypted_len", &self.reference.encrypted_len)
             .field("key", &self.key)
-            .field("source_digest", &"Digest256(redacted)")
             .field("rotation", &self.rotation)
             .finish()
     }
@@ -151,15 +148,6 @@ impl StagedObject {
     pub fn shares_key_with(&self, other: &Self) -> bool {
         self.key.constant_time_eq(&other.key)
     }
-
-    /// Returns true when `plaintext` is the content this ciphertext was made from.
-    #[must_use]
-    pub fn matches_source(&self, plaintext: &[u8]) -> bool {
-        sodium::constant_time_eq(
-            &kr_cbor::sha256(plaintext),
-            self.source_digest.as_bytes().as_slice(),
-        )
-    }
 }
 
 /// Encrypts one member object under a fresh random key, for one key rotation.
@@ -177,89 +165,7 @@ pub fn stage_object(source: &ObjectSource<'_>, rotation: KeyRotation) -> Result<
         filename: source.filename.to_owned(),
         bytes: object.bytes,
         key: object.key,
-        source_digest: Digest256::from_bytes(kr_cbor::sha256(source.plaintext)),
         rotation,
-    })
-}
-
-/// What resuming an upload did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResumeDecision {
-    /// The source is what it was, so the ciphertext already created is uploaded again from where
-    /// it stopped. No byte is re-encrypted and no key changes.
-    ReusedCiphertext,
-    /// The source changed, so encryption restarted under a new random key.
-    ///
-    /// Continuing the old ciphertext would have produced an object whose records came from two
-    /// different sources under one key, which is not a backup of either of them.
-    ReencryptedUnderNewKey,
-    /// The keys rotated, so encryption restarted under a new random key.
-    ///
-    /// The staged ciphertext is under a key a removed recipient holds a wrap for. Reusing it would
-    /// mean that a device removed from a mutable shared collection went on reading what the others
-    /// wrote after it left.
-    ReencryptedAfterRotation,
-    /// The source is what it was, and only its filename changed.
-    ///
-    /// The ciphertext and the key are kept; the manifest records the name the source has now.
-    ReusedCiphertextRenamed,
-}
-
-/// A resumed object and what resuming it did.
-#[derive(Debug)]
-pub struct ResumedObject {
-    /// The object to upload.
-    pub staged: StagedObject,
-    /// Whether the ciphertext was reused or made again.
-    pub decision: ResumeDecision,
-}
-
-/// Resumes one object's upload.
-///
-/// `previous` is what this device staged before the upload stopped. When the source is unchanged
-/// the same ciphertext is returned, so the upload continues from the byte it reached rather than
-/// starting again. When it changed, encryption restarts under a new key.
-///
-/// Resuming never reuses a nonce for a new wrap: a wrap is sealed by
-/// [`crate::archive::wrap_object_key`], which draws a fresh nonce for every call, and sealing a
-/// generation is a new call whether or not its ciphertext is new.
-///
-/// # Errors
-///
-/// Returns an error when libsodium is unavailable or reports a failure.
-pub fn resume_object(
-    mut previous: StagedObject,
-    source: &ObjectSource<'_>,
-    rotation: KeyRotation,
-) -> Result<ResumedObject> {
-    if previous.reference.object_id == source.object_id && previous.matches_source(source.plaintext)
-    {
-        if previous.rotation != rotation {
-            // The keys rotated under it. Its ciphertext is under a key a removed recipient holds a
-            // wrap for, so it is made again rather than continued.
-            return Ok(ResumedObject {
-                staged: stage_object(source, rotation)?,
-                decision: ResumeDecision::ReencryptedAfterRotation,
-            });
-        }
-        let renamed = previous.filename != source.filename;
-        if renamed {
-            // The bytes did not change and the name did. The manifest records what the source is
-            // called now; re-encrypting it would be work that changed nothing.
-            source.filename.clone_into(&mut previous.filename);
-        }
-        return Ok(ResumedObject {
-            staged: previous,
-            decision: if renamed {
-                ResumeDecision::ReusedCiphertextRenamed
-            } else {
-                ResumeDecision::ReusedCiphertext
-            },
-        });
-    }
-    Ok(ResumedObject {
-        staged: stage_object(source, rotation)?,
-        decision: ResumeDecision::ReencryptedUnderNewKey,
     })
 }
 

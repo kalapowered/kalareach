@@ -7162,8 +7162,10 @@ async fn a_generation_admitted_is_uploaded_part_by_part_and_published_once() {
     assert_eq!(host.web.asked().len(), asked);
 }
 
-/// A process can stop after any step. A restart settles what was on its way, reconciles, and goes
-/// on: every generation finishes once, and no request that was answered is sent again.
+/// KR-REQ-20.07: an upload stopped part way goes on with the ciphertext already made. A process
+/// can stop after any step. A restart settles what was on its way, reconciles, and goes on: every
+/// generation finishes once, no request that was answered is sent again, and what the service
+/// holds at the end is the ciphertext that was admitted, byte for byte.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_crash_after_any_step_and_a_restart_finish_the_generation_once_with_nothing_sent_twice() {
     let uninterrupted = {
@@ -7199,6 +7201,19 @@ async fn a_crash_after_any_step_and_a_restart_finish_the_generation_once_with_no
     for stopped_after in 0..uninterrupted.len() {
         let mut host = Host::open();
         host.admit(1, &[TWO_PARTS]);
+        // The ciphertext as it was admitted, before any step is taken.
+        let admitted: Vec<_> = host
+            .service
+            .objects(archive_id(), BackupGeneration::new(1))
+            .expect("a read")
+            .into_iter()
+            .map(|object| {
+                (
+                    object.object_id,
+                    std::fs::read(&object.staged_path).expect("the staged ciphertext"),
+                )
+            })
+            .collect();
         {
             let mut uploader = host.uploader(10_000);
             for _ in 0..stopped_after {
@@ -7242,6 +7257,14 @@ async fn a_crash_after_any_step_and_a_restart_finish_the_generation_once_with_no
                 late.is_empty(),
                 "stopped after {stopped_after} steps: {late:?}"
             );
+            for (object_id, ciphertext) in &admitted {
+                assert_eq!(
+                    host.web.stored_bytes(*object_id).as_ref(),
+                    Some(ciphertext),
+                    "the service holds the ciphertext that was admitted, after a stop after \
+                     {stopped_after} steps"
+                );
+            }
         }
         assert!(
             host.service.outbox().expect("a read").is_empty(),

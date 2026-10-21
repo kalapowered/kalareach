@@ -6,22 +6,19 @@
 //!
 //! 1. **Stage each object.** One random 256-bit key per object, `secretstream` in 1 MiB records
 //!    with the final authenticated record required. [`stage_object`].
-//! 2. **Resume by reusing ciphertext.** An upload that stopped part way is continued with the
-//!    bytes already created, and encryption restarts under a *new* key when the source changed.
-//!    [`resume_object`].
-//! 3. **Seal the generation.** The manifest is signed, every member key is wrapped once per
+//! 2. **Seal the generation.** The manifest is signed, every member key is wrapped once per
 //!    recipient, the signed manifest and those wraps become the plaintext of one more encrypted
 //!    object, and the manifest key is wrapped once per recipient into the public descriptor.
 //!    [`seal_archive`].
-//! 4. **Open it again.** The descriptor is validated before anything is allocated, the manifest is
+//! 3. **Open it again.** The descriptor is validated before anything is allocated, the manifest is
 //!    decrypted and its signature verified against the owner's trusted writers, and only then is a
 //!    member object restored. [`open_archive`].
 //!
 //! # What stays on the device
 //!
-//! A [`StagedObject`] holds its object key and the digest of the plaintext it was made from. Both
-//! are encryption state, and section 20 keeps plaintext object keys and encryption state out of
-//! service storage: a producer uploads [`StagedObject::bytes`] and nothing else from this type.
+//! A [`StagedObject`] holds its object key, which is encryption state, and section 20 keeps
+//! plaintext object keys and encryption state out of service storage: a producer uploads
+//! [`StagedObject::bytes`] and nothing else from this type.
 //!
 //! # What is outside the encrypted manifest
 //!
@@ -74,8 +71,8 @@ pub use crate::backup::members::{
     member_material,
 };
 pub use crate::backup::produce::{
-    ArchivePlan, ObjectSource, RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT, ResumeDecision, ResumedObject,
-    SealedArchive, StagedObject, resume_object, seal_archive, stage_object,
+    ArchivePlan, ObjectSource, RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT, SealedArchive, StagedObject,
+    seal_archive, stage_object,
 };
 pub use crate::backup::recipients::{
     ArchiveRecipients, CollectionKind, KeyRotation, RetainedObjectKeys, Revocation,

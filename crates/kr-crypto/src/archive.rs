@@ -89,7 +89,7 @@ pub fn decrypt_object(
 /// Wraps one object key for one recipient.
 ///
 /// The context binds the wrap to one object, one generation and one recipient. The nonce is fresh
-/// for every wrap, so reusing stored ciphertext when an upload resumes never reuses a nonce.
+/// for every wrap, so sealing the same staged ciphertext again never reuses a nonce.
 ///
 /// # Errors
 ///

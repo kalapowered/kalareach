@@ -176,8 +176,8 @@ impl ArchiveRecipients {
         }
         let rotates_object_keys = self.kind == CollectionKind::MutableShared;
         // Advancing the rotation is the rotation. Every object staged before it is refused by
-        // `seal_archive` and staged again under a new key when it is resumed, so the removed
-        // recipients' wraps open nothing written after this point.
+        // `seal_archive`, and staging it again draws a new key, so the removed recipients' wraps
+        // open nothing written after this point.
         let rotation = if rotates_object_keys {
             self.rotation.next().ok_or(CryptoError::RotationExhausted)?
         } else {
@@ -206,20 +206,6 @@ pub struct Revocation {
 }
 
 impl Revocation {
-    /// Whether ciphertext staged before the revocation may still be uploaded.
-    ///
-    /// A rotation says no: that ciphertext is under a key the removed recipient holds a wrap for,
-    /// so the object is staged again under a new key rather than resumed. A collection that is not
-    /// mutable and shared keeps its staged bytes, because nothing it contains changed.
-    ///
-    /// It is a report of a rule that is already enforced, not the rule itself.
-    /// [`crate::backup::seal_archive`] refuses an object from before
-    /// [`ArchiveRecipients::rotation`] whatever a caller does with this answer.
-    #[must_use]
-    pub const fn may_reuse_staged_ciphertext(&self) -> bool {
-        !self.rotates_object_keys
-    }
-
     /// Always false, and said rather than left to be assumed.
     ///
     /// Section 20: *a removed device may retain earlier keys; do not claim retroactive secrecy.*

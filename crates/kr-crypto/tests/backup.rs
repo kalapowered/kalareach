@@ -1,4 +1,4 @@
-//! The backup producer: objects, wraps, the signed manifest, the descriptor, resume and restore.
+//! The backup producer: objects, wraps, the signed manifest, the descriptor and restore.
 //!
 //! Section 20 ¶3 to ¶7 and ¶9, from the producer's side. The service half of these rules lives in
 //! the storage service; everything here is what a device does before it uploads a byte and after
@@ -9,9 +9,9 @@ use kr_crypto::archive::{self, EncryptedObject};
 use kr_crypto::backup::{
     ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CollectionKind,
     GenerationExpectation, GenerationStanding, KeyRotation, ObjectSource,
-    RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT, RestoreGeneration, ResumeDecision, RetainedObjectKeys,
-    SealedArchive, StagedObject, open_archive, recipient_key_id, resume_object, seal_archive,
-    stage_object, still_readable_after_revocation,
+    RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT, RestoreGeneration, RetainedObjectKeys, SealedArchive,
+    StagedObject, open_archive, recipient_key_id, seal_archive, stage_object,
+    still_readable_after_revocation,
 };
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
@@ -451,8 +451,48 @@ fn a_wrap_is_valid_only_for_its_own_object_and_recipient() {
     );
 }
 
+/// The same staged object sealed twice wraps its object key twice for the same context. The two
+/// member wraps get different nonces: a nonce derived from the context would pass
+/// `every_wrap_carries_a_fresh_nonce_and_the_whole_declared_context`, where each context is used
+/// once, and fail this one. Each seal makes a new manifest key, so the manifest wraps are not the
+/// same context twice and only add to the count.
+#[test]
+fn a_second_wrap_of_the_same_key_for_the_same_context_gets_a_fresh_nonce() {
+    let parties = Parties::generate();
+    let staged = stage(1, "a.cbor", b"the body");
+    let first = seal(&parties, 1, std::slice::from_ref(&staged));
+    let second = seal(&parties, 1, std::slice::from_ref(&staged));
+    assert_eq!(
+        manifest_payload(&parties, &first).member_key_wraps[0].context,
+        manifest_payload(&parties, &second).member_key_wraps[0].context,
+        "the two member wraps are for one context"
+    );
+
+    let mut nonces: Vec<[u8; 24]> = Vec::new();
+    for sealed in [&first, &second] {
+        let payload = manifest_payload(&parties, sealed);
+        for wrap in sealed
+            .descriptor
+            .manifest_key_wraps
+            .iter()
+            .chain(payload.member_key_wraps.iter())
+        {
+            nonces.push(*wrap.nonce.as_bytes());
+        }
+    }
+    let before = nonces.len();
+    nonces.sort_unstable();
+    nonces.dedup();
+    assert_eq!(
+        nonces.len(),
+        before,
+        "the same ciphertext sealed again still gets fresh wrap nonces"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
-// KR-REQ-20.07: the manifest is signed, encrypted as its own object, and a mismatch stops restore.
+// KR-REQ-20.07: the manifest is signed, encrypted as its own object, content that changed is
+// encrypted under a new key, and a mismatch stops restore.
 // ---------------------------------------------------------------------------------------------
 
 #[test]
@@ -624,6 +664,34 @@ fn a_tampered_manifest_object_stops_the_restore_before_any_member_is_reached() {
         )
         .is_err(),
         "the manifest is verified before any member object is restored"
+    );
+}
+
+/// KR-REQ-20.07: content that changed is encrypted under a new key. Staging an object again draws a
+/// new key whatever its content, so the key a generation published a wrap of for the first content
+/// opens nothing of the changed content, though both carry the same object identifier.
+#[test]
+fn changed_content_for_the_same_object_is_encrypted_under_a_new_key() {
+    let parties = Parties::generate();
+    let first = stage(1, "a.cbor", b"the body");
+    let published = seal(&parties, 1, std::slice::from_ref(&first));
+    let original = member_key(&parties, &published, first.object_id());
+    assert!(
+        archive::decrypt_object(&original, first.reference(), first.bytes()).is_ok(),
+        "the key the first generation published opens the first content"
+    );
+
+    let changed = stage(1, "a.cbor", b"a different body");
+    assert_eq!(changed.object_id(), first.object_id());
+    let again = seal(&parties, 2, std::slice::from_ref(&changed));
+    let now = member_key(&parties, &again, changed.object_id());
+    assert!(
+        !now.constant_time_eq(&original),
+        "changed content is never encrypted under the old key"
+    );
+    assert!(
+        archive::decrypt_object(&original, changed.reference(), changed.bytes()).is_err(),
+        "the old key opens nothing of the changed content"
     );
 }
 
@@ -838,7 +906,7 @@ fn a_manifest_under_a_schema_this_build_does_not_read_stops_the_restore() {
 }
 
 #[test]
-fn a_staged_object_never_prints_its_plaintext_or_its_fingerprint() {
+fn a_staged_object_never_prints_its_plaintext() {
     let plaintext = b"what the session actually said";
     let source = ObjectSource {
         object_id: object_id(1),
@@ -852,12 +920,6 @@ fn a_staged_object_never_prints_its_plaintext_or_its_fingerprint() {
     let staged = stage_object(&source, KeyRotation::INITIAL).expect("a staged object");
     let rendered = format!("{staged:?}");
     assert!(!rendered.contains("session actually said"));
-    assert!(
-        rendered.contains("Digest256(redacted)"),
-        "the source digest is a fingerprint of the plaintext: {rendered}"
-    );
-    let digest = kr_protocol::scalars::to_base64url(&kr_cbor::sha256(plaintext));
-    assert!(!rendered.contains(&digest));
 }
 
 #[test]
@@ -930,97 +992,6 @@ fn an_invalid_descriptor_fails_before_any_object_is_opened() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// KR-REQ-20.07: resume reuses ciphertext, and a changed source restarts under a new key.
-// ---------------------------------------------------------------------------------------------
-
-#[test]
-fn an_interrupted_upload_resumes_on_the_ciphertext_it_already_made() {
-    let staged = stage(1, "a.cbor", b"the body");
-    let before = staged.bytes().to_vec();
-    let reference = staged.reference().clone();
-
-    let resumed = resume_object(
-        staged,
-        &ObjectSource {
-            object_id: object_id(1),
-            filename: "a.cbor",
-            plaintext: b"the body",
-        },
-        KeyRotation::INITIAL,
-    )
-    .expect("a resumed object");
-    assert_eq!(resumed.decision, ResumeDecision::ReusedCiphertext);
-    assert_eq!(
-        resumed.staged.bytes(),
-        before,
-        "not one byte is re-encrypted"
-    );
-    assert_eq!(resumed.staged.reference(), &reference);
-
-    // A source that was only renamed keeps its ciphertext and records the name it has now, so the
-    // next manifest does not carry a filename the source no longer has.
-    let renamed = resume_object(
-        resumed.staged,
-        &ObjectSource {
-            object_id: object_id(1),
-            filename: "renamed.cbor",
-            plaintext: b"the body",
-        },
-        KeyRotation::INITIAL,
-    )
-    .expect("a resumed object");
-    assert_eq!(renamed.decision, ResumeDecision::ReusedCiphertextRenamed);
-    assert_eq!(
-        renamed.staged.bytes(),
-        before,
-        "still not one byte re-encrypted"
-    );
-    assert_eq!(renamed.staged.filename(), "renamed.cbor");
-}
-
-#[test]
-fn a_source_that_changed_restarts_encryption_under_a_new_key() {
-    // The original key is recovered through the wrap the first generation published, which is the
-    // only place it exists outside the staged object. Comparing the resumed object against an
-    // independently staged one would pass even if the key had been kept.
-    let parties = Parties::generate();
-    let staged = stage(1, "a.cbor", b"the body");
-    let before = staged.bytes().to_vec();
-    let published = seal(&parties, 1, std::slice::from_ref(&staged));
-    let original = member_key(&parties, &published, staged.object_id());
-
-    let resumed = resume_object(
-        staged,
-        &ObjectSource {
-            object_id: object_id(1),
-            filename: "a.cbor",
-            plaintext: b"a different body",
-        },
-        KeyRotation::INITIAL,
-    )
-    .expect("a resumed object");
-    assert_eq!(resumed.decision, ResumeDecision::ReencryptedUnderNewKey);
-    assert_ne!(resumed.staged.bytes(), before);
-
-    // The object the resume produced does not open under the key the first generation published.
-    let again = seal(&parties, 2, std::slice::from_ref(&resumed.staged));
-    let now = member_key(&parties, &again, resumed.staged.object_id());
-    assert!(
-        !now.constant_time_eq(&original),
-        "a changed source never continues under the old key"
-    );
-    assert!(
-        archive::decrypt_object(
-            &original,
-            resumed.staged.reference(),
-            resumed.staged.bytes()
-        )
-        .is_err(),
-        "the old key opens nothing the resume produced"
-    );
-}
-
 /// Recovers one member object's key out of the wrap a sealed generation published for it.
 ///
 /// It is the only place the key exists outside the staged object, whose own fields are private, so
@@ -1047,49 +1018,6 @@ fn member_key(
         &wrap.context.clone(),
     )
     .expect("the object key")
-}
-
-#[test]
-fn resuming_never_reuses_a_wrap_nonce() {
-    let parties = Parties::generate();
-    let staged = stage(1, "a.cbor", b"the body");
-    let first = seal(&parties, 1, std::slice::from_ref(&staged));
-
-    // The upload stopped after the objects were made; the producer resumes on the same ciphertext
-    // and seals the generation again.
-    let resumed = resume_object(
-        staged,
-        &ObjectSource {
-            object_id: object_id(1),
-            filename: "a.cbor",
-            plaintext: b"the body",
-        },
-        KeyRotation::INITIAL,
-    )
-    .expect("a resumed object");
-    assert_eq!(resumed.decision, ResumeDecision::ReusedCiphertext);
-    let second = seal(&parties, 1, std::slice::from_ref(&resumed.staged));
-
-    let mut nonces: Vec<[u8; 24]> = Vec::new();
-    for sealed in [&first, &second] {
-        let payload = manifest_payload(&parties, sealed);
-        for wrap in sealed
-            .descriptor
-            .manifest_key_wraps
-            .iter()
-            .chain(payload.member_key_wraps.iter())
-        {
-            nonces.push(*wrap.nonce.as_bytes());
-        }
-    }
-    let before = nonces.len();
-    nonces.sort_unstable();
-    nonces.dedup();
-    assert_eq!(
-        nonces.len(),
-        before,
-        "reused ciphertext still gets fresh wrap nonces"
-    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1216,20 +1144,27 @@ fn a_mutable_shared_collection_rotates_its_keys_and_an_owned_one_does_not() {
     )
     .expect("a sealed archive");
     let original = member_key(&parties, &published, staged.object_id());
+    assert!(
+        open_archive(
+            &ArchiveReader::Device(&leaving),
+            &parties.sender_key(),
+            &[trusted(&parties.writer)],
+            &expecting(),
+            &published.descriptor_bytes,
+            &published.encrypted_manifest,
+        )
+        .is_ok(),
+        "before the revocation the removed device is a recipient"
+    );
 
     let rotated = shared
         .revoke(&[leaving.key_id()])
         .expect("a rotation after this one")
         .expect("a revocation");
     assert!(rotated.rotates_object_keys);
-    assert!(
-        !rotated.may_reuse_staged_ciphertext(),
-        "staged ciphertext is discarded when the keys rotate"
-    );
     assert_ne!(shared.rotation(), before, "the rotation advanced");
 
-    // The rule is enforced, not reported: the ciphertext staged before the revocation cannot be
-    // sealed into the next generation, whatever a caller does with the answer above.
+    // The ciphertext staged before the revocation cannot be sealed into the next generation.
     let refusal = seal_archive(
         &parties.writer,
         &parties.sender,
@@ -1240,9 +1175,9 @@ fn a_mutable_shared_collection_rotates_its_keys_and_an_owned_one_does_not() {
     .expect_err("ciphertext from before the rotation");
     assert!(refusal.to_string().contains("rotated"), "{refusal}");
 
-    // Resuming it makes it again, under a key the removed device holds no wrap for.
-    let resumed = resume_object(
-        staged,
+    // Staging it again under the new rotation draws a new key, which the removed device holds no
+    // wrap for.
+    let restaged = stage_object(
         &ObjectSource {
             object_id: object_id(1),
             filename: "a.cbor",
@@ -1250,29 +1185,35 @@ fn a_mutable_shared_collection_rotates_its_keys_and_an_owned_one_does_not() {
         },
         shared.rotation(),
     )
-    .expect("a resumed object");
-    assert_eq!(resumed.decision, ResumeDecision::ReencryptedAfterRotation);
+    .expect("a staged object");
     let rekeyed = seal_archive(
         &parties.writer,
         &parties.sender,
         &shared,
         &plan(2),
-        std::slice::from_ref(&resumed.staged),
+        std::slice::from_ref(&restaged),
     )
     .expect("the re-staged object seals");
-    let now = member_key(&parties, &rekeyed, resumed.staged.object_id());
+    let now = member_key(&parties, &rekeyed, restaged.object_id());
     assert!(
         !now.constant_time_eq(&original),
         "the object is under a key the removed device holds no wrap for"
     );
     assert!(
-        archive::decrypt_object(
-            &original,
-            resumed.staged.reference(),
-            resumed.staged.bytes()
+        archive::decrypt_object(&original, restaged.reference(), restaged.bytes()).is_err(),
+        "the key that device holds opens nothing written after it left"
+    );
+    assert!(
+        open_archive(
+            &ArchiveReader::Device(&leaving),
+            &parties.sender_key(),
+            &[trusted(&parties.writer)],
+            &expecting(),
+            &rekeyed.descriptor_bytes,
+            &rekeyed.encrypted_manifest,
         )
         .is_err(),
-        "the key that device holds opens nothing written after it left"
+        "the removed device opens no part of the generation made after the rotation"
     );
 
     // An owned collection does not rotate, so its staged bytes still seal.
@@ -1285,7 +1226,6 @@ fn a_mutable_shared_collection_rotates_its_keys_and_an_owned_one_does_not() {
         .expect("an owned set does not rotate")
         .expect("a revocation");
     assert!(!plain.rotates_object_keys);
-    assert!(plain.may_reuse_staged_ciphertext());
     assert!(
         seal_archive(
             &parties.writer,
