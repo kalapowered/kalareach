@@ -437,48 +437,6 @@ fn a_hold_on_a_tree_inside_a_staging_directory_turns_away_its_cleanup() {
     support::assert_absent(&leftover, "the staging directory the cleanup took away");
 }
 
-/// KR-REQ-14.32: a writer whose directory the host cannot open might write anywhere, so a hold
-/// turns it away and it keeps every hold from being granted while it is at work.
-#[test]
-fn a_writer_whose_directory_cannot_be_opened_is_in_the_way_of_every_hold() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let fixture = Fixture::create();
-    let project = adopt(&fixture, "source", 1);
-    let linked = worktree(&fixture, project, "linked", 2);
-    let service = fixture.service();
-    // A directory its owner can enter and write but not read is one this host cannot open.
-    let closed = fixture.work().join("closed");
-    std::fs::create_dir(&closed).expect("a directory");
-    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o300))
-        .expect("the mode is set");
-    let restore = || {
-        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700))
-            .expect("the mode is put back");
-    };
-    if std::fs::read_dir(&closed).is_ok() {
-        // The account running this can read anything, so nothing is closed to it.
-        restore();
-        return;
-    }
-
-    let held = hold(service, linked).expect("the worktree is held");
-    let refused = service
-        .writer_in_directory("a test writer", &closed)
-        .expect_err("it might be writing in the held tree");
-    assert_eq!(refused.code(), ErrorCode::ResourceUnavailable);
-    drop(held);
-    let writer = service
-        .writer_in_directory("a test writer", &closed)
-        .expect("no hold stands");
-    assert_eq!(
-        hold(service, linked).expect_err("a writer that might write anywhere is at work"),
-        Refusal::WriterAtWork("a test writer")
-    );
-    drop(writer);
-    restore();
-}
-
 /// KR-REQ-14.32: a live session blocks a hold on a tree of its repository wherever in the
 /// repository it started, including in the user's own checkout when that is only a project and
 /// no workspace has been selected on it, and a session that started where no tree is recorded

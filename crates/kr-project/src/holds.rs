@@ -560,6 +560,12 @@ fn identity_chain(
     Some(chain)
 }
 
+/// What a writer of a directory writes, given the chain of identities the directory opened to: the
+/// directory and everything above it, or anywhere when it could not be opened.
+fn footprint_of_chain(chain: Option<Vec<ObjectIdentity>>) -> Footprint {
+    chain.map_or_else(Footprint::everywhere, |chain| Footprint::inside(&chain))
+}
+
 /// One tree this host records, and the repository it belongs to when that is known.
 struct KnownTree {
     tree: Option<ObjectIdentity>,
@@ -609,8 +615,7 @@ impl ProjectService {
     /// can name, and what is written there may be anywhere.
     #[must_use]
     pub fn footprint_inside(&self, path: &Path) -> Footprint {
-        self.directory_chain(path)
-            .map_or_else(Footprint::everywhere, |chain| Footprint::inside(&chain))
+        footprint_of_chain(self.directory_chain(path))
     }
 
     /// Registers a writer of the repository `repository` is open on, and of the directory a path
@@ -1145,5 +1150,15 @@ mod tests {
             chain[0],
             "a name that is not there yet stands for the directory it would be in"
         );
+    }
+
+    /// KR-REQ-14.32: a writer of a directory that could not be opened writes anywhere, and one of a
+    /// directory that opened writes it and the directories above it.
+    #[test]
+    fn a_directory_that_could_not_be_opened_is_written_anywhere() {
+        assert!(footprint_of_chain(None).anywhere);
+        let placed = footprint_of_chain(Some(vec![identity(1), identity(2)]));
+        assert!(!placed.anywhere);
+        assert_eq!(placed.touch, identities(&[1, 2]));
     }
 }
