@@ -2371,10 +2371,11 @@ pub(crate) mod tests {
             .get()
     }
 
-    /// A device's request is decided at readings no older than the policy's lock it is decided
-    /// under. A reading its caller took before the grant ran out does not decide it once the wall
-    /// clock has passed the grant's expiry, as when the expiry passes while the decision waits for
-    /// the lock. The control: with the wall clock short of the expiry, it is permitted.
+    /// KR-REQ-10.44, KR-REQ-09.18: a device's request is decided at readings no older than the
+    /// policy's lock it is decided under. A reading its caller took before the grant ran out does
+    /// not decide it once the wall clock has passed the grant's expiry, as when the expiry passes
+    /// while the decision waits for the lock. The control: with the wall clock short of the
+    /// expiry, it is permitted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_device_decision_reads_the_clocks_once_its_lock_is_held() {
         for passed in [false, true] {
@@ -2408,12 +2409,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// A refusal the clock decided outlives a failed write of its floor: the next decision writes
-    /// the floor as soon as storage takes it, permission or not, and a daemon started afterwards
-    /// with its clock wound back still refuses the grant. While the floor is not on disk the
-    /// device is not told of an expiry, which a clock wound back before the next start would
-    /// reverse: the answer is that the floor is unrecorded. Once it is on disk, the expiry is
-    /// answered.
+    /// KR-REQ-09.17, KR-REQ-09.18: a refusal the clock decided outlives a failed write of its
+    /// floor: the next decision writes the floor as soon as storage takes it, permission or not,
+    /// and a daemon started afterwards with its clock wound back still refuses the grant. While
+    /// the floor is not on disk the device is not told of an expiry, which a clock wound back
+    /// before the next start would reverse: the answer is that the floor is unrecorded. Once it
+    /// is on disk, the expiry is answered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_clock_refusal_whose_record_failed_is_written_by_the_next_decision_and_outlives_a_restart()
      {
@@ -3511,10 +3512,12 @@ pub(crate) mod tests {
         drop(controller);
     }
 
-    /// The offline bound runs out on the continuous clock it was anchored on. A decision taken
-    /// after the wall clock was wound back reads UTC inside the bound again, and is refused all the
-    /// same; a synchronisation of the authority feed anchors the bound afresh. On clocks the test
-    /// moves by hand, so no step depends on how much real time passes between two others.
+    /// KR-REQ-10.44: the offline bound is optional, and once chosen it runs out on the continuous
+    /// clock it was anchored on. With no bound chosen a device's request is decided with no
+    /// offline bound; a decision taken after the wall clock was wound back reads UTC inside the
+    /// chosen bound again, and is refused all the same; a synchronisation of the authority feed
+    /// anchors the bound afresh. On clocks the test moves by hand, so no step depends on how much
+    /// real time passes between two others.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_offline_bound_runs_out_on_the_clock_it_was_anchored_on() {
         let temp = kr_ipc::testing::TempHost::create();
@@ -3522,8 +3525,17 @@ pub(crate) mod tests {
         let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
         let controller = daemon_on(&temp, clocks).await;
         let revision = controller.policy().authority_revision();
-        choose_offline_bound(&controller, synchronised, 200);
         let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
+        // The bound is the owner's option: until one is chosen the grant is decided with none, and
+        // nothing waits on the authority feed.
+        let unbounded = controller
+            .decide_for_device(&lasting, &lasting_record, listing(&temp, synchronised))
+            .expect("with no bound chosen");
+        assert!(
+            unbounded.decided.permitted.offline.is_none(),
+            "with no bound chosen the decision carries none"
+        );
+        choose_offline_bound(&controller, synchronised, 200);
         let decision = controller
             .decide_for_device(&lasting, &lasting_record, listing(&temp, synchronised))
             .expect("inside the bound");
@@ -3757,10 +3769,11 @@ pub(crate) mod tests {
         drop(controller);
     }
 
-    /// Through the daemon: a bound that ran out while the daemon was down is refused after a
-    /// restart, with the request's reading of the wall clock at the synchronisation itself. The
-    /// restart takes the time spent from the record and from UTC; that the record alone is enough
-    /// is shown with clocks driven by hand in `a_restart_in_the_same_boot_adds_the_time_since_the_record`.
+    /// KR-REQ-10.44: through the daemon, a bound that ran out while the daemon was down is
+    /// refused after a restart, with the request's reading of the wall clock at the
+    /// synchronisation itself. The restart takes the time spent from the record and from UTC; that
+    /// the record alone is enough is shown with clocks driven by hand in
+    /// `a_restart_in_the_same_boot_adds_the_time_since_the_record`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_offline_bound_that_ran_out_while_the_daemon_was_down_is_refused_after_a_restart() {
         let temp = kr_ipc::testing::TempHost::create();
