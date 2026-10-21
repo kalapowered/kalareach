@@ -4,12 +4,14 @@ import android.Manifest
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.verify.domain.DomainVerificationManager
 import android.content.pm.verify.domain.DomainVerificationUserState
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.util.Base64
 import android.util.Log
 import android.webkit.WebView
@@ -86,6 +88,7 @@ class WrittenArguments {
 @TauriPlugin(
     permissions = [
         Permission(strings = [Manifest.permission.RECORD_AUDIO], alias = "microphone"),
+        Permission(strings = [Manifest.permission.CAMERA], alias = "camera"),
         Permission(strings = [Manifest.permission.POST_NOTIFICATIONS], alias = "notifications"),
     ],
 )
@@ -127,6 +130,78 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
         } catch (failure: RuntimeException) {
             Log.e(LOG_TAG, "the platform TLS verifier could not start", failure)
         }
+    }
+
+    // Reading a QR code. The scanner is shown over the application, one at a time, and answers once.
+
+    private var scanning: CodeScanner? = null
+
+    /** Which sources this device reads a code from: its camera, when it has one. */
+    @Command
+    fun scanSources(invoke: Invoke) {
+        val camera = activity.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)
+        invoke.resolve(JSObject().put("camera", camera).put("photo", false))
+    }
+
+    /** Shows the scanner, after the camera is allowed, and answers when it closes. */
+    @Command
+    fun scanCamera(invoke: Invoke) {
+        // One at a time: a newer request ends the older one, which answers with a cancel.
+        scanning?.cancel()
+        if (getPermissionState("camera") == PermissionState.GRANTED) {
+            showScanner(invoke)
+        } else {
+            requestPermissionForAlias("camera", invoke, "cameraAnswered")
+        }
+    }
+
+    @PermissionCallback
+    fun cameraAnswered(invoke: Invoke) {
+        if (getPermissionState("camera") == PermissionState.GRANTED) {
+            showScanner(invoke)
+        } else {
+            invoke.resolve(scanAnswer(ScanOutcome.CameraDenied))
+        }
+    }
+
+    /** This device offers no picker: the camera is its one way to read a code. */
+    @Command
+    fun scanPhoto(invoke: Invoke) {
+        invoke.reject("this device offers no picker for a code")
+    }
+
+    /** Opens this application's own page in the system's settings, where the camera is allowed. */
+    @Command
+    fun openSettings(invoke: Invoke) {
+        try {
+            val page = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", activity.packageName, null))
+            page.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            activity.startActivity(page)
+            invoke.resolve(JSObject().put("done", true))
+        } catch (failure: ActivityNotFoundException) {
+            invoke.reject("the settings page could not be opened")
+        }
+    }
+
+    private fun showScanner(invoke: Invoke) {
+        val host = activity as? ComponentActivity
+        if (host == null) {
+            invoke.reject("there is no screen to show the scanner on")
+            return
+        }
+        val scanner = CodeScanner(host) { outcome ->
+            scanning = null
+            invoke.resolve(scanAnswer(outcome))
+        }
+        scanning = scanner
+        scanner.show()
+    }
+
+    /** The one answer a request to read a code gets, in the words the plugin's Rust half reads. */
+    private fun scanAnswer(outcome: ScanOutcome): JSObject = when (outcome) {
+        is ScanOutcome.Text -> JSObject().put("outcome", "text").put("text", outcome.text)
+        ScanOutcome.Cancelled -> JSObject().put("outcome", "cancelled")
+        ScanOutcome.CameraDenied -> JSObject().put("outcome", "camera_denied")
     }
 
     // The voice call is the application's own, in a module this library cannot see: the application
