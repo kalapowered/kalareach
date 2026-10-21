@@ -13,9 +13,10 @@
 //! and a program that cannot be run is reported by the start, as an error of the process that
 //! would have run it.
 //!
-//! The shell is to have the terminal and nothing else of the worker's descriptors. Which ones the
-//! worker has open is read with the directory, before the start is admitted, and they are marked
-//! to close when the shell is run.
+//! The shell is to have the terminal and nothing else of the worker's descriptors. Every descriptor
+//! the child holds is marked to close when the shell is run, found in the child itself at the
+//! moment it is made, so that nothing the worker opened, whenever and above whatever limit, is
+//! missed.
 
 #![expect(
     unsafe_code,
@@ -36,8 +37,9 @@ pub(super) struct Reads {
     /// there, as the terminal library started a shell in one it could not find. A directory that
     /// is there and cannot be entered is not replaced: the start fails with the reason.
     opened: std::io::Result<OwnedFd>,
-    /// What bounds the descriptors the worker can have open.
-    descriptors: Descriptors,
+    /// One past the highest number the system gives a descriptor, where the child has to count
+    /// them to find them.
+    table_end: libc::c_int,
 }
 
 impl Reads {
@@ -68,45 +70,13 @@ impl Reads {
         Self {
             named_is_there,
             opened,
-            descriptors: Descriptors::read(),
+            table_end: table_end(),
         }
     }
 
     /// Whether the directory the command names was there.
     pub(super) const fn named_is_there(&self) -> bool {
         self.named_is_there
-    }
-}
-
-/// What bounds the descriptors the worker has open, read with the directory so that nothing is
-/// asked of the system between the admission of the start and the process.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Descriptors {
-    /// One past the highest descriptor the system lists as open, or zero where it lists none.
-    listed_end: libc::c_int,
-    /// One past the highest number the system gives any descriptor.
-    table_end: libc::c_int,
-}
-
-impl Descriptors {
-    fn read() -> Self {
-        Self {
-            listed_end: std::fs::read_dir("/dev/fd")
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(|entry| {
-                    entry
-                        .ok()?
-                        .file_name()
-                        .to_str()?
-                        .parse::<libc::c_int>()
-                        .ok()
-                })
-                .max()
-                .map_or(0, |highest| highest.saturating_add(1)),
-            table_end: table_end(),
-        }
     }
 }
 
@@ -132,14 +102,20 @@ fn table_end() -> libc::c_int {
     if read == 0 && limit > 0 {
         limit
     } else {
-        libc::c_int::MAX
+        FALLBACK_TABLE_END
     }
 }
 
-/// One past the highest number the system gives any descriptor of a process.
+/// The end of the table where the system will not say: well above what it gives by default.
+#[cfg(target_vendor = "apple")]
+const FALLBACK_TABLE_END: libc::c_int = 1 << 20;
+
+/// One past the highest number the system gives any descriptor of a process, where it is not
+/// asked: Linux lists the descriptors of the child instead, and the other systems are walked as far
+/// as the soft limit.
 #[cfg(not(target_vendor = "apple"))]
 const fn table_end() -> libc::c_int {
-    libc::c_int::MAX
+    0
 }
 
 /// Opens a directory for the one thing the start does with it, which is to enter it.
@@ -168,21 +144,26 @@ fn open_directory(path: &std::path::Path) -> std::io::Result<OwnedFd> {
 /// failed run through is among them: it is already marked, and closed by a good run, and it has to
 /// be open for a failed one to be reported.
 ///
-/// Linux marks them all in one call from kernel 5.11. Where it cannot, and on the other systems,
-/// every number is marked up to the highest of two: one past the highest descriptor that was
-/// listed open when the start was read, which covers what is open now whatever the limit has been
-/// lowered to since, and the soft limit on descriptors as the child finds it, which covers what
-/// was opened after that, because a descriptor is given a number below the soft limit in force. The
-/// system's own highest number bounds the second, and a soft limit that names no bound (and a
-/// system that listed no descriptors) is walked as far as [`MOST_WALKED`].
+/// Every descriptor the child has is found in the child, at the moment it is made, so no limit or
+/// timing in the worker can hide one:
+///
+/// * Linux marks them all in one call from kernel 5.11, and where that call is not available lists
+///   the child's own table (`/proc/self/fd`) and marks each. Where neither can be done the start
+///   fails, rather than going ahead with descriptors it could not account for.
+/// * Apple systems give no descriptor a number at or above `kern.maxfilesperproc`, whatever the
+///   soft limit says, so every number below it is marked: about 7 ms at the default of 92,160, in
+///   the child, before the shell runs.
+/// * Other Unix systems are walked as far as the soft limit, which does not cover a descriptor
+///   above a limit lowered since it was opened.
 ///
 /// A descriptor that is not open is refused by the call, and that is no failure. Any other refusal
 /// is returned, so that a shell is not started with a descriptor that could not be marked.
 ///
 /// This allocates nothing and calls only system calls, as it has to between the fork and the run.
-fn mark_close_on_exec(descriptors: Descriptors) -> std::io::Result<()> {
+fn mark_close_on_exec(table_end: libc::c_int) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
+        let _ = table_end;
         // SAFETY: the call takes no pointer, and marks descriptors of this process only.
         let marked = unsafe {
             libc::syscall(
@@ -195,28 +176,56 @@ fn mark_close_on_exec(descriptors: Descriptors) -> std::io::Result<()> {
         if marked == 0 {
             return Ok(());
         }
+        mark_listed_close_on_exec()
     }
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `limit` is this function's own and outlives the call.
-    let known = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } == 0;
-    let soft_end = if known && limit.rlim_cur != libc::RLIM_INFINITY {
-        libc::c_int::try_from(limit.rlim_cur)
-            .unwrap_or(libc::c_int::MAX)
-            .min(descriptors.table_end)
-    } else if descriptors.listed_end > 0 {
-        0
-    } else {
-        libc::c_int::try_from(MOST_WALKED).unwrap_or(libc::c_int::MAX)
-    };
-    mark_range_close_on_exec(3, descriptors.listed_end.max(soft_end))
+    #[cfg(target_vendor = "apple")]
+    {
+        mark_range_close_on_exec(3, table_end)
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        let _ = table_end;
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is this function's own and outlives the call.
+        let known = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } == 0;
+        let end = if known && limit.rlim_cur != libc::RLIM_INFINITY {
+            libc::c_int::try_from(limit.rlim_cur).unwrap_or(libc::c_int::MAX)
+        } else {
+            1 << 16
+        };
+        mark_range_close_on_exec(3, end)
+    }
 }
 
-/// The most descriptors walked one by one where the soft limit names no bound and the system lists
-/// none.
-const MOST_WALKED: libc::rlim_t = 1 << 16;
+/// Marks each descriptor the child's own table lists to close when the shell is run, reading the
+/// list into room on the stack.
+#[cfg(target_os = "linux")]
+fn mark_listed_close_on_exec() -> std::io::Result<()> {
+    let table = rustix::fs::open(
+        "/proc/self/fd",
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    let mut room = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
+    let mut entries = rustix::fs::RawDir::new(&table, &mut room);
+    while let Some(entry) = entries.next() {
+        let entry = entry?;
+        // The table's own entries, `.` and `..`, are not numbers.
+        let Some(descriptor) = std::str::from_utf8(entry.file_name().to_bytes())
+            .ok()
+            .and_then(|name| name.parse::<libc::c_int>().ok())
+        else {
+            continue;
+        };
+        if descriptor > 2 {
+            mark_range_close_on_exec(descriptor, descriptor + 1)?;
+        }
+    }
+    Ok(())
+}
 
 /// Marks the descriptors from `from` up to, not including, `to` to close when the shell is run.
 fn mark_range_close_on_exec(from: libc::c_int, to: libc::c_int) -> std::io::Result<()> {
@@ -246,7 +255,7 @@ pub(super) fn start(
     command: &ShellCommand,
 ) -> std::io::Result<std::process::Child> {
     let directory = reads.opened?;
-    let descriptors = reads.descriptors;
+    let table_end = reads.table_end;
     let mut process = std::process::Command::new(&command.program);
     process
         .args(&command.arguments)
@@ -288,7 +297,7 @@ pub(super) fn start(
             rustix::process::ioctl_tiocsctty(standard_input)?;
             // The directory that was opened, not a path to it.
             rustix::process::fchdir(&directory)?;
-            mark_close_on_exec(descriptors)
+            mark_close_on_exec(table_end)
         });
     }
     process.spawn()
@@ -296,7 +305,7 @@ pub(super) fn start(
 
 #[cfg(test)]
 pub(super) mod tests {
-    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::fd::OwnedFd;
 
     use super::*;
 
@@ -315,64 +324,64 @@ pub(super) mod tests {
                         .expect("left open on exec");
                     return placed;
                 }
-                Err(_) if wanted > 512 => wanted /= 2,
+                Err(_) if wanted > 64 => wanted /= 2,
                 Err(error) => panic!("no descriptor could be placed far up the table: {error}"),
             }
         }
     }
 
-    /// The descriptors from the first to the last given are marked, and the ones past it are not,
-    /// whatever number they have.
+    /// Every descriptor the child holds is marked to close when the shell is run, in a process of
+    /// its own, since marking is done to the whole table: one low, one far up it, and, on Linux, by
+    /// listing the table as well as by the one call that marks it, which the other would hide.
     #[test]
-    fn a_range_of_descriptors_is_marked_to_close_when_the_shell_is_run() {
-        let held = std::fs::File::open("/").expect("a descriptor to copy");
-        let first = descriptor_far_up(&held);
-        let placed = [
-            first,
-            rustix::io::fcntl_dupfd_cloexec(&held, 0).expect("another"),
-        ];
-        for descriptor in &placed {
-            rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::empty())
-                .expect("left open on exec");
-        }
-        let (low, high) = (
-            placed.iter().map(AsRawFd::as_raw_fd).min().expect("two"),
-            placed.iter().map(AsRawFd::as_raw_fd).max().expect("two"),
-        );
-        mark_range_close_on_exec(low, high).expect("marks");
-        let marked = |descriptor: &OwnedFd| {
-            rustix::io::fcntl_getfd(descriptor)
-                .expect("flags")
-                .contains(rustix::io::FdFlags::CLOEXEC)
-        };
-        let (below, at) = if placed[0].as_raw_fd() == low {
-            (&placed[0], &placed[1])
-        } else {
-            (&placed[1], &placed[0])
-        };
-        assert!(marked(below), "the range is marked");
-        assert!(!marked(at), "and nothing past it");
-    }
+    fn every_descriptor_the_child_holds_is_marked_to_close_when_the_shell_is_run() {
+        const IN_CHILD: &str = "KR_MARK_DESCRIPTORS_IN_CHILD";
 
-    /// What the system lists as open is what bounds the walk, so a descriptor above the soft limit
-    /// as it is now, or far up the table, is among them.
-    #[test]
-    fn the_descriptors_the_system_lists_include_one_far_up_the_table() {
-        let held = std::fs::File::open("/").expect("a descriptor to copy");
-        let far = descriptor_far_up(&held);
-        let descriptors = Descriptors::read();
-        assert!(
-            descriptors.listed_end > far.as_raw_fd(),
-            "the listing ends at {}, below the descriptor at {}",
-            descriptors.listed_end,
-            far.as_raw_fd()
-        );
-        assert!(
-            descriptors.table_end > far.as_raw_fd(),
-            "the table ends at {}, below a descriptor the system gave, at {}",
-            descriptors.table_end,
-            far.as_raw_fd()
-        );
+        if std::env::var_os(IN_CHILD).is_some() {
+            let held = std::fs::File::open("/").expect("a descriptor to copy");
+            let placed = || {
+                let low = rustix::io::fcntl_dupfd_cloexec(&held, 100).expect("one low");
+                rustix::io::fcntl_setfd(&low, rustix::io::FdFlags::empty()).expect("inheritable");
+                [low, descriptor_far_up(&held)]
+            };
+            let marked = |descriptor: &OwnedFd| {
+                rustix::io::fcntl_getfd(descriptor)
+                    .expect("flags")
+                    .contains(rustix::io::FdFlags::CLOEXEC)
+            };
+            let first = placed();
+            assert!(
+                !marked(&first[0]) && !marked(&first[1]),
+                "inheritable to begin with"
+            );
+            mark_close_on_exec(table_end()).expect("marks");
+            assert!(
+                marked(&first[0]),
+                "the descriptor low in the table is marked"
+            );
+            assert!(marked(&first[1]), "and the one far up it");
+            #[cfg(target_os = "linux")]
+            {
+                let second = placed();
+                mark_listed_close_on_exec().expect("marks by the listing");
+                assert!(
+                    marked(&second[0]),
+                    "listed: the descriptor low in the table"
+                );
+                assert!(marked(&second[1]), "listed: and the one far up it");
+            }
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().expect("this binary"))
+            .args([
+                "--exact",
+                "pty::spawn::tests::every_descriptor_the_child_holds_is_marked_to_close_when_the_shell_is_run",
+                "--test-threads=1",
+            ])
+            .env(IN_CHILD, "1")
+            .status()
+            .expect("the case runs in a process of its own");
+        assert!(status.success(), "the marking did not hold: {status}");
     }
 
     /// A missing directory falls back to the home directory the environment names, and a directory
