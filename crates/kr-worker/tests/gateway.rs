@@ -1740,18 +1740,24 @@ fn kr_req_12_10_gateway_request_state_survives_reopening_the_workers_own_journal
 /// KR-REQ-11.27 and KR-REQ-11.33: one exclusive admission carries one answer, whichever writer
 /// takes it, and the second writer is refused before its bytes go.
 ///
-/// Recording competing answers afterwards is not the contract. Section 11 gives every pending
-/// resource one resolution, and a resolution is bytes reaching the upstream, so what has to be
-/// impossible is the second transmission.
+/// A rich answer holds the admission from its marker, the point after which its bytes are the
+/// transport's to carry. Until then it holds only a reservation, and a native answer that reaches
+/// the resource first takes the transmission and the rich answer finds the resource taken at its
+/// marker. Recording competing answers afterwards is not the contract. Section 11 gives every
+/// pending resource one resolution, and a resolution is bytes reaching the upstream, so what has to
+/// be impossible is the second transmission.
 #[tokio::test]
 async fn kr_req_11_27_one_exclusive_admission_carries_one_answer_whichever_writer_takes_it() {
     let (broker, upstream) = gateway_recording(None);
 
-    // The rich writer takes the admission first. The native answer that follows is refused, and
+    // The rich writer's marker is written first. The native answer that follows is refused, and
     // the frame is never forwarded: the closure below would have run if it had been.
     let first = approval(&broker, "1", 2).expect("the interpretation is accepted");
     let admitted = reserve(&broker, first.resource_id, "allow", 3)
         .expect("the rich answer reserves the resource");
+    let marked = broker
+        .mark_approval(&admitted, TimestampMs::new(3))
+        .expect("the rich answer's marker is written");
     let forwarded = std::cell::Cell::new(false);
     let refusal = broker
         .native_answer_through(
@@ -1772,9 +1778,9 @@ async fn kr_req_11_27_one_exclusive_admission_carries_one_answer_whichever_write
 
     // The rich writer's own answer then goes, and it is the frame the core prepared for that
     // resource: it names the connection the resource was asked on and the request it answers.
-    broker
-        .record_approval(&admitted, TimestampMs::new(5))
-        .expect("the admitted answer goes");
+    let (dispatch, request) = marked.transmission();
+    let pending = dispatch.submit(&request).expect("the admitted answer goes");
+    let _in_flight = marked.submitted(pending);
     let carried: Vec<UpstreamBody> = upstream
         .submitted()
         .iter()
@@ -1834,6 +1840,47 @@ async fn kr_req_11_27_one_exclusive_admission_carries_one_answer_whichever_write
     assert_eq!(
         broker.pending(third.resource_id).expect("recorded").state,
         PendingState::Uncertain
+    );
+
+    // A rich answer that has only reserved the resource has not begun to transmit. A native answer
+    // that arrives then takes the transmission, is forwarded, and settles the resource, and the
+    // rich answer that reaches its marker afterwards sends nothing and is told the resource was
+    // taken.
+    let sent_before = upstream.submitted().len();
+    let fourth = approval(&broker, "4", 12).expect("a fourth interpretation");
+    let reserved = reserve(&broker, fourth.resource_id, "allow", 13)
+        .expect("the rich answer reserves the resource");
+    let forwarded = std::cell::Cell::new(false);
+    broker
+        .native_answer_through(
+            GatewayConnectionId::new(1),
+            response("4").as_bytes(),
+            TimestampMs::new(14),
+            |_| {
+                forwarded.set(true);
+                Ok(())
+            },
+        )
+        .expect("a native answer takes a reservation that has no marker");
+    assert!(forwarded.get(), "the native answer is the one that goes");
+    let overtaken = broker
+        .mark_approval(&reserved, TimestampMs::new(15))
+        .err()
+        .expect("the rich answer finds the resource taken at its marker");
+    assert_eq!(overtaken.code(), ErrorCode::QuestionResolved);
+    assert!(
+        overtaken.proven_unsent(),
+        "nothing of the rich answer was queued, so its refusal is known"
+    );
+    assert_eq!(
+        upstream.submitted().len(),
+        sent_before,
+        "the rich answer reached no transport"
+    );
+    assert_eq!(
+        broker.pending(fourth.resource_id).expect("recorded").state,
+        PendingState::Resolved,
+        "the native answer's delivery alone settled the resource"
     );
 }
 
