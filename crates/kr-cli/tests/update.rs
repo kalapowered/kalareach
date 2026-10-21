@@ -896,9 +896,9 @@ async fn an_update_left_after_its_switch_is_finished_by_the_next_run() {
     let record = host.record();
     assert!(record["update"].is_null(), "{record}");
     assert_eq!(record["previous"], one.name().as_str(), "{record}");
-    // The record the update left was written by an earlier build, as format 1; it is written again
-    // in the format this build writes.
-    assert_eq!(record["format"], 2, "{record}");
+    // The record the update left was written by an earlier build, in the format before this one's;
+    // it is written again in the format this build writes.
+    assert_eq!(record["format"], kr_cli::update::RECORD_FORMAT, "{record}");
 }
 
 /// KR-REQ-26.10: a transaction an earlier build began holds no root, and settles on the roots of its
@@ -1248,7 +1248,7 @@ async fn a_daemon_an_update_prepared_is_taken_back_only_once_no_stop_of_it_can_e
         },
     });
     let record = serde_json::json!({
-        "format": 1,
+        "format": EARLIER_RECORD_FORMAT,
         "update": {
             "source": one.name().as_str(),
             "target": two.as_str(),
@@ -2064,7 +2064,7 @@ fn a_release_kept_in_the_store_is_replaced_by_the_copy_checked_in_this_run() {
         host.store
             .create_directories()
             .expect("the store's directories");
-        std::fs::write(host.store.record(), b"{\"format\":1}\n").expect("the store's record");
+        std::fs::write(host.store.record(), an_empty_record()).expect("the store's record");
         let kept = host.store.release_directory(one.name());
         one.write(&kept);
         let outside = host.scratch("outside");
@@ -2115,7 +2115,7 @@ fn a_release_kept_in_the_store_is_replaced_by_the_copy_checked_in_this_run() {
     host.store
         .create_directories()
         .expect("the store's directories");
-    std::fs::write(host.store.record(), b"{\"format\":1}\n").expect("the store's record");
+    std::fs::write(host.store.record(), an_empty_record()).expect("the store's record");
     let kept = host.store.release_directory(one.name());
     one.write(&kept);
     let store = host.store.root().display().to_string();
@@ -2186,7 +2186,7 @@ fn a_kept_release_whose_manifest_is_not_a_file_is_refused_with_the_way_out() {
         host.store
             .create_directories()
             .expect("the store's directories");
-        std::fs::write(host.store.record(), b"{\"format\":1}\n").expect("the store's record");
+        std::fs::write(host.store.record(), an_empty_record()).expect("the store's record");
         let kept = host.store.release_directory(one.name());
         one.write(&kept);
         let outside = host.scratch("outside");
@@ -2519,11 +2519,10 @@ fn a_manifest_is_taken_only_as_the_root_s_targets_keys_signed_it() {
     assert!(root.verify(changed.to_string().as_bytes()).is_err());
     // And one that names a member twice with the same value, which leaves the canonical form and
     // the signature as they were: refused by the updater, as by every program of the release.
-    let repeated = document.replacen(
-        "\"signed\":{",
-        &format!("\"signed\":{{\"release\":\"{}\",", manifest.release),
-        1,
-    );
+    let signed = document.find("\"signed\":").expect("the signed members");
+    let open = signed + document[signed..].find('{').expect("an object") + 1;
+    let mut repeated = document.clone();
+    repeated.insert_str(open, &format!("\"release\":\"{}\",", manifest.release));
     assert_ne!(repeated, document, "the member is repeated");
     assert!(root.verify(repeated.as_bytes()).is_err());
     assert!(ReleaseManifest::read_document(repeated.as_bytes()).is_err());
@@ -5954,7 +5953,7 @@ async fn a_rescue_that_stopped_after_its_switch_is_finished_by_the_next_run() {
     // to two had stopped: the record states the rescue, that update it went on past, and no daemon
     // running.
     host.write_record(&serde_json::json!({
-        "format": 2,
+        "format": kr_cli::update::RECORD_FORMAT,
         "previous": null,
         "staged": two.name().as_str(),
         "update": {
@@ -6010,7 +6009,7 @@ async fn a_rescue_that_stopped_before_its_switch_is_the_failed_update_again() {
     let mut unstartable = host.restart();
     unstartable["start"]["arguments"]["arguments"] = serde_json::json!(["--no-such-argument"]);
     host.write_record(&serde_json::json!({
-        "format": 2,
+        "format": kr_cli::update::RECORD_FORMAT,
         "previous": null,
         "staged": two.name().as_str(),
         "update": {
@@ -6142,7 +6141,7 @@ async fn a_rescue_the_stores_refuse_leaves_the_failed_update_owing_the_daemon_as
     let mut first = host.restart();
     first["start"]["arguments"]["arguments"] = serde_json::json!(["--no-such-argument"]);
     host.write_record(&serde_json::json!({
-        "format": 2,
+        "format": kr_cli::update::RECORD_FORMAT,
         "previous": null,
         "staged": two.name().as_str(),
         "update": {
