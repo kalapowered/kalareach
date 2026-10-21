@@ -356,10 +356,17 @@ neither is a method a client could name.
 
 The resolve hook runs in front of an interactive invocation, before the command starts. The
 session answers with the argument vector to run: the command name and the vector the person typed,
-plus the flags an enabled integration for that command adds. Several things bypass it, and each keeps
-the invocation exactly as typed and is given no backend at all: a command invoked by absolute path,
-an integration the user has not enabled, a line of a script rather than an interactive invocation,
-a shell whose integration is not a managed KalaReach root shell yet, and a session that is closing.
+plus the flags an enabled integration for that command adds. Several things bypass it, and each
+keeps the invocation exactly as typed, is given no backend at all, and is named in the answer's
+`bypass`: a command invoked by absolute path (`absolute_path`), a command no integration names
+(`not_integrated`), an integration the user has not enabled (`disabled`), a line of a script
+rather than an interactive invocation (`not_interactive`), a shell whose integration is not a
+managed KalaReach root shell yet (`unmanaged_shell`), a session that is closing
+(`session_closing`), and an invocation that already uses the integration's flags other than as the
+one whole run the integration declares (`flags_conflict`): part of the run, the run out of its
+order, one of its options with a value attached, or the run together with another use of one of
+its options. The flags are added as one run or not at all, and nothing the person typed is
+changed.
 
 An invocation that takes the integration is given its backend before the answer is sent. The answer
 carries the flags, the registration file of the backend and the installation's launcher, and the
@@ -372,7 +379,7 @@ the program. Where the worker can establish no backend, the invocation is answer
 `backend_unavailable` and runs as typed: an agent started with the integration's flags and nothing
 behind them is worse off than one started without them. That covers a launch the route cannot serve:
 an option typed for the program, a word that is the name of another subcommand, a program that is a
-script, and, on Windows, where no gateway runs, a package that declares a server. The worker's
+script, a runtime directory too long for the socket a backend binds, and, on Windows, where no gateway runs, a package that declares a server. The worker's
 diagnostics say which. A build no signed qualification record names, and a package whose table
 declares no tested volatile forwarding mode, are refused later, when the launcher presents itself
 after an integrated answer, and the launcher then runs the command as typed.
