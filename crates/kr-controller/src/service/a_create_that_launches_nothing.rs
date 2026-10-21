@@ -3184,6 +3184,7 @@ async fn a_workflow_create_under_a_used_token_asks_the_nodes_admission() {
 }
 
 /// A closure a worker kept in its own journal for a session, with `surviving` left running.
+#[cfg(unix)]
 fn a_workers_own_closure(
     session_id: kr_protocol::ids::SessionId,
     surviving: Vec<kr_protocol::session::SurvivingResource>,
@@ -3204,6 +3205,7 @@ fn a_workers_own_closure(
 
 /// Registers a session as a writer, as a launch that may have run does, and starts a process the
 /// way a worker would be: one that lives until its standard input is closed.
+#[cfg(unix)]
 fn a_session_with_a_worker_running(
     controller: &Arc<Controller>,
 ) -> (
@@ -3229,87 +3231,97 @@ fn a_session_with_a_worker_running(
     (session_id, worker, identity)
 }
 
-/// KR-REQ-14.32: the registration of a session whose create did not come to a session ends once
-/// the kernel says its worker's process has, and not before.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_failed_creates_registration_ends_when_its_worker_ends() {
-    let (_temp, controller, _started) = daemon().await;
-    let (session_id, mut worker, identity) = a_session_with_a_worker_running(&controller);
-    let holds = Arc::clone(controller.project().service().holds());
+/// Writes the journal a worker kept for a session: with a closure that lists `surviving`, with a
+/// closure that lists nothing, or with no closure in it.
+#[cfg(unix)]
+fn a_workers_journal(
+    temp: &kr_ipc::testing::TempHost,
+    session_id: kr_protocol::ids::SessionId,
+    closure: Option<Vec<kr_protocol::session::SurvivingResource>>,
+) {
+    let path = temp.environment().journal_database(session_id);
+    std::fs::create_dir_all(path.parent().expect("a directory")).expect("the directory");
+    let mut journal = kr_worker::journal::Journal::open(&path).expect("the worker's journal opens");
+    if let Some(surviving) = closure {
+        journal
+            .record_closure(&a_workers_own_closure(session_id, surviving))
+            .expect("the closure is recorded");
+    }
+}
 
-    let watching = controller.watch_for_a_worker_to_end(session_id, identity);
+/// Runs the watch of a failed create over a worker that ends after the watch has looked at it
+/// once, and says whether the session still counts as a writer when the watch is done.
+#[cfg(unix)]
+async fn still_counted_after_the_worker_ends(
+    controller: &Arc<Controller>,
+    session_id: kr_protocol::ids::SessionId,
+    mut worker: std::process::Child,
+    identity: kr_protocol::identity::ProcessStartIdentity,
+    never_claimed: bool,
+) -> bool {
+    let holds = Arc::clone(controller.project().service().holds());
+    let watching = controller.watch_for_a_worker_to_end(session_id, identity, never_claimed);
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
     assert!(
-        holds.has_session(session_id),
+        !watching.is_finished() && holds.has_session(session_id),
         "the worker is running, so the session may still write"
     );
     drop(worker.stdin.take());
     worker.wait().expect("the worker ends");
     watching.await.expect("the watch finishes");
+    holds.has_session(session_id)
+}
+
+/// KR-REQ-14.32: the registration of a session whose create no claim took ends once the kernel
+/// says the worker's process has ended, whatever the worker's journal holds, because a worker
+/// that no claim took starts no session.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_registration_of_a_create_no_claim_took_ends_when_its_worker_ends() {
+    let (_temp, controller, _started) = daemon().await;
+    let (session_id, worker, identity) = a_session_with_a_worker_running(&controller);
     assert!(
-        !holds.has_session(session_id),
-        "the worker ended and its journal records nothing left running"
+        !still_counted_after_the_worker_ends(&controller, session_id, worker, identity, true).await
     );
 }
 
-/// KR-REQ-14.32: a worker that ended with a journal and no closure in it shows nothing about what
-/// its session left running, so the registration stays, and one whose closure lists nothing left
-/// running lets it go.
+/// KR-REQ-14.32: a worker that was claimed and that kept no journal shows nothing about what its
+/// session left running (it starts its shell even when it cannot open a journal), so the
+/// registration stays; a journal with no closure in it, and one whose closure lists a survivor,
+/// keep it too; a journal whose closure lists nothing lets it go.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_failed_creates_registration_follows_what_the_workers_journal_shows() {
-    for (closure, ends) in [(false, false), (true, true)] {
+async fn the_registration_of_a_claimed_failed_create_follows_what_the_workers_journal_shows() {
+    let survivor = vec![kr_protocol::session::SurvivingResource {
+        kind: "process".to_owned(),
+        detail: "a process the shell's startup files started".to_owned(),
+    }];
+    for (journal, counted, what) in [
+        (None, true, "no journal"),
+        (Some(None), true, "a journal with no closure in it"),
+        (
+            Some(Some(survivor)),
+            true,
+            "a closure that lists a survivor",
+        ),
+        (
+            Some(Some(Vec::new())),
+            false,
+            "a closure that lists nothing",
+        ),
+    ] {
         let (temp, controller, _started) = daemon().await;
-        let (session_id, mut worker, identity) = a_session_with_a_worker_running(&controller);
-        let holds = Arc::clone(controller.project().service().holds());
-        let path = temp.environment().journal_database(session_id);
-        std::fs::create_dir_all(path.parent().expect("a directory")).expect("the directory");
-        let mut journal =
-            kr_worker::journal::Journal::open(&path).expect("the worker's journal opens");
-        if closure {
-            journal
-                .record_closure(&a_workers_own_closure(session_id, Vec::new()))
-                .expect("the closure is recorded");
+        let (session_id, worker, identity) = a_session_with_a_worker_running(&controller);
+        if let Some(closure) = journal {
+            a_workers_journal(&temp, session_id, closure);
         }
-        drop(journal);
-
-        let watching = controller.watch_for_a_worker_to_end(session_id, identity);
-        drop(worker.stdin.take());
-        worker.wait().expect("the worker ends");
-        watching.await.expect("the watch finishes");
         assert_eq!(
-            !holds.has_session(session_id),
-            ends,
-            "a journal with{} a closure in it",
-            if closure { "" } else { "out" }
+            still_counted_after_the_worker_ends(&controller, session_id, worker, identity, false)
+                .await,
+            counted,
+            "{what}"
         );
     }
-}
-
-/// KR-REQ-14.32: the same registration stays when the worker's own record of its session shows
-/// something it left running, which is what a hold must keep waiting for.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_failed_creates_registration_stays_when_its_worker_left_something_running() {
-    let (temp, controller, _started) = daemon().await;
-    let (session_id, mut worker, identity) = a_session_with_a_worker_running(&controller);
-    let holds = Arc::clone(controller.project().service().holds());
-    let path = temp.environment().journal_database(session_id);
-    std::fs::create_dir_all(path.parent().expect("a directory")).expect("the directory");
-    kr_worker::journal::Journal::open(&path)
-        .expect("the worker's journal opens")
-        .record_closure(&a_workers_own_closure(
-            session_id,
-            vec![kr_protocol::session::SurvivingResource {
-                kind: "process".to_owned(),
-                detail: "a process the shell's startup files started".to_owned(),
-            }],
-        ))
-        .expect("the closure is recorded");
-
-    let watching = controller.watch_for_a_worker_to_end(session_id, identity);
-    drop(worker.stdin.take());
-    worker.wait().expect("the worker ends");
-    watching.await.expect("the watch finishes");
-    assert!(
-        holds.has_session(session_id),
-        "the worker ended and left a process running, so the session still counts"
-    );
 }

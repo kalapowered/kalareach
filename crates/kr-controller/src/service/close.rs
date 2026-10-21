@@ -1220,26 +1220,37 @@ impl Controller {
     /// Ends the registration of a session whose create did not come to a session, once the kernel
     /// says its worker's process has ended, looking until [`CLOSURE_WATCH_TIMEOUT`] has passed.
     ///
-    /// Such a worker closes whatever it started before it ends and keeps its own record of how it
-    /// ended, so when it ended the record is read, and a registration is ended only if the worker
-    /// kept no journal (it never started a session) or its journal shows a closure with nothing
-    /// left running. A worker still running after the bound keeps the registration until its
-    /// closure or until the daemon restarts, and so does one that left a process behind or whose
-    /// record shows nothing.
+    /// A worker that no claim took started no session, so its registration ends with its process.
+    /// One that was claimed closes whatever it started before it ends and keeps its own record of
+    /// how it ended, so when it ended the record is read, and the registration ends only if the
+    /// journal shows a closure with nothing left running. A worker still running after the bound
+    /// keeps the registration until its closure or until the daemon restarts, and so does one that
+    /// left a process behind or whose record shows nothing.
     pub(super) fn end_session_when_ended(
         self: &Arc<Self>,
         session_id: SessionId,
         identity: kr_protocol::identity::ProcessStartIdentity,
+        never_claimed: bool,
     ) {
-        drop(self.watch_for_a_worker_to_end(session_id, identity));
+        drop(self.watch_for_a_worker_to_end(session_id, identity, never_claimed));
     }
 
-    /// Whether a worker that has ended shows that its session left nothing running: it kept no
-    /// journal, so it never started a session, or its journal holds a closure that lists no
-    /// survivor. A journal with no closure in it, or one that cannot be read, shows nothing.
-    fn worker_left_nothing(&self, session_id: SessionId) -> bool {
-        if !self.paths.journal_database(session_id).exists() {
+    /// Whether a worker that has ended shows that its session left nothing running: no claim took
+    /// its launch, so it started no session, or its journal holds a closure that lists no survivor.
+    /// A worker that was claimed and kept no journal (it starts its shell even when it cannot open
+    /// one), a journal with no closure in it, and one that cannot be looked for or read show
+    /// nothing.
+    fn worker_left_nothing(&self, session_id: SessionId, never_claimed: bool) -> bool {
+        if never_claimed {
             return true;
+        }
+        if !self
+            .paths
+            .journal_database(session_id)
+            .try_exists()
+            .unwrap_or(false)
+        {
+            return false;
         }
         self.recovered_closure(session_id)
             .is_some_and(|closure| closure.surviving.is_empty())
@@ -1251,6 +1262,7 @@ impl Controller {
         self: &Arc<Self>,
         session_id: SessionId,
         identity: kr_protocol::identity::ProcessStartIdentity,
+        never_claimed: bool,
     ) -> tokio::task::JoinHandle<()> {
         let controller = Arc::clone(self);
         tokio::spawn(async move {
@@ -1261,10 +1273,11 @@ impl Controller {
                     kr_ipc::identity::ProcessState::Ended
                 ) {
                     let reader = Arc::clone(&controller);
-                    let left_nothing =
-                        tokio::task::spawn_blocking(move || reader.worker_left_nothing(session_id))
-                            .await
-                            .unwrap_or(false);
+                    let left_nothing = tokio::task::spawn_blocking(move || {
+                        reader.worker_left_nothing(session_id, never_claimed)
+                    })
+                    .await
+                    .unwrap_or(false);
                     if left_nothing {
                         controller
                             .project()

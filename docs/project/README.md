@@ -982,17 +982,18 @@ records, a project's own checkout included whether or not a workspace was ever s
 a terminal opened before the host knew its repository still counts. A session with no directory
 starts at the root and counts nowhere; one whose directory is not an absolute path, or whose
 request the daemon could not read after a restart, counts against every reservation. A session
-counts until its closure is recorded. A create that did not come to a session (a worker that
-reported it could not start, whether the create was still waiting or not, a launch no worker
-claimed, and a launch that did not report in time) counts until the kernel says the worker's
-process has ended and the worker's own journal shows nothing it left running (no journal, or one
-whose closure lists no survivor; a journal with no closure shows nothing); the host asks for sixty
-seconds, and a worker still running after that, or one that left a process behind, counts until
-the daemon restarts. A launch whose process the host could not identify
-counts until the daemon restarts too. A closure that could not confirm its worker ended counts
-until the kernel says the process has ended. A closure that records a process the session left
-running counts until the daemon restarts, and after a restart nothing follows that process. A
-closure that accounts for its worker releases the session even where its account of the session's
+counts until its closure is recorded. A create that did not come to a session counts until the
+kernel says the worker's process has ended, and then as follows. A launch no worker claimed started
+no session, so it stops counting. A worker that was claimed (it reported it could not start, or
+did not report in time) stops counting only if its own journal holds a closure that lists nothing
+it left running; no journal, a journal with no closure in it, and a closure that lists a survivor
+all keep it, because a worker starts its shell even when it cannot open a journal. A claimed
+launch that reports late and runs is a session like any other, and its closure ends it. The host
+asks for sixty seconds, and a worker still running after that counts until the daemon restarts. A
+launch whose process the host could not identify counts until the daemon restarts too. A closure
+that could not confirm its worker ended counts until the kernel says the process has ended. A
+closure that records a process the session left running counts until the daemon restarts, and
+after a restart nothing follows that process. A closure that accounts for its worker releases the session even where its account of the session's
 own processes is incomplete.
 
 What a reservation does not see: a session in a tree this host does not record (a linked worktree
