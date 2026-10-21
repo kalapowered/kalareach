@@ -28,3 +28,22 @@ By a deliberate re-copy, and no other way. Nothing in this repository writes int
 and no test regenerates it. A new release is copied from a named commit of the plugins repository
 into a directory named for its version, with the commit in the table above and the digests in the
 suite changed in the same change.
+
+## The whole Codex package
+
+`kalareach/codex/0.3.0/` is a different kind of copy: every file of the package, not only its
+manifest, so a host can install it and the gateway's whole path runs on what the release declares.
+
+| | |
+| --- | --- |
+| Source | `kalareach-plugins`, `plugins/kalareach/codex/` |
+| Commit | `6029c7845a1a16f3c6ef27097818848ad9641960`, the revision the manifest's `source.revision` names |
+| Files | `plugin.json`, `connector.json`, `presentation.json`, `README.md`, `fixtures/conformance.json`, `fixtures/frames.json` |
+| Package hash | `a37d8d7eaf63f8502ae2da2e57a39784a01a159426060aca53a48647d30b928f`, the SHA-256 digest of `plugin.json` |
+
+Each file is byte for byte what the plugins repository holds, and the manifest names every other
+file by digest, so the package check refuses a copy that differs. Where a checkout of the plugins
+repository sits beside this one, `crates/kr-worker/tests/bundled_codex.rs` also compares each file
+with the repository's. The worker's in-process cases keep using the Codex-shaped test package under
+`crates/kr-worker`, which stays until this package is the one a host ships.
+

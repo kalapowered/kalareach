@@ -1,0 +1,213 @@
+{
+  "manifest_version": 1,
+  "publisher_id": "kalareach",
+  "plugin_name": "codex",
+  "version": "0.3.0",
+  "display_name": "Codex CLI",
+  "description": "Recognises Codex CLI, serves it behind a gateway, reads its App Server through a declarative table, answers its approvals and stops the turn it is running.",
+  "sdk_range": ">=0.1.6, <0.2.0",
+  "wit_range": ">=0.1.0, <0.2.0",
+  "source": {
+    "repository": "https://github.com/kalapowered/kalareach-plugins",
+    "revision": "6029c7845a1a16f3c6ef27097818848ad9641960"
+  },
+  "match_rules": [
+    {
+      "id": "codex-npm",
+      "executable": {
+        "file_stem": "codex",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": {
+        "registry": "npm",
+        "package": "@openai/codex"
+      },
+      "confidence": "exact"
+    },
+    {
+      "id": "codex-executable",
+      "executable": {
+        "file_stem": "codex",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": null,
+      "confidence": "inferred"
+    }
+  ],
+  "platforms": [
+    {
+      "os": "linux",
+      "architectures": [
+        "x86_64",
+        "aarch64"
+      ]
+    },
+    {
+      "os": "mac_os",
+      "architectures": [
+        "aarch64"
+      ]
+    },
+    {
+      "os": "windows",
+      "architectures": [
+        "x86_64"
+      ]
+    }
+  ],
+  "payloads": [
+    {
+      "role": "asset",
+      "path": "README.md",
+      "digest": "67cda29387cf60869ce71be28ce9118a898de39a3a7efdef40310494f7a96fb0",
+      "size_bytes": "9588"
+    },
+    {
+      "role": "connector",
+      "path": "connector.json",
+      "digest": "62b6cecf01bf2bd1fa913770b608927cd65e622b54f7563f1a260074fed28e1b",
+      "size_bytes": "76645"
+    },
+    {
+      "role": "fixture",
+      "path": "fixtures/conformance.json",
+      "digest": "5481eac3070126d1836501fa9c312b68fd83a064aa6f8a879e607b19fccea819",
+      "size_bytes": "9648"
+    },
+    {
+      "role": "asset",
+      "path": "fixtures/frames.json",
+      "digest": "2c7d0791296851308672afba6eeba47d3f2432abd3f9957adeee2f9a7b28b1dd",
+      "size_bytes": "14073"
+    },
+    {
+      "role": "presentation",
+      "path": "presentation.json",
+      "digest": "28e6313dcd84c47f691f84a96e810aa66a26de0d9c44aee63abeafd810471394",
+      "size_bytes": "11041"
+    }
+  ],
+  "capabilities": [
+    {
+      "capability": "metadata.match",
+      "reason": "Recognise Codex CLI from its executable name and its published package"
+    },
+    {
+      "capability": "presentation.declarative",
+      "reason": "Show the thread, the running turn and the controls for it"
+    },
+    {
+      "capability": "broker.semantic_events",
+      "reason": "Read turn and item events from the App Server the session is already bound to"
+    },
+    {
+      "capability": "upstream.action",
+      "reason": "Ask Codex to stop the turn it is running when you press Stop"
+    },
+    {
+      "capability": "command_integration.launch",
+      "reason": "Start codex with the flags that point its terminal at the gateway, and its App Server as the session's backend"
+    },
+    {
+      "capability": "approval.decode",
+      "reason": "Read the approval requests Codex asks for a command and for a file change, and offer the decisions Codex reads"
+    },
+    {
+      "capability": "approval.respond",
+      "reason": "Answer those requests with the decision you choose"
+    }
+  ],
+  "actions": [
+    {
+      "id": "turn.cancel",
+      "label": "Stop the turn",
+      "effect": "upstream.cancel",
+      "implementation": {
+        "type": "upstream_cancel"
+      },
+      "parameters": {
+        "parameters": []
+      },
+      "description": "Cancel the turn the bound App Server is running, which ends it as interrupted",
+      "confirmation_required": false
+    },
+    {
+      "id": "thread.refresh",
+      "label": "Refresh",
+      "effect": "observe",
+      "implementation": {
+        "type": "presentation"
+      },
+      "parameters": {
+        "parameters": []
+      },
+      "description": "Draw this package's document again from the thread state the host already holds",
+      "confirmation_required": false
+    },
+    {
+      "id": "approval.answer",
+      "label": "Answer an approval",
+      "effect": "approval.respond",
+      "implementation": {
+        "type": "decision_destination",
+        "decision": "decision"
+      },
+      "parameters": {
+        "parameters": [
+          {
+            "name": "decision",
+            "kind": {
+              "type": "choice",
+              "choices": [
+                {
+                  "id": "accept",
+                  "label": "Allow once"
+                },
+                {
+                  "id": "accept-for-session",
+                  "label": "Allow for the session"
+                },
+                {
+                  "id": "decline",
+                  "label": "Decline"
+                },
+                {
+                  "id": "decline-and-stop",
+                  "label": "Decline and stop"
+                }
+              ]
+            },
+            "label": "Decision",
+            "required": true
+          }
+        ]
+      },
+      "description": "Answer the command or file-change approval Codex is waiting on",
+      "confirmation_required": false
+    }
+  ],
+  "attachments": null,
+  "native_bridge": null,
+  "command_integration": {
+    "command": "codex",
+    "flags": [
+      "--remote",
+      "{gateway}"
+    ],
+    "variables": [],
+    "backend": {
+      "arguments": [
+        "app-server",
+        "--listen",
+        "stdio://"
+      ],
+      "launching_words": [
+        "resume",
+        "fork"
+      ]
+    },
+    "grant_statement": "Adds --remote and the address of a gateway KalaReach opens to a codex you start in a managed shell, and starts the Codex App Server as that session's backend. Only a launch that types no option, or one that resumes or forks a thread, is served; any other runs as you typed it. The terminal and the server run as you, under their own permissions."
+  }
+}

@@ -1,0 +1,2314 @@
+{
+  "manifest_version": 1,
+  "plugin_id": "kalareach/codex",
+  "protocol": {
+    "name": "codex-app-server",
+    "qualified_range": "=0.155.1",
+    "tested_version": "0.155.1"
+  },
+  "transport": "stdio",
+  "framing": {
+    "type": "line_delimited_json",
+    "max_message_bytes": "8388608"
+  },
+  "request_id_path": {
+    "segments": [
+      {
+        "type": "member",
+        "name": "id"
+      }
+    ]
+  },
+  "method_path": {
+    "segments": [
+      {
+        "type": "member",
+        "name": "method"
+      }
+    ]
+  },
+  "response_correlation": {
+    "type": "matching_id",
+    "id_path": {
+      "segments": [
+        {
+          "type": "member",
+          "name": "id"
+        }
+      ]
+    }
+  },
+  "messages": {
+    "params": "params",
+    "result": "result",
+    "error": "error"
+  },
+  "routes": [
+    {
+      "method": "initialize",
+      "wire_name": "initialize",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.start",
+      "wire_name": "thread/start",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.resume",
+      "wire_name": "thread/resume",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.fork",
+      "wire_name": "thread/fork",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.archive",
+      "wire_name": "thread/archive",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.delete",
+      "wire_name": "thread/delete",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.unsubscribe",
+      "wire_name": "thread/unsubscribe",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.name.set",
+      "wire_name": "thread/name/set",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.goal.set",
+      "wire_name": "thread/goal/set",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.goal.get",
+      "wire_name": "thread/goal/get",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.goal.clear",
+      "wire_name": "thread/goal/clear",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.metadata.update",
+      "wire_name": "thread/metadata/update",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.attachment.add",
+      "wire_name": "thread/attachment/add",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.attachment.list",
+      "wire_name": "thread/attachment/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.attachment.remove",
+      "wire_name": "thread/attachment/remove",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.section.move",
+      "wire_name": "thread/section/move",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.unarchive",
+      "wire_name": "thread/unarchive",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.compact.start",
+      "wire_name": "thread/compact/start",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.shell-command",
+      "wire_name": "thread/shellCommand",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.approve-guardian-denied-action",
+      "wire_name": "thread/approveGuardianDeniedAction",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.rollback",
+      "wire_name": "thread/rollback",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.revert",
+      "wire_name": "thread/revert",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.list",
+      "wire_name": "thread/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread-section.list",
+      "wire_name": "threadSection/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread-section.create",
+      "wire_name": "threadSection/create",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread-section.update",
+      "wire_name": "threadSection/update",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread-section.delete",
+      "wire_name": "threadSection/delete",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.loaded.list",
+      "wire_name": "thread/loaded/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.read",
+      "wire_name": "thread/read",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.turns.list",
+      "wire_name": "thread/turns/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.items.list",
+      "wire_name": "thread/items/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "thread.inject-items",
+      "wire_name": "thread/inject_items",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "skills.list",
+      "wire_name": "skills/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "skills.extra-roots.set",
+      "wire_name": "skills/extraRoots/set",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "hooks.list",
+      "wire_name": "hooks/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "marketplace.add",
+      "wire_name": "marketplace/add",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "marketplace.remove",
+      "wire_name": "marketplace/remove",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "marketplace.upgrade",
+      "wire_name": "marketplace/upgrade",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "plugin.list",
+      "wire_name": "plugin/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "plugin.installed",
+      "wire_name": "plugin/installed",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "plugin.reconcile",
+      "wire_name": "plugin/reconcile",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "plugin.read",
+      "wire_name": "plugin/read",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "plugin.skill.read",
+      "wire_name": "plugin/skill/read",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "plugin.share.save",
+      "wire_name": "plugin/share/save",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "plugin.share.update-targets",
+      "wire_name": "plugin/share/updateTargets",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "plugin.share.list",
+      "wire_name": "plugin/share/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "plugin.share.checkout",
+      "wire_name": "plugin/share/checkout",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "plugin.share.delete",
+      "wire_name": "plugin/share/delete",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "app.read",
+      "wire_name": "app/read",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "app.list",
+      "wire_name": "app/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "app.installed",
+      "wire_name": "app/installed",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "fs.read-file",
+      "wire_name": "fs/readFile",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "fs.write-file",
+      "wire_name": "fs/writeFile",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "fs.create-directory",
+      "wire_name": "fs/createDirectory",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "fs.get-metadata",
+      "wire_name": "fs/getMetadata",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "fs.read-directory",
+      "wire_name": "fs/readDirectory",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "fs.remove",
+      "wire_name": "fs/remove",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "fs.copy",
+      "wire_name": "fs/copy",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "fs.watch",
+      "wire_name": "fs/watch",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "fs.unwatch",
+      "wire_name": "fs/unwatch",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "skills.config.write",
+      "wire_name": "skills/config/write",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "plugin.install",
+      "wire_name": "plugin/install",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "plugin.uninstall",
+      "wire_name": "plugin/uninstall",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "turn.start",
+      "wire_name": "turn/start",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "turn.steer",
+      "wire_name": "turn/steer",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "turn.interrupt",
+      "wire_name": "turn/interrupt",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "review.start",
+      "wire_name": "review/start",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "model.list",
+      "wire_name": "model/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "model-provider.capabilities.read",
+      "wire_name": "modelProvider/capabilities/read",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "experimental-feature.list",
+      "wire_name": "experimentalFeature/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "permission-profile.list",
+      "wire_name": "permissionProfile/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "experimental-feature.enablement.set",
+      "wire_name": "experimentalFeature/enablement/set",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "mcp-server.oauth.login",
+      "wire_name": "mcpServer/oauth/login",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "config.mcp-server.reload",
+      "wire_name": "config/mcpServer/reload",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "mcp-server-status.list",
+      "wire_name": "mcpServerStatus/list",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "mcp-server.resource.read",
+      "wire_name": "mcpServer/resource/read",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "mcp-server.tool.call",
+      "wire_name": "mcpServer/tool/call",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "windows-sandbox.setup-start",
+      "wire_name": "windowsSandbox/setupStart",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "windows-sandbox.readiness",
+      "wire_name": "windowsSandbox/readiness",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "account.login.start",
+      "wire_name": "account/login/start",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "account.login.cancel",
+      "wire_name": "account/login/cancel",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "account.logout",
+      "wire_name": "account/logout",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "account.rate-limits.read",
+      "wire_name": "account/rateLimits/read",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "account.rate-limit-reset-credit.consume",
+      "wire_name": "account/rateLimitResetCredit/consume",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "account.usage.read",
+      "wire_name": "account/usage/read",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "account.workspace-messages.read",
+      "wire_name": "account/workspaceMessages/read",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "account.send-add-credits-nudge-email",
+      "wire_name": "account/sendAddCreditsNudgeEmail",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "feedback.upload",
+      "wire_name": "feedback/upload",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "command.exec",
+      "wire_name": "command/exec",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "command.exec.write",
+      "wire_name": "command/exec/write",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "command.exec.terminate",
+      "wire_name": "command/exec/terminate",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "command.exec.resize",
+      "wire_name": "command/exec/resize",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "config.read",
+      "wire_name": "config/read",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "external-agent-config.detect",
+      "wire_name": "externalAgentConfig/detect",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "external-agent-config.import",
+      "wire_name": "externalAgentConfig/import",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "external-agent-config.import.record-history",
+      "wire_name": "externalAgentConfig/import/recordHistory",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "external-agent-config.import.read-histories",
+      "wire_name": "externalAgentConfig/import/readHistories",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "config.value.write",
+      "wire_name": "config/value/write",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "config.batch-write",
+      "wire_name": "config/batchWrite",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "config-requirements.read",
+      "wire_name": "configRequirements/read",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "account.read",
+      "wire_name": "account/read",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "fuzzy-file-search",
+      "wire_name": "fuzzyFileSearch",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "initialized",
+      "wire_name": "initialized",
+      "direction": "host_to_upstream"
+    },
+    {
+      "method": "item.command-execution.request-approval",
+      "wire_name": "item/commandExecution/requestApproval",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.file-change.request-approval",
+      "wire_name": "item/fileChange/requestApproval",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.tool.request-user-input",
+      "wire_name": "item/tool/requestUserInput",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "mcp-server.elicitation.request",
+      "wire_name": "mcpServer/elicitation/request",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.permissions.request-approval",
+      "wire_name": "item/permissions/requestApproval",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.tool.call",
+      "wire_name": "item/tool/call",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "account.chatgpt-auth-tokens.refresh",
+      "wire_name": "account/chatgptAuthTokens/refresh",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "attestation.generate",
+      "wire_name": "attestation/generate",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "apply-patch-approval",
+      "wire_name": "applyPatchApproval",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "exec-command-approval",
+      "wire_name": "execCommandApproval",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "error",
+      "wire_name": "error",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.started",
+      "wire_name": "thread/started",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.status.changed",
+      "wire_name": "thread/status/changed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.archived",
+      "wire_name": "thread/archived",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.deleted",
+      "wire_name": "thread/deleted",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.unarchived",
+      "wire_name": "thread/unarchived",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.closed",
+      "wire_name": "thread/closed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.reverted",
+      "wire_name": "thread/reverted",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "skills.changed",
+      "wire_name": "skills/changed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.name.updated",
+      "wire_name": "thread/name/updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.attachment.updated",
+      "wire_name": "thread/attachment/updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.goal.updated",
+      "wire_name": "thread/goal/updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.goal.cleared",
+      "wire_name": "thread/goal/cleared",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.queue.changed",
+      "wire_name": "thread/queue/changed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "project.changed",
+      "wire_name": "project/changed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.project.updated",
+      "wire_name": "thread/project/updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.environment.connected",
+      "wire_name": "thread/environment/connected",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.environment.disconnected",
+      "wire_name": "thread/environment/disconnected",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.settings.updated",
+      "wire_name": "thread/settings/updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.token-usage.updated",
+      "wire_name": "thread/tokenUsage/updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "turn.started",
+      "wire_name": "turn/started",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "hook.started",
+      "wire_name": "hook/started",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "turn.completed",
+      "wire_name": "turn/completed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "hook.completed",
+      "wire_name": "hook/completed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "turn.diff.updated",
+      "wire_name": "turn/diff/updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "turn.plan.updated",
+      "wire_name": "turn/plan/updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.started",
+      "wire_name": "item/started",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.auto-approval-review.started",
+      "wire_name": "item/autoApprovalReview/started",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.auto-approval-review.completed",
+      "wire_name": "item/autoApprovalReview/completed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "auto-approval-review.strict-review-required",
+      "wire_name": "autoApprovalReview/strictReviewRequired",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.completed",
+      "wire_name": "item/completed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.agent-message.delta",
+      "wire_name": "item/agentMessage/delta",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.plan.delta",
+      "wire_name": "item/plan/delta",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "command.exec.output-delta",
+      "wire_name": "command/exec/outputDelta",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "process.output-delta",
+      "wire_name": "process/outputDelta",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "process.exited",
+      "wire_name": "process/exited",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.command-execution.output-delta",
+      "wire_name": "item/commandExecution/outputDelta",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.command-execution.terminal-interaction",
+      "wire_name": "item/commandExecution/terminalInteraction",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.file-change.output-delta",
+      "wire_name": "item/fileChange/outputDelta",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.file-change.patch-updated",
+      "wire_name": "item/fileChange/patchUpdated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "server-request.resolved",
+      "wire_name": "serverRequest/resolved",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.mcp-tool-call.progress",
+      "wire_name": "item/mcpToolCall/progress",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "mcp-server.oauth-login.completed",
+      "wire_name": "mcpServer/oauthLogin/completed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "mcp-server.startup-status.updated",
+      "wire_name": "mcpServer/startupStatus/updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "mcp-server.event.stream.notification",
+      "wire_name": "mcpServer/event/stream/notification",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "account.updated",
+      "wire_name": "account/updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "account.rate-limits.updated",
+      "wire_name": "account/rateLimits/updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "app.list.updated",
+      "wire_name": "app/list/updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "remote-control.status.changed",
+      "wire_name": "remoteControl/status/changed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "external-agent-config.import.progress",
+      "wire_name": "externalAgentConfig/import/progress",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "external-agent-config.import.completed",
+      "wire_name": "externalAgentConfig/import/completed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "fs.changed",
+      "wire_name": "fs/changed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.reasoning.summary-text-delta",
+      "wire_name": "item/reasoning/summaryTextDelta",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.reasoning.summary-part-added",
+      "wire_name": "item/reasoning/summaryPartAdded",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "item.reasoning.text-delta",
+      "wire_name": "item/reasoning/textDelta",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.compacted",
+      "wire_name": "thread/compacted",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "model.rerouted",
+      "wire_name": "model/rerouted",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "model.verification",
+      "wire_name": "model/verification",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "model-provider.auth-recovery-started",
+      "wire_name": "modelProvider/authRecoveryStarted",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "model-provider.auth-recovery-completed",
+      "wire_name": "modelProvider/authRecoveryCompleted",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "turn.moderation-metadata",
+      "wire_name": "turn/moderationMetadata",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "model.safety-buffering.updated",
+      "wire_name": "model/safetyBuffering/updated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "warning",
+      "wire_name": "warning",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "guardian-warning",
+      "wire_name": "guardianWarning",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "deprecation-notice",
+      "wire_name": "deprecationNotice",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "config-warning",
+      "wire_name": "configWarning",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "fuzzy-file-search.session-updated",
+      "wire_name": "fuzzyFileSearch/sessionUpdated",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "fuzzy-file-search.session-completed",
+      "wire_name": "fuzzyFileSearch/sessionCompleted",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.realtime.started",
+      "wire_name": "thread/realtime/started",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.realtime.item-added",
+      "wire_name": "thread/realtime/itemAdded",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.realtime.item.started",
+      "wire_name": "thread/realtime/item/started",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.realtime.item.transcript.delta",
+      "wire_name": "thread/realtime/item/transcript/delta",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.realtime.item.completed",
+      "wire_name": "thread/realtime/item/completed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.realtime.transcript.delta",
+      "wire_name": "thread/realtime/transcript/delta",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.realtime.transcript.done",
+      "wire_name": "thread/realtime/transcript/done",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.realtime.output-audio.delta",
+      "wire_name": "thread/realtime/outputAudio/delta",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.realtime.sdp",
+      "wire_name": "thread/realtime/sdp",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.realtime.error",
+      "wire_name": "thread/realtime/error",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "thread.realtime.closed",
+      "wire_name": "thread/realtime/closed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "windows.world-writable-warning",
+      "wire_name": "windows/worldWritableWarning",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "windows-sandbox.setup-completed",
+      "wire_name": "windowsSandbox/setupCompleted",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "account.login.completed",
+      "wire_name": "account/login/completed",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "process.spawn",
+      "wire_name": "process/spawn",
+      "direction": "host_to_upstream"
+    }
+  ],
+  "methods": [
+    {
+      "method": "initialize",
+      "class": "mutation",
+      "evidence": "Negotiates this connection's capability opt-ins, including experimentalApi, so it changes what the connection may afterwards call"
+    },
+    {
+      "method": "thread.start",
+      "class": "mutation",
+      "evidence": "Creates a thread and subscribes this connection to its turn and item events"
+    },
+    {
+      "method": "thread.resume",
+      "class": "mutation",
+      "evidence": "Loads a stored thread so later turns append to it"
+    },
+    {
+      "method": "thread.fork",
+      "class": "mutation",
+      "evidence": "Copies stored history into a new thread id"
+    },
+    {
+      "method": "thread.archive",
+      "class": "mutation",
+      "evidence": "Moves a thread's log into the archived directory and attempts the same for descendant logs that are not already archived"
+    },
+    {
+      "method": "thread.delete",
+      "class": "mutation",
+      "evidence": "Permanently deletes a persisted thread and its spawned descendants"
+    },
+    {
+      "method": "thread.unsubscribe",
+      "class": "mutation",
+      "evidence": "Drops this connection's subscription; when it was the last one the server unloads the thread after a no-subscriber grace period"
+    },
+    {
+      "method": "thread.name.set",
+      "class": "mutation",
+      "evidence": "ClientRequest Thread/name/setRequest in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "thread.goal.set",
+      "class": "mutation",
+      "evidence": "ClientRequest Thread/goal/setRequest in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "thread.goal.get",
+      "class": "observation",
+      "evidence": "ClientRequest Thread/goal/getRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.goal.clear",
+      "class": "mutation",
+      "evidence": "ClientRequest Thread/goal/clearRequest in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "thread.metadata.update",
+      "class": "mutation",
+      "evidence": "ClientRequest Thread/metadata/updateRequest in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "thread.attachment.add",
+      "class": "mutation",
+      "evidence": "ClientRequest Thread/attachment/addRequest in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "thread.attachment.list",
+      "class": "observation",
+      "evidence": "ClientRequest Thread/attachment/listRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.attachment.remove",
+      "class": "mutation",
+      "evidence": "ClientRequest Thread/attachment/removeRequest in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "thread.section.move",
+      "class": "mutation",
+      "evidence": "ClientRequest Thread/section/moveRequest in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "thread.unarchive",
+      "class": "mutation",
+      "evidence": "ClientRequest Thread/unarchiveRequest in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "thread.compact.start",
+      "class": "mutation",
+      "evidence": "Rewrites the thread's conversation history by compaction"
+    },
+    {
+      "method": "thread.shell-command",
+      "class": "unsupported",
+      "evidence": "Runs a command outside the sandbox with full access and does not inherit the thread sandbox policy"
+    },
+    {
+      "method": "thread.approve-guardian-denied-action",
+      "class": "unsupported",
+      "evidence": "ClientRequest Thread/approveGuardianDeniedActionRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "thread.rollback",
+      "class": "mutation",
+      "evidence": "ClientRequest Thread/rollbackRequest in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "thread.revert",
+      "class": "mutation",
+      "evidence": "ClientRequest Thread/revertRequest in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "thread.list",
+      "class": "observation",
+      "evidence": "Pages through stored thread logs"
+    },
+    {
+      "method": "thread-section.list",
+      "class": "observation",
+      "evidence": "ClientRequest ThreadSection/listRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread-section.create",
+      "class": "mutation",
+      "evidence": "ClientRequest ThreadSection/createRequest in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "thread-section.update",
+      "class": "mutation",
+      "evidence": "ClientRequest ThreadSection/updateRequest in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "thread-section.delete",
+      "class": "mutation",
+      "evidence": "ClientRequest ThreadSection/deleteRequest in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "thread.loaded.list",
+      "class": "observation",
+      "evidence": "Lists the thread ids currently loaded in memory"
+    },
+    {
+      "method": "thread.read",
+      "class": "observation",
+      "evidence": "Reads a stored thread by id without resuming it or subscribing to it"
+    },
+    {
+      "method": "thread.turns.list",
+      "class": "observation",
+      "evidence": "Pages through a stored thread's turn history without resuming it"
+    },
+    {
+      "method": "thread.items.list",
+      "class": "observation",
+      "evidence": "ClientRequest Thread/items/listRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.inject-items",
+      "class": "mutation",
+      "evidence": "Appends items to a loaded thread's model-visible history and persists them"
+    },
+    {
+      "method": "skills.list",
+      "class": "observation",
+      "evidence": "ClientRequest Skills/listRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "skills.extra-roots.set",
+      "class": "unsupported",
+      "evidence": "ClientRequest Skills/extraRoots/setRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "hooks.list",
+      "class": "observation",
+      "evidence": "ClientRequest Hooks/listRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "marketplace.add",
+      "class": "unsupported",
+      "evidence": "ClientRequest Marketplace/addRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "marketplace.remove",
+      "class": "unsupported",
+      "evidence": "ClientRequest Marketplace/removeRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "marketplace.upgrade",
+      "class": "unsupported",
+      "evidence": "ClientRequest Marketplace/upgradeRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "plugin.list",
+      "class": "observation",
+      "evidence": "ClientRequest Plugin/listRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "plugin.installed",
+      "class": "observation",
+      "evidence": "ClientRequest Plugin/installedRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "plugin.reconcile",
+      "class": "unsupported",
+      "evidence": "ClientRequest Plugin/reconcileRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "plugin.read",
+      "class": "observation",
+      "evidence": "ClientRequest Plugin/readRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "plugin.skill.read",
+      "class": "observation",
+      "evidence": "ClientRequest Plugin/skill/readRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "plugin.share.save",
+      "class": "unsupported",
+      "evidence": "ClientRequest Plugin/share/saveRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "plugin.share.update-targets",
+      "class": "unsupported",
+      "evidence": "ClientRequest Plugin/share/updateTargetsRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "plugin.share.list",
+      "class": "observation",
+      "evidence": "ClientRequest Plugin/share/listRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "plugin.share.checkout",
+      "class": "unsupported",
+      "evidence": "ClientRequest Plugin/share/checkoutRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "plugin.share.delete",
+      "class": "unsupported",
+      "evidence": "ClientRequest Plugin/share/deleteRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "app.read",
+      "class": "observation",
+      "evidence": "ClientRequest App/readRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "app.list",
+      "class": "observation",
+      "evidence": "ClientRequest App/listRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "app.installed",
+      "class": "observation",
+      "evidence": "ClientRequest App/installedRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "fs.read-file",
+      "class": "unsupported",
+      "evidence": "Reads an absolute path through the app-server rather than through the host's own file grant"
+    },
+    {
+      "method": "fs.write-file",
+      "class": "unsupported",
+      "evidence": "Writes an absolute path through the app-server rather than through the host's own file grant"
+    },
+    {
+      "method": "fs.create-directory",
+      "class": "unsupported",
+      "evidence": "ClientRequest Fs/createDirectoryRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "fs.get-metadata",
+      "class": "unsupported",
+      "evidence": "ClientRequest Fs/getMetadataRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "fs.read-directory",
+      "class": "unsupported",
+      "evidence": "ClientRequest Fs/readDirectoryRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "fs.remove",
+      "class": "unsupported",
+      "evidence": "Removes an absolute path through the app-server rather than through the host's own file grant"
+    },
+    {
+      "method": "fs.copy",
+      "class": "unsupported",
+      "evidence": "ClientRequest Fs/copyRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "fs.watch",
+      "class": "unsupported",
+      "evidence": "ClientRequest Fs/watchRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "fs.unwatch",
+      "class": "unsupported",
+      "evidence": "ClientRequest Fs/unwatchRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "skills.config.write",
+      "class": "unsupported",
+      "evidence": "ClientRequest Skills/config/writeRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "plugin.install",
+      "class": "unsupported",
+      "evidence": "ClientRequest Plugin/installRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "plugin.uninstall",
+      "class": "unsupported",
+      "evidence": "ClientRequest Plugin/uninstallRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "turn.start",
+      "class": "mutation",
+      "evidence": "Starts generation against the thread and writes to the workspace the sandbox policy allows"
+    },
+    {
+      "method": "turn.steer",
+      "class": "mutation",
+      "evidence": "Appends user input to the turn named by expectedTurnId, which must be the active turn"
+    },
+    {
+      "method": "turn.interrupt",
+      "class": "mutation",
+      "evidence": "Cancels the in-flight turn, which ends with status interrupted"
+    },
+    {
+      "method": "review.start",
+      "class": "mutation",
+      "evidence": "Starts a reviewer run for the thread and streams review items"
+    },
+    {
+      "method": "model.list",
+      "class": "observation",
+      "evidence": "Lists available models and their effort options"
+    },
+    {
+      "method": "model-provider.capabilities.read",
+      "class": "observation",
+      "evidence": "ClientRequest ModelProvider/capabilities/readRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "experimental-feature.list",
+      "class": "observation",
+      "evidence": "ClientRequest ExperimentalFeature/listRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "permission-profile.list",
+      "class": "observation",
+      "evidence": "ClientRequest PermissionProfile/listRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "experimental-feature.enablement.set",
+      "class": "unsupported",
+      "evidence": "ClientRequest ExperimentalFeature/enablement/setRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "mcp-server.oauth.login",
+      "class": "credential",
+      "evidence": "ClientRequest McpServer/oauth/loginRequest in the pinned schema; it reads or carries the account, a credential or configuration"
+    },
+    {
+      "method": "config.mcp-server.reload",
+      "class": "mutation",
+      "evidence": "ClientRequest Config/mcpServer/reloadRequest in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "mcp-server-status.list",
+      "class": "observation",
+      "evidence": "ClientRequest McpServerStatus/listRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "mcp-server.resource.read",
+      "class": "observation",
+      "evidence": "ClientRequest McpServer/resource/readRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "mcp-server.tool.call",
+      "class": "mutation",
+      "evidence": "Calls a tool on a configured MCP server, whose effect this table cannot bound"
+    },
+    {
+      "method": "windows-sandbox.setup-start",
+      "class": "unsupported",
+      "evidence": "ClientRequest WindowsSandbox/setupStartRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "windows-sandbox.readiness",
+      "class": "observation",
+      "evidence": "ClientRequest WindowsSandbox/readinessRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "account.login.start",
+      "class": "credential",
+      "evidence": "Begins a login that carries an API key or a ChatGPT authorisation flow"
+    },
+    {
+      "method": "account.login.cancel",
+      "class": "credential",
+      "evidence": "ClientRequest Account/login/cancelRequest in the pinned schema; it reads or carries the account, a credential or configuration"
+    },
+    {
+      "method": "account.logout",
+      "class": "unsupported",
+      "evidence": "Discards the stored credentials of the account the person signed in with"
+    },
+    {
+      "method": "account.rate-limits.read",
+      "class": "credential",
+      "evidence": "ClientRequest Account/rateLimits/readRequest in the pinned schema; it reads or carries the account, a credential or configuration"
+    },
+    {
+      "method": "account.rate-limit-reset-credit.consume",
+      "class": "unsupported",
+      "evidence": "ClientRequest Account/rateLimitResetCredit/consumeRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "account.usage.read",
+      "class": "credential",
+      "evidence": "ClientRequest Account/usage/readRequest in the pinned schema; it reads or carries the account, a credential or configuration"
+    },
+    {
+      "method": "account.workspace-messages.read",
+      "class": "credential",
+      "evidence": "ClientRequest Account/workspaceMessages/readRequest in the pinned schema; it reads or carries the account, a credential or configuration"
+    },
+    {
+      "method": "account.send-add-credits-nudge-email",
+      "class": "unsupported",
+      "evidence": "ClientRequest Account/sendAddCreditsNudgeEmailRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "feedback.upload",
+      "class": "unsupported",
+      "evidence": "ClientRequest Feedback/uploadRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "command.exec",
+      "class": "unsupported",
+      "evidence": "Runs a command under the server sandbox with no thread or turn to bind it to"
+    },
+    {
+      "method": "command.exec.write",
+      "class": "unsupported",
+      "evidence": "ClientRequest Command/exec/writeRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "command.exec.terminate",
+      "class": "unsupported",
+      "evidence": "ClientRequest Command/exec/terminateRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "command.exec.resize",
+      "class": "unsupported",
+      "evidence": "ClientRequest Command/exec/resizeRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "config.read",
+      "class": "credential",
+      "evidence": "ClientRequest Config/readRequest in the pinned schema; it reads or carries the account, a credential or configuration"
+    },
+    {
+      "method": "external-agent-config.detect",
+      "class": "credential",
+      "evidence": "ClientRequest ExternalAgentConfig/detectRequest in the pinned schema; it reads or carries the account, a credential or configuration"
+    },
+    {
+      "method": "external-agent-config.import",
+      "class": "unsupported",
+      "evidence": "ClientRequest ExternalAgentConfig/importRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "external-agent-config.import.record-history",
+      "class": "unsupported",
+      "evidence": "ClientRequest ExternalAgentConfig/import/recordHistoryRequest in the pinned schema; it runs or writes outside the thread's own approvals, so this host does not carry it for rich work"
+    },
+    {
+      "method": "external-agent-config.import.read-histories",
+      "class": "credential",
+      "evidence": "ClientRequest ExternalAgentConfig/import/readHistoriesRequest in the pinned schema; it reads or carries the account, a credential or configuration"
+    },
+    {
+      "method": "config.value.write",
+      "class": "unsupported",
+      "evidence": "Writes a key into the user's config.toml on disk"
+    },
+    {
+      "method": "config.batch-write",
+      "class": "unsupported",
+      "evidence": "Applies configuration edits to the user's config.toml on disk"
+    },
+    {
+      "method": "config-requirements.read",
+      "class": "credential",
+      "evidence": "ClientRequest ConfigRequirements/readRequest in the pinned schema; it reads or carries the account, a credential or configuration"
+    },
+    {
+      "method": "account.read",
+      "class": "credential",
+      "evidence": "Reports the signed-in account and authentication state; the broker keeps the answer"
+    },
+    {
+      "method": "fuzzy-file-search",
+      "class": "observation",
+      "evidence": "ClientRequest FuzzyFileSearchRequest in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "initialized",
+      "class": "mutation",
+      "evidence": "ClientNotification InitializedNotification in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "item.command-execution.request-approval",
+      "class": "mutation",
+      "evidence": "A reverse request whose answer runs or refuses a command; answering changes what the agent does"
+    },
+    {
+      "method": "item.file-change.request-approval",
+      "class": "mutation",
+      "evidence": "A reverse request whose answer applies or refuses a file change"
+    },
+    {
+      "method": "item.tool.request-user-input",
+      "class": "mutation",
+      "evidence": "A reverse request whose answer becomes tool input the model acts on"
+    },
+    {
+      "method": "mcp-server.elicitation.request",
+      "class": "mutation",
+      "evidence": "A reverse request from a downstream MCP server whose answer it receives as structured input"
+    },
+    {
+      "method": "item.permissions.request-approval",
+      "class": "mutation",
+      "evidence": "A reverse request whose answer grants network or filesystem permissions, optionally for the whole session"
+    },
+    {
+      "method": "item.tool.call",
+      "class": "mutation",
+      "evidence": "ServerRequest Item/tool/callRequest in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "account.chatgpt-auth-tokens.refresh",
+      "class": "credential",
+      "evidence": "A reverse request for refreshed ChatGPT tokens; the broker answers it and never passes the tokens to a component"
+    },
+    {
+      "method": "attestation.generate",
+      "class": "credential",
+      "evidence": "ServerRequest Attestation/generateRequest in the pinned schema; it reads or carries the account, a credential or configuration"
+    },
+    {
+      "method": "apply-patch-approval",
+      "class": "mutation",
+      "evidence": "ServerRequest ApplyPatchApprovalRequest in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "exec-command-approval",
+      "class": "mutation",
+      "evidence": "ServerRequest ExecCommandApprovalRequest in the pinned schema; it changes the thread, the turn or what the application holds"
+    },
+    {
+      "method": "error",
+      "class": "observation",
+      "evidence": "Reports an error the server raised outside a request"
+    },
+    {
+      "method": "thread.started",
+      "class": "observation",
+      "evidence": "Reports that a thread was created or resumed"
+    },
+    {
+      "method": "thread.status.changed",
+      "class": "observation",
+      "evidence": "Reports a loaded thread's runtime status"
+    },
+    {
+      "method": "thread.archived",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/archivedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.deleted",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/deletedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.unarchived",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/unarchivedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.closed",
+      "class": "observation",
+      "evidence": "Reports that the last subscriber left and the thread was unloaded"
+    },
+    {
+      "method": "thread.reverted",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/revertedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "skills.changed",
+      "class": "observation",
+      "evidence": "ServerNotification Skills/changedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.name.updated",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/name/updatedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.attachment.updated",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/attachment/updatedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.goal.updated",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/goal/updatedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.goal.cleared",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/goal/clearedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.queue.changed",
+      "class": "observation",
+      "evidence": "Reports that the thread's queued input changed; the notification names the thread and carries no queue contents"
+    },
+    {
+      "method": "project.changed",
+      "class": "observation",
+      "evidence": "ServerNotification Project/changedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.project.updated",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/project/updatedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.environment.connected",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/environment/connectedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.environment.disconnected",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/environment/disconnectedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.settings.updated",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/settings/updatedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.token-usage.updated",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/tokenUsage/updatedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "turn.started",
+      "class": "observation",
+      "evidence": "Reports that a turn began and names its id"
+    },
+    {
+      "method": "hook.started",
+      "class": "observation",
+      "evidence": "ServerNotification Hook/startedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "turn.completed",
+      "class": "observation",
+      "evidence": "Reports the turn's final status"
+    },
+    {
+      "method": "hook.completed",
+      "class": "observation",
+      "evidence": "ServerNotification Hook/completedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "turn.diff.updated",
+      "class": "observation",
+      "evidence": "Reports the turn's accumulated diff"
+    },
+    {
+      "method": "turn.plan.updated",
+      "class": "observation",
+      "evidence": "ServerNotification Turn/plan/updatedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "item.started",
+      "class": "observation",
+      "evidence": "Reports an item the turn began, such as a command execution or a file change"
+    },
+    {
+      "method": "item.auto-approval-review.started",
+      "class": "observation",
+      "evidence": "ServerNotification Item/autoApprovalReview/startedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "item.auto-approval-review.completed",
+      "class": "observation",
+      "evidence": "ServerNotification Item/autoApprovalReview/completedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "auto-approval-review.strict-review-required",
+      "class": "observation",
+      "evidence": "ServerNotification AutoApprovalReview/strictReviewRequiredNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "item.completed",
+      "class": "observation",
+      "evidence": "Reports an item's final state"
+    },
+    {
+      "method": "item.agent-message.delta",
+      "class": "observation",
+      "evidence": "Streams assistant message text"
+    },
+    {
+      "method": "item.plan.delta",
+      "class": "observation",
+      "evidence": "ServerNotification Item/plan/deltaNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "command.exec.output-delta",
+      "class": "observation",
+      "evidence": "ServerNotification Command/exec/outputDeltaNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "process.output-delta",
+      "class": "observation",
+      "evidence": "ServerNotification Process/outputDeltaNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "process.exited",
+      "class": "observation",
+      "evidence": "ServerNotification Process/exitedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "item.command-execution.output-delta",
+      "class": "observation",
+      "evidence": "ServerNotification Item/commandExecution/outputDeltaNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "item.command-execution.terminal-interaction",
+      "class": "observation",
+      "evidence": "ServerNotification Item/commandExecution/terminalInteractionNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "item.file-change.output-delta",
+      "class": "observation",
+      "evidence": "ServerNotification Item/fileChange/outputDeltaNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "item.file-change.patch-updated",
+      "class": "observation",
+      "evidence": "ServerNotification Item/fileChange/patchUpdatedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "server-request.resolved",
+      "class": "observation",
+      "evidence": "Reports that a pending server request was answered or cleared"
+    },
+    {
+      "method": "item.mcp-tool-call.progress",
+      "class": "observation",
+      "evidence": "ServerNotification Item/mcpToolCall/progressNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "mcp-server.oauth-login.completed",
+      "class": "observation",
+      "evidence": "ServerNotification McpServer/oauthLogin/completedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "mcp-server.startup-status.updated",
+      "class": "observation",
+      "evidence": "ServerNotification McpServer/startupStatus/updatedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "mcp-server.event.stream.notification",
+      "class": "observation",
+      "evidence": "ServerNotification McpServer/event/stream/notificationNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "account.updated",
+      "class": "observation",
+      "evidence": "ServerNotification Account/updatedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "account.rate-limits.updated",
+      "class": "observation",
+      "evidence": "ServerNotification Account/rateLimits/updatedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "app.list.updated",
+      "class": "observation",
+      "evidence": "ServerNotification App/list/updatedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "remote-control.status.changed",
+      "class": "observation",
+      "evidence": "ServerNotification RemoteControl/status/changedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "external-agent-config.import.progress",
+      "class": "observation",
+      "evidence": "ServerNotification ExternalAgentConfig/import/progressNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "external-agent-config.import.completed",
+      "class": "observation",
+      "evidence": "ServerNotification ExternalAgentConfig/import/completedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "fs.changed",
+      "class": "observation",
+      "evidence": "ServerNotification Fs/changedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "item.reasoning.summary-text-delta",
+      "class": "observation",
+      "evidence": "ServerNotification Item/reasoning/summaryTextDeltaNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "item.reasoning.summary-part-added",
+      "class": "observation",
+      "evidence": "ServerNotification Item/reasoning/summaryPartAddedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "item.reasoning.text-delta",
+      "class": "observation",
+      "evidence": "ServerNotification Item/reasoning/textDeltaNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.compacted",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/compactedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "model.rerouted",
+      "class": "observation",
+      "evidence": "ServerNotification Model/reroutedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "model.verification",
+      "class": "observation",
+      "evidence": "ServerNotification Model/verificationNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "model-provider.auth-recovery-started",
+      "class": "observation",
+      "evidence": "ServerNotification ModelProvider/authRecoveryStartedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "model-provider.auth-recovery-completed",
+      "class": "observation",
+      "evidence": "ServerNotification ModelProvider/authRecoveryCompletedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "turn.moderation-metadata",
+      "class": "observation",
+      "evidence": "ServerNotification Turn/moderationMetadataNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "model.safety-buffering.updated",
+      "class": "observation",
+      "evidence": "ServerNotification Model/safetyBuffering/updatedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "warning",
+      "class": "observation",
+      "evidence": "Reports a non-fatal runtime warning"
+    },
+    {
+      "method": "guardian-warning",
+      "class": "observation",
+      "evidence": "ServerNotification GuardianWarningNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "deprecation-notice",
+      "class": "observation",
+      "evidence": "ServerNotification DeprecationNoticeNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "config-warning",
+      "class": "observation",
+      "evidence": "ServerNotification ConfigWarningNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "fuzzy-file-search.session-updated",
+      "class": "observation",
+      "evidence": "ServerNotification FuzzyFileSearch/sessionUpdatedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "fuzzy-file-search.session-completed",
+      "class": "observation",
+      "evidence": "ServerNotification FuzzyFileSearch/sessionCompletedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.realtime.started",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/realtime/startedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.realtime.item-added",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/realtime/itemAddedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.realtime.item.started",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/realtime/item/startedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.realtime.item.transcript.delta",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/realtime/item/transcript/deltaNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.realtime.item.completed",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/realtime/item/completedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.realtime.transcript.delta",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/realtime/transcript/deltaNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.realtime.transcript.done",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/realtime/transcript/doneNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.realtime.output-audio.delta",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/realtime/outputAudio/deltaNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.realtime.sdp",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/realtime/sdpNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.realtime.error",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/realtime/errorNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "thread.realtime.closed",
+      "class": "observation",
+      "evidence": "ServerNotification Thread/realtime/closedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "windows.world-writable-warning",
+      "class": "observation",
+      "evidence": "ServerNotification Windows/worldWritableWarningNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "windows-sandbox.setup-completed",
+      "class": "observation",
+      "evidence": "ServerNotification WindowsSandbox/setupCompletedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "account.login.completed",
+      "class": "observation",
+      "evidence": "ServerNotification Account/login/completedNotification in the pinned schema; it reads or reports state and changes none"
+    },
+    {
+      "method": "process.spawn",
+      "class": "unsupported",
+      "evidence": "Starts a process session outside the Codex sandbox"
+    }
+  ],
+  "decision_destination": null,
+  "decision_response": {
+    "answers": [
+      "item.command-execution.request-approval",
+      "item.file-change.request-approval"
+    ],
+    "result_member": "decision",
+    "decisions": [
+      {
+        "decision": "accept",
+        "value": "accept"
+      },
+      {
+        "decision": "accept-for-session",
+        "value": "acceptForSession"
+      },
+      {
+        "decision": "decline",
+        "value": "decline"
+      },
+      {
+        "decision": "decline-and-stop",
+        "value": "cancel"
+      }
+    ]
+  },
+  "observation": {
+    "selections": [
+      {
+        "method": "thread.start",
+        "thread": {
+          "segments": [
+            {
+              "type": "member",
+              "name": "result"
+            },
+            {
+              "type": "member",
+              "name": "thread"
+            },
+            {
+              "type": "member",
+              "name": "id"
+            }
+          ]
+        }
+      },
+      {
+        "method": "thread.resume",
+        "thread": {
+          "segments": [
+            {
+              "type": "member",
+              "name": "result"
+            },
+            {
+              "type": "member",
+              "name": "thread"
+            },
+            {
+              "type": "member",
+              "name": "id"
+            }
+          ]
+        }
+      },
+      {
+        "method": "thread.fork",
+        "thread": {
+          "segments": [
+            {
+              "type": "member",
+              "name": "result"
+            },
+            {
+              "type": "member",
+              "name": "thread"
+            },
+            {
+              "type": "member",
+              "name": "id"
+            }
+          ]
+        }
+      }
+    ],
+    "leaves": [
+      {
+        "method": "thread.unsubscribe",
+        "thread": {
+          "segments": [
+            {
+              "type": "member",
+              "name": "params"
+            },
+            {
+              "type": "member",
+              "name": "threadId"
+            }
+          ]
+        }
+      },
+      {
+        "method": "thread.closed",
+        "thread": {
+          "segments": [
+            {
+              "type": "member",
+              "name": "params"
+            },
+            {
+              "type": "member",
+              "name": "threadId"
+            }
+          ]
+        }
+      },
+      {
+        "method": "thread.archived",
+        "thread": {
+          "segments": [
+            {
+              "type": "member",
+              "name": "params"
+            },
+            {
+              "type": "member",
+              "name": "threadId"
+            }
+          ]
+        }
+      },
+      {
+        "method": "thread.deleted",
+        "thread": {
+          "segments": [
+            {
+              "type": "member",
+              "name": "params"
+            },
+            {
+              "type": "member",
+              "name": "threadId"
+            }
+          ]
+        }
+      }
+    ],
+    "turn_started": {
+      "method": "turn.started",
+      "thread": {
+        "segments": [
+          {
+            "type": "member",
+            "name": "params"
+          },
+          {
+            "type": "member",
+            "name": "threadId"
+          }
+        ]
+      },
+      "turn": {
+        "segments": [
+          {
+            "type": "member",
+            "name": "params"
+          },
+          {
+            "type": "member",
+            "name": "turn"
+          },
+          {
+            "type": "member",
+            "name": "id"
+          }
+        ]
+      }
+    },
+    "turn_ended": {
+      "method": "turn.completed",
+      "thread": {
+        "segments": [
+          {
+            "type": "member",
+            "name": "params"
+          },
+          {
+            "type": "member",
+            "name": "threadId"
+          }
+        ]
+      },
+      "turn": {
+        "segments": [
+          {
+            "type": "member",
+            "name": "params"
+          },
+          {
+            "type": "member",
+            "name": "turn"
+          },
+          {
+            "type": "member",
+            "name": "id"
+          }
+        ]
+      }
+    },
+    "request_resolved": {
+      "method": "server-request.resolved",
+      "request_id": {
+        "segments": [
+          {
+            "type": "member",
+            "name": "params"
+          },
+          {
+            "type": "member",
+            "name": "requestId"
+          }
+        ]
+      }
+    }
+  },
+  "operations": {
+    "prompt_submit": {
+      "method": "turn.start",
+      "params": {
+        "threadId": {
+          "$": "thread_id"
+        },
+        "input": [
+          {
+            "type": "text",
+            "text": {
+              "$": "text"
+            }
+          }
+        ]
+      },
+      "reply_turn": {
+        "segments": [
+          {
+            "type": "member",
+            "name": "result"
+          },
+          {
+            "type": "member",
+            "name": "turn"
+          },
+          {
+            "type": "member",
+            "name": "id"
+          }
+        ]
+      }
+    },
+    "turn_steer": {
+      "method": "turn.steer",
+      "params": {
+        "threadId": {
+          "$": "thread_id"
+        },
+        "expectedTurnId": {
+          "$": "turn_id"
+        },
+        "input": [
+          {
+            "type": "text",
+            "text": {
+              "$": "text"
+            }
+          }
+        ]
+      },
+      "reply_turn": {
+        "segments": [
+          {
+            "type": "member",
+            "name": "result"
+          },
+          {
+            "type": "member",
+            "name": "turnId"
+          }
+        ]
+      }
+    },
+    "turn_cancel": {
+      "method": "turn.interrupt",
+      "params": {
+        "threadId": {
+          "$": "thread_id"
+        },
+        "turnId": {
+          "$": "turn_id"
+        }
+      }
+    }
+  },
+  "volatile_forwarding": true,
+  "qualification_note": "Qualified against Codex CLI 0.155.1 (npm @openai/codex), whose macOS arm64 executable is sha256 8eaf1ad12fe6bf89b1710330f58900014322c7c5af677e43be116d8ac5fc0a9e, the App Server documentation at learn.chatgpt.com/docs/app-server and the JSON Schema that binary's generate-json-schema writes, both read 2026-09-20. Every stable wire name of that schema is routed and classified, and process/spawn, which no request union lists, is kept unsupported. The table covers the connection between the host and the App Server; the native --remote client speaks WebSocket and is the gateway listener's. It is served for the native codex executable only: a launch through an npm script runs as typed. max_message_bytes is this host's bound, not one the vendor states. fixtures/frames.json pins the evidence and is not a capture."
+}
