@@ -6,9 +6,7 @@ use std::process::ExitCode;
 
 use clap::Parser as _;
 use kr_cli::bridge::environments::Selected;
-use kr_cli::cli::{
-    AccountCommand, Cli, Command, HostArguments, HostCommand, ShellArguments, ShellCommand,
-};
+use kr_cli::cli::{AccountCommand, Cli, Command, HostCommand, ShellArguments, ShellCommand};
 use kr_cli::error::{CliError, Result};
 use kr_cli::output::{self, Asked, Document, Request};
 use kr_cli::report::Completion;
@@ -117,7 +115,7 @@ async fn run(cli: Cli) -> Result<Completion> {
     #[cfg(unix)]
     if !matches!(
         &cli.command,
-        Command::Host(HostArguments {
+        Command::Host(kr_cli::cli::HostArguments {
             command: HostCommand::Install(_)
         })
     ) && let Some((tree, installer)) = kr_cli::update::admit::unadmitted()
