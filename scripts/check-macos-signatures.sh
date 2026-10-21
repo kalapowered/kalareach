@@ -10,8 +10,8 @@
 # tools unsandboxed and a module of another team is refused.
 #
 # ad-hoc: the system's assessment refuses the file, which is the control that the check does not
-# pass everything. developer-id: each file has the hardened runtime, a Developer ID authority, a
-# team and a timestamp. notarized: each file also passes `codesign --check-notarization` and the
+# pass everything. developer-id: each file has the hardened runtime, a Developer ID authority, the
+# one team that signs the whole tree and a timestamp. notarized: each file also passes `codesign --check-notarization` and the
 # system's assessment of it accepts it as a Notarized Developer ID, which needs the network and a
 # notarised release.
 
@@ -21,6 +21,7 @@ tree="${1:?name the tree}"
 mode="${2:?name the mode: ad-hoc, developer-id or notarized}"
 failed=0
 count=0
+teams=()
 
 fail() {
     echo "check-macos-signatures: $1" >&2
@@ -48,6 +49,10 @@ while IFS= read -r -d '' file; do
             case "$details" in *"Authority=Developer ID Application"*) ;; *) fail "$relative has no Developer ID authority" ;; esac
             case "$details" in *"flags="*runtime*) ;; *) fail "$relative does not have the hardened runtime" ;; esac
             case "$details" in *"TeamIdentifier=not set"*) fail "$relative has no team" ;; esac
+            team="$(printf '%s\n' "$details" | sed -n 's/^TeamIdentifier=//p' | head -1)"
+            known=0
+            for seen in ${teams[@]+"${teams[@]}"}; do [ "$seen" = "$team" ] && known=1; done
+            [ "$known" -eq 1 ] || teams+=("$team")
             case "$details" in *"Timestamp="*) ;; *) fail "$relative has no timestamp" ;; esac
             if [ "$mode" = notarized ]; then
                 /usr/bin/codesign --verify --strict --check-notarization "$file" 2> /dev/null \
@@ -61,5 +66,9 @@ while IFS= read -r -d '' file; do
 done < <(find "$tree" -type f -print0)
 
 [ "$count" -gt 0 ] || { echo "check-macos-signatures: $tree holds no Mach-O file" >&2; exit 1; }
+# One team signs the whole tree: a module another team signed is refused by library validation.
+if [ "$mode" != ad-hoc ] && [ "${#teams[@]}" -gt 1 ]; then
+    fail "the tree is signed by more than one team: ${teams[*]}"
+fi
 [ "$failed" -eq 0 ] || exit 1
 echo "check-macos-signatures: $count files hold to $mode"
