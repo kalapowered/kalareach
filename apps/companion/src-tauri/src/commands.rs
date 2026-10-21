@@ -2397,7 +2397,7 @@ pub async fn owner_confirmation_review(
 pub async fn revocation_view(
     state: State<'_, AppState>,
 ) -> Result<crate::revocation::RevocationView> {
-    Ok(state.revocations()?.view(&state.revocation_context()).await)
+    Ok(state.revocations()?.look(&state.revocation_context()).await)
 }
 
 /// Revokes a device on a host this computer owns, once the person confirms it with the platform's

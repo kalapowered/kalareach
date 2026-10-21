@@ -19,6 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -304,6 +305,8 @@ pub struct ServiceWeb {
     faults: Mutex<Vec<Fault>>,
     released: watch::Sender<u64>,
     arrivals: watch::Sender<usize>,
+    /// How many milliseconds behind this machine's clock the service's own runs.
+    behind_ms: AtomicU64,
 }
 
 impl Default for ServiceWeb {
@@ -334,6 +337,7 @@ impl ServiceWeb {
             faults: Mutex::default(),
             released: watch::channel(0).0,
             arrivals: watch::channel(0).0,
+            behind_ms: AtomicU64::new(0),
         };
         {
             let mut state = web.state.lock().expect("the state");
@@ -364,6 +368,22 @@ impl ServiceWeb {
     #[must_use]
     pub fn origin(&self) -> &str {
         &self.origin
+    }
+
+    /// The service's own clock runs `by` behind this machine's from now on, so that a sender whose
+    /// clock is ahead of the service's meets the service as it does in production, where the two
+    /// are different machines. A signature is fresh within five minutes either side, so a few
+    /// minutes of difference leaves every request admitted.
+    pub fn run_behind(&self, by: std::time::Duration) {
+        self.behind_ms.store(
+            u64::try_from(by.as_millis()).expect("a short duration"),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// The time on the service's clock, in UTC milliseconds.
+    fn now(&self) -> u64 {
+        now_ms().saturating_sub(self.behind_ms.load(Ordering::SeqCst))
     }
 
     /// The service issues `token` to `account`, carrying `scopes`.
@@ -400,11 +420,12 @@ impl ServiceWeb {
     /// Writing again replaces the stream, as a later write of the owner does. A test serves a
     /// hostile bundle by putting one in place.
     pub fn put_bundle(&self, locator: &str, account: &str, ciphertext: Vec<u8>) {
-        self.state
-            .lock()
-            .expect("the state")
-            .bundles
-            .put(locator, account, &ciphertext, now_ms());
+        self.state.lock().expect("the state").bundles.put(
+            locator,
+            account,
+            &ciphertext,
+            self.now(),
+        );
     }
 
     /// The collection at `locator` is in the history `recovery` names, as one put back from an
@@ -1086,19 +1107,19 @@ impl ServiceWeb {
         if path == "/api/relay/lease" || path == "/api/relay/lease/revoke" {
             let mut state = self.state.lock().expect("the state");
             return if path == "/api/relay/lease" {
-                crate::relay::issue(&mut state.relay, &self.origin, document, now_ms())
+                crate::relay::issue(&mut state.relay, &self.origin, document, self.now())
             } else {
-                crate::relay::revoke(&mut state.relay, &self.origin, document, now_ms())
+                crate::relay::revoke(&mut state.relay, &self.origin, document, self.now())
             };
         }
         if path == "/api/relay/admission" {
             let mut state = self.state.lock().expect("the state");
-            return crate::relay::admit(&mut state.relay, &self.origin, document, now_ms());
+            return crate::relay::admit(&mut state.relay, &self.origin, document, self.now());
         }
         if path == "/api/relay/payer-authorisation/sign-in" {
             let mut state = self.state.lock().expect("the state");
             let State { relay, tokens, .. } = &mut *state;
-            return crate::relay::sign_in(relay, tokens, &self.origin, document, token, now_ms());
+            return crate::relay::sign_in(relay, tokens, &self.origin, document, token, self.now());
         }
         let method = match path {
             "/api/storage/status" => "storage.status",
@@ -1144,7 +1165,7 @@ impl ServiceWeb {
                 "This request was signed for another gateway.",
             );
         }
-        if !signature.payload.is_fresh_at(now_ms()) {
+        if !signature.payload.is_fresh_at(self.now()) {
             return refusal(
                 401,
                 "UNAUTHENTICATED",
@@ -1186,7 +1207,7 @@ impl ServiceWeb {
             let State {
                 feeds, mailboxes, ..
             } = &mut *state;
-            return crate::feed::sync(feeds, mailboxes, &signature, body, now_ms());
+            return crate::feed::sync(feeds, mailboxes, &signature, body, self.now());
         }
         if method == "sync.compare_exchange" {
             let State {
@@ -1204,7 +1225,7 @@ impl ServiceWeb {
                     body,
                     signature: &signature,
                     token,
-                    now_ms: now_ms(),
+                    now_ms: self.now(),
                 },
                 crate::sync::Allowances {
                     bundles: !*bundle_writes_refused,
@@ -1214,17 +1235,17 @@ impl ServiceWeb {
         }
         match method {
             "mailbox.deliver" => {
-                return crate::mailbox::deliver(&mut state.mailboxes, &signature, body, now_ms());
+                return crate::mailbox::deliver(&mut state.mailboxes, &signature, body, self.now());
             }
             "mailbox.read" => {
-                return crate::mailbox::read(&mut state.mailboxes, &signature, body, now_ms());
+                return crate::mailbox::read(&mut state.mailboxes, &signature, body, self.now());
             }
             "mailbox.acknowledge" => {
                 return crate::mailbox::acknowledge(
                     &mut state.mailboxes,
                     &signature,
                     body,
-                    now_ms(),
+                    self.now(),
                 );
             }
             _ => {}

@@ -64,7 +64,8 @@ use kr_client::ClientError;
 use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome, shown, shown_host};
 use kr_client::pairing::paired::PairedHost;
 use kr_client::services::authority::{
-    AuthorityFeedClient, AuthorityFeedRecord, AuthorityFeedSummary, RejectionReason,
+    AuthorityFeedClient, AuthorityFeedRecord, AuthorityFeedSummary, FeedAnnouncement,
+    RejectionReason,
 };
 use kr_client::services::{HttpDeadlines, HttpService, managed_response_limits};
 use kr_protocol::envelope::ActionTarget;
@@ -81,6 +82,7 @@ use crate::commands::{MUTATION_TTL, NoPreconditions};
 use crate::connection::{Connection, Standing};
 use crate::device::Device;
 use crate::error::{CommandError, Result};
+use crate::mailbox::{MailboxDesk, MailboxView};
 use crate::recovery::{DeviceSigner, now};
 use crate::settings::Settings;
 use crate::settings::connected::{ANSWER_WITHIN, Listing, listed, listed_replacing};
@@ -137,6 +139,8 @@ pub struct RevocationView {
     /// The service a request for a paired host is published at, as its host name and port. Null
     /// when this computer has no sync service setting to publish at.
     pub feed_origin: Option<String>,
+    /// This computer's reading of its own mailbox, where hosts announce that their feeds changed.
+    pub mailbox: MailboxView,
     /// The hosts, the one on this computer first.
     pub hosts: Vec<HostView>,
 }
@@ -495,6 +499,8 @@ pub struct Context {
     pub origin: Option<GatewayOrigin>,
     /// Settings sync, which is told of a device whose revocation this computer sent.
     pub settings: Option<Arc<Settings>>,
+    /// This computer's reader of its own mailbox.
+    pub mailbox: Option<Arc<MailboxDesk>>,
 }
 
 /// A host a request can be for.
@@ -541,6 +547,10 @@ enum Prepared {
         client: Box<AuthorityFeedClient>,
         feed: KeyId,
         request: kr_protocol::pairing::RevocationRequest,
+        /// The announcement that the feed changed, sealed to the host, to place in its mailbox
+        /// beside the request so that the host reads the feed now and not at its next poll. A
+        /// request goes without one when it cannot be sealed: the host reads the feed in any case.
+        announcement: Option<Box<FeedAnnouncement>>,
     },
 }
 
@@ -762,8 +772,37 @@ impl Revocations {
         RevocationView {
             ceremony: self.ceremony.kind(),
             feed_origin: context.origin.as_ref().map(host_of),
+            mailbox: context
+                .mailbox
+                .as_ref()
+                .map(|desk| desk.view())
+                .unwrap_or_default(),
             hosts,
         }
+    }
+
+    /// What the screen is shown when it looks: [`Self::view`], and beside it a pass of this
+    /// computer's reader of its own mailbox, where a host announces that its feed changed.
+    ///
+    /// The mailbox is read only when the view reads a feed, which is when this computer owns a
+    /// host that is not the one on this machine and the sync service setting names where. Whatever
+    /// the mailbox does, the view is the one [`Self::view`] gives.
+    pub async fn look(&self, context: &Context) -> RevocationView {
+        let (mut view, mailbox) = tokio::join!(self.view(context), self.read_the_mailbox(context));
+        // A look that does not read the mailbox says nothing of it: what an earlier look found is
+        // not true of a computer that has no feed to read since.
+        view.mailbox = mailbox.unwrap_or_default();
+        view
+    }
+
+    async fn read_the_mailbox(&self, context: &Context) -> Option<MailboxView> {
+        let desk = context.mailbox.as_ref()?;
+        context.origin.as_ref()?;
+        self.hosts(context)
+            .iter()
+            .any(|host| matches!(host, Host::Paired(_)))
+            .then_some(())?;
+        Some(desk.pass().await)
     }
 
     /// Passes the devices of revocations to settings sync, which holds what it sends at once and
@@ -1197,10 +1236,18 @@ impl Revocations {
                 .map_err(|error| {
                     CommandError::local_failure(format!("the request could not be signed: {error}"))
                 })?;
+                let announcement = FeedAnnouncement::sealed_for(
+                    &self.device.identity().keys.stored_envelope,
+                    &paired.host_keys.stored_envelope,
+                    now().get(),
+                )
+                .ok()
+                .map(Box::new);
                 Ok(Prepared::Feed {
                     client: Box::new(self.feed_client(origin)?),
                     feed: feed_of(paired),
                     request,
+                    announcement,
                 })
             }
         }
@@ -1218,7 +1265,11 @@ impl Revocations {
                 client,
                 feed,
                 request,
-            } => match client.publish(feed, &request, None).await {
+                announcement,
+            } => match client
+                .publish(feed, &request, announcement.as_deref())
+                .await
+            {
                 Ok(_) => Dispatched {
                     result: Ok(()),
                     stored_nothing: false,

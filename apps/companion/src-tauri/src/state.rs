@@ -46,6 +46,7 @@ pub struct AppState {
     paste: OnceLock<Arc<dyn PastePlatform>>,
     sync_service: OnceLock<Arc<SyncService>>,
     recovery: OnceLock<Arc<Recovery>>,
+    mailbox: OnceLock<Arc<crate::mailbox::MailboxDesk>>,
     settings: OnceLock<Arc<crate::settings::Settings>>,
     drafts: Arc<crate::drafts::DraftDesk>,
     questions: crate::questions::QuestionDesk,
@@ -87,6 +88,7 @@ impl AppState {
             paste: OnceLock::new(),
             sync_service: OnceLock::new(),
             recovery: OnceLock::new(),
+            mailbox: OnceLock::new(),
             settings: OnceLock::new(),
             drafts: Arc::new(crate::drafts::DraftDesk::default()),
             questions: crate::questions::QuestionDesk::default(),
@@ -542,6 +544,7 @@ impl AppState {
             replace: self.replacer(),
             origin: self.sync_service().ok().map(|service| service.origin()),
             settings: self.settings().ok(),
+            mailbox: self.mailbox.get().cloned(),
         }
     }
 
@@ -550,9 +553,25 @@ impl AppState {
         let _ = self.sync_service.set(service);
     }
 
+    /// Records this computer's reader of its own mailbox, once it has been opened.
+    pub fn mailbox_opened(&self, desk: Arc<crate::mailbox::MailboxDesk>) {
+        let _ = self.mailbox.set(desk);
+    }
+
     /// Records this computer's recovery seed and bundle, once they have been opened.
     pub fn recovery_opened(&self, recovery: Arc<Recovery>) {
         let _ = self.recovery.set(recovery);
+    }
+
+    /// This computer's reader of its own mailbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when this computer's records could not be opened.
+    pub fn mailbox(&self) -> Result<Arc<crate::mailbox::MailboxDesk>> {
+        self.mailbox.get().cloned().ok_or_else(|| {
+            CommandError::local_failure("this computer's reader of its mailbox is not open")
+        })
     }
 
     /// The sync service this computer is set to use.

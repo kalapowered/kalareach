@@ -329,6 +329,23 @@ impl Controller {
         Ok((named, beyond))
     }
 
+    /// The stored-envelope key of the paired device `device`, when its pairing is in force and the
+    /// key is recorded: the key an announcement to that device is sealed to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the device directory cannot be read.
+    pub(crate) fn paired_stored_envelope_key(
+        &self,
+        device: DeviceId,
+    ) -> Result<Option<kr_protocol::scalars::StoredEnvelopeKey>> {
+        Ok(self
+            .devices
+            .record_for_device(device)?
+            .filter(DeviceRecord::is_paired)
+            .and_then(|record| record.stored_envelope))
+    }
+
     /// Writes the feed's record down when anything in it is unwritten, so a host that stops
     /// anywhere finds it as it was, and a write that failed is made again by the next caller.
     pub(super) fn keep_feed(&self, feed: &mut crate::grants::AuthorityFeed) -> Result<()> {

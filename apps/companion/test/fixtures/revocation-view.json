@@ -1,6 +1,7 @@
 {
   "ceremony": "touch_id",
   "feed_origin": "sync.example.org:8443",
+  "mailbox": { "last_read_ms": 1700000000000, "announcements": 2, "stopped": "unreachable" },
   "hosts": [
     {
       "reference": "here",

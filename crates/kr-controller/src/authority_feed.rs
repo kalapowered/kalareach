@@ -53,12 +53,12 @@ use std::time::Duration;
 
 use kr_client::error::ClientError;
 use kr_client::services::authority::{
-    AuthorityFeedClient, AuthorityFeedRecord, AuthorityFeedState, RejectionReason,
+    AuthorityFeedClient, AuthorityFeedRecord, AuthorityFeedState, FeedAnnouncement, RejectionReason,
 };
 use kr_client::services::{
     HttpDeadlines, HttpService, ServiceHttp, ServiceSigner, managed_response_limits,
 };
-use kr_crypto::keys::AuthorisationKeyPair;
+use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
 use kr_crypto::sign::{SigningTranscript, sign};
 use kr_protocol::hostinfo::export::Sentence;
 use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
@@ -188,6 +188,9 @@ struct Shared {
     own_feed: KeyId,
     host_device_id: DeviceId,
     key: AuthorisationKeyPair,
+    /// The key this host seals an announcement to a remote owner with. It is the key the host's
+    /// own mailbox is addressed by: an owner knows it from the pairing.
+    stored_envelope: StoredEnvelopeKeyPair,
     quiet: Quiet,
     /// How long a connection waits for a synchronisation, in milliseconds.
     gate_wait_ms: AtomicU64,
@@ -239,13 +242,15 @@ impl std::fmt::Debug for FeedRuntime {
 
 impl FeedRuntime {
     /// Builds the carrier of the feed at `origin`, signing as the host whose authorisation key is
-    /// `key`. Nothing runs and nothing is sent until [`Self::run`].
+    /// `key` and sealing announcements with its stored-envelope key `stored_envelope`. Nothing runs
+    /// and nothing is sent until [`Self::run`].
     #[must_use]
     pub fn new(
         client: AuthorityFeedClient,
         origin: &GatewayOrigin,
         host_device_id: DeviceId,
         key: AuthorisationKeyPair,
+        stored_envelope: StoredEnvelopeKeyPair,
         timer: Arc<dyn Timer>,
     ) -> Self {
         let own_feed = client.own_feed();
@@ -256,6 +261,7 @@ impl FeedRuntime {
                 own_feed,
                 host_device_id,
                 key,
+                stored_envelope,
                 quiet: Quiet::new(Arc::clone(&timer)),
                 gate_wait_ms: AtomicU64::new(
                     u64::try_from(GATE_WAIT.as_millis()).unwrap_or(u64::MAX),
@@ -837,9 +843,10 @@ async fn settle(
         completion: applied.completion,
         acknowledged_at_ms: TimestampMs::new(controller.wall_now_ms()),
     };
+    let announcement = announcement_to_the_issuer(shared, controller, record, applied.completion);
     let state = shared
         .client
-        .acknowledge(&acknowledgement, None)
+        .acknowledge(&acknowledgement, announcement.as_ref())
         .await
         .map_err(|error| Stopped::of(&error, &shared.quiet))?;
     *latest = Latest::of(&state);
@@ -849,6 +856,41 @@ async fn settle(
     } else {
         Ok(false)
     }
+}
+
+/// The announcement that the feed changed, for the owner who published `record`'s request, to place
+/// in that owner's mailbox beside the acknowledgement.
+///
+/// The owner reads the feed to learn what became of its request; the announcement tells the
+/// owner's mailbox that the feed changed. It is made when the acknowledgement tells the owner
+/// something new, which is the first one or a change of its completion: a request left pending is
+/// acknowledged again on each pass, and announcing each of those would fill the owner's mailbox
+/// with one thing said again. The owner is the device that published, only while its pairing is in
+/// force and its key is recorded; a host that cannot seal one acknowledges without, because the
+/// feed is the record.
+fn announcement_to_the_issuer(
+    shared: &Shared,
+    controller: &Controller,
+    record: &AuthorityFeedRecord,
+    completion: RevocationCompletion,
+) -> Option<FeedAnnouncement> {
+    if !tells_something_new(record.acknowledgement.0.as_ref(), completion) {
+        return None;
+    }
+    let issuer = controller
+        .paired_stored_envelope_key(record.request.issuer_device_id)
+        .ok()??;
+    FeedAnnouncement::sealed_for(&shared.stored_envelope, &issuer, controller.wall_now_ms()).ok()
+}
+
+/// Whether acknowledging with `completion` tells the owner something the feed's `held`
+/// acknowledgement does not already say: the first acknowledgement, or a change of how much of the
+/// revocation the host's sessions have confirmed.
+fn tells_something_new(
+    held: Option<&RevocationAcknowledgement>,
+    completion: RevocationCompletion,
+) -> bool {
+    held.is_none_or(|held| held.completion != completion)
 }
 
 /// Refuses a record with a reason the publisher reads, and settles it here.
@@ -915,6 +957,40 @@ mod tests {
     use super::*;
     use futures_util::FutureExt as _;
 
+    /// A request a host acknowledges again on every pass while some of its sessions have yet to
+    /// confirm it announces once, and again when how much is confirmed changes. The daemon's
+    /// suites cannot hold a barrier pending, which takes a running session that does not answer.
+    #[test]
+    fn an_acknowledgement_that_says_nothing_new_is_not_announced() {
+        use kr_protocol::scalars::U64;
+        let pending = |workers| RevocationCompletion::Pending {
+            pending_workers: U64::new(workers),
+        };
+        let acknowledged = |completion| RevocationAcknowledgement {
+            request_id: RevocationRequestId::new(kr_ipc::new_uuid()),
+            host_device_id: DeviceId::new(kr_ipc::new_uuid()),
+            authority_revision: AuthorityRevision::new(2),
+            completion,
+            acknowledged_at_ms: TimestampMs::new(1),
+        };
+        assert!(
+            tells_something_new(None, pending(2)),
+            "the first one is news"
+        );
+        assert!(!tells_something_new(
+            Some(&acknowledged(pending(2))),
+            pending(2)
+        ));
+        assert!(tells_something_new(
+            Some(&acknowledged(pending(2))),
+            pending(1)
+        ));
+        assert!(tells_something_new(
+            Some(&acknowledged(pending(1))),
+            RevocationCompletion::Complete
+        ));
+    }
+
     #[derive(Debug)]
     struct NoSigner(kr_crypto::keys::AuthorisationKeyPair);
 
@@ -943,6 +1019,7 @@ mod tests {
             &origin,
             DeviceId::new(kr_ipc::new_uuid()),
             key,
+            kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a key pair"),
             Arc::new(crate::quiet::RealTimer),
         )
     }

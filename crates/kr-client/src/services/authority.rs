@@ -8,7 +8,8 @@
 //! host's device records.
 //!
 //! This module is the host's and the owner's way in. It carries the seven members of
-//! `authority.sync` over [`SignedService`] and nothing else: it holds no feed state, decides no
+//! `authority.sync` over [`SignedService`] and seals the announcement a caller places beside a
+//! change ([`FeedAnnouncement::sealed_for`]), and nothing else: it holds no feed state, decides no
 //! ordering and signs no record. The control daemon's `AuthorityFeed` is the host's record of what
 //! it has accepted, acknowledged and still owes, and it is what a caller drives with the answers
 //! from here.
@@ -45,22 +46,27 @@
 use std::fmt;
 use std::sync::Arc;
 
-use kr_protocol::ids::{AuthorityRevision, DeviceId, RevocationRequestId};
-use kr_protocol::mailbox::SealedEnvelope;
+use kr_crypto::envelope::seal_envelope;
+use kr_crypto::keys::StoredEnvelopeKeyPair;
+use kr_protocol::error::ErrorCode;
+use kr_protocol::ids::{AuthorityRevision, DeviceId, EnvelopeId, RevocationRequestId};
+use kr_protocol::mailbox::{
+    EnvelopePlaintext, EnvelopeVersion, MailboxPayloadType, SealedEnvelope,
+};
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{
     AuthorityRevisionRecord, KeyPurpose, RevocationAcknowledgement, RevocationRequest,
     RevocationTarget,
 };
 use kr_protocol::scalars::{
-    AuthorisationKey, KeyId, Nullable, StoredEnvelopeKey, TimestampMs, U64,
+    AuthorisationKey, Bytes, KeyId, Nullable, StoredEnvelopeKey, TimestampMs, U64,
 };
-use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
+use kr_protocol::service::{GatewayOrigin, SERVICE_REQUEST_FRESHNESS_MS, ServiceRequestSigner};
 use serde::{Deserialize, Serialize};
 
 use super::relay::{ServiceHttp, ServiceSigner};
 use super::signed::{SignedService, malformed, unreadable_answer};
-use crate::error::Result;
+use crate::error::{ClientError, Result};
 
 /// The path every authority-feed member is addressed to.
 pub const AUTHORITY_SYNC_PATH: &str = "/api/authority/sync";
@@ -117,8 +123,8 @@ pub enum RejectionReason {
 pub struct FeedAnnouncement {
     /// The recipient's stored-envelope public key: the host, or the device being answered.
     pub recipient_key: StoredEnvelopeKey,
-    /// The sealed item. Its payload type is an authority-feed change and its expiry is held to the
-    /// hour an announcement lives for.
+    /// The sealed item. Its payload type is an authority-feed change and its expiry is within the
+    /// bound the service sets an announcement ([`ANNOUNCEMENT_LIFETIME_MS`]).
     pub envelope: SealedEnvelope,
 }
 
@@ -630,17 +636,76 @@ impl AuthorityFeedClient {
     }
 }
 
-/// The instant an announcement placed beside a feed change expires.
+/// The furthest ahead of its own clock the service lets an announcement expire.
 ///
-/// An announcement is a nudge rather than a record: the service refuses one that lives longer than
-/// an hour, because the revocation itself is in the feed and stays there until the host is finished
-/// with it.
+/// An announcement is a nudge rather than a record: the service refuses a change whose
+/// announcement lives longer than an hour by its own clock, because the revocation itself is in the
+/// feed and stays there until the host is finished with it. The refusal is of the whole change.
 pub const ANNOUNCEMENT_LIFETIME_MS: u64 = 60 * 60 * 1000;
 
-/// The expiry an announcement sealed now carries.
+/// How long an announcement sealed now lives: the service's bound less the freshness of a signed
+/// request.
+///
+/// The service admits a request signed up to [`SERVICE_REQUEST_FRESHNESS_MS`] ahead of its own
+/// clock, and an announcement sealed on such a sender's clock would otherwise expire later than the
+/// service's bound and cost the sender the whole change, a revocation among them.
+pub const ANNOUNCEMENT_SEALED_LIFETIME_MS: u64 =
+    ANNOUNCEMENT_LIFETIME_MS - SERVICE_REQUEST_FRESHNESS_MS;
+
+/// The instant an announcement sealed at `now_ms` expires.
 #[must_use]
 pub const fn announcement_expiry(now_ms: u64) -> TimestampMs {
-    TimestampMs::new(now_ms.saturating_add(ANNOUNCEMENT_LIFETIME_MS))
+    TimestampMs::new(now_ms.saturating_add(ANNOUNCEMENT_SEALED_LIFETIME_MS))
+}
+
+impl FeedAnnouncement {
+    /// Seals an announcement that a feed changed, from `sender` to the device whose stored-envelope
+    /// key is `recipient`, at `now_ms` on the sender's clock.
+    ///
+    /// The payload is empty: the announcement says that something changed and nothing of what, and
+    /// a reader learns the rest from the feed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the envelope cannot be sealed.
+    pub fn sealed_for(
+        sender: &StoredEnvelopeKeyPair,
+        recipient: &StoredEnvelopeKey,
+        now_ms: u64,
+    ) -> Result<Self> {
+        let envelope = seal_envelope(
+            sender,
+            recipient,
+            &EnvelopePlaintext {
+                version: EnvelopeVersion::V1,
+                envelope_id: EnvelopeId::new(kr_ipc::new_uuid()),
+                sender_key_id: sender.key_id(),
+                recipient_key_id: kr_crypto::keys::key_id(
+                    KeyPurpose::StoredEnvelope,
+                    recipient.as_bytes(),
+                ),
+                payload_type: MailboxPayloadType::AuthorityFeedChange,
+                created_at_ms: TimestampMs::new(now_ms),
+                expires_at_ms: announcement_expiry(now_ms),
+                grant_id: Nullable::null(),
+                environment_id: Nullable::null(),
+                session_id: Nullable::null(),
+                session_epoch: Nullable::null(),
+                thread_id: Nullable::null(),
+                payload: Bytes::new(Vec::new()),
+            },
+        )
+        .map_err(|error| {
+            ClientError::refusal(
+                ErrorCode::ResourceUnavailable,
+                crate::shown::Shown::crypto(&error),
+            )
+        })?;
+        Ok(Self {
+            recipient_key: *recipient,
+            envelope,
+        })
+    }
 }
 
 #[cfg(test)]

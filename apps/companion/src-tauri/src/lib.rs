@@ -39,6 +39,7 @@ pub mod error;
 pub mod export;
 pub mod hosts;
 pub mod links;
+pub mod mailbox;
 pub mod owner;
 pub mod pairing;
 /// The checks a debug build runs for the voice call's bridge on a phone.
@@ -503,6 +504,7 @@ fn start_with_records(app: &tauri::AppHandle) {
     #[cfg(mobile)]
     hosts::resume(app);
     open_recovery(app);
+    open_mailbox(app);
 }
 
 fn open_the_records(app: &tauri::AppHandle) -> Result<()> {
@@ -657,6 +659,19 @@ fn open_recovery(app: &tauri::AppHandle) {
     }
 }
 
+/// Opens this computer's reader of its own mailbox, once the pairing records and the sync service
+/// setting are open.
+fn open_mailbox(app: &tauri::AppHandle) {
+    use tauri::Manager as _;
+
+    let Ok(data) = app.path().app_data_dir() else {
+        return;
+    };
+    if let Err(error) = start_mailbox(app, &data) {
+        tracing::warn!(%error, "this computer's reader of its mailbox could not be opened");
+    }
+}
+
 /// Tells the page, on [`settings::SETTINGS_EVENT`], whenever what it shows of the settings changes.
 pub fn watch_settings<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     use tauri::{Emitter as _, Manager as _};
@@ -772,6 +787,27 @@ pub fn start_recovery<R: tauri::Runtime>(
         state.sync_service()?,
     )?;
     state.recovery_opened(Arc::new(recovery));
+    Ok(())
+}
+
+/// Opens this computer's reader of its own mailbox, with its record under `data`, over the
+/// pairing records and the sync service setting, which are opened first. The record's directory is
+/// made when the reader first needs it.
+///
+/// # Errors
+///
+/// Returns a local failure when the pairing records or the setting are not open.
+pub fn start_mailbox<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    data: &std::path::Path,
+) -> Result<()> {
+    use std::sync::Arc;
+
+    use tauri::Manager as _;
+
+    let state = app.state::<AppState>();
+    let desk = mailbox::MailboxDesk::new(data, state.device()?, state.sync_service()?);
+    state.mailbox_opened(Arc::new(desk));
     Ok(())
 }
 

@@ -252,20 +252,47 @@ struct Rig {
     secrets: Arc<dyn SecretStore>,
     /// The device the host paired, which is the one that is revoked.
     phone: Device,
+    /// The timer the host's carriers wait by, held.
+    timer: Arc<HeldTimer>,
+    /// The host's own keys, for a host started to read its mailbox: a test seals as the host with
+    /// them.
+    host_keys: Option<DeviceKeys>,
 }
 
 impl Rig {
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// As [`Self::start`], with the host's reader of its own mailbox waiting by the held timer too,
+    /// so that a test decides when it looks.
+    async fn start_reading_the_mailbox() -> Self {
+        Self::start_with(true).await
+    }
+
+    async fn start_with(reads_the_mailbox: bool) -> Self {
         let served = serve().await;
         let owner = DeviceKeys::generate().expect("owner keys");
         let timer = HeldTimer::held();
-        let host = Host::start_with_feed_on(
-            &owner,
-            served.origin(),
-            Arc::clone(&timer) as _,
-            Clocks::system(),
-        )
-        .await;
+        let host_keys = reads_the_mailbox.then(|| DeviceKeys::generate().expect("host keys"));
+        let host = if let Some(host_keys) = &host_keys {
+            Host::start_with_feed_and_keys(
+                &owner,
+                host_keys,
+                served.origin(),
+                Arc::clone(&timer) as _,
+                Clocks::system(),
+            )
+            .await
+        } else {
+            Host::start_with_feed_on(
+                &owner,
+                served.origin(),
+                Arc::clone(&timer) as _,
+                Clocks::system(),
+            )
+            .await
+        };
         let phone = Device::create().await;
         pair_with(&host, &phone, &owner, proposal(&[ActionRight::SessionView])).await;
 
@@ -281,6 +308,7 @@ impl Rig {
         );
         support::record_owned(&app.device(), &host, "the test host");
         companion_tauri::start_sync_service(app.app.handle(), data.path());
+        companion_tauri::start_mailbox(app.app.handle(), data.path()).expect("the mailbox opens");
         let rig = Self {
             host,
             served,
@@ -290,11 +318,16 @@ impl Rig {
             data,
             secrets,
             phone,
+            timer,
+            host_keys,
         };
         rig.sync_service_is(rig.served.origin());
         // The passes the start and the pairing asked for end before anything connects: a
         // connection admitted while one runs is withdrawn when it finishes.
         rig.host_polls().await;
+        if rig.host_keys.is_some() {
+            rig.the_hosts_reader_has_passed_since(0).await;
+        }
         rig
     }
 
@@ -309,6 +342,8 @@ impl Rig {
             data,
             secrets,
             phone,
+            timer,
+            host_keys,
         } = self;
         drop(app);
         let app = Companion::start(
@@ -318,6 +353,7 @@ impl Rig {
             StubPaste::holding("", false),
         );
         companion_tauri::start_sync_service(app.app.handle(), data.path());
+        companion_tauri::start_mailbox(app.app.handle(), data.path()).expect("the mailbox opens");
         Self {
             host,
             served,
@@ -327,6 +363,8 @@ impl Rig {
             data,
             secrets,
             phone,
+            timer,
+            host_keys,
         }
     }
 
@@ -446,6 +484,46 @@ impl Rig {
         carrier.synchronised_before_serving().await;
     }
 
+    /// How many passes the host's reader of its own mailbox has finished.
+    fn the_hosts_reader_count(&self) -> u64 {
+        *self
+            .host
+            .controller()
+            .mailbox_reader()
+            .expect("a reader of the host's mailbox")
+            .passes()
+            .borrow()
+    }
+
+    /// Waits until the host's reader of its own mailbox has finished a pass since `seen` passes
+    /// were counted, and waits again by its timer.
+    async fn the_hosts_reader_has_passed_since(&self, seen: u64) {
+        let mut passes = self
+            .host
+            .controller()
+            .mailbox_reader()
+            .expect("a reader of the host's mailbox")
+            .passes();
+        tokio::time::timeout(WATCHDOG, async {
+            while *passes.borrow_and_update() <= seen {
+                passes.changed().await.expect("the reader is running");
+            }
+        })
+        .await
+        .expect("the host's reader finishes a pass");
+    }
+
+    /// What `kr doctor` says of the host's reader of its own mailbox.
+    fn the_hosts_reader_says(&self) -> String {
+        let controller = self.host.controller();
+        controller
+            .mailbox_reader()
+            .expect("a reader of the host's mailbox")
+            .doctor_check(controller)
+            .detail()
+            .to_owned()
+    }
+
     async fn view(&self) -> Value {
         self.app
             .call("revocation_view", json!({}))
@@ -473,6 +551,125 @@ impl Rig {
         })
         .await
         .unwrap_or_else(|_| panic!("gave up waiting for {what}"))
+    }
+
+    /// The key this computer's own mailbox is addressed by.
+    fn my_key(&self) -> kr_protocol::scalars::StoredEnvelopeKey {
+        *self.app.device().identity().keys.stored_envelope.public()
+    }
+
+    /// How many items this computer's mailbox holds at the service.
+    fn items_waiting_for_me(&self) -> usize {
+        self.served.web().mailbox_envelopes(&self.my_key()).len()
+    }
+
+    /// An item of `kind` from `from` to this computer's mailbox, with an identifier made of
+    /// `number`, left at the service by a stranger's installation as any device leaves one.
+    async fn leaves_an_item(
+        &self,
+        from: &kr_crypto::keys::StoredEnvelopeKeyPair,
+        kind: kr_protocol::mailbox::MailboxPayloadType,
+        number: u8,
+    ) -> kr_protocol::mailbox::SealedEnvelope {
+        use kr_protocol::mailbox::{EnvelopePlaintext, EnvelopeVersion};
+        let now = kr_ipc::now_ms().get();
+        let item = kr_crypto::envelope::seal_envelope(
+            from,
+            &self.my_key(),
+            &EnvelopePlaintext {
+                version: EnvelopeVersion::V1,
+                envelope_id: kr_protocol::ids::EnvelopeId::new(Uuid::from_bytes([number; 16])),
+                sender_key_id: from.key_id(),
+                recipient_key_id: kr_crypto::keys::key_id(
+                    kr_protocol::pairing::KeyPurpose::StoredEnvelope,
+                    self.my_key().as_bytes(),
+                ),
+                payload_type: kind,
+                created_at_ms: TimestampMs::new(now),
+                expires_at_ms: TimestampMs::new(now + 30 * 60 * 1000),
+                grant_id: Nullable::null(),
+                environment_id: Nullable::null(),
+                session_id: Nullable::null(),
+                session_epoch: Nullable::null(),
+                thread_id: Nullable::null(),
+                payload: kr_protocol::scalars::Bytes::new(vec![number; 16]),
+            },
+        )
+        .expect("a sealed item");
+        let origin = GatewayOrigin::new(self.served.origin()).expect("an origin");
+        let http = HttpService::with(
+            origin.clone(),
+            HttpDeadlines::default(),
+            managed_response_limits(),
+        )
+        .expect("a transport");
+        kr_client::services::mailbox::MailboxClient::new(
+            origin,
+            Arc::new(http),
+            Arc::new(Installation(
+                AuthorisationKeyPair::generate().expect("a key pair"),
+            )),
+        )
+        .deliver(&self.my_key(), &item)
+        .await
+        .expect("the service takes the item: it cannot read it");
+        item
+    }
+
+    /// The host's own stored-envelope key pair, for a host started to read its mailbox.
+    fn the_host(&self) -> &kr_crypto::keys::StoredEnvelopeKeyPair {
+        &self
+            .host_keys
+            .as_ref()
+            .expect("a host started to read its mailbox")
+            .stored_envelope
+    }
+
+    /// This computer's reader of its own mailbox.
+    fn desk(&self) -> Arc<companion_tauri::mailbox::MailboxDesk> {
+        self.app
+            .app
+            .state::<AppState>()
+            .mailbox()
+            .expect("the mailbox desk")
+    }
+
+    /// The record of what this computer took from its mailbox, as it is on disk.
+    fn record_on_disk(&self) -> Option<Vec<u8>> {
+        std::fs::read(self.data.path().join("mailbox").join("replay.json")).ok()
+    }
+
+    /// A record as this computer's reader of its mailbox finds it, owner-only, in the directory a
+    /// pass makes.
+    fn puts_a_record(&self, bytes: &[u8]) {
+        let directory = self.data.path().join("mailbox");
+        kr_ipc::paths::create_private_directory(&directory).expect("the directory");
+        kr_ipc::paths::write_owner_only_file(&directory.join("replay.json"), bytes)
+            .expect("a record is written");
+    }
+
+    /// The identifiers on that record, each with when it may be forgotten.
+    fn identifiers_on_record(&self) -> std::collections::BTreeMap<String, u64> {
+        self.record_on_disk()
+            .map(|bytes| {
+                serde_json::from_slice::<Value>(&bytes).expect("a record")["identifiers"]
+                    .as_object()
+                    .expect("identifiers")
+                    .iter()
+                    .map(|(id, until)| (id.clone(), until.as_u64().expect("a time")))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The key the host's own mailbox is addressed by.
+    fn host_stored_envelope_key(&self) -> kr_protocol::scalars::StoredEnvelopeKey {
+        self.host
+            .network()
+            .pairing()
+            .identity()
+            .keys
+            .stored_envelope
     }
 
     /// How many publications reached the host's own feed service.
@@ -748,6 +945,562 @@ async fn a_reference_the_screen_was_not_given_names_nothing_and_this_computer_is
     );
 }
 
+/// KR-REQ-20.04, KR-REQ-20.05: a revocation this computer publishes carries an announcement sealed
+/// to the host, and the host reads it from its own mailbox and opens it against the pairing: the
+/// item is the host's to open and nobody else's, and the host's reader takes it and tells the
+/// service it may go. The host's reader waits by a timer the test holds, so the announcement stays
+/// in the host's mailbox until the test lets the reader look.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_20_04_a_published_revocation_carries_an_announcement_the_host_opens() {
+    let rig = Rig::start_reading_the_mailbox().await;
+    let before = rig.view().await;
+    let host = host_by(&before, "feed");
+    let phone = the_phone(&host);
+
+    rig.revoke(
+        host["reference"].as_str().expect("a reference"),
+        phone["reference"].as_str().expect("a reference"),
+    )
+    .expect("the person confirms and the request is published");
+
+    assert_eq!(rig.publications(), 1);
+    assert_eq!(
+        rig.served
+            .web()
+            .mailbox_envelopes(&rig.host_stored_envelope_key())
+            .len(),
+        1,
+        "the announcement is in the host's mailbox beside the request"
+    );
+    assert!(
+        rig.the_hosts_reader_says()
+            .contains("0 announcement(s) taken"),
+        "{}",
+        rig.the_hosts_reader_says()
+    );
+
+    let seen = rig.the_hosts_reader_count();
+    let (_, release) = rig
+        .timer
+        .next_wait_under(kr_controller::mailbox_reader::POLL_INTERVAL + Duration::from_millis(1))
+        .await;
+    release.notify_one();
+    rig.the_hosts_reader_has_passed_since(seen).await;
+
+    assert!(
+        rig.the_hosts_reader_says()
+            .contains("1 announcement(s) taken"),
+        "{}",
+        rig.the_hosts_reader_says()
+    );
+    assert!(
+        rig.served
+            .web()
+            .mailbox_envelopes(&rig.host_stored_envelope_key())
+            .is_empty(),
+        "the service may remove what the host took"
+    );
+}
+
+/// An announcement is a nudge: the service refuses a change whose announcement outlives its own
+/// clock by more than an hour, and a sender whose clock runs ahead of the service's by less than
+/// the freshness of a signed request must not lose its revocation to that. Here the service's clock
+/// runs two minutes behind this computer's, and the revocation is stored with its announcement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_is_stored_though_this_computers_clock_runs_ahead_of_the_services() {
+    let rig = Rig::start_reading_the_mailbox().await;
+    rig.served.web().run_behind(Duration::from_secs(120));
+    let before = rig.view().await;
+    let host = host_by(&before, "feed");
+    let phone = the_phone(&host);
+
+    rig.revoke(
+        host["reference"].as_str().expect("a reference"),
+        phone["reference"].as_str().expect("a reference"),
+    )
+    .expect("the request is published, with its announcement");
+
+    assert_eq!(rig.publications(), 1);
+    assert_eq!(
+        rig.served
+            .web()
+            .mailbox_envelopes(&rig.host_stored_envelope_key())
+            .len(),
+        1,
+        "the announcement was placed"
+    );
+}
+
+/// What the screen is told of this computer's mailbox, after a look.
+async fn mailbox_after_a_look(rig: &Rig) -> Value {
+    rig.view().await["mailbox"].clone()
+}
+
+/// KR-REQ-20.04, KR-REQ-20.05, KR-REQ-10.46: the host that carries out a revocation announces what
+/// became of it to the computer that published it, and this computer takes the announcement from
+/// its own mailbox: it opens against the host it is paired with, is written down, and is counted
+/// once. Nothing wakes this computer's look but the look itself, which a screen makes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_20_05_the_hosts_announcement_of_its_acknowledgement_is_taken_from_this_computers_mailbox()
+ {
+    let rig = Rig::start_reading_the_mailbox().await;
+    let host = host_by(&rig.view().await, "feed");
+    let phone = the_phone(&host);
+    rig.revoke(
+        host["reference"].as_str().expect("a reference"),
+        phone["reference"].as_str().expect("a reference"),
+    )
+    .expect("the request is published");
+    let (_, release) = rig
+        .timer
+        .next_wait_under(kr_controller::mailbox_reader::POLL_INTERVAL + Duration::from_millis(1))
+        .await;
+    release.notify_one();
+
+    let looked = rig
+        .view_until("the host's announcement is taken", |view| {
+            view["mailbox"]["announcements"] == json!(1)
+        })
+        .await;
+    let mailbox = &looked["mailbox"];
+
+    assert_eq!(mailbox["stopped"], Value::Null);
+    assert_eq!(rig.items_waiting_for_me(), 0, "the service may remove it");
+    assert_eq!(rig.identifiers_on_record().len(), 1, "it is on record");
+}
+
+/// KR-REQ-20.05: the host announces only to a device whose pairing is in force. An owner whose
+/// request revokes its own device is acknowledged, and the host places nothing in its mailbox, as
+/// that device is no longer one the host pairs with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_that_revoked_its_own_device_is_acknowledged_without_an_announcement() {
+    use kr_protocol::ids::RevocationRequestId;
+    use kr_protocol::pairing::RevocationTarget;
+    use kr_protocol::scalars::CanonicalSet;
+    let rig = Rig::start_reading_the_mailbox().await;
+    let owner_device = rig.host.owner.as_ref().expect("an owner").device_id;
+    let host_device = rig.host.network().pairing().identity().device_id;
+    let origin = GatewayOrigin::new(rig.served.origin()).expect("an origin");
+    let http = HttpService::with(
+        origin.clone(),
+        HttpDeadlines::default(),
+        managed_response_limits(),
+    )
+    .expect("a transport");
+    let remote = AuthorityFeedClient::new(
+        origin,
+        Arc::new(http),
+        Arc::new(Installation(rig.owner.authorisation.clone())),
+    );
+    let request = kr_pairing::grants::sign_revocation_request(
+        &rig.owner.authorisation,
+        RevocationRequestId::new(kr_ipc::new_uuid()),
+        owner_device,
+        host_device,
+        RevocationTarget::Devices {
+            device_ids: CanonicalSet::from_iter([owner_device]),
+        },
+        kr_ipc::now_ms(),
+    )
+    .expect("a signed request");
+    remote
+        .publish(
+            rig.host
+                .controller()
+                .feed_runtime()
+                .expect("a carrier")
+                .feed(),
+            &request,
+            None,
+        )
+        .await
+        .expect("the feed takes the request");
+
+    rig.host_polls().await;
+
+    assert!(
+        rig.host
+            .controller()
+            .devices()
+            .devices()
+            .expect("the host's devices")
+            .into_iter()
+            .any(|record| record.device_id == owner_device && record.revoked_at_ms.is_some()),
+        "the host carried the request out"
+    );
+    assert_eq!(
+        rig.items_waiting_for_me(),
+        0,
+        "nothing was placed in the mailbox of a device the host no longer pairs with"
+    );
+}
+
+/// KR-REQ-20.04, KR-REQ-20.05: what this computer takes from its mailbox is what a host it is
+/// paired with sealed, and an unsigned payload that bears authority inside an envelope that is valid
+/// in every other way is refused. An item from a key nobody paired, and an item that bears authority
+/// from the host itself, are dropped and leave no identifier; the host's announcement beside them is taken, and the service
+/// is told that all three may go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_20_05_a_stranger_and_an_item_that_bears_authority_are_dropped() {
+    use kr_protocol::mailbox::MailboxPayloadType::{AuthorityFeedChange, SignedAuthorityObject};
+    let rig = Rig::start_reading_the_mailbox().await;
+    let stranger = kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a key pair");
+    rig.leaves_an_item(&stranger, AuthorityFeedChange, 1).await;
+    rig.leaves_an_item(rig.the_host(), SignedAuthorityObject, 2)
+        .await;
+    rig.leaves_an_item(rig.the_host(), AuthorityFeedChange, 3)
+        .await;
+
+    let mailbox = mailbox_after_a_look(&rig).await;
+
+    assert_eq!(mailbox["announcements"], json!(1), "only the host's own");
+    assert_eq!(rig.items_waiting_for_me(), 0);
+    assert_eq!(
+        rig.identifiers_on_record().len(),
+        1,
+        "what did not open is not on record"
+    );
+}
+
+/// KR-REQ-20.05: a host this computer forgot is no sender. Its item is taken while it is paired and
+/// dropped after, and the computer goes on reading because another host it owns is still read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_20_05_a_host_this_computer_forgot_is_no_sender() {
+    use kr_protocol::mailbox::MailboxPayloadType::AuthorityFeedChange;
+    let rig = Rig::start_reading_the_mailbox().await;
+    let other = DeviceKeys::generate().expect("another host's keys");
+    let other_id = DeviceId::new(kr_ipc::new_uuid());
+    let mut record = rig
+        .app
+        .device()
+        .pairing()
+        .hosts
+        .list()
+        .expect("the records")
+        .remove(0);
+    record.host_device_id = other_id;
+    record.host_endpoint_id = *other.transport.public();
+    record.host_keys = other.public_keys();
+    record.name = Some("the other host".to_owned());
+    rig.app
+        .device()
+        .pairing()
+        .hosts
+        .record(record)
+        .expect("the other host is recorded");
+
+    rig.leaves_an_item(&other.stored_envelope, AuthorityFeedChange, 1)
+        .await;
+    assert_eq!(mailbox_after_a_look(&rig).await["announcements"], json!(1));
+
+    rig.app
+        .device()
+        .forget_host(other_id)
+        .expect("the host is forgotten");
+    rig.leaves_an_item(&other.stored_envelope, AuthorityFeedChange, 2)
+        .await;
+    let mailbox = mailbox_after_a_look(&rig).await;
+
+    assert_eq!(
+        mailbox["announcements"],
+        json!(1),
+        "the second is not taken"
+    );
+    assert_eq!(mailbox["stopped"], Value::Null);
+    assert_eq!(
+        rig.items_waiting_for_me(),
+        0,
+        "it is dropped, and the service may remove it: {mailbox}, {} reads, {} acknowledgements",
+        rig.served.web().requests_to("/api/mailbox/read"),
+        rig.served.web().requests_to("/api/mailbox/acknowledge"),
+    );
+    assert_eq!(rig.identifiers_on_record().len(), 1);
+}
+
+/// KR-REQ-20.05: an identifier this computer accepted is refused when the service offers the item
+/// again, even to an application started since, and is kept until the item's expiry and a day more.
+/// The service never heard the first acknowledgement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_20_05_an_item_taken_once_is_refused_when_offered_again_after_a_restart() {
+    use kr_protocol::mailbox::MailboxPayloadType::AuthorityFeedChange;
+    let rig = Rig::start_reading_the_mailbox().await;
+    let item = rig
+        .leaves_an_item(rig.the_host(), AuthorityFeedChange, 7)
+        .await;
+    rig.served
+        .web()
+        .fail("/api/mailbox/acknowledge", 1, Moment::Before);
+
+    let first = mailbox_after_a_look(&rig).await;
+    assert_eq!(first["announcements"], json!(1));
+    assert_eq!(first["stopped"], json!("unreachable"));
+    assert_eq!(rig.items_waiting_for_me(), 1, "the service never heard");
+    assert_eq!(
+        rig.identifiers_on_record()
+            .values()
+            .copied()
+            .collect::<Vec<_>>(),
+        [item.routing.expires_at_ms.get() + kr_protocol::mailbox::REPLAY_ID_RETENTION_MS],
+        "kept until the item's expiry and a day more"
+    );
+
+    let rig = rig.restarted().await;
+    let second = mailbox_after_a_look(&rig).await;
+
+    assert_eq!(second["announcements"], json!(0), "taken once, not again");
+    assert_eq!(second["stopped"], Value::Null);
+    assert_eq!(rig.items_waiting_for_me(), 0);
+    assert_eq!(rig.identifiers_on_record().len(), 1);
+}
+
+/// What is already due to be forgotten is forgotten when something is written, and what is not is
+/// kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_identifier_that_is_due_to_be_forgotten_is_forgotten_and_the_rest_are_kept() {
+    use kr_protocol::mailbox::MailboxPayloadType::AuthorityFeedChange;
+    let rig = Rig::start_reading_the_mailbox().await;
+    let due = Uuid::from_bytes([0xd0; 16]).to_string();
+    let kept = Uuid::from_bytes([0xd1; 16]).to_string();
+    let far = kr_ipc::now_ms().get() + 3 * 24 * 60 * 60 * 1000;
+    rig.puts_a_record(
+        &serde_json::to_vec(&json!({
+            "version": 1,
+            "identifiers": { due.clone(): 1, kept.clone(): far }
+        }))
+        .expect("a record"),
+    );
+    rig.leaves_an_item(rig.the_host(), AuthorityFeedChange, 5)
+        .await;
+
+    assert_eq!(mailbox_after_a_look(&rig).await["announcements"], json!(1));
+
+    let held = rig.identifiers_on_record();
+    assert!(
+        !held.contains_key(&due),
+        "an identifier past its day is forgotten"
+    );
+    assert_eq!(held.get(&kept), Some(&far));
+    assert_eq!(held.len(), 2);
+}
+
+/// A pass does not wait for another window of the application, and the lock is held for the whole
+/// of the pass that has it: while one desk waits on the service, a second desk over the same
+/// directory, as another window of the application is, is skipped and asks the service nothing; once
+/// the first has ended, the second reads, and takes what the first did not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_does_not_wait_for_another_window_that_is_reading() {
+    use kr_protocol::mailbox::MailboxPayloadType::AuthorityFeedChange;
+    let rig = Rig::start_reading_the_mailbox().await;
+    rig.leaves_an_item(rig.the_host(), AuthorityFeedChange, 4)
+        .await;
+    let asked = rig.served.web().requests_to("/api/mailbox/read");
+    rig.served.web().fail("/api/mailbox/read", 1, Moment::Hold);
+    let first = rig.desk();
+    let reading = tokio::spawn(async move { first.pass().await });
+    rig.served
+        .web()
+        .requests_reach("/api/mailbox/read", asked + 1)
+        .await;
+    let state = rig.app.app.state::<AppState>();
+    let window = companion_tauri::mailbox::MailboxDesk::new(
+        rig.data.path(),
+        state.device().expect("the device"),
+        state.sync_service().expect("the setting is open"),
+    );
+
+    let skipped = window.pass().await;
+
+    assert_eq!(skipped.announcements, 0);
+    assert_eq!(
+        rig.served.web().requests_to("/api/mailbox/read"),
+        asked + 1,
+        "the second window asked the service nothing while the first was reading"
+    );
+    assert_eq!(rig.items_waiting_for_me(), 1);
+    rig.served.web().release_held();
+    reading.await.expect("the first pass ends");
+
+    assert_eq!(window.pass().await.announcements, 1);
+    assert_eq!(rig.items_waiting_for_me(), 0);
+    assert_eq!(rig.identifiers_on_record().len(), 1);
+}
+
+/// A record this build cannot trust is refused and left exactly as found, and nothing is
+/// acknowledged: a record of a version it does not read, a record that is not a record, and a record
+/// that is full of identifiers that must be kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_that_cannot_be_used_is_left_as_found_and_nothing_is_acknowledged() {
+    use kr_protocol::mailbox::MailboxPayloadType::AuthorityFeedChange;
+    let far = kr_ipc::now_ms().get() + 3 * 24 * 60 * 60 * 1000;
+    let full: serde_json::Map<String, Value> = (0..companion_tauri::mailbox::MOST_IDENTIFIERS)
+        .map(|index| {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+            (Uuid::from_bytes(bytes).to_string(), json!(far))
+        })
+        .collect();
+    let cases: [(&str, Vec<u8>, &str); 3] = [
+        (
+            "a newer version",
+            serde_json::to_vec(&json!({ "version": 2, "identifiers": {} })).expect("a record"),
+            "records",
+        ),
+        ("not a record", b"not a record".to_vec(), "records"),
+        (
+            "a full one",
+            serde_json::to_vec(&json!({ "version": 1, "identifiers": full })).expect("a record"),
+            "full",
+        ),
+    ];
+    for (what, bytes, stopped) in cases {
+        let rig = Rig::start_reading_the_mailbox().await;
+        rig.puts_a_record(&bytes);
+        rig.leaves_an_item(rig.the_host(), AuthorityFeedChange, 9)
+            .await;
+
+        let mailbox = mailbox_after_a_look(&rig).await;
+
+        assert_eq!(mailbox["stopped"], json!(stopped), "{what}");
+        assert_eq!(
+            rig.items_waiting_for_me(),
+            1,
+            "{what}: nothing was acknowledged"
+        );
+        assert_eq!(
+            rig.record_on_disk().expect("the record"),
+            bytes,
+            "{what}: the record is as it was found"
+        );
+    }
+}
+
+/// A service that asks to be left alone is left alone for as long as it asked, by every look, and
+/// the screen says so, from the look that was told. Each service is held to its own delay: one that
+/// asked this computer to wait is not asked while another service is read and this computer comes
+/// back to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_service_that_asks_to_be_left_alone_is_not_asked_again_by_the_next_look() {
+    let rig = Rig::start_reading_the_mailbox().await;
+    let asks_to_wait = || Moment::Refuse {
+        status: 429,
+        code: "RATE_LIMITED",
+        retry_after_seconds: Some(120),
+    };
+    rig.served
+        .web()
+        .fail("/api/mailbox/read", 1, asks_to_wait());
+
+    let first = mailbox_after_a_look(&rig).await;
+    assert_eq!(first["stopped"], json!("waiting"));
+    let asked = rig.served.web().requests_to("/api/mailbox/read");
+
+    let second = mailbox_after_a_look(&rig).await;
+
+    assert_eq!(second["stopped"], json!("waiting"));
+    assert_eq!(
+        rig.served.web().requests_to("/api/mailbox/read"),
+        asked,
+        "nothing was sent while the service asked to be left alone"
+    );
+
+    // Another service asks for a delay of its own, and this computer comes back to the first.
+    let elsewhere = serve().await;
+    elsewhere.web().fail("/api/mailbox/read", 1, asks_to_wait());
+    rig.sync_service_is(elsewhere.origin());
+    assert_eq!(
+        mailbox_after_a_look(&rig).await["stopped"],
+        json!("waiting")
+    );
+    rig.sync_service_is(rig.served.origin());
+
+    let back = mailbox_after_a_look(&rig).await;
+
+    assert_eq!(back["stopped"], json!("waiting"));
+    assert_eq!(
+        rig.served.web().requests_to("/api/mailbox/read"),
+        asked,
+        "the first service is still owed its delay"
+    );
+}
+
+/// A delay a service names is the service's to name and not unlimited: one so long that it cannot
+/// be added to a clock does not stop the screen, and the service is left alone for no more than an
+/// hour.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_service_that_names_an_endless_delay_does_not_stop_the_screen() {
+    let rig = Rig::start_reading_the_mailbox().await;
+    rig.served.web().fail(
+        "/api/mailbox/read",
+        1,
+        Moment::Refuse {
+            status: 429,
+            code: "RATE_LIMITED",
+            retry_after_seconds: Some(u64::MAX),
+        },
+    );
+
+    let view = rig.view().await;
+
+    assert_eq!(view["mailbox"]["stopped"], json!("waiting"));
+    assert!(
+        view["hosts"]
+            .as_array()
+            .is_some_and(|hosts| !hosts.is_empty()),
+        "the feed's view is there: {view}"
+    );
+    let asked = rig.served.web().requests_to("/api/mailbox/read");
+    assert_eq!(
+        mailbox_after_a_look(&rig).await["stopped"],
+        json!("waiting")
+    );
+    assert_eq!(rig.served.web().requests_to("/api/mailbox/read"), asked);
+}
+
+/// A mailbox that never answers does not hold the screen: the pass ends within its time and the view
+/// is the one the feed gave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mailbox_that_never_answers_does_not_hold_the_screen() {
+    let rig = Rig::start_reading_the_mailbox().await;
+    rig.desk().finish_within(Duration::from_millis(300));
+    rig.served.web().fail("/api/mailbox/read", 1, Moment::Hold);
+
+    let view = rig.view().await;
+
+    assert_eq!(view["mailbox"]["stopped"], json!("unreachable"));
+    assert!(
+        view["hosts"]
+            .as_array()
+            .is_some_and(|hosts| !hosts.is_empty()),
+        "the feed's view is there: {view}"
+    );
+    rig.served.web().release_held();
+}
+
+/// A computer that reads no feed asks the mailbox service nothing: with no host to read a feed of,
+/// the screen contacts no service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_computer_that_owns_no_host_to_read_a_feed_of_asks_the_mailbox_nothing() {
+    let rig = Rig::start_reading_the_mailbox().await;
+    let host = rig
+        .app
+        .device()
+        .pairing()
+        .hosts
+        .list()
+        .expect("the records")
+        .remove(0);
+    rig.app
+        .device()
+        .forget_host(host.host_device_id)
+        .expect("the host is forgotten");
+    let asked = rig.served.web().requests_to("/api/mailbox/read");
+
+    let view = rig.view().await;
+
+    assert_eq!(rig.served.web().requests_to("/api/mailbox/read"), asked);
+    assert_eq!(view["mailbox"]["last_read_ms"], Value::Null);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_does_not_answer_is_revoked_on_through_its_feed_from_the_list_last_seen() {
     let rig = Rig::start().await;
@@ -763,6 +1516,8 @@ async fn a_host_that_does_not_answer_is_revoked_on_through_its_feed_from_the_lis
         data,
         phone: _phone,
         secrets: _,
+        timer: _,
+        host_keys: _,
     } = rig;
     daemon.stop().await;
 
@@ -1627,6 +2382,11 @@ fn the_view_native_code_gives_the_screen_is_the_view_the_page_reads() {
     let view = RevocationView {
         ceremony: CeremonyKind::TouchId,
         feed_origin: Some("sync.example.org:8443".to_owned()),
+        mailbox: companion_tauri::mailbox::MailboxView {
+            last_read_ms: Some(1_700_000_000_000),
+            announcements: 2,
+            stopped: Some(companion_tauri::mailbox::Stopped::Unreachable),
+        },
         hosts: vec![here, studio, attic],
     };
     let fixture: Value =

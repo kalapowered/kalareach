@@ -765,6 +765,7 @@ impl Controller {
                     &origin,
                     kr_protocol::ids::DeviceId::new(setup.environment_id.get()),
                     device_keys.authorisation.clone(),
+                    device_keys.stored_envelope.clone(),
                     Arc::clone(&timer),
                 ))
             }
