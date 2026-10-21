@@ -566,12 +566,13 @@ impl Drop for Job {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_forced_close_ends_what_the_session_owns_when_the_root_shells_status_cannot_be_read() {
     let host = kr_ipc::testing::TempHost::create();
-    let named = host.root().join("job");
+    // A quote in the name is part of what the script has to carry through.
+    let named = host.root().join("the job's identifier");
     let config = configuration(
         &host,
         &format!(
-            "nohup sleep 300 >/dev/null 2>&1 & echo $! > '{}'; exec cat",
-            named.display()
+            "nohup sleep 300 >/dev/null 2>&1 & echo $! > {}; exec cat",
+            quoted(&named)
         ),
     );
     let mut session = Session::open(config).expect("opens");
@@ -2326,14 +2327,20 @@ async fn the_palette_a_create_request_names_reaches_the_launched_session() {
 /// A script that leaves `marker` behind when it runs, written for the POSIX shell a session is given
 /// on every machine this suite runs on.
 ///
-/// The shell's own redirection makes the file, so no utility has to be on its path. The name is one
-/// single-quoted word, with a quote in it closed over, given as an escaped quote of its own and
-/// reopened. On Windows its separators are forward slashes: the command line that shell is given
-/// reads a pair of backslashes inside a quoted argument as one, so a UNC prefix would lose one of
-/// its two. The backslash of an escaped quote stands alone before a quote, which that reading keeps.
-/// A path that is not text is refused rather than named as some other path.
+/// The shell's own redirection makes the file, so no utility has to be on its path.
 fn leaves_mark(marker: &std::path::Path) -> String {
-    let text = marker
+    format!(": > {}", quoted(marker))
+}
+
+/// A path as one single-quoted word of the POSIX shell a session is given.
+///
+/// A quote in it is closed over, given as an escaped quote of its own and reopened. On Windows its
+/// separators are forward slashes: the command line that shell is given reads a pair of backslashes
+/// inside a quoted argument as one, so a UNC prefix would lose one of its two. The backslash of an
+/// escaped quote stands alone before a quote, which that reading keeps. A path that is not text is
+/// refused rather than named as some other path.
+fn quoted(path: &std::path::Path) -> String {
+    let text = path
         .to_str()
         .expect("the host's temporary directory is text");
     let text = if cfg!(windows) {
@@ -2341,7 +2348,7 @@ fn leaves_mark(marker: &std::path::Path) -> String {
     } else {
         text.to_owned()
     };
-    format!(": > '{}'", text.replace('\'', r"'\''"))
+    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 /// What a directory holds, for the message of a mark that is not where the command was to leave it.
