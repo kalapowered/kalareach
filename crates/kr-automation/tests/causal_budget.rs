@@ -475,8 +475,8 @@ async fn self_retrigger_is_refused_without_explicit_recurrence() {
     .expect("explicit recurrence takes another turn");
 }
 
-/// A descendant's root, depth and parent are the journal's record of the node that produced its
-/// trigger, and its trigger's identifier is that node's action identifier.
+/// KR-REQ-25.15: a descendant's root, depth and parent are the journal's record of the node that
+/// produced its trigger, and its trigger's identifier is that node's action identifier.
 #[tokio::test]
 async fn a_descendant_takes_its_ancestry_from_the_node_that_produced_its_trigger() {
     let service = in_memory();
