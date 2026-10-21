@@ -484,8 +484,7 @@ impl Run {
     }
 }
 
-/// KR-REQ-10.36, KR-REQ-10.37, KR-REQ-10.38, KR-REQ-10.17: runs the host for one phone, phase by
-/// phase, until the script says it is done.
+/// Runs the host for one phone, phase by phase, until the script says it is done.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "started by scripts/e2e-pairing-device.sh beside a simulator or an emulator"]
 async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
