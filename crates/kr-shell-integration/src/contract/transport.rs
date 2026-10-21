@@ -467,7 +467,8 @@ pub struct WorkerExpectation {
 
 /// What the package a session launched declares about itself.
 ///
-/// It is the identity record the build wrote, read by the host that launched the executable. The
+/// It is the identity record the build wrote, as the build wrote it: the paths in it are the ones
+/// the build compiled into the bridge, which a package that has been moved still states. The
 /// bridge's own hello says the same things from inside the running shell, and the two are compared:
 /// a declaration that does not match the package this worker started describes a different reader,
 /// whatever else it proved.
@@ -501,14 +502,14 @@ impl PackageDeclaration {
     pub fn disagreement(&self, declared: &ShellIdentity) -> Option<String> {
         if declared.kind != self.kind {
             return Some(format!(
-                "it says it is {} and this session launched {}",
+                "it says it is {} and the package is {}",
                 declared.kind.as_str(),
                 self.kind.as_str()
             ));
         }
         if declared.executable != self.executable {
             return Some(format!(
-                "it names {} and this session launched {}",
+                "it names {} and the package states {}",
                 declared.executable, self.executable
             ));
         }

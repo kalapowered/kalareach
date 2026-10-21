@@ -22,7 +22,7 @@ mod shellpkg;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::RwLock;
+use std::sync::{PoisonError, RwLock};
 use std::time::Duration;
 
 use kr_shell_integration::contract::qualification::ShellKind;
@@ -30,7 +30,9 @@ use shellpkg::Package;
 use shellpkg::{CaseSetup, Session, StackIndex, cases};
 
 /// Who is using the packages where they were built. A case that puts the original out of the way
-/// takes it alone, so no other case of this file looks for a package that is not there.
+/// takes it alone, so no other case of this file looks for a package that is not there. The lock
+/// guards no data, so a case that panicked holding it leaves nothing to distrust, and the next case
+/// takes it as it is and reports its own failure.
 static ORIGINALS: RwLock<()> = RwLock::new(());
 
 /// A package directory moved aside for the length of a case, and put back when it ends, however it
@@ -124,7 +126,7 @@ fi
 #[test]
 #[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
 fn the_package_where_it_was_built_finds_its_own_modules() {
-    let _using = ORIGINALS.read().expect("no case panicked holding the lock");
+    let _using = ORIGINALS.read().unwrap_or_else(PoisonError::into_inner);
     let package = Package::built(ShellKind::Zsh);
     let root = package_root(&package);
     let told = run(&package.executable, None, SCRIPT);
@@ -141,7 +143,7 @@ fn the_package_where_it_was_built_finds_its_own_modules() {
 #[test]
 #[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
 fn a_moved_tree_loads_its_editor_and_modules_from_where_it_is() {
-    let _using = ORIGINALS.read().expect("no case panicked holding the lock");
+    let _using = ORIGINALS.read().unwrap_or_else(PoisonError::into_inner);
     let package = Package::built(ShellKind::Zsh);
     let original = package_root(&package);
     let holder = tempfile::Builder::new()
@@ -253,9 +255,7 @@ fn plain(case_id: &str) -> shellpkg::QualificationCase {
 /// what it was built as; the two agree wherever the package sits, so the handshake accepts the
 /// moved copy as it accepts the original, and the copy depends on nothing the original holds.
 fn a_moved_package_starts_a_managed_session(kind: ShellKind, case_id: &str) {
-    let _alone = ORIGINALS
-        .write()
-        .expect("no case panicked holding the lock");
+    let _alone = ORIGINALS.write().unwrap_or_else(PoisonError::into_inner);
     let package = Package::built(kind);
     let index = StackIndex::read().expect("the corpus index is there");
     let case = plain(case_id);
@@ -304,7 +304,7 @@ fn a_moved_fish_package_starts_a_managed_session_where_it_is() {
 #[test]
 #[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
 fn a_moved_package_whose_record_is_another_build_is_refused() {
-    let _using = ORIGINALS.read().expect("no case panicked holding the lock");
+    let _using = ORIGINALS.read().unwrap_or_else(PoisonError::into_inner);
     let package = Package::built(ShellKind::Zsh);
     let index = StackIndex::read().expect("the corpus index is there");
     let case = plain("zsh-plain");
