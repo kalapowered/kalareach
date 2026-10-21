@@ -2079,6 +2079,10 @@ mod reservation {
             }
         }
 
+        fn excludes(&self) -> String {
+            "every writer the test coordinates".to_owned()
+        }
+
         fn release(&self) {
             self.authority.released.fetch_add(1, Ordering::SeqCst);
         }

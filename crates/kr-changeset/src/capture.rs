@@ -186,20 +186,27 @@ pub struct QuiescenceSubject {
     pub workspace_id: WorkspaceId,
     /// That working tree, by identity rather than by name.
     pub work_tree: ObjectIdentity,
+    /// The Git directory of the repository the working tree belongs to, by identity: the
+    /// references, the index's repository and the administration of every linked worktree live
+    /// there, so a hold on the tree that left it out would hold nothing of them still.
+    pub git_dir: ObjectIdentity,
 }
 
 /// Who holds a workspace still while a capture reads it.
 ///
-/// This is the seam this crate exposes and the workflow service owns: a capture is the
-/// only thing here that asks for a reservation, and nothing here can grant one. It is what
-/// [`SourceConsistency::QuiescedCapture`] rests on, so an implementer owes the capture the whole
-/// of this contract:
+/// This is the seam this crate exposes: a capture is the only thing here that asks for a
+/// reservation, and the host supplies who grants it ([`ProjectQuiescence`] is the one built from
+/// the project service). It is what [`SourceConsistency::QuiescedCapture`] rests on, so an
+/// implementer owes the capture the whole of this contract:
 ///
 /// * **Exclusion, continuously.** From the moment a grant is returned until it is released or its
 ///   bound passes, every writer the implementer coordinates is kept off the workspace: the working
-///   tree, the index and the repository's own references alike. An advisory lock only KalaReach
-///   respects does not exclude an editor outside it, and an implementer that cannot exclude one
-///   refuses instead of granting.
+///   tree, the index and the repository's own references alike. The implementer says which
+///   writers those are ([`QuiescenceLease::excludes`]), and the version the capture records
+///   repeats it. A lock only KalaReach respects does not exclude an editor or a program outside
+///   it, and nothing here claims it does: what the capture adds is its own comparison of the
+///   tree after the last reading, which turns a change it can see into the weaker class instead
+///   of a quiesced one.
 /// * **Now or not at all.** [`Self::reserve`] never waits. A workspace it cannot hold still at the
 ///   moment it is asked is [`None`], and the capture goes on as the weaker class it can actually
 ///   perform, or refuses when the caller required the stronger one.
@@ -240,8 +247,103 @@ pub trait QuiescenceLease: Send + Sync + std::fmt::Debug {
     /// Whether this grant has excluded every writer without interruption since it was granted.
     fn holding(&self) -> bool;
 
+    /// What this grant keeps off the workspace, in the implementer's own words: the writers it
+    /// coordinates. It is read once, when the grant is taken, and the version records it beside
+    /// the class.
+    fn excludes(&self) -> String;
+
     /// Gives the workspace back.
     fn release(&self);
+}
+
+/// The quiescence authority of the project service: it holds a host-made isolated workspace's
+/// repository still by keeping off it every writer this host coordinates.
+///
+/// A hold is granted only for an isolated, ready workspace the host made, whose recorded tree and
+/// Git directory are the ones the capture opened, and only when no writer of this host is at work
+/// in the repository and no live session this host started is in a tree it records for it. The
+/// user's own checkout is refused: the user's own tools write it. The reason for the last refusal
+/// is kept, so a node that required the class can say which applies.
+#[derive(Debug)]
+pub struct ProjectQuiescence<'a> {
+    project: &'a kr_project::ProjectService,
+    refused: std::sync::Mutex<Option<kr_project::holds::Refusal>>,
+}
+
+impl<'a> ProjectQuiescence<'a> {
+    /// An authority over the repositories `project` knows.
+    #[must_use]
+    pub const fn new(project: &'a kr_project::ProjectService) -> Self {
+        Self {
+            project,
+            refused: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Why the last reservation was refused, when one was.
+    #[must_use]
+    pub fn refusal(&self) -> Option<kr_project::holds::Refusal> {
+        self.refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl QuiescenceAuthority for ProjectQuiescence<'_> {
+    fn reserve(&self, subject: QuiescenceSubject) -> Result<Option<Box<dyn QuiescenceLease + '_>>> {
+        match self.project.hold_workspace(
+            subject.workspace_id,
+            subject.work_tree,
+            subject.git_dir,
+        )? {
+            Ok(hold) => Ok(Some(Box::new(ProjectLease { subject, hold }))),
+            Err(refusal) => {
+                *self
+                    .refused
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(refusal);
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// One repository held still by the project service.
+#[derive(Debug)]
+struct ProjectLease {
+    subject: QuiescenceSubject,
+    hold: kr_project::holds::Hold,
+}
+
+impl QuiescenceLease for ProjectLease {
+    fn subject(&self) -> QuiescenceSubject {
+        self.subject
+    }
+
+    fn grant_id(&self) -> u128 {
+        self.hold.grant_id()
+    }
+
+    fn bound(&self) -> std::time::Instant {
+        self.hold.bound()
+    }
+
+    fn holding(&self) -> bool {
+        self.hold.holding()
+    }
+
+    fn excludes(&self) -> String {
+        "no diff apply, workspace creation or removal, project creation, staging cleanup or \
+         agent-tool installation of this host ran against this working tree or any tree this \
+         host records for its repository, and no session this host started in a directory of \
+         those trees was alive (a session is counted by the directory it started in)"
+            .to_owned()
+    }
+
+    fn release(&self) {
+        self.hold.release();
+    }
 }
 
 /// The grant one capture holds, released however that capture ends.
@@ -253,6 +355,8 @@ struct Granted<'a> {
     /// The deadline the grant was taken under, read once so a lease that moves its own bound
     /// forward cannot extend what this capture relies on.
     bound: std::time::Instant,
+    /// What the grant said it keeps off the workspace, read once with the rest.
+    excludes: String,
 }
 
 impl Drop for Granted<'_> {
@@ -438,6 +542,7 @@ pub fn capture(
         let subject = QuiescenceSubject {
             workspace_id: quiescence.workspace_id,
             work_tree: repository.identity().work_tree,
+            git_dir: repository.identity().git_dir,
         };
         match quiescence.authority.reserve(subject)? {
             Some(lease) => {
@@ -462,6 +567,7 @@ pub fn capture(
                 granted = Some(Granted {
                     grant_id: lease.grant_id(),
                     bound: lease.bound(),
+                    excludes: lease.excludes(),
                     lease,
                 });
                 reservation = Reservation::Held;
@@ -506,6 +612,7 @@ pub fn capture(
         };
         let planned = plan(&before, request);
         let mut rewritten = false;
+        let mut witnesses = Vec::new();
         let read = read_content(
             profile,
             repository,
@@ -513,6 +620,7 @@ pub fn capture(
             &planned,
             request,
             &mut rewritten,
+            &mut witnesses,
         );
         // A file that was written while this host read it and whose next attempt read it whole.
         // The content is a complete reading, so the capture carries on; what it cannot be is a
@@ -567,13 +675,33 @@ pub fn capture(
             }
             return Err(changed(&last_change));
         }
+        // The Git state is the same before and after, which says nothing about a file that was
+        // already modified and was written again after this host read it, while it read another.
+        // Each file read from the working tree is looked at once more, now that every reading is
+        // done, and a file that is not the one that was read is this host's own evidence that the
+        // reservation did not keep every writer off.
+        if reservation == Reservation::Held
+            && let Some(difference) = witnessed_change(repository, &witnesses)
+        {
+            last_change = format!("{difference} after this host had read it");
+            reservation.changed_underneath();
+            if required_quiesced {
+                return Err(required_quiescence_refused(CHANGED));
+            }
+        }
         let quiet_after = quiet()?;
         reservation.still_holding(granted.as_ref());
         if reservation == Reservation::Lapsed && required_quiesced {
             return Err(required_quiescence_refused(LAPSED));
         }
-        let (consistency, consistency_detail) =
-            classify(request, reservation, quiet_before && quiet_after);
+        let (consistency, consistency_detail) = classify(
+            request,
+            reservation,
+            quiet_before && quiet_after,
+            granted
+                .as_ref()
+                .map_or("", |granted| granted.excludes.as_str()),
+        );
         if let Some(required) = request.required_consistency
             && !consistency.satisfies(required)
         {
@@ -2966,6 +3094,7 @@ fn read_content(
     planned: &BTreeMap<String, Plan>,
     request: Scope<'_>,
     rewritten: &mut bool,
+    witnesses: &mut Vec<(String, Witness)>,
 ) -> Result<Manifest> {
     // Every read of a Git object counts, whichever plan asks for it: a deletion reads the base's
     // own blob so the version can restore it, exactly as a path the policy takes from the commit
@@ -3061,6 +3190,9 @@ fn read_content(
             } => {
                 let reading = read_working_tree(repository, path)?;
                 *rewritten |= reading.changed_while_reading;
+                if let Some(witness) = reading.witness {
+                    witnesses.push((path.clone(), witness));
+                }
                 match reading.read {
                     // The status said the path was there and it is not any more. That is a deletion
                     // the working tree holds, recorded with whatever the base has for it.
@@ -3183,6 +3315,86 @@ pub struct WorkingReading {
     /// that would otherwise call its source a quiesced one has to know that its own reading
     /// contradicts the reservation.
     pub changed_while_reading: bool,
+    /// What the file or its absence was when this host last looked, to be compared with a second
+    /// look when every reading is done. Nothing for a path this host could not read.
+    pub witness: Option<Witness>,
+}
+
+/// What a path of the working tree was when this host read it: the file's identity, length and
+/// instants, or its absence.
+///
+/// A second look after the last reading compares it with the path as it is then. It sees a path
+/// that was replaced, resized, written or removed; it does not see an overwrite that leaves the
+/// identity, the length and both instants as they were.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Witness {
+    /// The path was a file with this identity and length, last written at this instant and last
+    /// changed at this one where the platform says so.
+    File {
+        /// The file's identity.
+        identity: ObjectIdentity,
+        /// Its length in bytes.
+        length: u64,
+        /// When it was last written.
+        written: Option<cap_std::time::SystemTime>,
+        /// When its inode last changed, in seconds and nanoseconds, where the platform says.
+        changed: Option<(i64, i64)>,
+    },
+    /// The path was not there.
+    Absent,
+}
+
+/// Returns when a file's inode last changed, where the platform says.
+#[cfg(unix)]
+fn changed_at(file: &kr_transfer::AuthorisedFile) -> Option<(i64, i64)> {
+    use cap_std::fs::MetadataExt as _;
+    file.handle()
+        .metadata()
+        .ok()
+        .map(|metadata| (metadata.ctime(), metadata.ctime_nsec()))
+}
+
+/// Returns nothing: this platform does not say when an inode last changed.
+#[cfg(not(unix))]
+fn changed_at(_file: &kr_transfer::AuthorisedFile) -> Option<(i64, i64)> {
+    None
+}
+
+/// Takes a file's witness through the handle it is open on.
+fn witness_of(file: &kr_transfer::AuthorisedFile) -> Witness {
+    Witness::File {
+        identity: file.identity(),
+        length: file.byte_len(),
+        written: modified_at(file),
+        changed: changed_at(file),
+    }
+}
+
+/// Looks at every witnessed path once more, and says how the first one that differs differs.
+///
+/// A path that cannot be opened is a difference, whatever the reason: this host cannot say the
+/// file is the one it read.
+fn witnessed_change(
+    repository: &OpenedRepository,
+    witnesses: &[(String, Witness)],
+) -> Option<String> {
+    let Ok(tree) = confined_tree(repository) else {
+        return Some("the working tree could not be opened again".to_owned());
+    };
+    for (path, was) in witnesses {
+        let Ok(name) = RelativeName::parse(path) else {
+            return Some(format!("{path} could not be named again"));
+        };
+        let now = match tree.open_read(&name, ObjectPolicy::ReadableFile) {
+            Ok(file) => witness_of(&file),
+            Err(kr_transfer::Escape::NotFound { .. }) => Witness::Absent,
+            Err(_) => return Some(format!("{path} could not be opened again")),
+        };
+        if &now != was {
+            return Some(format!("{path} was written, replaced or removed"));
+        }
+    }
+    None
 }
 
 /// What a test runs immediately after one path's content has been read and before this host reads
@@ -3232,6 +3444,8 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
                     .to_owned(),
             ),
             changed_while_reading: false,
+
+            witness: None,
         });
     };
     let tree = confined_tree(repository)?;
@@ -3243,6 +3457,7 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
                 return Ok(WorkingReading {
                     read: WorkingRead::Gone,
                     changed_while_reading,
+                    witness: Some(Witness::Absent),
                 });
             }
             Err(
@@ -3251,6 +3466,8 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
                 return Ok(WorkingReading {
                     read: WorkingRead::Unsupported(error.to_string()),
                     changed_while_reading,
+
+                    witness: None,
                 });
             }
             // A mount where this path was an ordinary file or directory when the capture looked.
@@ -3270,6 +3487,8 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
                 return Ok(WorkingReading {
                     read: WorkingRead::Unreadable(error.to_string()),
                     changed_while_reading,
+
+                    witness: None,
                 });
             }
         };
@@ -3294,6 +3513,8 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
             return Ok(WorkingReading {
                 read: WorkingRead::Unreadable(error.to_string()),
                 changed_while_reading,
+
+                witness: None,
             });
         }
         // The one window a test cannot reach from outside: both readings of this file's metadata
@@ -3324,6 +3545,8 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
                 return Ok(WorkingReading {
                     read: WorkingRead::Unreadable(error.to_string()),
                     changed_while_reading,
+
+                    witness: None,
                 });
             }
         };
@@ -3332,9 +3555,11 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
             && after_len == bytes.len() as u64
             && modified_at(&file) == before_written
         {
+            let witness = witness_of(&file);
             return Ok(WorkingReading {
                 read: WorkingRead::Content { bytes, executable },
                 changed_while_reading,
+                witness: Some(witness),
             });
         }
         // Whatever the next attempt reads, this file was written while this host was reading the
@@ -3718,15 +3943,21 @@ fn classify(
     request: Scope<'_>,
     reservation: Reservation,
     quiet: bool,
+    excludes: &str,
 ) -> (SourceConsistency, String) {
     match reservation {
         Reservation::Held => {
             return (
                 SourceConsistency::QuiescedCapture,
-                "a quiescence reservation over this working tree was granted before the first \
-                 reading and was still holding after the last one, so every file this host read \
-                 was read out of one tree that nothing was writing to"
-                    .to_owned(),
+                format!(
+                    "a quiescence reservation over this working tree was granted before the first \
+                     reading and was still holding after the last one. It kept off the tree what \
+                     its holder coordinates: {excludes}. It does not exclude an editor or a \
+                     program its holder does not coordinate. This host compared the repository's \
+                     state before and after the read, and each file's identity, length and \
+                     instants after the last reading, and saw no change; an overwrite that leaves \
+                     all of those as they were is not something it can see"
+                ),
             );
         }
         Reservation::Lapsed => {
@@ -4406,14 +4637,14 @@ mod tests {
             ..request(&policy, &granted)
         };
         for quiet in [true, false] {
-            let (class, detail) = classify(scope(&declared), Reservation::NotAsked, quiet);
+            let (class, detail) = classify(scope(&declared), Reservation::NotAsked, quiet, "");
             assert_eq!(class, SourceConsistency::PerFileCapture);
             assert!(
                 detail.contains("detection rather than one instant"),
                 "the detail says what it is: {detail}"
             );
         }
-        let (class, detail) = classify(scope(&declared), Reservation::NotAsked, true);
+        let (class, detail) = classify(scope(&declared), Reservation::NotAsked, true, "");
         assert_eq!(class, SourceConsistency::PerFileCapture);
         assert!(
             detail.contains("it does not make this a quiesced capture"),
@@ -4424,16 +4655,27 @@ mod tests {
             scope(&request(&policy, &granted)),
             Reservation::NotAsked,
             true,
+            "",
         );
         assert_eq!(class_without, SourceConsistency::PerFileCapture);
         assert!(!detail_without.contains("quiesced"));
 
         // A grant that held through every reading is the one case that assigns the class.
-        let (held, held_detail) = classify(scope(&declared), Reservation::Held, true);
+        let (held, held_detail) = classify(
+            scope(&declared),
+            Reservation::Held,
+            true,
+            "the writers it coordinates",
+        );
         assert_eq!(held, SourceConsistency::QuiescedCapture);
         assert!(
             held_detail.contains("still holding after the last one"),
             "the detail says what held it: {held_detail}"
+        );
+        assert!(
+            held_detail.contains("the writers it coordinates")
+                && held_detail.contains("does not exclude an editor"),
+            "and what it kept off and what it did not: {held_detail}"
         );
 
         // A grant that stopped holding, and a workspace nothing would hold, are both the weaker
@@ -4446,7 +4688,7 @@ mod tests {
             ),
             (Reservation::Refused, "could not be reserved"),
         ] {
-            let (class, detail) = classify(scope(&declared), state, true);
+            let (class, detail) = classify(scope(&declared), state, true, "");
             assert_eq!(class, SourceConsistency::PerFileCapture);
             assert!(detail.contains(says), "{state:?} says why: {detail}");
             assert!(detail.contains("concurrent-change detection"));

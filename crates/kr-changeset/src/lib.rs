@@ -13,7 +13,8 @@ pub mod store;
 pub mod version;
 
 pub use crate::capture::{
-    CaptureRequest, Quiescence, QuiescenceAuthority, QuiescenceLease, QuiescenceSubject,
+    CaptureRequest, ProjectQuiescence, Quiescence, QuiescenceAuthority, QuiescenceLease,
+    QuiescenceSubject,
 };
 pub use crate::error::{ChangeSetError, Result};
 pub use crate::service::ChangeSetService;

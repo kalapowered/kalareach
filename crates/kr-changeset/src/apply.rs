@@ -978,6 +978,19 @@ fn direct(
     if order.preflight_only {
         return Ok(clean_preflight(order, limitations));
     }
+    // From here the apply writes the destination, its index's repository and, on a failure, the
+    // records of it: a capture that is holding this repository still turns it away now, before the
+    // claim, so nothing is recorded for it and the same action asked again after the capture has
+    // finished is applied. The guard lasts until the apply has settled.
+    let _writing = service.project().writer_of_repository(
+        if order.revert {
+            "diff.revert"
+        } else {
+            "diff.apply"
+        },
+        &repository,
+        None,
+    )?;
     take_claim(service, order)?;
     let _ = manifest;
     // What each requested operation puts in the destination, decided before anything is written: a
