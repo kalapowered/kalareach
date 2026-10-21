@@ -1013,9 +1013,8 @@ mod tests {
 
         /// KR-REQ-07.31: the console launcher runs the command it is given and reports success
         /// once the launcher has accepted it. The command connects to a loopback listener the
-        /// test holds, which is what shows it ran, and nothing has connected before the console is
-        /// asked. What is shown is that the command given to the launcher ran, not that a window
-        /// was drawn: a hosted job has no desktop to look at.
+        /// test holds, which is what shows it ran. What is shown is that the command given to the
+        /// launcher ran, not that a window was drawn: a hosted job has no desktop to look at.
         #[test]
         fn the_console_launcher_runs_the_command_it_is_given() {
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a loopback port");

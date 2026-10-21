@@ -4629,8 +4629,8 @@ async fn device_preview_key_update_via_controller() {
     );
 
     // Another device that is paired and live, with a key of its own at revision 1. The first
-    // device's channel is not its channel: asking, with a revision that would follow, to rotate
-    // its key is refused, and its record is left as it was.
+    // device, as the actor, asking with a revision that would follow to rotate that device's key
+    // is refused, and the other device's record is left as it was.
     let other_device_id = DeviceId::new(uuid(77));
     let other_key = kr_crypto::keys::NotificationPreviewKeyPair::generate().unwrap();
     controller
