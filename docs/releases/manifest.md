@@ -165,3 +165,44 @@ the signatures against the root, then every file against the manifest.
 `kr-release dev-keys --out DIR` makes a root and the keys for it. A run that proves the pipeline
 signs with those and throws them away with the run; the channel's own keys are in hardware and on
 offline media, never in a tree, an archive or a repository.
+
+## Publishing
+
+A `host/v<version>+<commit>` tag starts two workflows: `release-tree.yml` for the four macOS and Linux
+targets and `release-windows.yml` for the two Windows targets. In each, one job builds the programs
+on a runner of the target's own kind, assembles the tree, signs its manifest with keys of its own,
+packs it and holds the archive to what a host stages. It reads no secret and uses no environment,
+and the archive it keeps says in its name that it is not a release. A second job signs for release
+behind the `release-signing` environment: the platform's own signature first (Developer ID and
+notarisation on macOS, Authenticode on Windows), then the manifest again, since the first changed the
+files, with the channel's release keys. It runs for a tag and the default branch only.
+
+The channel's release keys do not exist yet. They are made at a key ceremony and held in hardware
+and on offline media, and no mechanism of this repository gives a run one. So the job that signs
+stops at that step on every platform, with the same refusal, and **tagging a host release does not
+publish one until the ceremony has been held.** The ceremony belongs to the project owner. A release
+that has been published is never changed: a correction is a new commit under its own tag.
+
+## Package managers
+
+`scripts/package-managers.py render` writes a Homebrew cask for macOS, a Homebrew formula for Linux
+and a winget portable manifest for Windows from the archives of one release. Each file carries the
+address of the archive it installs and the archive's SHA-256, which the script reads from the archive
+and never takes from a person. A family renders only when both of its architectures are given.
+
+None of them runs anything after it unpacks the release: Homebrew's `post_install` runs sandboxed,
+and a winget portable package has no hook. The `kr` that a package manager puts on the search path
+admits its own release instead. Its first command checks the release against the channel's root as
+`kr host install` does, puts it in the user's store of releases, and runs as the store's copy, so the
+daemon, the workers and the helpers never run from the package manager's directory. When another
+release is current, the first command hands the new one to the current release's `kr` as an update,
+which switches to it or waits for a live worker as any update does, and the command goes on with
+the release that is current. The store's record names the package manager as the installer, which owns
+which release is current, and the host's own update channel stays off for it. Removing the package
+removes the package manager's directory and never touches `versions/`.
+
+`scripts/check-homebrew-install.sh` installs a release with Homebrew itself from a tap of the run's
+own, upgrades it to the next release and removes it, and holds each of those to what the store says.
+The tree job runs it on the macOS and Linux runners, and a Homebrew in a directory of its own runs it
+on a machine that has none to spare. Opening a tap repository and submitting to winget's community
+repository are the project owner's to do.
