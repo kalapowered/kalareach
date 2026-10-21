@@ -936,9 +936,10 @@ beside the class. It does not promise that an editor or a program outside the im
 was kept off, and the version says that too. What stands between such a writer and a version
 recorded as quiesced is the capture's own comparison: after the last reading, with a reservation
 held, it opens every path it read from the working tree once more and compares each file's
-identity, length and instants (on Linux and macOS the instant the file's metadata last changed is among them, so a change of mode or owner during the read counts) with what it saw, and a difference makes the capture the per-file
-class with the contradiction recorded. That comparison sees what Git's state and those instants
-show. An overwrite that leaves all of them as they were is not something it can see.
+identity, length and instants with what it saw. A difference makes the capture the per-file class,
+with the contradiction recorded. On Linux and macOS the instants include when the file's metadata
+last changed, so a change of mode or owner during the read counts. The comparison sees what Git's
+state and those instants show; an overwrite that leaves all of them as they were is invisible to it.
 
 ### What holds a workspace still, and what it turns away
 
@@ -950,9 +951,10 @@ repository and no live session this host started is in a tree it records for it.
 is first granted over the working tree and its Git directory, and the other trees the host records
 for the repository are read and added once it stands, so a worktree being made at that moment
 either turns the reservation away as a writer at work or is counted. A tree adopted after the
-grant is not covered. It never waits: a workspace it cannot hold at that moment is captured as the per-file class, or the
-capture is refused when it required the quiesced one, and the refusal says which of these applies.
-A reservation ends at its bound, five minutes, whatever its holder does.
+grant is not covered. The reservation never waits: a workspace it cannot hold at that moment is
+captured as the per-file class, or the capture is refused when it required the quiesced one, and
+the refusal says which of these applies. A reservation ends at its bound, five minutes, whatever
+its holder does.
 
 While a reservation stands the host's own writers of that repository are turned away with
 `RESOURCE_UNAVAILABLE`, before they have written anything:
@@ -983,9 +985,9 @@ a terminal opened before the host knew its repository still counts. A session wi
 starts at the root and counts nowhere; one whose directory is not an absolute path, or whose
 request the daemon could not read after a restart, counts against every reservation.
 
-A session counts until its closure is recorded, with these exceptions, each of which waits for the
-kernel to say that the worker's process has ended. The host asks for sixty seconds; a worker still
-running after that counts until the daemon restarts.
+A session counts until its closure is recorded. Three cases end differently. In the first two the
+host waits for the kernel to say that the worker's process has ended; it asks for sixty seconds,
+and a worker still running after that counts until the daemon restarts.
 
 * A create that did not come to a session. A launch no worker claimed, or whose claim the host
   refused, started no session, so it stops counting when its worker's process ends. A worker that

@@ -621,5 +621,6 @@ work cannot be waited for. While the capture reads, a session, `diff.apply`, a w
 operation or an agent-tool installation or removal that would write the repository is turned
 away with `RESOURCE_UNAVAILABLE` and is not retried by the host; `docs/project/README.md` lists
 them and what a reservation does not see. A node that meets that refusal while it starts a
-session fails like any node whose session cannot start. An atomic snapshot, which reads the base commit's own Git
-objects rather than the working tree, is a point-in-time capture and needs no reservation.
+session fails like any node whose session cannot start. An atomic snapshot, which reads the base
+commit's own Git objects rather than the working tree, is a point-in-time capture and needs no
+reservation.
