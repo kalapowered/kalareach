@@ -65,7 +65,13 @@ function host(over: Partial<RevocationHost> = {}): RevocationHost {
 }
 
 function view(hosts: readonly RevocationHost[], over: Partial<RevocationView> = {}): RevocationView {
-  return { ceremony: 'touch_id', feed_origin: 'reach.kala.to', hosts, ...over }
+  return {
+    ceremony: 'touch_id',
+    feed_origin: 'reach.kala.to',
+    mailbox: { last_read_ms: Date.UTC(2026, 9, 18, 9, 32), announcements: 0, stopped: null },
+    hosts,
+    ...over
+  }
 }
 
 function screenOf(opened: RevocationView) {
@@ -431,6 +437,29 @@ describe('revoking a device', () => {
       'has not been able to read it since'
     )
     expect(screen.getByText(/the-attic is not answering/)).toBeVisible()
+  })
+})
+
+describe('reading the mailbox where hosts announce', () => {
+  it('says nothing while the mailbox is read, and says what a stop leaves standing when it is not', async () => {
+    const { controls } = screenOf(view([host()]))
+    await rowOf('the-phone')
+    expect(screen.queryByTestId('devices-mailbox')).not.toBeInTheDocument()
+
+    act(() => {
+      controls.revocation.change(
+        view([host()], { mailbox: { last_read_ms: null, announcements: 0, stopped: 'unreachable' } })
+      )
+    })
+    await userEvent.setup().click(screen.getByTestId('devices-refresh'))
+    const line = await screen.findByTestId('devices-mailbox')
+    expect(line).toHaveTextContent('could not read its mailbox')
+    // The line says what a person needs next: the answers to revocations are read from each feed.
+    expect(line).toHaveTextContent('still read from each feed')
+    // It is said once, in the live region, when the stop begins.
+    await waitFor(() => {
+      expect(screen.getByTestId('devices-heard')).toHaveTextContent('could not read its mailbox')
+    })
   })
 })
 

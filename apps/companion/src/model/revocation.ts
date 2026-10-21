@@ -10,6 +10,7 @@
 
 import type {
   CeremonyKind,
+  MailboxView,
   RevocationDevice,
   RevocationFeed,
   RevocationHost,
@@ -206,6 +207,31 @@ export function describeContact(host: RevocationHost, now: number = Date.now()):
   }
 }
 
+/**
+ * What a stop of the mailbox means for the person, or null when it was read. A host's answer is read
+ * from its feed in any case, and the line says so, because a person who reads that announcements are
+ * not arriving would otherwise take it for revocations not arriving.
+ */
+export function describeMailbox(mailbox: MailboxView): string | null {
+  const still = 'Answers to revocations are still read from each feed.'
+  switch (mailbox.stopped) {
+    case null:
+      return null
+    case 'unreachable':
+      return `This computer could not read its mailbox, where a host says that its feed changed. ${still}`
+    case 'refused':
+      return `The sync service turned back this computer's request for its mailbox. Check the sync service setting. ${still}`
+    case 'waiting':
+      return `The sync service asked this computer to wait before it reads its mailbox again. ${still}`
+    case 'records':
+      return `This computer could not use the records it reads its mailbox with, so it reads none. ${still}`
+    case 'full':
+      return `This computer's record of the mailbox items it has taken is full, so it takes no more until the oldest are due to be forgotten. ${still}`
+    default:
+      return null
+  }
+}
+
 /** What the feed says, as lines. Each stands alone, and the first is the one that matters most. */
 export function describeFeed(
   feed: RevocationFeed,
@@ -288,6 +314,8 @@ export function checkAgainName(device: RevocationDevice, host: RevocationHost): 
 export function announcements(before: RevocationView | null, after: RevocationView): readonly string[] {
   if (before === null) return []
   const said: string[] = []
+  const mailbox = describeMailbox(after.mailbox)
+  if (mailbox !== null && after.mailbox.stopped !== before.mailbox.stopped) said.push(mailbox)
   for (const host of after.hosts) {
     const earlier = before.hosts.find((each) => each.reference === host.reference)
     if (earlier === undefined) continue

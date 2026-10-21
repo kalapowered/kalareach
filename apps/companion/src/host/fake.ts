@@ -923,7 +923,12 @@ export function fakeHost(
   }
   const startedCodes: string[] = []
   let owner: OwnerView = { ceremony: 'touch_id', requests: [] }
-  let revocation: RevocationView = { ceremony: 'touch_id', feed_origin: 'reach.kala.to', hosts: [] }
+  let revocation: RevocationView = {
+    ceremony: 'touch_id',
+    feed_origin: 'reach.kala.to',
+    mailbox: { last_read_ms: null, announcements: 0, stopped: null },
+    hosts: []
+  }
   const revocationAsked: string[] = []
   let revocationFailure: { readonly code: string; readonly message: string } | null = null
   let revocationHold: ((release: () => void) => void) | null = null

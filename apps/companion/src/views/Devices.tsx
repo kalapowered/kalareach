@@ -38,6 +38,7 @@ import {
   describeContact,
   describeDevice,
   describeFeed,
+  describeMailbox,
   describeRoute,
   describeStanding,
   revokeLabel,
@@ -224,6 +225,11 @@ export function Devices(): ReactNode {
       ) : null}
       {view !== null && view.ceremony === 'none' ? (
         <Banner tone="accent" title="This computer cannot confirm" detail={CANNOT_CONFIRM} />
+      ) : null}
+      {view !== null && describeMailbox(view.mailbox) !== null ? (
+        <p className="account-note" data-testid="devices-mailbox">
+          {describeMailbox(view.mailbox)}
+        </p>
       ) : null}
       <div className="visually-hidden" aria-live="polite" data-testid="devices-heard">
         {heard}

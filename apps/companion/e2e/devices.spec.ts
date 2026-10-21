@@ -42,6 +42,7 @@ const device = (reference: string, name: string, standing: object, over: object 
 const EVERYTHING = {
   ceremony: 'touch_id',
   feed_origin: 'a-sync-service-with-a-long-name.example.org:8443',
+  mailbox: { last_read_ms: AT, announcements: 0, stopped: null },
   hosts: [
     {
       reference: 'studio',

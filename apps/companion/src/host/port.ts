@@ -769,12 +769,30 @@ export interface RevocationHost {
   readonly feed: RevocationFeed | null
 }
 
+/** Why this computer's reading of its own mailbox stopped before it read the mailbox through. */
+export type MailboxStop = 'unreachable' | 'refused' | 'waiting' | 'records' | 'full'
+
+/**
+ * This computer's reading of its own mailbox, where a host says that its feed changed. A host's
+ * acknowledgement is read from its feed whatever the mailbox does, so a stop here costs no answer
+ * to a revocation.
+ */
+export interface MailboxView {
+  /** When the mailbox was last read through, in UTC milliseconds; null before the first time. */
+  readonly last_read_ms: number | null
+  /** How many announcements from the hosts this computer is paired with it has taken. */
+  readonly announcements: number
+  /** Why the last reading stopped before it read the mailbox through; null when it did not. */
+  readonly stopped: MailboxStop | null
+}
+
 /** Every host this computer can revoke devices on. */
 export interface RevocationView {
   /** The ceremony this computer offers, which names the revoke button. */
   readonly ceremony: CeremonyKind
   /** The service a request for a paired host is published at; null when there is none to publish at. */
   readonly feed_origin: string | null
+  readonly mailbox: MailboxView
   readonly hosts: readonly RevocationHost[]
 }
 
