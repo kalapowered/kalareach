@@ -14,6 +14,7 @@ import android.os.Looper
 import android.provider.Settings
 import android.util.Base64
 import android.util.Log
+import android.view.WindowManager
 import android.webkit.WebView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
@@ -56,6 +57,11 @@ class SessionArguments {
 @InvokeArg
 class AttemptArguments {
     lateinit var attempt: String
+}
+
+@InvokeArg
+class KeepAwakeArguments {
+    var on: Boolean = false
 }
 
 @InvokeArg
@@ -168,6 +174,24 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun scanPhoto(invoke: Invoke) {
         invoke.reject("this device offers no picker for a code")
+    }
+
+    /**
+     * Keeps the screen on while a value the person compares with another device's shows, and lets
+     * it sleep again afterwards.
+     */
+    @Command
+    fun keepAwake(invoke: Invoke) {
+        val arguments = invoke.parseArgs(KeepAwakeArguments::class.java)
+        activity.runOnUiThread {
+            val window = activity.window
+            if (arguments.on) {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            } else {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+            invoke.resolve(done())
+        }
     }
 
     /** Opens this application's own page in the system's settings, where the camera is allowed. */

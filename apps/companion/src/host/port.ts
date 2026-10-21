@@ -1803,6 +1803,11 @@ export interface HostPort {
   pairingScanPhoto(): Promise<IntakeView>
   /** Opens this application's page in the system's settings, where the camera is allowed. */
   pairingOpenSettings(): Promise<void>
+  /**
+   * Keeps a phone's screen on while the value to compare with the host's shows, and lets it sleep
+   * again when the value goes. A computer has nothing to keep on.
+   */
+  pairingKeepAwake(on: boolean): Promise<void>
   /** Starts pairing with the invitation read from the pasteboard. */
   pairingStartRead(): Promise<void>
   /** Ends the attempt on this computer, or drops a pasted invitation. */

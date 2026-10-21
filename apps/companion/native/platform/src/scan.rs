@@ -128,6 +128,32 @@ pub async fn open_settings<R: Runtime>(app: &AppHandle<R>) -> Result<(), Platfor
     }
 }
 
+/// Keeps the screen on while `on` is true, which is while a value the person compares with another
+/// device's shows, and lets it sleep again when it is false. A desktop has nothing to keep on.
+///
+/// # Errors
+///
+/// Returns an error when the platform cannot do it.
+pub async fn keep_awake<R: Runtime>(app: &AppHandle<R>, on: bool) -> Result<(), PlatformError> {
+    #[cfg(mobile)]
+    {
+        use tauri::Manager as _;
+
+        #[derive(Serialize)]
+        struct Awake {
+            on: bool,
+        }
+        let platform = app.state::<crate::Platform<R>>();
+        let _: serde_json::Value = platform.call("keepAwake", Awake { on }).await?;
+        Ok(())
+    }
+    #[cfg(not(mobile))]
+    {
+        let _ = (app, on);
+        Ok(())
+    }
+}
+
 #[cfg(mobile)]
 async fn ask<R: Runtime>(app: &AppHandle<R>, method: &str) -> Result<Scan, PlatformError> {
     use tauri::Manager as _;

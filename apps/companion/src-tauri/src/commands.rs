@@ -157,6 +157,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("pairing_scan", None),
     ("pairing_scan_photo", None),
     ("pairing_open_settings", None),
+    ("pairing_keep_awake", None),
     ("pairing_start_read", None),
     ("pairing_stop", None),
     // The owner's confirmations of this computer's hosts.
@@ -567,6 +568,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         pairing_scan,
         pairing_scan_photo,
         pairing_open_settings,
+        pairing_keep_awake,
         pairing_start_read,
         pairing_stop,
         owner_confirmations,
@@ -2349,6 +2351,18 @@ pub async fn pairing_open_settings<R: tauri::Runtime>(app: tauri::AppHandle<R>) 
         .map_err(|error| CommandError::local_failure(error.to_string()))
 }
 
+/// Keeps a phone's screen on while the value to compare with the host's shows, and lets it sleep
+/// again when the value goes. It changes nothing else.
+#[tauri::command]
+pub async fn pairing_keep_awake<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    on: bool,
+) -> Result<()> {
+    companion_platform::scan::keep_awake(&app, on)
+        .await
+        .map_err(|error| CommandError::local_failure(error.to_string()))
+}
+
 async fn take_in(
     state: &State<'_, AppState>,
     source: pairing::Source,
@@ -3432,6 +3446,7 @@ mod tests {
         "pairing_scan",
         "pairing_scan_photo",
         "pairing_open_settings",
+        "pairing_keep_awake",
         "pairing_start_read",
         "pairing_stop",
         "owner_confirmations",
@@ -3576,6 +3591,7 @@ mod tests {
                 "pairing_scan",
                 "pairing_scan_photo",
                 "pairing_open_settings",
+                "pairing_keep_awake",
                 "pairing_start_read",
                 "pairing_stop",
                 "owner_confirmations",

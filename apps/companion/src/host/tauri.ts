@@ -372,6 +372,7 @@ export function tauriPort(): HostPort {
     pairingScan: () => call<IntakeView>('pairing_scan', {}),
     pairingScanPhoto: () => call<IntakeView>('pairing_scan_photo', {}),
     pairingOpenSettings: () => call<undefined>('pairing_open_settings', {}),
+    pairingKeepAwake: (on) => call<undefined>('pairing_keep_awake', { on }),
     pairingStartRead: () => call<undefined>('pairing_start_read', {}),
     pairingStop: () => call<undefined>('pairing_stop', {}),
     onPairing: (listener) => listening<PairingView | PairingUnavailable>(PAIRING_EVENT, listener),
