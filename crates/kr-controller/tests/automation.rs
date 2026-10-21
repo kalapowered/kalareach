@@ -6416,10 +6416,11 @@ async fn a_capture_of_a_workspace_the_host_made_records_a_quiesced_version() {
     host.clients.abort();
 }
 
-/// KR-REQ-14.32 and KR-REQ-25.20: a person's session that started in the project's own checkout,
-/// which no workspace was selected on at that time, is a writer of its repository for as long as
-/// it lives, so a workflow capture that requires the quiesced class of a worktree of it fails
-/// and says a live session is why, and succeeds once the session has closed.
+/// KR-REQ-14.32 and KR-REQ-25.20: a person's session that started in the project's own checkout
+/// is a writer of its repository for as long as it lives, so a workflow capture that requires the
+/// quiesced class of a worktree of it fails and says a live session is why, and succeeds once the
+/// session has closed. (That a session counts in a tree the host recorded only after the session
+/// began is the project service's case, in kr-project's `tests/holds.rs`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_live_session_in_the_projects_own_checkout_stops_a_quiesced_capture_until_it_closes() {
     let host = working_host().await;
@@ -6654,6 +6655,53 @@ async fn a_restarted_daemon_counts_a_session_with_no_readable_request_against_ev
             .expect("the records read")
             .is_ok(),
         "and not once it has closed"
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-14.32: a session whose worker ended while no daemon ran is closed by the daemon that
+/// starts and is not counted as a writer, so a hold on a tree of its repository is granted at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_daemon_does_not_count_a_session_that_ended_while_it_was_down() {
+    let (host, apart) = working_host_apart().await;
+    let mut control = client(&host).await;
+    let (project, _checkout) =
+        adopted_project(&mut control, host.environment_id, host.work()).await;
+    let tree = worktree_of(
+        &mut control,
+        host.environment_id,
+        project,
+        host.work(),
+        "tree",
+    )
+    .await;
+    let _created = session_in(&mut control, &host, &host.work().join("source")).await;
+    drop(control);
+    host.clients.abort();
+
+    let host = restarted_after(host, apart, |environment| {
+        let registry = rusqlite::Connection::open(environment.registry_database())
+            .expect("the registry opens while no daemon runs");
+        let worker: i64 = registry
+            .query_row("SELECT pid FROM reservations", [], |row| row.get(0))
+            .expect("the one session's worker was recorded");
+        let worker = rustix::process::Pid::from_raw(i32::try_from(worker).expect("a process"))
+            .expect("a process number");
+        rustix::process::kill_process(worker, rustix::process::Signal::KILL)
+            .expect("the worker this test started is ended");
+    })
+    .await;
+    let service = Arc::clone(host.controller.project().service());
+    let opened = service
+        .open_workspace_repository(tree)
+        .expect("the worktree opens")
+        .identity();
+    assert!(
+        service
+            .hold_workspace(tree, opened.work_tree, opened.git_dir)
+            .expect("the records read")
+            .is_ok(),
+        "the session ended while no daemon ran, and nothing of it is alive"
     );
     host.clients.abort();
 }
