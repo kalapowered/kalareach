@@ -998,57 +998,75 @@ mod tests {
     }
 
     /// The shell has the terminal and nothing else of the worker's descriptors: one the worker
-    /// holds open, with nothing to close it on exec, is not open in the shell. The control is the
-    /// terminal itself, which is.
+    /// holds open, with nothing to close it on exec, is not open in the shell, whether it was open
+    /// low in the table, far up it, or is opened while the start is being admitted, above all the
+    /// others. The shell lists what it has open, and the control is the terminal itself, which is.
     #[cfg(unix)]
     #[test]
     fn the_shell_inherits_no_descriptor_of_the_workers() {
         use std::os::fd::AsRawFd as _;
 
         let held = std::fs::File::open("/").expect("a descriptor of the worker's");
-        rustix::io::fcntl_setfd(&held, rustix::io::FdFlags::empty()).expect("left open on exec");
-        let number = held.as_raw_fd();
-        // And one far up the table, past what a fixed number of descriptors would have covered
-        // where the limit lets the worker have one: the soft limit is raised toward the hard one
-        // for it.
-        let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
-        let wanted = 70_100_u64.min(limit.maximum.unwrap_or(u64::MAX));
-        if limit.current.is_some_and(|current| current < wanted) {
-            let _ = rustix::process::setrlimit(
-                rustix::process::Resource::Nofile,
-                rustix::process::Rlimit {
-                    current: Some(wanted),
-                    maximum: limit.maximum,
-                },
-            );
-        }
-        let room = rustix::process::getrlimit(rustix::process::Resource::Nofile)
-            .current
-            .unwrap_or(u64::MAX);
-        let far_number = i32::try_from(room.saturating_sub(8).min(70_000)).expect("a number");
-        let far = rustix::io::fcntl_dupfd_cloexec(&held, far_number).expect("a descriptor far up");
-        rustix::io::fcntl_setfd(&far, rustix::io::FdFlags::empty()).expect("left open on exec");
-        let far_number = far.as_raw_fd();
+        // Numbers the shell and the program it lists with have none of their own at.
+        let low =
+            rustix::io::fcntl_dupfd_cloexec(&held, 100).expect("a descriptor low in the table");
+        rustix::io::fcntl_setfd(&low, rustix::io::FdFlags::empty()).expect("left open on exec");
+        let far = spawn::tests::descriptor_far_up(&held);
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let mut reader = pty.reader().expect("a reader");
-        let script = format!(
-            "[ -e /dev/fd/1 ] && printf '[terminal]'; [ -e /dev/fd/{number} ] && printf '[leaked]'; \
-             [ -e /dev/fd/{far_number} ] && printf '[leaked-far]'; printf '[done]'"
+        let command = crate::testing::posix_script(
+            "printf '[terminal:'; [ -e /dev/fd/1 ] && printf yes; printf ']'; \
+             printf '[open:'; ls /dev/fd | tr '\\n' ' '; printf '][done]'",
         );
+        // Opened by the admission, which is after the descriptors were read, and above them all.
+        let late = std::cell::RefCell::new(None);
         let mut shell = pty
-            .launch(&crate::testing::posix_script(&script), |_| Ok(()))
+            .launch(&command, |_| {
+                // A good way above the others, which no fixed margin above the highest of them
+                // would reach, or just above them where the table ends soon after.
+                let opened = rustix::io::fcntl_dupfd_cloexec(&held, far.as_raw_fd() + 100)
+                    .or_else(|_| rustix::io::fcntl_dupfd_cloexec(&held, far.as_raw_fd() + 1))
+                    .expect("a descriptor above the others");
+                rustix::io::fcntl_setfd(&opened, rustix::io::FdFlags::empty())
+                    .expect("left open on exec");
+                *late.borrow_mut() = Some(opened);
+                Ok(())
+            })
             .expect("launches");
         let seen = read_until(&pty, &mut reader, b"[done]");
         shell.wait().expect("waits");
         let seen = String::from_utf8_lossy(&seen);
         assert!(
-            seen.contains("[terminal]"),
+            seen.contains("[terminal:yes]"),
             "the shell has the terminal: {seen:?}"
         );
+        let open: Vec<i32> = seen
+            .split("[open:")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("the shell listed what it has open")
+            .split_whitespace()
+            .filter_map(|number| number.parse().ok())
+            .collect();
         assert!(
-            !seen.contains("[leaked"),
-            "a descriptor of the worker's is open in the shell: {seen:?}"
+            !open.is_empty(),
+            "the shell listed its descriptors: {seen:?}"
         );
+        let late = late.borrow();
+        let workers = [
+            ("low", low.as_raw_fd()),
+            ("far", far.as_raw_fd()),
+            (
+                "opened by the admission",
+                late.as_ref().expect("opened").as_raw_fd(),
+            ),
+        ];
+        for (which, number) in workers {
+            assert!(
+                !open.contains(&number),
+                "the descriptor of the worker's that was {which}, {number}, is open in the shell: {open:?}"
+            );
+        }
     }
 
     #[test]

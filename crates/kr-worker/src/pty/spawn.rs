@@ -36,8 +36,8 @@ pub(super) struct Reads {
     /// there, as the terminal library started a shell in one it could not find. A directory that
     /// is there and cannot be entered is not replaced: the start fails with the reason.
     opened: std::io::Result<OwnedFd>,
-    /// The highest descriptor the worker has open, where the system lists them.
-    highest_descriptor: Option<libc::c_int>,
+    /// What bounds the descriptors the worker can have open.
+    descriptors: Descriptors,
 }
 
 impl Reads {
@@ -68,7 +68,7 @@ impl Reads {
         Self {
             named_is_there,
             opened,
-            highest_descriptor: highest_descriptor(),
+            descriptors: Descriptors::read(),
         }
     }
 
@@ -78,13 +78,68 @@ impl Reads {
     }
 }
 
-/// The highest descriptor this process has open, from the system's list of them.
-fn highest_descriptor() -> Option<libc::c_int> {
-    std::fs::read_dir("/dev/fd")
-        .ok()?
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
-        .max()
+/// What bounds the descriptors the worker has open, read with the directory so that nothing is
+/// asked of the system between the admission of the start and the process.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Descriptors {
+    /// One past the highest descriptor the system lists as open, or zero where it lists none.
+    listed_end: libc::c_int,
+    /// One past the highest number the system gives any descriptor.
+    table_end: libc::c_int,
+}
+
+impl Descriptors {
+    fn read() -> Self {
+        Self {
+            listed_end: std::fs::read_dir("/dev/fd")
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| {
+                    entry
+                        .ok()?
+                        .file_name()
+                        .to_str()?
+                        .parse::<libc::c_int>()
+                        .ok()
+                })
+                .max()
+                .map_or(0, |highest| highest.saturating_add(1)),
+            table_end: table_end(),
+        }
+    }
+}
+
+/// One past the highest number the system gives any descriptor of a process.
+///
+/// Apple systems refuse a descriptor at or above `kern.maxfilesperproc` whatever the soft limit
+/// says; the limit is read here, and the call that reads it is not one for the child.
+#[cfg(target_vendor = "apple")]
+fn table_end() -> libc::c_int {
+    let mut limit: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    // SAFETY: the name is a NUL-terminated string, and the value and its size are this function's
+    // own and outlive the call.
+    let read = unsafe {
+        libc::sysctlbyname(
+            c"kern.maxfilesperproc".as_ptr(),
+            (&raw mut limit).cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read == 0 && limit > 0 {
+        limit
+    } else {
+        libc::c_int::MAX
+    }
+}
+
+/// One past the highest number the system gives any descriptor of a process.
+#[cfg(not(target_vendor = "apple"))]
+const fn table_end() -> libc::c_int {
+    libc::c_int::MAX
 }
 
 /// Opens a directory for the one thing the start does with it, which is to enter it.
@@ -114,14 +169,18 @@ fn open_directory(path: &std::path::Path) -> std::io::Result<OwnedFd> {
 /// be open for a failed one to be reported.
 ///
 /// Linux marks them all in one call from kernel 5.11. Where it cannot, and on the other systems,
-/// the descriptors up to the highest one the worker was found to have open, and a few above it for
-/// any opened since, are marked one by one; where the system lists none, those below the soft
-/// limit on descriptors, and never more than [`MOST_WALKED`] of them. A descriptor that is not
-/// open is refused by the call, which is the only way it can fail, and there is nothing to be done
-/// about that in the child.
+/// every number is marked up to the highest of two: one past the highest descriptor that was
+/// listed open when the start was read, which covers what is open now whatever the limit has been
+/// lowered to since, and the soft limit on descriptors as the child finds it, which covers what
+/// was opened after that, because a descriptor is given a number below the soft limit in force. The
+/// system's own highest number bounds the second, and a soft limit that names no bound (and a
+/// system that listed no descriptors) is walked as far as [`MOST_WALKED`].
+///
+/// A descriptor that is not open is refused by the call, and that is no failure. Any other refusal
+/// is returned, so that a shell is not started with a descriptor that could not be marked.
 ///
 /// This allocates nothing and calls only system calls, as it has to between the fork and the run.
-fn mark_close_on_exec(highest_open: Option<libc::c_int>) {
+fn mark_close_on_exec(descriptors: Descriptors) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: the call takes no pointer, and marks descriptors of this process only.
@@ -134,44 +193,44 @@ fn mark_close_on_exec(highest_open: Option<libc::c_int>) {
             )
         };
         if marked == 0 {
-            return;
+            return Ok(());
         }
     }
-    let end = match highest_open {
-        Some(highest) => highest.saturating_add(OPENED_SINCE),
-        None => {
-            let mut limit = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            // SAFETY: `limit` is this function's own and outlives the call.
-            let known = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } == 0;
-            let walked = if known {
-                limit.rlim_cur.min(MOST_WALKED)
-            } else {
-                MOST_WALKED
-            };
-            libc::c_int::try_from(walked).unwrap_or(libc::c_int::MAX)
-        }
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
     };
-    mark_range_close_on_exec(3, end);
+    // SAFETY: `limit` is this function's own and outlives the call.
+    let known = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } == 0;
+    let soft_end = if known && limit.rlim_cur != libc::RLIM_INFINITY {
+        libc::c_int::try_from(limit.rlim_cur)
+            .unwrap_or(libc::c_int::MAX)
+            .min(descriptors.table_end)
+    } else if descriptors.listed_end > 0 {
+        0
+    } else {
+        libc::c_int::try_from(MOST_WALKED).unwrap_or(libc::c_int::MAX)
+    };
+    mark_range_close_on_exec(3, descriptors.listed_end.max(soft_end))
 }
 
-/// The most descriptors walked one by one where the system lists none.
+/// The most descriptors walked one by one where the soft limit names no bound and the system lists
+/// none.
 const MOST_WALKED: libc::rlim_t = 1 << 16;
 
-/// How many descriptors above the highest one found open are marked as well, for any opened
-/// between the finding and the fork.
-const OPENED_SINCE: libc::c_int = 64;
-
 /// Marks the descriptors from `from` up to, not including, `to` to close when the shell is run.
-fn mark_range_close_on_exec(from: libc::c_int, to: libc::c_int) {
+fn mark_range_close_on_exec(from: libc::c_int, to: libc::c_int) -> std::io::Result<()> {
     for descriptor in from..to {
         // SAFETY: the call takes no pointer; a descriptor that is not open is refused.
-        unsafe {
-            libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC);
+        let marked = unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) };
+        if marked == -1 {
+            let refusal = std::io::Error::last_os_error();
+            if refusal.raw_os_error() != Some(libc::EBADF) {
+                return Err(refusal);
+            }
         }
     }
+    Ok(())
 }
 
 /// Starts `command` on `terminal` in `directory`, as a session leader with the terminal for its
@@ -187,7 +246,7 @@ pub(super) fn start(
     command: &ShellCommand,
 ) -> std::io::Result<std::process::Child> {
     let directory = reads.opened?;
-    let highest_open = reads.highest_descriptor;
+    let descriptors = reads.descriptors;
     let mut process = std::process::Command::new(&command.program);
     process
         .args(&command.arguments)
@@ -229,64 +288,99 @@ pub(super) fn start(
             rustix::process::ioctl_tiocsctty(standard_input)?;
             // The directory that was opened, not a path to it.
             rustix::process::fchdir(&directory)?;
-            mark_close_on_exec(highest_open);
-            Ok(())
+            mark_close_on_exec(descriptors)
         });
     }
     process.spawn()
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
+    use std::os::fd::{AsRawFd, OwnedFd};
+
     use super::*;
 
+    /// A descriptor of the worker's as far up the table as the system lets one go, left open on
+    /// exec, and the number it has.
+    ///
+    /// Placed by asking for the first free number at or above a high one, which takes nothing
+    /// another case holds, and tried lower until the system accepts one: the highest number it
+    /// gives is below its own limit on descriptors, which is not always the soft limit.
+    pub(in crate::pty) fn descriptor_far_up(like: &std::fs::File) -> OwnedFd {
+        let mut wanted = 70_000;
+        loop {
+            match rustix::io::fcntl_dupfd_cloexec(like, wanted) {
+                Ok(placed) => {
+                    rustix::io::fcntl_setfd(&placed, rustix::io::FdFlags::empty())
+                        .expect("left open on exec");
+                    return placed;
+                }
+                Err(_) if wanted > 512 => wanted /= 2,
+                Err(error) => panic!("no descriptor could be placed far up the table: {error}"),
+            }
+        }
+    }
+
     /// The descriptors from the first to the last given are marked, and the ones past it are not,
-    /// whatever number they have: past what a fixed bound would have walked, where the limit
-    /// allows one.
+    /// whatever number they have.
     #[test]
     fn a_range_of_descriptors_is_marked_to_close_when_the_shell_is_run() {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-
-        let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
-        let room = limit
-            .current
-            .unwrap_or(1 << 20)
-            .min(limit.maximum.unwrap_or(1 << 20));
-        let first = libc::c_int::try_from((room.saturating_sub(8)).min(70_000)).expect("a number");
-        let held = std::fs::File::open("/").expect("a descriptor to place");
-        let placed: Vec<OwnedFd> = (first..first + 3)
-            .map(|number| {
-                // SAFETY: the number is one this case has chosen to use for a descriptor of its
-                // own, high enough that nothing else of this process holds it, and the descriptor
-                // it makes is owned from here on.
-                unsafe {
-                    assert_eq!(
-                        libc::dup2(held.as_raw_fd(), number),
-                        number,
-                        "a descriptor at {number}"
-                    );
-                    OwnedFd::from_raw_fd(number)
-                }
-            })
-            .collect();
+        let held = std::fs::File::open("/").expect("a descriptor to copy");
+        let first = descriptor_far_up(&held);
+        let placed = [
+            first,
+            rustix::io::fcntl_dupfd_cloexec(&held, 0).expect("another"),
+        ];
         for descriptor in &placed {
             rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::empty())
                 .expect("left open on exec");
         }
-        mark_range_close_on_exec(first, first + 2);
-        let marked = |index: usize| {
-            rustix::io::fcntl_getfd(&placed[index])
+        let (low, high) = (
+            placed.iter().map(AsRawFd::as_raw_fd).min().expect("two"),
+            placed.iter().map(AsRawFd::as_raw_fd).max().expect("two"),
+        );
+        mark_range_close_on_exec(low, high).expect("marks");
+        let marked = |descriptor: &OwnedFd| {
+            rustix::io::fcntl_getfd(descriptor)
                 .expect("flags")
                 .contains(rustix::io::FdFlags::CLOEXEC)
         };
-        assert!(marked(0) && marked(1), "the range is marked");
-        assert!(!marked(2), "and nothing past it");
+        let (below, at) = if placed[0].as_raw_fd() == low {
+            (&placed[0], &placed[1])
+        } else {
+            (&placed[1], &placed[0])
+        };
+        assert!(marked(below), "the range is marked");
+        assert!(!marked(at), "and nothing past it");
     }
 
-    /// The directory the shell is to start in is told apart from one that is there and cannot be
-    /// entered, and from one that is not there.
+    /// What the system lists as open is what bounds the walk, so a descriptor above the soft limit
+    /// as it is now, or far up the table, is among them.
+    #[test]
+    fn the_descriptors_the_system_lists_include_one_far_up_the_table() {
+        let held = std::fs::File::open("/").expect("a descriptor to copy");
+        let far = descriptor_far_up(&held);
+        let descriptors = Descriptors::read();
+        assert!(
+            descriptors.listed_end > far.as_raw_fd(),
+            "the listing ends at {}, below the descriptor at {}",
+            descriptors.listed_end,
+            far.as_raw_fd()
+        );
+        assert!(
+            descriptors.table_end > far.as_raw_fd(),
+            "the table ends at {}, below a descriptor the system gave, at {}",
+            descriptors.table_end,
+            far.as_raw_fd()
+        );
+    }
+
+    /// A missing directory falls back to the home directory the environment names, and a directory
+    /// that is there does not.
     #[test]
     fn a_missing_directory_falls_back_to_the_home_directory_and_one_that_is_there_does_not() {
+        use std::os::unix::fs::MetadataExt as _;
+
         let host = kr_ipc::testing::TempHost::create();
         let home = host.root().join("home");
         std::fs::create_dir(&home).expect("the home directory");
@@ -297,7 +391,14 @@ mod tests {
         command.cwd = host.root().join("not-there").display().to_string();
         let missing = Reads::read(&command);
         assert!(!missing.named_is_there());
-        assert!(missing.opened.is_ok(), "the home directory opens");
+        let opened = std::fs::File::from(missing.opened.expect("the home directory opens"));
+        let home = std::fs::metadata(&home).expect("the home directory is there");
+        let found = opened.metadata().expect("what was opened");
+        assert_eq!(
+            (found.dev(), found.ino()),
+            (home.dev(), home.ino()),
+            "it is the home directory the environment names that was opened"
+        );
         command.cwd = host.root().display().to_string();
         assert!(Reads::read(&command).named_is_there());
     }
