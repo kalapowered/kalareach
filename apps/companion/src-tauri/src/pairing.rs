@@ -186,19 +186,27 @@ pub async fn take_in(
             Some(text) => zeroize::Zeroizing::new(text),
             None => return nothing(FailureKind::NothingToPaste),
         },
-        Source::Camera | Source::Photo => match platform.read_code(source).await {
-            Ok(Scan::Text(text)) => text,
-            Ok(Scan::Cancelled) => return IntakeView::cancelled(),
-            Ok(Scan::NoCode) => return nothing(FailureKind::NoCodeFound),
-            Ok(Scan::CameraDenied) => return nothing(FailureKind::CameraDenied),
-            Err(error) => {
-                tracing::warn!(%error, ?source, "the platform could not read a code");
-                return nothing(match source {
-                    Source::Photo => FailureKind::NoCodeFound,
-                    Source::Camera | Source::Pasteboard => FailureKind::CameraDenied,
-                });
+        Source::Camera | Source::Photo => {
+            let read = platform.read_code(source).await;
+            // Whatever the reader answered, an intake that was overtaken while it waited says
+            // nothing: not a failure, not an alert, not a word on the page.
+            if !device.owns(intake) {
+                return IntakeView::cancelled();
             }
-        },
+            match read {
+                Ok(Scan::Text(text)) => text,
+                Ok(Scan::Cancelled) => return IntakeView::cancelled(),
+                Ok(Scan::NoCode) => return nothing(FailureKind::NoCodeFound),
+                Ok(Scan::CameraDenied) => return nothing(FailureKind::CameraDenied),
+                Err(error) => {
+                    tracing::warn!(%error, ?source, "the platform could not read a code");
+                    return nothing(match source {
+                        Source::Photo => FailureKind::NoCodeFound,
+                        Source::Camera | Source::Pasteboard => FailureKind::CameraDenied,
+                    });
+                }
+            }
+        }
     };
     let invitation = match device.read(&text) {
         Ok(invitation) => invitation,
@@ -211,10 +219,18 @@ pub async fn take_in(
         && code.names_another_origin
     {
         let configured = device.view().origin;
-        if !platform
+        let accepted = platform
             .use_another_service(&code.origin, &configured.origin)
-            .await
-        {
+            .await;
+        // An answer to the alert after a newer intake, a stop or an attempt came first is no
+        // answer to anything the person is looking at now.
+        if !device.owns(intake) {
+            return IntakeView {
+                cleared,
+                ..IntakeView::cancelled()
+            };
+        }
+        if !accepted {
             return IntakeView {
                 invitation: None,
                 failure: None,
