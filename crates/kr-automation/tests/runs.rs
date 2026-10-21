@@ -106,6 +106,9 @@ async fn topological_execution_respects_dependencies() {
     }
 }
 
+/// KR-REQ-19.04: a step that depends on an earlier result runs on that result: when the node it
+/// depends on fails, the node that wants its success is never run, and the node that wants its
+/// failure is.
 #[tokio::test]
 async fn edge_condition_branching_success_and_failure() {
     let store = Arc::new(WorkflowStore::in_memory().unwrap());
@@ -184,6 +187,8 @@ async fn edge_condition_branching_success_and_failure() {
     assert_eq!(r_fail.status, NodeStatus::Success); // ran on failure branch
 }
 
+/// KR-REQ-19.04: a step that depends on an earlier result does not go on while that result is not
+/// established: a node whose outcome nobody can establish pauses its dependants for review.
 #[tokio::test]
 async fn unknown_predecessor_outcome_pauses_dependants_for_review() {
     let store = Arc::new(WorkflowStore::in_memory().unwrap());
@@ -660,5 +665,82 @@ async fn a_pause_mid_run_stops_the_next_node() {
             .unwrap()
             .is_empty(),
         "a refused run leaves no record behind"
+    );
+}
+
+/// A runner that records the order in which its nodes were dispatched.
+#[derive(Default)]
+struct Recording {
+    order: std::sync::Mutex<Vec<String>>,
+}
+
+impl kr_automation::ActionRunner for Recording {
+    fn cancel(&self, _dispatch: &kr_automation::Dispatch<'_>) -> kr_automation::Cancellation {
+        kr_automation::Cancellation::Unsupported
+    }
+
+    fn execute(
+        &self,
+        dispatch: &kr_automation::Dispatch<'_>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = kr_automation::Result<ActionOutcome>> + Send>,
+    > {
+        self.order
+            .lock()
+            .expect("the record is not poisoned")
+            .push(dispatch.node.node_id.clone());
+        let kind = dispatch.node.action_kind;
+        Box::pin(async move {
+            Ok(ActionOutcome::Success {
+                output: kr_automation::stand_in_output(kind),
+            })
+        })
+    }
+}
+
+/// KR-REQ-19.04: causal ordering. A step that depends on an earlier result is dispatched after the
+/// node that produces it, whichever order the definition lists the two in.
+#[tokio::test]
+async fn a_node_listed_first_still_runs_after_the_node_it_depends_on() {
+    let store = Arc::new(WorkflowStore::in_memory().unwrap());
+    let runner = Arc::new(Recording::default());
+    let engine = WorkflowEngine::new(
+        store.clone(),
+        common::host(
+            runner.clone(),
+            authority(),
+            Arc::new(kr_automation::ManualClock::new(1000)),
+        ),
+    );
+
+    // The dependant is listed before the node it waits for.
+    let dependant = common::node("dependant", WorkflowActionKind::AttentionNotice);
+    let predecessor = common::node("predecessor", WorkflowActionKind::RunTests);
+    let def = create_workflow_definition(
+        test_wf_id(30),
+        1,
+        "listed-backwards",
+        test_grant_id(1),
+        vec![dependant, predecessor],
+        vec![WorkflowEdge {
+            from_node: "predecessor".to_owned(),
+            to_node: "dependant".to_owned(),
+            condition: EdgeCondition::Success,
+        }],
+    );
+    store.save_definition(&def, 1000).unwrap();
+
+    let run_id = test_run_id(30);
+    let causal_ctx = kr_automation::CausalContext::new_root();
+    store
+        .commit_trigger_and_run(run_id, &def, "evt-1", &causal_ctx, 1000)
+        .unwrap();
+    let status = engine.execute_run(run_id, &def, &causal_ctx).await.unwrap();
+
+    assert_eq!(status, WorkflowRunStatus::Completed);
+    assert_eq!(
+        *runner.order.lock().expect("the record is not poisoned"),
+        ["predecessor", "dependant"],
+        "the dependant was dispatched after the node it depends on"
     );
 }

@@ -966,13 +966,13 @@ fn a_refused_install_leaves_no_variable_in_the_journal() {
     }
 }
 
-/// KR-REQ-25.13: a workflow definition is a versioned JSON document. One read from its text, with
-/// an event trigger, a resource scope, typed action nodes, success and failure edges, deadlines and
-/// a grant reference, installs under the revision that both the request and the document name.
-/// Each later install takes a higher revision, and an installed revision never changes: a changed
-/// document under a number already installed, a lower number than the latest, and a request that
-/// names another revision than its document are each refused, and every installed revision reads
-/// back as it was installed.
+/// KR-REQ-25.13, KR-REQ-19.04, KR-REQ-23.52: a workflow definition is a versioned JSON document.
+/// One read from its text, with an event trigger, a resource scope, typed action nodes, success and
+/// failure edges, deadlines and a grant reference, installs under the revision that both the
+/// request and the document name. Each later install takes a higher revision, and an installed
+/// revision never changes: a changed document under a number already installed, a lower number than
+/// the latest, and a request that names another revision than its document are each refused, and
+/// every installed revision reads back as it was installed.
 #[test]
 fn a_definition_is_a_versioned_json_document_whose_installed_revisions_never_change() {
     use std::sync::Arc;
