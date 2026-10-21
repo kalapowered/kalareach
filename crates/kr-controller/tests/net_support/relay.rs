@@ -274,7 +274,7 @@ struct PortKept;
 ///
 /// - no bind of port 0 and no connection that is given a local port is handed a port that is
 ///   bound, connected or not (on macOS a socket that listens on the wildcard address of both
-///   families can still be handed it, which no program of this workspace does);
+///   families can still be handed it, which no Rust code of this workspace does);
 /// - a program that names the port is turned away unless it too has the address-reuse option;
 /// - the relay's listener binds the port beside the connection, as any server does that restarts
 ///   while its connections are still open, and while the relay is stopped a connection to the port
