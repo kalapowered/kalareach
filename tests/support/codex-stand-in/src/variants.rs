@@ -28,8 +28,9 @@ pub const KEY_VARIABLE: &str = "KR_STAND_IN_API_KEY";
 /// waits for before it asks its question.
 pub const RELEASE_VARIABLE: &str = "KR_STAND_IN_RELEASE";
 
-/// The file the server appends one line to for each frame it reads from the terminal: `request`,
-/// `response` or `notification`, the identifier or method, and the method of a request.
+/// The file the server appends one line to when it starts (`server started`) and one for each
+/// frame it reads from the terminal: `request`, `response` or `notification`, the identifier or
+/// method, and the method of a request.
 pub const RECEIVED_VARIABLE: &str = "KR_STAND_IN_RECEIVED";
 
 /// The ways a run can differ from the default.

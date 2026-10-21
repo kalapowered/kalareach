@@ -171,6 +171,15 @@ impl TwoApprovals {
         PathBuf::from(name)
     }
 
+    /// How many lines the server wrote about what it started and read that `matching` accepts.
+    fn lines(&self, matching: impl Fn(&str) -> bool) -> usize {
+        std::fs::read_to_string(&self.received)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| matching(line))
+            .count()
+    }
+
     /// The identifiers of the responses the server has read from the terminal.
     fn responses(&self) -> Vec<String> {
         std::fs::read_to_string(&self.received)
@@ -503,6 +512,88 @@ fn kr_req_11_27_a_view_that_cannot_be_told_in_time_is_told_to_resynchronise() {
     let _ = run.launched.ends();
     shell.view_resynchronises();
     drop(held);
+}
+
+/// KR-REQ-11.36: a server that ends under a turn it never answered is not replaced, and the turn is
+/// not asked again.
+///
+/// The terminal asks the server to start a turn, and the server reads the request and never
+/// answers it. The server is then ended from outside, by the identity the session recorded for it.
+/// The terminal is told as a native client is told of a request that will not be answered, by an
+/// error under the identifier it used, and exits. The host's record says the request reached the
+/// server, and nothing was sent again: the file the server wrote holds one start and one request
+/// to start a turn for the whole run, and no other server is on record when the instance has
+/// ended.
+///
+/// A typed caller's `UPSTREAM_UNAVAILABLE` over a gateway-served instance is not claimed: no rich
+/// prompt reaches a gateway-served instance yet. Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_11_36_a_server_that_ends_under_an_unanswered_turn_is_not_replaced_or_asked_again() {
+    use kr_worker::broker::ClientRequestOutcome;
+
+    let shell = Gateway::served();
+    let mut run = launch_two_approvals(&shell, "unanswered", "stay,no-turn-answer");
+    let is_the_turn = |line: &str| line.starts_with("request ") && line.ends_with(" turn/start");
+    eventually(
+        "the server read the terminal's request to start a turn",
+        || run.lines(is_the_turn) >= 1,
+    );
+    let instance = shell.announcement().instance.application_instance_id;
+    let servers = shell.servers();
+    assert_eq!(servers.len(), 1, "{servers:?}");
+    let server = servers[0].clone();
+
+    let pid = i32::try_from(server.pid.get()).expect("a process identifier");
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(pid).expect("a process identifier"),
+        rustix::process::Signal::KILL,
+    )
+    .expect("the server is ended");
+
+    assert_eq!(
+        run.launched.ends().code(),
+        Some(1),
+        "{}",
+        run.launched.printed()
+    );
+    assert!(
+        run.launched
+            .printed()
+            .contains("Error: the server refused turn/start"),
+        "the terminal was answered its request with an error: {}",
+        run.launched.printed()
+    );
+    eventually("the instance ended with the terminal", || {
+        shell.broker.binding_state(instance).is_err()
+    });
+    assert_eq!(
+        kr_ipc::identity::process_state(&server),
+        kr_ipc::identity::ProcessState::Ended
+    );
+    assert!(
+        shell.servers().iter().all(|recorded| *recorded == server),
+        "no other server is on record: {:?}",
+        shell.servers()
+    );
+    assert_eq!(
+        run.lines(|line| line == "server started"),
+        1,
+        "no second server started"
+    );
+    assert_eq!(run.lines(is_the_turn), 1, "the request was not sent again");
+    let turns: Vec<_> = shell
+        .broker
+        .client_requests()
+        .expect("the ledger reads")
+        .into_iter()
+        .filter(|intent| intent.method.as_str() == "turn/start")
+        .collect();
+    assert_eq!(turns.len(), 1, "{turns:?}");
+    assert_eq!(
+        turns[0].outcome,
+        ClientRequestOutcome::Transmitted,
+        "the host recorded that the request reached the server, and no more than that"
+    );
 }
 
 /// KR-REQ-11.32 and KR-REQ-12.07: only the process the launch registered reaches the gateway, and

@@ -439,6 +439,7 @@ async fn terminated(terminate: &mut Signal) {
 /// takes a while to start is not one a signal can kill before it is ready for it.
 pub async fn run(variants: Variants) -> ! {
     let mut terminate = signal(SignalKind::terminate()).expect("a handler for terminate");
+    Server::note_received("server started");
     let contract = Contract::pinned();
     if variants.report_environment {
         eprintln!(
