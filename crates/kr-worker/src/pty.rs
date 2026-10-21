@@ -13,11 +13,16 @@ use std::io::{Read, Write};
 
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::session::Dimensions;
+#[cfg(windows)]
+use portable_pty::CommandBuilder;
 #[cfg(unix)]
 use portable_pty::native_pty_system;
-use portable_pty::{CommandBuilder, MasterPty, PtySize};
+use portable_pty::{MasterPty, PtySize};
 
 use crate::error::{Result, WorkerError};
+
+#[cfg(unix)]
+mod spawn;
 
 /// What to launch as the session's root shell.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +60,11 @@ impl ShellExit {
 /// The session's pseudo-terminal, created before any shell runs.
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
+    /// The end the root shell is given, until it is.
+    #[cfg(unix)]
+    slave: Option<std::os::fd::OwnedFd>,
+    /// The end the root shell is given, until it is.
+    #[cfg(windows)]
     slave: Option<Box<dyn portable_pty::SlavePty + Send>>,
     /// The event a started read of this terminal's output is signalled on.
     ///
@@ -100,9 +110,14 @@ impl Pty {
         // can be told the lease it is writing for has ended, and the reader can be stopped. Both
         // wait on the descriptor itself when there is nothing to do.
         answer_rather_than_wait(pair.master.as_ref())?;
+        // The shell is started by this host rather than by the terminal library, so that nothing
+        // is read from the file system between the last admission of the start and the process
+        // ([`spawn`]), and the slave end it needs is opened here by the name the master reports,
+        // while the library's own is still open.
+        let slave = open_slave(pair.master.as_ref())?;
         Ok(Self {
             master: pair.master,
-            slave: Some(pair.slave),
+            slave: Some(slave),
             dimensions,
         })
     }
@@ -166,21 +181,34 @@ impl Pty {
         if self.slave.is_none() {
             return Err(running());
         }
+        #[cfg(unix)]
+        let directory = spawn::Directory::open(command);
+        #[cfg(unix)]
+        let named_is_there = directory.named_is_there();
+        #[cfg(windows)]
         let named_is_there = std::path::Path::new(&command.cwd).is_dir();
         admit(named_is_there)?;
         let slave = self.slave.take().ok_or_else(running)?;
-        let mut builder = CommandBuilder::new(&command.program);
-        for argument in &command.arguments {
-            builder.arg(argument);
-        }
-        builder.env_clear();
-        for (name, value) in &command.environment {
-            builder.env(name, value);
-        }
-        builder.cwd(&command.cwd);
-        let child = slave
-            .spawn_command(builder)
-            .map_err(|error| WorkerError::pty("start the root shell", error))?;
+        #[cfg(unix)]
+        let child: Box<dyn portable_pty::Child + Send + Sync> = Box::new(
+            spawn::start(&slave, directory, command)
+                .map_err(|error| WorkerError::pty("start the root shell", error))?,
+        );
+        #[cfg(windows)]
+        let child = {
+            let mut builder = CommandBuilder::new(&command.program);
+            for argument in &command.arguments {
+                builder.arg(argument);
+            }
+            builder.env_clear();
+            for (name, value) in &command.environment {
+                builder.env(name, value);
+            }
+            builder.cwd(&command.cwd);
+            slave
+                .spawn_command(builder)
+                .map_err(|error| WorkerError::pty("start the root shell", error))?
+        };
         // The slave descriptor is dropped here. Holding it open would keep the terminal alive
         // after the shell exits, so the read loop would never see end of file and the session
         // would look busy for ever.
@@ -1074,6 +1102,29 @@ fn deadline(timeout: std::time::Duration) -> rustix::event::Timespec {
         tv_sec: i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
         tv_nsec: i64::from(timeout.subsec_nanos()),
     }
+}
+
+/// Opens the slave end of a terminal by the name its master reports.
+///
+/// The terminal library keeps the end it opened to itself, and a shell started by this host needs
+/// one of its own. It is not made the opening process's controlling terminal, which is the shell's
+/// to be.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::Pty`] when the terminal reports no name or the name cannot be opened.
+#[cfg(unix)]
+fn open_slave(master: &dyn MasterPty) -> Result<std::os::fd::OwnedFd> {
+    const OPERATION: &str = "open the slave end of the pseudo-terminal";
+    let name = master
+        .tty_name()
+        .ok_or_else(|| WorkerError::pty(OPERATION, "the terminal reports no name"))?;
+    rustix::fs::open(
+        &name,
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| WorkerError::pty(OPERATION, error))
 }
 
 /// Puts a terminal into the mode where it answers rather than waits.
