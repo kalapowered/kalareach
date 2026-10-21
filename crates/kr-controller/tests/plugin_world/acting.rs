@@ -145,6 +145,33 @@ pub struct Acting {
     /// scripted peer.
     pub _owner: Arc<kr_worker::broker::Duplex>,
     pub _tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// The native terminal's end of the transport, where the world serves one: its lines in and
+    /// out.
+    pub native: Option<tokio::sync::Mutex<NativeTerminal>>,
+}
+
+/// The native terminal's end of the production transport: the frames it writes go to the upstream
+/// through the broker's native admission, and the upstream's replies come back to it.
+pub struct NativeTerminal {
+    lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::net::UnixStream>>>,
+    writes: tokio::io::WriteHalf<tokio::net::UnixStream>,
+}
+
+/// What the world is started with, beyond how its component is registered.
+#[derive(Clone, Copy)]
+struct Options {
+    /// Whether the plugin host's epoch runs, so that a component is stopped by its deadline, or is
+    /// held still.
+    epoch: Epoch,
+    /// Whether the world serves a native terminal on the transport.
+    native_terminal: bool,
+}
+
+impl Options {
+    const DEFAULT: Self = Self {
+        epoch: Epoch::Held,
+        native_terminal: false,
+    };
 }
 
 /// How the component comes to be registered with the plugin runtime and handed to the worker.
@@ -160,33 +187,61 @@ enum Registration {
 
 impl Acting {
     pub async fn start() -> Option<Self> {
-        Self::assemble(Registration::ByHand { told: true }, None).await
+        Self::assemble(Registration::ByHand { told: true }, None, Options::DEFAULT).await
     }
 
     /// Starts the world with the worker's deadlines measured on `clock`, which the test moves by
     /// hand.
     pub async fn start_on(clock: Arc<dyn kr_transport::clock::ContinuousClock>) -> Option<Self> {
-        Self::assemble(Registration::ByHand { told: true }, Some(clock)).await
+        Self::assemble(
+            Registration::ByHand { told: true },
+            Some(clock),
+            Options::DEFAULT,
+        )
+        .await
     }
 
     /// Starts the world; `registered` says whether the worker has been told where the component
     /// stands, as its link tells it once the runtime has the component.
     pub async fn start_with(registered: bool) -> Option<Self> {
-        Self::assemble(Registration::ByHand { told: registered }, None).await
+        Self::assemble(
+            Registration::ByHand { told: registered },
+            None,
+            Options::DEFAULT,
+        )
+        .await
     }
 
     /// Starts the world with the worker's own link running: nothing is registered by the test, and
     /// the plugin runtime is not asked for until the link asks the daemon for it.
     pub async fn start_linked() -> Option<Self> {
-        Self::assemble(Registration::ByLink, None).await
+        Self::assemble(Registration::ByLink, None, Options::DEFAULT).await
+    }
+
+    /// Starts the world as a component that faults is met in a shipped host: the worker's own link
+    /// runs, so the runtime's notice that it disabled a binding reaches the broker; the plugin
+    /// host's epoch runs, so a call into the component is stopped when its deadline passes; and a
+    /// native terminal is served on the transport, so traffic that does not wait for the component
+    /// can be shown going on.
+    pub async fn start_faulting() -> Option<Self> {
+        Self::assemble(
+            Registration::ByLink,
+            None,
+            Options {
+                epoch: Epoch::Running,
+                native_terminal: true,
+            },
+        )
+        .await
     }
 
     async fn assemble(
         registration: Registration,
         clock: Option<Arc<dyn kr_transport::clock::ContinuousClock>>,
+        options: Options,
     ) -> Option<Self> {
         let wasm = component("preparing")?;
-        let hosted = hosted_on(Epoch::Held, clock).await;
+        let hosted = hosted_on(options.epoch, clock).await;
         let source = install(&hosted.environment(), &wasm);
         let runtime = match registration {
             Registration::ByHand { .. } => Some(Arc::new(hosted.runtime().await)),
@@ -264,13 +319,14 @@ impl Acting {
             .expect("the native connection is authenticated");
         let (here, there) = tokio::net::UnixStream::pair().expect("a socket pair");
         let (upstream_reads, upstream_writes) = tokio::io::split(here);
-        let (client_here, _client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (client_here, client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (client_reads, client_writes) = tokio::io::split(client_here);
         let (owner, writes) = kr_worker::broker::Duplex::new(
             Arc::clone(broker),
             kr_protocol::ids::GatewayConnectionId::new(1),
             kr_worker::broker::Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
             upstream_writes,
-            tokio::io::split(client_here).1,
+            client_writes,
             hosted.environment_id,
             "agent-user",
         );
@@ -312,6 +368,18 @@ impl Acting {
                     .to_path_buf(),
             ));
         let mut tasks = vec![peer, driving, reading];
+        let native = options.native_terminal.then(|| {
+            // The owner reads the native terminal's frames, which is what carries them upstream.
+            tasks.push(tokio::spawn({
+                let owner = Arc::clone(&owner);
+                async move { owner.serve(client_reads, false).await }
+            }));
+            let (reads, writes) = tokio::io::split(client_there);
+            tokio::sync::Mutex::new(NativeTerminal {
+                lines: tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(reads)),
+                writes,
+            })
+        });
         match (&registration, runtime.as_ref()) {
             (Registration::ByHand { told }, Some(runtime)) => {
                 // The component is registered with the runtime the way the worker's link registers
@@ -394,6 +462,7 @@ impl Acting {
             upstream,
             _owner: owner,
             _tasks: tasks,
+            native,
         })
     }
 
@@ -459,6 +528,41 @@ impl Acting {
         })
         .expect("encodes");
         mutation
+    }
+
+    /// One request of the native terminal's, carried upstream through the broker's native
+    /// admission and answered by the scripted upstream: the frame the terminal wrote is on the
+    /// upstream's record, and the reply that comes back to the terminal is the answer to it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when this world serves no native terminal, or the reply does not come back.
+    pub async fn native_round_trip(&self, id: u64) {
+        use tokio::io::AsyncWriteExt as _;
+
+        let mut terminal = self
+            .native
+            .as_ref()
+            .expect("this world serves a native terminal")
+            .lock()
+            .await;
+        let request = format!("{{\"id\":{id},\"method\":\"session/prompt\",\"params\":{{}}}}\n");
+        terminal
+            .writes
+            .write_all(request.as_bytes())
+            .await
+            .expect("the terminal writes its request");
+        let reply = tokio::time::timeout(PATIENCE, terminal.lines.next_line())
+            .await
+            .expect("the reply comes back")
+            .expect("the terminal reads")
+            .expect("the transport is still open");
+        let reply: serde_json::Value = serde_json::from_str(&reply).expect("a JSON reply");
+        assert_eq!(reply["id"], id, "the reply is to the request: {reply}");
+        assert!(
+            reply.get("result").is_some(),
+            "and it is an answer: {reply}"
+        );
     }
 
     /// What the scripted upstream has been written so far.

@@ -12,6 +12,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-23.30 | `plugin.action.invoke` runs the component registered for the binding, validates the plan it proposes against the action, the grant, the effect class and the arguments, transmits the plan that validates once, and rejects every other with a receipt that says it never dispatched |
+//! | KR-REQ-11.31 | a component that faults when asked to prepare an action disables its binding's rich capability, and the native terminal's requests and answers go on before, during and after, on the transport the production gateway uses (not through `kr-hook launch`, whose leg needs a real managed shell) |
 //!
 //! The scripted peer stands in for a vendor's agent. A test that needs a stopped plugin host stops
 //! the real one and lets it go, and every wait is for a condition the product reaches.
@@ -38,7 +39,7 @@ use plugin_world::acting::{
     ACTIONS, Acting, Change, answer, binding, read_receipt, send, signal, until_receipt,
     until_settled,
 };
-use plugin_world::kill;
+use plugin_world::{PATIENCE, kill};
 
 /// KR-REQ-23.30: the plan a component proposes for the cancellation it was invited to prepare is
 /// validated and transmitted once, as the method its action goes out as, and the receipt says the
@@ -816,5 +817,140 @@ async fn kr_req_23_30_an_action_whose_component_is_not_there_is_rejected_for_the
         acting.frames().is_empty(),
         "nothing was written to the upstream: {:?}",
         acting.frames()
+    );
+}
+
+/// KR-REQ-11.31: a component that faults disables the rich capability of its binding without
+/// stalling the native terminal's traffic.
+///
+/// The worker's own link runs, so the plugin runtime's notice that it disabled a binding reaches the
+/// broker, and the plugin host's epoch runs, so the component that never returns is stopped by its
+/// deadline. A native terminal is served on the transport the production gateway uses: its requests
+/// are carried upstream and answered, before the component is asked, while the plugin host is held
+/// with a call to the component waiting on it, between the faults, and after the binding is
+/// disabled. Once it is, a rich action is refused and nothing is written to the upstream for it.
+///
+/// Not claimed: a launch through `kr-hook launch` (the terminal here is the transport's client end,
+/// not a program in a managed shell), and Windows, where no gateway runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_31_a_component_that_faults_disables_its_binding_and_the_native_terminal_goes_on()
+{
+    let Some(acting) = Acting::start_faulting().await else {
+        return;
+    };
+    let broker = acting.hosted._service.broker();
+    let mut client = acting.client().await;
+    let mut native = 0_u64;
+
+    // The terminal's traffic goes on while the link registers the component, and a rich action is
+    // carried as soon as it has.
+    native += 1;
+    acting.native_round_trip(native).await;
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let mut number = 0_u64;
+    loop {
+        number += 1;
+        let mut mutation = acting.invocation(&client, "turn.cancel", b"{}");
+        mutation.request_id = RequestId::new(number);
+        match send(&mut client, mutation).await {
+            Outcome::Ok(_) => break,
+            Outcome::Error(refusal) => assert_eq!(
+                refusal.code,
+                ErrorCode::ResourceUnavailable,
+                "an action that cannot be prepared yet can be asked again: {refusal:?}"
+            ),
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "waited {PATIENCE:?} for the component to prepare an action"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        broker.rich_disabled(binding()).is_none(),
+        "the binding works before it faults"
+    );
+    let rich_frames = acting.frames().len() - native as usize;
+    assert_eq!(
+        rich_frames,
+        1,
+        "one rich action went: {:?}",
+        acting.frames()
+    );
+
+    // The first fault is asked while the plugin host is held: the call waits on the host, the
+    // terminal's request is carried and answered meanwhile, and the call faults when the host runs.
+    let mut watcher = acting.client().await;
+    let mut asking = acting.client().await;
+    let mut mutation = acting.invocation(&asking, "cancel.loop", b"{}");
+    mutation.request_id = RequestId::new(1);
+    let action_id = mutation.action_id;
+    let host = acting.stop_host();
+    asking
+        .writer()
+        .write_message(&ControlFrame::Mutation(Box::new(mutation)))
+        .await
+        .expect("writes the mutation");
+    until_receipt(&mut watcher, action_id, ReceiptState::Accepted).await;
+    native += 1;
+    acting.native_round_trip(native).await;
+    signal(&host, rustix::process::Signal::CONT);
+    let Outcome::Error(refusal) = answer(&mut asking, Some(1)).await else {
+        panic!("an action whose component never returns was carried");
+    };
+    assert_eq!(refusal.code, ErrorCode::ResourceUnavailable, "{refusal:?}");
+
+    // More faults, with the terminal's traffic between them, until the runtime disables the
+    // binding and the link tells the broker.
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    while broker.rich_disabled(binding()).is_none() {
+        number += 1;
+        let mut mutation = acting.invocation(&client, "cancel.loop", b"{}");
+        mutation.request_id = RequestId::new(number);
+        let outcome = send(&mut client, mutation).await;
+        assert!(
+            matches!(outcome, Outcome::Error(_)),
+            "an action whose component never returns was carried: {outcome:?}"
+        );
+        native += 1;
+        acting.native_round_trip(native).await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "waited {PATIENCE:?} for the binding to be disabled"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let reason = broker
+        .rich_disabled(binding())
+        .expect("the binding is disabled");
+    assert!(!reason.is_empty(), "and it says why");
+
+    // Rich is refused, the terminal goes on, and nothing was written for the faulted actions.
+    number += 1;
+    let mut mutation = acting.invocation(&client, "turn.cancel", b"{}");
+    mutation.request_id = RequestId::new(number);
+    let Outcome::Error(refusal) = send(&mut client, mutation).await else {
+        panic!("a rich action was carried by a binding the worker disabled");
+    };
+    assert_eq!(
+        refusal.code,
+        ErrorCode::UnsupportedCapability,
+        "{refusal:?}"
+    );
+    native += 1;
+    acting.native_round_trip(native).await;
+    let frames = acting.frames();
+    assert_eq!(
+        frames.len(),
+        native as usize + rich_frames,
+        "the upstream was written the terminal's requests and the one rich action that prepared: \
+         {frames:?}"
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame.contains("session/prompt"))
+            .count(),
+        native as usize
     );
 }
