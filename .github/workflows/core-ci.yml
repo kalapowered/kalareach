@@ -814,12 +814,14 @@ jobs:
       # What a Windows host detects to open a session's terminal in, and the console launcher that
       # runs the command it is given, both run here and not read from the code: Windows Terminal
       # when it is on `PATH` and the console after it, and a command the console is asked to run
-      # that makes what it was told to make. The saved preference's files and locks, the rest of
-      # this module's units, have never run on this platform and are not claimed by this filter.
+      # that connects to a listener the test holds. The detection case prints the list it found, so
+      # this log shows whether Windows Terminal was among them. The saved preference's files and
+      # locks, the rest of this module's units, have never run on this platform and are not
+      # claimed by this filter.
       - name: Test the terminal a session opens in
         if: ${{ !cancelled() && matrix.part == 'second' }}
-        # Quoted: a plain YAML scalar cannot end in a colon, and the filter does.
-        run: "cargo test --locked -p kr-shell-integration --lib host::terminal::tests::native_windows::"
+        # Quoted: in a plain YAML scalar the filter's `::` followed by a space reads as a key.
+        run: "cargo test --locked -p kr-shell-integration --lib host::terminal::tests::native_windows:: -- --nocapture"
 
       # What the doctor reads of this platform: the worker's own answer to whether its command
       # backends run, which is a fact apart from whether it can publish a credential file.

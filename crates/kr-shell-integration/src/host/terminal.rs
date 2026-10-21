@@ -961,8 +961,7 @@ mod tests {
         assert!(hold_preference_within(other.path(), patience).is_err());
     }
 
-    /// KR-REQ-07.31: a host with no terminal to open answers `TERMINAL_UNAVAILABLE`, which the
-    /// create that asked for a window reports beside the session it made.
+    /// KR-REQ-07.31: a host with no terminal to open answers `TERMINAL_UNAVAILABLE`.
     #[test]
     fn a_host_with_no_terminal_says_so_once() {
         let error = select(None, None, &[]).expect_err("refused");
@@ -1013,37 +1012,36 @@ mod tests {
         }
 
         /// KR-REQ-07.31: the console launcher runs the command it is given and reports success
-        /// once the launcher has accepted it. The command makes a directory, which is what shows
-        /// it ran; nothing has made it before the console is asked. The launcher is `cmd.exe /c
-        /// start`, which starts the command in a console of its own, so what is shown here is that
-        /// the command ran through it and not that a window was drawn: a hosted job has no desktop
-        /// to look at.
+        /// once the launcher has accepted it. The command connects to a loopback listener the
+        /// test holds, which is what shows it ran, and nothing has connected before the console is
+        /// asked. What is shown is that the command given to the launcher ran, not that a window
+        /// was drawn: a hosted job has no desktop to look at.
         #[test]
         fn the_console_launcher_runs_the_command_it_is_given() {
-            let directory = tempfile::tempdir().expect("a directory");
-            let made = directory.path().join("made-by-the-console");
-            assert!(!made.exists(), "nothing has run the command yet");
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a loopback port");
+            let port = listener.local_addr().expect("bound").port();
+            let (heard, told) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = heard.send(listener.accept().map(|_| ()));
+            });
 
             let selection = select(Some("windows-console"), None, &detect())
                 .expect("the console is always detected");
             let command = vec![
-                "cmd.exe".to_owned(),
-                "/c".to_owned(),
-                "mkdir".to_owned(),
-                made.display().to_string(),
+                "curl.exe".to_owned(),
+                "--silent".to_owned(),
+                "--max-time".to_owned(),
+                "60".to_owned(),
+                format!("http://127.0.0.1:{port}/"),
             ];
             open(&selection, &command).expect("the launcher accepted the command");
 
-            // The command runs in a process the launcher started and does not wait for, so what
-            // it makes is the signal. The deadline only ends a failure; passing it decides nothing.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-            while !made.exists() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the command the console was given never ran"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+            // The command runs in a process the launcher started and does not wait for, so its
+            // connection is the signal. The deadline only ends a failure; passing it decides
+            // nothing.
+            told.recv_timeout(std::time::Duration::from_secs(120))
+                .expect("the command the console was given never ran")
+                .expect("the listener took the command's connection");
         }
     }
 }

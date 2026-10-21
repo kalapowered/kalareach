@@ -751,7 +751,8 @@ fn windows() -> Vec<Step> {
             "the worker's library",
             &["test", "--locked", "-p", "kr-worker", "--lib"],
         ),
-        qualified_only(
+        Step::cargo(
+            Group::Rust,
             "the platform time adapter",
             &[
                 "test",
@@ -767,7 +768,6 @@ fn windows() -> Vec<Step> {
                 "every_recorded_platform_reading_classifies_the_way_the_fixture_states",
                 "retrust_needs_the_host_time_authority_or_the_owner_and_never_a_paired_peer",
             ],
-            "the_platform_time_adapter_reads_this_machines_own_time_service, every_recorded_platform_reading_classifies_the_way_the_fixture_states, retrust_needs_the_host_time_authority_or_the_owner_and_never_a_paired_peer",
         ),
         Step::cargo(
             Group::Rust,
@@ -1022,6 +1022,8 @@ fn windows() -> Vec<Step> {
                 "kr-shell-integration",
                 "--lib",
                 "host::terminal::tests::native_windows::",
+                "--",
+                "--nocapture",
             ],
             "host::terminal::tests::native_windows::",
         ),
