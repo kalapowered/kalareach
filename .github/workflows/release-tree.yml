@@ -303,6 +303,53 @@ jobs:
             "$root/shells/zsh/$identity/bin/zsh" -f -c 'zmodload zsh/zle && print -r -- "zle loaded from $module_path[1]"'
           done
 
+      # The release after this one, made of the same programs, so that an upgrade has a release to
+      # go to. It is signed with this run's keys like the first, and is no more a release than it.
+      - name: Make the release after this one
+        run: |
+          identity=()
+          if [ "$RUNNER_OS" = macOS ]; then
+            identity=(--macos-identity -)
+          fi
+          next="$(python3 -c 'import sys; v, c = sys.argv[1].split("+"); a, b, p = v.split("."); print(f"{a}.{b}.{int(p) + 1}+{c}")' "$RELEASE")"
+          top="kalareach-$TARGET-$next"
+          bash scripts/build-release.sh \
+            --target "$TARGET" --release "$next" --sequence "$((SEQUENCE + 1))" --commit "$COMMIT" --floor "$FLOOR" \
+            --programs "target/$TARGET/release" --shells "$RUNNER_TEMP/shells" \
+            --root "$RUNNER_TEMP/keys/root.json" --out "$RUNNER_TEMP/next/$top" \
+            --kr-release target/release/kr-release --plugins plugins-source "${identity[@]}"
+          target/release/kr-release sign --tree "$RUNNER_TEMP/next/$top" --checkout . \
+            --key "$RUNNER_TEMP/keys/targets-1.pk8" --key "$RUNNER_TEMP/keys/targets-2.pk8" \
+            --plugins plugins-source
+          mkdir -p "$RUNNER_TEMP/next-archive"
+          COPYFILE_DISABLE=1 tar -C "$RUNNER_TEMP/next" -czf "$RUNNER_TEMP/next-archive/$top.tar.gz" "$top"
+          echo "NEXT_ARCHIVE=$RUNNER_TEMP/next-archive/$top.tar.gz" >> "$GITHUB_ENV"
+
+      # What a package manager does with the archive, with Homebrew itself: a cask on macOS and a
+      # formula on Linux, installed from a tap of this run's own. The first command of the `kr` it
+      # links admits the release into a store, an upgrade leaves the release before it there, and a
+      # removal leaves both.
+      - name: Install, upgrade and remove it with Homebrew
+        run: |
+          brew="$(command -v brew || true)"
+          if [ -z "$brew" ] && [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+            brew=/home/linuxbrew/.linuxbrew/bin/brew
+          fi
+          kind=formula
+          if [ "$RUNNER_OS" = macOS ]; then
+            kind=cask
+          fi
+          if [ -z "$brew" ]; then
+            if [ "$RUNNER_OS" = macOS ]; then
+              echo "::error::this runner has no Homebrew, and the cask is installed with it"
+              exit 1
+            fi
+            echo "::notice::this runner has no Homebrew, so the formula is not installed here"
+            exit 0
+          fi
+          bash scripts/check-homebrew-install.sh --brew "$brew" --kind "$kind" \
+            --first "$RUNNER_TEMP/archive/$TOP.tar.gz" --second "$NEXT_ARCHIVE"
+
       - name: Keep the archive this run proved
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
