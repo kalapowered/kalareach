@@ -38,8 +38,10 @@ import to.kala.reach.companion.mobile.QrDecoder
 
 /** What reading a code came to. */
 sealed class ScanOutcome {
-    /** The text of the code. */
-    data class Text(val text: String) : ScanOutcome()
+    /** The text of the code. It holds an invitation's secret, so printing one never shows it. */
+    class Text(val text: String) : ScanOutcome() {
+        override fun toString(): String = "Text(..)"
+    }
 
     /** The person closed the scanner, or the application stopped being in front. */
     object Cancelled : ScanOutcome()
