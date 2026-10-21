@@ -547,10 +547,15 @@ Two secret buffers in this path are not cleared, and neither is reachable from t
    canonical form, plus those output bytes. This crate clears the tree it is handed back; it cannot
    reach the rest. Closing it means the same thing as the envelope case: a value tree whose
    temporaries clear themselves, in `crates/kr-cbor`, which owns the decoder.
-2. **`hkdf` 0.13.0 keeps its pseudorandom key and expansion buffers uncleared.** The crate has no
-   `zeroize` feature; `hmac` and `sha2` are built with theirs. Closing this means a maintained
-   release that clears them, or a reviewed patch. Section 20 requires a maintained implementation,
-   so a private fork is not the answer.
+2. **`hkdf` 0.13.0 keeps its pseudorandom key and expansion buffers uncleared, and so do the
+   older `hkdf`, `hmac` and `sha2` that `spake2` brings.** `hkdf` has no `zeroize` feature in
+   either version. The `hmac` 0.13.0 and `sha2` 0.11.0 this workspace pins are built with theirs.
+   `spake2` 0.4.0 depends on `hkdf` 0.12.4, `hmac` 0.12.1 and `sha2` 0.10.9, which have none, and
+   builds the password scalar from an HKDF and the shared key from a SHA-256 transcript hash of the
+   password, the two identities and both messages with them. The buffers of those two steps are not
+   cleared. Closing this means a maintained `spake2` release that depends on versions that clear
+   them, or a reviewed patch. Section 20 requires a maintained implementation, so a private fork is
+   not the answer.
 
 Both are recorded here with the versions pinned below, because no external cryptographic review has
 examined them. The release's statement of that exception is in
@@ -575,9 +580,13 @@ Pin these in the release manifest, with their exact versions and the resolved de
 libsodium's signed prebuilt libraries on Windows, so the manifest records the crate version, not a
 system library version. Compile and verify it on every Tauri target.
 
-`hmac` and `sha2` are built with their `zeroize` features, so their internal buffers are cleared.
-`hkdf` 0.13.0 has no such feature; its pseudorandom key and expansion buffers are not cleared, which
-is a limitation of the pinned implementation rather than of this wrapper. The same applies to the
-`serde` and `ciborium` value trees an envelope's payload passes through on its way to and from
-canonical bytes. The paths that carry key material avoid both: a key wrap is assembled and read
-without a value tree, and every key lives in a `Secret`.
+`hmac` 0.13.0 and `sha2` 0.11.0, the versions pinned above, are built with their `zeroize`
+features, so their internal buffers are cleared. `hkdf` 0.13.0 has no such feature; its pseudorandom
+key and expansion buffers are not cleared, which is a limitation of the pinned implementation
+rather than of this wrapper. `spake2` 0.4.0 also resolves `hkdf` 0.12.4, `hmac` 0.12.1 and `sha2`
+0.10.9 for the pairing code's key derivation and transcript hash, and none of those three has a
+`zeroize` feature, so what they hold is not cleared either. The same applies to the `serde` and
+`ciborium` value trees an envelope's payload passes through on its way to and from canonical
+bytes. The paths that carry key material avoid both: a key wrap is assembled and read
+without a value tree, and every key lives in a `Secret`. The short-code exchange is the one path
+whose secret, the pairing code, passes through the uncleared `spake2` buffers.
