@@ -12,6 +12,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-23.30 | `plugin.action.invoke` runs the component registered for the binding, validates the plan it proposes against the action, the grant, the effect class and the arguments, transmits the plan that validates once, and rejects every other with a receipt that says it never dispatched |
+//! | KR-REQ-11.28, KR-REQ-23.30 | through a connector whose table spells a cancellation, the plan a component prepares for the cancellation it was invited to prepare is validated against the token the host issued and written from the table's template, naming the thread and the running turn; every plan that is not that one, and a component's prompt, which the table spells no source for, is refused before the marker and nothing is written |
 //! | KR-REQ-11.31 | a component that faults when asked to prepare an action disables its binding's rich capability, and the native terminal's requests and answers go on before, during and after, on the transport the production gateway uses (not through `kr-hook launch`, whose leg needs a real managed shell) |
 //!
 //! The scripted peer stands in for a vendor's agent. A test that needs a stopped plugin host stops
@@ -76,6 +77,97 @@ async fn kr_req_23_30_a_component_prepares_a_cancellation_and_the_worker_transmi
     let sent = send(&mut client, mutation).await;
     assert!(matches!(sent, Outcome::Ok(_)), "{sent:?}");
     assert_eq!(acting.frames().len(), 2, "one more frame, for the prompt");
+}
+
+/// KR-REQ-11.28 and KR-REQ-23.30: through a connector whose table spells a cancellation as a
+/// template, with a thread bound and a turn running, the plan the real component prepares for the
+/// cancellation it was invited to prepare is written from the template, naming the thread and the
+/// turn the host read, and the receipt says the upstream acknowledged it. Every plan the component
+/// prepares that is not the invitation's own is refused with a receipt that says it never
+/// dispatched, and so is a prompt, which the table spells no source for; nothing more is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_28_a_components_cancellation_is_written_from_the_connectors_template_and_no_other_plan_is()
+ {
+    let Some(acting) = Acting::start_templated().await else {
+        return;
+    };
+    let mut client = acting.client().await;
+    let mutation = acting.invocation(&client, "turn.cancel", b"{}");
+    let action_id = mutation.action_id;
+    let outcome = send(&mut client, mutation).await;
+    assert!(
+        matches!(outcome, Outcome::Ok(_)),
+        "the prepared cancellation is carried out: {outcome:?}"
+    );
+    let frames = acting.frames();
+    assert_eq!(frames.len(), 1, "the upstream was written once: {frames:?}");
+    let frame: serde_json::Value = serde_json::from_str(&frames[0]).expect("a JSON frame");
+    assert_eq!(frame["method"], "turn/interrupt");
+    assert_eq!(
+        frame["params"],
+        serde_json::json!({ "threadId": "thread-1", "turnId": "turn-7" }),
+        "the template filled in with what the host read"
+    );
+    assert_eq!(
+        read_receipt(&mut client, action_id)
+            .await
+            .expect("a receipt")
+            .state,
+        ReceiptState::Applied
+    );
+
+    // Every plan that is not the invitation's own is refused, as it is without a template, and so
+    // is a component's prompt: the table spells nothing a component's text could go into.
+    let written = acting.frames().len();
+    let refused: Vec<&str> = ACTIONS
+        .iter()
+        .map(|(action, _)| *action)
+        .filter(|action| {
+            !["turn.cancel", "cancel.reasoned"].contains(action)
+                && !action.starts_with("attach.")
+                && ![
+                    "cancel.fault",
+                    "cancel.loop",
+                    "cancel.terminal",
+                    "cancel.present",
+                ]
+                .contains(action)
+        })
+        .collect();
+    assert!(
+        refused.contains(&"cancel.other.arguments") && refused.contains(&"prompt.send"),
+        "{refused:?}"
+    );
+    for (request_id, action) in (10..).zip(refused) {
+        let mut mutation = acting.invocation(&client, action, b"{}");
+        mutation.request_id = RequestId::new(request_id);
+        let action_id = mutation.action_id;
+        let outcome = send(&mut client, mutation).await;
+        let Outcome::Error(error) = outcome else {
+            panic!("{action}: a plan that is not the invocation's own was carried: {outcome:?}");
+        };
+        if action == "prompt.send" {
+            assert_eq!(error.code, ErrorCode::UnsupportedCapability, "{error:?}");
+            assert!(
+                error.message.contains("source"),
+                "the refusal names what the table lacks: {}",
+                error.message
+            );
+        }
+        assert_eq!(
+            read_receipt(&mut client, action_id)
+                .await
+                .expect("a receipt")
+                .state,
+            ReceiptState::Rejected,
+            "{action}: the action never dispatched"
+        );
+    }
+    assert_eq!(
+        acting.frames().len(),
+        written,
+        "nothing more was written to the upstream"
+    );
 }
 
 /// KR-REQ-23.30: every plan a component proposes that is not the invocation's own is refused, each

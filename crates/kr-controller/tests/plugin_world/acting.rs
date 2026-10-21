@@ -148,6 +148,8 @@ pub struct Acting {
     /// The native terminal's end of the transport, where the world serves one: its lines in and
     /// out.
     pub native: Option<tokio::sync::Mutex<NativeTerminal>>,
+    /// The binding revision the world's invocations are prepared at.
+    pub revision: AgentBindingRevision,
 }
 
 /// The native terminal's end of the production transport: the frames it writes go to the upstream
@@ -165,12 +167,17 @@ struct Options {
     epoch: Epoch,
     /// Whether the world serves a native terminal on the transport.
     native_terminal: bool,
+    /// Whether the connector spells a cancellation as a template, with a thread bound and a turn
+    /// running, so that a plan for a cancellation is written from the template and what the table
+    /// spells nothing for is refused, rather than written as the host's own frame.
+    templated: bool,
 }
 
 impl Options {
     const DEFAULT: Self = Self {
         epoch: Epoch::Held,
         native_terminal: false,
+        templated: false,
     };
 }
 
@@ -188,6 +195,20 @@ enum Registration {
 impl Acting {
     pub async fn start() -> Option<Self> {
         Self::assemble(Registration::ByHand { told: true }, None, Options::DEFAULT).await
+    }
+
+    /// Starts the world with a connector that spells a cancellation as a template, a thread bound
+    /// and a turn running.
+    pub async fn start_templated() -> Option<Self> {
+        Self::assemble(
+            Registration::ByHand { told: true },
+            None,
+            Options {
+                templated: true,
+                ..Options::DEFAULT
+            },
+        )
+        .await
     }
 
     /// Starts the world with the worker's deadlines measured on `clock`, which the test moves by
@@ -230,6 +251,7 @@ impl Acting {
             Options {
                 epoch: Epoch::Running,
                 native_terminal: true,
+                templated: false,
             },
         )
         .await
@@ -283,6 +305,22 @@ impl Acting {
                 TimestampMs::new(1),
             )
             .expect("the binding is recorded");
+        if options.templated {
+            // The terminal's conversation and the running turn, as the stream names them.
+            broker
+                .advance_binding(
+                    instance(),
+                    Some(kr_protocol::ids::AgentThreadId::new("thread-1").expect("a thread")),
+                    TimestampMs::new(2),
+                )
+                .expect("the binding names a thread");
+            broker
+                .set_turn(
+                    instance(),
+                    Some(kr_protocol::ids::AgentTurnId::new("turn-7").expect("a turn")),
+                )
+                .expect("a turn is running");
+        }
         for name in ["agent.prompt", "agent.cancel"] {
             broker
                 .record_capability(InstanceCapabilityRecord {
@@ -311,15 +349,43 @@ impl Acting {
 
         // The production transport over a socket pair, and a scripted peer that records what it
         // is written and answers every request.
-        broker
-            .pin_table(instance(), installed(), table(), rich())
-            .expect("the installed tables are pinned");
-        broker
-            .pin_reading(
-                instance(),
-                &package(),
+        let (rich_table, reading) = if options.templated {
+            let hole = |name: &str| serde_json::json!({ "$": name });
+            let mut table = rich();
+            table.entries.push(kr_protocol::gateway::RichMethodEntry {
+                method: kr_protocol::ids::UpstreamMethod::new("turn/interrupt").expect("valid"),
+                class: kr_protocol::gateway::NativeMethodClass::Mutation,
+                required_right: kr_protocol::rights::ActionRight::AgentCancel,
+                operation: Nullable::some(kr_protocol::gateway::RichOperation::TurnCancel),
+                provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+            });
+            table
+                .entries
+                .sort_by(|left, right| left.method.as_str().cmp(right.method.as_str()));
+            let mut reading = kr_worker::broker::reading::Reading::default();
+            reading.operations.insert(
+                kr_protocol::gateway::RichOperation::TurnCancel,
+                kr_worker::broker::reading::OperationTemplate {
+                    method: kr_protocol::ids::UpstreamMethod::new("turn/interrupt").expect("valid"),
+                    params: serde_json::json!({
+                        "threadId": hole("thread_id"),
+                        "turnId": hole("turn_id"),
+                    }),
+                    reply_turn: None,
+                },
+            );
+            (table, reading)
+        } else {
+            (
+                rich(),
                 kr_worker::broker::reading::Reading::spelling(&rich()),
             )
+        };
+        broker
+            .pin_table(instance(), installed(), table(), rich_table)
+            .expect("the installed tables are pinned");
+        broker
+            .pin_reading(instance(), &package(), reading)
             .expect("what the connector spells is pinned");
         broker
             .open_native_connection(instance(), &[9; 32], &process, &package(), "1")
@@ -470,6 +536,11 @@ impl Acting {
             _owner: owner,
             _tasks: tasks,
             native,
+            revision: if options.templated {
+                AgentBindingRevision::new(2)
+            } else {
+                AgentBindingRevision::new(1)
+            },
         })
     }
 
@@ -496,7 +567,7 @@ impl Acting {
                 session_id: Nullable::some(self.hosted.session_id),
                 session_epoch: Nullable::some(SessionEpoch::V1),
                 application_instance_id: Nullable::some(instance()),
-                agent_binding_revision: Nullable::some(AgentBindingRevision::new(1)),
+                agent_binding_revision: Nullable::some(self.revision),
             },
             expected: ParamsValue::empty(),
             action_window_id: client.action_window().action_window_id.clone(),
@@ -504,7 +575,7 @@ impl Acting {
             params: ParamsValue::from_typed(&PluginActionInvokeParams {
                 target: AgentMutationTarget {
                     subject: subject(self.hosted.session_id, instance()),
-                    binding_revision: AgentBindingRevision::new(1),
+                    binding_revision: self.revision,
                 },
                 plugin_id: package(),
                 action: ActionName::new(action).expect("an action name"),
@@ -528,7 +599,7 @@ impl Acting {
         mutation.params = ParamsValue::from_typed(&kr_protocol::agent::AgentPromptParams {
             target: AgentMutationTarget {
                 subject: subject(self.hosted.session_id, instance()),
-                binding_revision: AgentBindingRevision::new(1),
+                binding_revision: self.revision,
             },
             draft_id: Nullable::some(draft_id),
             text: Nullable::null(),
