@@ -1415,8 +1415,9 @@ async fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_r
         );
 
         // The pass reconciles the open connection from the host's own record: the request it
-        // still holds stays, and the one this host answered is uncertain and is never answered
-        // again. Rich work returns with it.
+        // still holds stays. The one this host answered was uncertain before the fault, because
+        // its upstream never acknowledged the answer, and is never answered again. Rich work
+        // returns with the pass.
         let finished = broker
             .reconcile_owed(TimestampMs::new(11))
             .expect("this was the last connection that owed one");
@@ -1511,6 +1512,79 @@ async fn a_restart_comes_back_fenced_and_numbers_its_connections_above_what_it_w
             .state,
         PendingState::Cancelled,
         "and the request it left is cancelled, because nothing can answer it"
+    );
+}
+
+/// KR-REQ-11.37: the pass that settles a connection nobody holds writes each settlement with its
+/// record, and a store that refuses it leaves the request, its row and the recovery's debt as they
+/// were.
+///
+/// A broker opened on a ledger that holds an unfinished recovery owes a connection no process
+/// holds. The store refuses the first pass's write: nothing is settled, live or in the row, the
+/// fence is back over the gap and rich work stays refused. Once the store takes writes again the
+/// gap is committed again and the next pass settles the request and finishes the recovery.
+#[tokio::test]
+async fn kr_req_11_37_a_pass_over_a_connection_nobody_holds_settles_nothing_the_store_refuses() {
+    let mut store = common::SharedStore::open();
+    let path = store.path.clone();
+    let resource_id = {
+        let (broker, _upstream) = gateway_sharing(&store);
+        let resource = approval(&broker, "1", 2).expect("an interpretation");
+        store.fault_acceptance();
+        store.recover_journal(5);
+        broker
+            .recover(TimestampMs::new(5))
+            .expect("the gap is committed");
+        assert_eq!(broker.mode(), GatewayMode::Recovering);
+        resource.resource_id
+    };
+    let restarted =
+        Broker::open(Some(&path), session(), store.health()).expect("the broker reopens");
+    assert_eq!(restarted.mode(), GatewayMode::Recovering);
+    let before = (
+        restarted.pending(resource_id),
+        restarted.recorded(resource_id).expect("the ledger reads"),
+    );
+
+    restarted
+        .refuse_ledger_writes(true)
+        .expect("the store is put in query-only mode");
+    assert!(
+        restarted.reconcile_owed(TimestampMs::new(11)).is_none(),
+        "a settlement the store refuses is not made"
+    );
+    assert_eq!(restarted.mode(), GatewayMode::NativeOnlyVolatile);
+    assert_eq!(
+        (
+            restarted.pending(resource_id),
+            restarted.recorded(resource_id).expect("the ledger reads"),
+        ),
+        before,
+        "and the request is as it was, live and in its row"
+    );
+    assert!(
+        restarted.require_rich_work().is_err(),
+        "rich work stays refused"
+    );
+
+    restarted
+        .refuse_ledger_writes(false)
+        .expect("the store takes writes again");
+    store.recover_journal(12);
+    restarted
+        .recover(TimestampMs::new(12))
+        .expect("the gap is committed again");
+    let finished = restarted
+        .reconcile_owed(TimestampMs::new(13))
+        .expect("the next pass settles the request and finishes the recovery");
+    assert_eq!(finished.to, GatewayMode::Normal);
+    assert_eq!(
+        restarted
+            .recorded(resource_id)
+            .expect("the ledger reads")
+            .expect("recorded")
+            .state,
+        PendingState::Cancelled
     );
 }
 
@@ -2089,7 +2163,9 @@ async fn kr_req_11_37_a_store_failing_under_settlement_or_recovery_keeps_what_ha
         "what happened inside the gap is what was committed"
     );
 
-    // And fails once more, under a reconciliation that would end the open request.
+    // And fails once more, under the recovery's finish: the open request is still held by an open
+    // connection, so the pass has no transition to make, and what the store refuses is the final
+    // accounting.
     let before = (
         broker.pending(open.resource_id),
         broker.recorded(open.resource_id).expect("the ledger reads"),
