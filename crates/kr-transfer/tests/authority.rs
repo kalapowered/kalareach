@@ -2656,11 +2656,13 @@ impl HungMount {
         let mut data = [0_u8; 1];
         let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
         let mut control = RecvAncillaryBuffer::new(&mut space);
+        // Marked to close on exec as it arrives, so that no process another case starts while the
+        // mount is there keeps the server's end open and the connection alive.
         recvmsg(
             &ours,
             &mut [IoSliceMut::new(&mut data)],
             &mut control,
-            RecvFlags::empty(),
+            RecvFlags::CMSG_CLOEXEC,
         )
         .map_err(|error| format!("the descriptor did not arrive: {error}"))?;
         let server = control.drain().find_map(|message| match message {
@@ -2745,6 +2747,79 @@ fn a_removal_does_not_wait_on_a_mount_that_never_answers() {
     assert!(
         matches!(**reason, Escape::CrossedMount { .. }),
         "because it is on another mount: {reason}"
+    );
+}
+
+/// KR-REQ-14.05: a mount put on a directory the removal has already emptied is not waited on
+/// either. The removal asks the name of such a directory whether it still holds the directory
+/// before it takes the name away, and that look must not go into a mount that never answers.
+///
+/// The mount is attached at the one moment that decides it: after the directory is emptied and
+/// before its name is looked at, where the removal's own test seam stands. The host leaves the
+/// case out as the case above does.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_removal_does_not_wait_on_a_mount_put_on_a_directory_it_has_emptied() {
+    use std::sync::{Arc, Mutex};
+
+    use kr_transfer::authority::testing::{RemovalStep, at_removal_step};
+
+    let root = kr_ipc::testing::PrivateTempDir::create();
+    let inner = root.path().join("tree/branch/inner");
+    std::fs::create_dir_all(&inner).expect("the tree");
+    std::fs::create_dir(root.path().join("probe")).expect("a place to try a mount");
+    match HungMount::attach(&root.path().join("probe")) {
+        Ok(probe) => drop(probe),
+        Err(why) => {
+            assert!(
+                std::env::var_os("KR_REQUIRE_FUSE").is_none(),
+                "this host cannot place the mount this check needs: {why}"
+            );
+            eprintln!("skipped: {why}");
+            return;
+        }
+    }
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+    let name = RelativeName::parse("tree").expect("a name");
+    let opened = authority.subdirectory(&name).expect("the tree opens");
+
+    let mount: Arc<Mutex<Option<HungMount>>> = Arc::default();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let removal = {
+        let (mount, inner) = (Arc::clone(&mount), inner.clone());
+        std::thread::spawn(move || {
+            // The hook belongs to the thread that removes, and the mount is placed by it.
+            let _hook = at_removal_step(move |reached, directory| {
+                if reached == RemovalStep::Emptied && directory == "tree/branch/inner" {
+                    let placed = HungMount::attach(&inner).expect("the mount is placed");
+                    *mount.lock().expect("the mount's holder") = Some(placed);
+                }
+            });
+            let _ = sender.send(authority.remove_tree(&name, opened));
+        })
+    };
+    let outcome = receiver.recv_timeout(HUNG_REMOVAL_DEADLINE);
+    // Letting the mount go ends a call that is still waiting on it, so the thread can be joined
+    // whatever the outcome was.
+    drop(mount.lock().expect("the mount's holder").take());
+    removal.join().expect("the removal's thread ends");
+    let refusal = outcome
+        .expect("the removal waits on a mount that never answers")
+        .expect_err("a mount on the directory stops the removal");
+    let Escape::RemovalStopped {
+        stopped_at, reason, ..
+    } = &refusal
+    else {
+        panic!("the refusal is a stopped removal: {refusal}");
+    };
+    assert_eq!(
+        stopped_at, "tree/branch/inner",
+        "it stops at the directory the mount is on"
+    );
+    assert!(
+        matches!(**reason, Escape::IdentityChanged { .. }),
+        "because its name no longer holds the directory that was emptied: {reason}"
     );
 }
 
