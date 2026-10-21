@@ -3385,8 +3385,8 @@ impl Broker {
         let (_, settled) = state.settle_ended(scope, kr_ipc::now_ms());
         state.gateway.close(connection);
         state.connection_dispatch.remove(&connection);
-        // What the connection's evidence said ends with it.
-        if held.reading.is_some() || held.origin.may_forward_natively() {
+        // What the connection's own evidence said ends with it.
+        if held.reading.is_some() {
             state.withdraw_gateway_evidence(held.application_instance_id, kr_ipc::now_ms());
         }
         // What it settled, here or before, is final now that nothing can name it on a connection
