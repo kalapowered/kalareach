@@ -269,7 +269,10 @@ impl Settled {
 ///
 /// `found` is the directory's device number and inode, `found_filesystem` the filesystem it is
 /// on, and `above` the device number of the directory it is in, which is read only when it is
-/// needed. `None` says it is not the recorded directory.
+/// needed. `Ok(None)` says it is not the recorded directory. `above` answers `Ok(None)` on a
+/// platform that numbers a filesystem once and so never reads the device above, and an error when
+/// a read that is made fails: that is passed on, because a directory whose parent could not be
+/// read has not been shown to be another directory.
 ///
 /// The inode decides which object it is, and the filesystem decides which filesystem it is on. A
 /// directory under another device number is the recorded one when the filesystem is the recorded
@@ -282,34 +285,37 @@ impl Settled {
 /// Remove the reading of a record without a usable filesystem, and the columns each store adds
 /// for it, once no supported upgrade starts from a store written before filesystems were
 /// recorded; a record that no use has settled by then is refused.
-#[must_use]
-pub(crate) fn settle(
+///
+/// # Errors
+///
+/// Returns what `above` returns when the device above is needed and cannot be read.
+pub(crate) fn settle<E>(
     expected: RecordedIdentity,
     found: ObjectIdentity,
     found_filesystem: FilesystemId,
-    above: impl FnOnce() -> Option<u64>,
-) -> Option<Settled> {
+    above: impl FnOnce() -> Result<Option<u64>, E>,
+) -> Result<Option<Settled>, E> {
     if expected.object.file_id != found.file_id {
-        return None;
+        return Ok(None);
     }
     if let Some(recorded) = expected.filesystem
         && !recorded.is_none()
         && recorded != found_filesystem
     {
-        return None;
+        return Ok(None);
     }
-    if expected.object.device != found.device && above() != Some(found.device) {
-        return None;
+    if expected.object.device != found.device && above()? != Some(found.device) {
+        return Ok(None);
     }
     let now = RecordedIdentity {
         object: found,
         filesystem: Some(found_filesystem),
     };
-    Some(if expected == now {
+    Ok(Some(if expected == now {
         Settled::AsRecorded
     } else {
         Settled::Revised { was: expected, now }
-    })
+    }))
 }
 
 /// Returns the identity of the filesystem an open directory is on.
@@ -414,10 +420,22 @@ mod tests {
         RecordedIdentity::from_parts(device, file_id, filesystem)
     }
 
+    /// Settles with the device above read as `above` gives it: a number, or none on a platform
+    /// that never reads it.
+    fn decide(
+        expected: RecordedIdentity,
+        found: ObjectIdentity,
+        found_filesystem: FilesystemId,
+        above: impl FnOnce() -> Option<u64>,
+    ) -> Option<Settled> {
+        settle::<std::convert::Infallible>(expected, found, found_filesystem, || Ok(above()))
+            .unwrap_or_else(|never| match never {})
+    }
+
     #[test]
     fn a_directory_on_the_recorded_filesystem_under_the_recorded_numbers_is_as_recorded() {
         assert_eq!(
-            settle(
+            decide(
                 recorded(7, 42, Some(FIRST)),
                 object(7, 42),
                 FIRST,
@@ -432,7 +450,7 @@ mod tests {
         // A filesystem attached in place of another one is given the device number the first had,
         // and a filesystem built in the same order gives its directories the same inodes.
         assert_eq!(
-            settle(
+            decide(
                 recorded(7, 42, Some(FIRST)),
                 object(7, 42),
                 SECOND,
@@ -447,17 +465,18 @@ mod tests {
         let now = recorded(9, 42, Some(FIRST));
         let was = recorded(7, 42, Some(FIRST));
         assert_eq!(
-            settle(was, object(9, 42), FIRST, || Some(9)),
+            decide(was, object(9, 42), FIRST, || Some(9)),
             Some(Settled::Revised { was, now })
         );
     }
 
     #[test]
     fn a_directory_that_is_not_on_the_filesystem_of_the_one_above_it_is_not_the_recorded_one() {
-        // Mounted over, or its parent cannot be read: the recorded filesystem is not enough.
+        // Mounted over, or on a platform that never reads the device above: the recorded
+        // filesystem is not enough.
         for above in [Some(8), None] {
             assert_eq!(
-                settle(recorded(7, 42, Some(FIRST)), object(9, 42), FIRST, || above),
+                decide(recorded(7, 42, Some(FIRST)), object(9, 42), FIRST, || above),
                 None,
                 "{above:?}"
             );
@@ -468,7 +487,7 @@ mod tests {
     fn another_inode_is_never_the_recorded_directory() {
         for filesystem in [Some(FIRST), Some(FilesystemId::NONE), None] {
             assert_eq!(
-                settle(recorded(7, 42, filesystem), object(7, 43), FIRST, || Some(
+                decide(recorded(7, 42, filesystem), object(7, 43), FIRST, || Some(
                     7
                 )),
                 None
@@ -482,41 +501,41 @@ mod tests {
         // the filesystem found becomes the record's.
         let was = recorded(7, 42, None);
         assert_eq!(
-            settle(was, object(7, 42), FIRST, || unreachable!("same device")),
+            decide(was, object(7, 42), FIRST, || unreachable!("same device")),
             Some(Settled::Revised {
                 was,
                 now: recorded(7, 42, Some(FIRST))
             })
         );
         assert_eq!(
-            settle(was, object(9, 42), FIRST, || Some(9)),
+            decide(was, object(9, 42), FIRST, || Some(9)),
             Some(Settled::Revised {
                 was,
                 now: recorded(9, 42, Some(FIRST))
             })
         );
-        assert_eq!(settle(was, object(9, 42), FIRST, || Some(8)), None);
-        assert_eq!(settle(was, object(9, 43), FIRST, || Some(9)), None);
+        assert_eq!(decide(was, object(9, 42), FIRST, || Some(8)), None);
+        assert_eq!(decide(was, object(9, 43), FIRST, || Some(9)), None);
     }
 
     #[test]
     fn a_filesystem_that_reported_none_is_decided_by_the_numbers_until_it_reports_one() {
         let was = recorded(7, 42, Some(FilesystemId::NONE));
         assert_eq!(
-            settle(was, object(7, 42), FilesystemId::NONE, || unreachable!(
+            decide(was, object(7, 42), FilesystemId::NONE, || unreachable!(
                 "same device"
             )),
             Some(Settled::AsRecorded)
         );
         assert_eq!(
-            settle(was, object(7, 42), FIRST, || unreachable!("same device")),
+            decide(was, object(7, 42), FIRST, || unreachable!("same device")),
             Some(Settled::Revised {
                 was,
                 now: recorded(7, 42, Some(FIRST))
             })
         );
         assert_eq!(
-            settle(was, object(9, 42), FilesystemId::NONE, || Some(8)),
+            decide(was, object(9, 42), FilesystemId::NONE, || Some(8)),
             None
         );
     }
@@ -524,7 +543,7 @@ mod tests {
     #[test]
     fn a_filesystem_that_stopped_reporting_its_identity_is_not_the_recorded_one() {
         assert_eq!(
-            settle(
+            decide(
                 recorded(7, 42, Some(FIRST)),
                 object(7, 42),
                 FilesystemId::NONE,

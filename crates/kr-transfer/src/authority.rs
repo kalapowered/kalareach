@@ -903,12 +903,15 @@ impl AuthorisedDirectory {
     /// # Errors
     ///
     /// Returns [`Escape::IdentityChanged`] when it is not the recorded directory, and
-    /// [`Escape::Unopenable`] when the handle cannot be asked which filesystem it is on.
+    /// [`Escape::Unopenable`] when the handle cannot be asked which filesystem it is on, or when
+    /// the directory is under another device number and the device of the directory above it, which
+    /// decides whether that is a new number or a mount, cannot be read. A read that failed is not
+    /// an answer about the directory, so it is not reported as another directory.
     pub fn check_recorded(&self, expected: RecordedIdentity) -> Result<Settled, Escape> {
         let filesystem = self.filesystem()?;
         settle(expected, self.identity, filesystem, || {
-            device_above(&self.directory, &self.display.display().to_string()).ok()
-        })
+            device_above(&self.directory, &self.display.display().to_string())
+        })?
         .ok_or_else(|| Escape::IdentityChanged {
             detail: format!(
                 "this authority was recorded for {expected} on {}, and now names {} on {}",
@@ -2499,8 +2502,12 @@ fn mount_of_file(file: &File, what: &str) -> Result<MountId, Escape> {
 
 /// Reads the device number of the directory an open directory is in, through the open directory
 /// itself. Reading it needs search permission on the directory and no descriptor.
+///
+/// # Errors
+///
+/// Returns [`Escape::Unopenable`] when the read fails.
 #[cfg(unix)]
-fn device_above(directory: &Dir, what: &str) -> Result<u64, Escape> {
+fn device_above(directory: &Dir, what: &str) -> Result<Option<u64>, Escape> {
     use std::os::fd::AsFd as _;
 
     rustix::fs::statat(
@@ -2510,23 +2517,19 @@ fn device_above(directory: &Dir, what: &str) -> Result<u64, Escape> {
     )
     // Converted as the standard library converts the device of a file's metadata, which is what
     // the identity of a directory records.
-    .map(|found| found.st_dev as _)
+    .map(|found| Some(found.st_dev as _))
     .map_err(|error| Escape::Unopenable {
         component: what.to_owned(),
         detail: error.to_string(),
     })
 }
 
-/// Reports that this platform does not read the device of the directory an open directory is in
-/// from its own handle.
+/// Says that this platform has no device above to read: a volume keeps its serial wherever it is
+/// mounted, so a directory found under another device number there is on another volume.
 #[cfg(not(unix))]
-fn device_above(_directory: &Dir, what: &str) -> Result<u64, Escape> {
-    Err(Escape::Unopenable {
-        component: what.to_owned(),
-        detail: "this host does not read the device of the directory an open directory is in \
-                 from its own handle"
-            .to_owned(),
-    })
+#[allow(clippy::unnecessary_wraps)]
+fn device_above(_directory: &Dir, _what: &str) -> Result<Option<u64>, Escape> {
+    Ok(None)
 }
 
 /// Opens the directory one open directory is in, from its own descriptor.
