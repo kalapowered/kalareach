@@ -61,6 +61,34 @@ describe('the Hosts screen of a phone', () => {
     expect(list.textContent).toContain('Can view sessions')
   })
 
+  // KR-REQ-10.38: the pairing screen of a phone speaks of this phone, offers the scanner and the
+  // picker the device reports, and gives the pairing column its sources.
+  it('speaks of this phone and offers the scanner the device reports', async () => {
+    const { controls } = start()
+    await openTab('Hosts')
+    await screen.findByRole('heading', { name: 'Pair with a host' })
+    expect(screen.queryByTestId('scan-code')).toBeNull()
+    act(() => {
+      controls.setPairing({ sources: { camera: true, photo: true } })
+    })
+    expect(await screen.findByTestId('scan-code')).toBeInTheDocument()
+    expect(screen.getByTestId('choose-photo')).toBeInTheDocument()
+    expect(screen.getByTestId('device-name').textContent).toMatch(/^This phone appears as /)
+    act(() => {
+      controls.setPairing({
+        state: {
+          state: 'awaiting_approval',
+          value: 'f3c1 46fd',
+          expires_at_ms: null,
+          rights: ['session.view'],
+          authority: 'view sessions',
+          grant_expires_at_ms: null
+        }
+      })
+    })
+    expect(await screen.findByText('Approve this phone on the host only if it shows the same value.')).toBeInTheDocument()
+  })
+
   // KR-REQ-13.08: choosing a host sends the commands there, and says which one is in use.
   it('sends the commands to the host the person chooses, and says it is in use', async () => {
     const { controls } = start()

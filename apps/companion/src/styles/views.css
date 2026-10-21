@@ -1475,6 +1475,14 @@
   overflow-wrap: anywhere;
 }
 
+/*
+ * The scanner's one control, above the code field: as wide as the column, so a thumb finds it
+ * without aiming, and as tall as every control is.
+ */
+.pairing-scan .button {
+  width: 100%;
+}
+
 /* A heading breaks at a syllable where the engine knows them, before it breaks anywhere. */
 .pairing-section h1 {
   hyphens: auto;
