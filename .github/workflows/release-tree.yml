@@ -204,7 +204,8 @@ jobs:
         run: cargo test --locked -p kr-release --test release_tree -- --include-ignored
 
       # Every Mach-O or ELF file the release carries is held to the baseline its target runs on:
-      # the host's programs, the shells' programs and the modules a shell loads.
+      # the host's programs, the shells' programs and the modules a shell loads, found by what a
+      # file is and not by its name, since a loadable builtin has no extension.
       - name: Read each floor back
         run: |
           files=()
@@ -215,7 +216,7 @@ jobs:
             if file -b "$file" | grep -q -E 'Mach-O|ELF'; then
               files+=("$file")
             fi
-          done < <(find "$RUNNER_TEMP/shells" -type f \( -path '*/bin/*' -o -name '*.so' -o -name '*.dylib' \) -print0)
+          done < <(find "$RUNNER_TEMP/shells" -type f -print0)
           {
             echo "### $TARGET: ${#files[@]} files"
             echo '```'
