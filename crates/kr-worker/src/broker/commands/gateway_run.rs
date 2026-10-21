@@ -48,6 +48,15 @@ use super::{Backend, BackendState, GATEWAY_SOCKET, verify};
 /// when this is over.
 pub(super) const CONNECTION_DEADLINE: Duration = Duration::from_secs(30);
 
+/// How long the session's views are given to be told what the program's connection settled when
+/// it ended, after the server's end has been started.
+///
+/// The telling ends by itself once the connection's observation is withdrawn, after one last
+/// reading of the outbox, so this only bounds a view that cannot be reached. A view the bound
+/// leaves behind is told to resynchronise, because it may have missed the cancellation of a
+/// request the program left unanswered.
+pub(super) const DELIVERY_BOUND: Duration = Duration::from_secs(2);
+
 /// How long starting the server, recording it and binding the socket may take together: less than
 /// the two seconds the launcher waits for the commitment, so the launch is given back before the
 /// launcher gives up on it.
@@ -192,6 +201,38 @@ impl Backend {
     pub(super) fn end_unless_closing(&self) {
         if !self.closing.load(Ordering::SeqCst) {
             self.end_gateway();
+        }
+    }
+
+    /// Waits for the session's views to be told what the program's ended connection settled, for
+    /// at most the delivery bound. A view that could not be reached in time, or whose telling
+    /// failed, is told to resynchronise before the task is ended, and fetches the state afresh.
+    async fn finish_delivery(&self, mut delivering: tokio::task::JoinHandle<()>) {
+        let Some(run) = self.gateway_run.as_ref() else {
+            delivering.abort();
+            return;
+        };
+        #[cfg(feature = "testing")]
+        let hold = run
+            .delivery_hold
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let told = tokio::time::timeout(run.delivery_bound, async {
+            #[cfg(feature = "testing")]
+            if let Some(hold) = hold {
+                let _ = hold.await;
+            }
+            (&mut delivering).await
+        })
+        .await;
+        if !matches!(told, Ok(Ok(()))) {
+            if let Some(runtime) = self.runtime() {
+                runtime
+                    .session()
+                    .resync_all_views(kr_protocol::recovery::ResyncReason::AgentStreamGap);
+            }
+            delivering.abort();
         }
     }
 
@@ -479,12 +520,18 @@ async fn handle(
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&attached.owner));
     let backend = Arc::clone(backend);
+    let broker = Arc::clone(broker);
     tokio::spawn(async move {
         let _ = attached.served().await;
-        if let Some(delivering) = delivering {
-            delivering.abort();
-        }
-        // The connection is over, and nothing is left for the server to serve.
+        // The connection's teardown closed it. A task that could not be joined never reached that
+        // teardown, and a connection left open would keep what it left unresolved pending for
+        // ever; closing one that is closed does nothing.
+        broker.close_connection(connection);
+        // The connection is over, and nothing is left for the server to serve. Its end is started
+        // before the views are waited for, so a view that is slow cannot hold a stop.
         backend.end_unless_closing();
+        if let Some(delivering) = delivering {
+            backend.finish_delivery(delivering).await;
+        }
     });
 }

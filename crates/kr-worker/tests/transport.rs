@@ -1662,17 +1662,18 @@ async fn kr_req_11_35_a_faulted_journal_refuses_reverse_writes_and_keeps_reads()
 }
 
 /// KR-REQ-11.27, KR-REQ-12.16 and section 24: a process that ends after the marker and before the
-/// operation leaves the request uncertain, and nothing after the restart runs it.
+/// operation leaves the request claimed with its marker, and nothing after the restart runs it.
 ///
 /// What a restart reads is the journal's committed state, and this test takes that state as a copy
 /// made at the moment the process stops, while the operation is held after its marker. The
-/// restarted broker reads the copy: the request comes back with its marker, a reconciliation leaves
-/// it uncertain rather than answerable, and the upstream sending the same request again on the
-/// restored connection is refused as the request it already is. It proves what recovery does with
-/// the committed record; the platform's own durability under an abrupt stop is not what it tests.
+/// restarted broker reads the copy: the request comes back claimed, with its marker and its one
+/// admission spent, so no writer takes it again, and the restarted broker's connections are
+/// numbered above the old one, so nothing it serves can name that request. Nothing reopens the old
+/// connection, so there is no restored connection for the upstream to send the request on again:
+/// that half of the clause has no production path. The case proves what the restart does with the
+/// committed record; the platform's own durability under an abrupt stop is not what it tests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_11_27_a_crash_after_the_marker_leaves_the_write_uncertain_and_never_runs_it_again()
-{
+async fn kr_req_11_27_a_crash_after_the_marker_leaves_the_write_claimed_and_never_runs_it_again() {
     let scratch = private_directory();
     let journal = scratch.join("journal.db");
     let (broker, connection) = broker_at(&journal);
@@ -1707,9 +1708,12 @@ async fn kr_req_11_27_a_crash_after_the_marker_leaves_the_write_uncertain_and_ne
         )
         .expect("the journal is copied as the crash left it");
 
-    // The restart. Its own connection is numbered above the old one, and the old one is restored
-    // for the upstream that comes back to it.
-    let (restarted, _) = broker_at(&copied);
+    // The restart. Its own connection is numbered above the old one.
+    let (restarted, new_connection) = broker_at(&copied);
+    assert!(
+        new_connection.get() > connection.get(),
+        "a new connection is numbered above every identifier the ledger holds"
+    );
     let recorded = restarted
         .recorded(resource_id)
         .expect("the ledger reads")
@@ -1719,41 +1723,13 @@ async fn kr_req_11_27_a_crash_after_the_marker_leaves_the_write_uncertain_and_ne
         PendingState::Claimed,
         "claimed, with its marker"
     );
-    restarted
-        .restore_native_connection(
-            connection,
-            instance(),
-            &CREDENTIAL,
-            &process_identity(),
-            &package(),
-            "1",
-        )
-        .expect("the old connection is restored");
-    grant_files(&restarted, &directory, FileAccess::ReadWrite);
-    let reconciled = restarted
-        .reconcile(
-            kr_worker::broker::ReconcileScope {
-                application_instance_id: instance(),
-                connection,
-            },
-            std::slice::from_ref(&recorded.request),
-            TimestampMs::new(3),
-        )
-        .expect("the upstream is reconciled");
-    assert_eq!(
-        reconciled.uncertain,
-        vec![resource_id],
-        "an operation that may have run is uncertain, never answerable again"
-    );
-    let replay = duplex_watched_on(&restarted, connection).await;
     assert!(
-        replay
-            .owner
-            .from_upstream(request.as_bytes(), TimestampMs::new(4))
-            .await
-            .is_err(),
-        "the same request on the restored connection is the request it already is"
+        restarted.pending(resource_id).is_some_and(|resource| {
+            resource.state == PendingState::Claimed && resource.request.connection == connection
+        }),
+        "the restarted broker holds it as it was: claimed, with its marker, on the old connection"
     );
+    grant_files(&restarted, &directory, FileAccess::ReadWrite);
 
     // The process that stopped never goes on. Its operation is abandoned where it stood, and the
     // absence of the file is read once that operation has finished and its resource has settled,
@@ -1773,10 +1749,10 @@ async fn kr_req_11_27_a_crash_after_the_marker_leaves_the_write_uncertain_and_ne
         restarted
             .pending(resource_id)
             .map(|resource| resource.state),
-        Some(PendingState::Uncertain)
+        Some(PendingState::Claimed),
+        "and nothing after the restart gave it another state or another answer"
     );
     served.drained.abort();
-    replay.drained.abort();
     let _ = std::fs::remove_dir_all(&directory);
     let _ = std::fs::remove_dir_all(&scratch);
 }
@@ -8206,7 +8182,7 @@ async fn kr_req_11_35_a_journal_fault_under_live_traffic_keeps_native_progress_a
         "a committed gap is not a reconciled upstream"
     );
     assert!(
-        broker.reconcile_connected(TimestampMs::new(21)).is_some(),
+        broker.reconcile_owed(TimestampMs::new(21)).is_some(),
         "the one upstream owed is reconciled from what its connection carried"
     );
     let resumed = broker
@@ -8317,7 +8293,7 @@ async fn kr_req_11_35_a_ledger_refusing_a_marker_under_live_traffic_raises_the_o
     broker
         .recover(TimestampMs::new(30))
         .expect("the broker commits its gap");
-    assert!(broker.reconcile_connected(TimestampMs::new(31)).is_some());
+    assert!(broker.reconcile_owed(TimestampMs::new(31)).is_some());
     assert_eq!(
         broker
             .recorded(eleven)
@@ -8344,15 +8320,16 @@ async fn kr_req_11_35_a_ledger_refusing_a_marker_under_live_traffic_raises_the_o
     );
 }
 
-/// KR-REQ-11.37: the host reconciles a connection from its own record only when that record is
-/// the whole of what its upstream saw, and only once none of its answers is still in flight.
+/// KR-REQ-11.37: the host reconciles an open connection from its own record only once none of its
+/// answers is still in flight, and a connection that ended inside the gap owes the recovery
+/// nothing.
 ///
 /// Connection 1 stays open through the gap with a rich answer admitted and not yet sent; it is
-/// reconciled once that answer is given up. Connection 2 closes during the gap and is restored: its
-/// upstream was out of reach for part of it, so the host does not speak for it, and rich work waits
-/// for that upstream to say what it still holds.
+/// reconciled once that answer is given up. Connection 2 ends inside the gap: its end settled what
+/// it left as a transition of the gap, so rich work does not wait for it, and the recovery commits
+/// that settlement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_11_37_reconciliation_waits_for_answers_in_flight_and_for_an_interrupted_upstream() {
+async fn kr_req_11_37_reconciliation_waits_for_answers_in_flight_and_not_for_an_ended_connection() {
     let mut store = common::SharedStore::open();
     let (broker, first) = broker_from(
         Broker::open(Some(&store.path), session(), store.health()).expect("the broker opens"),
@@ -8387,61 +8364,38 @@ async fn kr_req_11_37_reconciliation_waits_for_answers_in_flight_and_for_an_inte
         broker.mode(),
         kr_protocol::gateway::GatewayMode::NativeOnlyVolatile
     );
-    // Connection 2 ends inside the gap and its upstream comes back to it.
+    // Connection 2 ends inside the gap.
     broker.close_connection(second);
-    broker
-        .restore_native_connection(
-            second,
-            instance(),
-            &CREDENTIAL,
-            &process_identity(),
-            &package(),
-            "1",
-        )
-        .expect("the connection is restored");
 
     store.recover_journal(10);
     broker
         .recover(TimestampMs::new(10))
         .expect("the broker commits its gap");
     assert!(
-        broker.reconcile_connected(TimestampMs::new(11)).is_none(),
-        "an answer in flight on 1 and an interrupted upstream on 2 are both still owed"
+        broker.reconcile_owed(TimestampMs::new(11)).is_none(),
+        "an answer in flight on 1 is still owed"
     );
     assert_eq!(broker.mode(), kr_protocol::gateway::GatewayMode::Recovering);
 
-    // The answer in flight is given up: connection 1 carried all of the gap and is reconciled now.
+    // The answer in flight is given up: connection 1 carried all of the gap and is reconciled now,
+    // and connection 2 owed nothing, so rich work returns.
     broker.abandon(&admitted);
-    assert!(
-        broker.reconcile_connected(TimestampMs::new(12)).is_none(),
-        "connection 2's upstream has still not said what it holds"
-    );
-    assert_eq!(broker.mode(), kr_protocol::gateway::GatewayMode::Recovering);
     assert_eq!(
         broker.pending(held).expect("held").state,
         PendingState::Pending
     );
-
-    // Connection 2's upstream says it still holds its request, and rich work returns.
-    let (_, finished) = broker
-        .reconcile_recovered(
-            broker.recovery_generation(),
-            kr_worker::broker::ReconcileScope {
-                application_instance_id: instance(),
-                connection: second,
-            },
-            &[Broker::downstream(
-                second,
-                kr_protocol::ids::UpstreamRequestId::new("2").expect("valid"),
-            )],
-            TimestampMs::new(13),
-        )
-        .expect("the restored upstream reconciles");
-    assert!(finished.is_some());
-    assert_eq!(broker.mode(), kr_protocol::gateway::GatewayMode::Normal);
+    let finished = broker
+        .reconcile_owed(TimestampMs::new(12))
+        .expect("nothing is owed any more");
+    assert_eq!(finished.to, kr_protocol::gateway::GatewayMode::Normal);
     assert_eq!(
-        broker.pending(elsewhere).expect("held").state,
-        PendingState::Pending
+        broker
+            .recorded(elsewhere)
+            .expect("the ledger reads")
+            .expect("recorded")
+            .state,
+        PendingState::Cancelled,
+        "what connection 2 left was settled by its end, and the recovery committed it"
     );
     owner.shutdown();
     other.owner.shutdown();

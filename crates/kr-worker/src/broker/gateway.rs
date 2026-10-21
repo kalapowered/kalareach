@@ -183,7 +183,7 @@ impl PreparedResponse {
 ///
 /// The core declarative table reads top-level members, and a channel's frames carry what their
 /// table reads inside `params`, so a channel is a connection of its own kind. It observes its
-/// instance, joins a gap's continuous set and is closed like any other connection; what reads a
+/// instance and is closed like any other connection; what reads a
 /// declarative table's shape (a response's correlation, a reverse request, a rich admission, a
 /// native client's own request) does not know it, and refuses it as an unknown connection.
 #[derive(Clone, Debug)]
@@ -226,8 +226,8 @@ pub struct ReverseRequest {
 
 /// The gateway's connections and the tables they are interpreted with.
 ///
-/// The two kinds are kept apart. What every connection has (an instance it observes, a place in a
-/// gap's continuous set, a provenance) is answered for both; what reads a table is answered by the
+/// The two kinds are kept apart. What every connection has (an instance it observes, a
+/// provenance) is answered for both; what reads a table is answered by the
 /// kind's own table.
 #[derive(Debug, Default)]
 pub struct Gateway {
@@ -390,16 +390,6 @@ impl Gateway {
     pub fn provenance(&self, connection: GatewayConnectionId) -> Option<ActionProvenance> {
         self.contains(connection)
             .then_some(ActionProvenance::UpstreamTypedRpc)
-    }
-
-    /// Returns every open connection whose upstream is on the far side of this host's own owner:
-    /// a worker-launched native terminal's, and every native bridge channel.
-    pub fn native_connections(&self) -> impl Iterator<Item = GatewayConnectionId> + '_ {
-        self.connections
-            .values()
-            .filter(|connection| connection.origin.may_forward_natively())
-            .map(|connection| connection.connection)
-            .chain(self.channels.keys().copied())
     }
 
     /// Returns every connection of either kind to one instance, so a resolution can be fanned

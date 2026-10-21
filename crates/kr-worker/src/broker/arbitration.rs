@@ -148,27 +148,14 @@ impl Transition {
     }
 }
 
-/// What a reconnect found.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Reconciliation {
-    /// Resources the upstream still has pending, which stay exactly as they were.
-    pub still_pending: Vec<PendingResourceId>,
-    /// Resources this host may already have answered, now uncertain and never reissued.
-    pub uncertain: Vec<PendingResourceId>,
-    /// Resources the upstream no longer has, which it resolved itself.
-    pub withdrawn: Vec<PendingResourceId>,
-    /// Claims that were never dispatched, released back to pending for a fresh answer.
-    pub released: Vec<PendingResourceId>,
-}
-
 /// Which resources one reconciliation is about.
 ///
-/// A reconnect knows what one upstream connection still has pending. It knows nothing about any
-/// other, so applying its list to every resource this broker holds would cancel other upstreams'
-/// requests for the crime of not being on a list that was never about them.
+/// A reconciliation knows what one upstream connection still has pending. It knows nothing about
+/// any other, so applying its list to every resource this broker holds would cancel other
+/// upstreams' requests for the crime of not being on a list that was never about them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReconcileScope {
-    /// The application instance that reconnected.
+    /// The application instance whose connection is reconciled.
     pub application_instance_id: ApplicationInstanceId,
     /// The gateway connection whose identifiers the list names.
     pub connection: kr_protocol::ids::GatewayConnectionId,
@@ -688,7 +675,8 @@ impl Arbitration {
         expired
     }
 
-    /// Plans the reconciliation of one upstream's records with what it still has pending.
+    /// Plans the reconciliation of one connection's records with what its upstream still has
+    /// pending.
     ///
     /// The three outcomes are the whole contract:
     ///
@@ -698,8 +686,8 @@ impl Arbitration {
     ///   Asking again is the one thing that must not happen, because the answer may already have
     ///   been applied.
     ///
-    /// Only resources inside `scope` are considered. A reconnect speaks for one upstream on one
-    /// connection and for nothing else.
+    /// Only resources inside `scope` are considered. A reconciliation speaks for one upstream on
+    /// one connection and for nothing else. A connection whose upstream is gone lists nothing.
     ///
     /// Nothing is applied here. The caller writes each transition durably and commits it, the
     /// same way it does for a single resource.
@@ -708,11 +696,10 @@ impl Arbitration {
         &self,
         scope: ReconcileScope,
         still_open: &[DownstreamRequestId],
-    ) -> (Reconciliation, Vec<Transition>) {
+    ) -> Vec<Transition> {
         let open: std::collections::BTreeSet<&DownstreamRequestId> = still_open.iter().collect();
-        let mut result = Reconciliation::default();
         let mut transitions = Vec::new();
-        for (resource_id, pending) in &self.by_id {
+        for pending in self.by_id.values() {
             if pending.resource.state.is_terminal() {
                 continue;
             }
@@ -721,25 +708,12 @@ impl Arbitration {
             {
                 continue;
             }
-            let upstream_has_it = open.contains(&pending.resource.request);
-            let to = match (upstream_has_it, pending.dispatched) {
-                (_, true) => {
-                    result.uncertain.push(*resource_id);
-                    PendingState::Uncertain
-                }
-                (true, false) => {
-                    if pending.resource.state == PendingState::Claimed {
-                        result.released.push(*resource_id);
-                        PendingState::Pending
-                    } else {
-                        result.still_pending.push(*resource_id);
-                        continue;
-                    }
-                }
-                (false, false) => {
-                    result.withdrawn.push(*resource_id);
-                    PendingState::Cancelled
-                }
+            let to = if pending.dispatched {
+                PendingState::Uncertain
+            } else if open.contains(&pending.resource.request) {
+                continue;
+            } else {
+                PendingState::Cancelled
             };
             let mut resource = pending.resource.clone();
             resource.state = to;
@@ -750,13 +724,10 @@ impl Arbitration {
                 holds_claim: false,
                 dispatched: pending.dispatched,
                 transmitter: None,
-                // A resource that goes back to answerable gives its transmission admission back
-                // with its claim. Leaving the old reservation would make it a resource that says
-                // it is pending and that nobody can answer.
-                releases_transmitter: to == PendingState::Pending,
+                releases_transmitter: false,
             });
         }
-        (result, transitions)
+        transitions
     }
 
     /// Marks every unresolved resource volatile, and returns the records that changed.
@@ -961,12 +932,18 @@ mod tests {
         arbitration: &mut Arbitration,
         scope: ReconcileScope,
         still_open: &[DownstreamRequestId],
-    ) -> Reconciliation {
-        let (result, transitions) = arbitration.plan_reconcile(scope, still_open);
-        for transition in transitions {
+    ) {
+        for transition in arbitration.plan_reconcile(scope, still_open) {
             arbitration.commit(transition).expect("committed");
         }
-        result
+    }
+
+    fn state_of(arbitration: &Arbitration, resource_id: PendingResourceId) -> PendingState {
+        arbitration
+            .get(resource_id)
+            .expect("recorded")
+            .resource
+            .state
     }
 
     /// Takes a claim and applies it, the way the broker does under its lock.
@@ -1010,10 +987,10 @@ mod tests {
         let mut arbitration = Arbitration::new();
         let resource = resource(7, "11");
         let resource_id = resource.resource_id;
-        let request = resource.request.clone();
         arbitration.record(resource, None, None).expect("recorded");
         let released = claim(&mut arbitration, resource_id, "device-1", 2).expect("claimed");
-        reconcile(&mut arbitration, scope(), &[request]);
+        let gives_back = arbitration.plan_release(&released).expect("planned");
+        arbitration.commit(gives_back).expect("committed");
         // The same actor claims again. The old claim names an older attempt and must not resolve
         // the new one.
         let fresh = claim(&mut arbitration, resource_id, "device-1", 3).expect("claimed again");
@@ -1100,14 +1077,20 @@ mod tests {
         let marker = arbitration.plan_dispatched(&held).expect("planned");
         arbitration.commit(marker).expect("the marker is committed");
 
-        let reconciliation = reconcile(
+        reconcile(
             &mut arbitration,
             scope(),
             &[dispatched_request, untouched_request],
         );
-        assert_eq!(reconciliation.uncertain, vec![dispatched_id]);
-        assert_eq!(reconciliation.still_pending, vec![untouched_id]);
-        assert_eq!(reconciliation.withdrawn, vec![withdrawn_id]);
+        assert_eq!(
+            state_of(&arbitration, dispatched_id),
+            PendingState::Uncertain
+        );
+        assert_eq!(state_of(&arbitration, untouched_id), PendingState::Pending);
+        assert_eq!(
+            state_of(&arbitration, withdrawn_id),
+            PendingState::Cancelled
+        );
         assert!(
             claim(&mut arbitration, dispatched_id, "device-1", 5).is_err(),
             "an uncertain resource is never answered again"
@@ -1140,8 +1123,8 @@ mod tests {
             .expect("recorded");
 
         // The reconnect lists nothing. Only its own resource is withdrawn.
-        let reconciliation = reconcile(&mut arbitration, scope(), &[]);
-        assert_eq!(reconciliation.withdrawn, vec![mine_id]);
+        reconcile(&mut arbitration, scope(), &[]);
+        assert_eq!(state_of(&arbitration, mine_id), PendingState::Cancelled);
         assert_eq!(
             arbitration
                 .get(another_instance_id)
@@ -1158,28 +1141,6 @@ mod tests {
                 .state,
             PendingState::Pending
         );
-    }
-
-    #[test]
-    fn a_claim_that_never_dispatched_is_released_by_a_reconnect() {
-        let mut arbitration = Arbitration::new();
-        let resource = resource(7, "11");
-        let resource_id = resource.resource_id;
-        let request = resource.request.clone();
-        arbitration.record(resource, None, None).expect("recorded");
-        claim(&mut arbitration, resource_id, "device-1", 2).expect("claimed");
-        let reconciliation = reconcile(&mut arbitration, scope(), &[request]);
-        assert_eq!(reconciliation.released, vec![resource_id]);
-        assert_eq!(
-            arbitration
-                .get(resource_id)
-                .expect("recorded")
-                .resource
-                .state,
-            PendingState::Pending
-        );
-        claim(&mut arbitration, resource_id, "device-2", 3)
-            .expect("a fresh answer may claim it again");
     }
 
     #[test]

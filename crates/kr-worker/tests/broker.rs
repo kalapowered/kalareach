@@ -36,7 +36,7 @@ use kr_worker::broker::bridge::BridgeProcess;
 use kr_worker::broker::connectors::{DECISION_SCHEMA, InstalledConnector, decoding_trust, fixture};
 use kr_worker::broker::{
     Broker, BrokerError, BrokerTransport, Caller, Credential, ForegroundMark, Invocation, Ledger,
-    ManagedProcess, MutationAdmission, PackageIdentity, PendingTransmission, Probe, ReconcileScope,
+    ManagedProcess, MutationAdmission, PackageIdentity, PendingTransmission, Probe,
     RegisteredAction, TransportHandle, UpstreamArrival, UpstreamBody, UpstreamDispatch,
     UpstreamOutcome, UpstreamRequest, subject,
 };
@@ -155,13 +155,6 @@ fn request(connection: u64, id: &str) -> DownstreamRequestId {
         GatewayConnectionId::new(connection),
         UpstreamRequestId::new(id).expect("valid"),
     )
-}
-
-fn scope(instance_id: ApplicationInstanceId, connection: u64) -> ReconcileScope {
-    ReconcileScope {
-        application_instance_id: instance_id,
-        connection: GatewayConnectionId::new(connection),
-    }
 }
 
 fn evidence(
@@ -1379,13 +1372,15 @@ fn kr_req_11_26_on_a_live_connection_only_the_recording_packages_decoder_interpr
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// KR-REQ-11.26: a declarative connection's requests stay the recording package's after the
-/// connection closes. Its identifier is not restored under another package's tables, and another
-/// package's decoder is refused the recorder's request. Restored under the recorder's own tables,
-/// with a transport bound again, the answer to what the recorder's decoder interpreted goes, and
-/// the request it has not read yet is its decoder's to read.
+/// KR-REQ-11.26: a declarative connection's requests stay the recording package's. Another
+/// package's decoder is refused the recorder's request even when that package's tables are pinned
+/// for the instance, the recorder's own request stays answerable, and the recorder's decoder
+/// reads the request it has not read yet.
+///
+/// The case has no restoration half: no entry reopens a closed connection under any package's
+/// tables, so the question of whose tables would read a restored identifier does not arise.
 #[tokio::test]
-async fn kr_req_11_26_a_restored_identifier_leaves_its_requests_the_recording_packages() {
+async fn kr_req_11_26_a_connections_requests_stay_the_recording_packages() {
     let broker = broker_with(
         BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
         Some(trust(&[permission_method()], true)),
@@ -1394,8 +1389,6 @@ async fn kr_req_11_26_a_restored_identifier_leaves_its_requests_the_recording_pa
     let interpreted = offer(&broker, instance(2), binding(9), "11", 2)
         .expect("the recording package's decoder interprets it");
     let unread = forward(&broker, "12", 4).expect("forwarded");
-    let connection = GatewayConnectionId::new(1);
-    broker.close_connection(connection);
 
     broker
         .pin_table(
@@ -1405,20 +1398,6 @@ async fn kr_req_11_26_a_restored_identifier_leaves_its_requests_the_recording_pa
             rich_table(),
         )
         .expect("another package's tables are pinned");
-    let refusal = broker
-        .restore_native_connection(
-            connection,
-            instance(2),
-            &CREDENTIAL,
-            &process_identity(41, 900),
-            &other_package().plugin_id,
-            "1",
-        )
-        .expect_err("the identifier is not restored under another package's tables");
-    assert!(
-        matches!(refusal, BrokerError::PermissionDenied { .. }),
-        "{refusal}"
-    );
     let refusal = broker
         .interpret(
             binding(10),
@@ -1438,16 +1417,6 @@ async fn kr_req_11_26_a_restored_identifier_leaves_its_requests_the_recording_pa
         "and the recorder's request stays answerable"
     );
 
-    broker
-        .restore_native_connection(
-            connection,
-            instance(2),
-            &CREDENTIAL,
-            &process_identity(41, 900),
-            &package(),
-            "1",
-        )
-        .expect("the identifier is restored under the recorder's own tables");
     let upstream = carry_answers(&broker);
     answer(&broker, interpreted.resource_id, "allow", 7)
         .await
@@ -1473,37 +1442,40 @@ async fn kr_req_11_26_a_restored_identifier_leaves_its_requests_the_recording_pa
 }
 
 /// KR-REQ-11.26 and KR-REQ-11.27: a connection identifier keeps the package it first recorded
-/// requests under, for good. Restoring it under another package's tables is refused in the process
-/// that recorded its requests, and after a restart, which reads the package back from the request's
-/// own record; restored under its own package's tables, the native client's answer settles what it
-/// recorded. A connection whose first request was recorded inside a gap has its package committed
-/// with the gap, and a later restart refuses it the same way.
+/// requests under, for good. The native client's answer settles what the connection recorded, and
+/// a connection whose first request was recorded inside a gap keeps its package through the
+/// recovery that commits the gap: another package's decoder is refused its request, and the
+/// recorder's decoder reads it.
+///
+/// The case has no restart half: no entry reopens a connection after a restart, so no identifier
+/// is read back under any package's tables.
 #[tokio::test]
-async fn kr_req_11_26_a_connection_identifier_keeps_its_package_across_a_restart() {
+async fn kr_req_11_26_a_connection_keeps_its_package_through_a_gap() {
     let mut store = common::SharedStore::open();
     let path = store.path.clone();
+    let broker = Broker::open(Some(&path), session(), store.health()).expect("the broker opens");
+    broker
+        .register_instance(
+            instance(2),
+            IntegrationMode::Gateway,
+            None,
+            Some(managed(instance(2))),
+        )
+        .expect("the instance is registered");
     let other = other_package();
-    let register_and_pin = |broker: &Broker| {
-        broker
-            .register_instance(
-                instance(2),
-                IntegrationMode::Gateway,
-                None,
-                Some(managed(instance(2))),
-            )
-            .expect("the instance is registered");
-        broker
-            .pin_table(instance(2), installed(), declarative_table(), rich_table())
-            .expect("the installed tables are pinned");
-        broker
-            .pin_table(
-                instance(2),
-                other.clone(),
-                declarative_table_of(&other),
-                rich_table(),
-            )
-            .expect("another package's tables are pinned");
-    };
+    broker
+        .pin_table(instance(2), installed(), declarative_table(), rich_table())
+        .expect("the installed tables are pinned");
+    broker
+        .pin_table(
+            instance(2),
+            other.clone(),
+            declarative_table_of(&other),
+            rich_table(),
+        )
+        .expect("another package's tables are pinned");
+    bind_decoder(&broker, binding(9), &installed());
+    bind_decoder(&broker, binding(10), &other);
     let open = |broker: &Broker| {
         broker
             .open_native_connection(
@@ -1515,103 +1487,82 @@ async fn kr_req_11_26_a_connection_identifier_keeps_its_package_across_a_restart
             )
             .expect("the native connection is authenticated")
     };
-    let restore = |broker: &Broker, connection: GatewayConnectionId, plugin_id: &PluginId| {
-        broker.restore_native_connection(
+
+    let connection = open(&broker);
+    let recorded = forward(&broker, "11", 2).expect("recorded");
+    let answered = broker
+        .native_answer_through(
             connection,
-            instance(2),
-            &CREDENTIAL,
-            &process_identity(41, 900),
-            plugin_id,
-            "1",
+            br#"{"id":11,"result":{"outcome":"allow"}}"#,
+            TimestampMs::new(3),
+            |_| Ok(()),
         )
-    };
-    let refused = |outcome: Result<(), BrokerError>, what: &str| {
-        let refusal = outcome.expect_err(what);
-        assert!(
-            matches!(refusal, BrokerError::PermissionDenied { .. }),
-            "{what}: {refusal}"
-        );
-    };
+        .expect("the native client's answer is carried");
+    assert_eq!(answered.resource_id, recorded.resource_id);
+    assert_eq!(answered.state, PendingState::Resolved);
 
-    let recorded = {
-        let broker =
-            Broker::open(Some(&path), session(), store.health()).expect("the broker opens");
-        register_and_pin(&broker);
-        let connection = open(&broker);
-        let recorded = forward(&broker, "11", 2).expect("recorded");
-        broker.close_connection(connection);
-        refused(
-            restore(&broker, connection, &other.plugin_id),
-            "another package's tables do not read this identifier's requests",
-        );
-        recorded.resource_id
-    };
-
-    let gapped = {
-        let broker =
-            Broker::open(Some(&path), session(), store.health()).expect("the broker reopens");
-        register_and_pin(&broker);
-        let connection = GatewayConnectionId::new(1);
-        refused(
-            restore(&broker, connection, &other.plugin_id),
-            "the restart reads whose requests the identifier holds",
-        );
-        restore(&broker, connection, &package()).expect("restored under its own package's tables");
-        let answered = broker
-            .native_answer_through(
-                connection,
-                br#"{"id":11,"result":{"outcome":"allow"}}"#,
-                TimestampMs::new(3),
-                |_| Ok(()),
-            )
-            .expect("the native client's answer is carried");
-        assert_eq!(answered.resource_id, recorded);
-        assert_eq!(answered.state, PendingState::Resolved);
-
-        let gapped = open(&broker);
-        broker
-            .refuse_ledger_writes(true)
-            .expect("the store is put in query-only mode");
-        let during = broker
-            .forward_native(
-                gapped,
-                permission_frame("21").as_bytes(),
-                TimestampMs::new(4),
-            )
-            .expect("the native request is still recorded")
-            .1
-            .expect("it expects a response");
-        assert_eq!(
-            during.durability,
-            kr_protocol::session::Durability::Volatile
-        );
-        broker
-            .refuse_ledger_writes(false)
-            .expect("the store takes writes again");
-        store.recover_journal(5);
-        broker
-            .recover(TimestampMs::new(5))
-            .expect("the gap is committed");
-        gapped
-    };
-
-    let restarted =
-        Broker::open(Some(&path), session(), JournalHealth::shared()).expect("the broker reopens");
-    register_and_pin(&restarted);
-    refused(
-        restore(&restarted, gapped, &other.plugin_id),
-        "the gap committed whose requests the identifier holds",
+    let gapped = open(&broker);
+    broker
+        .refuse_ledger_writes(true)
+        .expect("the store is put in query-only mode");
+    let during = broker
+        .forward_native(
+            gapped,
+            permission_frame("21").as_bytes(),
+            TimestampMs::new(4),
+        )
+        .expect("the native request is still recorded")
+        .1
+        .expect("it expects a response");
+    assert_eq!(
+        during.durability,
+        kr_protocol::session::Durability::Volatile
     );
-    restore(&restarted, gapped, &package()).expect("restored under its own package's tables");
+    broker
+        .refuse_ledger_writes(false)
+        .expect("the store takes writes again");
+    store.recover_journal(5);
+    broker
+        .recover(TimestampMs::new(5))
+        .expect("the gap is committed");
+    assert!(
+        broker.reconcile_owed(TimestampMs::new(6)).is_some(),
+        "the recovery finishes: both connections are open"
+    );
+
+    let refusal = broker
+        .interpret(
+            binding(10),
+            during.resource_id,
+            projection(),
+            None,
+            TimestampMs::new(7),
+        )
+        .expect_err("another package's decoder does not read what the gap's connection recorded");
+    assert!(
+        matches!(refusal, BrokerError::PermissionDenied { .. }),
+        "{refusal}"
+    );
+    broker
+        .interpret(
+            binding(9),
+            during.resource_id,
+            projection(),
+            None,
+            TimestampMs::new(8),
+        )
+        .expect("the recorder's decoder reads it");
 }
 
 /// KR-REQ-11.26: a binding identifier names one package for as long as it is bound. Binding it
 /// again to another package is refused and leaves the binding as it was; the same package may bind
-/// it again. After a restart, when nothing is bound yet, an identifier bound to another package
-/// cannot answer what the first package's decoder interpreted under it, and the first package bound
-/// under it again, in a later process, can.
-#[tokio::test]
-async fn kr_req_11_26_a_binding_identifier_keeps_its_package() {
+/// it again.
+///
+/// There is no restart half: a restarted process rebuilds the binding table from nothing and
+/// nothing reopens the connection an old interpretation was answerable on, so no later process
+/// answers what an earlier one interpreted.
+#[test]
+fn kr_req_11_26_a_binding_identifier_keeps_its_package() {
     let foreign = other_package();
     let bind_as = |broker: &Broker, package: &PackageIdentity| {
         broker.bind_descriptor(
@@ -1648,81 +1599,6 @@ async fn kr_req_11_26_a_binding_identifier_keeps_its_package() {
         "and the binding is as it was"
     );
     bind_as(&broker, &installed()).expect("the same package binds it again");
-
-    // Across restarts, where a restarted process holds no binding until one is made.
-    let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
-    std::fs::create_dir_all(&directory).expect("the directory is created");
-    let path = directory.join("session.sqlite");
-    let process = |bound: &PackageIdentity| {
-        let broker = Broker::open(Some(&path), session(), JournalHealth::shared())
-            .expect("the broker opens");
-        broker
-            .register_instance(
-                instance(2),
-                IntegrationMode::Gateway,
-                None,
-                Some(managed(instance(2))),
-            )
-            .expect("the instance is registered");
-        bind_as(&broker, bound).expect("bound");
-        broker
-            .pin_table(instance(2), installed(), declarative_table(), rich_table())
-            .expect("the installed tables are pinned");
-        broker
-    };
-    let (first, second) = {
-        let broker = process(&installed());
-        broker
-            .open_native_connection(
-                instance(2),
-                &CREDENTIAL,
-                &process_identity(41, 900),
-                &package(),
-                "1",
-            )
-            .expect("the native connection is authenticated");
-        (
-            offer(&broker, instance(2), binding(9), "11", 2).expect("interpreted"),
-            offer(&broker, instance(2), binding(9), "12", 4).expect("interpreted"),
-        )
-    };
-    let restored = |broker: &Broker| {
-        broker
-            .restore_native_connection(
-                GatewayConnectionId::new(1),
-                instance(2),
-                &CREDENTIAL,
-                &process_identity(41, 900),
-                &package(),
-                "1",
-            )
-            .expect("the connection is restored under its own package's tables");
-        equip(broker)
-    };
-    {
-        let broker = process(&foreign);
-        let _upstream = restored(&broker);
-        let refusal = answer(&broker, first.resource_id, "allow", 6)
-            .await
-            .expect_err("another package bound under the identifier does not answer it");
-        assert!(
-            matches!(refusal, BrokerError::PermissionDenied { .. }),
-            "{refusal}"
-        );
-        assert_eq!(
-            broker.pending(first.resource_id).expect("held").state,
-            PendingState::Pending,
-            "refused before any claim"
-        );
-    }
-    let broker = process(&installed());
-    let upstream = restored(&broker);
-    answer(&broker, second.resource_id, "allow", 8)
-        .await
-        .expect("the package that interpreted it answers it");
-    assert_eq!(upstream.submitted().len(), 1);
-    drop(broker);
-    let _ = std::fs::remove_dir_all(&directory);
 }
 
 /// KR-REQ-11.25: narrowing an installation's grants narrows a component package's trust with them.
@@ -2267,10 +2143,14 @@ async fn kr_req_11_27_a_transport_that_panics_after_the_marker_leaves_the_answer
     );
 }
 
-/// KR-REQ-11.27: one resolution per pending resource, and a reconnect reconciles an answer that
-/// went without reissuing it.
+/// KR-REQ-11.27: one resolution per pending resource, and the end of the connection an answer went
+/// on reconciles that answer without reissuing it: the answer that went and was not confirmed is
+/// uncertain, the request nothing was sent for is cancelled, and nothing is asked a second time.
+///
+/// A request the upstream still holds and nothing was sent for stays answerable on a connection
+/// that stays open; that is the recovery's pass over an open connection, in the gateway suite.
 #[tokio::test]
-async fn kr_req_11_27_one_resolution_each_and_a_reconnect_leaves_a_sent_answer_uncertain() {
+async fn kr_req_11_27_one_resolution_each_and_a_connections_end_leaves_a_sent_answer_uncertain() {
     let (broker, upstream) = broker_recording(
         BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
         Some(trust(&[permission_method()], true)),
@@ -2314,36 +2194,36 @@ async fn kr_req_11_27_one_resolution_each_and_a_reconnect_leaves_a_sent_answer_u
         "the marker is in and no outcome is recorded"
     );
 
-    // The connection comes back and the upstream still lists the request. This host cannot tell
-    // whether its answer landed, so the resource is uncertain and is never answered again.
-    let reconciliation = broker
-        .reconcile(
-            scope(instance(2), 1),
-            &[request(1, "11"), request(1, "12")],
-            TimestampMs::new(8),
-        )
-        .expect("the reconnect reconciles");
-    assert_eq!(reconciliation.uncertain, vec![resource.resource_id]);
-    assert_eq!(
-        reconciliation.still_pending,
-        vec![other.resource_id],
-        "one the upstream still holds and nothing was sent for stays answerable"
-    );
-    assert_eq!(
+    // The connection ends. This host cannot tell whether its answer landed, so the resource is
+    // uncertain and is never answered again; the request nothing was sent for is cancelled,
+    // because nothing can answer it on a connection that has gone.
+    broker.close_connection(GatewayConnectionId::new(1));
+    let recorded_state = |resource_id| {
         broker
-            .pending(resource.resource_id)
+            .recorded(resource_id)
+            .expect("the ledger reads")
             .expect("recorded")
-            .state,
+            .state
+    };
+    assert_eq!(
+        recorded_state(resource.resource_id),
         PendingState::Uncertain
     );
+    assert_eq!(recorded_state(other.resource_id), PendingState::Cancelled);
     assert!(
         answer(&broker, resource.resource_id, "allow", 9)
             .await
             .is_err(),
-        "a reconnect never reissues an uncertain response"
+        "the end of a connection never reissues an uncertain response"
     );
-    // And the admission that was in force before the reconnect settles nothing either: its
-    // permit was spent when the bytes went, so there is no second transmission to make.
+    assert!(
+        answer(&broker, other.resource_id, "allow", 9)
+            .await
+            .is_err(),
+        "and a cancelled request takes no answer"
+    );
+    // And the admission that was in force before the end settles nothing either: its permit was
+    // spent when the bytes went, so there is no second transmission to make.
     assert!(
         broker
             .record_approval(&admitted, TimestampMs::new(10))
@@ -3265,23 +3145,10 @@ async fn kr_req_11_37_a_committed_gap_records_what_happened_inside_it_and_restor
                 .is_err(),
             "committing the gap is not the same as reconciling the upstream"
         );
-        broker
-            .reconcile_recovered(
-                broker.recovery_generation(),
-                scope(instance(2), 1),
-                &[
-                    Broker::downstream(
-                        GatewayConnectionId::new(1),
-                        UpstreamRequestId::new("11").expect("valid"),
-                    ),
-                    Broker::downstream(
-                        GatewayConnectionId::new(1),
-                        UpstreamRequestId::new("13").expect("valid"),
-                    ),
-                ],
-                TimestampMs::new(11),
-            )
-            .expect("the upstream said what it still holds, and rich work resumes");
+        assert!(
+            broker.reconcile_owed(TimestampMs::new(11)).is_some(),
+            "the open connection is reconciled from the host's record, and rich work resumes"
+        );
 
         // Normal operation again: an admitted answer goes and is written down, although the
         // resource's own history says it lived through a gap.

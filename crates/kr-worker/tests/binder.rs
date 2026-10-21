@@ -864,7 +864,7 @@ fn recover(worker: &mut Worker) {
         .broker
         .recover(TimestampMs::new(now))
         .expect("the gap is committed");
-    worker.broker.reconcile_connected(TimestampMs::new(now));
+    worker.broker.reconcile_owed(TimestampMs::new(now));
 }
 
 /// KR-REQ-11.24: a withdrawal the store cannot record takes effect at once, and its record is owed
@@ -1789,7 +1789,7 @@ fn kr_req_11_13_a_launch_given_back_after_its_bind_leaves_no_binding_or_row() {
         .broker
         .recover(TimestampMs::new(now))
         .expect("the gap is committed");
-    worker.broker.reconcile_connected(TimestampMs::new(now));
+    worker.broker.reconcile_owed(TimestampMs::new(now));
     assert!(
         worker.row(1).is_none(),
         "the owed row is removed once the recovery finishes"

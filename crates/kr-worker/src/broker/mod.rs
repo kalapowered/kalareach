@@ -105,7 +105,7 @@ use kr_protocol::ids::{
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, Uuid};
 
 pub use crate::broker::arbitration::{
-    Arbitration, Claim, Pending, ReconcileScope, Reconciliation, Transition, Transmitter,
+    Arbitration, Claim, Pending, ReconcileScope, Transition, Transmitter,
 };
 pub use crate::broker::attach::{
     Attached, Ended, NativeGateway, NativeLaunch, TEARDOWN_DEADLINE, hello_frame,
@@ -154,7 +154,7 @@ pub use crate::broker::semantic::{
     Exhausted, GrantLowerBound, HistoryFilter, ObservedUnder, Replay, SemanticLog, SnapshotCarried,
 };
 pub use crate::broker::tokens::{Invocation, TokenStore};
-pub use crate::broker::volatile::{RecoveryGeneration, VolatileState, VolatileTransition};
+pub use crate::broker::volatile::{VolatileState, VolatileTransition};
 
 /// Takes what one settlement came to, which is never a failure of the store.
 ///
@@ -741,8 +741,9 @@ struct BrokerState {
     /// is open changes nothing about it; a channel names its own package and is held here from
     /// the first request it records. An identifier keeps its package after its connection closes
     /// and across a restart, which reads it back from the ledger for every identifier that still
-    /// holds an unresolved resource. Its requests are that package's, so a restoration under
-    /// another package's tables is refused: those tables would read, answer and reconcile them.
+    /// holds an unresolved resource. Its requests are that package's, so no other package's
+    /// binding interprets them and no answer to them goes out on a connection that reads another
+    /// package's table.
     connection_packages: BTreeMap<GatewayConnectionId, PackageIdentity>,
     /// Every observer of this broker's transitions.
     ///
@@ -759,13 +760,6 @@ struct BrokerState {
     next_event: u64,
     /// The generation of this broker stream instance, advanced on every restart.
     stream_generation: u64,
-    /// The native connections that have stayed open since the fence was raised.
-    ///
-    /// Their owners carried every frame of the gap, in both directions, so what each one's upstream
-    /// still holds is what this broker holds for it. A connection that closes leaves this set and
-    /// does not come back into it when it is restored: its upstream was out of reach for part of
-    /// the gap, and only that upstream can say what it kept.
-    continuous: std::collections::BTreeSet<GatewayConnectionId>,
     /// The highest position this broker announced and could not record.
     ///
     /// A transition made while the journal is faulted is published and not written, so no replay
@@ -953,7 +947,6 @@ impl Broker {
                 announced,
                 next_event,
                 stream_generation,
-                continuous: std::collections::BTreeSet::new(),
                 unrecorded_after: 0,
                 admitted: binder::Admitted::default(),
                 owed_rows: std::collections::BTreeSet::new(),
@@ -2530,34 +2523,6 @@ impl Broker {
         )
     }
 
-    /// Reconciles one upstream's records with what it still has pending.
-    ///
-    /// A reconciliation is never taken without its record, so none is taken while the fence is
-    /// up. One after a storage failure is part of the recovery and goes through
-    /// [`Broker::reconcile_recovered`], which writes it without waiting for the store; this one is
-    /// refused while a recovery is running.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::LedgerUnavailable`] while the fence is up,
-    /// [`BrokerError::InvalidArgument`] while a recovery is running, and
-    /// [`BrokerError::StoreFault`] when a settled record cannot be written.
-    pub fn reconcile(
-        &self,
-        scope: ReconcileScope,
-        still_open: &[DownstreamRequestId],
-        now: TimestampMs,
-    ) -> Result<Reconciliation> {
-        let mut state = self.state();
-        if state.volatile.mode() == kr_protocol::gateway::GatewayMode::Recovering {
-            return Err(BrokerError::invalid(
-                "a recovery is running, and a reconciliation after a storage failure is the \
-                 recovery's own",
-            ));
-        }
-        state.reconcile_in(scope, still_open, now)
-    }
-
     /// Returns one binding as it stands now.
     ///
     /// A grant is checked against this rather than against whatever was recorded when a component
@@ -2625,15 +2590,6 @@ impl Broker {
         self.state().volatile.mode()
     }
 
-    /// Returns which recovery is running, or which one last ran.
-    ///
-    /// A reconciliation names it, so an acknowledgement prepared under one recovery cannot finish
-    /// another that a second storage failure opened in the meantime.
-    #[must_use]
-    pub fn recovery_generation(&self) -> RecoveryGeneration {
-        self.state().volatile.generation()
-    }
-
     /// Returns the evidence gap that is open, while one is.
     #[must_use]
     pub fn gap(&self) -> Option<kr_protocol::gateway::EvidenceGap> {
@@ -2647,7 +2603,7 @@ impl Broker {
     /// every resource the gap touched, in whatever state each actually reached. Rich work does not
     /// come back here; it comes back when every upstream that still had an unresolved resource has
     /// been reconciled, which is [`Broker::reconcile_recovered`] and
-    /// [`Broker::reconcile_connected`].
+    /// [`Broker::reconcile_owed`].
     ///
     /// The fence stays up while the gap is written, and the write is made off the broker's lock
     /// through the recovery's own connection, so native arbitration never waits on a store that
@@ -2829,98 +2785,35 @@ impl Broker {
         self.state().ledger.gaps()
     }
 
-    /// Reconciles one upstream that a recovery owes, from what that upstream says it still holds,
-    /// and finishes the recovery when it was the last one.
+    /// Reconciles every connection a recovery owes, and finishes the recovery when none is left.
     ///
-    /// This is the second half of section 11's "commit the gap and reconcile pending IDs with the
-    /// same upstream before restoring rich mutation", for an upstream that comes back and says what
-    /// it holds. The reconciliation runs first, so a resource this host may already have answered
-    /// is uncertain before anything can claim it again, and rich work comes back only when every
-    /// upstream that had an unresolved resource has been reconciled. The transition is `None`
-    /// while any of them has not.
+    /// A connection that is open has had its upstream on the far side of this host's own owner
+    /// for the whole of the gap, because a connection that closed settled what it left at its end
+    /// (see [`Broker::close_connection`]). Every request it made was recorded as it arrived and
+    /// every answer went out through the writer that established what reached the socket, so
+    /// what that upstream still holds is exactly what this host holds for the connection,
+    /// unresolved: nothing it could say would add to it. Once none of the connection's answers is
+    /// still in flight, its reconciliation is that list. A connection with an answer on its way
+    /// is left for a later pass, because the answer's own writer is about to establish what
+    /// reconciling now could only call uncertain.
     ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::InvalidArgument`] when the gateway is not recovering or the
-    /// acknowledgement belongs to another recovery, and [`BrokerError::StoreFault`] when a write
-    /// fails, which falls back to the fence.
-    pub fn reconcile_recovered(
-        &self,
-        generation: RecoveryGeneration,
-        scope: ReconcileScope,
-        still_open: &[DownstreamRequestId],
-        now: TimestampMs,
-    ) -> Result<(Reconciliation, Option<VolatileTransition>)> {
-        // One lock covers the whole of it. Validating the mode, reconciling the upstream and
-        // finishing the recovery under separate locks left two windows: a scope could be added to
-        // the owed set between them, and a late acknowledgement could remove one from a recovery
-        // it was never about. The generation closes the second, and this closes the first.
-        let mut state = self.state();
-        if state.volatile.mode() != kr_protocol::gateway::GatewayMode::Recovering {
-            return Err(BrokerError::invalid(format!(
-                "the gateway is {} and this finishes a recovery",
-                state.volatile.mode()
-            )));
-        }
-        // The generation is checked before anything is written. An acknowledgement prepared under
-        // a recovery that failed carries a list about a moment that has passed, and applying it
-        // first would cancel resources that are current before the refusal was reported.
-        state.volatile.check_generation(generation)?;
-        // The writes go under the lock, which is what makes the reconciliation and the finish one
-        // decision, and they take the store's lock without waiting for it: a store another
-        // connection is writing refuses them at once, and the upstream asks again.
-        let answered = state.promptly(|state| {
-            let reconciliation = state.reconcile_in(scope, still_open, now)?;
-            // This upstream is reconciled. Rich work comes back when every one that owed a
-            // reconciliation has given it, and not before.
-            if state.volatile.reconciled(
-                generation,
-                scope.application_instance_id,
-                scope.connection,
-            )? > 0
-            {
-                return Ok((reconciliation, None));
-            }
-            let finished = state.finish_recovery(generation, now)?;
-            Ok((reconciliation, Some(finished)))
-        });
-        drop(state);
-        // The recovery's end brought every binding to the admissions held, which can queue a
-        // notice for the session's journal.
-        if matches!(answered, Ok((_, Some(_)))) {
-            self.notices_ready.notify_one();
-        }
-        answered
-    }
-
-    /// Reconciles every upstream a recovery owes whose connection is still open, and finishes the
-    /// recovery when none is left.
-    ///
-    /// An open connection's upstream has been on the far side of this host's own owner for the
-    /// whole of the gap. Every request it made was recorded as it arrived and every answer went
-    /// out through the writer that established what reached the socket, so what that upstream
-    /// still holds is exactly what this host holds for the connection, unresolved: nothing it
-    /// could say would add to it. Once none of the connection's answers is still in flight, its
-    /// reconciliation is that list. A connection with an answer on its way is left for a later
-    /// pass, because the answer's own writer is about to establish what reconciling now could
-    /// only call uncertain.
-    ///
-    /// A connection that closed at any point since the fence went up has no such record: its
-    /// upstream was out of reach for part of the gap. It stays owed, and rich work stays fenced,
-    /// until that upstream is back and says what it still holds through
-    /// [`Broker::reconcile_recovered`]. A restoration does not change that.
+    /// A connection that is not open is one nobody can reopen, so its upstream holds nothing:
+    /// what it left unresolved is settled as its end settles it (cancelled for a request no
+    /// answer went for, uncertain for one an answer went for) and its entry goes from what the
+    /// recovery owes. This is the retry for a settlement at the connection's end that the store
+    /// refused, and the rule that no recovery waits for a connection that cannot come back.
     ///
     /// Its writes take the store's lock without waiting for it, so a store another connection is
     /// writing leaves this pass with nothing done and the next one tries again. A store that fails
     /// again raises the fence, and the next call tries again once the journal has recovered.
     /// Returns the transition back to normal operation when this finished the recovery.
-    pub fn reconcile_connected(&self, now: TimestampMs) -> Option<VolatileTransition> {
+    pub fn reconcile_owed(&self, now: TimestampMs) -> Option<VolatileTransition> {
         let mut state = self.state();
         if state.volatile.mode() != kr_protocol::gateway::GatewayMode::Recovering {
             return None;
         }
         let finished = state
-            .promptly(|state| Ok(state.reconcile_connected_in(now)))
+            .promptly(|state| Ok(state.reconcile_owed_in(now)))
             .ok()
             .flatten();
         drop(state);
@@ -3213,10 +3106,6 @@ impl Broker {
             installed_protocol_version,
         )?;
         state.connection_packages.insert(connection, pinned.package);
-        // A connection that begins inside a gap is carried by its owner for the whole of its life.
-        if state.volatile.mode() != kr_protocol::gateway::GatewayMode::Normal {
-            state.continuous.insert(connection);
-        }
         Ok(connection)
     }
 
@@ -3247,120 +3136,6 @@ impl Broker {
         )?;
         state.connection_packages.insert(connection, pinned.package);
         Ok(connection)
-    }
-
-    /// Restores one connection a restart left behind, keeping its identifier.
-    ///
-    /// A reconnect has to reach the resources it left pending, and those are namespaced by the
-    /// identifier the old connection had. Reusing one is therefore permitted, but only for the
-    /// instance that owned it and only while no live connection holds it: an identifier reopened
-    /// for another instance would correlate that instance's responses to somebody else's
-    /// resources, which is the defect this refuses rather than documents.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::PermissionDenied`] when the identifier is live, belongs to another
-    /// instance, names no retained resource of this one, or recorded its requests under another
-    /// package than the one whose tables would restore it, and whatever
-    /// [`Broker::open_native_connection`] refuses.
-    pub fn restore_native_connection(
-        &self,
-        connection: GatewayConnectionId,
-        application_instance_id: ApplicationInstanceId,
-        presented_credential: &[u8],
-        process: &ProcessStartIdentity,
-        plugin_id: &PluginId,
-        installed_protocol_version: &str,
-    ) -> Result<()> {
-        let mut state = self.state();
-        // A live connection of either kind: an identifier a channel holds is live too, and
-        // restoring it as a declarative connection would give one identifier two readers.
-        if state.gateway.contains(connection) {
-            return Err(BrokerError::denied(format!(
-                "{connection} is a live connection, and a restoration is not a replacement"
-            )));
-        }
-        let instance_generation = state
-            .instances
-            .get(&application_instance_id)
-            .map(|instance| instance.source_generation);
-        // Every retained resource of this connection, not the first one found. A connection can
-        // hold resources from both sides of a binding change, and checking one of them would
-        // restore the rest of them with it.
-        let mut retained = 0_usize;
-        for pending in state
-            .arbitration
-            .iter()
-            .filter(|pending| pending.resource.request.connection == connection)
-        {
-            retained += 1;
-            if pending.resource.application_instance_id != application_instance_id {
-                return Err(BrokerError::denied(format!(
-                    "{connection} holds resources of {} and this restoration names \
-                     {application_instance_id}",
-                    pending.resource.application_instance_id
-                )));
-            }
-            if Some(pending.resource.source_generation) != instance_generation {
-                return Err(BrokerError::denied(format!(
-                    "{connection} holds resources from generation {} and this instance is at \
-                     another, so restoring it would expose an old execution's resources to a new \
-                     one",
-                    pending.resource.source_generation
-                )));
-            }
-        }
-        if retained == 0 {
-            return Err(BrokerError::denied(format!(
-                "{connection} names no retained resource, so there is nothing to restore"
-            )));
-        }
-        let instance = state
-            .instances
-            .get(&application_instance_id)
-            .ok_or_else(|| unknown_instance(application_instance_id))?;
-        let launched = instance.process.as_ref().ok_or_else(|| {
-            BrokerError::denied(
-                "this host did not launch this application, so nothing about it is a native \
-                 connection it can authenticate",
-            )
-        })?;
-        if !launched.authenticates(presented_credential, process) {
-            return Err(BrokerError::denied(
-                "this connection does not present the launch binding and the private exchange of \
-                 a terminal this worker started",
-            ));
-        }
-        let pinned = state.pinned_table(application_instance_id, plugin_id)?;
-        // The identifier keeps the package it recorded its requests under, across a restart too.
-        // Another package's tables would read those requests, correlate the native client's
-        // answers to them and reconcile them in that package's terms, so they do not get the
-        // identifier.
-        match state.connection_packages.get(&connection) {
-            Some(recorded) if *recorded == pinned.package => {}
-            Some(recorded) => {
-                return Err(BrokerError::denied(format!(
-                    "{connection} holds requests of {}, and a restoration under the tables of {} \
-                     would read them in another package's terms",
-                    recorded.name(),
-                    pinned.package.beside(recorded)
-                )));
-            }
-            None => {
-                return Err(BrokerError::denied(format!(
-                    "{connection} names no package this host recorded its requests under, so \
-                     nothing says whose requests they are"
-                )));
-            }
-        }
-        state.gateway.open_native(
-            connection,
-            application_instance_id,
-            process.clone(),
-            pinned.table,
-            pinned.rich,
-            installed_protocol_version,
-        )
     }
 
     /// Returns one gateway connection as the broker holds it.
@@ -3419,19 +3194,44 @@ impl Broker {
             .map(Some)
     }
 
-    /// Closes one gateway connection.
+    /// Ends one gateway connection, which nothing will reopen.
     ///
-    /// The pending resources it produced stay exactly where they are: a connection ending is not
-    /// an answer, and a reconnect is what reconciles them. The ones it settled are final now,
-    /// because nothing can name them on a connection that has gone, and they are forgotten; the
-    /// ledger keeps their record.
+    /// A connection that ends is its upstream's end for this host: no entry reopens a closed
+    /// connection, and a terminal that loses its connection exits rather than reconnecting. So
+    /// what the connection left unresolved is settled as a reconciliation with an upstream that
+    /// holds nothing settles it, and not left pending for a reconnect that cannot come: a request
+    /// no answer went for is cancelled, and one an answer went for and nothing confirmed is
+    /// uncertain and is never asked again. It is settled while the connection is still an
+    /// observer of its instance, so its own subscription is told, and then the connection goes.
+    /// The ledger keeps every record; what settled is final now that nothing can name it on a
+    /// connection that has gone, and is forgotten from the live map.
+    ///
+    /// A settlement the store cannot record is kept as a transition of the gap, as native
+    /// traffic's is, so a fenced broker ends a connection too. A recovery that owed this
+    /// connection a reconciliation is told it has none to wait for, once every transition
+    /// committed; one that did not is retried by the recovery's own pass. An identifier no
+    /// declarative connection holds, such as a channel's, changes nothing here.
     pub fn close_connection(&self, connection: GatewayConnectionId) {
         let mut state = self.state();
+        let Some(held) = state.gateway.connection(connection).cloned() else {
+            return;
+        };
+        let scope = ReconcileScope {
+            application_instance_id: held.application_instance_id,
+            connection,
+        };
+        let (_, settled) = state.settle_ended(scope, kr_ipc::now_ms(), OnStoreFault::CarryOn);
         state.gateway.close(connection);
         state.connection_dispatch.remove(&connection);
-        // Its upstream is out of reach from here, so what it keeps is its own to say.
-        state.continuous.remove(&connection);
+        // What it settled, here or before, is final now that nothing can name it on a connection
+        // that has gone.
         state.forget_resolved();
+        if settled.is_ok() && state.volatile.mode() == kr_protocol::gateway::GatewayMode::Recovering
+        {
+            state
+                .volatile
+                .reconciled(held.application_instance_id, connection);
+        }
     }
 
     /// Admits one rich invocation against the closed method table.
@@ -3892,11 +3692,21 @@ impl BrokerState {
     }
 
     /// Reconciles every owed upstream whose connection stayed open, and finishes the recovery when
-    /// none is left. See [`Broker::reconcile_connected`].
-    fn reconcile_connected_in(&mut self, now: TimestampMs) -> Option<VolatileTransition> {
-        let generation = self.volatile.generation();
+    /// none is left. See [`Broker::reconcile_owed`].
+    fn reconcile_owed_in(&mut self, now: TimestampMs) -> Option<VolatileTransition> {
         for (application_instance_id, connection) in self.volatile.owed() {
-            if !self.continuous.contains(&connection) || !self.gateway.contains(connection) {
+            let scope = ReconcileScope {
+                application_instance_id,
+                connection,
+            };
+            if !self.gateway.contains(connection) {
+                // Nobody can reopen it, so its upstream holds nothing. A store that refuses this
+                // leaves the entry owed, and a later pass starts again.
+                if self.reconcile_in(scope, &[], now).is_err() {
+                    return None;
+                }
+                self.volatile
+                    .reconciled(application_instance_id, connection);
                 continue;
             }
             let of_scope = |pending: &&Pending| {
@@ -3919,25 +3729,18 @@ impl BrokerState {
                 .filter(of_scope)
                 .map(|pending| pending.resource.request.clone())
                 .collect();
-            let scope = ReconcileScope {
-                application_instance_id,
-                connection,
-            };
-            if self.reconcile_in(scope, &still_open, now).is_err()
-                || self
-                    .volatile
-                    .reconciled(generation, application_instance_id, connection)
-                    .is_err()
-            {
+            if self.reconcile_in(scope, &still_open, now).is_err() {
                 // The store failed again, which raised the fence, or another connection held it;
                 // a later pass starts again.
                 return None;
             }
+            self.volatile
+                .reconciled(application_instance_id, connection);
         }
         if !self.volatile.owed().is_empty() {
             return None;
         }
-        self.finish_recovery(generation, now).ok()
+        self.finish_recovery(now).ok()
     }
 
     /// Verifies a decoder's interpretation under the lock the caller holds. See
@@ -4179,12 +3982,8 @@ impl BrokerState {
     fn fence(&mut self, reason: &str, now: TimestampMs) {
         match self.volatile.mode() {
             kr_protocol::gateway::GatewayMode::NativeOnlyVolatile => return,
-            // A new gap: every native connection open now is one whose owner carries all of it.
-            // A recovery falling back keeps the set it had, because the gap it reopens is the same.
-            kr_protocol::gateway::GatewayMode::Normal => {
-                self.continuous = self.gateway.native_connections().collect();
-            }
-            kr_protocol::gateway::GatewayMode::Recovering => {}
+            kr_protocol::gateway::GatewayMode::Normal
+            | kr_protocol::gateway::GatewayMode::Recovering => {}
         }
         let (carried, _) = self.arbitration.enter_volatile();
         self.volatile.raise(reason, carried, now);
@@ -4225,11 +4024,7 @@ impl BrokerState {
     /// The accounting is written before the fence is lifted. A gap whose final counts were never
     /// recorded is one nobody can read afterwards to see what the fault cost, and a store that
     /// fails under it falls back to the fence rather than lifting it over an unwritten record.
-    fn finish_recovery(
-        &mut self,
-        generation: RecoveryGeneration,
-        now: TimestampMs,
-    ) -> Result<VolatileTransition> {
+    fn finish_recovery(&mut self, now: TimestampMs) -> Result<VolatileTransition> {
         if let Some(row) = self.volatile.row() {
             let gap = self.volatile.gap().cloned();
             if let Some(gap) = gap.as_ref() {
@@ -4241,8 +4036,7 @@ impl BrokerState {
                 ledger.finish_recovery(row)
             })?;
         }
-        let finished = self.volatile.finish_recovery(generation)?;
-        self.continuous.clear();
+        let finished = self.volatile.finish_recovery()?;
         // Under the lock the fence was lifted under, before any rich work is admitted: the rows
         // owed are written, and every live binding is brought to the admissions held, which is
         // where a change the store could not record while it was faulted takes effect.
@@ -4737,16 +4531,16 @@ impl BrokerState {
         ))
     }
 
-    /// Reconciles one upstream's records with what it still has pending. See
-    /// [`Broker::reconcile`].
+    /// Reconciles one connection's records with what its upstream still has pending, writing each
+    /// transition with its record: none is taken while the fence is up, or when the store refuses
+    /// it, and the first refusal stops the pass.
     fn reconcile_in(
         &mut self,
         scope: ReconcileScope,
         still_open: &[DownstreamRequestId],
         now: TimestampMs,
-    ) -> Result<Reconciliation> {
-        let (reconciliation, transitions) = self.arbitration.plan_reconcile(scope, still_open);
-        for transition in transitions {
+    ) -> Result<()> {
+        for transition in self.arbitration.plan_reconcile(scope, still_open) {
             self.commit_transition(
                 transition,
                 now,
@@ -4755,7 +4549,47 @@ impl BrokerState {
                 OnStoreFault::Refuse,
             )?;
         }
-        Ok(reconciliation)
+        Ok(())
+    }
+
+    /// Settles what one connection left unresolved, because its upstream is gone and nothing will
+    /// reopen it: an upstream that holds nothing.
+    ///
+    /// Every unresolved resource is planned once, up front, and committed in turn; a transition
+    /// that fails does not stop the ones after it, and the first failure is returned with how many
+    /// committed. While the ledger cannot take writes the resource is marked volatile before it
+    /// is committed, because a transition planned before the fence rose carries the durability it
+    /// was planned with, and a resource that lived through a gap says so for the rest of its
+    /// life. Under [`OnStoreFault::CarryOn`] a store that fails under a transition keeps it as a
+    /// transition of the gap; under [`OnStoreFault::Refuse`] it is not taken.
+    fn settle_ended(
+        &mut self,
+        scope: ReconcileScope,
+        now: TimestampMs,
+        on_fault: OnStoreFault,
+    ) -> (usize, Result<()>) {
+        let mut committed = 0;
+        let mut failed = Ok(());
+        for mut transition in self.arbitration.plan_reconcile(scope, &[]) {
+            if !self.volatile.writes_are_durable() {
+                transition.resource.durability = kr_protocol::session::Durability::Volatile;
+            }
+            match self.commit_transition(
+                transition,
+                now,
+                crate::broker::ledger::TransitionCause::Reconciliation,
+                None,
+                on_fault,
+            ) {
+                Ok(_) => committed += 1,
+                Err(error) => {
+                    if failed.is_ok() {
+                        failed = Err(error);
+                    }
+                }
+            }
+        }
+        (committed, failed)
     }
 
     /// Returns one action's current declaration, under the lock this state is read with.

@@ -484,11 +484,6 @@ impl Broker {
             table: Arc::new(table.clone()),
             offered: connector.offered_decisions(),
         });
-        // A channel that begins inside a gap is carried by its own reader and writer for the
-        // whole of its life, as a native connection is.
-        if state.volatile.mode() != GatewayMode::Normal {
-            state.continuous.insert(connection);
-        }
         Ok(connection)
     }
 
@@ -526,31 +521,14 @@ impl Broker {
             application_instance_id,
             connection,
         };
-        let (_, transitions) = state.arbitration.plan_reconcile(scope, &[]);
-        let mut settled = 0;
-        for transition in transitions {
-            if state
-                .commit_transition(
-                    transition,
-                    now,
-                    crate::broker::ledger::TransitionCause::Reconciliation,
-                    None,
-                    OnStoreFault::CarryOn,
-                )
-                .is_ok()
-            {
-                settled += 1;
-            }
-        }
+        let (settled, complete) = state.settle_ended(scope, now, OnStoreFault::CarryOn);
         state.gateway.close_channel(connection);
-        state.continuous.remove(&connection);
         // What it settled, here or before, is final now that nothing can name it on the channel.
         state.forget_resolved();
-        if state.volatile.mode() == GatewayMode::Recovering {
-            let generation = state.volatile.generation();
-            let _ = state
+        if complete.is_ok() && state.volatile.mode() == GatewayMode::Recovering {
+            state
                 .volatile
-                .reconciled(generation, application_instance_id, connection);
+                .reconciled(application_instance_id, connection);
         }
         state.channel_evidence(
             application_instance_id,

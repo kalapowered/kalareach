@@ -1633,8 +1633,9 @@ impl WorkerService {
 
     /// Takes the broker through its half of a recovery the journal has finished.
     ///
-    /// It commits the broker's gap and owes each upstream with an unresolved resource a
-    /// reconciliation, then reconciles every one whose connection is open. A fault the journal
+    /// It commits the broker's gap and owes each connection with an unresolved resource a
+    /// reconciliation, then reconciles every one: an open connection from the host's own record,
+    /// and one that has closed as an upstream that holds nothing. A fault the journal
     /// recovered from before the broker decided anything is still the broker's to recover from:
     /// reading the mode applies it. A store that fails again has already raised the fence where it
     /// failed, and the next pass starts again.
@@ -1656,7 +1657,7 @@ impl WorkerService {
         }
         // Whether this pass finished the recovery or left upstreams still owed, the next pass
         // looks again; there is nothing further to do with the answer here.
-        let _finished = self.broker.reconcile_connected(now);
+        let _finished = self.broker.reconcile_owed(now);
     }
 
     /// Looks at the host's clocks, and revalidates what a discontinuity invalidated.

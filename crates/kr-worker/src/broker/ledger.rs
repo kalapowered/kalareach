@@ -2860,7 +2860,7 @@ mod tests {
             .recover(TimestampMs::new(12))
             .expect("the broker commits its gap");
         assert!(
-            broker.reconcile_connected(TimestampMs::new(13)).is_some(),
+            broker.reconcile_owed(TimestampMs::new(13)).is_some(),
             "nothing unresolved was owed a reconciliation"
         );
         assert_eq!(broker.mode(), kr_protocol::gateway::GatewayMode::Normal);

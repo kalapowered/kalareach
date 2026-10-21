@@ -17,31 +17,6 @@ use kr_protocol::session::Durability;
 
 use crate::broker::error::{BrokerError, Result};
 
-/// Which recovery an acknowledgement belongs to.
-///
-/// A reconciliation is an upstream saying what it still holds, and it says so about one moment.
-/// Storage can fail again while a recovery is running, and the fence that follows opens a new
-/// recovery with its own owed set; an acknowledgement in flight from the previous one says nothing
-/// about the new one. Without an identity to compare, that late acknowledgement would remove a
-/// scope from a recovery it was never about, and rich work would come back over an upstream that
-/// had never been asked.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RecoveryGeneration(u64);
-
-impl RecoveryGeneration {
-    /// Returns the generation as a number, for a diagnostic.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl std::fmt::Display for RecoveryGeneration {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "recovery {}", self.0)
-    }
-}
-
 /// What one transition did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolatileTransition {
@@ -51,8 +26,6 @@ pub struct VolatileTransition {
     pub to: GatewayMode,
     /// The gap as it stands after the transition.
     pub gap: EvidenceGap,
-    /// The recovery this transition belongs to.
-    pub generation: RecoveryGeneration,
 }
 
 /// The gateway's durability mode and the gap it is accumulating.
@@ -71,11 +44,6 @@ pub struct VolatileState {
         kr_protocol::ids::ApplicationInstanceId,
         kr_protocol::ids::GatewayConnectionId,
     )>,
-    /// Which recovery the owed set belongs to.
-    ///
-    /// It advances every time a fence is raised, so an acknowledgement prepared under one recovery
-    /// can never finish another.
-    generation: RecoveryGeneration,
 }
 
 impl Default for VolatileState {
@@ -85,7 +53,6 @@ impl Default for VolatileState {
             gap: None,
             row: None,
             owed: std::collections::BTreeSet::new(),
-            generation: RecoveryGeneration(0),
         }
     }
 }
@@ -116,14 +83,6 @@ impl VolatileState {
         self.gap = Some(gap);
         self.row = Some(row);
         self.owed = owed.into_iter().collect();
-        // A restart is a new recovery. Nothing an earlier process prepared can finish this one.
-        self.generation = RecoveryGeneration(1);
-    }
-
-    /// Returns which recovery is running, or which one last ran.
-    #[must_use]
-    pub const fn generation(&self) -> RecoveryGeneration {
-        self.generation
     }
 
     /// Records which upstreams this recovery owes a reconciliation.
@@ -154,37 +113,14 @@ impl VolatileState {
         }
     }
 
-    /// Refuses an acknowledgement that belongs to another recovery than the one running.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::InvalidArgument`] naming both generations.
-    pub fn check_generation(&self, generation: RecoveryGeneration) -> Result<()> {
-        if generation == self.generation {
-            Ok(())
-        } else {
-            Err(BrokerError::invalid(format!(
-                "this reconciliation belongs to {generation} and {} is running",
-                self.generation
-            )))
-        }
-    }
-
     /// Records that one upstream has been reconciled, and returns what is still owed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::InvalidArgument`] when the acknowledgement belongs to another
-    /// recovery than the one running, because such an acknowledgement says nothing about this one.
     pub fn reconciled(
         &mut self,
-        generation: RecoveryGeneration,
         application_instance_id: kr_protocol::ids::ApplicationInstanceId,
         connection: kr_protocol::ids::GatewayConnectionId,
-    ) -> Result<usize> {
-        self.check_generation(generation)?;
+    ) -> usize {
         self.owed.remove(&(application_instance_id, connection));
-        Ok(self.owed.len())
+        self.owed.len()
     }
 
     /// Returns the upstreams this recovery still owes a reconciliation.
@@ -287,9 +223,7 @@ impl VolatileState {
     ) -> Result<VolatileTransition> {
         self.transition(GatewayMode::NativeOnlyVolatile, |state| {
             state.gap = Some(EvidenceGap::open(reason, now, carried_pending));
-            // A new fence is a new recovery to come. Anything prepared under the previous one is
-            // about a moment that has passed.
-            state.generation = RecoveryGeneration(state.generation.0.saturating_add(1));
+            // A new fence is a new recovery to come, with its own owed set.
             state.owed.clear();
         })
     }
@@ -329,16 +263,7 @@ impl VolatileState {
     /// # Errors
     ///
     /// Returns [`BrokerError::InvalidArgument`] when the gateway is not recovering.
-    pub fn finish_recovery(
-        &mut self,
-        generation: RecoveryGeneration,
-    ) -> Result<VolatileTransition> {
-        if generation != self.generation {
-            return Err(BrokerError::invalid(format!(
-                "this recovery is {generation} and {} is running",
-                self.generation
-            )));
-        }
+    pub fn finish_recovery(&mut self) -> Result<VolatileTransition> {
         if !self.owed.is_empty() {
             return Err(BrokerError::invalid(format!(
                 "this recovery still owes {} upstream reconciliation(s)",
@@ -374,10 +299,8 @@ impl VolatileState {
                 }
                 None => state.gap = Some(EvidenceGap::open(reason, now, carried_pending)),
             }
-            // The gap is the same one; the recovery that will close it is not. An
-            // acknowledgement in flight from the attempt that just failed is about a moment that
-            // has passed, and this is what makes it say so.
-            state.generation = RecoveryGeneration(state.generation.0.saturating_add(1));
+            // The gap is the same one; the recovery that will close it is not, and owes its
+            // reconciliations afresh.
             state.owed.clear();
         })
     }
@@ -432,7 +355,6 @@ impl VolatileState {
                 .gap
                 .clone()
                 .unwrap_or_else(|| EvidenceGap::open("", TimestampMs::new(0), 0)),
-            generation: self.generation,
         })
     }
 }
@@ -486,9 +408,7 @@ mod tests {
         );
         let refusal = state.require_rich_work().expect_err("still fenced");
         assert!(refusal.to_string().contains("reconciled"));
-        state
-            .finish_recovery(state.generation())
-            .expect("recovery finishes");
+        state.finish_recovery().expect("recovery finishes");
         assert!(state.admits_rich_work());
         assert_eq!(state.durability(), Durability::Durable);
         assert!(state.gap().is_none());
@@ -543,7 +463,7 @@ mod tests {
             .enter("the journal could not be written", 0, TimestampMs::new(100))
             .expect("the fence is entered");
         assert!(
-            state.finish_recovery(state.generation()).is_err(),
+            state.finish_recovery().is_err(),
             "the fence is left through recovery, not directly"
         );
     }

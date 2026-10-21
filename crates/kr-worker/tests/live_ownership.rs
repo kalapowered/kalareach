@@ -38,8 +38,8 @@ use kr_protocol::envelope::{
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::gateway::{
-    DeclarativeEntry, DeclarativeTable, DownstreamRequestId, NativeFraming, NativeMethodClass,
-    PendingResource, PendingState, RichMethodTable,
+    DeclarativeEntry, DeclarativeTable, NativeFraming, NativeMethodClass, PendingResource,
+    PendingState, RichMethodTable,
 };
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::{
@@ -49,7 +49,7 @@ use kr_protocol::ids::{
     ActionId, ActionWindowId, ActorId, ApplicationInstanceId, BrokerBindingId, BuildId,
     CapabilityId, CapabilityRevision, ConnectionId, ControllerGeneration, GatewayConnectionId,
     MethodTableVersion, PendingResourceId, PluginId, PublisherId, QuestionId, RequestId,
-    SessionEpoch, SessionId, UpstreamMethod, UpstreamRequestId,
+    SessionEpoch, SessionId, UpstreamMethod,
 };
 use kr_protocol::local::{ForwardedMutation, ForwardedRequest, LocalClientKind};
 use kr_protocol::method::{Method, MethodVersion};
@@ -64,8 +64,8 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Digest256, DurationMs, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
 use kr_worker::broker::{
-    BrokerError, BrokerTransport, Credential, ManagedProcess, PendingTransmission, ReconcileScope,
-    TransportHandle, UpstreamDispatch, UpstreamOutcome, UpstreamRequest,
+    BrokerError, BrokerTransport, Credential, ManagedProcess, PendingTransmission, TransportHandle,
+    UpstreamDispatch, UpstreamOutcome, UpstreamRequest,
 };
 use kr_worker::journal::{Journal, Submission};
 use kr_worker::questions::binding::VerifiedSource;
@@ -664,7 +664,9 @@ impl Reader<'_> {
 struct Held {
     receipt: Receipt,
     question: Question,
-    approval: PendingResource,
+    /// The approval, while the snapshot still holds it: a settled one of a connection that has
+    /// ended is the ledger's to read.
+    approval: Option<PendingResource>,
 }
 
 impl Held {
@@ -720,8 +722,7 @@ impl Held {
                 .agent_resources
                 .resources
                 .into_iter()
-                .find(|resource| resource.resource_id == approval)
-                .expect("the approval is in the snapshot"),
+                .find(|resource| resource.resource_id == approval),
         }
     }
 }
@@ -756,7 +757,10 @@ async fn kr_req_24_06_a_daemon_restart_keeps_the_receipt_the_approval_and_the_qu
     )
     .await;
     assert_eq!(before.question.state, QuestionState::Pending);
-    assert_eq!(before.approval.state, PendingState::Pending);
+    assert_eq!(
+        before.approval.as_ref().map(|approval| approval.state),
+        Some(PendingState::Pending)
+    );
 
     // The daemon goes, as a killed daemon goes: its connection ends and nothing is said. Its
     // replacement proves the next generation, and the one before it is fenced.
@@ -803,11 +807,17 @@ async fn kr_req_24_06_a_daemon_restart_keeps_the_receipt_the_approval_and_the_qu
     assert_eq!(record.actor_id, person_id());
 }
 
+/// KR-REQ-24.06: the receipt and the question a plugin's request left survive the end of its
+/// connection, and the approval it relayed is settled by that end: cancelled, because nothing can
+/// answer it on a connection that has gone, and a client that answers it is refused.
+///
+/// The plugin holds none of the receipt or the question either. What is not claimed here: a
+/// plugin that reconnects and answers on a restored connection, and a plugin-runtime service that
+/// restarts with an approval pending. The first has no production path, since no entry reopens a
+/// closed connection; the second does not end a gateway connection and has no case yet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_24_06_a_plugin_that_reconnects_finds_the_receipt_the_approval_and_the_question() {
-    // The plugin holds none of them either. Its connection ending is not an answer to the request
-    // it made; the process this worker launched connects again under the identifier its request
-    // was recorded under, says the request is still open, and answers it there.
+async fn kr_req_24_06_the_receipt_and_the_question_survive_a_connections_end_and_its_approval_settles()
+ {
     let host = host().await;
     let (question_id, caller_token) = ask(&host);
     let approval = arrive(&host, 1);
@@ -834,67 +844,13 @@ async fn kr_req_24_06_a_plugin_that_reconnects_finds_the_receipt_the_approval_an
     )
     .await;
     assert_eq!(before.question.state, QuestionState::Pending);
-    assert_eq!(before.approval.state, PendingState::Pending);
+    assert_eq!(
+        before.approval.as_ref().map(|approval| approval.state),
+        Some(PendingState::Pending)
+    );
 
     let broker = host.service.broker();
     broker.close_connection(host.connection);
-    assert_eq!(
-        broker.pending(approval).map(|resource| resource.state),
-        Some(PendingState::Pending),
-        "a connection ending is not an answer"
-    );
-
-    // A fresh launch of the plugin, a process of its own, is not given the identifier: the
-    // broker restores one only to the process it launched, presenting that launch's private
-    // exchange.
-    let fresh = broker
-        .restore_native_connection(
-            host.connection,
-            instance(),
-            &CREDENTIAL,
-            &process(42),
-            &plugin(),
-            "1",
-        )
-        .expect_err("another process is not the launch that made the connection");
-    assert!(
-        matches!(fresh, BrokerError::PermissionDenied { .. }),
-        "{fresh}"
-    );
-
-    // The launched process reconnects and says what it still has open.
-    broker
-        .restore_native_connection(
-            host.connection,
-            instance(),
-            &CREDENTIAL,
-            &process(41),
-            &plugin(),
-            "1",
-        )
-        .expect("the launched process restores its connection");
-    broker.bind_connection_dispatch(
-        host.connection,
-        Arc::new(Answering) as Arc<dyn UpstreamDispatch>,
-    );
-    let reconciled = broker
-        .reconcile(
-            ReconcileScope {
-                application_instance_id: instance(),
-                connection: host.connection,
-            },
-            &[DownstreamRequestId::new(
-                host.connection,
-                UpstreamRequestId::new("1").expect("an identifier"),
-            )],
-            kr_ipc::now_ms(),
-        )
-        .expect("the reconnect reconciles");
-    assert_eq!(
-        reconciled.still_pending,
-        vec![approval],
-        "the request the plugin still has open stays answerable"
-    );
 
     let after = Held::read(
         &mut Reader::Owner(&mut window),
@@ -904,22 +860,35 @@ async fn kr_req_24_06_a_plugin_that_reconnects_finds_the_receipt_the_approval_an
         approval,
     )
     .await;
+    assert_eq!(after.receipt, before.receipt, "the receipt is where it was");
+    assert_eq!(after.question, before.question, "and so is the question");
     assert_eq!(
-        after, before,
-        "the receipt, the question and the approval are where the plugin left them"
+        after.approval, None,
+        "the snapshot no longer holds what the ended connection left"
+    );
+    assert_eq!(
+        broker
+            .recorded(approval)
+            .expect("the ledger reads")
+            .expect("the ledger keeps it")
+            .state,
+        PendingState::Cancelled,
+        "the approval was settled by its connection's end"
     );
 
-    // The approval is answered on the restored connection, once, and the question by the owner.
-    let answered = broker
-        .native_answer_through(
-            host.connection,
-            &permission_answer(1),
-            kr_ipc::now_ms(),
-            |_| Ok(()),
-        )
-        .expect("the answer is carried on the restored connection");
-    assert_eq!(answered.resource_id, approval);
-    assert_eq!(answered.state, PendingState::Resolved);
+    // Nothing answers it on the connection that has gone, and the person's answer to the question
+    // is still taken.
+    assert!(
+        broker
+            .native_answer_through(
+                host.connection,
+                &permission_answer(1),
+                kr_ipc::now_ms(),
+                |_| Ok(()),
+            )
+            .is_err(),
+        "the connection has ended, so there is nothing to answer on"
+    );
     let resolved: QuestionResolveResult = within(
         "the answer",
         window.mutate(

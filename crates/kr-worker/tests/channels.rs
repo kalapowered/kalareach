@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use kr_protocol::broker::{BrokerGrant, BrokerGrants};
 use kr_protocol::error::ErrorCode;
-use kr_protocol::gateway::{GatewayMode, NativeFraming, PendingResource, PendingState};
+use kr_protocol::gateway::{GatewayMode, PendingResource, PendingState};
 use kr_protocol::ids::{ActorId, AgentBindingRevision, PendingResourceId, PublisherId};
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
 use kr_worker::broker::Broker;
@@ -26,15 +26,6 @@ use kr_worker::persistence::JournalHealth;
 mod common;
 
 use common::LIVENESS_DEADLINE;
-
-/// A declarative package installed beside the channel's, which pins its own tables.
-fn installed() -> kr_worker::broker::PackageIdentity {
-    kr_worker::broker::PackageIdentity {
-        plugin_id: kr_protocol::ids::PluginId::new("kalareach.codex").expect("valid"),
-        publisher_id: PublisherId::new("kalareach").expect("valid"),
-        package_digest: Digest256::from_bytes([5; 32]),
-    }
-}
 
 /// Polls `state` until it holds, within the suite's liveness deadline.
 async fn eventually(what: &str, state: impl Fn() -> bool) {
@@ -904,7 +895,7 @@ async fn kr_req_12_18_no_channel_holds_a_recovery_open() {
     // The channel that stayed open carried the whole gap, so what its upstream holds is what this
     // host holds for it, and the recovery finishes.
     assert!(
-        broker.reconcile_connected(TimestampMs::new(21)).is_some(),
+        broker.reconcile_owed(TimestampMs::new(21)).is_some(),
         "the recovery finishes"
     );
     assert_eq!(broker.mode(), GatewayMode::Normal);
@@ -1521,81 +1512,60 @@ async fn kr_req_12_18_only_the_channels_own_package_interprets_what_it_relays() 
     assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
 }
 
-/// KR-REQ-12.18: a channel's identifier is a live connection, so restoring a declarative connection
-/// under it is refused, and the channel goes on being served.
+/// KR-REQ-12.18: a channel's identifier is a live connection that a declarative connection's end
+/// does not reach. Closing a connection under a channel's identifier settles nothing the channel
+/// relayed and does not take away what carries its answers: the approval stays pending, an answer
+/// still goes out on the channel as the application's verdict, and the channel goes on being served.
+///
+/// No entry lets a caller name a connection identifier to open, so none is reused as another
+/// connection; the case is that the one entry which takes an identifier from its caller, an end,
+/// leaves a channel alone.
 #[tokio::test]
-async fn kr_req_12_18_a_channels_identifier_is_not_restored_as_another_connection() {
-    use kr_protocol::gateway::{
-        DeclarativeEntry, DeclarativeTable, NativeMethodClass, RichMethodEntry, RichMethodTable,
-        RichOperation,
-    };
-    use kr_protocol::ids::{MethodTableVersion, PluginId, UpstreamMethod};
+async fn kr_req_12_18_closing_under_a_channels_identifier_leaves_the_channel_served() {
+    let recorded: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/channel-frames-0.75.json"))
+            .expect("the recorded frames are JSON");
     let broker = memory_broker();
     register(&broker, 2);
     let package = Package::laid_out();
+    package.bind(&broker, 2);
     let mut channel = Channel::open(
         package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
         2,
         launched(2),
     );
-    channel.relay("abcde").await;
-    eventually("the approval is recorded", || {
-        relayed(&broker, 2, "abcde").is_some()
+    channel.send(&recorded["permission_request"]).await;
+    eventually("the approval is interpreted", || {
+        relayed(&broker, 2, "abcde").is_some_and(|resource| resource.interpretation_verified)
     })
     .await;
-    let connection = relayed(&broker, 2, "abcde")
-        .expect("recorded")
-        .request
-        .connection;
-    let declarative = PluginId::new("kalareach.codex").expect("valid");
-    let mut table = DeclarativeTable {
-        plugin_id: declarative.clone(),
-        publisher_id: PublisherId::new("kalareach").expect("valid"),
-        table_version: MethodTableVersion::new(1),
-        upstream_protocol_version: "1".to_owned(),
-        digest: Digest256::from_bytes([1; 32]),
-        framing: NativeFraming::JsonLines,
-        request_id_field: "id".to_owned(),
-        response_id_field: "id".to_owned(),
-        method_field: "method".to_owned(),
-        params_field: "params".to_owned(),
-        result_field: "result".to_owned(),
-        error_field: "error".to_owned(),
-        entries: vec![DeclarativeEntry {
-            method: UpstreamMethod::new("session/update").expect("valid"),
-            class: NativeMethodClass::Observation,
-            expects_response: false,
-            approval_option_field: Nullable::null(),
-            reverse: Nullable::null(),
-        }],
-    };
-    table.digest = table.canonical_digest().expect("encodable");
-    let rich = RichMethodTable {
-        table_version: MethodTableVersion::new(1),
-        upstream_protocol_version: "1".to_owned(),
-        entries: vec![RichMethodEntry {
-            method: UpstreamMethod::new("session/cancel").expect("valid"),
-            class: NativeMethodClass::Mutation,
-            required_right: kr_protocol::rights::ActionRight::AgentCancel,
-            operation: Nullable::some(RichOperation::TurnCancel),
-            provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
-        }],
-    };
-    broker
-        .pin_table(instance(2), installed(), table, rich)
-        .expect("a declarative table is pinned");
-    let refused = broker
-        .restore_native_connection(
-            connection,
-            instance(2),
-            &[9; 32],
-            &launched(2),
-            &declarative,
-            "1",
-        )
-        .expect_err("a live channel's identifier is not restored");
-    assert!(refused.to_string().contains("live connection"), "{refused}");
+    let resource = relayed(&broker, 2, "abcde").expect("recorded");
 
+    broker.close_connection(resource.request.connection);
+    assert_eq!(
+        broker
+            .pending(resource.resource_id)
+            .expect("the channel still holds it")
+            .state,
+        PendingState::Pending,
+        "a close under a channel's identifier settles nothing"
+    );
+
+    let answered = broker
+        .agent_approval_respond(
+            &caller(),
+            &respond(2, &resource, "allow"),
+            TimestampMs::new(5),
+        )
+        .await
+        .expect("the answer still goes out on the channel")
+        .0;
+    assert_eq!(answered.state, PendingState::Resolved);
+    assert_eq!(
+        channel.next().await,
+        Some(recorded["permission"].clone()),
+        "the verdict Claude Code reads"
+    );
     channel.relay("fghij").await;
     eventually("the channel is still served", || {
         relayed(&broker, 2, "fghij").is_some()

@@ -355,6 +355,12 @@ struct GatewayRun {
     ladders: Mutex<Vec<tokio::task::JoinHandle<Retirement>>>,
     /// How long the program has to connect once the launch is committed.
     connection_deadline: std::time::Duration,
+    /// How long the views are given to be told what the program's connection settled when it
+    /// ended.
+    delivery_bound: std::time::Duration,
+    /// What holds the telling of the views until a test lets it go, for this host's own tests.
+    #[cfg(feature = "testing")]
+    delivery_hold: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     broker: Arc<Broker>,
     handle: tokio::runtime::Handle,
     /// What the host has hashed of executables, so the server's is not read again.
@@ -376,6 +382,8 @@ impl GatewayRun {
         handle: tokio::runtime::Handle,
         hashed: Arc<HashedFiles>,
         connection_deadline: std::time::Duration,
+        delivery_bound: std::time::Duration,
+        #[cfg(feature = "testing")] delivery_hold: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<Self> {
         let socket = directory.join(GATEWAY_SOCKET);
         if socket.as_os_str().len() > SOCKET_PATH_LIMIT {
@@ -407,6 +415,9 @@ impl GatewayRun {
             connection: Mutex::new(None),
             ladders: Mutex::new(Vec::new()),
             connection_deadline,
+            delivery_bound,
+            #[cfg(feature = "testing")]
+            delivery_hold: Mutex::new(delivery_hold),
             broker,
             handle,
             hashed,
@@ -579,6 +590,13 @@ pub struct CommandBackends {
     /// How long a program has to connect to its gateway, for this host's own tests.
     #[cfg(feature = "testing")]
     connection_deadline: Mutex<Option<std::time::Duration>>,
+    /// How long the views are given to be told what a gateway's ended connection settled, for
+    /// this host's own tests.
+    #[cfg(feature = "testing")]
+    delivery_bound: Mutex<Option<std::time::Duration>>,
+    /// What holds the next gateway's telling of the views, for this host's own tests.
+    #[cfg(feature = "testing")]
+    delivery_hold: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     /// Where the next close stops before it retires a backend, for this host's own tests.
     #[cfg(feature = "testing")]
     retire_pause: Mutex<Option<DirectoryPause>>,
@@ -687,6 +705,10 @@ impl CommandBackends {
             #[cfg(feature = "testing")]
             connection_deadline: Mutex::new(None),
             #[cfg(feature = "testing")]
+            delivery_bound: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            delivery_hold: Mutex::new(None),
+            #[cfg(feature = "testing")]
             retire_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             files_pause: Mutex::new(None),
@@ -701,6 +723,46 @@ impl CommandBackends {
             .connection_deadline
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(deadline);
+    }
+
+    /// Sets how long the session's views are given to be told what the next gateway's connection
+    /// settled when it ended, for this host's own tests. It is compiled away in every shipped
+    /// build.
+    #[cfg(feature = "testing")]
+    pub fn deliver_within(&self, bound: std::time::Duration) {
+        *self
+            .delivery_bound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bound);
+    }
+
+    /// Holds the telling of the session's views, for the next gateway these backends plan, until
+    /// the returned end is used or dropped, for this host's own tests. With a bound shorter than
+    /// the hold the telling cannot finish in time, which is the case the views are then told to
+    /// resynchronise for. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn hold_delivery(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (release, hold) = tokio::sync::oneshot::channel();
+        *self
+            .delivery_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hold);
+        release
+    }
+
+    /// How long the session's views are given to be told what a gateway's connection settled when
+    /// it ended.
+    #[cfg(unix)]
+    fn delivery_bound(&self) -> std::time::Duration {
+        #[cfg(feature = "testing")]
+        if let Some(bound) = *self
+            .delivery_bound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return bound;
+        }
+        gateway_run::DELIVERY_BOUND
     }
 
     /// How long a program has to connect to its gateway once its launch is committed.
@@ -1393,6 +1455,12 @@ impl CommandBackends {
                     self.handle.clone(),
                     Arc::clone(&self.hashed),
                     self.connection_deadline(),
+                    self.delivery_bound(),
+                    #[cfg(feature = "testing")]
+                    self.delivery_hold
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take(),
                 )
             })
             .transpose()?;

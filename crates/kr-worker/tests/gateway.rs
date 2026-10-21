@@ -26,8 +26,8 @@ use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::session::Durability;
 use kr_worker::broker::{
     Broker, BrokerError, BrokerTransport, Caller, ConnectionOrigin, Credential, ManagedProcess,
-    MutationAdmission, PendingTransmission, ReconcileScope, TransportHandle, UpstreamBody,
-    UpstreamDispatch, UpstreamOutcome, UpstreamRequest, subject,
+    MutationAdmission, PendingTransmission, TransportHandle, UpstreamBody, UpstreamDispatch,
+    UpstreamOutcome, UpstreamRequest, subject,
 };
 use kr_worker::persistence::JournalHealth;
 
@@ -239,6 +239,25 @@ impl UpstreamDispatch for RecordingUpstream {
     }
 }
 
+/// A transport that takes an answer and cannot establish what became of it, as one whose upstream
+/// never acknowledges does: the answer's marker is in, and the resource ends uncertain.
+#[derive(Debug, Default)]
+struct UnconfirmedUpstream;
+
+impl UpstreamDispatch for UnconfirmedUpstream {
+    fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    fn submit(&self, _request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
+        Ok(PendingTransmission::settled(Err(
+            BrokerError::UpstreamUnavailable {
+                detail: "the upstream did not acknowledge the answer".to_owned(),
+            },
+        )))
+    }
+}
+
 fn caller(name: &str) -> Caller {
     Caller {
         actor_id: actor(name),
@@ -269,30 +288,6 @@ fn reserve(
         &respond(resource_id, option_id),
         TimestampMs::new(now),
     )
-}
-
-/// Answers one approval and stops the host at the moment its bytes go.
-///
-/// Section 24 puts the durable marker before the effect so that exactly this state is readable
-/// afterwards: the marker is in, the answer may already have reached the upstream, and nothing
-/// records what came of it. It is the state a worker that died mid-answer comes back to, and it is
-/// reconciliation, not a second answer, that settles it.
-fn answer_and_stop(broker: &Broker, resource_id: PendingResourceId, now: u64) {
-    let admitted = broker
-        .admit_approval(
-            &caller("device-1"),
-            &respond(resource_id, "allow"),
-            TimestampMs::new(now),
-        )
-        .expect("the answer is admitted");
-    // The marker goes in, and the host stops there, before its bytes are handed over: nothing of
-    // it runs afterwards, not even a destructor, which is what forgetting the marked answer stands
-    // for.
-    std::mem::forget(
-        broker
-            .mark_approval(&admitted, TimestampMs::new(now))
-            .expect("the marker is committed"),
-    );
 }
 
 /// Answers one approval the way the method does: admit, mark, transmit, settle.
@@ -1358,11 +1353,24 @@ async fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_r
     let mut store = common::SharedStore::open();
     let path = store.path.clone();
     let (surviving, answered) = {
-        let (broker, _upstream) = gateway_sharing(&store);
+        let (broker, upstream) = gateway_sharing(&store);
         let surviving = approval(&broker, "1", 2).expect("an interpretation before the fault");
         let answered = approval(&broker, "2", 4).expect("another one");
-        // An answer went before the fault and this host never recorded what came of it.
-        answer_and_stop(&broker, answered.resource_id, 6);
+        // An answer went before the fault and the upstream never acknowledged it, so the resource
+        // is uncertain and is never answered again.
+        broker.bind_connection_dispatch(
+            GatewayConnectionId::new(1),
+            std::sync::Arc::new(UnconfirmedUpstream) as _,
+        );
+        assert!(
+            answer(&broker, answered.resource_id, "allow", 6)
+                .await
+                .is_err()
+        );
+        broker.bind_connection_dispatch(
+            GatewayConnectionId::new(1),
+            std::sync::Arc::clone(&upstream) as _,
+        );
 
         store.fault_acceptance();
         assert_eq!(broker.mode(), GatewayMode::NativeOnlyVolatile);
@@ -1398,30 +1406,13 @@ async fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_r
             "rich work does not come back before the pending identifiers are reconciled"
         );
 
-        // Reconciliation with the same upstream: the request it still lists stays, and the one
-        // this host answered is uncertain and is never answered again. Rich work returns with it.
-        let (reconciliation, finished) = broker
-            .reconcile_recovered(
-                broker.recovery_generation(),
-                ReconcileScope {
-                    application_instance_id: instance(2),
-                    connection: GatewayConnectionId::new(1),
-                },
-                &[Broker::downstream(
-                    GatewayConnectionId::new(1),
-                    UpstreamRequestId::new("1").expect("valid"),
-                )],
-                TimestampMs::new(11),
-            )
-            .expect("the reconnect reconciles");
-        assert_eq!(reconciliation.still_pending, vec![surviving.resource_id]);
-        assert_eq!(reconciliation.uncertain, vec![answered.resource_id]);
-        assert_eq!(
-            finished
-                .expect("this was the last upstream that owed one")
-                .to,
-            GatewayMode::Normal
-        );
+        // The pass reconciles the open connection from the host's own record: the request it
+        // still holds stays, and the one this host answered is uncertain and is never answered
+        // again. Rich work returns with it.
+        let finished = broker
+            .reconcile_owed(TimestampMs::new(11))
+            .expect("this was the last connection that owed one");
+        assert_eq!(finished.to, GatewayMode::Normal);
         assert_eq!(broker.mode(), GatewayMode::Normal);
         assert!(
             broker.gap().is_none(),
@@ -1454,7 +1445,7 @@ async fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_r
     );
     assert!(
         restarted.pending(surviving).is_some(),
-        "the one the upstream still has comes back answerable"
+        "the one the upstream still has comes back pending"
     );
 }
 
@@ -1496,11 +1487,30 @@ async fn a_restart_comes_back_fenced_and_numbers_its_connections_above_what_it_w
         restarted.next_connection().get() > 1,
         "a new connection is numbered above every identifier this ledger holds"
     );
+
+    // The connection that owed the recovery belonged to the process that has gone, and nothing
+    // reopens it: its upstream holds nothing, so the first pass settles what it left and finishes
+    // the recovery.
+    let finished = restarted
+        .reconcile_owed(TimestampMs::new(11))
+        .expect("a recovery that owes a connection nobody holds finishes at the first pass");
+    assert_eq!(finished.to, GatewayMode::Normal);
+    assert_eq!(
+        restarted
+            .recorded(resource_id)
+            .expect("the ledger reads")
+            .expect("recorded")
+            .state,
+        PendingState::Cancelled,
+        "and the request it left is cancelled, because nothing can answer it"
+    );
 }
 
-/// Rich work comes back when every upstream that owed a reconciliation has given one.
+/// Rich work comes back when every connection that owed a reconciliation has been reconciled: a
+/// connection whose answer is still on its way is left for a later pass, because the answer's own
+/// writer is about to establish what reconciling now could only call uncertain.
 #[tokio::test]
-async fn a_recovery_waits_for_every_upstream_that_owed_it_a_reconciliation() {
+async fn a_recovery_waits_for_every_connection_that_owed_it_a_reconciliation() {
     let mut store = common::SharedStore::open();
     let (broker, _upstream) = gateway_built(None, store.health(), table());
     broker
@@ -1528,7 +1538,7 @@ async fn a_recovery_waits_for_every_upstream_that_owed_it_a_reconciliation() {
     let second = broker
         .forward_native(
             GatewayConnectionId::new(2),
-            frame("2", "fs/write_text_file").as_bytes(),
+            frame("2", "session/request_permission").as_bytes(),
             TimestampMs::new(3),
         )
         .expect("forwarded")
@@ -1542,49 +1552,43 @@ async fn a_recovery_waits_for_every_upstream_that_owed_it_a_reconciliation() {
         .recover(TimestampMs::new(5))
         .expect("the gap is committed");
 
-    let (_, finished) = broker
-        .reconcile_recovered(
-            broker.recovery_generation(),
-            ReconcileScope {
-                application_instance_id: instance(2),
-                connection: GatewayConnectionId::new(1),
-            },
-            &[Broker::downstream(
-                GatewayConnectionId::new(1),
-                UpstreamRequestId::new("1").expect("valid"),
-            )],
+    // The second connection's own client is answering as the pass runs: its writer is about to
+    // settle the answer, so the pass reconciles the first connection and leaves the second.
+    let answering = broker
+        .admit_native_answer(
+            GatewayConnectionId::new(2),
+            response("2").as_bytes(),
             TimestampMs::new(6),
         )
-        .expect("the first upstream reconciles");
+        .expect("the native client's answer is admitted");
     assert!(
-        finished.is_none(),
-        "one upstream says nothing about another's pending identifiers"
+        broker.reconcile_owed(TimestampMs::new(7)).is_none(),
+        "one connection says nothing about another's pending identifiers"
     );
     assert_eq!(broker.mode(), GatewayMode::Recovering);
     assert!(
-        answer(&broker, first.resource_id, "allow", 7)
+        answer(&broker, first.resource_id, "allow", 8)
             .await
-            .is_err()
+            .is_err(),
+        "rich work has not come back"
     );
 
-    let (_, finished) = broker
-        .reconcile_recovered(
-            broker.recovery_generation(),
-            ReconcileScope {
-                application_instance_id: instance(3),
-                connection: GatewayConnectionId::new(2),
-            },
-            &[Broker::downstream(
-                GatewayConnectionId::new(2),
-                UpstreamRequestId::new("2").expect("valid"),
-            )],
-            TimestampMs::new(8),
-        )
-        .expect("the second upstream reconciles");
-    assert!(finished.is_some(), "and that was the last one that owed");
-    assert_eq!(broker.mode(), GatewayMode::Normal);
-    assert!(broker.pending(second.resource_id).is_some());
-    answer(&broker, first.resource_id, "allow", 9)
+    broker
+        .native_answer_sent(&answering, TimestampMs::new(9))
+        .expect("the writer settles the answer");
+    let finished = broker
+        .reconcile_owed(TimestampMs::new(10))
+        .expect("and that was the last connection that owed");
+    assert_eq!(finished.to, GatewayMode::Normal);
+    assert_eq!(
+        broker
+            .recorded(second.resource_id)
+            .expect("the ledger reads")
+            .expect("recorded")
+            .state,
+        PendingState::Resolved
+    );
+    answer(&broker, first.resource_id, "allow", 11)
         .await
         .expect("rich work is back");
 }
@@ -1751,19 +1755,17 @@ async fn kr_req_11_27_one_exclusive_admission_carries_one_answer_whichever_write
     );
 }
 
-/// KR-REQ-11.37: a reconciliation belongs to one recovery, and a scope that appears during a
-/// recovery joins what it owes.
+/// KR-REQ-11.37: a storage failure during a recovery reopens the same gap and starts a recovery of
+/// its own, and a connection that appears during the recovery joins what it owes.
 ///
-/// Two windows closed here. A storage failure during recovery opens a new recovery, and an
-/// acknowledgement in flight from the one that failed must not finish it. And an upstream whose
-/// first request arrives while the recovery is running has not said what it holds, so rich work
-/// does not come back over it.
+/// An upstream whose first request arrives while the recovery is running has not been reconciled,
+/// so rich work does not come back over it.
 #[tokio::test]
-async fn kr_req_11_37_a_reconciliation_names_its_recovery_and_a_new_scope_joins_what_it_owes() {
+async fn kr_req_11_37_a_failure_during_recovery_reopens_the_gap_and_a_new_connection_joins_what_it_owes()
+ {
     let mut store = common::SharedStore::open();
     let (broker, _upstream) = gateway_sharing(&store);
     let first = approval(&broker, "1", 2).expect("interpreted");
-    let also = approval(&broker, "3", 2).expect("interpreted");
 
     store.fault_acceptance();
     assert_eq!(broker.mode(), GatewayMode::NativeOnlyVolatile);
@@ -1771,7 +1773,7 @@ async fn kr_req_11_37_a_reconciliation_names_its_recovery_and_a_new_scope_joins_
     broker
         .recover(TimestampMs::new(4))
         .expect("the gap is committed");
-    let first_recovery = broker.recovery_generation();
+    assert_eq!(broker.mode(), GatewayMode::Recovering);
 
     // Storage fails again during the recovery. The fence goes back over the same gap at the
     // broker's next decision, and the recovery that will close it is a new one.
@@ -1785,39 +1787,6 @@ async fn kr_req_11_37_a_reconciliation_names_its_recovery_and_a_new_scope_joins_
     broker
         .recover(TimestampMs::new(6))
         .expect("the gap is committed again");
-    let second_recovery = broker.recovery_generation();
-    assert_ne!(first_recovery, second_recovery);
-
-    // The acknowledgement prepared under the first recovery is about a moment that has passed.
-    // It says the upstream holds nothing, which applied would cancel both resources; it is refused
-    // before anything is written, so both the live resources and their rows are as they were.
-    let live_before = broker.pending_resources();
-    let rows_before: Vec<_> = [first.resource_id, also.resource_id]
-        .into_iter()
-        .map(|id| broker.recorded(id).expect("the ledger reads"))
-        .collect();
-    let stale = broker
-        .reconcile_recovered(
-            first_recovery,
-            ReconcileScope {
-                application_instance_id: instance(2),
-                connection: GatewayConnectionId::new(1),
-            },
-            &[],
-            TimestampMs::new(7),
-        )
-        .expect_err("a reconciliation from the recovery that failed finishes nothing");
-    assert_eq!(stale.code(), ErrorCode::InvalidArgument);
-    assert_eq!(
-        broker.pending_resources(),
-        live_before,
-        "the stale list changed no live resource"
-    );
-    let rows_after: Vec<_> = [first.resource_id, also.resource_id]
-        .into_iter()
-        .map(|id| broker.recorded(id).expect("the ledger reads"))
-        .collect();
-    assert_eq!(rows_after, rows_before, "and no ledger row");
     assert_eq!(broker.mode(), GatewayMode::Recovering);
     assert!(
         answer(&broker, first.resource_id, "allow", 8)
@@ -1826,12 +1795,9 @@ async fn kr_req_11_37_a_reconciliation_names_its_recovery_and_a_new_scope_joins_
         "rich work has not come back"
     );
 
-    // A second upstream records its first request while the recovery is running. It has not said
-    // what it holds either, so it joins what this recovery owes and finishing the first one does
-    // not lift the fence.
-    broker
-        .pin_table(instance(2), installed(), table(), rich())
-        .expect("the installed tables are pinned");
+    // A second connection records its first request while the recovery is running, and its client
+    // is answering as the pass runs. It has not been reconciled, so it joins what this recovery
+    // owes and finishing the first connection does not lift the fence.
     broker
         .open_native_connection(
             instance(2),
@@ -1848,37 +1814,31 @@ async fn kr_req_11_37_a_reconciliation_names_its_recovery_and_a_new_scope_joins_
             TimestampMs::new(9),
         )
         .expect("the native path continues through a recovery");
-
-    let (_, waiting) = broker
-        .reconcile_recovered(
-            second_recovery,
-            ReconcileScope {
-                application_instance_id: instance(2),
-                connection: GatewayConnectionId::new(1),
-            },
-            &[],
+    let answering = broker
+        .admit_native_answer(
+            GatewayConnectionId::new(2),
+            response("7").as_bytes(),
             TimestampMs::new(10),
         )
-        .expect("the first upstream reconciles");
+        .expect("the native client's answer is admitted");
     assert!(
-        waiting.is_none(),
-        "a scope that appeared during the recovery is one the recovery owes"
+        broker.reconcile_owed(TimestampMs::new(11)).is_none(),
+        "a connection that appeared during the recovery is one the recovery owes"
     );
     assert_eq!(broker.mode(), GatewayMode::Recovering);
 
-    let (_, finished) = broker
-        .reconcile_recovered(
-            second_recovery,
-            ReconcileScope {
-                application_instance_id: instance(2),
-                connection: GatewayConnectionId::new(2),
-            },
-            &[],
-            TimestampMs::new(11),
-        )
-        .expect("and the upstream that appeared reconciles too");
-    assert!(finished.is_some());
-    assert_eq!(broker.mode(), GatewayMode::Normal);
+    broker
+        .native_answer_sent(&answering, TimestampMs::new(12))
+        .expect("the writer settles the answer");
+    let finished = broker
+        .reconcile_owed(TimestampMs::new(13))
+        .expect("and the connection that appeared is reconciled too");
+    assert_eq!(finished.to, GatewayMode::Normal);
+    assert_eq!(
+        broker.recorded_gaps().expect("the ledger reads").len(),
+        1,
+        "the second failure reopened the same interval rather than opening another"
+    );
 }
 
 /// KR-REQ-11.25 and KR-REQ-11.30: a qualified table's digest names the protocol semantics it
@@ -1944,77 +1904,6 @@ fn kr_req_11_25_a_tables_digest_names_the_semantics_it_declares() {
     assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
 }
 
-/// KR-REQ-11.26 and KR-REQ-12.06: restoring a connection checks every resource it retained, in
-/// whichever order they are read.
-#[test]
-fn kr_req_11_26_a_restoration_checks_every_resource_the_connection_retained() {
-    let mut stale_first = 0_usize;
-    let mut stale_second = 0_usize;
-    // Resources are identified by random handles, so the order a connection's retained resources
-    // are read in is not the order they were created in. The refusal has to hold either way, so
-    // the scenario runs until both orders have been seen.
-    for _ in 0..200 {
-        let broker = gateway(None);
-        let connection = GatewayConnectionId::new(1);
-        let current = broker
-            .forward_native(
-                connection,
-                frame("1", "session/request_permission").as_bytes(),
-                TimestampMs::new(2),
-            )
-            .expect("forwarded")
-            .1
-            .expect("it expects a response")
-            .resource_id;
-        // The upstream owner changes, and a request recorded after it belongs to the execution
-        // that is running now.
-        broker
-            .advance_binding(instance(2), None, TimestampMs::new(3))
-            .expect("the binding advances");
-        let newer = broker
-            .forward_native(
-                connection,
-                frame("2", "session/request_permission").as_bytes(),
-                TimestampMs::new(4),
-            )
-            .expect("forwarded")
-            .1
-            .expect("it expects a response")
-            .resource_id;
-        broker.close_connection(connection);
-
-        let order: Vec<_> = broker
-            .pending_resources()
-            .into_iter()
-            .filter(|resource| resource.request.connection == connection)
-            .map(|resource| resource.resource_id)
-            .collect();
-        assert_eq!(order.len(), 2);
-        if order[0] == current {
-            stale_first += 1;
-        } else {
-            assert_eq!(order[0], newer);
-            stale_second += 1;
-        }
-
-        let refusal = broker
-            .restore_native_connection(
-                connection,
-                instance(2),
-                &CREDENTIAL,
-                &process_identity(41, 900),
-                &package(),
-                "1",
-            )
-            .expect_err("a connection holding an old execution's resources is not restored");
-        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
-        if stale_first > 0 && stale_second > 0 {
-            return;
-        }
-    }
-    panic!("both read orders should have occurred: {stale_first} and {stale_second}");
-}
-
 /// KR-REQ-11.33 and KR-REQ-12.08: a table that declares no answer member answers nothing.
 ///
 /// The decision goes in the member the connector's own table names. A table that names none
@@ -2049,14 +1938,18 @@ async fn kr_req_11_33_a_table_that_names_no_answer_member_refuses_before_anythin
     );
 }
 
-/// KR-REQ-11.27: a reconnect gives back a reservation nothing was sent under.
+/// KR-REQ-11.27 and KR-REQ-11.37: a reservation nothing was sent under is given back by its holder,
+/// and a recovery waits for the holder instead of reconciling around it.
 ///
-/// The two halves of reconciliation are the difference the marker makes. A resource this host had
-/// reserved but not marked is answerable again once the upstream says it still holds the request;
-/// one it had marked is uncertain for ever.
+/// A resource this host had reserved but not marked is answerable again once its holder gives the
+/// reservation back; one it had marked is uncertain for ever (the connection's end settles that
+/// one: `kr_req_11_27_one_resolution_each_and_a_connections_end_leaves_a_sent_answer_uncertain`).
+/// While the reservation is held the connection is not reconciled, because the holder is about to
+/// settle it, and the recovery finishes on the pass after it is given back.
 #[tokio::test]
-async fn kr_req_11_27_a_reconnect_gives_back_a_reservation_nothing_was_sent_under() {
-    let (broker, upstream) = gateway_recording(None);
+async fn kr_req_11_27_a_recovery_waits_for_a_reservation_and_the_holder_gives_it_back() {
+    let mut store = common::SharedStore::open();
+    let (broker, upstream) = gateway_sharing(&store);
     let reserved = approval(&broker, "1", 2).expect("the interpretation is accepted");
     let admitted =
         reserve(&broker, reserved.resource_id, "allow", 4).expect("its transmission is reserved");
@@ -2068,21 +1961,18 @@ async fn kr_req_11_27_a_reconnect_gives_back_a_reservation_nothing_was_sent_unde
         PendingState::Claimed
     );
 
-    let reconciliation = broker
-        .reconcile(
-            ReconcileScope {
-                application_instance_id: instance(2),
-                connection: GatewayConnectionId::new(1),
-            },
-            &[Broker::downstream(
-                GatewayConnectionId::new(1),
-                UpstreamRequestId::new("1").expect("valid"),
-            )],
-            TimestampMs::new(6),
-        )
-        .expect("the reconnect reconciles");
-    assert_eq!(reconciliation.released, vec![reserved.resource_id]);
-    assert!(reconciliation.uncertain.is_empty());
+    store.fault_acceptance();
+    store.recover_journal(5);
+    broker
+        .recover(TimestampMs::new(5))
+        .expect("the gap is committed");
+    assert!(
+        broker.reconcile_owed(TimestampMs::new(6)).is_none(),
+        "a connection with a reservation held is left for a later pass"
+    );
+    assert_eq!(broker.mode(), GatewayMode::Recovering);
+
+    broker.abandon(&admitted);
     assert_eq!(
         broker
             .pending(reserved.resource_id)
@@ -2091,14 +1981,18 @@ async fn kr_req_11_27_a_reconnect_gives_back_a_reservation_nothing_was_sent_unde
         PendingState::Pending,
         "nothing was sent under that reservation, so the resource is answerable again"
     );
+    let finished = broker
+        .reconcile_owed(TimestampMs::new(7))
+        .expect("the pass after the holder gave it back finishes the recovery");
+    assert_eq!(finished.to, GatewayMode::Normal);
 
     // The admission that held it settles nothing afterwards, and a fresh answer goes.
     assert!(
         broker
-            .record_approval(&admitted, TimestampMs::new(7))
+            .record_approval(&admitted, TimestampMs::new(8))
             .is_err()
     );
-    let applied = answer(&broker, reserved.resource_id, "allow", 8)
+    let applied = answer(&broker, reserved.resource_id, "allow", 9)
         .await
         .expect("it is answerable");
     assert_eq!(applied.state, PendingState::Resolved);
@@ -2112,8 +2006,8 @@ async fn kr_req_11_27_a_reconnect_gives_back_a_reservation_nothing_was_sent_unde
 /// The answer's marker is recorded and its bytes go; then the ledger refuses the settlement. The
 /// answer did go, so it is settled in memory as a transition of the gap, behind the fence the
 /// failure raised, and the recovery commits it. The store then fails again, first under the
-/// recovery's own commit and then under a reconciliation: each falls back to the fence, and the
-/// resource the failed reconciliation would have ended is exactly as it was, live and in its row.
+/// recovery's own commit and then under its finish: each falls back to the fence, and the
+/// resource the finish passed over is exactly as it was, live and in its row.
 #[tokio::test]
 async fn kr_req_11_37_a_store_failing_under_settlement_or_recovery_keeps_what_happened_and_nothing_else()
  {
@@ -2195,18 +2089,15 @@ async fn kr_req_11_37_a_store_failing_under_settlement_or_recovery_keeps_what_ha
     broker
         .refuse_ledger_writes(true)
         .expect("the store is put in query-only mode");
-    let refused = broker
-        .reconcile_recovered(
-            broker.recovery_generation(),
-            ReconcileScope {
-                application_instance_id: instance(2),
-                connection: GatewayConnectionId::new(1),
-            },
-            &[],
-            TimestampMs::new(12),
-        )
-        .expect_err("a reconciliation that cannot be written is not applied");
-    assert_eq!(refused.code(), ErrorCode::StorageUnavailable);
+    assert_eq!(
+        broker.mode(),
+        GatewayMode::Recovering,
+        "the open request is still owed a reconciliation"
+    );
+    assert!(
+        broker.reconcile_owed(TimestampMs::new(12)).is_none(),
+        "a finish that cannot be written is not made"
+    );
     assert_eq!(broker.mode(), GatewayMode::NativeOnlyVolatile);
     assert_eq!(
         (
@@ -2230,21 +2121,10 @@ async fn kr_req_11_37_a_store_failing_under_settlement_or_recovery_keeps_what_ha
             .await
             .is_err()
     );
-    let (_, finished) = broker
-        .reconcile_recovered(
-            broker.recovery_generation(),
-            ReconcileScope {
-                application_instance_id: instance(2),
-                connection: GatewayConnectionId::new(1),
-            },
-            &[Broker::downstream(
-                GatewayConnectionId::new(1),
-                UpstreamRequestId::new("2").expect("valid"),
-            )],
-            TimestampMs::new(15),
-        )
-        .expect("the upstream says what it still holds");
-    assert!(finished.is_some());
+    assert!(
+        broker.reconcile_owed(TimestampMs::new(15)).is_some(),
+        "the open connection is reconciled from the host's record"
+    );
     answer(&broker, open.resource_id, "allow", 16)
         .await
         .expect("rich work is back");
@@ -2255,32 +2135,20 @@ async fn kr_req_11_37_a_store_failing_under_settlement_or_recovery_keeps_what_ha
     );
 }
 
-/// The scope one recovery owes on this suite's one connection.
-fn owed_scope() -> ReconcileScope {
-    ReconcileScope {
-        application_instance_id: instance(2),
-        connection: GatewayConnectionId::new(1),
-    }
-}
-
 /// KR-REQ-11.35 and KR-REQ-11.37: a fault the journal recovered from before the broker decided
 /// anything is still the broker's gap, and one that opens during a recovery sends it back.
 ///
 /// Nothing asks the broker anything between the journal faulting and the journal recovering, so
 /// the condition is healthy again by the time the broker next looks. The work it carried in
 /// between went unrecorded all the same: it enters the fence it missed, commits the gap and owes
-/// the upstream a reconciliation. A second fault that opens and recovers while that recovery is
-/// running, again unseen, sends the recovery back to the fence under a new generation, and the
-/// reconciliation prepared under the old one is refused.
+/// the connection a reconciliation. A second fault that opens and recovers while that recovery is
+/// running, again unseen, sends the recovery back to the fence, and a pass over it finishes
+/// nothing until the gap is committed again.
 #[tokio::test]
 async fn kr_req_11_37_a_fault_the_broker_never_saw_is_still_its_gap_and_its_recovery_falls_back() {
     let mut store = common::SharedStore::open();
     let (broker, _upstream) = gateway_sharing(&store);
     let held = approval(&broker, "1", 2).expect("an interpretation before the fault");
-    let still_open = [Broker::downstream(
-        GatewayConnectionId::new(1),
-        UpstreamRequestId::new("1").expect("valid"),
-    )];
 
     store.fault_acceptance();
     store.recover_journal(3);
@@ -2314,43 +2182,135 @@ async fn kr_req_11_37_a_fault_the_broker_never_saw_is_still_its_gap_and_its_reco
         GatewayMode::NativeOnlyVolatile,
         "a fault inside the recovery sends it back, seen or not"
     );
-    assert!(broker.recovery_generation() > first.generation);
-    let stale = broker
-        .reconcile_recovered(
-            first.generation,
-            owed_scope(),
-            &still_open,
-            TimestampMs::new(6),
-        )
-        .expect_err("a reconciliation prepared under the recovery that fell back");
-    assert_eq!(stale.code(), ErrorCode::InvalidArgument);
+    assert!(
+        broker.reconcile_owed(TimestampMs::new(6)).is_none(),
+        "a pass finishes nothing for a recovery that fell back"
+    );
     assert_eq!(
         broker.pending(held.resource_id).expect("still held").state,
         PendingState::Pending,
         "and it changed nothing"
     );
 
-    let second = broker
+    broker
         .recover(TimestampMs::new(7))
         .expect("the gap is committed again");
-    let (reconciliation, finished) = broker
-        .reconcile_recovered(
-            second.generation,
-            owed_scope(),
-            &still_open,
-            TimestampMs::new(8),
-        )
-        .expect("the upstream says what it still holds");
-    assert_eq!(reconciliation.still_pending, vec![held.resource_id]);
+    let finished = broker
+        .reconcile_owed(TimestampMs::new(8))
+        .expect("the open connection is reconciled from the host's record");
+    assert_eq!(finished.to, GatewayMode::Normal);
     assert_eq!(
-        finished.map(|finished| finished.to),
-        Some(GatewayMode::Normal)
+        broker.pending(held.resource_id).expect("still held").state,
+        PendingState::Pending,
+        "the request the connection still holds stays"
     );
     assert_eq!(
         broker.recorded_gaps().expect("the ledger reads").len(),
         1,
         "the second fault reopened the same interval rather than opening another"
     );
+}
+
+/// KR-REQ-11.37 and KR-REQ-11.27: a recovery owes nothing to a connection that has ended, whether
+/// it ended before the fault or inside the gap, and a connection's end settles what it left.
+///
+/// A connection that ended in normal operation settled its unanswered request as cancelled, so a
+/// fault after it owes it nothing. One that ended inside the gap settled in memory, as a
+/// transition of the gap that the recovery commits, and the resource keeps saying that it lived
+/// through a gap. Either way the recovery finishes at its first pass.
+#[tokio::test]
+async fn kr_req_11_37_a_recovery_owes_nothing_to_a_connection_that_has_ended() {
+    // Ended in normal operation, then a fault.
+    let mut store = common::SharedStore::open();
+    let (broker, _upstream) = gateway_sharing(&store);
+    let early = approval(&broker, "1", 2).expect("an interpretation");
+    broker.close_connection(GatewayConnectionId::new(1));
+    assert_eq!(
+        broker
+            .recorded(early.resource_id)
+            .expect("the ledger reads")
+            .expect("recorded")
+            .state,
+        PendingState::Cancelled,
+        "the end of the connection settled what it left"
+    );
+    store.fault_acceptance();
+    store.recover_journal(4);
+    assert_eq!(broker.mode(), GatewayMode::NativeOnlyVolatile);
+    broker
+        .recover(TimestampMs::new(4))
+        .expect("the gap is committed");
+    let finished = broker
+        .reconcile_owed(TimestampMs::new(5))
+        .expect("nothing is owed to a connection that has ended");
+    assert_eq!(finished.to, GatewayMode::Normal);
+
+    // Ended inside the gap.
+    let mut store = common::SharedStore::open();
+    let (broker, _upstream) = gateway_sharing(&store);
+    let inside = approval(&broker, "1", 2).expect("an interpretation");
+    store.fault_acceptance();
+    assert_eq!(broker.mode(), GatewayMode::NativeOnlyVolatile);
+    broker.close_connection(GatewayConnectionId::new(1));
+    store.recover_journal(4);
+    broker
+        .recover(TimestampMs::new(4))
+        .expect("the gap is committed");
+    let finished = broker
+        .reconcile_owed(TimestampMs::new(5))
+        .expect("the connection that ended in the gap owes the recovery nothing");
+    assert_eq!(finished.to, GatewayMode::Normal);
+    let recorded = broker
+        .recorded(inside.resource_id)
+        .expect("the ledger reads")
+        .expect("the recovery committed the settlement of the gap");
+    assert_eq!(recorded.state, PendingState::Cancelled);
+    assert_eq!(
+        recorded.durability,
+        Durability::Volatile,
+        "and it says it lived through a gap"
+    );
+}
+
+/// KR-REQ-11.37: a connection's end that meets a failing store settles every request it left, and
+/// every one of them says that it lived through the gap.
+///
+/// The store refuses the first settlement the end commits, which raises the fence. The second
+/// request was planned before the fence rose, so it carries the durability it had; the end marks
+/// it volatile before it commits it, and the recovery writes it down as one that lived through a
+/// gap.
+#[tokio::test]
+async fn kr_req_11_37_a_connection_that_ends_under_a_failing_store_marks_every_request_volatile() {
+    let mut store = common::SharedStore::open();
+    let (broker, _upstream) = gateway_sharing(&store);
+    let first = approval(&broker, "1", 2).expect("an interpretation");
+    let second = approval(&broker, "2", 4).expect("an interpretation");
+    broker
+        .refuse_ledger_writes(true)
+        .expect("the store is put in query-only mode");
+    broker.close_connection(GatewayConnectionId::new(1));
+    assert_eq!(broker.mode(), GatewayMode::NativeOnlyVolatile);
+
+    broker
+        .refuse_ledger_writes(false)
+        .expect("the store takes writes again");
+    store.recover_journal(6);
+    broker
+        .recover(TimestampMs::new(6))
+        .expect("the gap is committed");
+    assert!(broker.reconcile_owed(TimestampMs::new(7)).is_some());
+    for resource in [first.resource_id, second.resource_id] {
+        let recorded = broker
+            .recorded(resource)
+            .expect("the ledger reads")
+            .expect("recorded");
+        assert_eq!(recorded.state, PendingState::Cancelled);
+        assert_eq!(
+            recorded.durability,
+            Durability::Volatile,
+            "every request the end settled under the failing store says it lived through a gap"
+        );
+    }
 }
 
 /// KR-REQ-11.35: native work goes on while a recovery writes the gap, and what it did is in what
@@ -2440,9 +2400,7 @@ async fn kr_req_11_35_native_work_goes_on_while_a_recovery_is_held_at_its_write(
 ///
 /// A component bound, a grant changed, an adapter's checkpoint and an ordinary reconciliation all
 /// need their record, and the store is what failed. Each is refused before the store is reached,
-/// so an empty list from an upstream cancels nothing, and each is taken again once the recovery
-/// is complete. While the recovery runs, an ordinary reconciliation is refused too: reconciling is
-/// then the recovery's own, which writes without waiting for the store.
+/// and each is taken again once the recovery is complete.
 #[tokio::test]
 async fn kr_req_11_37_nothing_that_needs_its_record_is_taken_while_the_fence_is_up() {
     let mut store = common::SharedStore::open();
@@ -2502,43 +2460,20 @@ async fn kr_req_11_37_nothing_that_needs_its_record_is_taken_while_the_fence_is_
         ),
         "an adapter checkpoint",
     );
-    fenced(
-        broker
-            .reconcile(owed_scope(), &[], TimestampMs::new(3))
-            .map(|_| ()),
-        "an ordinary reconciliation",
-    );
     assert_eq!(
         broker.pending(held.resource_id).expect("still held").state,
         PendingState::Pending,
-        "and the empty list cancelled nothing"
+        "and nothing refused cancelled it"
     );
 
     store.recover_journal(4);
     broker
         .recover(TimestampMs::new(4))
         .expect("the gap is committed");
-    let during = broker
-        .reconcile(owed_scope(), &[], TimestampMs::new(4))
-        .expect_err("a reconciliation during a recovery is the recovery's own");
-    assert_eq!(during.code(), ErrorCode::InvalidArgument);
-    assert_eq!(
-        broker.pending(held.resource_id).expect("still held").state,
-        PendingState::Pending,
-        "and that empty list cancelled nothing either"
+    assert!(
+        broker.reconcile_owed(TimestampMs::new(5)).is_some(),
+        "the open connection is reconciled from the host's record"
     );
-    let (_, finished) = broker
-        .reconcile_recovered(
-            broker.recovery_generation(),
-            owed_scope(),
-            &[Broker::downstream(
-                GatewayConnectionId::new(1),
-                UpstreamRequestId::new("1").expect("valid"),
-            )],
-            TimestampMs::new(5),
-        )
-        .expect("the upstream says what it still holds");
-    assert!(finished.is_some());
     bind(6).expect("a component is bound once the recovery is complete");
     broker
         .checkpoint(
@@ -2575,7 +2510,7 @@ async fn kr_req_11_37_a_recovery_finishes_without_waiting_for_a_busy_store() {
         .execute_batch("BEGIN IMMEDIATE")
         .expect("the write lock is taken");
     assert!(
-        broker.reconcile_connected(TimestampMs::new(5)).is_none(),
+        broker.reconcile_owed(TimestampMs::new(5)).is_none(),
         "the finish is not written while another connection holds the store"
     );
     assert!(
@@ -2593,7 +2528,7 @@ async fn kr_req_11_37_a_recovery_finishes_without_waiting_for_a_busy_store() {
         .expect("the write lock is let go");
 
     let finished = broker
-        .reconcile_connected(TimestampMs::new(6))
+        .reconcile_owed(TimestampMs::new(6))
         .expect("the next pass finishes");
     assert_eq!(finished.to, GatewayMode::Normal);
     assert_eq!(
