@@ -101,11 +101,20 @@ pub fn shell_quoted(path: &std::path::Path) -> String {
             path.display()
         )
     });
-    let text = if cfg!(windows) {
+    shell_word(&if cfg!(windows) {
         text.replace('\\', "/")
     } else {
         text.to_owned()
-    };
+    })
+}
+
+/// Text as one single-quoted word of a POSIX shell, whatever it holds.
+///
+/// For a command that is itself handed to a shell as one argument (`sh -c`, a remote command): the
+/// quotes inside it, those [`shell_quoted`] puts round a path included, are closed over, given as
+/// escaped quotes of their own and reopened, so the inner shell receives the command as written.
+#[must_use]
+pub fn shell_word(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
