@@ -1496,21 +1496,12 @@ impl Broker {
         }
         let invocation = Self::invocation_for(caller, &registered, params, arguments.clone());
         // A cancellation acts on the turn this instance is running, read here under the lock the
-        // admission is made under: the action names none, and one that is not running is refused
-        // rather than cancelled by whatever turn is running when it lands.
+        // admission is made under: the action names none. A connector whose table writes the
+        // cancellation needs it, and refuses the plan for want of it before the marker.
         let turn_id = if registered.operation
             == Some(kr_protocol::broker::PreparedOperation::UpstreamCancel)
         {
-            Some(
-                state
-                    .running_turn(params.target.subject.application_instance_id)?
-                    .ok_or_else(|| BrokerError::PreconditionFailed {
-                        detail: format!(
-                            "{} cancels the turn this instance is running, and none is known",
-                            params.action
-                        ),
-                    })?,
-            )
+            state.running_turn(params.target.subject.application_instance_id)?
         } else {
             None
         };
