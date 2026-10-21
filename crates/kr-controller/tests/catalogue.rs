@@ -42,7 +42,7 @@ async fn put_allowed(
 ) -> bool {
     module
         .put_allowed_adapters(
-            || allowed,
+            || allowed.clone(),
             tokio::time::Instant::now() + std::time::Duration::from_secs(60),
         )
         .await

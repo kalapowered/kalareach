@@ -1014,10 +1014,12 @@ impl InvitationStore for InvitationRows {
             .with(|connection| {
                 let mut statement = connection.prepare(
                     "SELECT invitation_id FROM pairing_invitations
-                     WHERE state IN ('open', 'locked') ORDER BY issued_at_ms",
+                     WHERE state IN (?1, ?2) ORDER BY issued_at_ms",
                 )?;
                 statement
-                    .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+                    .query_map(params![STATE_OPEN, STATE_LOCKED], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })?
                     .collect::<rusqlite::Result<Vec<_>>>()
             })
             .map_err(store_error)?;

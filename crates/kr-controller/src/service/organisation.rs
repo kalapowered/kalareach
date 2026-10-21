@@ -9,6 +9,8 @@
 //! action changes is the policy, which is written together with the action's answer in one
 //! transaction, so a host never holds an enrolment it cannot answer for.
 
+use std::sync::Arc;
+
 use kr_protocol::confirmation::{
     ConfirmationDisplay, ExclusiveManagementPlan, OrganisationEnrolPlan,
 };
@@ -405,20 +407,35 @@ impl Controller {
     ) -> Result<ParamsValue> {
         let params: OrganisationPolicyApplyParams = parse(&mutation.params)?;
         let organisation_id = params.policy.payload.organisation_id;
-        let reading = self.lifetimes.clock_trust().sample(&self.devices)?;
         let answer = {
             let registry = self.registry.lock().await;
             self.check_admission(&registry, &carried)?;
+            // The clock is read only for a chain, whose head is a statement about now, and read
+            // under the guard like an enrolment's: a policy has no lifetime and needs no clock.
+            let reading = match params.authority.as_ref() {
+                Some(_) => self.lifetimes.clock_trust().sample(&self.devices)?,
+                None => None,
+            };
+            let followed_head = std::cell::Cell::new(None);
             self.update_policy_claimed(
                 hold,
                 |policy| {
-                    policy
+                    let advanced = policy
                         .apply_organisation_policy(
                             &params.policy,
                             params.authority.as_ref(),
                             reading.as_ref(),
+                            self.clock.now(),
                         )
                         .map_err(policy_refusal)?;
+                    if advanced {
+                        followed_head.set(
+                            params
+                                .authority
+                                .as_ref()
+                                .map(|authority| authority.head.payload.expires_at_ms),
+                        );
+                    }
                     let applied = policy
                         .enrolment(organisation_id)
                         .and_then(|enrolment| enrolment.applied_policy())
@@ -440,7 +457,17 @@ impl Controller {
                     let bytes = kr_cbor::encode(encode(&answer)?.as_value());
                     Ok((answer, bytes))
                 },
-                || self.check_admission(&registry, &carried),
+                || {
+                    self.check_admission(&registry, &carried)?;
+                    // A chain the policy followed was judged at a reading taken before the waits
+                    // for the locks, and its head is a bound that can pass while they last.
+                    match followed_head.get() {
+                        Some(head_expires_at) => {
+                            self.head_holds_still(head_expires_at, reading.as_ref())
+                        }
+                        None => Ok(()),
+                    }
+                },
             )?
         };
         self.put_the_adapters_the_policy_allows().await?;
@@ -448,7 +475,7 @@ impl Controller {
     }
 
     /// Puts the adapters the organisations' policies allow in force, within the time a request may
-    /// wait for the catalogue, and sends the workers a round when that changed them.
+    /// wait for the catalogue.
     ///
     /// # Errors
     ///
@@ -457,12 +484,7 @@ impl Controller {
     pub(crate) async fn put_the_adapters_the_policy_allows(&self) -> Result<()> {
         let deadline = tokio::time::Instant::now() + super::WORKER_EXCHANGE;
         match self.put_the_adapter_allowlist_by(deadline).await {
-            Ok(moved) => {
-                if moved {
-                    self.admissions_due();
-                }
-                Ok(())
-            }
+            Ok(_) => Ok(()),
             Err(error) => Err(ControllerError::Refused {
                 code: error.code,
                 detail: format!(
@@ -475,15 +497,52 @@ impl Controller {
     }
 
     /// Puts the adapters the organisations' policies allow in force for the admissions that follow,
-    /// and returns true when that changed what was in force. The list is read from the policy once
-    /// the catalogue is held, so it is the policy as it stands then.
+    /// sends the workers a round when that changed them, and returns true when it did. The list is
+    /// read from the policy once the catalogue is held, so it is the policy as it stands then.
+    ///
+    /// The caller waits until `deadline`. The change itself runs on a task of its own, so a caller
+    /// that stops waiting leaves it to finish: a native bridge that is being brought to what the
+    /// list wants is never cut part way.
     pub(crate) async fn put_the_adapter_allowlist_by(
         &self,
         deadline: tokio::time::Instant,
     ) -> std::result::Result<bool, kr_protocol::error::ProtocolError> {
-        self.catalogue
-            .put_allowed_adapters(|| self.policy().adapter_allowlist(), deadline)
-            .await
+        let policy = Arc::clone(&self.policy);
+        let read = move || {
+            policy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .adapter_allowlist()
+        };
+        if read() == self.catalogue.adapters_in_force() {
+            return Ok(false);
+        }
+        let unavailable = |why: &str| {
+            kr_protocol::error::ProtocolError::new(
+                ErrorCode::ResourceUnavailable,
+                format!("the adapters the organisations allow are not in force: {why}"),
+            )
+        };
+        let Some(controller) = self.me.upgrade() else {
+            return Err(unavailable("this daemon is stopping"));
+        };
+        let task = tokio::spawn(async move {
+            let moved = controller
+                .catalogue
+                .put_allowed_adapters(read, deadline)
+                .await;
+            if matches!(moved, Ok(true)) {
+                controller.admissions_due();
+            }
+            moved
+        });
+        match tokio::time::timeout_at(deadline, task).await {
+            Ok(Ok(moved)) => moved,
+            Ok(Err(_)) => Err(unavailable("the change did not complete")),
+            Err(_) => Err(unavailable(
+                "the catalogue is busy with another change or a package is slow to read",
+            )),
+        }
     }
 
     /// `organisation.withdraw`: this host leaves an organisation's policy, and is fenced for it.
@@ -549,14 +608,12 @@ impl Controller {
                 // The organisation's list goes with its enrolment. A withdrawal only widens the
                 // adapters the host admits, so a put that does not land waits for the next pass.
                 let deadline = tokio::time::Instant::now() + super::WORKER_EXCHANGE;
-                match self.put_the_adapter_allowlist_by(deadline).await {
-                    Ok(true) => self.admissions_due(),
-                    Ok(false) => {}
-                    Err(error) => eprintln!(
+                if let Err(error) = self.put_the_adapter_allowlist_by(deadline).await {
+                    eprintln!(
                         "kr-controller: the adapters the organisations allow could not be put in \
                          force after a withdrawal: {}",
                         error.message
-                    ),
+                    );
                 }
                 encode(&completed)
             }

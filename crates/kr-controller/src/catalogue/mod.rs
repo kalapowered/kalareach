@@ -221,6 +221,11 @@ pub struct CatalogueModule {
     /// computed for: rounds at an unchanged revision reuse it. Nothing a snapshot carries moves
     /// without the revision moving, the bridges included (see [`Self::write`]).
     snapshots: Arc<std::sync::Mutex<Option<CachedSnapshot>>>,
+    /// The adapters the catalogue admits under now, or none stated for every adapter the host
+    /// qualifies: what the catalogue holds, kept beside its lock and written under it, so a caller
+    /// can tell that nothing has to change without waiting for a synchronisation that holds the
+    /// catalogue.
+    adapters_in_force: std::sync::Mutex<Option<std::collections::BTreeSet<PluginId>>>,
     /// The enrolment budgets this host's configuration puts in force: set at the daemon's start
     /// and at every acceptance of the configuration after it, by the rule every value in force
     /// follows (`config::catalogue::budgets_in_force`), and read by each enrolment and each
@@ -353,7 +358,7 @@ impl CatalogueModule {
                 .map_err(unavailable)?;
         }
         catalogue
-            .set_allowed_adapters(allowed, &Owner::acting())
+            .set_allowed_adapters(allowed.clone(), &Owner::acting())
             .map_err(unavailable)?;
         let limits = kr_plugin_catalogue::LimitsInForce::default();
         limits.put(limits_of(&budgets));
@@ -367,6 +372,7 @@ impl CatalogueModule {
             catalogue: Arc::new(Mutex::new(catalogue)),
             environment_id,
             bridges,
+            adapters_in_force: std::sync::Mutex::new(allowed),
             #[cfg(feature = "testing")]
             transport,
             snapshots: Arc::new(std::sync::Mutex::new(None)),
@@ -638,13 +644,25 @@ impl CatalogueModule {
         record_disable_policy(&mut catalogue, wanted).map_err(ProtocolError::from)
     }
 
+    /// The adapters the catalogue admits under now, or none stated for every adapter the host
+    /// qualifies.
+    #[must_use]
+    pub fn adapters_in_force(&self) -> Option<std::collections::BTreeSet<PluginId>> {
+        self.adapters_in_force
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Puts the adapters the organisations' policies allow in force for the admissions that
     /// follow, or every adapter with `None`, and returns true when that changed what was in force,
     /// so the caller sends every worker a round.
     ///
-    /// `allowed` is read once this call holds the catalogue, which is what the host's policy says
-    /// at that moment: two changes cannot leave the list of the older one in force. The wait for
-    /// the catalogue, which a synchronisation holds across its network work, ends at `deadline`.
+    /// `allowed` is read once before anything is waited for: a list that is already in force
+    /// changes nothing and waits for nothing. Otherwise it is read again once this call holds the
+    /// catalogue, which is what the host's policy says at that moment, so two changes cannot leave
+    /// the list of the older one in force. The wait for the catalogue, which a synchronisation
+    /// holds across its network work, ends at `deadline`.
     ///
     /// # Errors
     ///
@@ -653,21 +671,28 @@ impl CatalogueModule {
     /// one before then, and the same call again tries again.
     pub async fn put_allowed_adapters(
         &self,
-        allowed: impl FnOnce() -> Option<std::collections::BTreeSet<PluginId>>,
+        allowed: impl Fn() -> Option<std::collections::BTreeSet<PluginId>>,
         deadline: tokio::time::Instant,
     ) -> Answer<bool> {
+        if allowed() == self.adapters_in_force() {
+            return Ok(false);
+        }
         let mut catalogue = tokio::time::timeout_at(deadline, self.catalogue.lock())
             .await
             .map_err(|_| {
                 ProtocolError::new(
                     ErrorCode::ResourceUnavailable,
-                    "the catalogue is busy with another change or a package is slow to read, so \
-                     the adapters the organisations allow were not put in force",
+                    "the catalogue is busy with another change or a package is slow to read",
                 )
             })?;
+        let wanted = allowed();
         let moved = catalogue
-            .set_allowed_adapters(allowed(), &Owner::acting())
+            .set_allowed_adapters(wanted.clone(), &Owner::acting())
             .map_err(ProtocolError::from)?;
+        *self
+            .adapters_in_force
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = wanted;
         if moved {
             // The list changed which packages may run in an application's name, so each bridge
             // follows what its installation now wants, under the same lock and after the change's

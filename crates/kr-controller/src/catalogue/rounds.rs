@@ -22,6 +22,11 @@ use super::{Controller, LaunchPhase, UNACCOUNTED_WORKER, WORKER_EXCHANGE};
 /// every member whose end is not confirmed.
 pub(crate) const ADMISSIONS_CADENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// What the doctor's note starts with when the adapters the organisations allow could not be put in
+/// force.
+const ADAPTERS_NOT_PUT: &str =
+    "the host could not put the adapters its organisations allow in force: ";
+
 /// How many rounds one member is sent in a row while each answer discovers a release the round
 /// before did not cover.
 const DISCOVERY_ROUNDS: usize = 4;
@@ -309,13 +314,15 @@ impl Controller {
         self.check_unconfirmed_members();
         let deadline = tokio::time::Instant::now() + WORKER_EXCHANGE;
         // The adapters in force are derived from the policy on disk, so a put that failed is made
-        // again here, ahead of the rounds that carry its revision. A list that has not landed is
-        // for the doctor to say.
-        if let Err(error) = self.put_the_adapter_allowlist_by(deadline).await {
-            self.note_admissions(format!(
-                "the adapters the organisations allow are not in force: {}",
-                error.message
-            ));
+        // again here, ahead of the rounds that carry its revision. A list already in force costs
+        // nothing. One that did not land is for the doctor to say, until a put lands.
+        match self.put_the_adapter_allowlist_by(deadline).await {
+            Ok(_) => self
+                .admission_notes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|note| !note.starts_with(ADAPTERS_NOT_PUT)),
+            Err(error) => self.note_admissions(format!("{ADAPTERS_NOT_PUT}{}", error.message)),
         }
         let Ok((revision, installed)) = self.catalogue.installed_within(deadline).await else {
             return;

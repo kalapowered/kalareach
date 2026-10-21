@@ -923,12 +923,13 @@ impl HostPolicy {
     }
 
     /// Applies an organisation's signed policy, with the organisation's chain beside it when the
-    /// chain has moved.
+    /// chain has moved, and returns whether the chain moved this host's anchor.
     ///
     /// The rules are in the order [`PolicyRefused`] lists them. A chain is followed first, on this
     /// policy, because the key that signs a policy is the one the chain ends with; a chain that is
-    /// not newer changes nothing, and one that would drop an installed lease is refused, since
-    /// dropping a lease owes a fence that presenting the chain with a lease raises.
+    /// not newer changes nothing, and one that would drop a lease still in force is refused, since
+    /// dropping it owes a fence that presenting the chain with a lease raises. A lease that has
+    /// ended is dropped with the chain: nothing answers to it. `now` is the continuous clock.
     ///
     /// # Errors
     ///
@@ -939,7 +940,8 @@ impl HostPolicy {
         policy: &OrganisationPolicy,
         authority: Option<&PolicyAuthority>,
         reading: Option<&ObservedUtc>,
-    ) -> std::result::Result<(), PolicyRefused> {
+        now: ContinuousInstant,
+    ) -> std::result::Result<bool, PolicyRefused> {
         let organisation_id = policy.payload.organisation_id;
         if !self.enrolments.contains_key(&organisation_id) {
             return Err(PolicyRefused::NotEnrolled);
@@ -948,26 +950,43 @@ impl HostPolicy {
             .payload
             .check_structure()
             .map_err(PolicyRefused::Structure)?;
+        let mut advanced = false;
         if let Some(authority) = authority {
             if authority.organisation_id != organisation_id {
                 return Err(PolicyRefused::ForeignChain);
             }
-            match self
+            let utc_ms = reading.map_or(0, |reading| self.settled_now(reading.now.get()));
+            let in_force: Vec<_> = self
+                .enrolments
+                .get(&organisation_id)
+                .map(|enrolment| {
+                    enrolment
+                        .installed_leases()
+                        .filter(|lease| lease.in_force(now, utc_ms))
+                        .map(|lease| {
+                            (
+                                lease.lease().payload.account_id.clone(),
+                                lease.lease().payload.device_key,
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let ChainOutcome::Advanced { dropped, .. } = self
                 .accept_chain(authority, reading)
                 .map_err(PolicyRefused::Chain)?
             {
-                ChainOutcome::Advanced { dropped, .. } if !dropped.is_empty() => {
+                advanced = true;
+                if dropped.iter().any(|holder| in_force.contains(holder)) {
                     return Err(PolicyRefused::ChainDropsLeases);
                 }
-                ChainOutcome::Advanced { .. }
-                | ChainOutcome::Unchanged
-                | ChainOutcome::Stale { .. } => {}
             }
         }
         self.enrolments
             .get_mut(&organisation_id)
             .ok_or(PolicyRefused::NotEnrolled)?
-            .apply_policy(policy)
+            .apply_policy(policy)?;
+        Ok(advanced)
     }
 
     /// Whether `device_id` is bound to a member account in any organisation this host is enrolled

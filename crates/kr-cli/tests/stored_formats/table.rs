@@ -124,7 +124,6 @@ pub fn known() -> Vec<Known> {
             "WorkflowRunStatus",
             "7840b23fa2bfbd1d3167e89020a9502fda0b13ce1ffd075765332b0ba5886756",
         ),
-        // What the registry keeps inside its tables and the answers it keeps for a retried call.
         // The delivery journal: what a notice holds, and the words it matches stored text against.
         source(
             "delivery",
@@ -297,8 +296,7 @@ pub fn known() -> Vec<Known> {
             &[("crates/kr-attention/src/event.rs", "Origin")],
             "e799e9f01ab42d78a4fd7dcc2d4611e41cfbd1900a5e2c0b620ae7490bfb955c",
         ),
-        // The registry's columns of words, and the consumed reasons it stores by their protocol
-        // names.
+        // The catalogue's column of words.
         words_of(
             "catalogue",
             "repository kinds",

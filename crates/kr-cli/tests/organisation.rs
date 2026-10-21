@@ -249,13 +249,18 @@ fn export_policy(
 }
 
 fn exported_organisation(directory: &Path) -> Exported {
+    exported_organisation_as(directory, 0x21, "chain.json")
+}
+
+/// An organisation named by `byte` that signs with real keys, whose chain is written to `file`.
+fn exported_organisation_as(directory: &Path, byte: u8, file: &str) -> Exported {
     let now = kr_ipc::now_ms().get();
     let sign = |key: &AuthorisationKeyPair, domain: &str, input: Vec<u8>| -> Signature64 {
         let transcript =
             SigningTranscript::from_canonical_bytes(domain, input).expect("a transcript");
         kr_crypto::sign::sign(key, &transcript).expect("a signature")
     };
-    let organisation_id = OrganisationId::new(Uuid::from_bytes([0x21; 16]));
+    let organisation_id = OrganisationId::new(Uuid::from_bytes([byte; 16]));
     let first = AuthorisationKeyPair::generate().expect("a key");
     let second = AuthorisationKeyPair::generate().expect("a key");
     let first_payload = PolicyAuthorityLinkPayload {
@@ -307,7 +312,7 @@ fn exported_organisation(directory: &Path) -> Exported {
             payload: head_payload,
         },
     };
-    let path = directory.join("chain.json");
+    let path = directory.join(file);
     std::fs::write(&path, serde_json::to_vec(&authority).expect("encodes")).expect("writes");
     Exported {
         authority,
@@ -555,11 +560,12 @@ async fn exclusive_management_is_refused_where_the_host_would_refuse_it() {
     assert_eq!(listed["exclusive"], false, "{listed}");
 }
 
-/// KR-REQ-18.06: `kr organisation policy` applies the policy an organisation signed to a host
-/// enrolled in it, and the list shows the revision and the adapters it allows and the adapters the
-/// host admits. The same policy again is a repeat, and an older one is refused by its rule.
+/// `kr organisation policy` applies the policy an organisation signed to a host enrolled in it, and
+/// the list shows the revision and the adapters it allows and the adapters the policies allow
+/// together. The same policy again is a repeat, a chain that is another organisation's is sent
+/// beside it and refused by the host, and an older policy is refused by its rule.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_18_06_a_policy_is_applied_listed_and_not_applied_again_when_older() {
+async fn a_policy_is_applied_listed_and_not_applied_again_when_older() {
     let directory = tempfile::tempdir().expect("a directory");
     let organisation = exported_organisation(directory.path());
     let host = Host::start_enrolled(&organisation.authority).await;
@@ -609,6 +615,23 @@ async fn kr_req_18_06_a_policy_is_applied_listed_and_not_applied_again_when_olde
     let again = host.kr_json(&["organisation", "policy", file, "--json"]);
     assert_eq!(again, applied, "the same policy again is a repeat");
 
+    // A chain that belongs to another organisation is read from its file, sent beside the policy
+    // and refused by the host before the policy is looked at.
+    let other = exported_organisation_as(directory.path(), 0x22, "other-chain.json");
+    let output = host.kr(&[
+        "organisation",
+        "policy",
+        file,
+        "--chain",
+        other.chain.to_str().expect("a path"),
+    ]);
+    assert!(
+        !output.status.success(),
+        "another organisation's chain is refused"
+    );
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("(foreign_chain)"), "{said}\n{}", host.log());
+
     let older = export_policy(directory.path(), &organisation, "policy-2.json", 2, None);
     let output = host.kr(&["organisation", "policy", older.to_str().expect("a path")]);
     assert!(!output.status.success(), "an older revision is refused");
@@ -616,7 +639,7 @@ async fn kr_req_18_06_a_policy_is_applied_listed_and_not_applied_again_when_olde
     assert!(said.contains("(not_newer)"), "{said}\n{}", host.log());
 }
 
-/// KR-REQ-18.06: a policy file that is not a policy is the person's mistake and is said before the
+/// A policy file that is not a policy is the person's mistake and is said before the
 /// host is asked, and a policy for an organisation the host is not enrolled in is refused by the
 /// host, by its rule, with nothing applied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

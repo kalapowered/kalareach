@@ -372,6 +372,17 @@ async fn kr_req_18_06_a_policy_that_does_not_verify_changes_nothing() {
         "structure",
     );
 
+    // Issued before the key that signs it took over: the second revision took over a day ago.
+    refused_as(
+        apply(
+            &fixture,
+            organisation.policy(2, 1, Some(&[CODEX]), now - 2 * 24 * 60 * MINUTE_MS),
+            None,
+        )
+        .await,
+        "issued_before_activation",
+    );
+
     // An earlier key revision, properly signed: only the key the chain ends with signs a policy.
     refused_as(
         apply(
@@ -649,12 +660,17 @@ async fn kr_req_18_06_a_list_that_could_not_be_put_in_force_is_told_and_then_put
         .expect("the request");
     {
         let held = controller.catalogue().catalogue().lock().await;
-        let refused = client
-            .repeat(&request)
-            .await
-            .expect("the daemon answers")
-            .expect_err("the list could not be put in force");
-        assert_eq!(refused.code, ErrorCode::ResourceUnavailable, "{refused:?}");
+        // Every time the owner asks, and every time the same action is repeated, the catalogue is
+        // still held and the answer says so: a recorded success is not given while the list is not
+        // in force.
+        for _ in 0..2 {
+            let refused = client
+                .repeat(&request)
+                .await
+                .expect("the daemon answers")
+                .expect_err("the list could not be put in force");
+            assert_eq!(refused.code, ErrorCode::ResourceUnavailable, "{refused:?}");
+        }
         let installation = held
             .installation(environment_id, &example())
             .expect("readable")
