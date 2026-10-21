@@ -166,6 +166,23 @@ impl ReaderMark {
         self.keymap != kr_protocol::root::EditorKeymap::ViCommand
     }
 
+    /// The later of two things said of a session's readers, where there is one of each.
+    ///
+    /// A reader entering or leaving moves the lifetime on, a reader that came after another has
+    /// the higher revision, and one reader's own changes to its line move its buffer revision.
+    #[must_use]
+    pub fn newer(first: Option<Self>, second: Option<Self>) -> Option<Self> {
+        let order = |mark: &Self| (mark.lifetime, mark.reader_revision, mark.buffer_revision);
+        match (first, second) {
+            (Some(first), Some(second)) => Some(if order(&second) > order(&first) {
+                second
+            } else {
+                first
+            }),
+            (first, second) => first.or(second),
+        }
+    }
+
     /// Whether the reader was in the state this exclusion names, as the report has it.
     ///
     /// `None` is an exclusion that is not a state of a reader at all, which one of them is: that
@@ -1546,6 +1563,10 @@ impl Session {
     /// where it was is no better. So the teardown and the command are one step here, and a
     /// teardown that did not arrive returns before anything is typed, saying so.
     ///
+    /// Every key of the teardown goes in only once the reader has said it read the one before it,
+    /// and the command only once it has said it read the last: see
+    /// [`Session::recover_one_key_at_a_time`] for what a key typed sooner can do.
+    ///
     /// # Errors
     ///
     /// Returns which of the two did not happen: the teardown, after which nothing was typed, or
@@ -1555,13 +1576,21 @@ impl Session {
         teardown: &[&[u8]],
         marker: &str,
     ) -> Result<String, String> {
+        let mut said = None;
         for bytes in teardown.iter().copied() {
             self.type_bytes(bytes);
-            std::thread::sleep(self.bounded(Duration::from_millis(80)));
+            said = Some(
+                self.reader_has_read_what_was_typed(said.as_ref())
+                    .map_err(|why| {
+                        format!("the teardown was typed and the reader did not read it: {why}")
+                    })?,
+            );
         }
-        self.recover();
+        let said = self.recover_one_key_at_a_time(said).map_err(|why| {
+            format!("the keys that put the reader back were typed and it did not read them: {why}")
+        })?;
         let typing = self
-            .reader_takes_typed_text(teardown, REPLY)
+            .reader_takes_typed_text(teardown, said, REPLY)
             .map_err(|why| {
                 format!(
                     "the teardown did not reach a reader that takes typed text, so no command was \
@@ -1600,13 +1629,15 @@ impl Session {
     pub fn reader_takes_typed_text(
         &mut self,
         keys: &[&[u8]],
+        known: Option<ReaderMark>,
         within: Duration,
     ) -> Result<ReaderMark, String> {
         let deadline = Deadline::after(self.bounded(within));
         // What the reader has already said about itself, waiting for nothing: the keys that ended
         // the drive's state are reports of their own, and a reader that never left the keymap it
-        // types text in has nothing here to do.
-        let mut last = self.report_in_hand().map(|report| report.mark);
+        // types text in has nothing here to do. `known` is what a caller already has of it, from
+        // an exchange that no report of the reader's is behind.
+        let mut last = ReaderMark::newer(self.report_in_hand().map(|report| report.mark), known);
         let mut offers: usize = 0;
         loop {
             let heard = last
@@ -2203,19 +2234,135 @@ impl Session {
     /// pending sequence. The keys here are the ones every one of these editors answers with
     /// "stop what you are doing and keep the line", followed by clearing the line itself.
     pub fn recover(&mut self) {
-        // An editor whose own queue the reader steps to reach is left out of the interrupt: that
-        // key ends its read altogether there, and the reader that comes back is a different one
-        // from the one a fence would have been about.
-        let keys: &[&[u8]] = if dialect(self.package_kind).answers_at_the_next_step {
-            &[CTRL_G, CTRL_U]
-        } else {
-            &[CTRL_G, CTRL_C, CTRL_U]
-        };
-        for bytes in keys.iter().copied() {
+        for bytes in self.recovery_keys().iter().copied() {
             self.type_bytes(bytes);
             std::thread::sleep(self.bounded(Duration::from_millis(80)));
         }
         std::thread::sleep(self.bounded(Duration::from_millis(120)));
+    }
+
+    /// The keys [`Session::recover`] types, in the order it types them.
+    fn recovery_keys(&self) -> &'static [&'static [u8]] {
+        // An editor whose own queue the reader steps to reach is left out of the interrupt: that
+        // key ends its read altogether there, and the reader that comes back is a different one
+        // from the one a fence would have been about.
+        if dialect(self.package_kind).answers_at_the_next_step {
+            &[CTRL_G, CTRL_U]
+        } else {
+            &[CTRL_G, CTRL_C, CTRL_U]
+        }
+    }
+
+    /// Puts the reader back where a drive left it, one key at a time.
+    ///
+    /// The keys are the ones [`Session::recover`] types, but each goes in only when the reader has
+    /// read the one before it. An interrupt that reaches a shell while it is still busy with an
+    /// earlier key is not acted on where it is: the shell goes on with that key and takes the
+    /// interrupt up later, at the next line it reads, which it then abandons after its first
+    /// character. The line a person types after the interrupt is the one that suffers, and no
+    /// length of waiting afterwards undoes it, so what is waited for is the reader's own word that
+    /// it has read what was typed.
+    ///
+    /// `said` is what the reader last said of itself, if it has said anything since the drive
+    /// began. Returns what it said of itself once it had read the last key.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the reader could not say it had read a key.
+    pub fn recover_one_key_at_a_time(
+        &mut self,
+        mut said: Option<ReaderMark>,
+    ) -> Result<Option<ReaderMark>, String> {
+        for bytes in self.recovery_keys().iter().copied() {
+            self.type_bytes(bytes);
+            said = Some(self.reader_has_read_what_was_typed(said.as_ref())?);
+        }
+        Ok(said)
+    }
+
+    /// Waits until the reader that is running says that nothing typed to it is left unread, and
+    /// returns what it said of itself in saying so.
+    ///
+    /// It is asked through a fence exchange, which a reader answers from the point where it has
+    /// read everything it was given and is about to wait for the terminal. An answer that still
+    /// counts input in a queue, or in the terminal, is about a reader that has not got there yet,
+    /// and it is asked again. A reader that was replaced since `after`, the last thing it said of
+    /// itself, says so, and what is asked next is the reader that is there now.
+    ///
+    /// # Errors
+    ///
+    /// Returns that nothing answered, or what the reader answered other than that.
+    fn reader_has_read_what_was_typed(
+        &mut self,
+        after: Option<&ReaderMark>,
+    ) -> Result<ReaderMark, String> {
+        let deadline = self.deadline_for(FENCE);
+        let (mut prompt_generation, mut reader_revision) = after.map_or_else(
+            || {
+                self.last_entry.as_ref().map_or_else(
+                    || {
+                        (
+                            kr_protocol::root::PromptGeneration::new(0),
+                            kr_protocol::root::ReaderRevision::new(0),
+                        )
+                    },
+                    |entry| (entry.prompt_generation, entry.reader_revision),
+                )
+            },
+            |mark| {
+                (
+                    kr_protocol::root::PromptGeneration::new(mark.prompt_generation),
+                    kr_protocol::root::ReaderRevision::new(mark.reader_revision),
+                )
+            },
+        );
+        let mut asked = 0;
+        loop {
+            asked += 1;
+            let id = self.ask(WorkerRequest::Fence(RootEditorFenceParams {
+                session_id: self.session_id,
+                fence_id: fence_id(201),
+                prompt_generation,
+                reader_revision,
+                deadline_ms: FENCE_EXCHANGE_TIMEOUT,
+                cause: FenceCause::Retry,
+            }));
+            match self.answer_by(id, deadline) {
+                Some(BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement))) => {
+                    if acknowledgement.queues.all_drained() && acknowledgement.snapshot.is_drained()
+                    {
+                        return Ok(ReaderMark::of_acknowledgement(
+                            &acknowledgement,
+                            self.reader_lifetime,
+                        ));
+                    }
+                    self.pump(Duration::from_millis(25));
+                }
+                Some(BridgeAnswer::Fence(RootEditorFenceResult::Refused(refusal)))
+                    if refusal.reason == kr_protocol::root::FenceRefusalReason::ReaderMoved =>
+                {
+                    let Some(report) = self.next_reader_report(deadline, |_| true) else {
+                        return Err(format!(
+                            "the reader moved under every one of {asked} fences in {FENCE:?} and \
+                             reported no reader to ask instead"
+                        ));
+                    };
+                    prompt_generation = report.idle.prompt_generation;
+                    reader_revision = report.idle.reader_revision;
+                }
+                None => {
+                    return Err(format!(
+                        "nothing answered any of {asked} fences in {FENCE:?}, so the reader did \
+                         not say it had read what was typed"
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "the reader answered a fence about what was typed with {other:?}"
+                    ));
+                }
+            }
+        }
     }
 
     /// Asks the shell whether the case's customisation is loaded and working.
