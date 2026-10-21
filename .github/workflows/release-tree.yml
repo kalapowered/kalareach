@@ -465,10 +465,10 @@ jobs:
           bash scripts/check-macos-signatures.sh "$TREE" notarized
 
       # The manifest is written again, since signing changed the files, and signed by a threshold of
-      # the channel's release keys. Those keys are held in hardware and on offline media, and no
-      # mechanism of this repository gives a run one, so this is where the job stops until the
-      # channel's signing service is set up.
+      # the channel's release keys. Those keys do not exist yet: they are made at a key ceremony,
+      # held in hardware and on offline media, and no mechanism of this repository gives a run one.
+      # This is where the job stops, with the same words on every platform, until they do.
       - name: Write the manifest again and sign it with the channel's release keys
         run: |
-          echo "::error::the channel's release keys are not set up: they are held in hardware and on offline media, and this job has no signing service to ask for a signature. The tree is signed and checked up to this step, and the release is not signed."
+          echo "::error::the channel's release keys do not exist yet, so this release cannot be signed. Publishing a release waits for the key ceremony, which is the project owner's to hold. The tree is signed and checked up to this step."
           exit 1
