@@ -1368,12 +1368,10 @@ export type ExternalDestinationKind = 'webhook' | 'slack' | 'discord' | 'telegra
  * Section 20 signs an authorisation-bearing payload **before** encryption, so pairwise message
  * authentication can never substitute for an issuer's grant signature. The set is closed, and it
  * is closed on one property: every member carries its issuer's key identifier and a signature
- * over a domain-separated transcript of its own fields. A payload outside it carries no authority
- * a reader could check, so the mailbox does not forward it as authority.
+ * over a domain-separated transcript of its own fields.
  *
- * Nothing here is authority by arriving. [`Self::issuer_key_id`] names the key the signature must
- * verify under, and a reader resolves that name through the authority it already holds: section
- * 19 makes content data, and the envelope supplies no key of its own.
+ * Nothing here is authority by arriving. A reader of a mailbox refuses an item of this kind, and
+ * the objects take effect only through the authority feed and the host's own records.
  */
 export type ForwardedAuthority =
   | {
