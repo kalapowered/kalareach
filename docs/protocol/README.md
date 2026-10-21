@@ -451,8 +451,15 @@ generated schema as the `ErrorCode` enumeration.
 `ErrorCode::retry_category` is the single source for the mapping, and `ProtocolError::new` fills the
 field from it.
 
-Typed resource states such as `permission_required`, `restart_required`, pending revocation and
-voice `creation_unknown` are not error codes. They belong to their own result schemas.
+Typed resource states such as `permission_required`, pending revocation and voice
+`creation_unknown` are not error codes. The host reports each in its own result schema:
+`permission_required` as a capability state, a pending revocation as a revocation barrier with its
+per-worker status, and `creation_unknown` as a voice start outcome.
+
+`restart_required` is not a host result and has no schema of its own. It is the setup assistant's
+state, which the companion works out from two readings of one capability: the host still reports
+`permission_required` after the person was offered the permission. A host cannot see a grant it was
+not given, so it cannot report that a restart would change the answer.
 
 ## The method and authority table
 

@@ -85,6 +85,9 @@ describe('the state one capability is shown as', () => {
     }
   })
 
+  // KR-REQ-23.56: `restart_required` is a typed state of the setup assistant, worked out from two
+  // readings of one capability (the host's `permission_required`, and a grant that was offered), and
+  // not a result the host reports and not an error spelling.
   it('asks for a restart once the grant was given and the answer did not change', () => {
     const waiting = record('desktop.screen_capture', 'permission_required')
     expect(displayState(waiting, { grantWasOffered: true })).toBe('restart_required')
