@@ -126,3 +126,45 @@ fn the_conditions_name_the_host_and_the_reference_host_it_is_held_to() {
         );
     }
 }
+
+#[test]
+fn a_window_asked_to_read_the_disk_records_its_durable_writes_before_the_reference_host_line() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let lines = Window::open_with_disk(directory.path()).close().lines();
+    let labels: Vec<&str> = lines
+        .iter()
+        .map(|line| line.split_whitespace().next().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "build",
+            "host",
+            "processor",
+            "processors",
+            "memory",
+            "load",
+            "speed",
+            "stolen",
+            "durable",
+            "reference"
+        ],
+        "the disk's line comes after the others and before the sum of them: {lines:#?}"
+    );
+    assert!(
+        if cfg!(target_os = "linux") {
+            lines[8].contains(" ms entering and ") && lines[8].contains(" ms leaving")
+        } else {
+            lines[8].contains("unverified")
+        },
+        "the disk is read at both edges where the platform is read, and is unverified elsewhere: {}",
+        lines[8]
+    );
+    assert!(
+        std::fs::read_dir(directory.path())
+            .expect("the directory")
+            .next()
+            .is_none(),
+        "the reading leaves nothing in the directory it was taken in"
+    );
+}
