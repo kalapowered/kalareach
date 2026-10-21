@@ -919,6 +919,7 @@ fn many(store: &Store, prefix: &str, count: usize, flags: &[String]) -> Vec<Admi
                     native_bridge: false,
                     component: false,
                     gateway: false,
+                    volatile_forwarding: false,
                 },
                 |_| {},
             )

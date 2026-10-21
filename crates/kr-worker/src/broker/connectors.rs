@@ -361,6 +361,25 @@ impl InstalledConnector {
         &self.table
     }
 
+    /// Says why the gateway serves no launch of this connector, when its table declares no tested
+    /// volatile forwarding mode.
+    ///
+    /// Section 11: a connector without a safe, tested volatile forwarding mode cannot be advertised
+    /// as a resilient managed gateway, and its unchanged terminal integration remains the supported
+    /// path. A launch served by the gateway is what advertises a connector as one, and a terminal
+    /// started against the gateway cannot return to its unchanged integration while it runs, so the
+    /// refusal is made when the launch is admitted, and the invocation then runs as typed.
+    #[must_use]
+    pub fn volatile_forwarding_refusal(&self) -> Option<ConnectorRefusal> {
+        (!self.table.volatile_forwarding).then(|| {
+            ConnectorRefusal::new(
+                "the connector's table declares no tested volatile forwarding mode \
+                 (volatile_forwarding), so the gateway serves none of its launches and the \
+                 unchanged terminal integration is the supported path",
+            )
+        })
+    }
+
     /// Compiles the connector's table into the form the gateway interprets, for the executable
     /// that runs.
     ///
@@ -379,7 +398,8 @@ impl InstalledConnector {
     ///
     /// # Errors
     ///
-    /// Returns [`ConnectorRefusal`] when no signed record names the executable, when the table is
+    /// Returns [`ConnectorRefusal`] when the table declares no tested volatile forwarding mode,
+    /// when no signed record names the executable, when the table is
     /// not qualified for the version it names, when the table is not one the gateway reads (its
     /// framing is not one JSON document per line, it correlates responses by order, it reads a
     /// member by a path other than one top-level member, or it names no message members), when a
@@ -441,6 +461,12 @@ impl InstalledConnector {
                  classifies {}",
                 table.methods.len()
             )));
+        }
+        // The structure of the table is judged first, so a table the gateway cannot read is refused
+        // for that; a table it can read is served only when it declares a tested volatile
+        // forwarding mode.
+        if let Some(refusal) = self.volatile_forwarding_refusal() {
+            return Err(refusal);
         }
         let mut entries = Vec::with_capacity(table.methods.len());
         for classified in &table.methods {
@@ -1059,6 +1085,9 @@ pub mod fixture {
         /// Whether the package ships a table the worker's gateway reads over a backend's
         /// standard streams, in place of the Channels table, and declares no action.
         pub gateway: bool,
+        /// Whether that table declares a tested volatile forwarding mode, which the worker's
+        /// gateway needs of a connector before it serves one.
+        pub volatile_forwarding: bool,
     }
 
     impl Shape {
@@ -1076,6 +1105,7 @@ pub mod fixture {
                 native_bridge: true,
                 component: false,
                 gateway: false,
+                volatile_forwarding: false,
             }
         }
 
@@ -1096,6 +1126,7 @@ pub mod fixture {
                 native_bridge: false,
                 component: false,
                 gateway: false,
+                volatile_forwarding: false,
             }
         }
 
@@ -1123,6 +1154,7 @@ pub mod fixture {
                 native_bridge: false,
                 component: false,
                 gateway: true,
+                volatile_forwarding: true,
             }
         }
 
@@ -1140,6 +1172,7 @@ pub mod fixture {
                 native_bridge: false,
                 component: false,
                 gateway: false,
+                volatile_forwarding: false,
             }
         }
     }
@@ -1159,6 +1192,7 @@ pub mod fixture {
             native_bridge: false,
             component: false,
             gateway: false,
+            volatile_forwarding: false,
         }
     }
 
@@ -1265,7 +1299,7 @@ pub mod fixture {
     /// streams, the members it reads a message by at the top level, and the methods a
     /// Codex-shaped application's session sends that its classes tell apart: one of each class,
     /// and a notification in each direction. It answers no approval.
-    fn gateway_connector_json_for(plugin_id: &str) -> String {
+    fn gateway_connector_json_for(plugin_id: &str, volatile_forwarding: bool) -> String {
         let path =
             |name: &str| serde_json::json!({ "segments": [{ "type": "member", "name": name }] });
         let table = serde_json::json!({
@@ -1303,7 +1337,7 @@ pub mod fixture {
                 { "method": "remote.control.status.changed", "class": "observation", "evidence": "Reports the remote control status and changes none" }
             ],
             "decision_destination": null,
-            "volatile_forwarding": false,
+            "volatile_forwarding": volatile_forwarding,
             "qualification_note": "A test fixture shaped like the Codex connector."
         });
         serde_json::to_string_pretty(&table).expect("a literal table encodes")
@@ -1550,7 +1584,7 @@ pub mod fixture {
                 "connector",
                 "connector.json",
                 if shape.gateway {
-                    gateway_connector_json_for(&plugin_id)
+                    gateway_connector_json_for(&plugin_id, shape.volatile_forwarding)
                 } else {
                     connector_json_for(&plugin_id)
                 }
