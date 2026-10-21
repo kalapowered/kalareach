@@ -821,7 +821,9 @@ impl Controller {
     /// not necessarily gone, and one that is on its way out has not necessarily had its closure
     /// recorded: a command that ends at once takes its worker with it first. As a read of the
     /// session does, this asks for the closure of a worker that has ended, and answers from it.
-    /// Where none is established the failure stands, with its cause.
+    /// Where none is established the failure stands, with its cause: a worker that does not answer
+    /// in time is [`ControllerError::Uncertain`], since its session exists and the same create asked
+    /// again is answered with it.
     ///
     /// # Errors
     ///
@@ -846,7 +848,15 @@ impl Controller {
                     .await?
                     .is_none()
                 {
-                    return Err(error);
+                    return Err(match error {
+                        // A worker that has reported itself and does not describe its session has
+                        // made the session: the caller's create is neither done nor failed, and
+                        // asking again under the same token is answered with the session.
+                        ControllerError::Supervision { detail } => {
+                            ControllerError::Uncertain { detail }
+                        }
+                        other => other,
+                    });
                 }
                 Ok(None)
             }

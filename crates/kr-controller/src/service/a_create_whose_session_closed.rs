@@ -412,8 +412,8 @@ async fn a_create_and_its_replay_give_up_on_a_worker_that_does_not_describe_its_
     ] {
         let refused = outcome.expect_err("a session nothing describes is not answered");
         assert!(
-            matches!(refused, ControllerError::Supervision { .. }),
-            "{what} ends with the failure of the wait: {refused:?}"
+            matches!(refused, ControllerError::Uncertain { .. }),
+            "{what} ends with the failure of the wait, which leaves the create uncertain: {refused:?}"
         );
     }
     assert!(
