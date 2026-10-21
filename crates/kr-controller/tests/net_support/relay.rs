@@ -91,7 +91,9 @@ impl LocalRelay {
         let (certs, tls) = iroh_relay::server::testing::self_signed_tls_certs_and_config();
         let ca_roots = certs.into_iter().map(|cert| cert.to_vec()).collect();
         let refusal = Refusal::default();
-        let (server, port) = Self::serve(&tls, 0, &refusal).await;
+        let (server, port) = Self::serve(&tls, 0, &refusal)
+            .await
+            .expect("a relay server");
         let url: iroh::RelayUrl = format!("https://127.0.0.1:{port}")
             .parse()
             .expect("a relay URL");
@@ -105,7 +107,11 @@ impl LocalRelay {
         }
     }
 
-    async fn serve(tls: &rustls::ServerConfig, port: u16, refusal: &Refusal) -> (Server, u16) {
+    async fn serve(
+        tls: &rustls::ServerConfig,
+        port: u16,
+        refusal: &Refusal,
+    ) -> Result<(Server, u16), iroh_relay::server::SpawnError> {
         let tls = TlsConfig::new(
             (Ipv4Addr::LOCALHOST, port),
             CertConfig::Manual {
@@ -121,9 +127,9 @@ impl LocalRelay {
         config.relay = Some(relay);
         config.quic = Some(QuicConfig::new((Ipv4Addr::LOCALHOST, 0)));
 
-        let server = Server::spawn(config).await.expect("a relay server");
+        let server = Server::spawn(config).await?;
         let port = server.https_addr().expect("configured").port();
-        (server, port)
+        Ok((server, port))
     }
 
     /// The bytes the relay has forwarded between endpoints so far, counted over its whole life.
@@ -178,11 +184,43 @@ impl LocalRelay {
     }
 
     /// Starts the relay again at the address it had, with the certificate it had.
+    ///
+    /// The port a stopped relay had is free for any other program on the machine to take, and on a
+    /// machine that runs many tests at once, another relay that binds an address of its own is
+    /// given it. The relay takes its port back as soon as whatever has it lets it go, and a test
+    /// that went wrong is stopped rather than left to wait.
     pub async fn start_again(&mut self) {
         assert!(self.server.is_none(), "the relay is running");
         self.refusal = self.refusal.for_a_server_started_again();
-        let (server, port) = Self::serve(&self.tls, self.port, &self.refusal).await;
+        let (server, port) = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                match Self::serve(&self.tls, self.port, &self.refusal).await {
+                    Ok(served) => return served,
+                    Err(error) if is_address_in_use(&error) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(error) => panic!("a relay server: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("the port the relay had is free again");
         assert_eq!(port, self.port, "the relay came back at its address");
         self.server = Some(server);
     }
+}
+
+/// Whether `error`, or a cause it names, is an address that something else holds.
+fn is_address_in_use(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut next = Some(error);
+    while let Some(error) = next {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|cause| cause.kind() == std::io::ErrorKind::AddrInUse)
+        {
+            return true;
+        }
+        next = error.source();
+    }
+    false
 }
