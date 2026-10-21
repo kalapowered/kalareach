@@ -47,6 +47,13 @@ use kr_worker::persistence::JournalHealth;
 /// Each file it waits for is one its test writes, and it waits for one for at least as long as the
 /// launcher waits at a test's barrier (6000 polls, each at least 20 ms): a test that stops before
 /// it writes the file would otherwise leave its program polling for as long as the machine runs.
+///
+/// A hook answers at its own deadline, with nothing reported, when the machine keeps it from the
+/// worker for that long, and says so on standard error. A run that did is not the hook the program
+/// means to make: `hook_loop` makes it again, and what it keeps is the last run's words. The two
+/// phrases it looks for are the ones the forwarder writes for that, which the launch gives it. The
+/// count of tries only ends a hook that never gets through. The program may be any shell the case
+/// names, so the loop is plain Bourne shell, and a nested process runs the same text.
 const SCRIPT: &str = r#"report="$REPORT"
 await_file() {
   polls=0
@@ -56,6 +63,8 @@ await_file() {
     sleep 0.02
   done
 }
+hook_loop='tries=0; while :; do printf "%s" "$1" | "$HOOK" claude-code hook > "$2" 2>&1; grep -q -F -e "$HOOK_DEADLINE_WORDS" -e "$HOOK_ADMISSION_WORDS" "$2" || break; tries=$((tries + 1)); [ "$tries" -le 600 ] || break; done'
+run_hook() { eval "$hook_loop"; }
 {
   echo "pid=$$"
   if [ -n "$KR_REGISTRATION" ] && [ -f "$KR_REGISTRATION" ]; then
@@ -71,15 +80,15 @@ await_file() {
 if [ -n "$HOOK" ]; then
   if [ -n "$WAIT_FOR" ]; then await_file "$WAIT_FOR"; fi
   if [ -n "$NESTED" ]; then
-    /bin/bash -c 'printf "%s" "$HOOK_EVENT" | "$HOOK" claude-code hook' > "$report.nested" 2>&1
+    /bin/bash -c "$hook_loop" nested "$HOOK_EVENT" "$report.nested"
     echo done > "$report.nested.hooked"
     if [ -n "$THEN_OWN" ]; then await_file "$THEN_OWN"; fi
   fi
-  printf '%s' "$HOOK_EVENT" | "$HOOK" claude-code hook > "$report.hook" 2>&1
+  run_hook "$HOOK_EVENT" "$report.hook"
   echo done > "$report.hooked"
   if [ -n "$AGAIN_AFTER" ]; then
     await_file "$AGAIN_AFTER"
-    printf '%s' "$HOOK_EVENT_2" | "$HOOK" claude-code hook > "$report.hook2" 2>&1
+    run_hook "$HOOK_EVENT_2" "$report.hook2"
     echo done > "$report.hooked2"
   fi
   if [ -n "$THEN_EXEC" ]; then
@@ -688,6 +697,11 @@ impl Shell {
 
         command
             .env("REPORT", self.reports.join(name))
+            .env("HOOK_DEADLINE_WORDS", kr_hook::hook::deadline_diagnostic())
+            .env(
+                "HOOK_ADMISSION_WORDS",
+                kr_hook::exchange::ExchangeError::TimedOut.to_string(),
+            )
             .process_group(self.group.id())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -2620,7 +2634,10 @@ fn kr_req_11_34_a_nested_process_s_session_start_is_recorded_and_moves_nothing()
     eventually("the nested process's hook has run", || {
         shell.reports.join("nested.nested.hooked").exists()
     });
-    eventually("its report is recorded", || observed(&shell, instance) == 1);
+    // A hook the machine kept from the worker is made again, so a report can be recorded more than
+    // once; what is claimed is that it is recorded, and that the program's own comes after it.
+    eventually("its report is recorded", || observed(&shell, instance) >= 1);
+    let nested = observed(&shell, instance);
     assert_eq!(
         selected(&shell, instance),
         None,
@@ -2631,7 +2648,10 @@ fn kr_req_11_34_a_nested_process_s_session_start_is_recorded_and_moves_nothing()
     eventually("the program's own report selects the thread", || {
         selected(&shell, instance).as_deref() == Some(THREAD)
     });
-    assert_eq!(observed(&shell, instance), 2);
+    assert!(
+        observed(&shell, instance) > nested,
+        "the program's own report is recorded as well"
+    );
     let _ = finish(child);
 }
 
