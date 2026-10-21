@@ -12,6 +12,9 @@
 //! | --- | --- |
 //! | KR-REQ-12.07 | a plain `codex resume` typed in a managed root shell runs behind a gateway that exists before the terminal connects, with the name and vector typed and the integration's flags added; an absolute-path invocation runs as typed and a program found running is adopted and given none |
 //! | KR-REQ-12.06 | the binding of a gateway-served terminal whose thread selection nothing reads says so: no thread, rich mutations suspended for that reason before and after the terminal connects, a rich prompt refused for it, the terminal available throughout |
+//! | KR-REQ-11.22, KR-REQ-11.33, KR-REQ-12.11 | a paired device answers the approval of a real session through the released Codex package: the request is interpreted and answered once as the response Codex reads, the terminal's own late answer is not forwarded and does not end the connection, and in the other order the device's answer is refused because the request is resolved |
+//! | KR-REQ-11.28, KR-REQ-11.36, KR-REQ-12.08, KR-REQ-12.12, KR-REQ-12.06, KR-REQ-23.30 | the same session's typed operations: the binding names the thread and the running turn from the stream, a steer and the declared cancellation reach the server as the requests Codex reads, a prompt over a running turn and a queue the table does not declare are refused with nothing sent, and a prompt after the turn starts one |
+//! | KR-REQ-11.36 | a prompt whose server dies under it is an outcome nobody can establish |
 //! | KR-REQ-12.10, KR-ACC-006, KR-REQ-11.27 | the daemon killed while the terminal writes leaves the worker, terminal and server and the terminal's output; a restarted daemon serves the same agent, binding and pending request to a reconnecting device, which is drawn what the local terminal shows, and the terminal's answer reaches the server once, without the request being asked again |
 //! | KR-REQ-07.61, KR-REQ-07.66 | the session's closure, requested or by a worker's crash, ends the server that ignores the end of its input and a terminate, and what it started, by the identities the worker recorded |
 //!
@@ -43,21 +46,26 @@ use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::matching::{Architecture, OperatingSystem};
 use kr_plugin_sdk::text::Label;
 use kr_protocol::agent::{
-    AgentBindingState, AgentCapabilitiesParams, AgentCapabilitiesResult, AgentMutationResult,
-    AgentMutationTarget, AgentPromptParams, AgentSubject, PromptText,
+    AgentApprovalRespondParams, AgentApprovalRespondResult, AgentBindingState,
+    AgentCapabilitiesParams, AgentCapabilitiesResult, AgentMutationResult, AgentMutationTarget,
+    AgentPromptParams, AgentSteerParams, AgentSubject, PluginActionInvokeParams,
+    PluginActionInvokeResult, PromptText,
 };
-use kr_protocol::broker::IntegrationMode;
+use kr_protocol::broker::{ActionName, InstanceCapabilityState, IntegrationMode};
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::{PendingKind, PendingState};
 use kr_protocol::identity::ProcessStartIdentity;
-use kr_protocol::ids::{ApplicationInstanceId, PluginId, SessionEpoch, SessionId};
+use kr_protocol::ids::{
+    AgentTurnId, ApplicationInstanceId, CapabilityId, PendingResourceId, PluginId, SessionEpoch,
+    SessionId,
+};
 use kr_protocol::method::Method;
 use kr_protocol::recovery::{
     AgentInstancesParams, AgentInstancesResult, EventsSnapshotParams, EventsSnapshotResult,
 };
 use kr_protocol::root::CommandBypassReason;
-use kr_protocol::scalars::Nullable;
+use kr_protocol::scalars::{Bytes, Nullable};
 use kr_worker::broker::THREAD_NOT_READ;
 use kr_worker::broker::connectors::fixture;
 
@@ -140,6 +148,12 @@ fn complete_table() -> String {
             "observation",
         ),
         (
+            "server-request.resolved",
+            "serverRequest/resolved",
+            "upstream_to_host",
+            "observation",
+        ),
+        (
             "item.command-execution.request-approval",
             "item/commandExecution/requestApproval",
             "upstream_to_host",
@@ -157,19 +171,45 @@ fn complete_table() -> String {
     serde_json::to_string_pretty(&table).expect("a table encodes")
 }
 
-/// Publishes the Codex-shaped test package in a signed generation of its own, whose index names the
-/// digest of `executable` as the one build it qualifies, and installs and enables it in the
-/// environment with its integration granted, as the owner's confirmation of that exact
-/// installation does.
-async fn install_codex(environment: &EnvironmentPaths, run: &Run, executable: &Path) {
+/// Which package a case installs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Package {
+    /// The worker's Codex-shaped test package, whose table says nothing about the thread, the turn
+    /// or how an approval is answered.
+    Table,
+    /// The Codex package the plugins repository publishes, as the repository holds it.
+    Released,
+}
+
+/// The directory of the released Codex package's copy.
+fn released_codex() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../fixtures/plugins/released/kalareach/codex/0.3.0")
+}
+
+/// Publishes a Codex package in a signed generation of its own, whose index names the digest of
+/// `executable` as the one build it qualifies, and installs and enables it in the environment
+/// with the grants it asks for, as the owner's confirmation of that exact installation does.
+async fn install_codex(
+    environment: &EnvironmentPaths,
+    run: &Run,
+    executable: &Path,
+    flavour: Package,
+) {
     let written = run.root().join("written");
-    let source = fixture::package_with_connector(
-        &written,
-        &run.binary("kr-hook"),
-        &fixture::Shape::codex_backend(),
-        complete_table(),
-    )
-    .expect("the package is written");
+    let package_dir = match flavour {
+        Package::Table => {
+            fixture::package_with_connector(
+                &written,
+                &run.binary("kr-hook"),
+                &fixture::Shape::codex_backend(),
+                complete_table(),
+            )
+            .expect("the package is written")
+            .package_dir
+        }
+        Package::Released => released_codex(),
+    };
     let digest = PayloadDigest::of(&std::fs::read(executable).expect("the placed stand-in"));
     let build = QualifiedBuild {
         application: Label::new("codex").expect("a label"),
@@ -193,7 +233,7 @@ async fn install_codex(environment: &EnvironmentPaths, run: &Run, executable: &P
     let generation = generations::Generation::build(
         &home,
         generations::GenerationSpec {
-            package: Some(source.package_dir.clone()),
+            package: Some(package_dir),
             builds: vec![build],
             ..generations::GenerationSpec::default()
         },
@@ -237,7 +277,15 @@ async fn install_codex(environment: &EnvironmentPaths, run: &Run, executable: &P
             &codex(),
             &version,
             package,
-            InstallationGrant::with([PluginCapability::CommandIntegrationLaunch]),
+            InstallationGrant::with(match flavour {
+                Package::Table => vec![PluginCapability::CommandIntegrationLaunch],
+                Package::Released => vec![
+                    PluginCapability::CommandIntegrationLaunch,
+                    PluginCapability::ApprovalDecode,
+                    PluginCapability::ApprovalRespond,
+                    PluginCapability::UpstreamAction,
+                ],
+            }),
             None,
             &mut Change::new(&Owner::confirming()),
         )
@@ -257,11 +305,23 @@ struct Context {
     shell: shells::ManagedShell,
     /// The directory the stand-in is placed in as `codex`, and the shell's search path names.
     tools: PathBuf,
+    /// The package the case installs.
+    package: Package,
 }
 
 impl Context {
-    /// Makes the run and places the programs, or says why the case cannot run here.
+    /// Makes the run and places the programs, or says why the case cannot run here, for a case that
+    /// installs the Codex-shaped test package.
     fn start(leg: &str) -> Option<Self> {
+        Self::starting(leg, Package::Table)
+    }
+
+    /// The same, for a case that installs the Codex package the plugins repository publishes.
+    fn start_released(leg: &str) -> Option<Self> {
+        Self::starting(leg, Package::Released)
+    }
+
+    fn starting(leg: &str, package: Package) -> Option<Self> {
         let shell = match shells::managed_zsh() {
             Ok(shell) => shell,
             Err(why) if shells::required() => panic!("the {leg} leg's managed shell: {why}"),
@@ -281,6 +341,7 @@ impl Context {
             run,
             shell,
             tools,
+            package,
         })
     }
 
@@ -302,8 +363,12 @@ impl Context {
                 stable_address: true,
             },
             |environment| {
-                self.runtime
-                    .block_on(install_codex(environment, &self.run, &self.codex()));
+                self.runtime.block_on(install_codex(
+                    environment,
+                    &self.run,
+                    &self.codex(),
+                    self.package,
+                ));
             },
         )
     }
@@ -387,6 +452,168 @@ impl Context {
             ))
             .unwrap_or_else(|why| panic!("agent.capabilities: {why}"));
         read.binding
+    }
+
+    /// Reads the binding until `holds` is true of it, within the liveness bound.
+    fn binding_until(
+        &self,
+        remote: &Remote,
+        session_id: SessionId,
+        instance: ApplicationInstanceId,
+        why: &str,
+        holds: impl Fn(&AgentBindingState) -> bool,
+    ) -> AgentBindingState {
+        let started = Instant::now();
+        loop {
+            let read = self.binding(remote, session_id, instance);
+            if holds(&read) {
+                return read;
+            }
+            assert!(
+                started.elapsed() < LIVENESS,
+                "{why}: the binding is {read:?}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Reads the capability record the host keeps for an instance.
+    fn capability(
+        &self,
+        remote: &Remote,
+        session_id: SessionId,
+        instance: ApplicationInstanceId,
+        name: &str,
+    ) -> (InstanceCapabilityState, Option<String>) {
+        let read: AgentCapabilitiesResult = self
+            .runtime
+            .block_on(remote.read(
+                Method::AgentCapabilities,
+                &AgentCapabilitiesParams {
+                    subject: subject(session_id, instance),
+                },
+            ))
+            .unwrap_or_else(|why| panic!("agent.capabilities: {why}"));
+        let record = read
+            .capabilities
+            .record(&CapabilityId::new(name).expect("a capability"))
+            .unwrap_or_else(|| panic!("{name} is not recorded: {:?}", read.capabilities));
+        (record.state, record.disabled_reason.0.clone())
+    }
+
+    /// What a rich call at `binding` acts on.
+    fn target(
+        remote: &Remote,
+        session_id: SessionId,
+        instance: ApplicationInstanceId,
+        binding: &AgentBindingState,
+    ) -> (ActionTarget, AgentMutationTarget) {
+        (
+            ActionTarget {
+                environment_id: remote.environment_id(),
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(SessionEpoch::V1),
+                application_instance_id: Nullable::some(instance),
+                agent_binding_revision: Nullable::some(binding.binding_revision),
+            },
+            AgentMutationTarget {
+                subject: subject(session_id, instance),
+                binding_revision: binding.binding_revision,
+            },
+        )
+    }
+
+    /// Answers the pending approval `resource`, and returns what the host answered.
+    fn answers(
+        &self,
+        remote: &Remote,
+        session_id: SessionId,
+        instance: ApplicationInstanceId,
+        binding: &AgentBindingState,
+        resource: PendingResourceId,
+        option: &str,
+    ) -> Result<AgentApprovalRespondResult, kr_e2e_m1b::device::RequestError> {
+        let (target, mutation_target) = Self::target(remote, session_id, instance, binding);
+        self.runtime.block_on(remote.mutate(
+            Method::AgentApprovalRespond,
+            target,
+            &AgentApprovalRespondParams {
+                target: mutation_target,
+                resource_id: resource,
+                option_id: option.to_owned(),
+            },
+        ))
+    }
+
+    /// Submits a prompt to an instance at the revision of `binding`.
+    fn prompts(
+        &self,
+        remote: &Remote,
+        session_id: SessionId,
+        instance: ApplicationInstanceId,
+        binding: &AgentBindingState,
+        text: &str,
+        queued: bool,
+    ) -> Result<AgentMutationResult, kr_e2e_m1b::device::RequestError> {
+        let (target, mutation_target) = Self::target(remote, session_id, instance, binding);
+        self.runtime.block_on(remote.mutate(
+            if queued {
+                Method::AgentPromptQueue
+            } else {
+                Method::AgentPromptSubmit
+            },
+            target,
+            &AgentPromptParams {
+                target: mutation_target,
+                draft_id: Nullable::null(),
+                text: Nullable::some(PromptText::new(text).expect("a prompt")),
+            },
+        ))
+    }
+
+    /// Steers the turn `turn` of an instance.
+    fn steers(
+        &self,
+        remote: &Remote,
+        session_id: SessionId,
+        instance: ApplicationInstanceId,
+        binding: &AgentBindingState,
+        turn: &AgentTurnId,
+        text: &str,
+    ) -> Result<AgentMutationResult, kr_e2e_m1b::device::RequestError> {
+        let (target, mutation_target) = Self::target(remote, session_id, instance, binding);
+        self.runtime.block_on(remote.mutate(
+            Method::AgentTurnSteer,
+            target,
+            &AgentSteerParams {
+                target: mutation_target,
+                turn_id: turn.clone(),
+                text: PromptText::new(text).expect("a steer"),
+            },
+        ))
+    }
+
+    /// Invokes the package's declared action that cancels the turn that is running.
+    fn cancels_by_action(
+        &self,
+        remote: &Remote,
+        session_id: SessionId,
+        instance: ApplicationInstanceId,
+        binding: &AgentBindingState,
+    ) -> Result<PluginActionInvokeResult, kr_e2e_m1b::device::RequestError> {
+        let (target, mutation_target) = Self::target(remote, session_id, instance, binding);
+        self.runtime.block_on(remote.mutate(
+            Method::PluginActionInvoke,
+            target,
+            &PluginActionInvokeParams {
+                target: mutation_target,
+                plugin_id: codex(),
+                action: ActionName::new("turn.cancel").expect("an action"),
+                draft_id: Nullable::null(),
+                resource_id: Nullable::null(),
+                parameters: Bytes::new(b"{}".to_vec()),
+            },
+        ))
     }
 
     /// Submits a prompt to an instance at the revision of `binding`, and returns what the host
@@ -545,6 +772,42 @@ fn release_of(ctx: &Context) -> PathBuf {
 /// The file the stand-in's server notes the frames it received in.
 fn received_by(ctx: &Context) -> PathBuf {
     ctx.run.root().join("received")
+}
+
+/// The lines the stand-in's server noted for what it received.
+fn received_lines(ctx: &Context) -> Vec<String> {
+    std::fs::read_to_string(received_by(ctx))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The parameters of each request of `method` the server received, in order.
+fn requests_of(ctx: &Context, method: &str) -> Vec<serde_json::Value> {
+    let prefix = format!("params {method} ");
+    received_lines(ctx)
+        .iter()
+        .filter_map(|line| line.strip_prefix(&prefix))
+        .map(|rest| serde_json::from_str(rest).expect("the server noted JSON"))
+        .collect()
+}
+
+/// Waits until the server has received `count` requests of `method`, and returns them.
+fn requests_until(ctx: &Context, method: &str, count: usize) -> Vec<serde_json::Value> {
+    let started = Instant::now();
+    loop {
+        let found = requests_of(ctx, method);
+        if found.len() >= count {
+            return found;
+        }
+        assert!(
+            started.elapsed() < LIVENESS,
+            "the server did not receive {count} request(s) of {method}: {:?}",
+            received_lines(ctx)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Lets the stand-in's terminal print its tick `number`.
@@ -1256,5 +1519,409 @@ fn kr_req_07_61_a_worker_killed_leaves_a_server_the_daemon_ends_with_what_it_sta
     assert!(ended_within(&session.worker, LIVENESS), "the worker ends");
     let closure = closure_of(&host, &session.person.display);
     session.closed_as(&closure, "worker_crash");
+    ctx.close(&host);
+}
+
+/// What an approval pending on the stand-in's server is, once a decoder has read it.
+fn interpreted_approval(
+    ctx: &Context,
+    remote: &Remote,
+    session_id: SessionId,
+) -> kr_protocol::gateway::PendingResource {
+    let read = ctx.instances_until(remote, session_id, "the request is interpreted", |read| {
+        read.agent_resources.resources.len() == 1
+            && read.agent_resources.resources[0].interpretation_verified
+    });
+    read.agent_resources.resources[0].clone()
+}
+
+/// Whether the binding names `thread` and, when `turn` is given, that turn, and rich work is not
+/// suspended.
+fn names(binding: &AgentBindingState, thread: &str, turn: Option<&str>) -> bool {
+    binding
+        .thread_id
+        .0
+        .as_ref()
+        .map(ToString::to_string)
+        .as_deref()
+        == Some(thread)
+        && binding
+            .turn_id
+            .0
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref()
+            == turn
+        && !binding.rich_mutations_suspended
+}
+
+/// KR-REQ-11.22, KR-REQ-11.33 and KR-REQ-12.11: a paired device answers the approval of a real
+/// session, behind a gateway, through the Codex package the plugins repository publishes. The
+/// terminal holds its own answer and goes on reading. The request is read under the package's
+/// trust and answered once, as the response Codex reads, with the decision the device chose; the
+/// server's word that it was answered reaches the terminal. When the terminal then sends its own
+/// answer, it is not forwarded, the connection goes on, and the server has received one answer,
+/// which the terminal's next question after it shows.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_11_33_a_device_answers_an_approval_the_terminal_holds_and_the_late_terminal_answer_is_not_forwarded()
+ {
+    let Some(ctx) = Context::start_released("gateway-approve-first") else {
+        return;
+    };
+    let host = ctx.host();
+    let (_device, _paired, remote) = ctx.pair(&host);
+    let person = Person::enters(&ctx, &host);
+    person.exports(
+        &ctx,
+        "answer-when-released,keep-reading,ping-when-released,stay",
+    );
+    person.types("codex");
+    let _ = person.sees(ASKED, "the terminal reaches the server through the gateway");
+    let instance = first_instance(&ctx, &remote, person.session_id).application_instance_id;
+    let binding = ctx.binding_until(
+        &remote,
+        person.session_id,
+        instance,
+        "the stream names the thread and the turn",
+        |binding| names(binding, "thread-1", Some("turn-1")),
+    );
+    let pending = interpreted_approval(&ctx, &remote, person.session_id);
+    assert_eq!(pending.state, PendingState::Pending);
+    let evidence = ctx.capability(&remote, person.session_id, instance, "agent.approval");
+    assert_eq!(
+        evidence.0,
+        InstanceCapabilityState::QualifiedAvailable,
+        "{evidence:?}"
+    );
+
+    // The device answers. The server is sent the response Codex reads: the request's own
+    // identifier and the decision in the member the table names.
+    let answered = ctx
+        .answers(
+            &remote,
+            person.session_id,
+            instance,
+            &binding,
+            pending.resource_id,
+            "accept-for-session",
+        )
+        .expect("the device's answer is carried");
+    assert_eq!(answered.state, PendingState::Resolved);
+    let received = received_lines(&ctx);
+    assert_eq!(
+        received
+            .iter()
+            .filter(|line| line.starts_with("response "))
+            .count(),
+        1,
+        "{received:?}"
+    );
+    // The server said the request was answered, and the terminal read it while it held its answer.
+    let _ = person.sees(
+        "TUI: serverRequest/resolved",
+        "the terminal reads the server's word that the request was answered",
+    );
+
+    // The terminal sends its own answer late, and then asks the server a question. The server
+    // answers the question, so the connection went on, and it received the one answer.
+    let mark = person.window.mark();
+    std::fs::write(release_of(&ctx), b"go").expect("the release");
+    let _ = person.window.wait_for(
+        mark,
+        b"TUI: the server answered after the turn",
+        "the connection goes on after the terminal's late answer",
+    );
+    let received = received_lines(&ctx);
+    assert_eq!(
+        received
+            .iter()
+            .filter(|line| line.starts_with("response "))
+            .count(),
+        1,
+        "the terminal's late answer was not forwarded: {received:?}"
+    );
+    let done = ctx.instances_until(
+        &remote,
+        person.session_id,
+        "the request is resolved",
+        |read| {
+            read.agent_resources.resources.len() == 1
+                && read.agent_resources.resources[0].state == PendingState::Resolved
+        },
+    );
+    assert_eq!(
+        done.agent_resources.resources[0].resource_id,
+        pending.resource_id
+    );
+    ctx.close(&host);
+}
+
+/// KR-REQ-11.33: in the other order the terminal answers first, the request is resolved, and the
+/// device's answer to it is refused for that and sends nothing.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_11_33_a_device_answer_to_a_request_the_terminal_answered_is_refused_and_sends_nothing() {
+    let Some(ctx) = Context::start_released("gateway-answered-first") else {
+        return;
+    };
+    let host = ctx.host();
+    let (_device, _paired, remote) = ctx.pair(&host);
+    let person = Person::enters(&ctx, &host);
+    person.exports(&ctx, "answer-when-released,stay");
+    person.types("codex");
+    let _ = person.sees(ASKED, "the terminal reaches the server through the gateway");
+    let instance = first_instance(&ctx, &remote, person.session_id).application_instance_id;
+    let binding = ctx.binding_until(
+        &remote,
+        person.session_id,
+        instance,
+        "the stream names the thread and the turn",
+        |binding| names(binding, "thread-1", Some("turn-1")),
+    );
+    let pending = interpreted_approval(&ctx, &remote, person.session_id);
+
+    // The terminal answers, and the server's word that the request was answered completes the turn.
+    std::fs::write(release_of(&ctx), b"go").expect("the release");
+    let _ = person.sees("TUI: turn/completed", "the turn completes");
+    let _ = ctx.instances_until(&remote, person.session_id, "the request resolves", |read| {
+        read.agent_resources.resources.len() == 1
+            && read.agent_resources.resources[0].state == PendingState::Resolved
+    });
+    let refused = ctx
+        .answers(
+            &remote,
+            person.session_id,
+            instance,
+            &binding,
+            pending.resource_id,
+            "accept",
+        )
+        .expect_err("the request was answered");
+    assert_eq!(
+        refused.refusal(),
+        Some(ErrorCode::QuestionResolved),
+        "{refused}"
+    );
+    let received = received_lines(&ctx);
+    assert_eq!(
+        received
+            .iter()
+            .filter(|line| line.starts_with("response "))
+            .count(),
+        1,
+        "the server received the terminal's answer and nothing else: {received:?}"
+    );
+    ctx.close(&host);
+}
+
+/// KR-REQ-12.06, KR-REQ-12.08, KR-REQ-12.12, KR-REQ-11.28, KR-REQ-11.36 and KR-REQ-23.30: the
+/// typed operations of a real session through the Codex package the plugins repository publishes.
+/// The binding names the thread and the running turn from the stream, and the capability map says
+/// what the package's table lets a device do, a queue excepted. A prompt over the running turn and
+/// a queue the table does not declare are refused and send nothing. A steer and the package's
+/// declared cancellation reach the server as the requests Codex reads, naming the thread and the
+/// turn; the turn's end clears the binding's turn; and a prompt then starts a turn whose identifier
+/// the reply names.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_12_08_a_device_steers_cancels_and_prompts_through_what_the_released_package_declares() {
+    let Some(ctx) = Context::start_released("gateway-operations") else {
+        return;
+    };
+    let host = ctx.host();
+    let (_device, _paired, remote) = ctx.pair(&host);
+    let person = Person::enters(&ctx, &host);
+    person.exports(&ctx, "answer-when-released,keep-reading,stay");
+    person.types("codex");
+    let _ = person.sees(ASKED, "the terminal reaches the server through the gateway");
+    let session = person.session_id;
+    let instance = first_instance(&ctx, &remote, session).application_instance_id;
+
+    // KR-REQ-12.06: the stream names the thread and the running turn, and rich work is available.
+    let running = ctx.binding_until(
+        &remote,
+        session,
+        instance,
+        "the stream names the thread and the turn",
+        |binding| names(binding, "thread-1", Some("turn-1")),
+    );
+
+    // KR-REQ-12.08 and KR-REQ-12.12: what the table lets a device do, and what it does not.
+    for name in [
+        "agent.prompt",
+        "agent.steer",
+        "agent.cancel",
+        "agent.approval",
+    ] {
+        let (state, reason) = ctx.capability(&remote, session, instance, name);
+        assert_eq!(
+            state,
+            InstanceCapabilityState::QualifiedAvailable,
+            "{name}: {reason:?}"
+        );
+    }
+    let (state, reason) = ctx.capability(&remote, session, instance, "agent.prompt.queue");
+    assert_eq!(state, InstanceCapabilityState::Incompatible);
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("queue")),
+        "the reason names the table: {reason:?}"
+    );
+
+    // Refusals before anything is sent: a prompt over the running turn is not a queue, and the
+    // table declares no queue.
+    let refused = ctx
+        .prompts(&remote, session, instance, &running, "now", false)
+        .expect_err("a prompt over a running turn");
+    assert_eq!(
+        refused.refusal(),
+        Some(ErrorCode::DraftConflict),
+        "{refused}"
+    );
+    let refused = ctx
+        .prompts(&remote, session, instance, &running, "later", true)
+        .expect_err("a queue the table does not declare");
+    assert_eq!(
+        refused.refusal(),
+        Some(ErrorCode::UnsupportedCapability),
+        "{refused}"
+    );
+    assert_eq!(
+        requests_of(&ctx, "turn/start").len(),
+        1,
+        "only the terminal's own turn reached the server"
+    );
+
+    // A steer names the thread and the turn it expects, and the reply names the turn.
+    let turn = AgentTurnId::new("turn-1").expect("a turn");
+    let steered = ctx
+        .steers(
+            &remote,
+            session,
+            instance,
+            &running,
+            &turn,
+            "the other file",
+        )
+        .expect("the steer is carried");
+    assert_eq!(
+        steered
+            .turn_id
+            .0
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("turn-1")
+    );
+    assert_eq!(
+        requests_until(&ctx, "turn/steer", 1)[0],
+        serde_json::json!({
+            "threadId": "thread-1",
+            "expectedTurnId": "turn-1",
+            "input": [{ "type": "text", "text": "the other file" }]
+        })
+    );
+
+    // The package's declared cancellation is written from the table's template, with the thread
+    // and the turn the host read; the server completes the turn and the binding's turn clears.
+    let cancelled = ctx
+        .cancels_by_action(&remote, session, instance, &running)
+        .expect("the declared cancellation is carried");
+    assert!(
+        cancelled.mutation.0.is_some(),
+        "the action reached the upstream"
+    );
+    assert_eq!(
+        requests_until(&ctx, "turn/interrupt", 1)[0],
+        serde_json::json!({ "threadId": "thread-1", "turnId": "turn-1" })
+    );
+    let idle = ctx.binding_until(
+        &remote,
+        session,
+        instance,
+        "the turn's end clears the binding's turn",
+        |binding| names(binding, "thread-1", None),
+    );
+
+    // With no turn running a prompt starts one, and the reply names it.
+    let started = ctx
+        .prompts(&remote, session, instance, &idle, "run it again", false)
+        .expect("the prompt is carried");
+    assert_eq!(
+        started
+            .turn_id
+            .0
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("turn-2")
+    );
+    assert_eq!(
+        requests_until(&ctx, "turn/start", 2)[1],
+        serde_json::json!({
+            "threadId": "thread-1",
+            "input": [{ "type": "text", "text": "run it again" }]
+        })
+    );
+
+    // A steer with no turn running is refused, and sends nothing.
+    let refused = ctx
+        .steers(&remote, session, instance, &idle, &turn, "too late")
+        .expect_err("the turn is over");
+    assert!(refused.refusal().is_some(), "{refused}");
+    assert_eq!(requests_of(&ctx, "turn/steer").len(), 1);
+    ctx.close(&host);
+}
+
+/// KR-REQ-11.36: a prompt a device sends while the server dies under it is an outcome nobody can
+/// establish, and the caller is told so.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_11_36_a_prompt_whose_server_dies_under_it_is_an_outcome_nobody_can_establish() {
+    let Some(ctx) = Context::start_released("gateway-server-dies") else {
+        return;
+    };
+    let host = ctx.host();
+    let (_device, _paired, remote) = ctx.pair(&host);
+    let person = Person::enters(&ctx, &host);
+    // The server starts no command of its own here: it is killed, and a command it started would
+    // be left for the closure to find, which is another case's.
+    person.types("export KR_STAND_IN=die-on-second-turn,stay");
+    person.types(&format!(
+        "export KR_STAND_IN_RECEIVED={}",
+        received_by(&ctx).display()
+    ));
+    person.types("codex");
+    let _ = person.sees("TUI: turn/completed", "the terminal's turn completes");
+    let session = person.session_id;
+    let instance = first_instance(&ctx, &remote, session).application_instance_id;
+    let idle = ctx.binding_until(
+        &remote,
+        session,
+        instance,
+        "the stream names the thread and no turn",
+        |binding| names(binding, "thread-1", None),
+    );
+    let refused = ctx
+        .prompts(&remote, session, instance, &idle, "go on", false)
+        .expect_err("the server died under the prompt");
+    // The host says it cannot establish whether the action happened: the client's own account of
+    // an unknown outcome, which carries the action and the host's OUTCOME_UNKNOWN.
+    let kr_e2e_m1b::device::RequestError::Client(kr_client::ClientError::OutcomeUnknown {
+        error,
+        ..
+    }) = &refused
+    else {
+        panic!("the outcome is unknown, and the host says so: {refused}");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown, "{refused}");
+    // The same prompt is not sent again: the server received one request of the second turn at most.
+    assert!(requests_of(&ctx, "turn/start").len() <= 2);
     ctx.close(&host);
 }

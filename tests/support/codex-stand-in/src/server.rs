@@ -516,7 +516,7 @@ impl Server {
     }
 
     async fn turn(&mut self, id: &Value, frame: &Value) {
-        if self.variants.die_on_host_turn && id.as_str().is_some_and(|id| id.starts_with("kr-")) {
+        if self.variants.die_on_second_turn && self.turns_made >= 1 {
             std::process::exit(0);
         }
         let thread_id = frame["params"]["threadId"]
