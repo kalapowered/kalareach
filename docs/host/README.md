@@ -3125,17 +3125,38 @@ holds and accepts the next one only under the new key. A policy the organisation
 old key is refused until the organisation signs it again. A host that has not followed the rotation
 needs the chain beside the policy: `kr organisation policy <policy-file> --chain <chain-file>`.
 
-The host keeps the policy's revision and its adapter allowlist with the organisation's enrolment,
-in the policy row of the host's authority store, so a restart restores both. The policy states
-other settings too: the least client version, the longest grant, what members' clients may reach
-outside KalaReach, the backup requirements and the audit retention. The host verifies them with
-the rest of the policy and neither stores nor applies them. The revision is a floor: a policy at
-or below it is refused, a restart does not lower it, and a captured older policy cannot bring back
-a list the organisation has since replaced. The floor lives with the enrolment, so a withdrawal
-removes it. Lease records are kept across a withdrawal, and the floor is not: a later enrolment,
-which needs the owner's confirmation again, starts with no policy. A host that is exclusively
-organisation-managed cannot leave its last organisation until that ends. Like every floor, the
-floor goes back when the whole store is restored.
+The host keeps the policy's revision and its adapter allowlist in a store of its own,
+`organisation-policy.json` in the environment's state directory beside the registry, and not in
+the registry's rows. The file holds one entry for each enrolment that has applied a policy. An
+entry names the organisation and the authority revision the host took when it enrolled, and is
+written with every other entry in one write, owner only. A host that has applied no policy has no
+file. A start reads the file before the catalogue opens, so a restart restores the revision and
+the list. A start stops, naming the file, when the file is there and is not a record of the format
+this build reads: a host that came back without the restrictions it was left with would run every
+adapter. A release before this one reads the registry and does not name the file, so it leaves the
+file alone and a rollback to it is not refused for it. That release applies no organisation
+policy, so a host rolled back to it admits every adapter it qualifies. A host that is brought
+forward again applies the policy once more, as long as the enrolment it was applied for is still
+held.
+
+The request writes the file before the registry row that records a chain it followed. A stop
+between the two leaves the policy applied at the next start, with the chain advance not recorded,
+and the same request made again completes it. A request that is refused after the file was written
+puts the file back as it was. An entry applies only to the enrolment it was applied for. A
+withdrawal writes the file again, without the entry of the organisation it left, or removes the
+file when no entry is left. A stop that leaves an entry of an enrolment that has ended behind
+names an enrolment the host no longer holds, so the next start drops it, and no later enrolment in
+the same organisation takes it.
+
+The policy states other settings too: the least client version, the longest grant, what members'
+clients may reach outside KalaReach, the backup requirements and the audit retention. The host
+verifies them with the rest of the policy and neither stores nor applies them. The revision is a
+floor: a policy at or below it is refused, a restart does not lower it, and a captured older
+policy cannot bring back a list the organisation has since replaced. The floor lives with the
+enrolment's entry, so a withdrawal removes it. Lease records are kept across a withdrawal, and the
+floor is not: a later enrolment, which needs the owner's confirmation again, starts with no
+policy. A host that is exclusively organisation-managed cannot leave its last organisation until
+that ends. Like every floor, the floor goes back when the whole state directory is restored.
 
 The adapters the host admits are those that every enrolled organisation which states an allowlist
 allows: the intersection of the lists. An organisation with no list adds no constraint, a host with
@@ -3153,8 +3174,8 @@ host puts the list in force in four places:
   is still busy then, or the revision cannot be raised, the policy is recorded and the request
   answers `RESOURCE_UNAVAILABLE` or `STORAGE_UNAVAILABLE`, saying the host puts the list in force at
   its next admissions pass; until it does, the list the policies state and the list in force differ.
-  The recorded answer is given to a repeat of the same action only once the list is in force, and a
-  repeat of the same policy by a new action completes it.
+  The host keeps no answer for the request. The same request made again applies the same policy
+  again, which changes nothing the host keeps, and puts the list in force.
 - After `organisation.withdraw`, which can only widen the list. A put that does not land waits for
   the next pass.
 - At the head of every admissions pass, which runs every 30 seconds and whenever a change asks for
@@ -6057,7 +6078,8 @@ notice again. Setting a clock back will not make any numbers be lower than any p
   the grants under the bound are refused until the owner acts at the host.
 * **Revalidation after wake and reboot.** The policy, its restrictions, its enrolments and both
   floors are read back from the environment's authority store when the daemon starts, so a restart
-  does not return an unrestricted host. Membership leases are not: a lease lasts at most fifteen
+  does not return an unrestricted host. The policies the owner applied are read back with their
+  revisions from the store of applied policies that lies beside it. Membership leases are not: a lease lasts at most fifteen
   minutes, and a restarted host holds none until the service gives it one. A policy document naming
   a revision at or below the floor is refused, and the floor only rises. A signature proves who
   wrote a policy, not that the policy is the current one.
