@@ -8,6 +8,7 @@
 
 use std::process::Output;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -165,14 +166,34 @@ fn at_terminal(
     line.push(b'\r');
     window.type_text(&line);
     let exit = window.exit_code(LIVENESS);
-    let printed = window.collected().since(mark);
-    let document = first_document(&printed).unwrap_or_else(|| {
-        panic!(
-            "{what} printed no document after the ceremony ({} bytes)",
-            printed.len()
-        )
-    });
+    let document = document_after(&window, mark, what, "after the ceremony");
     Answered { exit, document }
+}
+
+/// The first JSON document the window is sent after `mark`, waited for.
+///
+/// A program that has ended has written everything it printed, but the thread that collects what
+/// the window is sent may not have read it yet: the end of the program is not the end of what the
+/// window holds. What is waited for is the document itself, which is whole only once its closing
+/// brace has arrived.
+///
+/// # Panics
+///
+/// Panics with how much arrived when no document has arrived within [`LIVENESS`].
+fn document_after(window: &Window, mark: usize, what: &str, when: &str) -> Value {
+    let started = Instant::now();
+    loop {
+        let printed = window.collected().since(mark);
+        if let Some(document) = first_document(&printed) {
+            return document;
+        }
+        assert!(
+            started.elapsed() < LIVENESS,
+            "{what} printed no document {when} ({} bytes)",
+            printed.len()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// The first JSON document in what a command printed, wherever it starts.
@@ -266,13 +287,7 @@ pub fn share_at_terminal(host: &Host<'_>, arguments: &[&str], typed: &[u8]) -> (
     line.push(b'\r');
     window.type_text(&line);
     let exit = window.exit_code(LIVENESS);
-    let printed = window.collected().since(mark);
-    let document = first_document(&printed).unwrap_or_else(|| {
-        panic!(
-            "kr share invite printed no document after the question ({} bytes)",
-            printed.len()
-        )
-    });
+    let document = document_after(&window, mark, "kr share invite", "after the question");
     (shown, Answered { exit, document })
 }
 
