@@ -405,7 +405,9 @@ fn clock_now(clock: &ManualClock) -> u64 {
 /// KR-REQ-25.15: a workflow does not retrigger on its own descendants unless the reviewed
 /// definition says so. A definition document that says nothing of recurrence, as a client sends one
 /// to `workflow.install`, reads as recurrence off, is refused another turn in its own chain, and
-/// nothing further runs; the same workflow with explicit recurrence takes it.
+/// nothing further runs; the same workflow with explicit recurrence takes it. The node creates a
+/// session, which every platform accepts in a definition; a node that runs a command is refused on
+/// Windows.
 #[tokio::test]
 async fn self_retrigger_is_refused_without_explicit_recurrence() {
     let service = in_memory();
@@ -414,10 +416,10 @@ async fn self_retrigger_is_refused_without_explicit_recurrence() {
         1,
         "self-trigger",
         test_grant_id(1),
-        vec![common::node("step", WorkflowActionKind::RunTests)],
+        vec![common::node("step", WorkflowActionKind::CreateSession)],
         vec![],
     );
-    written.trigger.event_type = "tests.passed".to_owned();
+    written.trigger.event_type = "session.created".to_owned();
     // The document as it travels, with the field a client leaves out left out.
     let mut document = serde_json::to_value(&written).expect("a document");
     document
@@ -457,8 +459,8 @@ async fn self_retrigger_is_refused_without_explicit_recurrence() {
     let recurring = recurring_workflow(
         3,
         "self-trigger",
-        "tests.passed",
-        WorkflowActionKind::RunTests,
+        "session.created",
+        WorkflowActionKind::CreateSession,
     );
     install_and_enable(&recurring_service, &recurring, 1_000);
     recurring_service
@@ -476,12 +478,18 @@ async fn self_retrigger_is_refused_without_explicit_recurrence() {
 }
 
 /// KR-REQ-25.15: a descendant's root, depth and parent are the journal's record of the node that
-/// produced its trigger, and its trigger's identifier is that node's action identifier.
+/// produced its trigger, and its trigger's identifier is that node's action identifier. The nodes
+/// create sessions, which every platform accepts in a definition.
 #[tokio::test]
 async fn a_descendant_takes_its_ancestry_from_the_node_that_produced_its_trigger() {
     let service = in_memory();
-    let first = recurring_workflow(4, "first", "manual", WorkflowActionKind::RunTests);
-    let second = recurring_workflow(5, "second", "tests.passed", WorkflowActionKind::RunTests);
+    let first = recurring_workflow(4, "first", "manual", WorkflowActionKind::CreateSession);
+    let second = recurring_workflow(
+        5,
+        "second",
+        "session.created",
+        WorkflowActionKind::CreateSession,
+    );
     install_and_enable(&service, &first, 1_000);
     install_and_enable(&service, &second, 1_000);
 
