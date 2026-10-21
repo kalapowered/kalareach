@@ -1557,6 +1557,7 @@ impl Broker {
             ledger.put_binding(&record)
         })?;
         state.bindings.insert(binding_id, binding);
+        state.renew_every_gateway_evidence(now);
         Ok(())
     }
 
@@ -1637,6 +1638,7 @@ impl Broker {
             .ok_or_else(|| unknown_binding(binding_id))?;
         binding.grants = grants;
         binding.trust = trust;
+        state.renew_every_gateway_evidence(kr_ipc::now_ms());
         Ok(())
     }
 
@@ -1673,6 +1675,7 @@ impl Broker {
             .get_mut(&binding_id)
             .ok_or_else(|| unknown_binding(binding_id))?;
         binding.trust = trust;
+        state.renew_every_gateway_evidence(kr_ipc::now_ms());
         Ok(())
     }
 
@@ -1688,6 +1691,7 @@ impl Broker {
         };
         binding.rich_disabled = Some(reason.into());
         binding.revocation_disabled = false;
+        state.renew_every_gateway_evidence(kr_ipc::now_ms());
         let changes = Arc::clone(&state.component_changes);
         drop(state);
         changes.notify_one();
@@ -2130,16 +2134,15 @@ impl Broker {
         let mut state = self.state();
         // A request whose bytes never went was never seen by the server and leaves nothing behind;
         // one that went in part may have been read, and what became of it is unknown.
-        if let Some(open) = request.open.as_ref()
-            && let Some(instance) = state.instances.get_mut(&request.application_instance_id)
-        {
+        if let Some(open) = request.open.as_ref() {
             let given_up = match outcome {
                 crate::broker::ledger::ClientRequestOutcome::Unsent => Some(false),
                 crate::broker::ledger::ClientRequestOutcome::Uncertain => Some(true),
                 _ => None,
             };
             if let Some(unknown) = given_up {
-                instance.stream.give_up(open, unknown);
+                let application_instance_id = request.application_instance_id;
+                state.stream_given_up(application_instance_id, open, unknown, kr_ipc::now_ms());
             }
         }
         if !request.recorded || !state.volatile.writes_are_durable() {
@@ -3267,6 +3270,11 @@ impl Broker {
             state.gateway.read_with(connection, reading);
         }
         state.connection_packages.insert(connection, pinned.package);
+        // A request an earlier connection left unanswered was carried by a server that went with
+        // it.
+        if let Some(instance) = state.instances.get_mut(&application_instance_id) {
+            instance.stream.new_connection();
+        }
         state.renew_gateway_evidence(application_instance_id, kr_ipc::now_ms());
         Ok(connection)
     }

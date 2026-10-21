@@ -9,7 +9,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.06 | the thread a success reply to a selecting request names is the instance's binding, the revision advances only when the thread changed, and rich mutations resume; they wait while a selection is in flight and after one whose outcome is unknown, an older reply never restores a conversation the terminal left, a conversation another execution owns is never published, and a turn or a leave about another thread changes nothing |
+//! | KR-REQ-12.06 | the thread a success reply to a selecting request names is the instance's binding, the revision advances only when the thread changed, and rich mutations resume; they wait while a selection is in flight and after one whose outcome is unknown, an older reply never restores a conversation the terminal left, a conversation another execution owns is never published, a turn or a leave about another thread changes nothing, replies are applied in the order their requests were admitted once none is in flight (a success whose newer request is then refused is the binding; a leave of another conversation does not hide an older selection; a leave of the bound conversation survives a newer request that is refused), and a request given up at its deadline keeps the instance suspended until a selection names the conversation |
 //! | KR-REQ-11.30 | an unlisted frame keeps rich mutations suspended until a selection admitted after it has named the thread and every unlisted request before that has been answered |
 //! | KR-REQ-12.08 | a gateway connection's capability evidence says what its tables let a client do, follows each change of binding, and ends with the connection |
 //! | KR-REQ-11.33 | a request the connector's table answers as a response is interpreted under the binding's trust; the server's own word that it was answered settles what nobody answered and leaves an answer that is being written to its writer |
@@ -79,6 +79,10 @@ struct World {
     _client: tokio::io::DuplexStream,
     connection: GatewayConnectionId,
     writes: tokio::task::JoinHandle<()>,
+    /// What an installation hands the worker, kept so a case can hand it a narrower grant.
+    admissions: Admissions,
+    sources: ConnectorSources,
+    source: kr_worker::broker::connectors::ConnectorSource,
 }
 
 impl World {
@@ -182,6 +186,9 @@ impl World {
             _client: client,
             connection,
             writes: tokio::spawn(writes),
+            admissions,
+            sources,
+            source,
         }
     }
 
@@ -282,6 +289,22 @@ impl World {
     fn revision(&self) -> u64 {
         self.state().binding_revision.get()
     }
+
+    /// Lets the deadline for the terminal's own requests pass, and waits for the owner to give up
+    /// what the server did not answer.
+    async fn past_the_deadline(&self) {
+        tokio::time::advance(
+            kr_worker::broker::CLIENT_REPLY_DEADLINE + std::time::Duration::from_secs(30),
+        )
+        .await;
+        for _ in 0..200 {
+            if self.owner.forwarded_client_requests() == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the owner did not give up what the server never answered");
+    }
 }
 
 impl Drop for World {
@@ -291,7 +314,17 @@ impl Drop for World {
 }
 
 const START: &str = r#"{"id":1,"method":"thread/start","params":{}}"#;
+const LEAVE_OTHER: &str =
+    r#"{"id":3,"method":"thread/unsubscribe","params":{"threadId":"thread-9"}}"#;
+const LEAVE_ONE: &str =
+    r#"{"id":4,"method":"thread/unsubscribe","params":{"threadId":"thread-1"}}"#;
+const REFUSED: &str = r#""error":{"code":-32600,"message":"no such thread"}"#;
+const UNLISTED: &str = r#"{"id":7,"method":"fuzzyFileSearch","params":{"query":"x"}}"#;
 const RESUME: &str = r#"{"id":2,"method":"thread/resume","params":{"threadId":"thread-2"}}"#;
+
+fn binding_id() -> BrokerBindingId {
+    BrokerBindingId::new(Uuid::from_bytes([7; 16]))
+}
 
 fn named(thread: &str) -> String {
     format!(r#""result":{{"thread":{{"id":"{thread}"}}}}"#)
@@ -431,13 +464,25 @@ async fn kr_req_12_06_an_older_reply_never_restores_what_a_later_request_left() 
     let newer = world.terminal_asks(RESUME).await;
     assert!(world.waiting().is_some());
     world.server_answers(&newer, &named("thread-2")).await;
-    assert_eq!(world.thread().as_deref(), Some("thread-2"));
-    assert_eq!(world.waiting(), None, "the newest request is answered");
-    // The older reply arrives last and names another thread: nothing changes.
+    assert_eq!(
+        world.thread(),
+        None,
+        "the older request has not been answered"
+    );
+    assert!(
+        world
+            .waiting()
+            .is_some_and(|reason| reason.contains("has not answered")),
+        "{:?}",
+        world.waiting()
+    );
+    // The older reply arrives last and names another thread: the last selection decides, and the
+    // thread the older one named is never bound.
     let revision = world.revision();
     world.server_answers(&older, &named("thread-1")).await;
     assert_eq!(world.thread().as_deref(), Some("thread-2"));
-    assert_eq!(world.revision(), revision);
+    assert_eq!(world.revision(), revision + 1, "one advance, to the newest");
+    assert_eq!(world.waiting(), None);
 
     // The newer of two requests is given up (its deadline passed, its connection ended): what
     // became of it is unknown, and the older one's success reply does not say.
@@ -753,6 +798,62 @@ async fn kr_req_11_33_the_server_clearing_a_request_never_settles_an_answer_that
     }
 }
 
+/// KR-REQ-11.33: the same holds for a rich answer that is being written: the server's notice that
+/// the request was answered comes before the write is accounted for and decides nothing, and the
+/// writer's settlement says the answer went.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_33_the_server_clearing_a_request_never_settles_a_rich_answer_being_written() {
+    let mut world = World::new(8);
+    world.terminal_selects("thread-1").await;
+    world.server_says(ASK).await;
+    let id = world.broker.pending_resources()[0].resource_id;
+    let admitted = world
+        .broker
+        .admit_approval(&World::owner_caller(), &world.rich_answer("accept"), NOW)
+        .expect("the rich answer is admitted");
+    let in_flight = world
+        .broker
+        .record_approval(&admitted, NOW)
+        .expect("its marker is written and its bytes are queued");
+    assert_eq!(
+        world.broker.pending(id).expect("held").state,
+        PendingState::Claimed,
+        "the write has not finished"
+    );
+    world.server_says(RESOLVED).await;
+    assert_eq!(
+        world.broker.pending(id).expect("held").state,
+        PendingState::Claimed,
+        "the writer decides"
+    );
+    // The server reads the answer, and the writer settles it as resolved.
+    let upstream = &mut world.upstream;
+    let (settled, written) = tokio::join!(in_flight.settled(NOW), async {
+        let mut taken = [0_u8; 256];
+        let mut got = 0;
+        while !taken[..got].ends_with(b"\n") {
+            got += upstream
+                .read(&mut taken[got..])
+                .await
+                .expect("the server reads");
+        }
+        taken[..got].to_vec()
+    });
+    assert_eq!(
+        settled.expect("the answer went").state,
+        PendingState::Resolved
+    );
+    assert!(
+        String::from_utf8_lossy(&written).contains("\"decision\":\"accept\""),
+        "{}",
+        String::from_utf8_lossy(&written)
+    );
+    assert_eq!(
+        world.broker.pending(id).expect("held").state,
+        PendingState::Resolved
+    );
+}
+
 const TERMINAL_ANSWERS: &[u8] = br#"{"id":"approval-1","result":{"decision":"decline"}}"#;
 
 /// KR-REQ-11.33: a rich answer is written as the response to the request, in the shape the table
@@ -948,6 +1049,339 @@ async fn kr_req_12_06_a_rich_answer_admitted_before_a_selection_is_stopped_at_it
         .await
         .expect_err("a request of the old conversation is stale");
     assert_eq!(stale.code(), kr_protocol::error::ErrorCode::StaleSession);
+    assert_eq!(
+        world.broker.pending(id).expect("held").state,
+        PendingState::Pending
+    );
+}
+
+/// KR-REQ-12.06: a success reply that came while a newer request was in flight is the binding
+/// when that newer request is refused, whichever way round the replies come.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_06_a_success_is_applied_when_the_newer_request_is_refused() {
+    let world = World::new(1 << 20);
+    let first = world.terminal_asks(START).await;
+    world.server_answers(&first, &named("thread-1")).await;
+    let bound = world.revision();
+
+    let older = world.terminal_asks(RESUME).await;
+    let newer = world.terminal_asks(START).await;
+    world.server_answers(&older, &named("thread-2")).await;
+    assert_eq!(world.thread().as_deref(), Some("thread-1"));
+    assert!(world.waiting().is_some(), "the newer request is in flight");
+    world.server_answers(&newer, REFUSED).await;
+    assert_eq!(
+        world.thread().as_deref(),
+        Some("thread-2"),
+        "the server applied the older request, and the newer one changed nothing"
+    );
+    assert_eq!(world.waiting(), None);
+    assert_eq!(world.revision(), bound + 1);
+
+    // The other way round: the refusal first, then the success.
+    let older = world.terminal_asks(START).await;
+    let newer = world.terminal_asks(RESUME).await;
+    world.server_answers(&newer, REFUSED).await;
+    world.server_answers(&older, &named("thread-3")).await;
+    assert_eq!(world.thread().as_deref(), Some("thread-3"));
+    assert_eq!(world.waiting(), None);
+}
+
+/// KR-REQ-12.06: a leave of another conversation changes nothing and hides nothing, and a leave of
+/// the bound one is not lost to a selection that is then refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_06_a_leave_neither_hides_a_selection_nor_is_lost_to_a_refused_one() {
+    let world = World::new(1 << 20);
+    let first = world.terminal_asks(START).await;
+    world.server_answers(&first, &named("thread-1")).await;
+
+    // A selection, then a leave of a conversation the terminal is not in, answered first.
+    let selecting = world.terminal_asks(START).await;
+    let leaving = world.terminal_asks(LEAVE_OTHER).await;
+    world.server_answers(&leaving, r#""result":{}"#).await;
+    assert!(world.waiting().is_some(), "the selection is in flight");
+    world.server_answers(&selecting, &named("thread-5")).await;
+    assert_eq!(
+        world.thread().as_deref(),
+        Some("thread-5"),
+        "the server started the conversation the terminal is now in"
+    );
+    assert_eq!(world.waiting(), None);
+
+    // A leave of the bound conversation, then a selection the server refuses.
+    let world = World::new(1 << 20);
+    let first = world.terminal_asks(START).await;
+    world.server_answers(&first, &named("thread-1")).await;
+    let leaving = world.terminal_asks(LEAVE_ONE).await;
+    let selecting = world.terminal_asks(RESUME).await;
+    world.server_answers(&leaving, r#""result":{}"#).await;
+    world.server_answers(&selecting, REFUSED).await;
+    assert_eq!(world.thread(), None, "the terminal left that conversation");
+    assert!(
+        world
+            .waiting()
+            .is_some_and(|reason| reason.contains("not read")),
+        "{:?}",
+        world.waiting()
+    );
+
+    // A selection and then a leave of what it selected, answered the other way round.
+    let world = World::new(1 << 20);
+    let selecting = world.terminal_asks(START).await;
+    let leaving = world
+        .terminal_asks(r#"{"id":4,"method":"thread/unsubscribe","params":{"threadId":"thread-4"}}"#)
+        .await;
+    world.server_answers(&leaving, r#""result":{}"#).await;
+    world.server_answers(&selecting, &named("thread-4")).await;
+    assert_eq!(world.thread(), None, "the terminal selected it and left it");
+    assert!(world.waiting().is_some());
+}
+
+/// KR-REQ-12.06 and KR-REQ-11.30: a request the server never answered, given up at its deadline,
+/// leaves what it did unknown: a selection that did not answer holds the instance back until the
+/// next one names the conversation, and a request of an unlisted method keeps the suspension it
+/// caused for as long as the connection lives.
+#[tokio::test(start_paused = true)]
+async fn kr_req_12_06_a_request_given_up_at_its_deadline_leaves_what_it_did_unknown() {
+    // A selection the server never answers.
+    let world = World::new(1 << 20);
+    let first = world.terminal_asks(START).await;
+    world.server_answers(&first, &named("thread-1")).await;
+    let _silent = world.terminal_asks(RESUME).await;
+    world.past_the_deadline().await;
+    assert!(
+        world
+            .waiting()
+            .is_some_and(|reason| reason.contains("unknown")),
+        "{:?}",
+        world.waiting()
+    );
+    assert_eq!(world.thread().as_deref(), Some("thread-1"));
+    // A selection that is answered names the conversation and ends the wait.
+    let selecting = world.terminal_asks(RESUME).await;
+    world.server_answers(&selecting, &named("thread-2")).await;
+    assert_eq!(world.thread().as_deref(), Some("thread-2"));
+    assert_eq!(world.waiting(), None);
+
+    // A request of a method the table does not list, never answered: the server may still be
+    // carrying it out, so no selection after it says the conversation is as it was.
+    let world = World::new(1 << 20);
+    let first = world.terminal_asks(START).await;
+    world.server_answers(&first, &named("thread-1")).await;
+    let _unlisted = world.terminal_asks(UNLISTED).await;
+    world.past_the_deadline().await;
+    for thread in ["thread-2", "thread-3"] {
+        let selecting = world.terminal_asks(RESUME).await;
+        world.server_answers(&selecting, &named(thread)).await;
+        assert_eq!(world.thread().as_deref(), Some(thread));
+        assert!(
+            world
+                .waiting()
+                .is_some_and(|reason| reason.contains("not classified")),
+            "no selection says what the unlisted request did: {:?}",
+            world.waiting()
+        );
+    }
+}
+
+/// KR-REQ-12.06: a conversation another live execution owns is never published as this instance's
+/// binding, and the instance says why it waits until a conversation that can be bound is selected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_06_a_conversation_another_execution_owns_is_never_published() {
+    let world = World::new(1 << 20);
+    let other = ApplicationInstanceId::new(Uuid::from_bytes([8; 16]));
+    world
+        .broker
+        .register_instance(other, IntegrationMode::Gateway, None, None)
+        .expect("another instance is registered");
+    world
+        .broker
+        .advance_binding(
+            other,
+            Some(kr_protocol::ids::AgentThreadId::new("thread-9").expect("a thread")),
+            NOW,
+        )
+        .expect("it owns a conversation");
+
+    let selecting = world.terminal_asks(START).await;
+    world.server_answers(&selecting, &named("thread-9")).await;
+    assert_eq!(
+        world.thread(),
+        None,
+        "the owned conversation is not published"
+    );
+    assert!(
+        world
+            .waiting()
+            .is_some_and(|reason| reason.contains("cannot be bound")),
+        "{:?}",
+        world.waiting()
+    );
+    let selecting = world.terminal_asks(RESUME).await;
+    world.server_answers(&selecting, &named("thread-2")).await;
+    assert_eq!(world.thread().as_deref(), Some("thread-2"));
+    assert_eq!(world.waiting(), None);
+}
+
+/// KR-REQ-12.08: the capability the connection records for approvals follows what the binding may
+/// do: a narrower grant, a withdrawn right to answer and a component fault each end it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_08_the_approval_evidence_follows_the_bindings_grants_and_faults() {
+    let approval = |world: &World| {
+        world
+            .broker
+            .capabilities(instance())
+            .record(&CapabilityId::new("agent.approval").expect("a capability"))
+            .cloned()
+            .expect("it is recorded")
+    };
+
+    // A narrower grant handed to the worker by the installation.
+    let mut world = World::new(1 << 20);
+    assert_eq!(
+        approval(&world).state,
+        InstanceCapabilityState::QualifiedAvailable
+    );
+    world.source.granted.retain(|capability| {
+        *capability != kr_plugin_sdk::capability::PluginCapability::ApprovalRespond
+    });
+    kr_worker::broker::catalogue::testing::admit(
+        &world.admissions,
+        &world.sources,
+        &world.broker,
+        vec![testing::admitted(&world.source)],
+        2,
+    );
+    assert_eq!(
+        approval(&world).state,
+        InstanceCapabilityState::Incompatible,
+        "{:?}",
+        approval(&world).disabled_reason
+    );
+
+    // A revocation its repository published, under the policy that disables at the next admission,
+    // and the revocation no longer standing.
+    let world = World::new(1 << 20);
+    let package = testing::admitted(&world.source);
+    let revoked = kr_protocol::admission::ReleaseState {
+        revocation: kr_protocol::scalars::Nullable::some(
+            kr_protocol::admission::AdmissionRevocation {
+                reason: "compromised".to_owned(),
+                revoked_at: TimestampMs::new(5),
+                statement: "Do not run this release.".to_owned(),
+            },
+        ),
+        ..testing::release_of(&package)
+    };
+    testing::hand_over(
+        &world.admissions,
+        &world.sources,
+        &world.broker,
+        testing::Snapshot {
+            policy: kr_protocol::admission::RevocationPolicy::DisableAtNextAdmission,
+            releases: vec![revoked],
+            ..testing::Snapshot::admitting(2, Vec::new())
+        },
+    );
+    assert_eq!(
+        approval(&world).state,
+        InstanceCapabilityState::Incompatible,
+        "a revoked release's binding answers nothing"
+    );
+    testing::admit(
+        &world.admissions,
+        &world.sources,
+        &world.broker,
+        vec![package],
+        3,
+    );
+    assert_eq!(
+        approval(&world).state,
+        InstanceCapabilityState::QualifiedAvailable,
+        "and a revocation that no longer stands lifts it"
+    );
+
+    // The right to answer withdrawn from the binding.
+    let world = World::new(1 << 20);
+    world
+        .broker
+        .withdraw_answering(binding_id())
+        .expect("the right is withdrawn");
+    assert_eq!(
+        approval(&world).state,
+        InstanceCapabilityState::Incompatible
+    );
+
+    // A component fault.
+    let world = World::new(1 << 20);
+    world.broker.disable_rich(binding_id(), "a component fault");
+    assert_eq!(
+        approval(&world).state,
+        InstanceCapabilityState::Incompatible
+    );
+}
+
+/// KR-REQ-12.06 and KR-REQ-11.30: a rich answer admitted before a leave or an unlisted frame is
+/// stopped when its permit is taken, and one admitted before its connection ended is told that
+/// nothing was sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_06_a_held_permit_is_stopped_by_a_leave_an_unlisted_frame_and_a_closed_connection()
+ {
+    let caller = World::owner_caller();
+    // Each case has a world of its own: a request belongs to the conversation it was asked in.
+    for (what, then) in [
+        (
+            "a frame of an unlisted method",
+            r#"{"method":"thread/reverted","params":{"threadId":"thread-1"}}"#,
+        ),
+        (
+            "the server ending the conversation",
+            r#"{"method":"thread/closed","params":{"threadId":"thread-1"}}"#,
+        ),
+    ] {
+        let mut world = World::new(1 << 20);
+        world.terminal_selects("thread-1").await;
+        world.server_says(ASK).await;
+        let id = world.broker.pending_resources()[0].resource_id;
+        let admitted = world
+            .broker
+            .admit_approval(&caller, &world.rich_answer("accept"), NOW)
+            .expect("admitted");
+        world.server_says(then).await;
+        let refused = world
+            .broker
+            .mark_approval(&admitted, NOW)
+            .err()
+            .unwrap_or_else(|| panic!("{what} stops a permit admitted before it"));
+        assert!(refused.proven_unsent(), "{what}: {refused:?}");
+        assert_eq!(
+            world.broker.pending(id).expect("held").state,
+            PendingState::Pending,
+            "{what}: the claim was given back"
+        );
+    }
+
+    // The connection ends between the admission and the take: nothing can be sent, and the
+    // refusal is one this host decided, not an outcome nobody can establish.
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    world.server_says(ASK).await;
+    let id = world.broker.pending_resources()[0].resource_id;
+    let admitted = world
+        .broker
+        .admit_approval(&caller, &world.rich_answer("accept"), NOW)
+        .expect("admitted");
+    world.owner.shutdown();
+    let refused = world
+        .broker
+        .mark_approval(&admitted, NOW)
+        .err()
+        .expect("the transport is closed");
+    assert!(refused.proven_unsent(), "{refused:?}");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::UpstreamUnavailable
+    );
     assert_eq!(
         world.broker.pending(id).expect("held").state,
         PendingState::Pending

@@ -112,6 +112,21 @@ impl Reading {
         reading
     }
 
+    /// Returns true when a notification of `method` is one the core reads something out of: a
+    /// turn that started or ended, a conversation that ended, or a request that was cleared.
+    #[must_use]
+    pub fn reads_notification(&self, method: &UpstreamMethod) -> bool {
+        [&self.turn_started, &self.turn_ended]
+            .into_iter()
+            .flatten()
+            .any(|places| &places.method == method)
+            || self.leaves.contains_key(method)
+            || self
+                .request_resolved
+                .as_ref()
+                .is_some_and(|(resolved, _)| resolved == method)
+    }
+
     /// Returns true when the table says the core reads anything out of the stream.
     #[must_use]
     pub fn reads_the_stream(&self) -> bool {

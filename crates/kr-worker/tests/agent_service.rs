@@ -1507,11 +1507,21 @@ async fn kr_req_11_33_a_rich_answer_a_native_answer_overtakes_before_its_marker_
         "the terminal's answer is the one that resolved it"
     );
 
-    // The same action identity again: its receipt is what answers, and nothing goes upstream.
+    // The same action identity again: its receipt is what answers, so it is the retained refusal
+    // and not an admission against the resolved resource, and nothing goes upstream.
     let outcome = send(&mut client, again).await;
-    assert!(
-        matches!(outcome, Outcome::Ok(_) | Outcome::Error(_)),
-        "{outcome:?}"
+    let Outcome::Ok(value) = outcome else {
+        panic!("the retained receipt answers a repeated identity: {outcome:?}");
+    };
+    let retained: kr_protocol::receipt::ReceiptResponse = value
+        .to_typed()
+        .expect("what answers a repeated identity is its receipt");
+    assert_eq!(retained.receipt.state, ReceiptState::Refused);
+    assert_eq!(retained.receipt.action_id, action_id);
+    assert_eq!(
+        retained.receipt.error.0.as_ref().map(|error| error.code),
+        Some(ErrorCode::QuestionResolved),
+        "with the refusal it recorded"
     );
     assert_eq!(
         upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
@@ -1522,6 +1532,76 @@ async fn kr_req_11_33_a_rich_answer_a_native_answer_overtakes_before_its_marker_
         receipt(&mut client, action_id).await.state,
         ReceiptState::Refused
     );
+}
+
+/// KR-REQ-12.06 and section 9: a rich answer stopped at its take by something that came after its
+/// admission (a suspension, a moved binding) sent nothing, so its receipt is `refused` and its
+/// error is the cause's own, not an outcome nobody can establish. The resource stays answerable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_06_a_rich_answer_stopped_at_its_take_is_refused_with_its_cause() {
+    for (cause, expected) in [
+        ("a suspension", ErrorCode::DraftConflict),
+        ("a moved binding", ErrorCode::StaleSession),
+    ] {
+        let host = host().await;
+        let upstream = Arc::new(CountingUpstream::default());
+        register(&host, None);
+        let resource_id = offer_approval(&host, Arc::clone(&upstream));
+        let mut client = cli(&host).await;
+        let mutation = approval_mutation(&client, &host, 21, resource_id);
+        let action_id = mutation.action_id;
+
+        let (arrived, release) = host.service.broker().pause_before_marker();
+        let sending = tokio::spawn(async move {
+            let outcome = send(&mut client, mutation).await;
+            (outcome, client)
+        });
+        tokio::time::timeout(LIVENESS_DEADLINE, arrived)
+            .await
+            .expect("the answer reached the pause before its marker")
+            .expect("the pause is armed");
+        if cause == "a suspension" {
+            host.service
+                .broker()
+                .suspend_rich_mutations(instance(), "a frame the table does not classify arrived")
+                .expect("the instance is held");
+        } else {
+            host.service
+                .broker()
+                .advance_binding(
+                    instance(),
+                    Some(kr_protocol::ids::AgentThreadId::new("thread-2").expect("a thread")),
+                    TimestampMs::new(5),
+                )
+                .expect("the binding moves");
+        }
+        release.send(()).expect("the answer is let go");
+
+        let (outcome, mut client) = sending.await.expect("the mutation is answered");
+        let Outcome::Error(error) = outcome else {
+            panic!("{cause}: an answer stopped at its take did not apply: {outcome:?}");
+        };
+        assert_eq!(error.code, expected, "{cause}");
+        assert_eq!(
+            upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{cause}: the rich answer wrote no frame"
+        );
+        assert_eq!(
+            receipt(&mut client, action_id).await.state,
+            ReceiptState::Refused,
+            "{cause}: a refusal established before any byte was queued"
+        );
+        assert_eq!(
+            host.service
+                .broker()
+                .pending(resource_id)
+                .expect("retained")
+                .state,
+            kr_protocol::gateway::PendingState::Pending,
+            "{cause}: the claim was given back"
+        );
+    }
 }
 
 /// Section 9 and KR-REQ-11.27: an approval whose dispatch marker the receipt journal refused

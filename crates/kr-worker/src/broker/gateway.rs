@@ -288,9 +288,10 @@ impl Gateway {
         &self,
         application_instance_id: ApplicationInstanceId,
     ) -> Option<&Connection> {
-        self.connections
-            .values()
-            .find(|held| held.application_instance_id == application_instance_id)
+        self.connections.values().find(|held| {
+            held.application_instance_id == application_instance_id
+                && held.origin.may_forward_natively()
+        })
     }
 
     /// Gives one open connection the reading of its connector's table.

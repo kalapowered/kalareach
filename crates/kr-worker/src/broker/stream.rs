@@ -20,9 +20,12 @@
 //! * no reply has named a conversation yet ([`THREAD_NOT_READ`](crate::broker::THREAD_NOT_READ),
 //!   set at launch).
 //!
-//! Only the reply to the selecting request admitted last is adopted. Replies can come in any
-//! order, and an older one never restores a conversation the terminal has left or clears the
-//! uncertainty of a later request.
+//! Replies can come in any order, so what a success reply names is not applied when it arrives. It
+//! is kept until no request that selects or leaves a conversation is in flight, and the replies
+//! are then applied in the order their requests were admitted: the last selection decides the
+//! conversation, a leave ends the conversation it names when that is the one bound by then, and an
+//! older reply never restores a conversation a later request has left. A request whose reply
+//! never came leaves the instance suspended until a later selection has named the conversation.
 //!
 //! A permit admitted before any of this happened is checked again when it is taken: see
 //! [`Broker::take_mutation`](crate::broker::Broker::take_mutation).
@@ -77,6 +80,17 @@ struct OpenRequest {
     kind: OpenKind,
 }
 
+/// What a success reply to a request that selects or leaves a conversation did to the terminal's.
+#[derive(Clone, Debug)]
+enum Effect {
+    /// The terminal is in this conversation. `clean` says that when the reply came, every request
+    /// of an unlisted method admitted before the request had been answered, so the reply is one a
+    /// suspension an unlisted frame caused may lift on.
+    Select { thread: AgentThreadId, clean: bool },
+    /// The terminal left this conversation, where the request named one.
+    Leave(Option<String>),
+}
+
 /// Why the instance stays suspended after a selection's outcome was lost or refused.
 #[derive(Clone, Debug)]
 struct Hold {
@@ -92,12 +106,18 @@ pub struct StreamState {
     /// The requests of the terminal's still open, by the identifier this host forwarded them
     /// under.
     open: BTreeMap<UpstreamRequestId, OpenRequest>,
-    /// The sequence number of the last reply adopted.
+    /// What the success replies received while another request was still in flight did, by the
+    /// sequence number of the request they answered.
+    proven: BTreeMap<u64, Effect>,
+    /// The sequence number of the last reply applied.
     adopted: u64,
     hold: Option<Hold>,
     /// The sequence number of the last frame of an unlisted method, which suspended rich mutations
     /// for a reason of its own.
     unlisted: Option<u64>,
+    /// Whether a request of an unlisted method was given up unanswered: the server may still be
+    /// carrying it out, and nothing will say when it has, so no selection lifts its suspension.
+    unlisted_lost: bool,
 }
 
 impl StreamState {
@@ -128,13 +148,25 @@ impl StreamState {
 
     /// Forgets a request of the terminal's that will not be answered, and says whether the server
     /// may have read it.
+    ///
+    /// One the server may have read leaves what it did unknown: a request that selects or leaves a
+    /// conversation holds the instance back until a later reply names the conversation, and one of
+    /// an unlisted method keeps its suspension until a new connection opens.
     pub(super) fn give_up(&mut self, id: &UpstreamRequestId, unknown: bool) {
         if let Some(open) = self.open.remove(id)
             && unknown
-            && matches!(open.kind, OpenKind::Selection(_) | OpenKind::Leave(_))
         {
-            self.hold_unknown(open.seq);
+            match open.kind {
+                OpenKind::Selection(_) | OpenKind::Leave(_) => self.hold_unknown(open.seq),
+                OpenKind::Unlisted => self.unlisted_lost = true,
+            }
         }
+    }
+
+    /// Forgets what an earlier connection left unsaid about requests of unlisted methods: the
+    /// server that was carrying them out went with that connection.
+    pub(super) fn new_connection(&mut self) {
+        self.unlisted_lost = false;
     }
 
     /// Holds the instance back, because what became of request `seq` is unknown, unless a later
@@ -224,13 +256,58 @@ impl BrokerState {
         }
     }
 
+    /// Applies the replies received so far, in the order their requests were admitted, once no
+    /// request that selects or leaves a conversation is still in flight.
+    ///
+    /// The last selection among them decides the conversation, so what an older one named is not
+    /// taken at all: nothing is bound that an obsolete request named, and no refusal is made for
+    /// it. A leave after it ends the conversation it names when that is the one bound by then.
+    fn apply_stream(&mut self, application_instance_id: ApplicationInstanceId, now: TimestampMs) {
+        let Some(instance) = self.instances.get_mut(&application_instance_id) else {
+            return;
+        };
+        let stream = &mut instance.stream;
+        let in_flight = stream
+            .open
+            .values()
+            .any(|open| matches!(open.kind, OpenKind::Selection(_) | OpenKind::Leave(_)));
+        if !in_flight {
+            // What a reply says about a request older than one whose outcome is unknown, or whose
+            // conversation could not be bound, is moot: that request decides what the terminal is
+            // in, and the next selection that is answered will say.
+            let floor = stream
+                .adopted
+                .max(stream.hold.as_ref().map_or(0, |hold| hold.seq));
+            let proven: Vec<(u64, Effect)> = std::mem::take(&mut stream.proven)
+                .into_iter()
+                .filter(|(seq, _)| *seq > floor)
+                .collect();
+            let from = proven
+                .iter()
+                .rposition(|(_, effect)| matches!(effect, Effect::Select { .. }))
+                .unwrap_or(0);
+            for (seq, effect) in proven.into_iter().skip(from) {
+                match effect {
+                    Effect::Select { thread, clean } => {
+                        self.adopt_thread(application_instance_id, seq, thread, clean, now);
+                    }
+                    Effect::Leave(left) => {
+                        self.adopt_leave(application_instance_id, seq, left, now)
+                    }
+                }
+            }
+        }
+        self.renew_gateway_evidence(application_instance_id, now);
+    }
+
     /// Takes the conversation a reply named as the instance's binding, or holds the instance back
     /// when it cannot be taken.
     fn adopt_thread(
         &mut self,
         application_instance_id: ApplicationInstanceId,
         seq: u64,
-        thread: Option<AgentThreadId>,
+        thread: AgentThreadId,
+        clean: bool,
         now: TimestampMs,
     ) {
         let current = self
@@ -238,8 +315,9 @@ impl BrokerState {
             .get(&application_instance_id)
             .and_then(|instance| instance.thread_id.clone());
         let mut refusal = None;
-        if current != thread
-            && let Err(error) = self.advance_binding(application_instance_id, thread.clone(), now)
+        if current.as_ref() != Some(&thread)
+            && let Err(error) =
+                self.advance_binding(application_instance_id, Some(thread.clone()), now)
         {
             // Another live execution owns the conversation the terminal selected. It is never
             // published as this instance's binding: the binding becomes none, and the instance
@@ -249,36 +327,61 @@ impl BrokerState {
                 "the conversation the terminal selected cannot be bound here: {error}"
             ));
         }
-        let selected = refusal.is_none() && thread.is_some();
+        let selected = refusal.is_none();
         let Some(instance) = self.instances.get_mut(&application_instance_id) else {
             return;
         };
         instance.stream.adopted = instance.stream.adopted.max(seq);
-        // Every selecting or leaving request older than the one adopted is superseded: its reply,
-        // when it comes, is ignored, and it holds nothing back meanwhile.
-        instance
-            .stream
-            .open
-            .retain(|_, other| matches!(other.kind, OpenKind::Unlisted) || other.seq > seq);
+        // An unlisted frame's suspension lifts when a conversation was named after it by a reply
+        // that came when no unlisted request before it was still unanswered or lost.
+        if selected
+            && clean
+            && let Some(unlisted) = instance.stream.unlisted
+            && unlisted < seq
+        {
+            instance.rich_suspension = None;
+            instance.stream.unlisted = None;
+        }
         instance.thread_unread = (!selected).then_some(THREAD_NOT_READ);
         instance.stream.hold = match refusal {
             Some(reason) => Some(Hold { seq, reason }),
             None => instance.stream.hold.take().filter(|hold| hold.seq > seq),
         };
-        // An unlisted frame's suspension lifts when a conversation was named after it and no
-        // unlisted request before that is still unanswered.
-        if let Some(unlisted) = instance.stream.unlisted
-            && unlisted < seq
-            && !instance
-                .stream
-                .open
-                .values()
-                .any(|open| matches!(open.kind, OpenKind::Unlisted) && open.seq < seq)
-        {
-            instance.rich_suspension = None;
-            instance.stream.unlisted = None;
+    }
+
+    /// Ends the bound conversation when the terminal left it, or says what is not known about a
+    /// leave that names none.
+    fn adopt_leave(
+        &mut self,
+        application_instance_id: ApplicationInstanceId,
+        seq: u64,
+        left: Option<String>,
+        now: TimestampMs,
+    ) {
+        let Some(instance) = self.instances.get(&application_instance_id) else {
+            return;
+        };
+        let bound = instance.thread_id.as_ref().map(ToString::to_string);
+        match left {
+            Some(left) if bound.as_deref() == Some(left.as_str()) => {
+                let _ = self.advance_binding(application_instance_id, None, now);
+                let Some(instance) = self.instances.get_mut(&application_instance_id) else {
+                    return;
+                };
+                // The conversation is left, and an unknown request before it is not made known by
+                // that: only a selection that is answered ends a hold.
+                instance.stream.adopted = instance.stream.adopted.max(seq);
+                instance.thread_unread = Some(THREAD_NOT_READ);
+            }
+            // A conversation other than the bound one was left: the binding stands.
+            Some(_) => {}
+            // A leave that names no conversation leaves which one the terminal is in unknown.
+            None => {
+                if let Some(instance) = self.instances.get_mut(&application_instance_id) {
+                    instance.stream.hold_unknown(seq);
+                }
+            }
         }
-        self.renew_gateway_evidence(application_instance_id, now);
     }
 
     /// Applies the reply to one request of the terminal's that was open.
@@ -290,51 +393,52 @@ impl BrokerState {
         body: &serde_json::Value,
         now: TimestampMs,
     ) {
-        let Some(instance) = self.instances.get(&application_instance_id) else {
+        let Some(instance) = self.instances.get_mut(&application_instance_id) else {
             return;
         };
-        // Only the reply to the newest request that has not ended in a proven refusal is adopted.
-        // An older one is superseded: it changes nothing, so it never restores a conversation the
-        // terminal has left, and it never clears the uncertainty of a later request.
-        let stream = &instance.stream;
-        let newer_open = stream
-            .open
-            .values()
-            .any(|other| other.seq > open.seq && !matches!(other.kind, OpenKind::Unlisted));
-        let newer_held = stream.hold.as_ref().is_some_and(|hold| hold.seq > open.seq);
-        if open.seq <= stream.adopted || newer_open || newer_held {
-            return;
-        }
-        // An error reply is a refusal the server proved: the terminal changes its conversation only
-        // on a success reply that names it, so nothing changed.
-        if !succeeded {
-            return;
-        }
-        match &open.kind {
-            OpenKind::Selection(path) => {
-                match named(body, path).and_then(|thread| AgentThreadId::new(thread).ok()) {
-                    Some(thread) => {
-                        self.adopt_thread(application_instance_id, open.seq, Some(thread), now)
-                    }
-                    None => {
-                        if let Some(instance) = self.instances.get_mut(&application_instance_id) {
-                            instance.stream.hold_unknown(open.seq);
+        let stream = &mut instance.stream;
+        // A reply older than one already applied changes nothing: it never restores a conversation
+        // the terminal has left. An error reply is a refusal the server proved, and the terminal
+        // changes its conversation only on a success reply that names it, so nothing changed.
+        if succeeded && open.seq > stream.adopted {
+            match &open.kind {
+                OpenKind::Selection(path) => {
+                    match named(body, path).and_then(|thread| AgentThreadId::new(thread).ok()) {
+                        Some(thread) => {
+                            let clean = !stream.unlisted_lost
+                                && !stream.open.values().any(|other| {
+                                    matches!(other.kind, OpenKind::Unlisted) && other.seq < open.seq
+                                });
+                            stream
+                                .proven
+                                .insert(open.seq, Effect::Select { thread, clean });
                         }
+                        None => stream.hold_unknown(open.seq),
                     }
                 }
-            }
-            OpenKind::Leave(left) => {
-                let bound = instance.thread_id.as_ref().map(ToString::to_string);
-                if left.is_some() && *left == bound {
-                    self.adopt_thread(application_instance_id, open.seq, None, now);
-                } else if let Some(instance) = self.instances.get_mut(&application_instance_id) {
-                    // A conversation other than the bound one was left: the binding stands, and
-                    // the request no longer holds anything back.
-                    instance.stream.adopted = instance.stream.adopted.max(open.seq);
+                OpenKind::Leave(left) => {
+                    stream.proven.insert(open.seq, Effect::Leave(left.clone()));
                 }
+                OpenKind::Unlisted => {}
             }
-            OpenKind::Unlisted => {}
         }
+        self.apply_stream(application_instance_id, now);
+    }
+
+    /// Forgets a request of the terminal's that will not be answered, and applies what that lets
+    /// go of.
+    pub(super) fn stream_given_up(
+        &mut self,
+        application_instance_id: ApplicationInstanceId,
+        id: &UpstreamRequestId,
+        unknown: bool,
+        now: TimestampMs,
+    ) {
+        let Some(instance) = self.instances.get_mut(&application_instance_id) else {
+            return;
+        };
+        instance.stream.give_up(id, unknown);
+        self.apply_stream(application_instance_id, now);
     }
 
     /// Records what the capability map says about a gateway-served instance: what the connection's
@@ -472,6 +576,15 @@ impl BrokerState {
         }
     }
 
+    /// Records again what every gateway connection's evidence says, after a change of which
+    /// bindings there are, what each may do, or whether its rich capabilities are disabled.
+    pub(super) fn renew_every_gateway_evidence(&mut self, now: TimestampMs) {
+        let instances: Vec<ApplicationInstanceId> = self.instances.keys().copied().collect();
+        for application_instance_id in instances {
+            self.renew_gateway_evidence(application_instance_id, now);
+        }
+    }
+
     /// Withdraws what a gateway connection's evidence said, because the connection ended.
     pub(super) fn withdraw_gateway_evidence(
         &mut self,
@@ -555,10 +668,12 @@ impl Broker {
         let Some(application_instance_id) = state.gateway.instance_of(connection) else {
             return;
         };
-        let Some(instance) = state.instances.get_mut(&application_instance_id) else {
-            return;
-        };
-        instance.stream.give_up(upstream_request_id, unknown);
+        state.stream_given_up(
+            application_instance_id,
+            upstream_request_id,
+            unknown,
+            kr_ipc::now_ms(),
+        );
     }
 
     /// Reads what one frame the server sent says about the terminal's conversation and turn, after
@@ -583,7 +698,8 @@ impl Broker {
         else {
             return;
         };
-        if !reading.reads_the_stream() {
+        // Most of what a server says is not about the conversation, and is not parsed here.
+        if !reading.reads_notification(method) {
             return;
         }
         let Some(application_instance_id) = state.gateway.instance_of(connection) else {

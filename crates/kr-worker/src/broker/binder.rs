@@ -501,6 +501,7 @@ impl BrokerState {
         self.component_states.remove(&binding_id);
         self.component_changes.notify_one();
         self.settle_owed_rows(now);
+        self.renew_every_gateway_evidence(now);
         Ok(refused)
     }
 
@@ -600,7 +601,9 @@ impl BrokerState {
         self.apply_release_states(now);
         self.close_ended(now);
         self.bind_the_unbound(now);
-        // A revocation, a disabling or an ending changes which components are wanted.
+        // A revocation, a disabling or an ending changes which components are wanted, and what a
+        // gateway connection's capability map says of approvals follows them.
+        self.renew_every_gateway_evidence(now);
         self.component_changes.notify_one();
     }
 
@@ -802,6 +805,7 @@ impl BrokerState {
             }
         }
         self.settle_owed_rows(now);
+        self.renew_every_gateway_evidence(now);
     }
 
     /// Forgets every binding of one instance, and lets go of the tables pinned for it: both go

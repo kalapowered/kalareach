@@ -1412,7 +1412,7 @@ impl Broker {
         // What the admission was made against is read again now, with the permit taken: a
         // selection, a leave, an unlisted frame or a fence that came after the admission stops
         // this answer here, before any marker, and gives the claim back.
-        if let Err(error) = self.recheck_permit(admitted) {
+        if let Err(error) = self.recheck_permit(admitted, &permit.dispatch, &permit.request) {
             crate::broker::settled(self.release_claim(&claim, now));
             return Err(BrokerError::NotTransmitted(Box::new(error)));
         }
@@ -1640,7 +1640,7 @@ impl Broker {
             .token
             .clone()
             .ok_or_else(|| BrokerError::invalid("this admission carries no action token"))?;
-        if let Err(error) = self.recheck_permit(admitted) {
+        if let Err(error) = self.recheck_permit(admitted, &permit.dispatch, &permit.request) {
             // Nothing will carry the action, so the token it spent goes with it.
             self.state().tokens.retire(&token.token_id);
             return Err(BrokerError::NotTransmitted(Box::new(error)));
@@ -2088,23 +2088,35 @@ impl Broker {
         Ok(taken.submitted(dispatch.submit(&request)?))
     }
 
-    /// Checks again, under the broker's lock, what a permit was admitted against, as the permit
-    /// is taken.
+    /// Checks again, as the permit is taken, what a permit was admitted against: under the
+    /// broker's lock, and then with the transport the admission chose.
     ///
-    /// The admission checked the instance's binding, its suspension and the fence at one moment,
-    /// and the bytes follow later. A conversation the terminal selected or left meanwhile, a frame
-    /// of a method the table does not classify and a journal fault each change one of those, and
-    /// each stops a permit admitted before it. What nothing can order is the interval between the
-    /// permit's taking and its bytes reaching the transport's queue: every frame the host writes
-    /// names its thread, so one past this point reaches the thread the binding named at the
-    /// admission, never another.
+    /// The admission checked the instance's binding, its suspension, the fence and the transport at
+    /// one moment, and the bytes follow later. A conversation the terminal selected or left
+    /// meanwhile, a frame of a method the table does not classify and a journal fault each change
+    /// one of the first three, a connection that ended changes the last, and each stops a permit
+    /// admitted before it, so what refuses it here has sent nothing. What nothing can order is the
+    /// interval between the permit's taking and its bytes reaching the transport's queue: every
+    /// frame the host writes names its thread, so one past this point reaches the thread the
+    /// binding named at the admission, never another.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::PreconditionFailed`] while rich work is fenced or suspended,
-    /// [`BrokerError::StaleBinding`] when the binding moved, and [`BrokerError::UnknownSubject`]
-    /// for an instance this broker no longer holds.
-    fn recheck_permit(&self, admitted: &MutationAdmission) -> Result<()> {
+    /// [`BrokerError::StaleBinding`] when the binding moved, [`BrokerError::UnknownSubject`] for an
+    /// instance this broker no longer holds, and whatever the transport refuses.
+    fn recheck_permit(
+        &self,
+        admitted: &MutationAdmission,
+        dispatch: &std::sync::Arc<dyn UpstreamDispatch>,
+        request: &UpstreamRequest,
+    ) -> Result<()> {
+        self.recheck_broker(admitted)?;
+        // The transport is asked outside the broker's lock: it takes locks of its own.
+        dispatch.admit(request)
+    }
+
+    fn recheck_broker(&self, admitted: &MutationAdmission) -> Result<()> {
         let state = self.state();
         state.volatile.require_rich_work()?;
         let application_instance_id = admitted.application_instance_id();
@@ -2147,7 +2159,7 @@ impl Broker {
             ));
         }
         let permit = admitted.take()?;
-        self.recheck_permit(admitted)
+        self.recheck_permit(admitted, &permit.dispatch, &permit.request)
             .map_err(|refusal| BrokerError::NotTransmitted(Box::new(refusal)))?;
         Ok(TakenMutation {
             turn_id: permit.request.turn_id.clone(),
