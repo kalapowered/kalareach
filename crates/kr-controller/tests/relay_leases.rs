@@ -1375,11 +1375,35 @@ async fn a_host_whose_leased_relay_stops_uses_its_configured_relays_and_goes_bac
 /// KR-REQ-17.34: a relay the leases are installed on that has never answered this host does not
 /// cost it the relay it was configured with. The configured relays are set aside only once the
 /// leased relay has been seen to answer, so the host stays at them, tells the owner why, and goes to
-/// the leased relay when it comes up.
+/// the leased relay when it comes up. The port stays the relay's while it is stopped: a connection
+/// to it is turned away, and a program that wants it for itself is not given it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_leased_relay_that_never_answered_does_not_cost_the_host_its_configured_relay() {
     let mut relays = Relays::spawn().await;
     relays.leased.stop().await;
+    let port = relays.leased.url.port().expect("the relay has a port");
+    let dialled = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .expect("a stopped relay turns a connection away at once");
+    assert!(
+        dialled
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused),
+        "a connection to the stopped relay was not turned away: {:?}",
+        dialled.map(|_| ())
+    );
+    let wanted = tokio::net::TcpSocket::new_v4()
+        .expect("a socket")
+        .bind(([127, 0, 0, 1], port).into());
+    assert!(
+        wanted
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::AddrInUse),
+        "a program was given the port of the stopped relay: {wanted:?}"
+    );
     let rig = relays.rig().await;
     let owner = rig.owner_device();
     rig.until("the owner's device holds a lease", || rig.holds(&owner))
