@@ -783,8 +783,9 @@ impl Controller {
                 // A worker that cannot be reached is not necessarily gone, and one that is on its
                 // way out has not necessarily had its closure recorded: a command that ends at
                 // once takes its worker with it first. As a read of the session does, this asks
-                // for the closure of a worker that has ended, and answers from it; where none is
-                // established the failure stands, with its cause.
+                // for the closure of a worker that has ended, and answers from it. Where none is
+                // established the connection's failure stands, with its cause; a failure of the
+                // registry, or of the closure's own write, is returned in its place.
                 Err(error) => {
                     if self
                         .closure_after_a_worker_could_not_be_reached(reservation.session_id, &error)

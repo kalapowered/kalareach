@@ -1050,6 +1050,8 @@ impl Controller {
             #[cfg(test)]
             before_a_created_session_is_read: ReadPause::default(),
             #[cfg(test)]
+            after_a_worker_is_looked_for_in_vain: ReadPause::default(),
+            #[cfg(test)]
             before_a_worker_is_made_known: ReadPause::default(),
             #[cfg(test)]
             after_the_local_access_is_drawn: ReadPause::default(),

@@ -589,6 +589,11 @@ pub struct Controller {
     /// Compiled away in every shipped build.
     #[cfg(test)]
     before_a_created_session_is_read: ReadPause,
+    /// Where this host's own tests stop a create that is waiting for the end of the worker it could
+    /// not reach, after a look that found no closure and before the next, so that the worker's
+    /// process can end in between. Compiled away in every shipped build.
+    #[cfg(test)]
+    after_a_worker_is_looked_for_in_vain: ReadPause,
     /// Where this host's own tests stop the task that makes a worker known, before it writes the
     /// worker's descriptor, so that a second look at the same reservation can try to begin while
     /// the publication is in flight. Compiled away in every shipped build.

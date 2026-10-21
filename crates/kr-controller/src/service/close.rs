@@ -30,24 +30,22 @@ pub const CLOSURE_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// How soon the end of a worker whose connection is gone is looked for again.
 const WORKER_ENDING_LOOK: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// Whether `error` is the failure of a connection to a worker that is no longer there to be made, or
-/// to go on: its endpoint is gone, or refuses, or the connection ended under the exchange. It is
-/// what a worker leaves a caller that meets it as it ends.
+/// Whether `error` is what a caller meets when it reaches a worker as that worker ends: the
+/// endpoint is gone or refuses, or the connection ended under the exchange, closed, cut short or
+/// reset. A worker that has finished its closure stops accepting, and its process ends a moment
+/// later.
 fn a_worker_is_on_its_way_out(error: &ControllerError) -> bool {
+    use kr_ipc::IpcError;
     use std::io::ErrorKind;
 
-    matches!(
-        error,
-        ControllerError::Ipc(kr_ipc::IpcError::Socket { source, .. })
-            if matches!(
-                source.kind(),
-                ErrorKind::NotFound
-                    | ErrorKind::ConnectionRefused
-                    | ErrorKind::ConnectionReset
-                    | ErrorKind::BrokenPipe
-                    | ErrorKind::UnexpectedEof
-            )
-    )
+    match error {
+        ControllerError::Ipc(IpcError::PeerClosed | IpcError::TruncatedFrame { .. }) => true,
+        ControllerError::Ipc(IpcError::Socket { source, .. }) => matches!(
+            source.kind(),
+            ErrorKind::NotFound | ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
+        ),
+        _ => false,
+    }
 }
 
 /// How long a close waits for the worker that owns the session.
@@ -458,36 +456,36 @@ impl Controller {
 
     /// The closure of a session whose worker could not be reached, for a caller that is owed the
     /// session's state: the closure recorded, or the closure of a worker the kernel says has ended
-    /// ([`Self::reconcile`]). `None` where neither is established.
+    /// ([`Self::workflow_session_closure`]). `None` where neither is established.
     ///
     /// A worker that has finished its closure stops accepting connections, and takes its endpoint
     /// away, before the kernel says its process has ended, and a command that ends at once takes
     /// its worker with it before this daemon has asked anything of it. A caller that met such a
-    /// worker (`error` is the failure of its connection ending, or never being made) is owed the
-    /// closure a moment later, not the failure. So for that failure the worker's end is waited for:
-    /// the two conditions are asked again as they come about, until
-    /// [`super::workers::WORKER_EXCHANGE`] has passed, which ends a worker that is neither
-    /// answering nor ending. Any other failure is asked once, as a read asks.
+    /// worker (`error` is the failure of a connection that never was made or ended under the
+    /// exchange) is owed the closure a moment later, not the failure. So for that failure the
+    /// worker's end is looked for every [`WORKER_ENDING_LOOK`] until
+    /// [`super::workers::WORKER_EXCHANGE`] has passed, which ends the wait for a worker that is
+    /// neither answering nor ending, not the worker. Any other failure is looked at once, as a
+    /// read looks.
     ///
     /// # Errors
     ///
     /// Returns an error when the registry cannot be read or written.
     pub(super) async fn closure_after_a_worker_could_not_be_reached(
-        &self,
+        self: &Arc<Self>,
         session_id: SessionId,
         error: &ControllerError,
     ) -> Result<Option<ClosureRecord>> {
         let deadline = tokio::time::Instant::now() + super::workers::WORKER_EXCHANGE;
         loop {
-            if let Some(closure) = self.reconcile(session_id).await? {
-                return Ok(Some(closure));
-            }
-            if let Some(closure) = self.registry.lock().await.closure(session_id)? {
+            if let Some(closure) = self.workflow_session_closure(session_id).await? {
                 return Ok(Some(closure));
             }
             if !a_worker_is_on_its_way_out(error) || tokio::time::Instant::now() >= deadline {
                 return Ok(None);
             }
+            #[cfg(test)]
+            self.after_a_worker_is_looked_for_in_vain.wait().await;
             tokio::time::sleep(WORKER_ENDING_LOOK).await;
         }
     }
