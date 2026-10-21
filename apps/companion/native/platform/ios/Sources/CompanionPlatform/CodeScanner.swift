@@ -178,13 +178,19 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
       x: (view.bounds.width - side) / 2, y: (view.bounds.height - side) / 2, width: side, height: side)
     outline.path = UIBezierPath(roundedRect: square, cornerRadius: 24).cgPath
     let margin = view.safeAreaInsets
-    hint.frame = CGRect(
-      x: 24, y: square.minY - 24 - 60, width: view.bounds.width - 48, height: 60)
-    hint.sizeToFit()
-    hint.frame = CGRect(
-      x: 24, y: square.minY - 24 - hint.bounds.height, width: view.bounds.width - 48, height: hint.bounds.height)
-    cancel.frame = CGRect(x: 16, y: margin.top + 8, width: 88, height: 44)
+    // The controls follow the text size: the label is as wide and tall as its words need at the
+    // size the person chose, and never smaller than a finger.
+    let room = CGSize(width: view.bounds.width / 2, height: .greatestFiniteMagnitude)
+    let words = cancel.sizeThatFits(room)
+    cancel.frame = CGRect(
+      x: 16, y: margin.top + 8, width: max(88, words.width + 24), height: max(44, words.height + 16))
     torch.frame = CGRect(x: view.bounds.width - 16 - 44, y: margin.top + 8, width: 44, height: 44)
+    // The hint sits above the square and below the controls, and keeps clear of them when the text
+    // is large: it runs over the preview rather than under Cancel.
+    let wide = view.bounds.width - 48
+    let height = hint.sizeThatFits(CGSize(width: wide, height: .greatestFiniteMagnitude)).height
+    let lowest = max(cancel.frame.maxY, torch.frame.maxY) + 8
+    hint.frame = CGRect(x: 24, y: max(lowest, square.minY - 24 - height), width: wide, height: height)
   }
 
   private func configureCamera() {
@@ -269,19 +275,21 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
 
 /// The system's picker for one picture. It hands this application only the picture the person
 /// chose, and needs no permission to the photo library.
+///
+/// It answers once. A pick the person has not finished, or a picture still being read, ends with a
+/// cancel when a newer request or the application's going to the background comes first, and what
+/// the picture shows after that is dropped: nothing is held for a person who has gone.
 final class PhotoReader: NSObject, PHPickerViewControllerDelegate {
   private var done: ((ScanOutcome) -> Void)?
   private weak var picker: PHPickerViewController?
+  private var background: NSObjectProtocol?
 
-  /// Ends the pick with a cancel, closing the picker.
+  /// Ends the pick with a cancel, closing the picker. It does nothing once the pick is answered.
   func cancel() {
-    let answer = done
+    guard let answer = done else { return }
     done = nil
-    guard let picker = picker else {
-      answer?(.cancelled)
-      return
-    }
-    picker.dismiss(animated: true) { answer?(.cancelled) }
+    stopWatching()
+    close(picker) { answer(.cancelled) }
   }
 
   /// Shows the picker on `presenter` and answers `done` once, with the code in the chosen picture.
@@ -293,20 +301,44 @@ final class PhotoReader: NSObject, PHPickerViewControllerDelegate {
     picker.delegate = self
     self.done = done
     self.picker = picker
+    background = NotificationCenter.default.addObserver(
+      forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+    ) { [weak self] _ in self?.cancel() }
     presenter.present(picker, animated: true)
   }
 
   func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
-    let answer = done
-    done = nil
     guard let provider = results.first?.itemProvider else {
-      picker.dismiss(animated: true) { answer?(.cancelled) }
+      finish(.cancelled)
       return
     }
     // The picture is read in memory, and never written anywhere.
     provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
       let outcome: ScanOutcome = data.flatMap { QrReader.text(in: $0) }.map { .text($0) } ?? .noCode
-      DispatchQueue.main.async { picker.dismiss(animated: true) { answer?(outcome) } }
+      DispatchQueue.main.async { self.finish(outcome) }
     }
+  }
+
+  /// Answers once, after the picker has gone from the screen: with `outcome`, unless a cancel
+  /// answered first.
+  private func finish(_ outcome: ScanOutcome) {
+    guard let answer = done else { return }
+    done = nil
+    stopWatching()
+    close(picker) { answer(outcome) }
+  }
+
+  private func stopWatching() {
+    if let observer = background { NotificationCenter.default.removeObserver(observer) }
+    background = nil
+  }
+
+  /// Takes the picker off the screen, when it is on it, and then runs `afterwards`.
+  private func close(_ picker: PHPickerViewController?, afterwards: @escaping () -> Void) {
+    guard let picker = picker, picker.presentingViewController != nil else {
+      afterwards()
+      return
+    }
+    picker.dismiss(animated: true, completion: afterwards)
   }
 }

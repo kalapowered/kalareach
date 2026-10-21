@@ -238,7 +238,11 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
   /// request or the scanner's own end gives.
   private final class OpenScan {
     private var invoke: Invoke?
-    /// Closes the scanner or the picker the request opened, answering it with a cancel.
+    /// What runs once the request has its answer, which is after its scanner or picker has gone from
+    /// the screen: the plugin forgets the request, and a newer request that waited goes on.
+    private var afterwards: [() -> Void] = []
+    /// Closes the scanner or the picker the request opened, answering it with a cancel once it has
+    /// gone from the screen.
     var close: (() -> Void)?
 
     init(_ invoke: Invoke) { self.invoke = invoke }
@@ -247,6 +251,20 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
       guard let waiting = invoke else { return }
       invoke = nil
       waiting.resolve(ScanAnswer(outcome))
+      let next = afterwards
+      afterwards = []
+      for step in next { step() }
+    }
+
+    /// Ends the request with a cancel, and runs `then` once it is answered.
+    func end(then: @escaping () -> Void) {
+      afterwards.append(then)
+      if let close = close { close() } else { answer(.cancelled) }
+    }
+
+    /// Runs `then` once the request is answered, at once when it already is.
+    func whenAnswered(_ then: @escaping () -> Void) {
+      if invoke == nil { then() } else { afterwards.append(then) }
     }
   }
 
@@ -298,18 +316,24 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
 
   private func beginScan(_ invoke: Invoke, _ open: @escaping (UIViewController, OpenScan) -> Void) {
     DispatchQueue.main.async {
-      // One at a time: a newer request ends the older one's wait with a cancel.
+      let begin = {
+        guard let presenter = self.topViewController() else {
+          invoke.reject("there is no screen to show the scanner on")
+          return
+        }
+        let scan = OpenScan(invoke)
+        self.scanning = scan
+        scan.whenAnswered { if self.scanning === scan { self.scanning = nil } }
+        open(presenter, scan)
+      }
+      // One at a time: a newer request ends the older one with a cancel, and shows its own only
+      // once the older one's scanner or picker is off the screen, so it never finds the one that is
+      // still leaving as the top of the stack.
       if let earlier = self.scanning {
-        earlier.close?()
-        earlier.answer(.cancelled)
+        earlier.end(then: begin)
+      } else {
+        begin()
       }
-      guard let presenter = self.topViewController() else {
-        invoke.reject("there is no screen to show the scanner on")
-        return
-      }
-      let scan = OpenScan(invoke)
-      self.scanning = scan
-      open(presenter, scan)
     }
   }
 
