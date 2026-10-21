@@ -758,11 +758,16 @@ test.describe('a message in passing over the card an invitation opens', () => {
   // (it is drawn anew there) and does not give it a new time. The page's clock is held, and moved on
   // by the case, so no time is waited.
   test('goes at the time it had when a card opens over it', async ({ page }) => {
-    await page.clock.install({ time: new Date(CLOCKS[0].at) })
+    // The clock stands at the moment the case counts from before the page exists, so it is there
+    // whatever the page takes to load: a clock that ran from the case's first line would be past
+    // that moment by the time the page was up, and a clock cannot be stopped at a moment behind it.
+    // It is installed a minute earlier only so that stopping it at that moment is a step forward.
+    const from = Date.parse(CLOCKS[0].at) + 1_000
+    await page.clock.install({ time: new Date(from - 60_000) })
+    await page.clock.pauseAt(new Date(from))
     await withSystemTextScale(page, 1)
     await page.setViewportSize({ width: 320, height: 720 })
     await open(page, 'ios', 'attention', offers)
-    await page.clock.pauseAt(new Date(Date.parse(CLOCKS[0].at) + 1_000))
     await page.getByRole('button', { name: /shared session 3 with you/ }).click()
     await page.clock.runFor(1_000)
     await page.getByTestId('accept-offer').click()
