@@ -27,6 +27,29 @@ use super::{Controller, encode, parse};
 /// How long a closing worker is watched before the controller stops waiting for it to end.
 pub const CLOSURE_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How soon the end of a worker whose connection is gone is looked for again.
+const WORKER_ENDING_LOOK: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Whether `error` is the failure of a connection to a worker that is no longer there to be made, or
+/// to go on: its endpoint is gone, or refuses, or the connection ended under the exchange. It is
+/// what a worker leaves a caller that meets it as it ends.
+fn a_worker_is_on_its_way_out(error: &ControllerError) -> bool {
+    use std::io::ErrorKind;
+
+    matches!(
+        error,
+        ControllerError::Ipc(kr_ipc::IpcError::Socket { source, .. })
+            if matches!(
+                source.kind(),
+                ErrorKind::NotFound
+                    | ErrorKind::ConnectionRefused
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+            )
+    )
+}
+
 /// How long a close waits for the worker that owns the session.
 ///
 /// Section 7's own timing for a closure: five seconds for the processes to stop and two more to
@@ -430,6 +453,42 @@ impl Controller {
                 )),
             },
             None => self.reconcile_session(session_id).await,
+        }
+    }
+
+    /// The closure of a session whose worker could not be reached, for a caller that is owed the
+    /// session's state: the closure recorded, or the closure of a worker the kernel says has ended
+    /// ([`Self::reconcile`]). `None` where neither is established.
+    ///
+    /// A worker that has finished its closure stops accepting connections, and takes its endpoint
+    /// away, before the kernel says its process has ended, and a command that ends at once takes
+    /// its worker with it before this daemon has asked anything of it. A caller that met such a
+    /// worker (`error` is the failure of its connection ending, or never being made) is owed the
+    /// closure a moment later, not the failure. So for that failure the worker's end is waited for:
+    /// the two conditions are asked again as they come about, until
+    /// [`super::workers::WORKER_EXCHANGE`] has passed, which ends a worker that is neither
+    /// answering nor ending. Any other failure is asked once, as a read asks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read or written.
+    pub(super) async fn closure_after_a_worker_could_not_be_reached(
+        &self,
+        session_id: SessionId,
+        error: &ControllerError,
+    ) -> Result<Option<ClosureRecord>> {
+        let deadline = tokio::time::Instant::now() + super::workers::WORKER_EXCHANGE;
+        loop {
+            if let Some(closure) = self.reconcile(session_id).await? {
+                return Ok(Some(closure));
+            }
+            if let Some(closure) = self.registry.lock().await.closure(session_id)? {
+                return Ok(Some(closure));
+            }
+            if !a_worker_is_on_its_way_out(error) || tokio::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(WORKER_ENDING_LOOK).await;
         }
     }
 

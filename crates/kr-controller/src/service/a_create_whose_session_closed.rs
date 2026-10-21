@@ -3,14 +3,18 @@
 //! The create answers with the session as its worker describes it. A closure that is recorded
 //! between the worker's report and that description takes the worker out of what the daemon holds,
 //! and the session is then closed rather than unknown: the closure is the answer, as it is to the
-//! same create asked again afterwards.
+//! same create asked again afterwards. So is the closure of a worker that has ended before the
+//! daemon has recorded one, as the worker of a command that ends at once does.
 
+use kr_protocol::identity::{DesktopBinding, ProcessStartIdentity, WorkerProfile};
+use kr_protocol::ids::AuthorityRevision;
 use kr_protocol::session::{SessionCreateResult, SessionState};
 
 use super::a_create_that_launches_nothing::create_params;
 use super::a_link_that_is_not_given_back::Served;
 use super::a_read_that_meets_a_worker_on_its_way_out::closure_of;
-use crate::registry::Reservation;
+use crate::error::ControllerError;
+use crate::registry::{Reservation, WorkerRecord};
 
 /// A daemon, a real worker that has reported itself, and the create it reported for.
 async fn reported() -> (Served, Reservation) {
@@ -34,6 +38,18 @@ async fn reported() -> (Served, Reservation) {
 
 /// What a create is answered with, for the worker `world` serves.
 async fn answered(world: &Served, reservation: &Reservation) -> SessionCreateResult {
+    answer(world, reservation)
+        .await
+        .expect("the create is answered")
+        .to_typed()
+        .expect("a create result")
+}
+
+/// The create's answer or its failure, for the worker `world` serves.
+async fn answer(
+    world: &Served,
+    reservation: &Reservation,
+) -> crate::error::Result<kr_protocol::envelope::ParamsValue> {
     world
         .controller
         .answer_a_created_session(
@@ -42,9 +58,44 @@ async fn answered(world: &Served, reservation: &Reservation) -> SessionCreateRes
             world.worker.endpoint.as_text(),
         )
         .await
-        .expect("the create is answered")
-        .to_typed()
-        .expect("a create result")
+}
+
+/// Leaves the worker of `world` gone as the worker of a command that ended at once is: its
+/// endpoint is taken away, and the registry names `process` as the worker's process.
+async fn gone(world: &Served, reservation: &Reservation, process: ProcessStartIdentity) {
+    world
+        .controller
+        .registry
+        .lock()
+        .await
+        .adopt_worker(
+            &WorkerRecord {
+                session_id: world.session_id,
+                display_number: reservation.display_number,
+                public_key: world.worker.descriptor.worker_public_key,
+                process_identity: process,
+                endpoint: world.worker.endpoint.as_text(),
+                profile: WorkerProfile::HeadlessUser,
+                state: SessionState::Live,
+                acknowledged_revision: AuthorityRevision::new(0),
+            },
+            Some(&DesktopBinding::none()),
+        )
+        .expect("the registry records the worker");
+    std::fs::remove_file(world.worker.endpoint.as_path()).expect("the endpoint is taken away");
+}
+
+/// The identity of a process that has ended: one started, described while it ran, and ended.
+fn the_identity_of_an_ended_process() -> ProcessStartIdentity {
+    let mut child = std::process::Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .expect("a process starts");
+    let identity = kr_ipc::identity::process_start_identity(child.id())
+        .expect("a running process is described");
+    child.kill().expect("the process is ended");
+    child.wait().expect("the process is collected");
+    identity
 }
 
 fn assert_closed(answer: &SessionCreateResult, world: &Served) {
@@ -100,4 +151,60 @@ async fn a_create_whose_session_closed_after_its_worker_reported_is_answered_fro
 
     // The closure is complete when the create looks for its worker: nothing is in the directory.
     assert_closed(&answered(&world, &reservation).await, &world);
+}
+
+/// KR-REQ-09.12: a create whose worker ended before the create could describe the session, with no
+/// closure recorded yet, is answered from the closure the daemon establishes for a worker the
+/// kernel says has ended: the session closed, with no endpoint to attach to. A command that ends at
+/// once takes its worker with it, and the create meets the worker's endpoint gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_whose_worker_ended_before_it_was_described_is_answered_from_a_closure_for_it() {
+    let (world, reservation) = reported().await;
+    assert!(
+        world
+            .controller
+            .registry
+            .lock()
+            .await
+            .closure(world.session_id)
+            .expect("the registry answers")
+            .is_none(),
+        "no closure is recorded"
+    );
+    gone(&world, &reservation, the_identity_of_an_ended_process()).await;
+
+    assert_closed(&answered(&world, &reservation).await, &world);
+}
+
+/// KR-REQ-09.12: where no closure is established for a worker that cannot be reached, the create
+/// fails as it did, with the failure of the connection. The worker here has no endpoint any more
+/// and the kernel says its process is running, so nothing says its session ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_whose_worker_cannot_be_reached_and_has_not_ended_fails_with_the_connection() {
+    let (world, reservation) = reported().await;
+    gone(
+        &world,
+        &reservation,
+        kr_ipc::identity::current_process_start_identity().expect("this process is described"),
+    )
+    .await;
+
+    let refused = answer(&world, &reservation)
+        .await
+        .expect_err("a worker that has not ended and cannot be reached leaves no answer");
+    assert!(
+        matches!(refused, ControllerError::Ipc(_)),
+        "the failure names the connection: {refused:?}"
+    );
+    assert!(
+        world
+            .controller
+            .registry
+            .lock()
+            .await
+            .closure(world.session_id)
+            .expect("the registry answers")
+            .is_none(),
+        "no closure was invented"
+    );
 }

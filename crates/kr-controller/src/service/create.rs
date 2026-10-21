@@ -752,11 +752,15 @@ impl Controller {
     ///
     /// The worker is read from the directory, and its session can close before it is described. The
     /// closure is the answer then, as it is to a create that is asked again afterwards: the session
-    /// as it closed, with no endpoint, and with no window to report on.
+    /// as it closed, with no endpoint, and with no window to report on. A worker that has ended
+    /// without its closure being recorded yet, as one does whose command ends at once, is
+    /// reconciled for it. A create through the protocol and a create for a workflow's node both
+    /// answer here.
     ///
     /// # Errors
     ///
-    /// Returns an error when the worker cannot be described and no closure is recorded.
+    /// Returns an error when the worker cannot be described and no closure is recorded, nor
+    /// established for a worker that has ended.
     pub(super) async fn answer_a_created_session(
         self: &Arc<Self>,
         create: &SessionCreateParams,
@@ -776,7 +780,21 @@ impl Controller {
                 Ok(read) => Some(read.session),
                 // The worker left the directory between the two: its session closed.
                 Err(ControllerError::UnknownSession { .. }) => None,
-                Err(error) => return Err(error),
+                // A worker that cannot be reached is not necessarily gone, and one that is on its
+                // way out has not necessarily had its closure recorded: a command that ends at
+                // once takes its worker with it first. As a read of the session does, this asks
+                // for the closure of a worker that has ended, and answers from it; where none is
+                // established the failure stands, with its cause.
+                Err(error) => {
+                    if self
+                        .closure_after_a_worker_could_not_be_reached(reservation.session_id, &error)
+                        .await?
+                        .is_none()
+                    {
+                        return Err(error);
+                    }
+                    None
+                }
             },
             None => None,
         };
