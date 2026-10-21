@@ -16,8 +16,11 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use crate::contract::{Contract, Frame, RELEASE, Side};
 use crate::variants::{SPEAK_VARIABLE, Variants, padded};
 
-/// The identifier of the one approval the server asks for.
+/// The identifier of the approval the server asks for.
 const APPROVAL: &str = "approval-1";
+
+/// The identifier of the second approval, under `two-approvals`.
+const SECOND_APPROVAL: &str = "approval-2";
 
 /// The program's argument that makes it lead a session of its own and run a command in it.
 pub const EXEC_IN_NEW_SESSION: &str = "--exec-in-new-session";
@@ -51,6 +54,8 @@ struct Server {
     /// The server's own requests the terminal has not answered, by identifier.
     sent: BTreeMap<String, String>,
     commands: Vec<Started>,
+    /// Whether the second approval has been asked, under `two-approvals`.
+    second_asked: bool,
 }
 
 fn thread() -> Value {
@@ -214,11 +219,36 @@ impl Server {
         }
     }
 
+    /// Appends one line about a frame the terminal wrote to the file `KR_STAND_IN_RECEIVED` names,
+    /// where a test that wants to know what reached the server reads it.
+    fn note_received(what: &str) {
+        use std::io::Write as _;
+        let Some(path) = std::env::var_os(crate::variants::RECEIVED_VARIABLE) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "{what}");
+        }
+    }
+
     async fn handle(&mut self, frame: Value) {
         let checked = match self.contract.check(Side::Terminal, &frame, &self.sent) {
             Ok(checked) => checked,
             Err(why) => return self.violation(&why, &frame).await,
         };
+        match &checked {
+            Frame::Request { id, method } => Self::note_received(&format!("request {id} {method}")),
+            Frame::Response { id, .. } | Frame::Failure { id, .. } => {
+                Self::note_received(&format!("response {id}"));
+            }
+            Frame::Notification { method } => {
+                Self::note_received(&format!("notification {method}"))
+            }
+        }
         match checked {
             Frame::Request { id, method } => {
                 self.received.insert(id.clone(), method.clone());
@@ -240,6 +270,25 @@ impl Server {
                     // The server dies with its command running, once the approval is answered.
                     if self.variants.die_first {
                         std::process::exit(0);
+                    }
+                    if self.variants.two_approvals && !self.second_asked {
+                        self.second_asked = true;
+                        self.sent.insert(
+                            json!(SECOND_APPROVAL).to_string(),
+                            "item/commandExecution/requestApproval".to_owned(),
+                        );
+                        self.send(json!({
+                            "id": SECOND_APPROVAL,
+                            "method": "item/commandExecution/requestApproval",
+                            "params": {
+                                "itemId": "item-2",
+                                "startedAtMs": 0,
+                                "threadId": "thread-1",
+                                "turnId": "turn-1"
+                            }
+                        }))
+                        .await;
+                        return;
                     }
                     self.send(json!({
                         "method": "turn/completed",
@@ -319,6 +368,10 @@ impl Server {
         }
         eprintln!("stand-in: turn started");
         self.start_command();
+        if self.variants.no_turn_answer {
+            // The terminal's request is read and nothing is ever answered.
+            return;
+        }
         let approval = json!({
             "id": if self.variants.colliding_ids { json!(crate::terminal::TURN) } else { json!(APPROVAL) },
             "method": "item/commandExecution/requestApproval",
@@ -424,6 +477,7 @@ pub async fn run(variants: Variants) -> ! {
         received: BTreeMap::new(),
         sent: BTreeMap::new(),
         commands: Vec::new(),
+        second_asked: false,
     };
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let speak = server

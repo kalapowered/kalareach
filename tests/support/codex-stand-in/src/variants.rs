@@ -28,6 +28,10 @@ pub const KEY_VARIABLE: &str = "KR_STAND_IN_API_KEY";
 /// waits for before it asks its question.
 pub const RELEASE_VARIABLE: &str = "KR_STAND_IN_RELEASE";
 
+/// The file the server appends one line to for each frame it reads from the terminal: `request`,
+/// `response` or `notification`, the identifier or method, and the method of a request.
+pub const RECEIVED_VARIABLE: &str = "KR_STAND_IN_RECEIVED";
+
 /// The ways a run can differ from the default.
 #[derive(Clone, Debug, Default)]
 pub struct Variants {
@@ -80,6 +84,14 @@ pub struct Variants {
     /// The terminal says it is waiting, and does not connect until the file `KR_STAND_IN_RELEASE`
     /// names exists.
     pub wait_to_connect: bool,
+    /// The server asks a second approval once the first is answered, and finishes the turn when
+    /// the second is answered. A terminal under `answer-when-released` waits for the file named
+    /// `KR_STAND_IN_RELEASE` with `.second` added before it answers the second.
+    pub two_approvals: bool,
+    /// The terminal reads the second approval and does not answer it.
+    pub leave_second_unanswered: bool,
+    /// The server never answers the terminal's request to start a turn.
+    pub no_turn_answer: bool,
 }
 
 impl Variants {
@@ -118,6 +130,9 @@ impl Variants {
                 "write-when-released" => variants.write_when_released = true,
                 "answer-when-released" => variants.answer_when_released = true,
                 "wait-to-connect" => variants.wait_to_connect = true,
+                "two-approvals" => variants.two_approvals = true,
+                "leave-second-unanswered" => variants.leave_second_unanswered = true,
+                "no-turn-answer" => variants.no_turn_answer = true,
                 other => panic!("{VARIABLE} names a variant this program does not have: {other}"),
             }
         }

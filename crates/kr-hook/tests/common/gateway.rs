@@ -29,6 +29,56 @@ pub const COMMAND: &str = r#"["/bin/sh", "-c", "sleep 120 & wait"]"#;
 /// The same, for a command that ignores a terminate and passes that on to what it starts.
 pub const STUBBORN: &str = r#"["/bin/sh", "-c", "trap '' TERM; sleep 120 & wait"]"#;
 
+/// Where a harness session's broker keeps its ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ledger {
+    /// In memory, beside nothing.
+    Memory,
+    /// In a file of its own under the host's root.
+    OnDisk,
+    /// In the session's journal, as the broker of a worker service does.
+    Service,
+}
+
+/// A worker service for the session the view runs, opened over the session's own journal.
+fn serve(placed: &Placed, view: &View) -> kr_worker::service::WorkerService {
+    use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
+    use kr_protocol::ids::{BuildId, ControllerGeneration, SessionEpoch};
+
+    let environment = placed.host.environment();
+    let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+    let identity = Arc::new(
+        WorkerIdentity::generate(
+            session(),
+            SessionEpoch::V1,
+            boot.clone(),
+            kr_ipc::identity::current_process_start_identity().expect("this process"),
+            kr_protocol::hello::PROTOCOL_VERSION,
+        )
+        .expect("a session key"),
+    );
+    let store = kr_crypto::store::open_store_in(&environment.secrets_dir()).expect("a store");
+    let controller =
+        ControllerIdentity::initialise(store.store.as_ref(), placed.host.environment_id())
+            .expect("a controller identity");
+    kr_worker::service::WorkerService::new(
+        Arc::clone(&view.runtime),
+        identity,
+        environment
+            .worker_endpoint(kr_protocol::session::DisplayNumber::new(1))
+            .expect("an endpoint"),
+        kr_worker::service::ServiceBinding {
+            environment_id: placed.host.environment_id(),
+            boot_identity: boot,
+            controller_public_key: *controller.public_key(),
+            controller_generation: ControllerGeneration::new(1),
+            journal_path: Some(environment.journal_database(session())),
+            build_id: BuildId::new("kr-hook-test/0").expect("a build identifier"),
+        },
+    )
+    .expect("a worker service")
+}
+
 pub fn words(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| (*part).to_owned()).collect()
 }
@@ -65,11 +115,23 @@ pub struct Gateway {
     pub placed: Placed,
     pub runtime: tokio::runtime::Runtime,
     pub broker: Arc<Broker>,
+    /// The worker service the session runs, where the harness was built with one: its maintenance
+    /// is the production storage-recovery pass.
+    pub service: Option<Arc<kr_worker::service::WorkerService>>,
     pub backends: Arc<CommandBackends>,
     pub view: View,
     pub executable: PathBuf,
     pub outputs: PathBuf,
     pub generation: std::sync::atomic::AtomicU64,
+}
+
+/// What a session's view was told about a resource.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewTold {
+    /// The transition itself.
+    Resource,
+    /// To discard what it holds and install a fresh state, which covers any transition it missed.
+    Resynchronise,
 }
 
 /// A launch the test started: the launcher, which becomes the terminal, and what it printed.
@@ -86,17 +148,24 @@ impl Gateway {
     /// A session whose broker keeps its ledger in a file under the host's root, which a test can
     /// search for what must not be kept.
     pub fn with_ledger_on_disk() -> Self {
-        Self::build(true, "", true)
+        Self::build(true, "", Ledger::OnDisk)
+    }
+
+    /// A session served by a real worker service, as the worker binary runs one: the broker is the
+    /// service's, its ledger lives in the session's journal, the backends are installed through the
+    /// service, and the storage-recovery pass a test runs is the service's own maintenance.
+    pub fn served() -> Self {
+        Self::build(true, "", Ledger::Service)
     }
 
     /// A session whose signed record names the stand-in's digest, or, with `qualified` false,
     /// names no executable at all, and whose backends live in the directory `runtime_name` names
     /// under the host's root (the root itself when it is empty).
     pub fn with(qualified: bool, runtime_name: &str) -> Self {
-        Self::build(qualified, runtime_name, false)
+        Self::build(qualified, runtime_name, Ledger::Memory)
     }
 
-    pub fn build(qualified: bool, runtime_name: &str, ledger_on_disk: bool) -> Self {
+    pub fn build(qualified: bool, runtime_name: &str, ledger: Ledger) -> Self {
         let placed = Placed::new();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -123,11 +192,34 @@ impl Gateway {
                 version: fixture::GATEWAY_QUALIFIED_VERSION.to_owned(),
             }];
         }
-        let ledger = ledger_on_disk.then(|| placed.host.root().join("broker-ledger.sqlite"));
-        let broker = Arc::new(
-            Broker::open(ledger.as_deref(), session(), JournalHealth::shared())
-                .expect("the broker opens"),
-        );
+        let view = {
+            let _entered = runtime.enter();
+            View::open(&placed.host)
+        };
+        let (broker, service) = match ledger {
+            Ledger::Service => {
+                let service = Arc::new(serve(&placed, &view));
+                (Arc::clone(service.broker()), Some(service))
+            }
+            Ledger::OnDisk => (
+                Arc::new(
+                    Broker::open(
+                        Some(&placed.host.root().join("broker-ledger.sqlite")),
+                        session(),
+                        JournalHealth::shared(),
+                    )
+                    .expect("the broker opens"),
+                ),
+                None,
+            ),
+            Ledger::Memory => (
+                Arc::new(
+                    Broker::open(None, session(), JournalHealth::shared())
+                        .expect("the broker opens"),
+                ),
+                None,
+            ),
+        };
         let sources = Arc::new(ConnectorSources::new());
         let admissions = kr_worker::broker::catalogue::Admissions::new();
         let _ = kr_worker::broker::catalogue::testing::admit(
@@ -138,35 +230,35 @@ impl Gateway {
             1,
         );
         assert!(sources.for_command("codex").is_some());
-        let view = {
-            let _entered = runtime.enter();
-            View::open(&placed.host)
+        let config = CommandBackendsConfig {
+            session_id: session(),
+            environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
+            os_user: "someone".to_owned(),
+            runtime_dir: if runtime_name.is_empty() {
+                placed.host.root().to_path_buf()
+            } else {
+                let directory = placed.host.root().join(runtime_name);
+                std::fs::create_dir_all(&directory).expect("a runtime directory");
+                directory
+            },
+            sources,
+            launcher: Some(placed.forwarder.clone()),
+            registered_forwarder: Some(placed.forwarder.clone()),
         };
-        let backends = Arc::new(
-            CommandBackends::new(
-                Arc::clone(&broker),
-                CommandBackendsConfig {
-                    session_id: session(),
-                    environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
-                    os_user: "someone".to_owned(),
-                    runtime_dir: if runtime_name.is_empty() {
-                        placed.host.root().to_path_buf()
-                    } else {
-                        let directory = placed.host.root().join(runtime_name);
-                        std::fs::create_dir_all(&directory).expect("a runtime directory");
-                        directory
-                    },
-                    sources,
-                    launcher: Some(placed.forwarder.clone()),
-                    registered_forwarder: Some(placed.forwarder.clone()),
-                },
-                runtime.handle().clone(),
-            )
-            .with_views(Arc::downgrade(&view.runtime)),
-        );
-        view.runtime
-            .session()
-            .set_command_backends(Arc::clone(&backends));
+        let backends = if let Some(service) = service.as_ref() {
+            // The production wiring: the service hands the backends its broker and the session.
+            let _entered = runtime.enter();
+            service.install_command_backends(config)
+        } else {
+            let backends = Arc::new(
+                CommandBackends::new(Arc::clone(&broker), config, runtime.handle().clone())
+                    .with_views(Arc::downgrade(&view.runtime)),
+            );
+            view.runtime
+                .session()
+                .set_command_backends(Arc::clone(&backends));
+            backends
+        };
         let outputs = placed.host.root().join("outputs");
         std::fs::create_dir_all(&outputs).expect("a directory for what the terminal prints");
         Self {
@@ -174,6 +266,7 @@ impl Gateway {
             placed,
             runtime,
             broker,
+            service,
             backends,
             view,
             executable,
@@ -305,6 +398,83 @@ impl Gateway {
             .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
             .expect("the launch is committed")
             .expect("and paused before the launcher is told");
+    }
+
+    /// Runs the service's storage-recovery pass, as often as it takes, until the gateway reads
+    /// `mode`, within the liveness bound. The pass is the one the worker's maintenance runs once a
+    /// minute: the journal first, then the broker.
+    ///
+    /// # Panics
+    ///
+    /// Panics when this harness has no service, or the gateway does not read `mode` in time.
+    pub fn recovers_to(&self, what: &str, mode: kr_protocol::gateway::GatewayMode) {
+        let service = self
+            .service
+            .as_ref()
+            .expect("the harness was built with a service");
+        let started = Instant::now();
+        loop {
+            service.recover_storage_now();
+            if self.broker.mode() == mode {
+                return;
+            }
+            assert!(
+                started.elapsed() < LIVENESS,
+                "{what}: the gateway reads {} and not {mode}",
+                self.broker.mode()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Reads the session view's stream until it is told that `resource` became `state`, or told to
+    /// resynchronise, within the liveness bound.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the view is told neither.
+    pub fn view_is_told(
+        &self,
+        resource: kr_protocol::ids::PendingResourceId,
+        state: kr_protocol::gateway::PendingState,
+    ) -> ViewTold {
+        let mut stream = self.view.stream.lock().expect("the view's stream");
+        self.runtime.block_on(async {
+            loop {
+                match tokio::time::timeout(LIVENESS, stream.recv()).await {
+                    Ok(Some(kr_worker::output::OutputDelivery::AgentResource { event, bytes })) => {
+                        stream.written(bytes);
+                        if event.resource_id == resource && event.state == state {
+                            return ViewTold::Resource;
+                        }
+                    }
+                    Ok(Some(kr_worker::output::OutputDelivery::Resync(_))) => {
+                        return ViewTold::Resynchronise;
+                    }
+                    Ok(Some(delivery)) => stream.written(delivery.len()),
+                    Ok(None) | Err(_) => panic!("the view was told nothing about {resource}"),
+                }
+            }
+        })
+    }
+
+    /// Reads the session view's stream until it is told to resynchronise, within the liveness
+    /// bound.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the view is told nothing of the kind.
+    pub fn view_resynchronises(&self) {
+        let mut stream = self.view.stream.lock().expect("the view's stream");
+        self.runtime.block_on(async {
+            loop {
+                match tokio::time::timeout(LIVENESS, stream.recv()).await {
+                    Ok(Some(kr_worker::output::OutputDelivery::Resync(_))) => return,
+                    Ok(Some(delivery)) => stream.written(delivery.len()),
+                    Ok(None) | Err(_) => panic!("the view was never told to resynchronise"),
+                }
+            }
+        });
     }
 
     /// The next announcement about an agent instance the session's view is sent.

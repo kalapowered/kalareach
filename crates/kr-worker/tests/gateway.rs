@@ -1029,11 +1029,12 @@ fn kr_req_12_13_a_long_sessions_snapshot_does_not_grow_with_what_ended_runs_sett
     );
 }
 
-/// KR-REQ-12.13, the control: a request nobody answered is carried whatever becomes of its
-/// connection, because a connection ending is not an answer, and one still waiting on a connection
-/// that stays is carried beside it.
+/// KR-REQ-12.13, the control: a request nobody answered on a run that ended is settled as
+/// cancelled, because nothing can answer it on a connection that has gone, and the snapshot carries
+/// the request waiting on a connection that stays and nothing of the ended run. The ledger keeps
+/// the ended run's record.
 #[test]
-fn kr_req_12_13_an_unanswered_request_is_carried_after_its_run_has_ended() {
+fn kr_req_12_13_an_unanswered_request_is_settled_when_its_run_has_ended() {
     let broker = gateway(None);
     let waiting = forwarded(&broker, GatewayConnectionId::new(1), "1", 2);
     let run = agent_run(&broker);
@@ -1053,15 +1054,22 @@ fn kr_req_12_13_an_unanswered_request_is_carried_after_its_run_has_ended() {
         "the request on the connection that stays: {carried:?}"
     );
     assert!(
-        carried.contains(&(unanswered.resource_id, PendingState::Pending)),
-        "and the one its ended run left unanswered: {carried:?}"
+        carried
+            .iter()
+            .all(|(resource_id, _)| *resource_id != unanswered.resource_id),
+        "and nothing of the run that ended: {carried:?}"
+    );
+    assert!(
+        broker.pending(unanswered.resource_id).is_none(),
+        "the live arbitration no longer holds what the ended run left"
     );
     assert_eq!(
         broker
-            .pending(unanswered.resource_id)
-            .expect("the live arbitration holds it")
+            .recorded(unanswered.resource_id)
+            .expect("the ledger reads")
+            .expect("the ledger keeps it")
             .state,
-        PendingState::Pending
+        PendingState::Cancelled
     );
 }
 

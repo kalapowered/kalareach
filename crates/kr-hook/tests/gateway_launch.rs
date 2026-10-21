@@ -154,6 +154,357 @@ fn kr_req_07_67_closing_an_attachment_leaves_a_gateway_served_session_running() 
     });
 }
 
+/// A run of the stand-in that asks two approvals, with the files a test reads and releases it by.
+struct TwoApprovals {
+    launched: common::gateway::Launched,
+    /// The file the terminal waits for before it answers the first approval.
+    release: PathBuf,
+    /// What the server wrote down about the frames the terminal sent it.
+    received: PathBuf,
+}
+
+impl TwoApprovals {
+    /// The file the terminal waits for before it answers the second approval.
+    fn second_release(&self) -> PathBuf {
+        let mut name = self.release.as_os_str().to_owned();
+        name.push(".second");
+        PathBuf::from(name)
+    }
+
+    /// The identifiers of the responses the server has read from the terminal.
+    fn responses(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.received)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.strip_prefix("response ").map(str::to_owned))
+            .collect()
+    }
+}
+
+/// Launches the stand-in under `variants`, in a session that asks the terminal two approvals.
+fn launch_two_approvals(shell: &Gateway, name: &str, variants: &str) -> TwoApprovals {
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let release = shell.placed.host.root().join(format!("{name}-answer"));
+    let received = shell.placed.host.root().join(format!("{name}-received"));
+    let launched = shell.launch(
+        &answer,
+        name,
+        &[
+            ("KR_STAND_IN", variants),
+            ("KR_STAND_IN_COMMAND", COMMAND),
+            (
+                "KR_STAND_IN_RELEASE",
+                release.to_str().expect("a text path"),
+            ),
+            (
+                "KR_STAND_IN_RECEIVED",
+                received.to_str().expect("a text path"),
+            ),
+        ],
+    );
+    TwoApprovals {
+        launched,
+        release,
+        received,
+    }
+}
+
+/// The second approval the server asked, once the broker has recorded it.
+fn the_second_approval(shell: &Gateway) -> Option<kr_protocol::gateway::PendingResource> {
+    shell
+        .broker
+        .pending_resources()
+        .into_iter()
+        .find(|resource| resource.request.upstream.as_str().contains("approval-2"))
+}
+
+/// KR-REQ-11.37: a recovery that owes a connection the terminal ended inside the gap finishes.
+///
+/// The ledger refuses writes in live traffic, so the terminal's answer to the first approval meets
+/// a store that fails and the gateway enters `native_only_volatile`. The server then asks a second
+/// approval, which is recorded behind the fence and left unanswered, and the terminal ends: its
+/// connection and its server go with it. The ledger takes writes again and the service's own
+/// storage-recovery pass runs until the gateway is back to normal. A recovery that waited for the
+/// ended connection's upstream to say what it held would never finish, and rich work would stay
+/// fenced for the session; this one commits the gap with the settlement of the second approval in
+/// it, and a launch after it gets rich work.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_11_37_a_recovery_that_owes_a_connection_the_terminal_ended_in_the_gap_finishes() {
+    use kr_protocol::gateway::{GatewayMode, PendingState};
+
+    let shell = Gateway::served();
+    let mut run = launch_two_approvals(
+        &shell,
+        "gap",
+        "stay,two-approvals,answer-when-released,leave-second-unanswered",
+    );
+    run.launched
+        .prints("TUI: the server asks for item/commandExecution/requestApproval");
+    assert_eq!(shell.broker.mode(), GatewayMode::Normal);
+    shell
+        .broker
+        .refuse_ledger_writes(true)
+        .expect("the ledger stops taking writes");
+    std::fs::write(&run.release, b"answer").expect("the terminal is released");
+    eventually("the second approval is recorded behind the fence", || {
+        the_second_approval(&shell).is_some()
+    });
+    assert_eq!(shell.broker.mode(), GatewayMode::NativeOnlyVolatile);
+    let second = the_second_approval(&shell).expect("recorded").resource_id;
+
+    let _ = run.launched.child.kill();
+    let _ = run.launched.ends();
+    eventually(
+        "the end of the connection settled the second approval",
+        || {
+            shell
+                .broker
+                .pending(second)
+                .is_some_and(|resource| resource.state == PendingState::Cancelled)
+        },
+    );
+
+    shell
+        .broker
+        .refuse_ledger_writes(false)
+        .expect("the ledger takes writes again");
+    shell.recovers_to("the recovery", GatewayMode::Normal);
+    assert_eq!(
+        shell
+            .broker
+            .recorded_gaps()
+            .expect("the ledger reads")
+            .len(),
+        1
+    );
+    let recorded = shell
+        .broker
+        .recorded(second)
+        .expect("the ledger reads")
+        .expect("the recovery committed the second approval");
+    assert_eq!(recorded.state, PendingState::Cancelled);
+    assert_eq!(
+        recorded.durability,
+        kr_protocol::session::Durability::Volatile,
+        "and it says it lived through a gap"
+    );
+    shell
+        .broker
+        .require_rich_work()
+        .expect("rich work is admitted again");
+
+    // The session goes on: the next launch is served and finishes its turn.
+    let again = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let mut next = shell.launch(
+        &again,
+        "after",
+        &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_COMMAND", COMMAND)],
+    );
+    next.prints("TUI: turn/completed");
+}
+
+/// KR-REQ-11.27: the end of the terminal's connection reconciles what it left, without reissuing.
+///
+/// The terminal answers the first approval and leaves the second unanswered, and ends. The second
+/// approval is cancelled in the ledger and no longer pending in the broker, the session's attached
+/// view is told so, a typed answer to it is refused as resolved, and the server read the answer to
+/// the first approval once and nothing about the second. The next launch is served by a new
+/// server on a new connection.
+///
+/// Not claimed: a reconnect of the terminal, which does not exist (the pinned terminal exits when
+/// its connection drops), and the control daemon's restart. Windows, where no gateway runs.
+#[test]
+fn kr_req_11_27_an_approval_the_terminal_left_unanswered_is_settled_when_its_connection_ends() {
+    use kr_protocol::gateway::PendingState;
+
+    let shell = Gateway::served();
+    let mut run = launch_two_approvals(
+        &shell,
+        "ends",
+        "stay,two-approvals,answer-when-released,leave-second-unanswered",
+    );
+    run.launched
+        .prints("TUI: the server asks for item/commandExecution/requestApproval");
+    let instance = shell.announcement().instance.application_instance_id;
+    let servers = shell.servers();
+    assert_eq!(servers.len(), 1, "{servers:?}");
+    let server = servers[0].clone();
+    std::fs::write(&run.release, b"answer").expect("the terminal is released");
+    eventually("the second approval is recorded", || {
+        the_second_approval(&shell).is_some()
+    });
+    let second = the_second_approval(&shell).expect("recorded").resource_id;
+    assert_eq!(
+        the_second_approval(&shell).expect("recorded").state,
+        PendingState::Pending
+    );
+
+    let _ = run.launched.child.kill();
+    let _ = run.launched.ends();
+    eventually("the server ended with the terminal", || {
+        kr_ipc::identity::process_state(&server) == kr_ipc::identity::ProcessState::Ended
+    });
+    assert_eq!(
+        shell.view_is_told(second, PendingState::Cancelled),
+        common::gateway::ViewTold::Resource,
+        "the attached view was told the approval is cancelled"
+    );
+    assert!(
+        shell.broker.pending(second).is_none(),
+        "the broker no longer holds it as pending"
+    );
+    assert_eq!(
+        shell
+            .broker
+            .recorded(second)
+            .expect("the ledger reads")
+            .expect("recorded")
+            .state,
+        PendingState::Cancelled
+    );
+
+    // A person's typed answer to it is refused as resolved, and nothing is carried anywhere.
+    let refusal = shell
+        .runtime
+        .block_on(shell.broker.agent_approval_respond(
+            &kr_worker::broker::Caller {
+                actor_id: kr_protocol::ids::ActorId::new("device-1").expect("an actor"),
+                grant_id: None,
+            },
+            &kr_protocol::agent::AgentApprovalRespondParams {
+                target: kr_protocol::agent::AgentMutationTarget {
+                    subject: kr_worker::broker::subject(common::session::session(), instance),
+                    binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+                },
+                resource_id: second,
+                option_id: "allow".to_owned(),
+            },
+            kr_ipc::now_ms(),
+        ))
+        .expect_err("an ended approval takes no answer");
+    assert_eq!(
+        refusal.code(),
+        kr_protocol::error::ErrorCode::QuestionResolved
+    );
+    assert_eq!(
+        run.responses().len(),
+        1,
+        "the server read one answer, the first approval's, and nothing about the second: {:?}",
+        run.responses()
+    );
+
+    // The next launch is a new server on a new connection, and it is sent nothing of the old one.
+    let again = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let mut next = shell.launch(
+        &again,
+        "next",
+        &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_COMMAND", COMMAND)],
+    );
+    next.prints("TUI: turn/completed");
+    let servers = shell.servers();
+    assert!(
+        servers.iter().all(|running| *running != server),
+        "the old server is not the new one: {servers:?}"
+    );
+    assert_eq!(
+        run.responses().len(),
+        1,
+        "and the old run was sent nothing more"
+    );
+}
+
+/// KR-REQ-11.37: the production recovery reconciles an owed gateway connection that stayed open.
+///
+/// The same fence as above, but the terminal stays connected with the second approval pending. The
+/// service's recovery pass reconciles the open connection from the host's own record, the gateway
+/// is back to normal, the second approval is still pending, and the terminal then answers it: it
+/// resolves once, and the server read exactly one answer for each approval.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_11_37_the_recovery_reconciles_an_owed_gateway_connection_that_stayed_open() {
+    use kr_protocol::gateway::{GatewayMode, PendingState};
+
+    let shell = Gateway::served();
+    let mut run = launch_two_approvals(&shell, "open", "stay,two-approvals,answer-when-released");
+    run.launched
+        .prints("TUI: the server asks for item/commandExecution/requestApproval");
+    shell
+        .broker
+        .refuse_ledger_writes(true)
+        .expect("the ledger stops taking writes");
+    std::fs::write(&run.release, b"answer").expect("the terminal is released");
+    eventually("the second approval is recorded behind the fence", || {
+        the_second_approval(&shell).is_some()
+    });
+    assert_eq!(shell.broker.mode(), GatewayMode::NativeOnlyVolatile);
+    let second = the_second_approval(&shell).expect("recorded").resource_id;
+
+    shell
+        .broker
+        .refuse_ledger_writes(false)
+        .expect("the ledger takes writes again");
+    shell.recovers_to("the recovery", GatewayMode::Normal);
+    assert_eq!(
+        shell.broker.pending(second).expect("still held").state,
+        PendingState::Pending,
+        "the request the connection still holds stays"
+    );
+
+    std::fs::write(run.second_release(), b"answer").expect("the terminal is released again");
+    run.launched.prints("TUI: turn/completed");
+    eventually("the second approval resolved", || {
+        shell
+            .broker
+            .pending(second)
+            .is_some_and(|resource| resource.state == PendingState::Resolved)
+    });
+    assert_eq!(
+        run.responses().len(),
+        2,
+        "the server read one answer for each approval: {:?}",
+        run.responses()
+    );
+}
+
+/// KR-REQ-11.27: a view that cannot be told in time is told to resynchronise.
+///
+/// The telling of the session's views is held past its bound, as a view that cannot be reached
+/// would hold it, and the terminal ends with an approval unanswered. The cancellation may or may
+/// not have reached the view by the bound; the view is told to discard what it held and install
+/// the broker's state afresh, which covers it.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_11_27_a_view_that_cannot_be_told_in_time_is_told_to_resynchronise() {
+    let shell = Gateway::served();
+    shell.backends.deliver_within(Duration::from_millis(50));
+    let held = shell.backends.hold_delivery();
+    let mut run = launch_two_approvals(
+        &shell,
+        "held",
+        "stay,two-approvals,answer-when-released,leave-second-unanswered",
+    );
+    run.launched
+        .prints("TUI: the server asks for item/commandExecution/requestApproval");
+    std::fs::write(&run.release, b"answer").expect("the terminal is released");
+    eventually("the second approval is recorded", || {
+        the_second_approval(&shell).is_some()
+    });
+    let _ = run.launched.child.kill();
+    let _ = run.launched.ends();
+    shell.view_resynchronises();
+    drop(held);
+}
+
 /// KR-REQ-11.32 and KR-REQ-12.07: only the process the launch registered reaches the gateway, and
 /// an upgrade a browser could have sent does not use the admission: another process that speaks a
 /// plain upgrade to the socket, while the program has become the terminal and not yet connected, is

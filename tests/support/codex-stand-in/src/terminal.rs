@@ -75,6 +75,8 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
     let mut sent: BTreeMap<String, String> = BTreeMap::new();
     // The server's requests this terminal has not answered, by identifier.
     let mut received: BTreeMap<String, String> = BTreeMap::new();
+    // How many requests the server has made of this terminal.
+    let mut requests_read = 0_usize;
 
     macro_rules! send {
         ($frame:expr) => {{
@@ -220,13 +222,19 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
             }
             Frame::Request { id, method } => {
                 received.insert(id.clone(), method.clone());
+                requests_read += 1;
                 println!("TUI: the server asks for {method}");
-                if variants.leave_unanswered {
+                if variants.leave_unanswered
+                    || (variants.leave_second_unanswered && requests_read > 1)
+                {
                     continue;
                 }
                 if variants.answer_when_released
-                    && let Ok(release) = std::env::var(RELEASE_VARIABLE)
+                    && let Ok(mut release) = std::env::var(RELEASE_VARIABLE)
                 {
+                    if requests_read > 1 {
+                        release.push_str(".second");
+                    }
                     while !std::path::Path::new(&release).exists() {
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
