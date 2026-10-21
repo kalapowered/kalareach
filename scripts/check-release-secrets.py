@@ -327,7 +327,9 @@ def self_test():
                 handle.write(data)
 
     def flagged(found, relative):
-        return any(path.endswith(relative) or f"!{relative}" in path for path, _ in found)
+        # A found path is spelled as the platform spells it, and a planted one with `/`.
+        spelled = [path.replace(os.sep, "/") for path, _ in found]
+        return any(path.endswith(relative) or f"!{relative}" in path for path in spelled)
 
     with tempfile.TemporaryDirectory(prefix="kalareach-secrets-") as scratch:
         secrets = os.path.join(scratch, "secrets")
