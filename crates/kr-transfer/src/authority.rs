@@ -1367,11 +1367,12 @@ impl AuthorisedDirectory {
     ///   everything in it is gone. The removal stays on the mount `opened` is on, whether or not
     ///   this authority was confined to one, so a directory mounted into the tree is refused before
     ///   anything in it is reached: a recursive removal that crossed into another filesystem would
-    ///   take away what no name inside the tree named. On Linux nothing is asked of the other
-    ///   filesystem either, not even a look at its root, so a mount whose server does not answer
-    ///   stops the removal as any other mount does instead of holding it. Elsewhere the mount is
-    ///   found by opening the entry and comparing its mount, and a mount that never answers holds
-    ///   the removal at that look.
+    ///   take away what no name inside the tree named. On Linux from 5.6, which has `openat2`,
+    ///   nothing is asked of the other filesystem either, not even a look at its root, so a mount
+    ///   whose server does not answer stops the removal as any other mount does instead of holding
+    ///   it. On an older kernel, in a sandbox that refuses the call, and elsewhere, the mount is
+    ///   found by looking at the entry and opening it and comparing its mount, and a mount that
+    ///   never answers holds the removal at that look.
     /// * **Nothing is followed.** On Unix an entry that is not a directory is unlinked by its name
     ///   in the handle of the directory it is in, which removes a link as a link and cannot remove a
     ///   directory, so an entry replaced by a directory in the meantime stops the removal rather
@@ -1434,7 +1435,7 @@ impl AuthorisedDirectory {
         let entry = OsStr::new(name.as_str());
         // The object the caller checked, or nothing: a different object at the name is not what
         // the caller asked to take away.
-        same_object_at(&self.directory, entry, opened.identity, name.as_str())?;
+        same_object_at(&self.directory, entry, opened.identity, name.as_str(), true)?;
         // The mount rule travels with the removal whoever asked for it. An authority that carries
         // it already compares `opened` with its own mount; one that does not starts the removal on
         // the mount `opened` itself is on.
@@ -1459,9 +1460,9 @@ impl AuthorisedDirectory {
     /// parsed as a relative name: a tree holds names a relative name refuses, such as a Windows
     /// device name on a Unix host, and every one of them has to be removable. It is opened the way
     /// each step of a descent is: without following a link, as a directory, and on this
-    /// authority's mount where the authority is confined to one. On Linux the open itself refuses
-    /// to go into a mount, so a mount whose server does not answer is refused without being asked
-    /// anything.
+    /// authority's mount where the authority is confined to one. On Linux from 5.6, which has
+    /// `openat2`, the open itself refuses to go into a mount, so a mount whose server does not
+    /// answer is refused without being asked anything.
     fn enter(&self, entry: &OsStr, reported: &str) -> Result<Self, Escape> {
         let opened = open_in_place(&self.directory, entry, reported)?;
         refuse_reparse_point(&opened, reported)?;
@@ -1599,16 +1600,18 @@ impl Removal {
             // platform can say so. Only a directory is descended into, and whether it is one is
             // settled by the open that enters it; everything else is removed by a call that
             // cannot remove a directory, whatever this said.
-            match held_by(&directory.directory, &entry) {
-                Ok(Held::Directory) => self.descend(directory, &entry, &here)?,
-                Ok(Held::Other) => {
+            match look_at(&directory.directory, &entry, false) {
+                Ok(Looked::Object {
+                    is_directory: true, ..
+                }) => self.descend(directory, &entry, &here)?,
+                Ok(Looked::Object { .. }) => {
                     remove_non_directory(&directory.directory, &entry)
                         .map_err(|error| self.stopped(&here, entry_failure(&here, &error)))?;
                     self.removed += 1;
                 }
                 // A mount is not this tree's to take, and it is refused here as it is where a
                 // directory is entered, without a look at what is on the other side of it.
-                Ok(Held::Mount) => {
+                Ok(Looked::Mount) => {
                     return Err(self.stopped(
                         &here,
                         Escape::CrossedMount {
@@ -1692,7 +1695,7 @@ fn remove_empty(
 ) -> Result<(), Escape> {
     #[cfg(feature = "testing")]
     testing::reached(testing::RemovalStep::Emptied, reported);
-    same_object_at(holder, entry, emptied.identity, reported)?;
+    same_object_at(holder, entry, emptied.identity, reported, false)?;
     // Windows removes a directory only by its name and only once no handle on it is open, because
     // the handles this host resolves names through are opened so that nothing can rename or
     // delete a directory beneath them. Unix does not mind, so there the handle stays open across
@@ -1850,19 +1853,23 @@ fn entry_names(directory: &Dir, at: &str) -> Result<Vec<OsString>, Escape> {
 }
 
 /// Checks that a name in `directory` holds the directory whose identity is `expected`.
+///
+/// A name that has a mount on it holds the mount's root and not the directory, whatever the
+/// identities are; where the platform can say so, the look does not go into the mount to find out,
+/// unless `across_mounts` is set, which a caller that has been handed a mount's root asks for.
 fn same_object_at(
     directory: &Dir,
     entry: &OsStr,
     expected: ObjectIdentity,
     reported: &str,
+    across_mounts: bool,
 ) -> Result<(), Escape> {
-    match directory.symlink_metadata(entry) {
-        Ok(metadata) => {
-            let found = ObjectIdentity {
-                device: metadata.dev(),
-                file_id: metadata.ino(),
-            };
-            if metadata.is_dir() && found == expected {
+    match look_at(directory, entry, across_mounts) {
+        Ok(Looked::Object {
+            is_directory,
+            identity: found,
+        }) => {
+            if is_directory && found == expected {
                 Ok(())
             } else {
                 Err(Escape::IdentityChanged {
@@ -1872,6 +1879,11 @@ fn same_object_at(
                 })
             }
         }
+        Ok(Looked::Mount) => Err(Escape::IdentityChanged {
+            detail: format!(
+                "{reported} was the directory {expected}, and its name now holds a mount"
+            ),
+        }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Err(Escape::IdentityChanged {
                 detail: format!("{reported} was the directory {expected}, and its name is empty"),
@@ -1899,13 +1911,15 @@ fn entry_failure(reported: &str, error: &std::io::Error) -> Escape {
     }
 }
 
-/// What a name in a directory holds, as far as a removal needs to know before it does anything to
-/// it.
-enum Held {
-    /// A directory, which is entered and emptied.
-    Directory,
-    /// Anything else, which a call that cannot remove a directory removes.
-    Other,
+/// What one look at a name in a directory found.
+enum Looked {
+    /// An object, with what a removal needs to know of it before it does anything to it.
+    Object {
+        /// Whether it is a directory.
+        is_directory: bool,
+        /// Its identity.
+        identity: ObjectIdentity,
+    },
     /// A mount: the name leads to another filesystem, which a removal does not go into.
     #[cfg_attr(
         not(target_os = "linux"),
@@ -1917,40 +1931,51 @@ enum Held {
     Mount,
 }
 
-/// Asks what `entry` is in `directory`, without following a link and, on Linux, without going into
-/// a mount.
+/// Looks at `entry` in `directory` without following a link and, on Linux, without going into a
+/// mount, unless `across_mounts` is set.
 ///
 /// On Linux the entry is opened as a path with the resolution barred from crossing a mount point,
 /// which the kernel refuses before it asks the filesystem on the other side anything. A look at the
-/// root of a mount whose server has gone does not return, and this one does. A kernel too old to
-/// have the call looks at the entry the way every other platform does, as does a platform that has
-/// no such call: there a mount that never answers holds the removal at the look, and the mount
-/// rule is applied to what the entry opens as.
-fn held_by(directory: &Dir, entry: &OsStr) -> std::io::Result<Held> {
+/// root of a mount whose server has gone does not return, and this one does. A kernel that does
+/// not have the call, or that a sandbox will not let it use, looks at the entry the way every other
+/// platform does, as does a platform that has no such call: there a mount that never answers holds
+/// the removal at the look, and the mount rule is applied to what the entry opens as.
+fn look_at(directory: &Dir, entry: &OsStr, across_mounts: bool) -> std::io::Result<Looked> {
     #[cfg(target_os = "linux")]
-    match rustix::fs::openat2(
-        directory,
-        entry,
-        rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-        rustix::fs::ResolveFlags::NO_XDEV | rustix::fs::ResolveFlags::NO_MAGICLINKS,
-    ) {
-        Ok(found) => {
-            let kind = rustix::fs::FileType::from_raw_mode(rustix::fs::fstat(&found)?.st_mode);
-            return Ok(if kind == rustix::fs::FileType::Directory {
-                Held::Directory
-            } else {
-                Held::Other
-            });
+    if !across_mounts {
+        match rustix::fs::openat2(
+            directory,
+            entry,
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+            rustix::fs::ResolveFlags::NO_XDEV | rustix::fs::ResolveFlags::NO_MAGICLINKS,
+        ) {
+            Ok(found) => {
+                let found = rustix::fs::fstat(&found)?;
+                return Ok(Looked::Object {
+                    is_directory: rustix::fs::FileType::from_raw_mode(found.st_mode)
+                        == rustix::fs::FileType::Directory,
+                    identity: ObjectIdentity {
+                        device: found.st_dev,
+                        file_id: found.st_ino,
+                    },
+                });
+            }
+            Err(rustix::io::Errno::XDEV) => return Ok(Looked::Mount),
+            // The call is not there, or a sandbox answers a call it does not know with a refusal.
+            Err(rustix::io::Errno::NOSYS | rustix::io::Errno::PERM) => {}
+            Err(error) => return Err(error.into()),
         }
-        Err(rustix::io::Errno::XDEV) => return Ok(Held::Mount),
-        Err(rustix::io::Errno::NOSYS) => {}
-        Err(error) => return Err(error.into()),
     }
-    Ok(if directory.symlink_metadata(entry)?.file_type().is_dir() {
-        Held::Directory
-    } else {
-        Held::Other
+    #[cfg(not(target_os = "linux"))]
+    let _ = across_mounts;
+    let metadata = directory.symlink_metadata(entry)?;
+    Ok(Looked::Object {
+        is_directory: metadata.is_dir(),
+        identity: ObjectIdentity {
+            device: metadata.dev(),
+            file_id: metadata.ino(),
+        },
     })
 }
 
@@ -1977,7 +2002,7 @@ fn open_in_place(directory: &Dir, entry: &OsStr, reported: &str) -> Result<Dir, 
                 component: reported.to_owned(),
             });
         }
-        Err(rustix::io::Errno::NOSYS) => {}
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::PERM) => {}
         Err(error) => return Err(entry_failure(reported, &error.into())),
     }
     directory
