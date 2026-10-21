@@ -726,9 +726,9 @@ mod tests {
     }
 
     /// KR-REQ-09.18: a message under a personal grant whose offline bound has run out admits
-    /// nothing: in UTC, and then the floor it was found at is written down, so a clock wound back before a restart
-    /// cannot revive the bound; and on the continuous clock, whatever UTC says. The control: inside
-    /// the bound it admits, and no floor is written.
+    /// nothing: in UTC, and then the floor it was found at is written down, so a clock wound back
+    /// before a restart cannot revive the bound; and on the continuous clock, whatever UTC says.
+    /// The control: inside the bound it admits, and no floor is written.
     #[test]
     fn a_lapsed_offline_bound_admits_nothing_and_its_utc_lapse_writes_the_floor_down() {
         use std::sync::atomic::{AtomicU64, Ordering};

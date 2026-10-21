@@ -620,8 +620,8 @@ fn codex_connector(store: &Store, version: Option<&str>) -> InstalledConnector {
 }
 
 /// KR-REQ-11.30, KR-REQ-11.44: the table an installed package carries compiles to the table the
-/// gateway interprets. The golden file is that table as the compile writes it; a change to what the compile
-/// makes of a package shows up as a change to it.
+/// gateway interprets. The golden file is that table as the compile writes it; a change to what the
+/// compile makes of a package shows up as a change to it.
 #[test]
 fn kr_req_11_30_the_installed_table_compiles_to_the_golden_core_table() {
     let store = Store::new("compile");
@@ -682,8 +682,9 @@ fn core_class(class: MethodClass) -> NativeMethodClass {
 }
 
 /// KR-REQ-11.30, KR-REQ-11.44: a broker pins the compiled table and reads the frames a session
-/// carries as the installed table classifies them. The frames are the pinned build's own shapes: its first
-/// exchange, a login, a thread, a turn and a command; and one method the table does not list.
+/// carries as the installed table classifies them. The frames are the pinned build's own shapes:
+/// its first exchange, a login, a thread, a turn and a command; and one method the table does not
+/// list.
 #[test]
 fn kr_req_11_30_the_broker_reads_a_session_s_frames_as_the_installed_table_classifies_them() {
     let store = Store::new("admit");
