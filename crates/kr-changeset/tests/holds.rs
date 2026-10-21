@@ -356,12 +356,15 @@ fn a_capture_under_the_projects_authority_is_quiesced_and_the_hosts_writers_are_
     );
 }
 
-/// KR-REQ-14.32: a file that was already modified, written again after this host read it while it
-/// read another, contradicts the reservation: the class is the weaker one, and a request that
-/// required the quiesced class is refused. So does a path that was gone when it was read and is
-/// back by the end.
-#[test]
-fn a_file_written_after_its_own_read_makes_the_capture_per_file_and_a_required_class_is_refused() {
+/// How a test gets in the way of a capture: called with the worktree's directory, the path being
+/// read and the attempt, each time a file's content has just been read.
+type Interference = Arc<dyn Fn(&std::path::Path, &str, u32) + Send + Sync>;
+
+/// Captures a held worktree whose files are `README.md`, `src/lib.rs`, `zzz.txt` and `zzzz.txt`,
+/// already modified and read in that order, while `interfere` runs as each is read: once asking for
+/// no class in particular, where the capture is the weaker class and says a held tree was written,
+/// and once requiring the quiesced class, where it is refused.
+fn a_contradicted_capture(interfere: &Interference) {
     for required in [None, Some(SourceConsistency::QuiescedCapture)] {
         let scene = scene();
         write(&scene.tree, "README.md", "modified in the worktree\n");
@@ -372,27 +375,9 @@ fn a_file_written_after_its_own_read_makes_the_capture_per_file_and_a_required_c
         let authority = ProjectQuiescence::new(&project);
 
         let tree = scene.tree.clone();
+        let interfere = Arc::clone(interfere);
         kr_changeset::capture::interpose_working_tree_reads(Some(Arc::new(
-            move |read: &str, attempt: u32| {
-                if attempt > 0 {
-                    return;
-                }
-                match read {
-                    // README.md was read first. Written again with another length while the next
-                    // file is read, and one later path is taken away before its turn.
-                    "src/lib.rs" => {
-                        std::fs::write(tree.join("README.md"), "modified again, and longer\n")
-                            .expect("the fixture writes");
-                        std::fs::remove_file(tree.join("zzz.txt")).expect("the fixture removes");
-                    }
-                    // And the path that was gone when it was read is back before the end.
-                    "zzzz.txt" => {
-                        std::fs::write(tree.join("zzz.txt"), "back again\n")
-                            .expect("the fixture writes");
-                    }
-                    _ => {}
-                }
-            },
+            move |read: &str, attempt: u32| interfere(&tree, read, attempt),
         )));
         let outcome = scene.fixture.capture_with_authority(
             scene.isolated,
@@ -432,6 +417,88 @@ fn a_file_written_after_its_own_read_makes_the_capture_per_file_and_a_required_c
             }
         }
     }
+}
+
+/// Writes `contents` over `path` and puts the modification time it had back, as a program that
+/// wants a rewrite unseen does.
+fn rewrite_keeping_the_time(path: &std::path::Path, contents: &str) {
+    let modified = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .expect("the file has a modification time");
+    std::fs::write(path, contents).expect("the fixture writes");
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(modified))
+        .expect("the fixture puts the time back");
+}
+
+/// KR-REQ-14.32: a file that was already modified, written again with another length after this
+/// host read it while it read another, contradicts the reservation: the class is the weaker one,
+/// and a request that required the quiesced class is refused.
+#[test]
+fn a_file_rewritten_to_another_length_after_its_read_is_not_quiesced() {
+    a_contradicted_capture(
+        &(Arc::new(|tree: &std::path::Path, read: &str, attempt: u32| {
+            // README.md was read first; src/lib.rs is being read now.
+            if attempt == 0 && read == "src/lib.rs" {
+                std::fs::write(tree.join("README.md"), "modified again, and longer\n")
+                    .expect("the fixture writes");
+            }
+        }) as Interference),
+    );
+}
+
+/// KR-REQ-14.32: the same rewrite with the same length and the modification time put back is seen
+/// too, by the instant the file's inode last changed, which a program cannot put back.
+#[test]
+fn a_file_rewritten_to_the_same_length_with_its_time_put_back_after_its_read_is_not_quiesced() {
+    a_contradicted_capture(
+        &(Arc::new(|tree: &std::path::Path, read: &str, attempt: u32| {
+            if attempt == 0 && read == "src/lib.rs" {
+                rewrite_keeping_the_time(&tree.join("README.md"), "MODIFIED IN THE WORKTREE\n");
+            }
+        }) as Interference),
+    );
+}
+
+/// KR-REQ-14.32: a file rewritten in place, with the same length and its time put back, while this
+/// host reads it is not read as the file it was: the reading is repeated, and the class is the
+/// weaker one, because something wrote the tree while the reservation held it.
+#[test]
+fn a_file_rewritten_in_place_while_it_is_read_is_not_quiesced() {
+    a_contradicted_capture(
+        &(Arc::new(|tree: &std::path::Path, read: &str, attempt: u32| {
+            if attempt == 0 && read == "README.md" {
+                rewrite_keeping_the_time(&tree.join("README.md"), "MODIFIED IN THE WORKTREE\n");
+            }
+        }) as Interference),
+    );
+}
+
+/// KR-REQ-14.32: a path that was gone when this host came to read it and is back by the end
+/// contradicts the reservation too.
+#[test]
+fn a_path_gone_when_it_was_read_and_back_by_the_end_is_not_quiesced() {
+    a_contradicted_capture(
+        &(Arc::new(|tree: &std::path::Path, read: &str, attempt: u32| {
+            if attempt > 0 {
+                return;
+            }
+            match read {
+                // zzz.txt is taken away before its turn.
+                "src/lib.rs" => {
+                    std::fs::remove_file(tree.join("zzz.txt")).expect("the fixture removes")
+                }
+                // And it is back before the end.
+                "zzzz.txt" => {
+                    std::fs::write(tree.join("zzz.txt"), "back again\n")
+                        .expect("the fixture writes");
+                }
+                _ => {}
+            }
+        }) as Interference),
+    );
 }
 
 /// KR-REQ-14.32: the user's own checkout, a workspace a live session started in a tree of, and a

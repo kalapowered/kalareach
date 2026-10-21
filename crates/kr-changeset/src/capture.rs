@@ -335,9 +335,10 @@ impl QuiescenceLease for ProjectLease {
 
     fn excludes(&self) -> String {
         "no diff apply, workspace creation or removal, project creation, staging cleanup or \
-         agent-tool installation of this host ran against this working tree or any tree this \
-         host records for its repository, and no session this host started in a directory of \
-         those trees was alive (a session is counted by the directory it started in)"
+         agent-tool installation or removal of this host ran against this working tree or any \
+         tree this host recorded for its repository when the reservation was granted, and no \
+         session this host started in a directory of those trees was alive (a session is \
+         counted by the directory it started in)"
             .to_owned()
     }
 
@@ -3491,7 +3492,10 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
                 .into(),
             });
         }
-        let before_written = modified_at(&file);
+        // What the file was before any of it was read: its identity, length and instants, the time
+        // the inode last changed among them. An overwrite that puts the modification time back
+        // cannot put that one back.
+        let before_witness = witness_of(&file);
         let executable = is_executable(&file);
         let mut bytes = Vec::with_capacity(usize::try_from(before_len).unwrap_or(0));
         // Bounded by one more byte than the bound, so a file that grows while it is being read is
@@ -3523,9 +3527,9 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
             });
         }
         // The same open handle is asked again, so what is compared is the object this host read
-        // rather than whatever the name now resolves to. The modification instant is compared
-        // beside the length, because an overwrite in place of the same number of bytes changes
-        // neither the identity nor the length and is exactly the change a reader would miss.
+        // rather than whatever the name now resolves to. Every instant is compared beside the
+        // length, because an overwrite in place of the same number of bytes changes neither the
+        // identity nor the length and is exactly the change a reader would miss.
         let after_len = match file.revalidate() {
             Ok(length) => length,
             Err(error) => {
@@ -3539,13 +3543,12 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
         if file.identity() == before_identity
             && after_len == before_len
             && after_len == bytes.len() as u64
-            && modified_at(&file) == before_written
+            && witness_of(&file) == before_witness
         {
-            let witness = witness_of(&file);
             return Ok(WorkingReading {
                 read: WorkingRead::Content { bytes, executable },
                 changed_while_reading,
-                witness: Some(witness),
+                witness: Some(before_witness),
             });
         }
         // Whatever the next attempt reads, this file was written while this host was reading the
