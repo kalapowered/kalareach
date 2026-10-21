@@ -525,12 +525,19 @@ async fn restarted_after(
     between: impl FnOnce(&kr_ipc::paths::EnvironmentPaths),
 ) -> Host {
     let Host {
-        _temp, controller, ..
+        _temp,
+        controller,
+        work,
+        ..
     } = host;
     drop(controller);
     apart.end();
     between(&_temp.environment());
-    working_host_on(_temp, |supervisor| supervisor).await
+    // The repositories and workspaces the test made are in the working directory, and the new
+    // daemon finds them where they were.
+    let mut restarted = working_host_on(_temp, |supervisor| supervisor).await;
+    restarted.work = work;
+    restarted
 }
 
 /// Starts a daemon on an environment and on `clocks`, waiting out one that is still letting go of
@@ -6683,7 +6690,9 @@ async fn a_restarted_daemon_does_not_count_a_session_that_ended_while_it_was_dow
         let registry = rusqlite::Connection::open(environment.registry_database())
             .expect("the registry opens while no daemon runs");
         let worker: i64 = registry
-            .query_row("SELECT pid FROM reservations", [], |row| row.get(0))
+            .query_row("SELECT launcher_pid FROM reservations", [], |row| {
+                row.get(0)
+            })
             .expect("the one session's worker was recorded");
         let worker = rustix::process::Pid::from_raw(i32::try_from(worker).expect("a process"))
             .expect("a process number");
