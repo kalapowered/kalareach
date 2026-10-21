@@ -6059,9 +6059,9 @@ answered by the native client alone.
 
 A request belongs to the package whose table recorded it, and that package is kept with the
 request's source. A connection identifier keeps the package it recorded requests under for good,
-across a restart too, which reads it back from the ledger: the identifier is never restored under
-another package's tables, so any answer to its requests, the native client's included, goes out on
-a connection that reads that package's table. Only a binding of that package, at the same bytes,
+across a restart too, which reads it back from the ledger: nothing reads its requests under another
+package's tables, so any answer to its requests, the native client's included, goes out on a
+connection that reads that package's table. Only a binding of that package, at the same bytes,
 interprets a request, and a rich answer to it needs the binding that interpreted it to run that
 package still: a binding identifier names one package for as long as it is bound, and one bound
 again after a restart to another package answers nothing the first interpreted.
@@ -6191,7 +6191,7 @@ The terminal is watched as a process, for as long as it runs. A socket reaching 
 process behind it exiting are two events in either order, and neither bounds the other: a terminal
 can close its connection and go on running for an hour, and a terminal whose connection stays open
 can exit at once. So what decides is the process, and the watch outlives the connection: a terminal
-that exits long after its attachment closed still ends its instance.
+that exits long after its connection closed still ends its instance.
 
 ## The gateway
 
@@ -6310,6 +6310,18 @@ waiting for a reply that is not coming. A reply that cannot be handed to the ter
 connection: a person who would never learn what their request did is not something to carry on
 through.
 
+The end of a connection settles what it left. Nothing reopens a closed connection, and the pinned
+terminal exits when its connection drops, so the host treats the upstream of an ended connection as
+holding nothing and reconciles what the connection left unresolved against that: a request no answer
+went for is cancelled, and one an answer went for and nothing confirmed is uncertain and is never
+asked again.
+The settlement is made while the connection still observes its instance, so the session's attached
+views are told, and the ledger keeps every record. A view that cannot be told within a short bound
+is told to resynchronise instead, which covers what it missed. A client that answers a settled
+request is told it is resolved, and nothing is written to any upstream. A settlement the store
+cannot record is kept in memory as a transition of the gap, and a recovery commits it. Not claimed:
+Windows, where no gateway runs.
+
 Every durable change a resource undergoes is committed with the record that announces it, in one
 transaction, because a crash between the two would lose an event about a change that did happen.
 That covers the three the broker makes: recording the request, marking that an answer has gone, and
@@ -6395,9 +6407,9 @@ The request is recorded, what to do about it is decided, and the one admission t
 with the dispatch marker committed, all under the broker's one lock and all before the operation
 runs. No native answer and no rich answer can take that admission afterwards, so this host's answer
 is the only one the upstream receives. A process that ends after the marker leaves the request
-uncertain when it restarts: a reconciliation keeps it uncertain rather than answerable, and the same
-request sent again on the restored connection is refused as the request it already is. Nothing
-performs it a second time.
+claimed with its marker when it restarts, with its one admission spent, so no writer takes it
+again. Nothing reopens the old connection, and a restarted worker numbers its connections above
+every identifier its ledger holds, so nothing performs it a second time.
 
 The operation runs away from the connection's readers, so a slow or stalled file holds its own
 thread and nothing the upstream or the terminal says behind it. It has a deadline, and at the
@@ -6425,15 +6437,15 @@ takes, so a store that fails under either of them fences rich work on the receip
 broker alike. The condition also counts the faults it has opened, and the broker applies one it
 missed even when the journal has already recovered from it: a fault is a gap whether or not the
 broker was asked anything while it lasted, and one that opens during a recovery sends that recovery
-back to the fence under a new generation.
+back to the fence.
 
 When the store fails the gateway enters `native_only_volatile`, atomically and in memory: rich work
 is fenced, every unresolved resource is marked volatile, the identifiers already claimed or
 dispatched are counted and carried, and the gap is opened. Nothing is written on the way in, and
 nothing that holds the broker's lock writes to the store while the fence is up: a write that needs
-its record, such as binding a component, changing a grant, a launch profile, an adapter's
-checkpoint or an ordinary reconciliation, is refused before the store is reached. So nothing native
-waits on the store that failed; the gap is written when the store recovers.
+its record, such as binding a component, changing a grant, a launch profile or an adapter's
+checkpoint, is refused before the store is reached. So nothing native waits on the store that
+failed; the gap is written when the store recovers.
 
 What continues is the qualified native forwarding path and its in-memory arbitration. A native
 request, the terminal's answer to one, the terminal's own requests and this host's answers to
@@ -6441,9 +6453,10 @@ reverse requests all go on, and a failure met under one of them is carried on in
 transition of the gap rather than refused. So is the record of something that has already
 happened, such as an answer whose bytes went before the store refused its settlement. What stops is
 everything rich: a new interpretation, a rich mutation, a rich approval and a rich answer that was
-admitted and not yet sent are all refused with `UPSTREAM_UNAVAILABLE`, because the caller needs to
-know that this operation cannot reach the upstream now and that no second backend was opened to
-make it look as though it did. A reverse write is refused too, because the marker that has to
+admitted and not yet sent are all refused, because the caller needs to know that this operation
+cannot reach the upstream now and that no second backend was opened to make it look as though it
+did. The broker refuses them with `UPSTREAM_UNAVAILABLE`; a typed request through the worker's
+receipt path is refused earlier, as `STORAGE_UNAVAILABLE`. A reverse write is refused too, because the marker that has to
 precede it cannot be recorded; a reverse read still runs. Nothing is relabelled: a rich client is
 still a rich client and still cannot forward.
 
@@ -6460,8 +6473,8 @@ connection of its own, off the broker's lock, while the fence stays up: native w
 the store takes the write, and what that work changed is written by another pass before the fence
 comes down. A failure part way leaves the fence in place, and the next pass starts again. The
 gateway is then *recovering*, which admits no rich work; what ends that is reconciling the pending
-identifiers with **every** upstream that still had one, and rich work returns with the last of them,
-after the gap's final accounting is written. The reconciliations and that final accounting are
+identifiers of **every** connection that still had one, and rich work returns with the last of
+them, after the gap's final accounting is written. The reconciliations and that final accounting are
 written under the broker's lock, because they and the fence coming down are one decision, and they
 take the store's lock without waiting for it: a store another connection is writing refuses them at
 once, is not counted as failed, and leaves the finish to a later pass.
@@ -6469,14 +6482,19 @@ once, is not counted as failed, and leaves the finish to a later pass.
 A connection that stayed open through the whole gap has carried every frame of it in both
 directions, so what its upstream still holds is what the host holds for it, unresolved; the host
 reconciles it with that once none of its answers is still in flight. A connection that closed at
-any point since the fence went up, including one later restored, is reconciled only when its
-upstream says what it still holds. A reconciliation prepared under a recovery that failed is
-refused before it writes anything, so it changes neither a live resource nor its record.
+any point since the fence went up settled what it left at its end, as a connection that closes in
+normal operation does, so a recovery waits for none that has closed. If the store refused that
+settlement, the recovery's pass makes it: a connection that is not open is reconciled as an
+upstream that holds nothing, its entry goes from what the recovery owes only once what it left is
+settled, and the pass stops at the first write the store refuses. Every transition of a settlement
+made inside a gap is marked volatile, including the ones planned before the store first refused a
+write.
 
-A worker that dies between the commit and the reconciliation comes back recovering, because what
-ends a recovery is an upstream and no upstream has spoken to the new process. Volatile operations
-are never replayed to manufacture durable history: a resource that lived through a gap says so for
-the rest of its life, and its later transitions are written down like anything else.
+A worker that dies between the commit and the reconciliation comes back recovering, with every
+connection it owed gone with the process that held them, so its first pass settles what they left
+and finishes the recovery. Volatile operations are never replayed to manufacture durable history: a
+resource that lived through a gap says so for the rest of its life, and its later transitions are
+written down like anything else.
 
 ## The local listener
 
