@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::num::NonZeroU64;
 
 use kr_protocol::update::{MANIFEST_FILE, SignedMembers};
+use tough::schema::key::Key;
 use tough::schema::{Role, RoleType, Root, Signature, Signed};
 use tough::sign::Sign;
 
@@ -64,6 +65,21 @@ pub enum SignError {
     Key(String),
 }
 
+/// A key as it is, whatever its description says: the kind of key and its decoded public bytes.
+///
+/// The Update Framework names a key by a digest of its description, so the spelling of the public
+/// value (hexadecimal in either case), a member added to the description and the name of an
+/// elliptic-curve key's type all change the name and leave the key as it was.
+fn key_material(key: &Key) -> (&'static str, Vec<u8>) {
+    match key {
+        Key::Rsa { keyval, .. } => ("rsa", keyval.public.to_vec()),
+        Key::Ed25519 { keyval, .. } => ("ed25519", keyval.public.to_vec()),
+        Key::Ecdsa { keyval, .. } | Key::EcdsaOld { keyval, .. } => {
+            ("ecdsa", keyval.public.to_vec())
+        }
+    }
+}
+
 /// Checks that no role of `root` names one key under two identifiers.
 ///
 /// # Errors
@@ -79,14 +95,13 @@ pub fn check_root_keys(root: &Root) -> Result<(), VerifyError> {
             if !identifiers.insert(identifier) {
                 continue;
             }
-            if let Some(key) = root.keys.get(identifier) {
-                // A key is what its value says it is, whatever else its description holds: the
-                // members added to a description change its identifier and not the key.
-                let value = serde_json::to_value(key)
-                    .ok()
-                    .and_then(|description| description.get("keyval").cloned());
-                material.insert(value.map_or_else(|| format!("{identifier:?}"), |v| v.to_string()));
-            }
+            // A key the root does not describe is named by nothing a signature could be counted
+            // against, so it stands for itself.
+            let found = root
+                .keys
+                .get(identifier)
+                .map_or_else(|| (role_name(*role), identifier.to_vec()), key_material);
+            material.insert(found);
         }
         if material.len() != identifiers.len() {
             return Err(VerifyError::ReusedKey {

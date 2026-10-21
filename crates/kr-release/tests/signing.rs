@@ -90,57 +90,95 @@ fn a_threshold_of_two_is_met_by_two_keys_and_not_by_one() {
     ));
 }
 
-/// KR-REQ-26.41: one key the root describes twice is one key. The second description carries a
-/// member the first does not, which gives it another identifier and the same key; with a threshold
-/// of two, one private key would sign for both. The root is refused before a signature is counted.
+/// One key described again in each way that changes its name and not the key: a member added to
+/// the description, a member added to the value, and the public value spelled in capitals.
+fn described_again(key: &Key) -> Vec<(&'static str, Key)> {
+    let mut outer = key.clone();
+    if let Key::Ed25519 { _extra, .. } = &mut outer {
+        _extra.insert("note".to_owned(), serde_json::json!("again"));
+    }
+    let altered = |change: &dyn Fn(&mut serde_json::Value)| {
+        let mut value = serde_json::to_value(key).expect("a description");
+        change(&mut value);
+        serde_json::from_value::<Key>(value).expect("a key")
+    };
+    vec![
+        ("a member of the description", outer),
+        (
+            "a member of the value",
+            altered(&|value| value["keyval"]["note"] = serde_json::json!("again")),
+        ),
+        (
+            "the public value in capitals",
+            altered(&|value| {
+                let public = value["keyval"]["public"]
+                    .as_str()
+                    .expect("hexadecimal")
+                    .to_uppercase();
+                value["keyval"]["public"] = serde_json::json!(public);
+            }),
+        ),
+    ]
+}
+
+/// KR-REQ-26.41: one key the root describes twice is one key, however the second description
+/// differs. Each way gives it another identifier and the same key; with a threshold of two, one
+/// private key would sign for both. The root is refused before a signature is counted.
 #[test]
 fn one_key_described_twice_does_not_meet_a_threshold_of_two() {
     let only = pair();
     let plain = tuf_key(&only);
-    let mut described_again = plain.clone();
-    if let Key::Ed25519 { _extra, .. } = &mut described_again {
-        _extra.insert("note".to_owned(), serde_json::json!("again"));
+    for (how, again) in described_again(&plain) {
+        let root = root_with(&[plain.clone(), again.clone()], 2);
+        assert_ne!(
+            plain.key_id().expect("an identifier"),
+            again.key_id().expect("an identifier"),
+            "the two descriptions have two names: {how}"
+        );
+
+        let written = members("kalareach-release");
+        let canonical = {
+            use tough::schema::Role;
+            Role::canonical_form(&kr_release::Signable(written.clone())).expect("canonical")
+        };
+        let signature = |key: &Key| Signature {
+            keyid: key.key_id().expect("an identifier"),
+            sig: only.sign(&canonical).as_ref().to_vec().into(),
+        };
+        let document = serde_json::json!({
+            "signed": written,
+            "signatures": [signature(&plain), signature(&again)],
+        })
+        .to_string();
+
+        assert!(
+            matches!(
+                verify_manifest(&root, document.as_bytes()),
+                Err(VerifyError::ReusedKey { role: "targets" })
+            ),
+            "{how}"
+        );
+        assert!(
+            matches!(
+                check_root_keys(&root),
+                Err(VerifyError::ReusedKey { role: "targets" })
+            ),
+            "{how}"
+        );
+
+        // The same two descriptions cannot sign a successor root for a trusted root that names them.
+        let next = Signed {
+            signed: root_with(&[tuf_key(&pair())], 1),
+            signatures: vec![signature(&plain), signature(&again)],
+        };
+        assert!(
+            matches!(
+                verify_root_by(&root, &next),
+                Err(VerifyError::ReusedKey { .. })
+            ),
+            "{how}"
+        );
     }
-    let root = root_with(&[plain.clone(), described_again.clone()], 2);
-    assert_ne!(
-        plain.key_id().expect("an identifier"),
-        described_again.key_id().expect("an identifier"),
-        "the two descriptions have two names"
-    );
-
-    let written = members("kalareach-release");
-    let canonical = {
-        use tough::schema::Role;
-        Role::canonical_form(&kr_release::Signable(written.clone())).expect("canonical")
-    };
-    let signature = |key: &Key| Signature {
-        keyid: key.key_id().expect("an identifier"),
-        sig: only.sign(&canonical).as_ref().to_vec().into(),
-    };
-    let document = serde_json::json!({
-        "signed": written,
-        "signatures": [signature(&plain), signature(&described_again)],
-    })
-    .to_string();
-
-    assert!(matches!(
-        verify_manifest(&root, document.as_bytes()),
-        Err(VerifyError::ReusedKey { role: "targets" })
-    ));
-    assert!(matches!(
-        check_root_keys(&root),
-        Err(VerifyError::ReusedKey { role: "targets" })
-    ));
-
-    // The same two descriptions cannot sign a successor root for a trusted root that names them.
-    let next = Signed {
-        signed: root_with(&[tuf_key(&pair())], 1),
-        signatures: vec![signature(&plain), signature(&described_again)],
-    };
-    assert!(matches!(
-        verify_root_by(&root, &next),
-        Err(VerifyError::ReusedKey { .. })
-    ));
 }
 
 /// KR-REQ-26.12: metadata signed by an authorised key that is not a release's manifest is not
