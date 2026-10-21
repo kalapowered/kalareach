@@ -46,6 +46,12 @@ pub enum VerifyError {
         /// The role.
         role: &'static str,
     },
+    /// A role of the root names a key that is not an Ed25519 key of 32 bytes.
+    #[error("the root names a key for its {role} role that is not an Ed25519 key of 32 bytes")]
+    UnsupportedKey {
+        /// The role.
+        role: &'static str,
+    },
     /// Fewer distinct keys than the role's threshold signed.
     #[error("it is not signed by the number of keys the root names for the role")]
     Threshold,
@@ -65,26 +71,29 @@ pub enum SignError {
     Key(String),
 }
 
-/// A key as it is, whatever its description says: the kind of key and its decoded public bytes.
+/// The public bytes of a release key, which is an Ed25519 key of exactly 32 bytes and nothing else.
 ///
 /// The Update Framework names a key by a digest of its description, so the spelling of the public
-/// value (hexadecimal in either case), a member added to the description and the name of an
-/// elliptic-curve key's type all change the name and leave the key as it was.
-fn key_material(key: &Key) -> (&'static str, Vec<u8>) {
+/// value (hexadecimal in either case), a member added to the description and the name of the
+/// key's type all change the name and leave the key as it was. The library that checks a signature
+/// reads one Ed25519 key from its 32 raw bytes or from the 44 bytes of its `SubjectPublicKeyInfo`,
+/// an RSA key in two encodings and an elliptic-curve point compressed or not, so the bytes of one
+/// key can differ too. A root that names only keys of one kind in one encoding gives a key one
+/// spelling, and two names for it are found by comparing bytes.
+fn release_key(key: &Key) -> Option<[u8; 32]> {
     match key {
-        Key::Rsa { keyval, .. } => ("rsa", keyval.public.to_vec()),
-        Key::Ed25519 { keyval, .. } => ("ed25519", keyval.public.to_vec()),
-        Key::Ecdsa { keyval, .. } | Key::EcdsaOld { keyval, .. } => {
-            ("ecdsa", keyval.public.to_vec())
-        }
+        Key::Ed25519 { keyval, .. } => <[u8; 32]>::try_from(&*keyval.public).ok(),
+        Key::Rsa { .. } | Key::Ecdsa { .. } | Key::EcdsaOld { .. } => None,
     }
 }
 
-/// Checks that no role of `root` names one key under two identifiers.
+/// Checks that no role of `root` names one key under two identifiers, and that every key a role
+/// names is a release key.
 ///
 /// # Errors
 ///
-/// Returns [`VerifyError::ReusedKey`] naming the first role that does.
+/// Returns [`VerifyError::ReusedKey`] naming the first role that names a key twice, and
+/// [`VerifyError::UnsupportedKey`] naming the first role that names a key of another kind or size.
 pub fn check_root_keys(root: &Root) -> Result<(), VerifyError> {
     let mut roles: Vec<_> = root.roles.iter().collect();
     roles.sort_by_key(|(role, _)| role_name(**role));
@@ -97,10 +106,17 @@ pub fn check_root_keys(root: &Root) -> Result<(), VerifyError> {
             }
             // A key the root does not describe is named by nothing a signature could be counted
             // against, so it stands for itself.
-            let found = root
-                .keys
-                .get(identifier)
-                .map_or_else(|| (role_name(*role), identifier.to_vec()), key_material);
+            let found = match root.keys.get(identifier) {
+                Some(key) => (
+                    "key",
+                    release_key(key)
+                        .ok_or(VerifyError::UnsupportedKey {
+                            role: role_name(*role),
+                        })?
+                        .to_vec(),
+                ),
+                None => ("identifier", identifier.to_vec()),
+            };
             material.insert(found);
         }
         if material.len() != identifiers.len() {
@@ -128,8 +144,8 @@ const fn role_name(role: RoleType) -> &'static str {
 ///
 /// # Errors
 ///
-/// Returns [`VerifyError`] for a document that is not an envelope, a root that reuses a key, or
-/// signatures short of the threshold.
+/// Returns [`VerifyError`] for a document that is not an envelope, a root that reuses a key or names
+/// one that is not a release key, or signatures short of the threshold.
 pub fn verify_manifest(root: &Root, document: &[u8]) -> Result<SignedMembers, VerifyError> {
     let signed: Signed<Signable> =
         serde_json::from_slice(document).map_err(VerifyError::Document)?;

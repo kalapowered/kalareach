@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 
-use aws_lc_rs::signature::Ed25519KeyPair;
+use aws_lc_rs::signature::{
+    ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, Ed25519KeyPair, KeyPair,
+};
 use kr_protocol::update::SignedMembers;
 use kr_release::{VerifyError, check_root_keys, sign_manifest, verify_manifest, verify_root_by};
 use tough::schema::key::Key;
@@ -179,6 +181,87 @@ fn one_key_described_twice_does_not_meet_a_threshold_of_two() {
             "{how}"
         );
     }
+}
+
+/// A key as the root's key table writes it, with the public value spelled in hexadecimal.
+fn described(kind: &str, scheme: &str, public: &[u8]) -> Key {
+    let hex: String = public.iter().map(|byte| format!("{byte:02x}")).collect();
+    serde_json::from_value(serde_json::json!({
+        "keytype": kind,
+        "keyval": { "public": hex },
+        "scheme": scheme,
+    }))
+    .expect("a key")
+}
+
+/// KR-REQ-26.41: the library that checks a signature reads one key in more than one encoding: an
+/// Ed25519 key as its 32 raw bytes or wrapped in its 44-byte `SubjectPublicKeyInfo`, and an
+/// elliptic-curve key as a compressed or an uncompressed point. A root that names one key under two
+/// of them has two names for one private key, and a threshold of two would count that key twice. A
+/// release key is an Ed25519 key of 32 bytes and nothing else, so no key has two spellings: the
+/// root is refused before a signature is counted.
+#[test]
+fn a_key_that_is_not_an_ed25519_key_of_32_bytes_is_refused() {
+    let only = pair();
+    let plain = tuf_key(&only);
+    let raw = only.public_key().as_ref().to_vec();
+    assert_eq!(raw.len(), 32);
+
+    // The same Ed25519 key in its 44-byte wrapper: one private key signs under both names.
+    let spki_prefix = [
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    let wrapped = described(
+        "ed25519",
+        "ed25519",
+        &[spki_prefix.as_slice(), &raw].concat(),
+    );
+    let root = root_with(&[plain.clone(), wrapped.clone()], 2);
+    let written = members("kalareach-release");
+    let canonical = {
+        use tough::schema::Role;
+        Role::canonical_form(&kr_release::Signable(written.clone())).expect("canonical")
+    };
+    let signature = |key: &Key| Signature {
+        keyid: key.key_id().expect("an identifier"),
+        sig: only.sign(&canonical).as_ref().to_vec().into(),
+    };
+    let document = serde_json::json!({
+        "signed": written,
+        "signatures": [signature(&plain), signature(&wrapped)],
+    })
+    .to_string();
+    let verdict = verify_manifest(&root, document.as_bytes()).map(|_| "accepted");
+    assert!(
+        matches!(
+            verdict,
+            Err(VerifyError::UnsupportedKey { role: "targets" })
+        ),
+        "an Ed25519 key in a wrapper: {verdict:?}"
+    );
+
+    // One elliptic-curve key as an uncompressed point and as a compressed one.
+    let random = aws_lc_rs::rand::SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &random)
+        .expect("an elliptic-curve key");
+    let curve = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref())
+        .expect("a key pair");
+    let point = curve.public_key().as_ref().to_vec();
+    assert_eq!(point.len(), 65);
+    let mut compressed = vec![if point[64] & 1 == 0 { 0x02 } else { 0x03 }];
+    compressed.extend_from_slice(&point[1..33]);
+    let root = root_with(
+        &[
+            described("ecdsa", "ecdsa-sha2-nistp256", &point),
+            described("ecdsa", "ecdsa-sha2-nistp256", &compressed),
+        ],
+        2,
+    );
+    let verdict = check_root_keys(&root);
+    assert!(
+        matches!(verdict, Err(VerifyError::UnsupportedKey { .. })),
+        "an elliptic-curve key as two points: {verdict:?}"
+    );
 }
 
 /// KR-REQ-26.12: metadata signed by an authorised key that is not a release's manifest is not

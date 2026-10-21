@@ -137,8 +137,9 @@ The tree is complete, and every step that changes a file has run, before the man
 the platform's signature changes the bytes the manifest's digests cover. `sign` assembles the
 manifest again, refuses a `release.json` that is not what the tree makes, and signs it with each
 key. The channel's root names the keys that may sign and how many must; a release signed by one
-key of a two-key threshold, or by one key described twice, does not verify, and a root that names
-one key under two identifiers in a role is refused. `verify` is a host's own check of a release:
+key of a two-key threshold, or by one key described twice, does not verify. A release key is an
+Ed25519 key of 32 bytes, the one spelling of a key; a root that names a key of another kind or
+size, or one key under two identifiers in a role, is refused. `verify` is a host's own check of a release:
 the signatures against the root, then every file against the manifest.
 
 `kr-release dev-keys --out DIR` makes a root and the keys for it. A run that proves the pipeline

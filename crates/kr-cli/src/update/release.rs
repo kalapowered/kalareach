@@ -183,12 +183,12 @@ impl ChannelRoot {
                     "the release's manifest is not a signed document: {}",
                     Shown::json(&error)
                 )),
-                kr_release::VerifyError::ReusedKey { .. } | kr_release::VerifyError::Threshold => {
-                    CliError::Other(Shown::said(
-                        "the release's manifest is not signed by the release keys the update \
+                kr_release::VerifyError::ReusedKey { .. }
+                | kr_release::VerifyError::UnsupportedKey { .. }
+                | kr_release::VerifyError::Threshold => CliError::Other(Shown::said(
+                    "the release's manifest is not signed by the release keys the update \
                          channel's root names",
-                    ))
-                }
+                )),
             },
         )?;
         members.manifest().map_err(|_| {
