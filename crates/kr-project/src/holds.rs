@@ -343,12 +343,13 @@ impl WorkspaceHolds {
         let mut state = self.state();
         let now = (self.moment)();
         state.expire(now);
-        if let Some((what, _)) = state
+        if let Some(what) = state
             .writers
             .values()
             .find(|(_, footprint)| writer_meets(footprint, &reach))
+            .map(|(what, _)| *what)
         {
-            return Err(Refusal::WriterAtWork(*what));
+            return Err(Refusal::WriterAtWork(what));
         }
         let sessions = state
             .sessions

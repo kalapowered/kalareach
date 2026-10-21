@@ -680,10 +680,7 @@ pub fn capture(
         // Each file read from the working tree is looked at once more, now that every reading is
         // done, and a file that is not the one that was read is this host's own evidence that the
         // reservation did not keep every writer off.
-        if reservation == Reservation::Held
-            && let Some(difference) = witnessed_change(repository, &witnesses)
-        {
-            last_change = format!("{difference} after this host had read it");
+        if reservation == Reservation::Held && witnesses_differ(repository, &witnesses) {
             reservation.changed_underneath();
             if required_quiesced {
                 return Err(required_quiescence_refused(CHANGED));
@@ -3370,31 +3367,25 @@ fn witness_of(file: &kr_transfer::AuthorisedFile) -> Witness {
     }
 }
 
-/// Looks at every witnessed path once more, and says how the first one that differs differs.
+/// Looks at every witnessed path once more, and says whether any of them is not what it was.
 ///
 /// A path that cannot be opened is a difference, whatever the reason: this host cannot say the
 /// file is the one it read.
-fn witnessed_change(
-    repository: &OpenedRepository,
-    witnesses: &[(String, Witness)],
-) -> Option<String> {
+fn witnesses_differ(repository: &OpenedRepository, witnesses: &[(String, Witness)]) -> bool {
     let Ok(tree) = confined_tree(repository) else {
-        return Some("the working tree could not be opened again".to_owned());
+        return true;
     };
-    for (path, was) in witnesses {
+    witnesses.iter().any(|(path, was)| {
         let Ok(name) = RelativeName::parse(path) else {
-            return Some(format!("{path} could not be named again"));
+            return true;
         };
         let now = match tree.open_read(&name, ObjectPolicy::ReadableFile) {
             Ok(file) => witness_of(&file),
             Err(kr_transfer::Escape::NotFound { .. }) => Witness::Absent,
-            Err(_) => return Some(format!("{path} could not be opened again")),
+            Err(_) => return true,
         };
-        if &now != was {
-            return Some(format!("{path} was written, replaced or removed"));
-        }
-    }
-    None
+        &now != was
+    })
 }
 
 /// What a test runs immediately after one path's content has been read and before this host reads
@@ -3444,7 +3435,6 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
                     .to_owned(),
             ),
             changed_while_reading: false,
-
             witness: None,
         });
     };
@@ -3466,7 +3456,6 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
                 return Ok(WorkingReading {
                     read: WorkingRead::Unsupported(error.to_string()),
                     changed_while_reading,
-
                     witness: None,
                 });
             }
@@ -3487,7 +3476,6 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
                 return Ok(WorkingReading {
                     read: WorkingRead::Unreadable(error.to_string()),
                     changed_while_reading,
-
                     witness: None,
                 });
             }
@@ -3513,7 +3501,6 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
             return Ok(WorkingReading {
                 read: WorkingRead::Unreadable(error.to_string()),
                 changed_while_reading,
-
                 witness: None,
             });
         }
@@ -3545,7 +3532,6 @@ pub fn read_working_tree(repository: &OpenedRepository, path: &str) -> Result<Wo
                 return Ok(WorkingReading {
                     read: WorkingRead::Unreadable(error.to_string()),
                     changed_while_reading,
-
                     witness: None,
                 });
             }
