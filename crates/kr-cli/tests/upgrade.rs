@@ -2614,12 +2614,13 @@ async fn the_release_before_reads_the_journal_of_a_command_session_this_release_
     host.worker_ended(&updated.worker).await;
 }
 
-/// KR-REQ-26.07: the local window outlasts the public one. A host whose daemon states public major 2
-/// lists only major 2 to a device, so a device of major 1 is refused at the door; and in the same
-/// run that daemon adopts the live worker of the release before, which speaks major 1 and is at a
-/// level the daemon retains, and the session is kept: the worker is the process it was, the `kr` of
-/// release two, which states major 2, closes it through the daemon, and a client of major 1 is
-/// refused by that daemon.
+/// KR-REQ-26.07, KR-REQ-20.23: the local window outlasts the public one. A host whose daemon states
+/// public major 2 lists only major 2 to a device, so a device of major 1 is refused at the door; and
+/// in the same run that daemon adopts the live worker of the release before, which speaks major 1
+/// and is at a level the daemon retains, and the session is kept: the worker is the process it was,
+/// the `kr` of release two, which states major 2, closes it through the daemon, so the daemon of
+/// this release speaks the protocol of the worker that outlived the update, and a client of major 1
+/// is refused by that daemon.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_of_a_later_public_major_keeps_the_session_of_the_release_before() {
     let mut updated = Updated::on_the_network().await;
