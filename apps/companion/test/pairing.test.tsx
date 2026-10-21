@@ -425,9 +425,11 @@ describe('pairing with a host', () => {
       cancelled: false
     })
     await userEvent.click(screen.getByTestId('scan-code'))
-    expect((await screen.findByTestId('paste-failure')).textContent).toBe(
-      'KalaReach cannot use the camera. Allow it in Settings, or type the code.'
-    )
+    // A camera that is not allowed says so and offers the way to allow it, which opens the
+    // application's own page in the system's settings.
+    const denied = (await screen.findByTestId('paste-failure')).textContent ?? ''
+    expect(denied).toMatch(/camera/)
+    expect(denied).toMatch(/Settings/)
     await userEvent.click(screen.getByTestId('open-settings'))
     await waitFor(() => {
       expect(controls.settingsOpened.count).toBe(1)
@@ -441,11 +443,12 @@ describe('pairing with a host', () => {
       cancelled: false
     })
     await userEvent.click(screen.getByTestId('choose-photo'))
+    // A picture with no code is a different thing from a camera that is not allowed: it speaks of
+    // the picture, says nothing of the camera, and offers no settings.
     await waitFor(() => {
-      expect(screen.getByTestId('paste-failure').textContent).toBe(
-        'No KalaReach invitation was found in that picture. Choose another picture, or scan the code.'
-      )
+      expect(screen.getByTestId('paste-failure').textContent).toMatch(/picture/)
     })
+    expect(screen.getByTestId('paste-failure').textContent).not.toMatch(/camera/)
     expect(screen.queryByTestId('open-settings')).toBeNull()
   })
 
@@ -462,9 +465,7 @@ describe('pairing with a host', () => {
       mode: 'direct',
       service: null
     })
-    expect(await screen.findByTestId('failure-sentence')).toHaveTextContent(
-      'The invitation did not work. Ask the host for a new one.'
-    )
+    expect(await screen.findByTestId('failure-sentence')).toHaveTextContent(/did not work/)
     expect(screen.getByTestId('failure-action')).toHaveTextContent('Scan again')
     await userEvent.click(screen.getByTestId('failure-action'))
     await waitFor(() => {

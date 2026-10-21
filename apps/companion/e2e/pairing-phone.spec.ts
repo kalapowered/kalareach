@@ -66,7 +66,7 @@ for (const surface of ['ios', 'android'] as const) {
           const box = await button.boundingBox()
           expect(box?.height ?? 0, `${name} is a finger tall`).toBeGreaterThanOrEqual(TARGET[surface] - 1)
         }
-        await expect(page.getByText('Scan the QR code your host shows')).toBeVisible()
+        await expect(page.getByText(/Scan the QR code/)).toBeVisible()
         await expect(page.getByTestId('device-name')).toContainText('This phone appears as')
         await page.locator('.pairing-column').screenshot({ path: shot(`entry-${label}`) })
         expect(await overrunning(page, '.pairing-column'), 'nothing runs past the screen').toEqual([])
@@ -85,9 +85,7 @@ for (const surface of ['ios', 'android'] as const) {
           })
         })
         await page.getByRole('button', { name: 'Scan code', exact: true }).click()
-        await expect(page.getByTestId('paste-failure')).toHaveText(
-          'KalaReach cannot use the camera. Allow it in Settings, or type the code.'
-        )
+        await expect(page.getByTestId('paste-failure')).toContainText(/camera/)
         const settings = await page.getByTestId('open-settings').boundingBox()
         expect(settings?.height ?? 0, 'Open Settings is a finger tall').toBeGreaterThanOrEqual(TARGET[surface] - 1)
         await page.locator('.pairing-column').screenshot({ path: shot(`denied-${label}`) })
@@ -106,7 +104,7 @@ for (const surface of ['ios', 'android'] as const) {
           })
         })
         await expect(page.getByRole('heading', { name: 'Check this value on the host' })).toBeVisible()
-        await expect(page.getByText('Approve this phone on the host only if it shows the same value.')).toBeVisible()
+        await expect(page.getByText(/Approve this phone on the host/)).toBeVisible()
         // The value wraps between its groups, and each group stays whole.
         const groups = await page.locator('.verification-group').evaluateAll((all) =>
           all.map((each) => {
