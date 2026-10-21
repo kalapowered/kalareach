@@ -1358,6 +1358,15 @@ impl Drop for Second {
     }
 }
 
+/// The store record format the build before this one wrote, which this build reads and writes again
+/// in its own.
+const EARLIER_RECORD_FORMAT: u32 = kr_cli::update::RECORD_FORMAT - 1;
+
+/// A store's record that holds nothing, in the format this build writes.
+fn an_empty_record() -> String {
+    format!("{{\"format\":{}}}\n", kr_cli::update::RECORD_FORMAT)
+}
+
 impl Host {
     /// A tree with an empty store.
     fn create() -> Self {
@@ -1365,7 +1374,7 @@ impl Host {
         host.store
             .create_directories()
             .expect("the store's directories");
-        std::fs::write(host.store.record(), b"{\"format\":1}\n").expect("the store's record");
+        std::fs::write(host.store.record(), an_empty_record()).expect("the store's record");
         host
     }
 
@@ -1925,7 +1934,7 @@ impl Host {
             },
         });
         let record = serde_json::json!({
-            "format": 1,
+            "format": EARLIER_RECORD_FORMAT,
             "previous": null,
             "staged": two.name().as_str(),
             "update": {
