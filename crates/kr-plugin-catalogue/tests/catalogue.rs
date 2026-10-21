@@ -7289,6 +7289,9 @@ async fn a_verification_that_does_not_finish_leaves_the_accepted_checkpoint_as_i
     );
 }
 
+/// How long [`Slow`] takes over each package file.
+const MIRROR_PACE: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// Reads the local repository and takes its time over every package file, so time passes while a
 /// mirror fetches.
 #[derive(Clone, Debug)]
@@ -7305,7 +7308,7 @@ impl tough::Transport for Slow {
                 .lock()
                 .expect("the list")
                 .push(jiff::Timestamp::now());
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            tokio::time::sleep(MIRROR_PACE).await;
             if self
                 .absent
                 .is_some_and(|suffix| url.path().ends_with(suffix))
@@ -7348,13 +7351,16 @@ async fn the_time_a_mirror_saw_is_kept_with_the_trust_checkpoint() {
         catalogue.set_transport(Arc::new(slow.clone()));
         let outcome = catalogue.sync(&repository()).await;
         assert_eq!(outcome.is_ok(), absent.is_none(), "{absent:?}: {outcome:?}");
-        // The client reads its clock just before it asks for each file.
-        let last_fetch = *slow
-            .called
-            .lock()
-            .expect("the list")
-            .last()
-            .expect("the mirror fetched");
+        // The client reads its clock just before it asks for each file, and the transport takes
+        // its time over each file it is asked for. So the time the client read for the last file
+        // is later than the moment the file before it was asked for, and an earlier time is not.
+        let asked = slow.called.lock().expect("the list").clone();
+        assert!(
+            asked.len() >= 2,
+            "{absent:?}: the mirror asked for {} files, and the last two tell its times apart",
+            asked.len()
+        );
+        let before_last = asked[asked.len() - 2];
         let kept: jiff::Timestamp = serde_json::from_slice(
             &std::fs::read(
                 catalogue
@@ -7367,9 +7373,9 @@ async fn the_time_a_mirror_saw_is_kept_with_the_trust_checkpoint() {
         )
         .expect("a time");
         assert!(
-            last_fetch.duration_since(kept) < jiff::SignedDuration::from_millis(100),
-            "{absent:?}: the kept time {kept} is from before the mirror's last fetch at \
-             {last_fetch}"
+            kept > before_last,
+            "{absent:?}: the kept time {kept} is not later than the moment the file before the \
+             last was asked for, {before_last}"
         );
     }
 }
