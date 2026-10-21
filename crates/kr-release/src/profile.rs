@@ -2,10 +2,10 @@
 //!
 //! A release says it once, from the host's own tables: the arguments a shell is started with in
 //! each mode, and the startup files that hold the entry. The arguments name no option that skips or
-//! replaces a startup file of the person's, so every startup file runs in the order the shell reads
-//! them and the package's entry runs among them; the entries are put in files the shell reads
-//! itself. A person who moves a startup directory (`ZDOTDIR`, `XDG_CONFIG_HOME`) moves the entry
-//! with it, which the location says in the shell's own words.
+//! replaces a startup file of the person's, and the entries are put in files the shell reads
+//! itself; the order the shell reads its startup files in is the shell's, and is not stated. A
+//! person who moves a startup directory (`ZDOTDIR`, `XDG_CONFIG_HOME`) moves the entry with it,
+//! which the location says in the shell's own words.
 
 use std::path::{Path, PathBuf};
 
@@ -69,17 +69,21 @@ enum Reads {
 /// An argument that makes a shell skip or replace a startup file of the person's.
 fn skips_startup(argument: &str) -> bool {
     let lowered = argument.to_ascii_lowercase();
-    [
-        "-f",
-        "--norc",
-        "--noprofile",
-        "--no-config",
-        "--rcfile",
-        "--init-file",
-        "-noprofile",
-    ]
-    .iter()
-    .any(|skipping| lowered == *skipping || lowered.starts_with(&format!("{skipping}=")))
+    // Fish's `-N` is a capital: its `-n` is another option, and a lower-case comparison would take
+    // the two for one.
+    argument == "-N"
+        || [
+            "-f",
+            "--no-rcs",
+            "--norc",
+            "--noprofile",
+            "--no-config",
+            "--rcfile",
+            "--init-file",
+            "-noprofile",
+        ]
+        .iter()
+        .any(|skipping| lowered == *skipping || lowered.starts_with(&format!("{skipping}=")))
 }
 
 fn entries(kind: ShellKind) -> Result<Vec<(ProfileEntry, Reads)>> {
