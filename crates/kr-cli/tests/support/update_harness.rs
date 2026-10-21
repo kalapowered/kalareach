@@ -164,17 +164,22 @@ fn the_root() -> &'static str {
     ROOT.get_or_init(|| channel_root(1, &keys().root, &[&keys().root]))
 }
 
-/// A manifest's document, signed by `signer`.
+/// A manifest's document, signed by `signer` with the signer a release is built with.
 fn signed_document(manifest: &ReleaseManifest, signer: &Ed25519KeyPair) -> String {
     let members = SignedMembers::of(manifest).expect("members");
-    let canonical =
-        tough::schema::Role::canonical_form(&kr_cli::update::release::Signable(members.clone()))
-            .expect("canonical");
-    serde_json::json!({
-        "signed": members,
-        "signatures": [signature(signer, &canonical)],
+    // On a thread of its own, since a test that calls this may be inside a runtime already.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("a runtime")
+                    .block_on(kr_release::sign_manifest(&members, &[signer]))
+                    .expect("signed")
+            })
+            .join()
+            .expect("the signer finished")
     })
-    .to_string()
 }
 
 /* -------------------------------------------------------------------------------------------- */

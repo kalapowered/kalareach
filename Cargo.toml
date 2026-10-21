@@ -26,6 +26,7 @@ members = [
     "crates/kr-plugin-service",
     "crates/kr-project",
     "crates/kr-protocol",
+    "crates/kr-release",
     "crates/kr-shell-integration",
     "crates/kr-term",
     "crates/kr-term-probe",
@@ -145,6 +146,7 @@ kr-plugin-sdk = { path = "crates/kr-plugin-sdk", version = "=0.1.0" }
 kr-plugin-service = { path = "crates/kr-plugin-service", version = "=0.1.0" }
 kr-project = { path = "crates/kr-project", version = "=0.1.0" }
 kr-protocol = { path = "crates/kr-protocol", version = "=0.1.0" }
+kr-release = { path = "crates/kr-release", version = "=0.1.0" }
 kr-shell-integration = { path = "crates/kr-shell-integration", version = "=0.1.0" }
 kr-term = { path = "crates/kr-term", version = "=0.1.0" }
 kr-transfer = { path = "crates/kr-transfer", version = "=0.1.0" }

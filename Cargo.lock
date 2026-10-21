@@ -4395,6 +4395,7 @@ dependencies = [
  "kr-plugin-service",
  "kr-project",
  "kr-protocol",
+ "kr-release",
  "kr-service-stand-in",
  "kr-shell-integration",
  "kr-term",
@@ -4989,6 +4990,20 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "zeroize",
+]
+
+[[package]]
+name = "kr-release"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "jiff",
+ "kr-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tough",
 ]
 
 [[package]]

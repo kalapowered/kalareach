@@ -16,7 +16,6 @@
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
-use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};
 
 use kr_client::shown;
@@ -66,34 +65,6 @@ pub const fn this_target() -> &'static str {
     }
 }
 
-/// A release manifest as the release keys sign it: the manifest's own JSON, whole, members this
-/// build does not know included, so what is checked is exactly what was signed.
-///
-/// It is checked as The Update Framework checks a targets role: over its canonical JSON, by a
-/// threshold of the keys the channel root names for that role. The manifest's own `_type` is part
-/// of what is signed, which keeps a signature over the channel's targets metadata from passing for
-/// one over a release.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
-pub struct Signable(pub kr_protocol::update::SignedMembers);
-
-impl tough::schema::Role for Signable {
-    const TYPE: tough::schema::RoleType = tough::schema::RoleType::Targets;
-
-    /// A release does not expire: what it is stays what it was signed as.
-    fn expires(&self) -> jiff::Timestamp {
-        jiff::Timestamp::MAX
-    }
-
-    fn version(&self) -> NonZeroU64 {
-        NonZeroU64::MIN
-    }
-
-    fn filename(&self, _consistent_snapshot: bool) -> String {
-        MANIFEST_FILE.to_owned()
-    }
-}
-
 /// The update channel's root a release carries: The Update Framework's root metadata, which names
 /// the keys of each role and how many of each must sign.
 pub struct ChannelRoot {
@@ -129,7 +100,7 @@ impl ChannelRoot {
                     Shown::json(&error)
                 ))
             })?;
-        signed.signed.verify_role(&signed).map_err(|_| {
+        kr_release::verify_root_itself(&signed).map_err(|_| {
             CliError::Other(shown!(
                 "the update channel's root at {} is not signed by the root keys it names",
                 Shown::root(&path)
@@ -144,7 +115,7 @@ impl ChannelRoot {
     ///
     /// Returns a refusal when it is not signed by its own root keys.
     pub fn kept(signed: tough::schema::Signed<tough::schema::Root>) -> Result<Self> {
-        signed.signed.verify_role(&signed).map_err(|_| {
+        kr_release::verify_root_itself(&signed).map_err(|_| {
             CliError::Other(Shown::said(
                 "the update channel's root this host kept is not signed by the root keys it names",
             ))
@@ -190,7 +161,7 @@ impl ChannelRoot {
                 this_version
             )));
         }
-        self.signed.signed.verify_role(&next.signed).map_err(|_| {
+        kr_release::verify_root_by(&self.signed.signed, &next.signed).map_err(|_| {
             CliError::Other(Shown::said(
                 "the release's update channel root is not signed by the root keys this host \
                  trusts",
@@ -206,20 +177,21 @@ impl ChannelRoot {
     /// Returns a refusal when the document is not a signed manifest, or its signatures do not
     /// reach the threshold.
     pub fn verify(&self, document: &[u8]) -> Result<ReleaseManifest> {
-        let signed: tough::schema::Signed<Signable> =
-            serde_json::from_slice(document).map_err(|error| {
-                CliError::Other(shown!(
+        let members = kr_release::verify_manifest(&self.signed.signed, document).map_err(
+            |error| match error {
+                kr_release::VerifyError::Document(error) => CliError::Other(shown!(
                     "the release's manifest is not a signed document: {}",
                     Shown::json(&error)
-                ))
-            })?;
-        self.signed.signed.verify_role(&signed).map_err(|_| {
-            CliError::Other(Shown::said(
-                "the release's manifest is not signed by the release keys the update channel's \
-                 root names",
-            ))
-        })?;
-        signed.signed.0.manifest().map_err(|_| {
+                )),
+                kr_release::VerifyError::ReusedKey { .. } | kr_release::VerifyError::Threshold => {
+                    CliError::Other(Shown::said(
+                        "the release's manifest is not signed by the release keys the update \
+                         channel's root names",
+                    ))
+                }
+            },
+        )?;
+        members.manifest().map_err(|_| {
             CliError::Other(Shown::said(
                 "the release's manifest is not one this build reads, or lists files or stores a \
                  host cannot take",

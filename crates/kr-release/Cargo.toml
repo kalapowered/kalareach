@@ -1,0 +1,29 @@
+[package]
+name = "kr-release"
+description = "KalaReach's release signing: the one place a release manifest is signed and verified, and the tool that assembles a release's manifest and record from a built tree"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The key pairs a manifest is signed with, and the random source The Update Framework's signing
+# asks for.
+aws-lc-rs.workspace = true
+# The expiry a role states, which a release's has none of.
+jiff.workspace = true
+kr-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# The update channel's metadata, its signed envelope and its keys: the same implementation the
+# plugin catalogue verifies with, so one verifier stands behind both.
+tough.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt"] }
+
+[lints]
+workspace = true
