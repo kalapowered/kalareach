@@ -108,6 +108,7 @@ pub fn build(
         refuse!("{LOCK} keeps the classes {named:?}, and a release record keeps {CLASSES:?}");
     }
     let pinned_plugins = bundled_plugins_commit(checkout)?;
+    let enabled = capabilities(checkout, target)?;
 
     let mut classes = Vec::new();
     for name in CLASSES {
@@ -129,6 +130,15 @@ pub fn build(
                         "{name} is unavailable and does not say which capability the release leaves off, and why"
                     );
                 };
+                if enabled
+                    .iter()
+                    .any(|entry| entry["capability"] == capability.as_str())
+                {
+                    refuse!(
+                        "{name} is unavailable because the release leaves off {capability}, and an \
+                         agent build of this release enables it"
+                    );
+                }
                 json!({ "class": name, "state": "unavailable", "capability": capability, "reason": reason })
             }
             "pending" => {
@@ -149,7 +159,7 @@ pub fn build(
     Ok(json!({
         "format": 1,
         "classes": classes,
-        "capabilities": capabilities(checkout, target)?,
+        "capabilities": enabled,
     }))
 }
 

@@ -85,19 +85,23 @@ fn fixture(index: &Value) -> Fixture {
         })
         .to_string(),
     );
+    let index_text = index.to_string();
+    let targets_text = json!({ "signed": { "targets": { "index.json": { "hashes": { "sha256": hex(index_text.as_bytes()) } } } } })
+        .to_string();
     write(
         root,
         "bundled-plugins.lock",
-        &json!({ "source": { "commit": commit } }).to_string(),
+        &json!({
+            "source": { "commit": commit },
+            "metadata": [
+                { "path": "targets/index.json", "digest": hex(index_text.as_bytes()) },
+                { "path": "metadata/targets.json", "digest": hex(targets_text.as_bytes()) },
+            ],
+        })
+        .to_string(),
     );
-    let index_text = index.to_string();
     write(root, "bundled-plugins/targets/index.json", &index_text);
-    write(
-        root,
-        "bundled-plugins/metadata/targets.json",
-        &json!({ "signed": { "targets": { "index.json": { "hashes": { "sha256": hex(index_text.as_bytes()) } } } } })
-            .to_string(),
-    );
+    write(root, "bundled-plugins/metadata/targets.json", &targets_text);
     let lock = json!({
         "format": 1,
         "classes": {
@@ -121,8 +125,27 @@ fn fixture(index: &Value) -> Fixture {
     }
 }
 
+/// The catalogue index this repository bundles, whose one entry names no build.
 fn no_builds() -> Value {
-    json!({ "entries": [{ "plugin_id": "a/b", "version": "1.0.0", "capabilities": [{ "capability": "x.y" }], "qualification": [] }] })
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bundled-plugins/targets/index.json");
+    let mut index: Value =
+        serde_json::from_slice(&std::fs::read(path).expect("the index")).expect("an index");
+    index["entries"] = json!([index["entries"][0].clone()]);
+    index
+}
+
+/// A qualification result, as the signed index states one.
+fn qualification() -> Value {
+    json!({
+        "capability_id": "agent.approval.respond/1",
+        "capability_version": "1.0.0",
+        "subject": "claude 2.1.278",
+        "state": "version_qualified",
+        "source": "signed_record",
+        "profile_digest": "cd".repeat(32),
+        "statement": "every case of the version qualification passed",
+    })
 }
 
 fn edit_lock(fixture: &Fixture, edit: &dyn Fn(&mut Value)) {
@@ -287,14 +310,14 @@ fn a_build_whose_plugin_cites_no_qualification_enables_nothing() {
     // nothing is enabled.
     let mut index = no_builds();
     index["entries"][0]["builds"] = json!([build]);
-    index["entries"][0]["qualification"] = json!([{ "record": "notes#claude" }]);
+    index["entries"][0]["qualification"] = json!([qualification()]);
     let fixture = self::fixture(&index);
     let made = record::build(fixture.checkout.path(), TARGET, &elsewhere(&fixture), false)
         .expect("a record");
-    assert_eq!(made["capabilities"][0]["capability"], "x.y");
+    assert_eq!(made["capabilities"][0]["capability"], "metadata.match");
     assert_eq!(
-        made["capabilities"][0]["qualification"][0]["record"],
-        "notes#claude"
+        made["capabilities"][0]["qualification"][0]["subject"],
+        "claude 2.1.278"
     );
     let elsewhere_made = record::build(
         fixture.checkout.path(),
@@ -304,6 +327,85 @@ fn a_build_whose_plugin_cites_no_qualification_enables_nothing() {
     )
     .expect("a record");
     assert_eq!(elsewhere_made["capabilities"], json!([]));
+}
+
+/// KR-REQ-12.33, KR-REQ-01.26: the agent builds and the evidence a release cites are read from the
+/// index the bundled catalogue is locked to, as the catalogue reads it: an index other than the
+/// locked one, a result that is not a result, and a result that claims what a host alone can
+/// establish are each refused.
+#[test]
+fn the_index_a_release_cites_is_the_locked_one_and_a_catalogue_index() {
+    let mut index = no_builds();
+    index["entries"][0]["builds"] = json!([{
+        "application": "claude", "distribution": "npm", "version": "2.1.278",
+        "os": "mac_os", "architecture": "aarch64", "executable_digest": "ab".repeat(32),
+    }]);
+    index["entries"][0]["qualification"] = json!([qualification()]);
+    let fixture = fixture(&index);
+    let built = |fixture: &Fixture| {
+        record::build(fixture.checkout.path(), TARGET, &elsewhere(fixture), false)
+    };
+    built(&fixture).expect("the control: the locked index, with a result");
+
+    // An index that the lock does not pin: another generation's, put in beside the lock.
+    let path = fixture
+        .checkout
+        .path()
+        .join("bundled-plugins/targets/index.json");
+    let kept = std::fs::read(&path).expect("the index");
+    let mut moved = index.clone();
+    moved["generation"] = json!(99);
+    std::fs::write(&path, moved.to_string()).expect("moved");
+    // With the targets metadata brought along, so that only the lock stands against it.
+    let targets = fixture
+        .checkout
+        .path()
+        .join("bundled-plugins/metadata/targets.json");
+    let kept_targets = std::fs::read(&targets).expect("the metadata");
+    std::fs::write(
+        &targets,
+        json!({ "signed": { "targets": { "index.json": { "hashes": { "sha256": hex(moved.to_string().as_bytes()) } } } } })
+            .to_string(),
+    )
+    .expect("moved");
+    let refused = built(&fixture).expect_err("another index");
+    assert!(refused.to_string().contains("pins"), "{refused}");
+    std::fs::write(&path, kept).expect("put back");
+    std::fs::write(&targets, kept_targets).expect("put back");
+
+    // A result that is not one, and one that claims a capability is available on a host.
+    for (what, result) in [
+        ("a null", Value::Null),
+        ("a claim of host availability", {
+            let mut result = qualification();
+            result["state"] = json!("qualified_available");
+            result
+        }),
+    ] {
+        let mut index = index.clone();
+        index["entries"][0]["qualification"] = json!([result]);
+        let fixture = self::fixture(&index);
+        assert!(built(&fixture).is_err(), "{what}");
+    }
+}
+
+/// KR-REQ-01.26: a class the release says it leaves off for want of a capability does not name a
+/// capability an agent build of the release enables.
+#[test]
+fn a_class_left_off_does_not_name_a_capability_that_is_enabled() {
+    let mut index = no_builds();
+    index["entries"][0]["builds"] = json!([{
+        "application": "claude", "distribution": "npm", "version": "2.1.278",
+        "os": "mac_os", "architecture": "aarch64", "executable_digest": "ab".repeat(32),
+    }]);
+    index["entries"][0]["qualification"] = json!([qualification()]);
+    let fixture = fixture(&index);
+    edit_lock(&fixture, &|lock| {
+        lock["classes"]["service_limits"]["capability"] = json!("metadata.match");
+    });
+    let refused = record::build(fixture.checkout.path(), TARGET, &elsewhere(&fixture), false)
+        .expect_err("an enabled capability left off");
+    assert!(refused.to_string().contains("metadata.match"), "{refused}");
 }
 
 /// The record this repository's lock makes, with no other repository at hand: every class is

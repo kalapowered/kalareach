@@ -19,6 +19,9 @@ aws-lc-rs.workspace = true
 clap.workspace = true
 # The expiry a role states, which a release's has none of.
 jiff.workspace = true
+# The catalogue index and the rules it keeps, which the bundled index is read and held to exactly as
+# the catalogue reads it.
+kr-plugin-sdk.workspace = true
 kr-protocol.workspace = true
 # How a host starts each shell and where it puts its marked entry in the person's own startup
 # files, which a release states for each shell package it carries.
