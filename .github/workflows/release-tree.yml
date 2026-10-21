@@ -10,8 +10,10 @@ name: release-tree
 # it, signs the manifest with keys and a channel root that this run made, and then does with the
 # archive what a host does: checks it (`scripts/check-release-archive.py`), unpacks it, verifies its
 # signature and every file against the manifest, installs it into a store of its own, and starts the
-# Zsh package from the unpacked tree. No environment and no secret is read. What the run signs is not
-# a release, because no host trusts a root it made: the archive it keeps says so in its name.
+# Zsh package from the unpacked tree. On macOS it also installs, upgrades and removes the Homebrew
+# cask for it, and a `formula` job does the same with the formula on the Linux targets. No
+# environment and no secret is read. What the run signs is not a release, because no host trusts a
+# root it made: the archive it keeps says so in its name.
 #
 # On macOS the tree is signed ad hoc before its manifest is written, since a signature changes the
 # bytes a manifest covers, and each file is held to it. An ad hoc signature has no team, so it carries
@@ -326,30 +328,34 @@ jobs:
           COPYFILE_DISABLE=1 tar -C "$RUNNER_TEMP/next" -czf "$RUNNER_TEMP/next-archive/$top.tar.gz" "$top"
           echo "NEXT_ARCHIVE=$RUNNER_TEMP/next-archive/$top.tar.gz" >> "$GITHUB_ENV"
 
-      # What a package manager does with the archive, with Homebrew itself: a cask on macOS and a
-      # formula on Linux, installed from a tap of this run's own. The first command of the `kr` it
-      # links admits the release into a store, an upgrade leaves the release before it there, and a
-      # removal leaves both.
+      # What a package manager does with the archive, with Homebrew itself: a cask on macOS, installed
+      # from a tap of this run's own. The first command of the `kr` it links admits the release into a
+      # store, an upgrade leaves the release before it there, and a removal leaves both. The Linux
+      # formula is installed by the `formula` job below, on a runner whose C library Homebrew
+      # accepts: the floor-checked runner of this job is older, and Homebrew then builds its own
+      # toolchain to install anything.
       - name: Install, upgrade and remove it with Homebrew
+        if: runner.os == 'macOS'
         run: |
           brew="$(command -v brew || true)"
-          if [ -z "$brew" ] && [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
-            brew=/home/linuxbrew/.linuxbrew/bin/brew
-          fi
-          kind=formula
-          if [ "$RUNNER_OS" = macOS ]; then
-            kind=cask
-          fi
           if [ -z "$brew" ]; then
-            if [ "$RUNNER_OS" = macOS ]; then
-              echo "::error::this runner has no Homebrew, and the cask is installed with it"
-              exit 1
-            fi
-            echo "::notice::this runner has no Homebrew, so the formula is not installed here"
-            exit 0
+            echo "::error::this runner has no Homebrew, and the cask is installed with it"
+            exit 1
           fi
-          bash scripts/check-homebrew-install.sh --brew "$brew" --kind "$kind" \
+          bash scripts/check-homebrew-install.sh --brew "$brew" --kind cask \
             --first "$RUNNER_TEMP/archive/$TOP.tar.gz" --second "$NEXT_ARCHIVE"
+
+      # The two releases the `formula` job installs and upgrades between.
+      - name: Keep the two releases for the formula
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: formula-input-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/archive/${{ env.TOP }}.tar.gz
+            ${{ env.NEXT_ARCHIVE }}
+          retention-days: 1
+          if-no-files-found: error
 
       - name: Keep the archive this run proved
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -367,6 +373,52 @@ jobs:
           path: ${{ runner.temp }}/unsigned
           retention-days: 1
           if-no-files-found: error
+
+  # A Homebrew formula installed with Homebrew itself on the two Linux targets: the release the tree
+  # job built, then the one after it, then the removal. No environment and no secret.
+  formula:
+    name: the formula on ${{ matrix.target }}
+    needs: tree
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Take the two releases
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: formula-input-${{ matrix.target }}
+          path: ${{ runner.temp }}/releases
+
+      - name: Install, upgrade and remove it with Homebrew
+        run: |
+          brew="$(command -v brew || true)"
+          if [ -z "$brew" ] && [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+            brew=/home/linuxbrew/.linuxbrew/bin/brew
+          fi
+          if [ -z "$brew" ]; then
+            echo "::error::this runner has no Homebrew, and the formula is installed with it"
+            exit 1
+          fi
+          # The release before the other sorts first, as its version is the lower.
+          mapfile -t archives < <(ls "$RUNNER_TEMP"/releases/kalareach-*.tar.gz | sort)
+          if [ "${#archives[@]}" -ne 2 ]; then
+            echo "::error::the formula job was given ${#archives[@]} releases, and installs two"
+            exit 1
+          fi
+          bash scripts/check-homebrew-install.sh --brew "$brew" --kind formula \
+            --first "${archives[0]}" --second "${archives[1]}"
 
   sign:
     name: sign the tree of ${{ matrix.target }}

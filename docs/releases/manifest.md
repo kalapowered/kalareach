@@ -184,6 +184,8 @@ directory and never touches `versions/`.
 
 `scripts/check-homebrew-install.sh` installs a release with Homebrew itself from a tap of the run's
 own, upgrades it to the next release and removes it, and holds each of those to what the store says.
-The tree job runs it on the macOS and Linux runners, and a Homebrew in a directory of its own runs it
-on a machine that has none to spare. Opening a tap repository and submitting to winget's community
+The tree job runs it for the cask on the macOS runners, and the `formula` job runs it for the formula
+on Linux runners of a newer image than the floor-checked build, since Homebrew on an older one builds
+a toolchain of its own to install anything. A Homebrew in a directory of its own runs it on a machine
+that has none to spare. Opening a tap repository and submitting to winget's community
 repository are the project owner's to do.
