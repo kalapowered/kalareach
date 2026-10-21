@@ -2573,8 +2573,8 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
 
     // The control: a device that holds every right the first device's workflow needs except the
     // workflow-management grant is refused each of the five. It installs under its own grant, so
-    // the one thing it lacks is the management grant; the other four name the first device's
-    // workflow.
+    // the one thing it lacks is the management grant; enable, pause and run name the first
+    // device's workflow, and read names none.
     let viewer = net_support::Device::create().await;
     let viewer_record = net_support::pair_with(
         &host,

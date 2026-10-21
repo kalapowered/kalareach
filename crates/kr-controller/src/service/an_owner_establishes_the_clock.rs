@@ -942,7 +942,9 @@ async fn an_expired_grant_stays_out_in_a_new_boot_and_the_owners_establishment_k
         decides(&controller, &record_of(&lasts)),
         "a grant that has not run out is decided again"
     );
-    held_out(&controller);
+    // Read before anything asks about the grant, so that the record is shown as the establishment
+    // left it and not as a later question rewrote it. The establishment has no handle on the grant
+    // store, so this is a property of how it is wired, which this read would show broken.
     assert_eq!(
         controller
             .sharing()
@@ -952,6 +954,7 @@ async fn an_expired_grant_stays_out_in_a_new_boot_and_the_owners_establishment_k
         Some(stored_tombstone),
         "the establishment keeps the end on the stored grant's record"
     );
+    held_out(&controller);
     // The stored grant's own lifetime, now that the clock is proven again, is still over: the
     // wall clock reads before its expiry, and what keeps the grant out is what the host wrote
     // down when it ran out (its tombstone, and the floor the end was found at).
