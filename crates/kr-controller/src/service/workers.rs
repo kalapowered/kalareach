@@ -360,10 +360,6 @@ impl Controller {
         }
     }
 
-    pub(super) async fn read_from_worker(&self, worker: &KnownWorker) -> Result<SessionReadResult> {
-        self.read_from_worker_within(worker, None).await
-    }
-
     /// Reads a session from its worker, optionally giving the worker a bounded moment to answer.
     ///
     /// The bound belongs here rather than around the call. A request abandoned from outside would

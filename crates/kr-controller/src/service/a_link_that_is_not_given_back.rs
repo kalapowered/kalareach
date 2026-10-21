@@ -201,7 +201,7 @@ async fn a_read_dropped_part_way_gives_up_its_link() {
     let controller = Arc::clone(&silent.controller);
     let worker = silent.worker.clone();
     abandoned_part_way(&heard, 1, async move {
-        controller.read_from_worker(&worker).await
+        controller.read_from_worker_within(&worker, None).await
     })
     .await;
     the_link_was_given_up(&silent, &heard, 1).await;
@@ -848,7 +848,7 @@ async fn a_link_a_newer_generation_fenced_is_given_up_with_the_lease() {
     let _newer = served.a_newer_generation_takes_over().await;
 
     let refused = controller
-        .read_from_worker(&served.worker)
+        .read_from_worker_within(&served.worker, None)
         .await
         .expect_err("the worker refuses the old daemon's link");
     assert_eq!(

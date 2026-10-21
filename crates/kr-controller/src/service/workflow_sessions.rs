@@ -148,7 +148,7 @@ impl Controller {
     /// confirms delivery, which is what lets the worker stop the group, and watches for the
     /// worker to end. A session with no worker in the directory is closed already, was never
     /// launched, or has a worker that has not yet reported; its record, if there is one, is what
-    /// [`Self::workflow_session_closure`] reads.
+    /// [`Self::recorded_or_established_closure`] reads.
     ///
     /// Answers whether a worker was asked: `false` says the directory holds no worker for the
     /// session and nothing was sent. A caller that must see a session closed asks again until it
@@ -254,7 +254,12 @@ impl Controller {
         }
     }
 
-    /// The closure of a session, after asking whether its worker has gone.
+    /// The closure of a session: the one recorded, or, for a worker the kernel says has ended, the
+    /// one established for it.
+    ///
+    /// Asked by whoever is owed the state of a session whose worker cannot be reached: a workflow
+    /// node's dispatch and its sweep, a create ([`Self::closure_after_a_worker_could_not_be_reached`])
+    /// and a read.
     ///
     /// A command that ends takes its worker with it, and nothing records that on its own: this
     /// asks the kernel about the worker the registry holds, and only a worker the kernel says has
@@ -267,8 +272,10 @@ impl Controller {
     ///
     /// # Errors
     ///
-    /// Returns an error when the registry cannot be read.
-    pub(crate) async fn workflow_session_closure(
+    /// Returns an error when the registry cannot be read or written, when the descriptor of a
+    /// closed session cannot be removed, or when this daemon stops before it has finished a
+    /// closure it started.
+    pub(crate) async fn recorded_or_established_closure(
         self: &Arc<Self>,
         session_id: SessionId,
     ) -> Result<Option<ClosureRecord>> {
