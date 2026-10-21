@@ -9332,7 +9332,7 @@
             "$ref": "#/$defs/AgentChoice"
           },
           "default": {},
-          "description": "What the owner or an administrator wrote down for the agents of each package\n(`publisher/plugin`).\n\nSection 7 lets an agent whose own sandbox cannot nest under the session's job run under\nan **explicitly selected** reduced-ownership profile. A launch runs an agent under the\n`ownership` its profile records, and nothing reads this section for a launch: every\nprofile this host writes records `full`, and this host starts no agent through the\nworker's launch. So the section is validated, kept and reported as `agents.ownership`,\nand a change to it changes nothing a launch does. An entry names `reduced` or `full` for\none package, and nothing else; a package with no entry is `full`.",
+          "description": "What the owner or an administrator wrote down for the agents of each package\n(`publisher/plugin`).\n\nSection 7 lets an agent whose own sandbox cannot nest under the session's job run under\nan **explicitly selected** reduced-ownership profile. A launch runs an agent under the\n`ownership` its profile records, and nothing reads this section for a launch: every\nprofile this host writes records `full`, because the program of a command route runs in\nthe shell's own job and the worker starts only the application server a gateway route\ndeclares, as part of the session. So the section is validated, kept and reported as\n`agents.ownership`, and a change to it changes nothing a launch does. An entry names\n`reduced` or `full` for one package, and nothing else; a package with no entry is\n`full`.",
           "type": "object"
         },
         "authority": {
