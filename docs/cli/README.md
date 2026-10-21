@@ -1947,8 +1947,9 @@ first key.
 it. For each organisation the host is enrolled in, it shows the identifier of its first key, the key
 rotation is followed from, the highest key revision accepted and the enrolment revision that a grant
 requiring the organisation names. It shows the revision of the policy applied for the organisation
-and the adapters it allows, or that none is applied, and then the adapters the organisations' policies allow together. It shows
-the devices bound to member accounts of that organisation, and the lease last recorded for each. It also shows whether the host is exclusively
+and the adapters it allows, or that none is applied. It shows the devices bound to member accounts
+of that organisation, and the lease last recorded for each. After the organisations, it shows the
+adapters their policies allow together. It also shows whether the host is exclusively
 organisation-managed, and whether it trusts its clock. It shows each time exclusive management was
 turned off. It prints the device identifier, authorisation key and key identifier that a lease for the host's
 own local owner is signed for, and names each session whose worker cannot be told what that owner may do. A

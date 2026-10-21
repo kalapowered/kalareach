@@ -807,8 +807,8 @@ pub enum OrganisationCommand {
     /// verifies it under the key the organisation's chain ends with, refuses one at or below the
     /// revision it holds (the same policy again is a repeat), and applies the adapter allowlist
     /// the policy states: every enrolled organisation that states a list narrows what this host
-    /// admits to the adapters all the lists name. When the organisation has rotated its key since this host last followed it, `--chain`
-    /// gives the chain beside the policy.
+    /// admits to the adapters all the lists name. When the organisation has rotated its key since
+    /// this host last followed it, `--chain` gives the chain beside the policy.
     Policy(OrganisationPolicyArguments),
     /// Make this host exclusively organisation-managed, or end that.
     ///

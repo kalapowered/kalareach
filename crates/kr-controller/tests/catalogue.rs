@@ -4596,6 +4596,79 @@ mod native_bridges {
         assert!(bridge_facts(&host, &digest).is_some());
     }
 
+    /// KR-REQ-18.06: a list that is already in force is not waited for, and a list that a change
+    /// restored while an older put was under way is the one left in force. The put reads the list
+    /// again once it has set it: a change made meanwhile found the older list in force and was
+    /// answered, so the list it left is the one the host must hold. The control is a list that
+    /// names the package, which is kept, and the catalogue held by another change, which a put that
+    /// has something to change reports as busy.
+    ///
+    /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
+    /// platforms.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kr_req_18_06_the_list_the_policy_states_last_is_the_one_left_in_force() {
+        let site = Site::new();
+        let host = host(&site);
+        let digest = synchronised(&host).await;
+        let before = site.tree();
+        let _: wire::PluginInstallResult = installed_and_enabled(&host, &digest).await;
+        let placed = applied(&before, &host.working);
+        assert_eq!(site.tree(), placed, "applied");
+        let naming = |name: &str| {
+            Some(std::collections::BTreeSet::from([
+                PluginId::new(name).expect("a plugin identifier")
+            ]))
+        };
+        let soon = || tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+
+        // The policy states a list that leaves the package out when the put first reads it, and
+        // no list from then on, as it does when a newer change restores the list in force.
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let moved = host
+            .module
+            .put_allowed_adapters(
+                || {
+                    if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                        naming("kalareach/codex")
+                    } else {
+                        None
+                    }
+                },
+                tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("put");
+        assert!(moved, "the put changed the list on its way");
+        assert_eq!(host.module.adapters_in_force(), None);
+        assert_eq!(
+            site.tree(),
+            placed,
+            "the list the policy states last is in force, so the package keeps its registration"
+        );
+        assert!(bridge_facts(&host, &digest).is_some());
+
+        // A list that is in force is not waited for, though the catalogue is held; one that has to
+        // change is told that the catalogue is busy, and changes nothing.
+        let held = host.module.catalogue().lock().await;
+        assert!(
+            !host
+                .module
+                .put_allowed_adapters(|| None, soon())
+                .await
+                .expect("a list in force needs no catalogue"),
+        );
+        let busy = host
+            .module
+            .put_allowed_adapters(|| naming("kalareach/codex"), soon())
+            .await
+            .expect_err("the catalogue is held");
+        assert_eq!(busy.code, ErrorCode::ResourceUnavailable, "{busy:?}");
+        drop(held);
+        assert_eq!(host.module.adapters_in_force(), None);
+        assert_eq!(site.tree(), placed);
+    }
+
     /// KR-REQ-11.42: the index that says whether a release is revoked is read once, after what
     /// needs no index and before the package. Where it cannot be read nothing is known to stand
     /// and the registration is not kept on its account, and a package the organisation's list

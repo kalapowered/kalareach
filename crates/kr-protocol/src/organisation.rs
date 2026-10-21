@@ -64,9 +64,9 @@ pub struct OrganisationPolicyApplyParams {
     /// The organisation's chain, when it has moved since the host last accepted one. The key that
     /// signs a policy is the one the chain ends with, so a policy under a newer key needs the chain
     /// beside it. A chain that is not newer changes nothing. A newer chain that does not verify,
-    /// or that shows an installed lease was signed after its key was succeeded, refuses the whole
-    /// request and keeps nothing: a lease that has to be dropped is fenced when the chain is
-    /// presented with `membership.present`.
+    /// or that shows a lease still in force was signed after its key was succeeded, refuses the
+    /// whole request and keeps nothing: a lease that has to be dropped is fenced when the chain is
+    /// presented with `membership.present`. A lease that has ended is dropped with the chain.
     pub authority: Nullable<PolicyAuthority>,
 }
 

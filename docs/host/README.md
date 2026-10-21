@@ -3160,7 +3160,7 @@ host puts the list in force in four places:
 - At the head of every admissions pass, which runs every 30 seconds and whenever a change asks for
   one. The list in force is derived from the policy on disk, so a put that failed is made again. A
   list that is already in force costs nothing and waits for nothing. While a put keeps failing,
-  `kr host doctor` reports it through the catalogue check, and a list that should have narrowed
+  `kr doctor` reports it through the catalogue check, and a list that should have narrowed
   stays wide.
 
 Each put reads the policy once it holds the catalogue, so two changes cannot leave the older list in

@@ -215,6 +215,18 @@ fn refused_as(
     error
 }
 
+/// Whether the doctor's catalogue evidence says that the adapters the organisations allow could not
+/// be put in force.
+async fn the_doctor_says_the_list_is_not_in_force(
+    controller: &kr_controller::service::Controller,
+) -> bool {
+    controller
+        .catalogue_warnings()
+        .await
+        .iter()
+        .any(|warning| warning.contains("could not put the adapters its organisations allow"))
+}
+
 /// KR-REQ-18.06: a policy the organisation signed under the key the host pinned decides which
 /// adapters the host admits. Before it, the package is admitted; a policy that names another
 /// adapter leaves it out, and one that names it admits it again.
@@ -505,7 +517,21 @@ async fn a_chain_that_would_drop_an_installed_lease_is_refused_with_its_policy()
     read_host_info(&raw)
         .await
         .expect("the lease is still in force");
+
+    // Once the lease has ended nothing answers to it, and the same chain is followed with the
+    // policy: the lease that was in force is the only thing the refusal protected.
     raw.close();
+    fixture.pass(Duration::from_secs(16 * 60));
+    let now = fixture.now();
+    let organisation = &fixture.organisation;
+    apply(
+        &fixture,
+        organisation.policy(3, 1, Some(&[CODEX]), now),
+        Some(organisation.authority(now)),
+    )
+    .await
+    .expect("a chain that drops only a lease that has ended is followed");
+    assert_eq!(fixture.listed().await.enrolments[0].accepted_head.get(), 3);
     fixture.host.stop().await;
 }
 
@@ -699,7 +725,9 @@ async fn kr_req_18_06_a_list_that_could_not_be_put_in_force_is_told_and_then_put
     assert!(is_left_out_by_the_allowlist(&admission(&fixture).await));
     drop(client);
 
-    // A later policy fails the same way, and the next pass puts its list in force.
+    // A later policy fails the same way. The host's own pass, which finds the catalogue held too,
+    // says to the doctor that it could not put the list in force; once the catalogue is let go the
+    // next pass puts the list in force and the note goes.
     let next = fixture
         .organisation
         .policy(2, 2, Some(&[EXAMPLE]), fixture.now());
@@ -709,9 +737,25 @@ async fn kr_req_18_06_a_list_that_could_not_be_put_in_force_is_told_and_then_put
             .await
             .expect_err("the list could not be put in force");
         assert_eq!(refused.code, ErrorCode::ResourceUnavailable, "{refused:?}");
+        controller.ask_for_admissions_pass();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !the_doctor_says_the_list_is_not_in_force(&controller).await {
+            assert!(
+                Instant::now() < deadline,
+                "the pass never said that the list is not in force"
+            );
+        }
     }
     controller.ask_for_admissions_pass();
     until_admission(&fixture, is_admitted).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while the_doctor_says_the_list_is_not_in_force(&controller).await {
+        assert!(
+            Instant::now() < deadline,
+            "the note outlived the put that landed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     fixture.host.stop().await;
 }
 

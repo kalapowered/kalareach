@@ -296,7 +296,6 @@ pub fn known() -> Vec<Known> {
             &[("crates/kr-attention/src/event.rs", "Origin")],
             "e799e9f01ab42d78a4fd7dcc2d4611e41cfbd1900a5e2c0b620ae7490bfb955c",
         ),
-        // The catalogue's column of words.
         words_of(
             "catalogue",
             "repository kinds",

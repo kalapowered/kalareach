@@ -248,6 +248,11 @@ pub struct CatalogueModule {
     policies_carried: Arc<std::sync::Mutex<Vec<kr_protocol::admission::RevocationPolicy>>>,
 }
 
+/// Why the adapters the organisations allow were not confirmed in force: the catalogue was held for
+/// longer than a request waits, by another change or by a package that is slow to read.
+pub(crate) const BUSY_FOR_ADAPTERS: &str = "the catalogue was busy for longer than a request waits: \
+     another change is under way, or a package is slow to read";
+
 /// Where a test may hold a computation of this module.
 #[cfg(feature = "testing")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -679,20 +684,25 @@ impl CatalogueModule {
         }
         let mut catalogue = tokio::time::timeout_at(deadline, self.catalogue.lock())
             .await
-            .map_err(|_| {
-                ProtocolError::new(
-                    ErrorCode::ResourceUnavailable,
-                    "the catalogue is busy with another change or a package is slow to read",
-                )
-            })?;
-        let wanted = allowed();
-        let moved = catalogue
-            .set_allowed_adapters(wanted.clone(), &Owner::acting())
-            .map_err(ProtocolError::from)?;
-        *self
-            .adapters_in_force
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = wanted;
+            .map_err(|_| ProtocolError::new(ErrorCode::ResourceUnavailable, BUSY_FOR_ADAPTERS))?;
+        // The list is read again once it is in force: a change that was made while this one held
+        // the catalogue found the older list in force, took the fast path above and was answered,
+        // so the list it left is put in force here, and the loop ends only on a list that the
+        // policy still states.
+        let mut moved = false;
+        loop {
+            let wanted = allowed();
+            moved |= catalogue
+                .set_allowed_adapters(wanted.clone(), &Owner::acting())
+                .map_err(ProtocolError::from)?;
+            *self
+                .adapters_in_force
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = wanted.clone();
+            if allowed() == wanted {
+                break;
+            }
+        }
         if moved {
             // The list changed which packages may run in an application's name, so each bridge
             // follows what its installation now wants, under the same lock and after the change's

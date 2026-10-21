@@ -370,6 +370,7 @@ impl Controller {
                 self.head_holds_still(
                     params.authority.head.payload.expires_at_ms,
                     reading.as_ref(),
+                    chain_refusal,
                 )
             },
         )?;
@@ -463,7 +464,9 @@ impl Controller {
                     // for the locks, and its head is a bound that can pass while they last.
                     match followed_head.get() {
                         Some(head_expires_at) => {
-                            self.head_holds_still(head_expires_at, reading.as_ref())
+                            self.head_holds_still(head_expires_at, reading.as_ref(), |refused| {
+                                policy_refusal(PolicyRefused::Chain(refused))
+                            })
                         }
                         None => Ok(()),
                     }
@@ -488,8 +491,9 @@ impl Controller {
             Err(error) => Err(ControllerError::Refused {
                 code: error.code,
                 detail: format!(
-                    "the organisation's policy is recorded, but the adapters it allows are not in \
-                     force yet, and the host puts them in force at its next admissions pass: {}",
+                    "the organisation's policy is recorded, but the host could not confirm that the \
+                     adapters it allows are in force, and puts them in force at its next \
+                     admissions pass: {}",
                     error.message
                 ),
             }),
@@ -517,12 +521,8 @@ impl Controller {
         if read() == self.catalogue.adapters_in_force() {
             return Ok(false);
         }
-        let unavailable = |why: &str| {
-            kr_protocol::error::ProtocolError::new(
-                ErrorCode::ResourceUnavailable,
-                format!("the adapters the organisations allow are not in force: {why}"),
-            )
-        };
+        let unavailable =
+            |why: &str| kr_protocol::error::ProtocolError::new(ErrorCode::ResourceUnavailable, why);
         let Some(controller) = self.me.upgrade() else {
             return Err(unavailable("this daemon is stopping"));
         };
@@ -539,9 +539,7 @@ impl Controller {
         match tokio::time::timeout_at(deadline, task).await {
             Ok(Ok(moved)) => moved,
             Ok(Err(_)) => Err(unavailable("the change did not complete")),
-            Err(_) => Err(unavailable(
-                "the catalogue is busy with another change or a package is slow to read",
-            )),
+            Err(_) => Err(unavailable(crate::catalogue::BUSY_FOR_ADAPTERS)),
         }
     }
 
@@ -916,16 +914,17 @@ impl Controller {
         &self,
         head_expires_at: TimestampMs,
         read: Option<&crate::service::net::devices::ObservedUtc>,
+        refusal: fn(ChainRefused) -> ControllerError,
     ) -> Result<()> {
         if !self.lifetimes.clock_trust().is_trusted_now() {
-            return Err(chain_refusal(ChainRefused::ClockUntrusted));
+            return Err(refusal(ChainRefused::ClockUntrusted));
         }
         let head_ends = kr_protocol::grant::GrantExpiry::At {
             expires_at_ms: head_expires_at,
         };
         let read_at = read.map_or(0, |reading| reading.now.get());
         if self.sharing.grants().bound_passed(head_ends, read_at)? {
-            return Err(chain_refusal(ChainRefused::HeadNotCurrent));
+            return Err(refusal(ChainRefused::HeadNotCurrent));
         }
         Ok(())
     }
@@ -1138,16 +1137,16 @@ mod tests {
         let judged = reading(start);
 
         controller
-            .head_holds_still(head_ends, Some(&judged))
+            .head_holds_still(head_ends, Some(&judged), chain_refusal)
             .expect("a head with ten minutes left is current");
         wall.store(start + 9 * MINUTE_MS, Ordering::SeqCst);
         controller
-            .head_holds_still(head_ends, Some(&judged))
+            .head_holds_still(head_ends, Some(&judged), chain_refusal)
             .expect("and with one minute left");
 
         wall.store(start + 11 * MINUTE_MS, Ordering::SeqCst);
         let refused = controller
-            .head_holds_still(head_ends, Some(&judged))
+            .head_holds_still(head_ends, Some(&judged), chain_refusal)
             .expect_err("a head that ran out during the wait is not enrolled");
         assert!(
             matches!(
@@ -1166,7 +1165,11 @@ mod tests {
         let (_temp, controller, _continuous, wall, _clocks) = distrusting().await;
         let now = wall.load(Ordering::SeqCst);
         let refused = controller
-            .head_holds_still(TimestampMs::new(now + 10 * MINUTE_MS), Some(&reading(now)))
+            .head_holds_still(
+                TimestampMs::new(now + 10 * MINUTE_MS),
+                Some(&reading(now)),
+                chain_refusal,
+            )
             .expect_err("a clock that is not trusted judges no head");
         assert_eq!(refused.code(), ErrorCode::ClockUntrusted, "{refused:?}");
         stopped(controller).await;
