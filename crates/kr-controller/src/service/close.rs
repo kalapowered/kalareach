@@ -838,6 +838,12 @@ impl Controller {
             .ok()
             .flatten();
         drop(registry);
+        self.end_session_hold(
+            record,
+            reservation
+                .as_ref()
+                .and_then(|reservation| reservation.launcher_identity.clone()),
+        );
         if let Some(reservation) = reservation {
             self.retire_job_when_ended(reservation.reservation_id, reservation.launcher_identity);
         }
@@ -852,6 +858,126 @@ impl Controller {
                 "this daemon stopped before it finished tidying a closed session",
             )),
         }
+    }
+
+    /// Ends a closed session's registration as a writer, when nothing it ran can still write.
+    ///
+    /// A capture holds a repository still only while no live session started in it, and a session
+    /// is live until its closure says that nothing it started is left. A closure that records a
+    /// process the session left running keeps the registration until the daemon restarts, which
+    /// forgets it: this host has no way to follow that process. A closure that could not confirm
+    /// its worker ended keeps it until the kernel says the worker's process has.
+    fn end_session_hold(
+        &self,
+        record: &ClosureRecord,
+        launched: Option<kr_protocol::identity::ProcessStartIdentity>,
+    ) {
+        let holds = Arc::clone(self.project().service().holds());
+        let session_id = record.session_id;
+        if record.surviving.is_empty() {
+            holds.end_session(session_id);
+            return;
+        }
+        if record
+            .surviving
+            .iter()
+            .any(|resource| resource.kind != UNACCOUNTED_WORKER)
+        {
+            return;
+        }
+        let Some(identity) = launched else {
+            return;
+        };
+        end_session_when_worker_ended(holds, session_id, identity);
+    }
+
+    /// Registers, as writers, the sessions this daemon found alive when it started.
+    ///
+    /// Nothing about a registration is stored, so a daemon that starts knows the live sessions
+    /// from the registry alone: every reservation that may have a process, each placed by the
+    /// directory its recorded request named (a reservation with no readable request is placed
+    /// nowhere, which every hold waits for), and every closure that could not confirm its worker
+    /// ended while that worker still runs. This runs before anything is served, so nothing can
+    /// hold a repository yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    pub(super) async fn register_the_sessions_found_alive(&self) -> Result<()> {
+        use crate::registry::LaunchPhase;
+        let mut open = Vec::new();
+        let mut unaccounted = Vec::new();
+        {
+            let registry = self.registry.lock().await;
+            for phase in [
+                LaunchPhase::Spawned,
+                LaunchPhase::Claimed,
+                LaunchPhase::Live,
+                LaunchPhase::Fenced,
+            ] {
+                open.extend(registry.reservations_in(phase)?);
+            }
+            for (session_id, closure) in registry.closures()? {
+                if !closure
+                    .surviving
+                    .iter()
+                    .any(|resource| resource.kind == UNACCOUNTED_WORKER)
+                {
+                    continue;
+                }
+                if let Some(reservation) = registry.reservation_for_session(session_id)?
+                    && let Some(identity) = reservation.launcher_identity.clone()
+                    && !matches!(
+                        kr_ipc::identity::process_state(&identity),
+                        kr_ipc::identity::ProcessState::Ended
+                    )
+                {
+                    unaccounted.push((reservation, identity));
+                }
+            }
+        }
+        let project = Arc::clone(self.project().service());
+        let places = |reservations: Vec<crate::registry::Reservation>| {
+            let project = Arc::clone(&project);
+            move || {
+                reservations
+                    .into_iter()
+                    .map(|reservation| {
+                        let place = reservation
+                            .create_intent
+                            .as_deref()
+                            .and_then(|recorded| super::create::recorded_create(recorded).ok())
+                            .map_or(kr_project::holds::SessionPlace::Unknown, |create| {
+                                project.session_place(create.cwd.as_ref().map(String::as_str))
+                            });
+                        (reservation.session_id, place)
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        let (open_places, unaccounted_places) = tokio::task::spawn_blocking({
+            let open = places(open);
+            let unaccounted_reservations = unaccounted
+                .iter()
+                .map(|(reservation, _)| reservation.clone())
+                .collect::<Vec<_>>();
+            let unaccounted = places(unaccounted_reservations);
+            move || (open(), unaccounted())
+        })
+        .await
+        .map_err(|_| ControllerError::RegistryUnavailable {
+            detail: "this daemon stopped before it registered the sessions it found alive"
+                .to_owned(),
+        })?;
+        for (session_id, place) in open_places {
+            project.holds().adopt_session(session_id, place);
+        }
+        for ((session_id, place), (_, identity)) in unaccounted_places.into_iter().zip(unaccounted)
+        {
+            project.holds().adopt_session(session_id, place);
+            end_session_when_worker_ended(Arc::clone(project.holds()), session_id, identity);
+        }
+        Ok(())
     }
 
     /// Takes a closed session out of what this daemon holds of its workers.
@@ -1086,6 +1212,29 @@ impl Controller {
             }
         });
     }
+}
+
+/// Ends a session's registration as a writer once the kernel says its worker's process has
+/// ended, looking until [`CLOSURE_WATCH_TIMEOUT`] has passed. A worker still running after that
+/// keeps the registration until the daemon restarts.
+fn end_session_when_worker_ended(
+    holds: Arc<kr_project::holds::WorkspaceHolds>,
+    session_id: SessionId,
+    identity: kr_protocol::identity::ProcessStartIdentity,
+) {
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + CLOSURE_WATCH_TIMEOUT;
+        while tokio::time::Instant::now() < deadline {
+            if matches!(
+                kr_ipc::identity::process_state(&identity),
+                kr_ipc::identity::ProcessState::Ended
+            ) {
+                holds.end_session(session_id);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    });
 }
 
 /// Removes a worker's job on a thread that may block, since the platform is asked with commands

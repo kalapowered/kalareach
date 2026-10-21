@@ -411,8 +411,9 @@ each of them as it stood and two admissions that arrive together cannot both tak
   wait, for any reason, it does not take that report. An action the host can still stop settles
   cancelled, which says the host stopped asking and not that the world is as it was; one it cannot
   stop settles unknown. A change-set node cannot be stopped after it has begun. A `create_session`
-  node cannot be stopped once its admission at the launch transition has passed. A command, test or
-  `create_session` node whose dispatch has ended cannot be stopped either.
+  node cannot be stopped once its admission at the launch transition has passed, or, for a node
+  that runs again after a restart, once the session its first attempt made has been handed back to
+  it. A command, test or `create_session` node whose dispatch has ended cannot be stopped either.
 * **A limit stops the run.** When a run's deadline or an action's wait passes, the run dispatches
   nothing further. In one transaction, the action it outlived settles as above, every node still
   waiting that depends on an outcome that is not known pauses for review, every other node still
@@ -607,11 +608,18 @@ A test result is what this host observed, and nothing a caller reports.
 
 When a run captures a change-set, the version of that change-set is bound to the run by the host,
 not by what a caller said: the provenance a capture records names the run that asked for it. A
-capture of the working tree a workflow runs asks the host to hold its workspace still, and the host
-does not grant it. The capture records the per-file consistency it performs and never claims a
-quiesced tree, and its detail says that the workspace could not be reserved. If the workflow
-includes a capture node that requires a quiesced capture, the node fails, and its reason names which
-applies: a shared existing checkout is written by the user's own tools, a workspace live sessions
-hold is written by their shells, and this host's own writers do not ask for a reservation before
-they write. An atomic snapshot, which reads the base commit's own Git objects rather than the
-working tree, is a point-in-time capture and needs no reservation.
+capture of the working tree a workflow runs asks the host to hold its workspace still. The host
+grants that for an isolated workspace it made, when none of its own writers is at work in the
+repository and no live session it started is in a tree it records for it, and then the version is
+recorded as a quiesced capture, with a sentence that says which writers were kept off and that an
+editor or program outside them was not. Everything else is captured file by file and recorded as
+the per-file class, whose detail says that the workspace could not be reserved. If the workflow
+includes a capture node that requires a quiesced capture, the node fails when the host cannot hold
+the workspace, and its reason names which applies: a shared existing checkout is written by the
+user's own tools, a live session is written by its shell, and a writer of this host that is at
+work cannot be waited for. While the capture reads, a session, `diff.apply`, a workspace
+operation or an agent-tool installation that would write the repository is turned away with
+`RESOURCE_UNAVAILABLE` and is not retried by the host; `docs/project/README.md` lists them and what
+a reservation does not see. A node that meets that refusal while it starts a session fails like
+any node whose session cannot start. An atomic snapshot, which reads the base commit's own Git
+objects rather than the working tree, is a point-in-time capture and needs no reservation.

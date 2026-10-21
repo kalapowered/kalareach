@@ -930,10 +930,64 @@ Two things are recorded separately on the version's policy, because they are sep
 which decides nothing, and `quiescence_held` is whether a reservation actually held the workspace
 for the whole read, which is what decides the class.
 
-The reservation mechanism itself belongs to the workflow service, which knows what is running
-against a workspace and can keep it off. What a reservation cannot promise is an editor outside
-KalaReach: an implementer that cannot exclude one refuses to grant rather than granting something
-it cannot honour.
+A reservation promises that the writers its implementer coordinates were kept off, and the
+implementer says which writers those are in its own words; the version records that sentence
+beside the class. It does not promise that an editor or a program outside the implementer's reach
+was kept off, and the version says that too. What stands between such a writer and a version
+recorded as quiesced is the capture's own comparison: after the last reading, with a reservation
+held, it opens every path it read from the working tree once more and compares each file's
+identity, length and instants with what it saw, and a difference makes the capture the per-file
+class with the contradiction recorded. That comparison sees what Git's state and those instants
+show. An overwrite that leaves all of them as they were is not something it can see.
+
+### What holds a workspace still, and what it turns away
+
+This host's own reservation is the project service's. It is granted for an isolated workspace the
+host made (a Git worktree or an independent clone) that is ready, whose recorded working tree
+and Git directory are the ones the capture opened, and never for the user's own checkout, which
+the user's own tools write. It is granted only when no writer of this host is at work in the
+repository and no live session this host started is in a tree it records for it. It never waits:
+a workspace it cannot hold at that moment is captured as the per-file class, or the capture is
+refused when it required the quiesced one, and the refusal says which of these applies. A
+reservation ends at its bound, five minutes, whatever its holder does.
+
+While a reservation stands the host's own writers of that repository are turned away with
+`RESOURCE_UNAVAILABLE`, before they have written or recorded anything:
+
+* `diff.apply` and `diff.revert` into any working tree of the repository (a preflight writes
+  nothing and is not turned away; a proposal and a reference compare-and-swap write no tree);
+* `workspace.create` of a linked worktree (it writes the repository's own administration), and of
+  any isolated workspace or `project.init` or `project.clone` whose directory is inside a working
+  tree the reservation covers;
+* `workspace.remove`, which prunes the repository and removes the working tree with every tree
+  recorded inside it, so a reservation on a clone inside the tree being removed turns the removal
+  away;
+* the cleanup of a repository operation's staging directory inside such a tree;
+* an agent-tool installation at project scope into such a tree;
+* a session that would start in one of those trees: the daemon asks before the shell is started.
+
+A session is a writer for as long as it lives. It is found by the directory it was asked to start
+in: the nearest existing directory at or above that path, after links, together with every
+directory above it, matched at the moment a reservation is asked for against every tree this host
+records, a project's own checkout included whether or not a workspace was ever selected on it, so
+a terminal opened before the host knew its repository still counts. A session with no directory
+starts at the root and counts nowhere; one whose directory is not an absolute path, or whose
+request the daemon could not read after a restart, counts against every reservation. A session
+counts until its closure is recorded; a closure that could not confirm its worker ended counts
+until the kernel says the worker's process has ended, and a closure that records a process the
+session left running counts until the daemon restarts, after which nothing follows that process.
+A closure that accounts for its worker releases the session even where its account of the
+session's own processes is incomplete, as it always is on macOS.
+What a reservation does not see: a session in a tree this host does not record (a linked worktree
+the user added by hand), a shell that changes into a tree after it started elsewhere, a climb that
+stops at a mount, and the writers of other programs.
+
+A refused `workspace.create`, `workspace.remove`, `project.init`, `project.clone` or
+`session.create` is recorded under its action identifier, like any other outcome of those methods,
+so a caller asks again under a new one once the reservation has ended; `diff.apply` and
+`diff.revert` record nothing before their claim, so the same action asked again then is carried
+out. Only a workflow's capture asks for a reservation: a person's own `changeset.capture` offers
+none and is per-file.
 
 ### What a capture will not read
 

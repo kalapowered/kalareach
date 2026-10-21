@@ -472,6 +472,9 @@ impl Controller {
             }
             EnvironmentOrigin::HostContext => self.host_context_environment(),
         };
+        // A workflow node's create asks the node's admission even when its token has been used
+        // before, so the node it belongs to is committed to the session its first attempt made.
+        let for_a_node = launch.is_some();
         environment.launch = launch;
         // The create request itself is recorded with the reservation, before anything is spawned.
         // A daemon that dies between the reservation and the launch then finds a request it can
@@ -532,6 +535,17 @@ impl Controller {
             // A repeated token resolves to the session it already created, whatever this host's
             // conditions are now. A desktop that has gone since is a reason not to start a new
             // session rather than a reason to withhold the answer about one that already exists.
+            //
+            // A workflow node is the exception to the answer being given unasked: its admission
+            // is asked here as well, under the registry guard, because a node that is handed a
+            // session its first attempt made is a node whose session exists, and a request to
+            // stop it must find it committed and say it cannot be stopped. A node whose authority
+            // has gone since is not handed the session; the sweep that closes what it owned
+            // closes this one.
+            if for_a_node {
+                let registry = self.registry.lock().await;
+                admit(&registry)?;
+            }
             return self.replay_create(&reservation).await;
         }
 
@@ -604,6 +618,18 @@ impl Controller {
             return Err(error);
         }
 
+        // Where the session starts, as the identities of that directory and of every directory
+        // above it, so that a capture asking for a repository to be held still can tell whether
+        // this session's shell writes there. It opens directories, so it is not done under the
+        // registry's lock.
+        let place = {
+            let project = Arc::clone(self.project().service());
+            let directory = create.cwd.as_ref().cloned();
+            tokio::task::spawn_blocking(move || project.session_place(directory.as_deref()))
+                .await
+                .map_err(|error| ControllerError::supervision(error.to_string()))?
+        };
+
         // The reservation moves to `spawned` before anything is started. A worker can reach the
         // rendezvous socket the instant the service manager starts it, which is sooner than the
         // launcher returns, and a reservation still recorded as merely reserved would fence its own
@@ -617,23 +643,47 @@ impl Controller {
         // revocation takes: a revocation that has installed its revision has already withdrawn the
         // registrations that revision replaced, so what this reads is never a registration the
         // revocation is part way through removing.
+        let mut registration;
         {
             let mut registry = self.registry.lock().await;
             registry.set_phase(reservation.reservation_id, LaunchPhase::Spawned)?;
+            // The session is a writer where it starts from here to its end, and a capture that is
+            // holding the repository it starts in still refuses it now, before the admission, so
+            // the clock is still read last. The registration ends with this scope unless a
+            // process may be running.
+            registration = match self
+                .project()
+                .service()
+                .holds()
+                .begin_session(reservation.session_id, place)
+            {
+                Ok(registration) => Some(registration),
+                Err(held) => {
+                    registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
+                    drop(registry);
+                    hold.end_wait().await;
+                    self.discard_worker_dir(reservation.session_id);
+                    return Err(ControllerError::Refused {
+                        code: ErrorCode::ResourceUnavailable,
+                        detail: held.to_string(),
+                    });
+                }
+            };
             // The admission this create carries, against the registry this guard holds: the
             // authority revision it was admitted under, the registration behind it, and the
             // deadline, in that order. The registration is read with the registry lock already
             // held, which is the order a revocation takes, and the clock is read last, so the last
             // thing between this create and its launch is a reading with nothing left to wait for.
             //
-            // The document in force is read in the same section, and before the admission, so
-            // that the clock is still read last: one accepted as unusable while this create
-            // prepared its launch refuses it here. An acceptance takes the registry lock before it
-            // returns (`fence_owed`), so one that overlaps this section ends after it, and the
-            // create came first; a document accepted after this section has no create left to
-            // refuse.
+            // The document in force is read in the same section, and decided before the
+            // admission asks anything, so that the clock is still read last and a create the
+            // document refuses commits nothing of the node it is for: one accepted as unusable
+            // while this create prepared its launch refuses it here. An acceptance takes the
+            // registry lock before it returns (`fence_owed`), so one that overlaps this section
+            // ends after it, and the create came first; a document accepted after this section
+            // has no create left to refuse.
             let unusable = self.refusal_for_unusable_document();
-            if let Err(refusal) = admit(&registry).and_then(|()| unusable.map_or(Ok(()), Err)) {
+            if let Err(refusal) = unusable.map_or(Ok(()), Err).and_then(|()| admit(&registry)) {
                 // Nothing was started, so the reservation is resolved as a confirmed failure and
                 // stops occupying the environment. The caller is told which of the two it was.
                 registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
@@ -670,7 +720,14 @@ impl Controller {
         // thread is given up meanwhile, so a create waiting on it does not hold back the requests
         // and the rendezvous of the workers around it.
         let identity = match crate::supervision::blocking_start(|| self.supervisor.start(&launch)) {
-            LaunchOutcome::Started(identity) => identity,
+            LaunchOutcome::Started(identity) => {
+                // A process is running from here, so the session stays a writer until its
+                // closure says otherwise, whatever becomes of this create.
+                if let Some(registration) = registration.take() {
+                    registration.keep();
+                }
+                identity
+            }
             // Nothing started, so the reservation is resolved as a confirmed failure and stops
             // occupying the environment. It is never resumed.
             LaunchOutcome::NotStarted { detail } => {
@@ -687,6 +744,11 @@ impl Controller {
             // A process may be running. The create fails for the caller, and the reservation stays
             // spawned: it keeps its slot until something settles what happened to that process.
             LaunchOutcome::Uncertain { detail, pid } => {
+                // A process may be running, so the session stays a writer until something
+                // settles what happened to it.
+                if let Some(registration) = registration.take() {
+                    registration.keep();
+                }
                 // Before the launcher's identity is recorded: a claim waits for that identity, so
                 // none can take the variables of a create that has stopped waiting. A reservation
                 // that is spawned, with no create waiting for it, is refused every claim, which
@@ -712,6 +774,12 @@ impl Controller {
             // A worker that failed its rendezvous, or never reported, has no session to close, so
             // no closure removes its job. It goes once the worker has ended.
             Ok(Ok(Err(error))) => {
+                // The worker was refused its claim or reported that it could not start, so no
+                // shell ran and the session writes nowhere.
+                self.project()
+                    .service()
+                    .holds()
+                    .end_session(reservation.session_id);
                 self.retire_job_when_ended(reservation.reservation_id, Some(identity));
                 // A refusal of the authority the create stood on is that, and not a launch that
                 // failed: the caller pauses on the one and fails on the other.

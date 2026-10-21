@@ -1205,6 +1205,10 @@ impl Controller {
         // record says the host restarted rather than that a worker died for reasons unknown.
         controller.close_previous_boot().await?;
         controller.recover_reservations().await?;
+        // And what is left alive after recovery is registered as the writers it is, before
+        // anything is served: a capture that holds a repository still has to count the sessions
+        // an earlier daemon started in it.
+        controller.register_the_sessions_found_alive().await?;
         // Recovery has settled every reservation it can, so what is left under the workers
         // directory that no session claims is nothing's.
         controller.sweep_worker_dirs().await?;

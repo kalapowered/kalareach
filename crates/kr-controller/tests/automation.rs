@@ -374,15 +374,32 @@ fn unit_main_process(_label: &str, _deadline: std::time::Instant) -> Option<Opti
 async fn working_host_through(
     wrap: impl FnOnce(Box<dyn WorkerSupervisor>) -> Box<dyn WorkerSupervisor>,
 ) -> Host {
+    working_host_through_on(Clocks::system(), wrap).await
+}
+
+/// [`working_host_through`] on the clocks the test gives the daemon.
+async fn working_host_through_on(
+    clocks: Clocks,
+    wrap: impl FnOnce(Box<dyn WorkerSupervisor>) -> Box<dyn WorkerSupervisor>,
+) -> Host {
     let temp = teardown::Tree::create();
     let worker = temp.root().join("kr-worker");
     kr_ipc::testing::place_and_start_once(&beside_this_test("kr-worker"), &worker, &["--version"]);
-    working_host_on(temp, wrap).await
+    working_host_on_clocks(temp, clocks, wrap).await
 }
 
 /// A daemon with real sessions on a tree that already holds its worker program.
 async fn working_host_on(
     temp: teardown::Tree,
+    wrap: impl FnOnce(Box<dyn WorkerSupervisor>) -> Box<dyn WorkerSupervisor>,
+) -> Host {
+    working_host_on_clocks(temp, Clocks::system(), wrap).await
+}
+
+/// [`working_host_on`] on the clocks the test gives the daemon.
+async fn working_host_on_clocks(
+    temp: teardown::Tree,
+    clocks: Clocks,
     wrap: impl FnOnce(Box<dyn WorkerSupervisor>) -> Box<dyn WorkerSupervisor>,
 ) -> Host {
     let environment = temp.environment();
@@ -391,15 +408,9 @@ async fn working_host_on(
     let supervisor = wrap(Box::new(Patient {
         inner: temp.supervisor(kr_controller::supervision::detect()),
     }));
-    let controller = start_daemon_with(
-        &environment,
-        environment_id,
-        Clocks::system(),
-        supervisor,
-        worker,
-    )
-    .await
-    .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
+    let controller = start_daemon_with(&environment, environment_id, clocks, supervisor, worker)
+        .await
+        .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
     let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
@@ -792,6 +803,16 @@ async fn adopted_workspace(
     environment_id: EnvironmentId,
     work: &Path,
 ) -> WorkspaceId {
+    adopted_project(control, environment_id, work).await.1
+}
+
+/// Adopts a repository with an edit in it, built under `work`, selects the user's own tree as a
+/// workspace, and returns the project and that workspace.
+async fn adopted_project(
+    control: &mut LocalClient,
+    environment_id: EnvironmentId,
+    work: &Path,
+) -> (kr_protocol::ids::ProjectRepositoryId, WorkspaceId) {
     let _source = repository(work, "source");
 
     let adopted: ProjectAdoptResult = typed(
@@ -838,11 +859,14 @@ async fn adopted_workspace(
             .expect("the call reaches the daemon")
             .expect("workspace.create succeeds"),
     );
-    created
-        .workspace
-        .0
-        .expect("a creation returns the workspace")
-        .workspace_id
+    (
+        adopted.project.project_repository_id,
+        created
+            .workspace
+            .0
+            .expect("a creation returns the workspace")
+            .workspace_id,
+    )
 }
 
 async fn an_automation_run_captures_a_change_set_in(
@@ -4425,12 +4449,17 @@ impl Door {
     }
 
     async fn host(&self) -> Host {
+        self.host_on(Clocks::system()).await
+    }
+
+    /// A host whose daemon runs on the clocks the test gives it.
+    async fn host_on(&self, clocks: Clocks) -> Host {
         let (open, arrived, started) = (
             Arc::clone(&self.open),
             Arc::clone(&self.arrived),
             Arc::clone(&self.started),
         );
-        working_host_through(move |inner| {
+        working_host_through_on(clocks, move |inner| {
             Box::new(AtTheDoor {
                 inner,
                 open,
@@ -5086,8 +5115,21 @@ async fn a_wait_that_ends_at_the_door_makes_no_session(
     node: impl FnOnce(&Host, &Path) -> WorkflowNode,
     settles: NodeStatus,
 ) {
+    const WAIT_MS: u64 = 300_000;
     let door = Door::shut();
-    let host = door.host().await;
+    // The clock the engine reads is the machine's until the case moves it: the node's wait ends
+    // when the case says, with the launch at the door, and not when the machine has run for as
+    // long as the wait, whatever else it was doing.
+    let moved = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let host = door
+        .host_on(Clocks {
+            wall: WallClock::from_fn({
+                let moved = Arc::clone(&moved);
+                move || kr_ipc::now_ms().get() + moved.load(std::sync::atomic::Ordering::SeqCst)
+            }),
+            ..Clocks::system()
+        })
+        .await;
     let mut control = client(&host).await;
     let marker = host.work().join("a-command-ran");
     host.issue(grant_id(number), rights);
@@ -5097,16 +5139,16 @@ async fn a_wait_that_ends_at_the_door_makes_no_session(
         "a node",
         node(&host, &marker),
     );
-    // Long enough for the launch to reach the door under load; the node's wait ends there.
     document.deadlines = WorkflowDeadlines {
-        run_deadline_ms: U64::new(60_000),
-        action_wait_ms: U64::new(4_000),
+        run_deadline_ms: U64::new(1_800_000),
+        action_wait_ms: U64::new(WAIT_MS),
     };
     install(&mut control, &host, &document).await;
     enable(&mut control, &host, &document).await;
 
     let running = run_from_another_task(&host, &document, "evt-at-the-door");
     door.until_a_launch_arrives().await;
+    moved.store(WAIT_MS + 1, std::sync::atomic::Ordering::SeqCst);
     until("the engine to stop waiting for the node", || {
         node_statuses(&host).last().is_some_and(|status| {
             status != NodeStatus::Pending.as_str() && status != NodeStatus::Running.as_str()
@@ -6149,6 +6191,403 @@ async fn a_tree_the_removal_will_not_take_leaves_its_row_released() {
     assert!(
         std::fs::read_dir(&scratch).is_ok_and(|mut entries| entries.next().is_some()),
         "the tree the removal would not take is still there"
+    );
+    host.clients.abort();
+}
+
+/// Makes a Git worktree of a project, which is a workspace this host made, at `name` under `work`.
+async fn worktree_of(
+    control: &mut LocalClient,
+    environment_id: EnvironmentId,
+    project: kr_protocol::ids::ProjectRepositoryId,
+    work: &Path,
+    name: &str,
+) -> WorkspaceId {
+    let created: WorkspaceCreateResult = typed(
+        &control
+            .mutate(
+                Method::WorkspaceCreate,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &WorkspaceCreateParams {
+                    project_repository_id: project,
+                    label: name.to_owned(),
+                    kind: WorkspaceKind::Isolated,
+                    isolation: Nullable::some(
+                        kr_protocol::project::IsolationMechanism::GitWorktree,
+                    ),
+                    policy: include_everything(),
+                    base_revision: Nullable::null(),
+                    base_change_set_id: Nullable::null(),
+                    destination: Nullable::some(DestinationRequest {
+                        environment_id,
+                        parent: DestinationParent::Host {
+                            path: work.display().to_string(),
+                        },
+                        name: name.to_owned(),
+                    }),
+                    preview_only: false,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workspace.create succeeds"),
+    );
+    created
+        .workspace
+        .0
+        .expect("a creation returns the workspace")
+        .workspace_id
+}
+
+/// A capture node that requires the quiesced class.
+fn quiesced_capture_node(workspace: WorkspaceId) -> WorkflowNode {
+    let mut node = capture_node(workspace);
+    let mut params: ChangesetCaptureParams =
+        serde_json::from_str(&node.action_params).expect("the node's parameters");
+    params.required_consistency =
+        Nullable::some(kr_protocol::changeset::SourceConsistency::QuiescedCapture);
+    node.action_params = serde_json::to_string(&params).expect("the node's parameters");
+    node
+}
+
+/// What the journal says a run's failed node came to.
+fn why_a_node_failed(host: &Host, run_id: kr_protocol::ids::WorkflowRunId) -> String {
+    rusqlite::Connection::open(
+        host._temp
+            .environment()
+            .state_dir()
+            .join(kr_automation::store::WORKFLOW_DB_NAME),
+    )
+    .expect("opens the workflow journal")
+    .query_row(
+        "SELECT error_json FROM node_receipts WHERE run_id = ?1",
+        [run_id.to_string()],
+        |row| row.get(0),
+    )
+    .expect("the failed node's reason")
+}
+
+/// Starts a person's session whose shell starts in `directory`, through the daemon's own create.
+async fn session_in(
+    control: &mut LocalClient,
+    host: &Host,
+    directory: &Path,
+) -> kr_protocol::session::SessionCreateResult {
+    typed(
+        &control
+            .mutate(
+                Method::SessionCreate,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &kr_protocol::session::SessionCreateParams {
+                    environment_id: host.environment_id,
+                    presentation: kr_protocol::session::Presentation::Invisible,
+                    shell: Nullable::some("/bin/sh".to_owned()),
+                    shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+                    cwd: Nullable::some(directory.display().to_string()),
+                    dimensions: Nullable::null(),
+                    worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+                    environment_snapshot: Vec::new(),
+                    palette: Nullable::null(),
+                    launch_profile: kr_protocol::session::LaunchProfile::default(),
+                    terminal: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("session.create succeeds"),
+    )
+}
+
+/// Closes a person's session, and waits until the daemon no longer counts it as a writer.
+async fn close_session(
+    control: &mut LocalClient,
+    host: &Host,
+    created: &kr_protocol::session::SessionCreateResult,
+) {
+    let session = &created.session;
+    let _: kr_protocol::session::SessionCloseResult = typed(
+        &control
+            .mutate(
+                Method::SessionClose,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget {
+                    environment_id: host.environment_id,
+                    session_id: Nullable::some(session.session_id),
+                    session_epoch: Nullable::some(session.session_epoch),
+                    application_instance_id: Nullable::null(),
+                    agent_binding_revision: Nullable::null(),
+                },
+                &kr_protocol::session::SessionCloseParams {
+                    session_id: session.session_id,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("session.close succeeds"),
+    );
+    until("the closed session to stop counting as a writer", || {
+        !host
+            .controller
+            .project()
+            .service()
+            .holds()
+            .has_session(session.session_id)
+    })
+    .await;
+}
+
+/// KR-REQ-14.32 and KR-REQ-25.20: a workflow's capture of a workspace this host made, with the
+/// quiesced class required, is recorded as one, and the version says what kept the writers off
+/// and what it does not exclude.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capture_of_a_workspace_the_host_made_records_a_quiesced_version() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let (project, _checkout) =
+        adopted_project(&mut control, host.environment_id, host.work()).await;
+    let tree = worktree_of(
+        &mut control,
+        host.environment_id,
+        project,
+        host.work(),
+        "tree",
+    )
+    .await;
+    host.issue(grant_id(70), &[ActionRight::ChangesetCreate]);
+    let document = definition(
+        workflow_id(70),
+        grant_id(70),
+        "a capture that needs a quiesced tree",
+        quiesced_capture_node(tree),
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+
+    let run: WorkflowRunResult = typed(
+        &start(&mut control, &host, &document, "evt-quiesced")
+            .await
+            .expect("workflow.run answers"),
+    );
+    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+    let receipts = receipts_of(&mut control, &document, run.run_id).await;
+    let captured = receipts[0]
+        .output
+        .0
+        .as_ref()
+        .expect("the receipt carries the version");
+    let read: ChangesetReadResult = typed(
+        &control
+            .request(
+                Method::ChangesetRead,
+                &ChangesetReadParams {
+                    change_set_id: first_change_set(captured),
+                    version: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("changeset.read succeeds"),
+    );
+    assert_eq!(
+        read.version.consistency,
+        kr_protocol::changeset::SourceConsistency::QuiescedCapture,
+        "{}",
+        read.version.consistency_detail
+    );
+    assert!(
+        read.version
+            .consistency_detail
+            .contains("does not exclude an editor"),
+        "{}",
+        read.version.consistency_detail
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-14.32 and KR-REQ-25.20: a person's session that started in the project's own checkout,
+/// which no workspace was selected on at that time, is a writer of its repository for as long as
+/// it lives, so a workflow capture that requires the quiesced class of a worktree of it fails
+/// and says a live session is why, and succeeds once the session has closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_session_in_the_projects_own_checkout_stops_a_quiesced_capture_until_it_closes() {
+    let host = working_host().await;
+    let mut control = client(&host).await;
+    let (project, _checkout) =
+        adopted_project(&mut control, host.environment_id, host.work()).await;
+    let tree = worktree_of(
+        &mut control,
+        host.environment_id,
+        project,
+        host.work(),
+        "tree",
+    )
+    .await;
+    host.issue(grant_id(71), &[ActionRight::ChangesetCreate]);
+    let document = definition(
+        workflow_id(71),
+        grant_id(71),
+        "a capture that needs a quiesced tree",
+        quiesced_capture_node(tree),
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+
+    let session = session_in(&mut control, &host, &host.work().join("source")).await;
+    let refused: WorkflowRunResult = typed(
+        &start(&mut control, &host, &document, "evt-with-a-session")
+            .await
+            .expect("workflow.run answers"),
+    );
+    assert_eq!(refused.status, WorkflowRunStatus::Failed, "{refused:?}");
+    let why = why_a_node_failed(&host, refused.run_id);
+    assert!(
+        why.contains("requires a quiesced capture") && why.contains("a live session started in"),
+        "{why}"
+    );
+
+    close_session(&mut control, &host, &session).await;
+    let held: WorkflowRunResult = typed(
+        &start(&mut control, &host, &document, "evt-without-one")
+            .await
+            .expect("workflow.run answers"),
+    );
+    assert_eq!(held.status, WorkflowRunStatus::Completed, "{held:?}");
+    host.clients.abort();
+}
+
+/// KR-REQ-14.32 and KR-REQ-25.20: while a capture holds a repository, the daemon turns away a
+/// person's `session.create` that would start in it and an agent-tool installation into it, with
+/// `RESOURCE_UNAVAILABLE` over the wire, and both succeed when the hold is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_turns_away_a_session_and_an_installation_over_the_wire() {
+    let host = working_host().await;
+    let mut control = client(&host).await;
+    let (project, _checkout) =
+        adopted_project(&mut control, host.environment_id, host.work()).await;
+    let tree = worktree_of(
+        &mut control,
+        host.environment_id,
+        project,
+        host.work(),
+        "tree",
+    )
+    .await;
+    let service = Arc::clone(host.controller.project().service());
+    let opened = service
+        .open_workspace_repository(tree)
+        .expect("the worktree opens")
+        .identity();
+    let installation = kr_protocol::skill::AgentToolsParams {
+        agent: kr_protocol::skill::AgentTarget::Codex,
+        scope: kr_protocol::skill::InstallScope::Project,
+        project_dir: Nullable::some(host.work().join("source").display().to_string()),
+    };
+    let target = ActionTarget::environment(host.environment_id);
+
+    let hold = service
+        .hold_workspace(tree, opened.work_tree, opened.git_dir)
+        .expect("the records read")
+        .expect("the worktree is held");
+    let refused = control
+        .mutate(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &kr_protocol::session::SessionCreateParams {
+                environment_id: host.environment_id,
+                presentation: kr_protocol::session::Presentation::Invisible,
+                shell: Nullable::some("/bin/sh".to_owned()),
+                shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+                cwd: Nullable::some(host.work().join("source").display().to_string()),
+                dimensions: Nullable::null(),
+                worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+                environment_snapshot: Vec::new(),
+                palette: Nullable::null(),
+                launch_profile: kr_protocol::session::LaunchProfile::default(),
+                terminal: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("a session in a held repository is turned away");
+    assert_eq!(refused.code, ErrorCode::ResourceUnavailable, "{refused:?}");
+    let refused = control
+        .mutate(
+            Method::AgentToolsInstall,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &installation,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("an installation into a held repository is turned away");
+    assert_eq!(refused.code, ErrorCode::ResourceUnavailable, "{refused:?}");
+    assert!(
+        !host.work().join("source/.agents").exists(),
+        "nothing was written into the repository"
+    );
+
+    drop(hold);
+    let created = session_in(&mut control, &host, &host.work().join("source")).await;
+    close_session(&mut control, &host, &created).await;
+    let _: kr_protocol::skill::AgentToolsInstallResult = typed(
+        &control
+            .mutate(
+                Method::AgentToolsInstall,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &installation,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the installation goes ahead once nothing holds the repository"),
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-14.32: a daemon that starts counts the sessions an earlier daemon started and left
+/// running, so a hold on a worktree of their repository is refused until they close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_daemon_counts_the_sessions_it_finds_alive() {
+    let (host, apart) = working_host_apart().await;
+    let mut control = client(&host).await;
+    let (project, _checkout) =
+        adopted_project(&mut control, host.environment_id, host.work()).await;
+    let tree = worktree_of(
+        &mut control,
+        host.environment_id,
+        project,
+        host.work(),
+        "tree",
+    )
+    .await;
+    let created = session_in(&mut control, &host, &host.work().join("source")).await;
+    drop(control);
+    host.clients.abort();
+
+    let host = restarted(host, apart).await;
+    let service = Arc::clone(host.controller.project().service());
+    let opened = service
+        .open_workspace_repository(tree)
+        .expect("the worktree opens")
+        .identity();
+    assert_eq!(
+        service
+            .hold_workspace(tree, opened.work_tree, opened.git_dir)
+            .expect("the records read")
+            .expect_err("the session an earlier daemon started is alive"),
+        kr_project::holds::Refusal::SessionsBound(1)
+    );
+    let mut control = client(&host).await;
+    close_session(&mut control, &host, &created).await;
+    assert!(
+        service
+            .hold_workspace(tree, opened.work_tree, opened.git_dir)
+            .expect("the records read")
+            .is_ok(),
+        "and not once it has closed"
     );
     host.clients.abort();
 }

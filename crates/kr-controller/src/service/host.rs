@@ -89,6 +89,28 @@ impl Controller {
                     .to_owned(),
             });
         }
+        // A project-scope change writes the skill package and the tool server's entry inside the
+        // project's directory, which may be a working tree a capture holds still. A refusal here
+        // is before the marker, so nothing is recorded for it and the same action asked again
+        // after the capture has finished is carried out.
+        let _writing = match (
+            params.scope,
+            params.project_dir.as_ref().map(String::as_str),
+        ) {
+            (kr_protocol::skill::InstallScope::Project, Some(directory)) => Some(
+                self.project()
+                    .service()
+                    .writer_in_directory(
+                        "an agent-tool installation",
+                        std::path::Path::new(directory),
+                    )
+                    .map_err(|error| ControllerError::Refused {
+                        code: error.code(),
+                        detail: error.to_string(),
+                    })?,
+            ),
+            _ => None,
+        };
         // Everything above can wait: for this task to be scheduled, for the lock, for the checks
         // to read the agent's tree. The admission this change was accepted under is asked after
         // those waits, and the dispatch marker is written while this daemon's connection table is
