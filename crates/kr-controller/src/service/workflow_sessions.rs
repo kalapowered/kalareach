@@ -258,8 +258,8 @@ impl Controller {
     /// one established for it.
     ///
     /// Asked by whoever is owed the state of a session whose worker cannot be reached: a workflow
-    /// node's dispatch and its sweep, a create ([`Self::closure_after_a_worker_could_not_be_reached`])
-    /// and a read.
+    /// node's dispatch and its sweep, and a create or a replayed create
+    /// ([`Self::closure_after_a_worker_could_not_be_reached`]).
     ///
     /// A command that ends takes its worker with it, and nothing records that on its own: this
     /// asks the kernel about the worker the registry holds, and only a worker the kernel says has
