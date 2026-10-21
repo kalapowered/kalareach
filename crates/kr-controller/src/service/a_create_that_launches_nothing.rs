@@ -3182,3 +3182,101 @@ async fn a_workflow_create_under_a_used_token_asks_the_nodes_admission() {
         .expect_err("a node whose authority has gone is not handed the session");
     assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
 }
+
+/// A closure a worker kept in its own journal for a session, with `surviving` left running.
+fn a_workers_own_closure(
+    session_id: kr_protocol::ids::SessionId,
+    surviving: Vec<kr_protocol::session::SurvivingResource>,
+) -> kr_protocol::session::ClosureRecord {
+    kr_protocol::session::ClosureRecord {
+        session_id,
+        session_epoch: kr_protocol::ids::SessionEpoch::V1,
+        reason: kr_protocol::session::ClosureReason::RootLaunchFailed,
+        root_exit_code: Nullable::null(),
+        root_signal: Nullable::null(),
+        terminated: Vec::new(),
+        surviving,
+        ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
+        durability: kr_protocol::session::Durability::Durable,
+        closed_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+    }
+}
+
+/// Registers a session as a writer, as a launch that may have run does, and starts a process the
+/// way a worker would be: one that lives until its standard input is closed.
+fn a_session_with_a_worker_running(
+    controller: &Arc<Controller>,
+) -> (
+    kr_protocol::ids::SessionId,
+    std::process::Child,
+    kr_protocol::identity::ProcessStartIdentity,
+) {
+    let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+    controller
+        .project()
+        .service()
+        .holds()
+        .begin_session(session_id, kr_project::holds::SessionPlace::Unknown)
+        .expect("nothing holds anything")
+        .keep();
+    let worker = std::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("a process that waits for its input");
+    let identity =
+        kr_ipc::identity::process_start_identity(worker.id()).expect("the process has an identity");
+    (session_id, worker, identity)
+}
+
+/// KR-REQ-14.32: the registration of a session whose create did not come to a session ends once
+/// the kernel says its worker's process has, and not before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_creates_registration_ends_when_its_worker_ends() {
+    let (_temp, controller, _started) = daemon().await;
+    let (session_id, mut worker, identity) = a_session_with_a_worker_running(&controller);
+    let holds = Arc::clone(controller.project().service().holds());
+
+    let watching = controller.watch_for_a_worker_to_end(session_id, identity);
+    assert!(
+        holds.has_session(session_id),
+        "the worker is running, so the session may still write"
+    );
+    drop(worker.stdin.take());
+    worker.wait().expect("the worker ends");
+    watching.await.expect("the watch finishes");
+    assert!(
+        !holds.has_session(session_id),
+        "the worker ended and its journal records nothing left running"
+    );
+}
+
+/// KR-REQ-14.32: the same registration stays when the worker's own record of its session shows
+/// something it left running, which is what a hold must keep waiting for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_creates_registration_stays_when_its_worker_left_something_running() {
+    let (temp, controller, _started) = daemon().await;
+    let (session_id, mut worker, identity) = a_session_with_a_worker_running(&controller);
+    let holds = Arc::clone(controller.project().service().holds());
+    let path = temp.environment().journal_database(session_id);
+    std::fs::create_dir_all(path.parent().expect("a directory")).expect("the directory");
+    kr_worker::journal::Journal::open(&path)
+        .expect("the worker's journal opens")
+        .record_closure(&a_workers_own_closure(
+            session_id,
+            vec![kr_protocol::session::SurvivingResource {
+                kind: "process".to_owned(),
+                detail: "a process the shell's startup files started".to_owned(),
+            }],
+        ))
+        .expect("the closure is recorded");
+
+    let watching = controller.watch_for_a_worker_to_end(session_id, identity);
+    drop(worker.stdin.take());
+    worker.wait().expect("the worker ends");
+    watching.await.expect("the watch finishes");
+    assert!(
+        holds.has_session(session_id),
+        "the worker ended and left a process running, so the session still counts"
+    );
+}
