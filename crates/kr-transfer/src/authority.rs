@@ -1451,13 +1451,22 @@ impl AuthorisedDirectory {
         } else {
             opened.confined_to_one_mount()?
         };
+        // A name that holds the root of a mount, which a caller can hand over where this authority
+        // has no mount rule of its own, is followed into at its end: the directory the caller
+        // checked is on the mount, and the name leads there. A name on the mount that holds it is
+        // not, so a mount put on it afterwards is refused without a look into it.
+        let held_on = match self.mount {
+            Some(mount) => mount,
+            None => mount_of(&self.directory, &self.display.display().to_string())?,
+        };
+        let name_leads_into_a_mount = opened.mount != Some(held_on);
         let mut removal = Removal {
             name: name.as_str().to_owned(),
             removed: 0,
             held: vec![opened.identity],
         };
         removal.empty(&opened, name.as_str())?;
-        removal.take_directory(self, entry, opened, name.as_str(), true)
+        removal.take_directory(self, entry, opened, name.as_str(), name_leads_into_a_mount)
     }
 
     /// Opens one entry a listing of this directory returned, as a directory of its own.
@@ -1672,9 +1681,10 @@ impl Removal {
 
     /// Takes away the name of a directory this removal has emptied.
     ///
-    /// `across_mounts` is set for the directory the removal was asked to take away, which the
-    /// caller may have been handed as the root of a mount, and not for a directory beneath it: a
-    /// mount put on a name inside the tree is not something this removal looks into.
+    /// `across_mounts` is set for the directory the removal was asked to take away when it is the
+    /// root of a mount, which the caller may have handed over, and not for a directory beneath it
+    /// or one on the mount that holds it: a mount put on those names is not something this
+    /// removal looks into.
     fn take_directory(
         &mut self,
         holder: &AuthorisedDirectory,
