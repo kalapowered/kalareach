@@ -972,9 +972,9 @@ async fn a_code_the_camera_or_the_picker_reads_is_taken_in_as_a_pasted_one_is() 
     assert_eq!(view.failure, Some(FailureKind::NoCodeFound));
 }
 
-/// An intake holds what it read only while it is the one under way. An answer to the alert that
-/// arrives after a stop, after a newer intake or after an attempt began holds nothing, whatever the
-/// answer: the person is told nothing happened, and what a newer intake held stays.
+/// KR-REQ-10.17: an intake holds what it read only while it is the one under way. An answer to the
+/// alert that arrives after a stop, after a newer intake or after an attempt began holds nothing,
+/// whatever the answer: the person is told nothing happened, and what a newer intake held stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_intake_that_was_overtaken_holds_nothing() {
     use companion_tauri::pairing::take_in;

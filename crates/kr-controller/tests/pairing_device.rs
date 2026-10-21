@@ -155,11 +155,11 @@ fn text_of(payload: kr_protocol::pairing::DirectQrPayload) -> String {
         .to_string()
 }
 
-/// The pictures of the fixtures' two QR codes are committed beside them (`fixtures/pairing/qr-*.png`),
-/// drawn as the host's own terminal drawing draws a code: low error correction and a quiet zone of
-/// four modules. The phones' decoders read these pictures in their own tests (Vision on a Mac, ZXing
-/// on a JVM) and must give back the fixtures' text, which makes them the decoders' check against
-/// what a host shows. Set `KR_WRITE_FIXTURES=1` to draw them again.
+/// KR-REQ-10.38: the pictures of the fixtures' two QR codes are committed beside them
+/// (`fixtures/pairing/qr-*.png`), drawn as the host's own terminal drawing draws a code: low error
+/// correction and a quiet zone of four modules. The phones' decoders read these pictures in their
+/// own tests (Vision on a Mac, ZXing on a JVM) and must give back the fixtures' text, which makes
+/// them the decoders' check against what a host shows. Set `KR_WRITE_FIXTURES=1` to draw them again.
 #[test]
 fn the_committed_qr_pictures_are_the_fixtures_drawn_the_way_the_host_draws_them() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/pairing");
@@ -484,7 +484,8 @@ impl Run {
     }
 }
 
-/// Runs the host for one phone, phase by phase, until the script says it is done.
+/// KR-REQ-10.36, KR-REQ-10.37, KR-REQ-10.38, KR-REQ-10.17: runs the host for one phone, phase by
+/// phase, until the script says it is done.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "started by scripts/e2e-pairing-device.sh beside a simulator or an emulator"]
 async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
