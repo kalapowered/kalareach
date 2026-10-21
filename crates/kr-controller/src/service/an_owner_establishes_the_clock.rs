@@ -782,7 +782,7 @@ async fn an_expired_grant_stays_out_in_a_new_boot_and_the_owners_establishment_k
     use kr_transport::handshake::PairedDirectory;
 
     use crate::grants::GrantRecord;
-    use crate::service::net::lifetimes::GrantEnd;
+    use crate::service::net::lifetimes::{Anchored, GrantEnd};
     use crate::service::net::tests::{setup, started};
 
     let temp = kr_ipc::testing::TempHost::create();
@@ -937,5 +937,15 @@ async fn an_expired_grant_stays_out_in_a_new_boot_and_the_owners_establishment_k
         "a grant that has not run out is decided again"
     );
     held_out(&controller);
+    // The stored grant's own lifetime, now that the clock is proven again, is read from the end on
+    // record and not derived afresh from a wall clock that reads before its expiry.
+    assert_eq!(
+        controller
+            .lifetimes()
+            .stored(controller.sharing().grants(), &stored)
+            .expect("the clock is proven"),
+        Anchored::Over,
+        "a stored grant whose end is on record is out of force in the new boot"
+    );
     drop(controller);
 }
