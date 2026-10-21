@@ -6349,31 +6349,39 @@ turn started.
 Rich mutations wait while a request of the terminal's that selects or leaves a conversation has not
 been answered, and after one whose outcome is unknown: its reply could not be read, it was given up
 at its deadline or with its connection, or its bytes went in part. A refusal from the server is
-proven, and changes nothing. A request whose bytes never went leaves nothing behind. Only the reply
-to the newest request that has not been refused is taken: an older reply never restores a
-conversation the terminal has left, and never clears the uncertainty of a later request.
+proven, and changes nothing. A request whose bytes never went leaves nothing behind. Replies can
+come in any order, so a success reply is not applied when it arrives. It is kept until no such
+request is in flight, and the replies are then applied in the order their requests were admitted:
+the last selection decides the conversation, and a leave ends the conversation it names when that
+is the one bound by then. An older reply never restores a conversation a later request has left,
+and a reply older than a request whose outcome is unknown says nothing about where the terminal is:
+the instance waits until a later selection has named the conversation.
 
 An operation admitted before any of that, and not yet taken, is checked again when its permit is
-taken: the binding revision, every reason rich mutations wait, and the journal's fence. What nothing
-orders is the interval between the take and the bytes reaching the transport's queue. A frame the
-host writes names its thread (an approval's answer names its request), so a frame past the take
-reaches the thread the binding named when it was admitted and never another, though that can be one
-the terminal has just left, as a frame the terminal itself wrote can be.
+taken: the binding revision, every reason rich mutations wait, the journal's fence, and that the
+connection the admission chose still takes frames. A refusal there is a refusal before any marker,
+and nothing was sent. What nothing orders is the interval between the take and the bytes reaching
+the transport's queue. A frame the host writes names its thread (an approval's answer names its
+request), so a frame past the take reaches the thread the binding named when it was admitted and
+never another, though that can be one the terminal has just left, as a frame the terminal itself
+wrote can be.
 
 A frame of a method the table does not classify suspends rich mutations, as described above. That
-suspension lifts when a selection admitted after the frame has named the conversation and every
-request of the terminal's that the table does not classify, admitted before that selection, has been
-answered. It confirms what a selection names and no more: it cannot see what an unlisted method
-changed that no selection names, nor a change of conversation that has no message. A terminal that
-routinely sends such a method keeps rich mutations suspended until it selects a thread again, which
-a resume of the same thread does.
+suspension lifts when a selection admitted after the frame has named the conversation, by a reply
+that came when every request of the terminal's that the table does not classify, admitted before
+that selection, had been answered. A request of that kind that the server never answered, given up
+at its deadline, keeps the suspension until a new connection opens: the server may still be carrying
+it out, and nothing will say when it has. The lift confirms what a selection names and no more: it
+cannot see what an unlisted method changed that no selection names, nor a change of conversation
+that has no message. A terminal that routinely sends such a method keeps rich mutations suspended
+until it selects a thread again, which a resume of the same thread does.
 
 The connection records its own capability evidence. `agent.approval` is available when the table
 answers approvals and the binding holds `approval.decode` and `approval.respond`;
 `agent.prompt`, `agent.prompt.queue`, `agent.steer` and `agent.cancel` are available when the rich
 table names the operation, and are otherwise recorded unavailable with the reason. The evidence is
-written again after every change of binding and every change of the binding's grants, and withdrawn
-when the connection ends.
+written again after every change of binding, of the bindings there are, of what a binding may do
+(its grants, its trust, a revocation, a component fault), and withdrawn when the connection ends.
 
 A request the table's `decision_response` answers is recorded, forwarded to the terminal and then
 interpreted, in that order, so the terminal's own answer never waits for a meaning. When the binding
