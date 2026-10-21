@@ -25,7 +25,7 @@ public enum QrReader {
   /// The text of the first QR code in the picture `data` holds, or nil when it holds none or is no
   /// picture. The picture is read in memory and never written, and is brought down to
   /// `longestSide` pixels on its longest side when it is larger: a photograph is much larger than
-  /// a code needs, and a version-20 code, the largest a host draws, is read well at 2,048.
+  /// a code needs, and a version-23 code, which is what a host's direct invitation draws, is read well at 2,048.
   public static func text(in data: Data, longestSide: Int = 2048) -> String? {
     guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
     let options: [CFString: Any] = [

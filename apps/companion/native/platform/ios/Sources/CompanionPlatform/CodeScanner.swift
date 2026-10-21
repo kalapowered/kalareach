@@ -178,7 +178,7 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
     else { return }
     device = camera
     session.beginConfiguration()
-    // A host's largest code is a version-20 one, a hundred modules wide: it needs more than the
+    // A host's direct invitation is a version-23 code, 109 modules wide: it needs more than the
     // default preview resolution to be read from a hand's length.
     session.sessionPreset = session.canSetSessionPreset(.hd1920x1080) ? .hd1920x1080 : .high
     if session.canAddInput(input) { session.addInput(input) }
