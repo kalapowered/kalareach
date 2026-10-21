@@ -458,8 +458,8 @@ per-worker status, and `creation_unknown` as a voice start outcome.
 
 `restart_required` is not a host result and has no schema of its own. It is the setup assistant's
 state, which the companion works out from two readings of one capability: the host still reports
-`permission_required` after the person was offered the permission. A host cannot see a grant it was
-not given, so it cannot report that a restart would change the answer.
+`permission_required` after the person was offered the permission. A running host cannot see a
+grant given after it started, so it cannot report that a restart would change the answer.
 
 ## The method and authority table
 

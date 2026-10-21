@@ -5397,9 +5397,15 @@ mod native_bridges {
     /// publisher: the repository's signed index says so. The package, signed as the vendor's,
     /// installs through the daemon with the owner's confirmation; once it is enabled the daemon
     /// applies the package's own bridge recipe in the application's directory, and hands the
-    /// worker the installed package with the bridge it put in place. What the worker then reads
-    /// is the vendor's: its publisher, its bridge, and the decisions its protocol table offers
-    /// under the vendor's own labels.
+    /// worker the installed package with the bridge it put in place. What a worker's reader then
+    /// takes from that package is the vendor's: its publisher, its bridge, and the decisions it
+    /// offers under the vendor's own labels, which its manifest declares and its table maps.
+    ///
+    /// What the package is: Claude Code's package of the bridge generation republished under
+    /// another publisher, so the bridge files are the same bytes. It stays a Claude Code package
+    /// because the host places a native bridge only for the applications it has a layout for
+    /// (Claude Code and Gemini CLI), and takes a registration's application to be the package's
+    /// own name. The reader runs in the test process; no worker is started.
     ///
     /// Not shown here: the transport the application is given, which the core makes and a worker
     /// serves and which no package supplies.
