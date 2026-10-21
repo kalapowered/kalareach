@@ -2788,20 +2788,25 @@ impl Broker {
     /// Reconciles every connection a recovery owes, and finishes the recovery when none is left.
     ///
     /// A connection that is open has had its upstream on the far side of this host's own owner
-    /// for the whole of the gap, because a connection that closed settled what it left at its end
-    /// (see [`Broker::close_connection`]). Every request it made was recorded as it arrived and
-    /// every answer went out through the writer that established what reached the socket, so
-    /// what that upstream still holds is exactly what this host holds for the connection,
-    /// unresolved: nothing it could say would add to it. Once none of the connection's answers is
-    /// still in flight, its reconciliation is that list. A connection with an answer on its way
-    /// is left for a later pass, because the answer's own writer is about to establish what
-    /// reconciling now could only call uncertain.
+    /// for the whole of its life, and the host accounts for all of it: a connection that started
+    /// inside the gap was recorded from its first request, and one that closed settled what it
+    /// left at its end (see [`Broker::close_connection`]). Every request it made was recorded as
+    /// it arrived and every answer went out through the writer that established what reached the
+    /// socket, so what that upstream still holds is exactly what this host holds for the
+    /// connection, unresolved: nothing it could say would add to it. Once none of the
+    /// connection's answers is still in flight, its reconciliation is that list. A connection
+    /// with an answer on its way is left for a later pass, because the answer's own writer is
+    /// about to establish what reconciling now could only call uncertain.
     ///
     /// A connection that is not open is one nobody can reopen, so its upstream holds nothing:
     /// what it left unresolved is settled as its end settles it (cancelled for a request no
     /// answer went for, uncertain for one an answer went for) and its entry goes from what the
-    /// recovery owes. This is the retry for a settlement at the connection's end that the store
-    /// refused, and the rule that no recovery waits for a connection that cannot come back.
+    /// recovery owes. Two cases reach this. A broker opened on a ledger that holds an unfinished
+    /// recovery owes the connections of the process before it, and none is open. And a
+    /// settlement at a connection's end that failed for a reason that is not a store fault left
+    /// its requests unresolved, and this pass makes it. A store fault at the end keeps the
+    /// settlement in memory as a transition of the gap instead, which the recovery commits. This
+    /// is the rule that no recovery waits for a connection that cannot come back.
     ///
     /// Its writes take the store's lock without waiting for it, so a store another connection is
     /// writing leaves this pass with nothing done and the next one tries again. A store that fails
@@ -3220,7 +3225,7 @@ impl Broker {
             application_instance_id: held.application_instance_id,
             connection,
         };
-        let (_, settled) = state.settle_ended(scope, kr_ipc::now_ms(), OnStoreFault::CarryOn);
+        let (_, settled) = state.settle_ended(scope, kr_ipc::now_ms());
         state.gateway.close(connection);
         state.connection_dispatch.remove(&connection);
         // What it settled, here or before, is final now that nothing can name it on a connection
@@ -3691,8 +3696,8 @@ impl BrokerState {
         self.fence(&reason, now);
     }
 
-    /// Reconciles every owed upstream whose connection stayed open, and finishes the recovery when
-    /// none is left. See [`Broker::reconcile_owed`].
+    /// Reconciles every connection a recovery owes, and finishes the recovery when none is left.
+    /// See [`Broker::reconcile_owed`].
     fn reconcile_owed_in(&mut self, now: TimestampMs) -> Option<VolatileTransition> {
         for (application_instance_id, connection) in self.volatile.owed() {
             let scope = ReconcileScope {
@@ -3700,8 +3705,8 @@ impl BrokerState {
                 connection,
             };
             if !self.gateway.contains(connection) {
-                // Nobody can reopen it, so its upstream holds nothing. A store that refuses this
-                // leaves the entry owed, and a later pass starts again.
+                // Nobody can reopen it, so its upstream holds nothing. A store that is busy or
+                // refuses this leaves the entry owed, and a later pass starts again.
                 if self.reconcile_in(scope, &[], now).is_err() {
                     return None;
                 }
@@ -4560,14 +4565,10 @@ impl BrokerState {
     /// committed. While the ledger cannot take writes the resource is marked volatile before it
     /// is committed, because a transition planned before the fence rose carries the durability it
     /// was planned with, and a resource that lived through a gap says so for the rest of its
-    /// life. Under [`OnStoreFault::CarryOn`] a store that fails under a transition keeps it as a
-    /// transition of the gap; under [`OnStoreFault::Refuse`] it is not taken.
-    fn settle_ended(
-        &mut self,
-        scope: ReconcileScope,
-        now: TimestampMs,
-        on_fault: OnStoreFault,
-    ) -> (usize, Result<()>) {
+    /// life. A store that fails under a transition keeps it as a transition of the gap
+    /// ([`OnStoreFault::CarryOn`]), because what ended has ended whether or not it can be recorded
+    /// now.
+    fn settle_ended(&mut self, scope: ReconcileScope, now: TimestampMs) -> (usize, Result<()>) {
         let mut committed = 0;
         let mut failed = Ok(());
         for mut transition in self.arbitration.plan_reconcile(scope, &[]) {
@@ -4579,7 +4580,7 @@ impl BrokerState {
                 now,
                 crate::broker::ledger::TransitionCause::Reconciliation,
                 None,
-                on_fault,
+                OnStoreFault::CarryOn,
             ) {
                 Ok(_) => committed += 1,
                 Err(error) => {

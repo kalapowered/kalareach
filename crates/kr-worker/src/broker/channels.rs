@@ -48,7 +48,7 @@ use crate::broker::gateway::ChannelConnection;
 use crate::broker::methods::{
     PendingTransmission, UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest,
 };
-use crate::broker::{Broker, BrokerState, OnStoreFault, UpstreamArrival};
+use crate::broker::{Broker, BrokerState, UpstreamArrival};
 
 /// How many admitted answers one channel holds before its writer takes them.
 ///
@@ -521,7 +521,7 @@ impl Broker {
             application_instance_id,
             connection,
         };
-        let (settled, complete) = state.settle_ended(scope, now, OnStoreFault::CarryOn);
+        let (settled, complete) = state.settle_ended(scope, now);
         state.gateway.close_channel(connection);
         // What it settled, here or before, is final now that nothing can name it on the channel.
         state.forget_resolved();
