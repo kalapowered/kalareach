@@ -4456,11 +4456,12 @@ async fn a_runtime_recovers_first_and_then_drives_the_outbox_on_its_own_cadence(
     );
 }
 
-/// KR-REQ-23.27: a paired device rotates its own notification-preview key through its own paired
-/// channel, and both stores that hold the key take the rotation; a registration that does not
-/// follow the recorded revision is refused and changes neither; a device cannot rotate the key of
-/// another device that is paired and live, and an actor that is not a paired device rotates no
-/// key at all.
+/// KR-REQ-23.27: the controller's handling of a device's rotation of its notification-preview key,
+/// for the actor a paired connection resolves to: the device rotates its own key, and both stores
+/// that hold the key take the rotation; a registration that does not follow the recorded revision
+/// is refused and changes neither; a device cannot rotate the key of another device that is paired
+/// and live, and an actor that is not a paired device rotates no key at all. That a rotation made
+/// over a paired connection takes effect is shown by the delivery-path case that keys 23.27 too.
 #[tokio::test]
 async fn device_preview_key_update_via_controller() {
     let (temp, controller) = start_controller().await;
