@@ -368,6 +368,57 @@ fn a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_number
     );
 }
 
+/// KR-REQ-14.16: a directory whose device number differs from the recorded one is decided by the
+/// device of the directory above it, and when that cannot be read the check says it could not be
+/// made. It does not say the directory is another one: a holder that is told so leaves the record
+/// and the directory alone as another's, where a failed read is neither. The control is the same
+/// record, with the directory above readable, which settles as the recorded filesystem under a new
+/// number. Run as the superuser, a mode stops nothing, and the case then has nothing to show.
+#[cfg(unix)]
+#[test]
+fn a_directory_above_that_cannot_be_read_is_not_taken_for_another_directory() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let scratch = tempfile::tempdir().expect("a temporary directory");
+    let directory = scratch.path().join("recorded");
+    std::fs::create_dir(&directory).expect("the recorded directory");
+    std::fs::write(directory.join("probe"), b"x").expect("a file in it");
+    let environment =
+        kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([5; 16]));
+    let held = kr_transfer::AuthorisedDirectory::open_root(environment, &directory)
+        .expect("opens the directory");
+    let recorded = held.recorded().expect("reads its identity");
+    // The numbers the filesystem had when the directory was recorded, and one further along now.
+    let was = RecordedIdentity {
+        object: kr_transfer::ObjectIdentity {
+            device: recorded.object.device.wrapping_add(1),
+            file_id: recorded.object.file_id,
+        },
+        filesystem: recorded.filesystem,
+    };
+    assert_eq!(
+        held.check_recorded(was).expect("the directory above reads"),
+        Settled::Revised { was, now: recorded },
+        "the control: the recorded filesystem under another number"
+    );
+
+    // Readable, and not searchable: the device of the directory above is read through it.
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o400))
+        .expect("takes the search right away");
+    let enforced = std::fs::metadata(directory.join("probe")).is_err();
+    let outcome = held.check_recorded(was);
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+        .expect("gives it back");
+    if !enforced {
+        eprintln!("skipped: a mode stops nothing for this account");
+        return;
+    }
+    assert!(
+        matches!(outcome, Err(kr_transfer::Escape::Unopenable { .. })),
+        "a read that failed is not another directory: {outcome:?}"
+    );
+}
+
 /// KR-REQ-14.10, KR-REQ-14.16: a store written before filesystems were recorded is taken forward
 /// when its records are next used: each directory is decided as it was, and the filesystem it is
 /// found on becomes the record's, once.

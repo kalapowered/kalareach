@@ -4108,6 +4108,47 @@ mod tests {
         assert!(!scratch.exists(), "under its own identity it goes");
     }
 
+    /// A directory whose filesystem is numbered differently now is the recorded one only while the
+    /// directory above it can be read, which is how the new number is told from a mount over it.
+    /// When a command took the directory's search right away that read fails, and the directory is
+    /// not another's: it is left where it is and named. The control is the same record with the
+    /// directory searchable, which goes. Run as the superuser, a mode stops nothing, and the case
+    /// then has nothing to show.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_whose_device_cannot_be_compared_is_left_and_named() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("a root");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("the root is private");
+        let (scratch, identity) = made(root.path(), "node");
+        std::fs::write(scratch.join("file"), b"x").expect("a file in it");
+        let (device, rest) = identity.split_once(':').expect("three parts");
+        let renumbered = format!("{}:{rest}", device.parse::<u64>().expect("a device") + 1);
+
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o400))
+            .expect("the command took the search right away");
+        let left = remove_scratch(environment(), root.path(), &scratch, Some(&renumbered));
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))
+            .expect("it is given back");
+        assert!(
+            left.is_some(),
+            "a directory whose device cannot be compared is named, not passed over as another's"
+        );
+        assert!(scratch.join("file").exists(), "and left where it is");
+
+        assert_eq!(
+            remove_scratch(environment(), root.path(), &scratch, Some(&renumbered)),
+            None,
+            "the control: the same record, with the directory above readable, goes"
+        );
+        assert!(!scratch.exists());
+    }
+
     /// A command that unpacks an archive loosens the mode of the directory it runs in. It is still
     /// the recorded directory, and it goes: it is made private again before it is asked whether
     /// only this account can change it.
