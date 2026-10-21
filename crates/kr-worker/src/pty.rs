@@ -833,6 +833,64 @@ mod tests {
         assert_eq!(shell.wait().expect("waits").code, 0);
     }
 
+    /// KR-REQ-19.04 and KR-REQ-25.14: on Windows the system reads the directory and looks for the
+    /// program as it creates the process, after the admission has allowed the start, and a read
+    /// that waits can carry the start past its moment. So the admission is asked again once the
+    /// process exists, before it runs: a start whose moment has passed by then ends the process
+    /// unstarted and fails with the admission's own refusal.
+    ///
+    /// The moment passes here as the process is created: the admission allows the start while no
+    /// process exists and refuses it once one does, which is only so if it is asked after the
+    /// creation. The process is ended without having run, and nothing it would have done is done.
+    #[cfg(windows)]
+    #[test]
+    fn a_start_whose_moment_passes_as_the_process_is_created_runs_nothing() {
+        use crate::windows::conpty::CREATED;
+
+        let host = kr_ipc::testing::TempHost::create();
+        let work = host.root().join("work");
+        std::fs::create_dir(&work).expect("the directory the shell is to start in");
+        let mut command = crate::testing::posix_script(": > ran-here");
+        command.cwd = work.display().to_string();
+        let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
+        CREATED.with(|created| created.set(None));
+        let created = std::cell::RefCell::new(None);
+        let refused = pty.launch(&command, |_| match CREATED.with(std::cell::Cell::get) {
+            None => Ok(()),
+            Some(process) => {
+                *created.borrow_mut() = kr_ipc::identity::process_start_identity(process).ok();
+                Err(WorkerError::PermissionDenied {
+                    detail: "the moment has passed".to_owned(),
+                })
+            }
+        });
+        let outcome = match &refused {
+            Ok(_) => "a shell was started".to_owned(),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            matches!(refused, Err(WorkerError::PermissionDenied { .. })),
+            "the start is refused with the admission's refusal: {outcome}"
+        );
+        let process = created
+            .into_inner()
+            .expect("the process existed when the start was refused");
+        // The process goes: ended by the refused start, which waits for no run of its own.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while kr_ipc::identity::process_state(&process) != kr_ipc::identity::ProcessState::Ended {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the process a refused start created is still there"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !work.join("ran-here").exists(),
+            "the shell ran, though its start was refused"
+        );
+        assert!(pty.was_used(), "the terminal was handed to the start");
+    }
+
     /// KR-REQ-19.04 and KR-REQ-25.14: once the admission has allowed the start, the directory is
     /// not read again. The directory is moved away inside the admission, as a mount or an owner
     /// could take it, and the shell still starts in the directory that was opened before: reading
