@@ -376,9 +376,10 @@ pub struct ConnectorManifest {
     pub decision_destination: Nullable<DecisionDestination>,
     /// Whether the connector has a tested volatile forwarding mode.
     ///
-    /// Without one it is not a resilient managed gateway: on receipt-storage failure its
-    /// unchanged terminal integration is the supported path, and the manifest says so rather than
-    /// letting a reader assume otherwise.
+    /// Without one it is not a resilient managed gateway, so this host serves no gateway for it:
+    /// a launch of its application runs as typed, and its unchanged terminal integration is the
+    /// supported path on receipt-storage failure. The manifest says so rather than letting a
+    /// reader assume otherwise.
     pub volatile_forwarding: bool,
     /// What the publisher says about the qualification behind this table.
     pub qualification_note: Nullable<Summary>,

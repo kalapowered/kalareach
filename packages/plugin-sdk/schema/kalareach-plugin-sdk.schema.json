@@ -1046,7 +1046,7 @@
           "description": "How the broker reaches the upstream."
         },
         "volatile_forwarding": {
-          "description": "Whether the connector has a tested volatile forwarding mode.\n\nWithout one it is not a resilient managed gateway: on receipt-storage failure its\nunchanged terminal integration is the supported path, and the manifest says so rather than\nletting a reader assume otherwise.",
+          "description": "Whether the connector has a tested volatile forwarding mode.\n\nWithout one it is not a resilient managed gateway, so this host serves no gateway for it:\na launch of its application runs as typed, and its unchanged terminal integration is the\nsupported path on receipt-storage failure. The manifest says so rather than letting a\nreader assume otherwise.",
           "type": "boolean"
         }
       },

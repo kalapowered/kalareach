@@ -588,8 +588,11 @@ environment the host selected, so a package cannot point it somewhere else.
 
 A vendor protocol that cannot meet this contract uses a native bridge beside the unchanged terminal
 application instead. A connector without a tested volatile forwarding mode says so in its manifest:
-on receipt-storage failure its unchanged terminal integration is the supported path, and a reader
-should not have to guess.
+the worker's gateway serves no launch of it, so the program runs as typed and its unchanged
+terminal integration is the supported path on receipt-storage failure, and a reader should not
+have to guess. A connector that declares the mode is served by the gateway, which keeps the
+already authenticated native terminal forwarding while the receipt journal is faulted. Not
+claimed: Windows, where no gateway runs.
 
 ## The component interface
 
