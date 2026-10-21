@@ -2823,6 +2823,15 @@ fn check_observation(
                 ),
             );
         }
+        if connector.classify(reading.method) == MethodClass::Unsupported {
+            table_invalid(
+                report,
+                format!(
+                    "the observation reads {}, which the table classifies as unsupported",
+                    reading.method
+                ),
+            );
+        }
         match direction(reading.method) {
             None => table_invalid(
                 report,

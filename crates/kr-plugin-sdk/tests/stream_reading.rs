@@ -338,6 +338,16 @@ fn kr_req_12_06_an_observation_names_places_inside_messages_the_table_routes() {
         .turn = path(&["result", "turn", "id"]);
     refused(&turn_in_result, "not inside the table's params member");
 
+    // A method the table classifies as unsupported is one the host does not carry, so it cannot be
+    // read as the place a conversation is named.
+    let mut unsupported = server_table();
+    for entry in &mut unsupported.methods {
+        if entry.method.as_str() == "thread.start" {
+            entry.class = MethodClass::Unsupported;
+        }
+    }
+    refused(&unsupported, "classifies as unsupported");
+
     let mut two_roles = server_table();
     observation(&mut two_roles).leaves[0].method = method("turn.started");
     refused(&two_roles, "a method has one role");
