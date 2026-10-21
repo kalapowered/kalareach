@@ -210,12 +210,14 @@ mod macos {
         // publisher only listens on it.
         let session = Arc::new(session);
         let host = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
-        let publisher = tauri::async_runtime::spawn(companion_tauri::connection::forward_events(
-            app.clone(),
-            Arc::clone(&session),
-            host,
-        ));
+        // Subscribed as the application subscribes, before anything can be sent on the connection.
+        // `witness` is a second subscription, which says when the session has received an event.
+        let events = session.events();
+        let mut witness = session.events();
 
+        // Both events are in the session before the publisher is started: an event sent before the
+        // task that forwards them first runs is one the page is still given, and the publisher
+        // starting late is the order that decides it.
         runtime.block_on(async {
             link.push(
                 "session.state",
@@ -227,7 +229,20 @@ mod macos {
                 ParamsValue::new(kr_cbor::CanonicalValue::Bytes(vec![1, 2, 3])),
             )
             .await;
-        });
+            for _ in 0..2 {
+                tokio::time::timeout(LIVENESS, witness.recv())
+                    .await
+                    .map_err(|_| "the session did not receive both events".to_owned())?
+                    .map_err(|error| format!("the session's events ended: {error}"))?;
+            }
+            Ok::<_, String>(())
+        })?;
+        let publisher = tauri::async_runtime::spawn(companion_tauri::connection::forward_events(
+            app.clone(),
+            Arc::clone(&session),
+            host,
+            events,
+        ));
         wait_for("the page hearing both events", || heard(&window).len() >= 2).map_err(
             |failure| {
                 format!(

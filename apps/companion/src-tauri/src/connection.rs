@@ -463,6 +463,10 @@ pub async fn keep<R, A, F>(
             Attempt::Nothing => return,
             Attempt::Reached(connection) => {
                 let session = connection.session();
+                // Before the connection is announced to anything, so that nothing the host sends
+                // on it can come before the subscription: an event sent to a connection nobody
+                // listens on yet is lost to the page.
+                let events = session.events();
                 let environment_id = connection.environment_id();
                 let paired_host = match connection.standing() {
                     Standing::Paired { host, .. } => Some(host.host_device_id),
@@ -484,7 +488,7 @@ pub async fn keep<R, A, F>(
                 // A connection that did not last is not a recovery: a host that accepts and then
                 // closes is waited for as one that does not answer.
                 backoff.connected();
-                forward_events(app.clone(), session, environment_id).await;
+                forward_events(app.clone(), session, environment_id, events).await;
             }
             Attempt::Failed(error) => {
                 if !state.disconnected_for(choice, error.message) {
@@ -569,6 +573,10 @@ async fn question_ended(asking: &mut Option<tauri::async_runtime::JoinHandle<()>
 
 /// Publishes the session's events to the window until the connection ends, and then says so.
 ///
+/// `events` is the session's subscription, taken by the caller before anything could be sent on the
+/// connection: a subscription made here, when this task first runs, would miss whatever the host
+/// sent in between.
+///
 /// Every event carries the stream it came from, so a view that is showing one session can ignore
 /// another's. A client that published events without their stream would leave each view guessing
 /// whether an event was its own. When the connection ends the application is told it is not
@@ -578,9 +586,9 @@ pub async fn forward_events<R: Runtime>(
     app: AppHandle<R>,
     session: Arc<Session>,
     host: EnvironmentId,
+    mut events: tokio::sync::broadcast::Receiver<kr_protocol::envelope::Notification>,
 ) {
     let host = host.to_string();
-    let mut events = session.events();
     // The question of whether the host withdrew this connection, while one is out: one at a time.
     let mut asking: Option<tauri::async_runtime::JoinHandle<()>> = None;
     loop {
