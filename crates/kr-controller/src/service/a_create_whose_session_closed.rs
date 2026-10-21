@@ -5,7 +5,8 @@
 //! and the session is then closed rather than unknown: the closure is the answer, as it is to the
 //! same create asked again afterwards. So is the closure of a worker that has ended before the
 //! daemon has recorded one, as the worker of a command that ends at once does, and the closure of
-//! a worker that ends while the create waits for it.
+//! a worker that ends while the create waits for it. The same create asked again under its token
+//! is answered the same way, and neither waits for ever on a worker that does not answer.
 
 use std::sync::Arc;
 
@@ -198,6 +199,14 @@ impl Gone {
 }
 
 fn assert_closed(answer: &SessionCreateResult, session_id: SessionId) {
+    assert_a_closed_session(answer, session_id);
+    assert!(
+        !answer.deduplicated,
+        "an answer made for the create itself is not a replay of it"
+    );
+}
+
+fn assert_a_closed_session(answer: &SessionCreateResult, session_id: SessionId) {
     assert_eq!(answer.session.state, SessionState::Closed);
     assert_eq!(
         answer
@@ -212,10 +221,6 @@ fn assert_closed(answer: &SessionCreateResult, session_id: SessionId) {
     assert!(
         answer.endpoint.0.is_none(),
         "a closed session has no endpoint"
-    );
-    assert!(
-        !answer.deduplicated,
-        "an answer made for the create itself is not a replay of it"
     );
 }
 
@@ -292,6 +297,145 @@ async fn a_create_whose_worker_cannot_be_reached_and_has_not_ended_fails_with_th
         "the failure is the connection that was not made: {refused:?}"
     );
     assert!(!gone.closure_is_recorded().await, "no closure was invented");
+}
+
+/// KR-REQ-09.12: the same create asked again under its token, whose worker ended before the daemon
+/// recorded a closure, is answered from the closure the daemon establishes for a worker the kernel
+/// says has ended, as the create itself is: the session closed, with no endpoint to attach to, and
+/// the answer says it is a repeat. The failure of the connection that was never made is not the
+/// answer to a create whose session has a closure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_asked_again_whose_worker_ended_before_it_was_described_is_answered_from_a_closure()
+ {
+    let gone =
+        Gone::with_the_worker_process(kr_ipc::identity::ended_process_identity(4_000_000)).await;
+    assert!(!gone.closure_is_recorded().await, "no closure is recorded");
+
+    let replayed = to_a_result(
+        gone.controller
+            .replay_create(&gone.reservation)
+            .await
+            .expect("the create asked again is answered"),
+    );
+    assert_a_closed_session(&replayed, gone.reservation.session_id);
+    assert!(replayed.deduplicated, "the answer says it is a repeat");
+}
+
+/// Holds the session of a worker's service, so that the worker answers no request that needs it,
+/// until the hold is let go. The lock is taken on a thread of its own, which keeps it for as long
+/// as the hold lives, and the hold is in place when this returns.
+struct HeldSession {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    holder: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HeldSession {
+    fn of(service: &Arc<kr_worker::service::WorkerService>) -> Self {
+        let service = Arc::clone(service);
+        let (held, is_held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let session = service.runtime().session();
+            held.send(()).expect("the case is waiting for the hold");
+            // Ends when the hold is let go, or dropped, which is the same.
+            let _ = released.recv();
+            drop(session);
+        });
+        is_held.recv().expect("the session is held");
+        Self {
+            release: Some(release),
+            holder: Some(holder),
+        }
+    }
+}
+
+impl Drop for HeldSession {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(holder) = self.holder.take() {
+            let _ = holder.join();
+        }
+    }
+}
+
+/// KR-REQ-09.12: a create, and the same create asked again, do not wait for ever on a worker that
+/// has reported itself and does not describe its session. A real worker whose session this case
+/// holds answers nothing that needs it, over a connection the daemon already has; each create ends
+/// with the failure of the wait, no closure is invented for a worker the kernel says is running, and
+/// the session is still there to be described once the worker answers.
+///
+/// The case waits for the daemon's own bound. It decides by what the creates return; the minute
+/// it allows them only ends a case in which they never do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_and_its_replay_give_up_on_a_worker_that_does_not_describe_its_session() {
+    use kr_ipc::identity::current_process_start_identity;
+
+    let (world, reservation) = reported().await;
+    let controller = &world.controller;
+    // The worker is the one process the kernel says is running, so no closure can be established.
+    controller
+        .registry
+        .lock()
+        .await
+        .adopt_worker(
+            &worker_record(
+                &reservation,
+                &world.worker,
+                current_process_start_identity().expect("this process is described"),
+            ),
+            Some(&DesktopBinding::none()),
+        )
+        .expect("the registry records the worker");
+    // The daemon's link to the worker is open before the worker stops answering.
+    let mut link = controller
+        .worker_client(&world.worker)
+        .await
+        .expect("the daemon opens its link to the worker");
+    link.give_back();
+    drop(link);
+
+    let held = HeldSession::of(world.service());
+    let endpoint = world.worker.endpoint.as_text();
+    let (created, replayed) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::join!(
+            answer(controller, &reservation, endpoint),
+            controller.replay_create(&reservation)
+        )
+    })
+    .await
+    .expect("a create waits for ever on a worker that does not describe its session");
+    drop(held);
+
+    for (what, outcome) in [
+        ("the create", created),
+        ("the create asked again", replayed),
+    ] {
+        let refused = outcome.expect_err("a session nothing describes is not answered");
+        assert!(
+            matches!(refused, ControllerError::Supervision { .. }),
+            "{what} ends with the failure of the wait: {refused:?}"
+        );
+    }
+    assert!(
+        !world
+            .controller
+            .registry
+            .lock()
+            .await
+            .closure(reservation.session_id)
+            .expect("the registry answers")
+            .is_some(),
+        "no closure was invented for a worker that is running"
+    );
+    // The worker answers again, and the create asked once more is answered with the session.
+    let described = to_a_result(
+        controller
+            .replay_create(&reservation)
+            .await
+            .expect("the worker describes its session"),
+    );
+    assert_ne!(described.session.state, SessionState::Closed);
+    assert!(described.deduplicated);
 }
 
 /// A process this test holds, ended when the test lets it go.
