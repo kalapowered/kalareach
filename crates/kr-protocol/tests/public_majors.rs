@@ -12,7 +12,10 @@ use kr_protocol::hello::{
     PROTOCOL_VERSION, PUBLIC_MAJORS, ProtocolVersion, PublicMajor, select_version,
     supported_versions, supported_versions_of,
 };
-use kr_protocol::retained::{RETAINED, RETAINED_WORKER_LEVELS};
+use kr_protocol::retained::{
+    Level, RETAINED, RETAINED_WORKER_LEVELS, RetainedLevel, stated_protocol, worker_protocols,
+    worker_protocols_for,
+};
 
 /// A day, from the first ten characters of an ISO 8601 date or timestamp.
 fn day(text: &str) -> Date {
@@ -442,4 +445,109 @@ fn parse(recorded: &str) -> Vec<PublicMajor> {
             }
         })
         .collect()
+}
+
+/// A level with no surface of its own, only a recorded table, which is all `worker_protocol` reads.
+fn level_recording(table: &'static str) -> RetainedLevel {
+    RetainedLevel::new(RETAINED_WORKER_LEVELS[0], "", "", "", &[], &[]).with_public_majors(table)
+}
+
+/// KR-REQ-26.07: a level names the protocol of its workers: the newest version of the newest major
+/// of the table its release recorded. The real table of the retained level, a table of a replaced
+/// major and a current one in either order, and tables that name nothing or that do not read.
+#[test]
+fn a_level_names_the_protocol_its_workers_speak_from_the_table_it_recorded() {
+    for retained in &RETAINED {
+        assert_eq!(
+            retained.worker_protocol(),
+            Some(ProtocolVersion::new(1, 0)),
+            "level {} is the one release of major 1",
+            retained.level
+        );
+    }
+    let replaced =
+        "major=1 versions=1.0 replaced=2030-03-01 supported_until=2031-09-01 retired=true\n";
+    let current = "major=2 versions=2.0,2.1 replaced=- supported_until=- retired=false\n";
+    assert_eq!(
+        level_recording(Box::leak(
+            format!("{replaced}{current}digest=00\n").into_boxed_str()
+        ))
+        .worker_protocol(),
+        Some(ProtocolVersion::new(2, 1)),
+        "the newest version of the newest major"
+    );
+    assert_eq!(
+        level_recording(Box::leak(
+            format!("{current}{replaced}digest=00\n").into_boxed_str()
+        ))
+        .worker_protocol(),
+        Some(ProtocolVersion::new(2, 1)),
+        "whatever the order of the rows"
+    );
+    assert_eq!(
+        level_recording("digest=00\n").worker_protocol(),
+        None,
+        "no row"
+    );
+    assert_eq!(
+        level_recording("major=2 versions=1.0 replaced=- supported_until=- retired=false\n")
+            .worker_protocol(),
+        None,
+        "a version of another major than its row's does not read"
+    );
+    assert_eq!(
+        RetainedLevel::new(RETAINED_WORKER_LEVELS[0], "", "", "", &[], &[]).worker_protocol(),
+        None,
+        "a level that recorded no table names no protocol"
+    );
+}
+
+/// KR-REQ-26.07: a release's workers state the protocol its source declares, and its table ends at
+/// that major, so a level names one protocol across every release of it (the generator holds each
+/// tree it reads to the same rule).
+#[test]
+fn the_newest_major_of_this_builds_table_is_the_major_it_declares() {
+    let newest = PUBLIC_MAJORS.iter().map(|row| row.major).max();
+    assert_eq!(newest, Some(PROTOCOL_VERSION.major));
+    assert_eq!(Level::this().protocol(), Some(stated_protocol()));
+    assert_eq!(
+        Level::retained(&RETAINED[0]).protocol(),
+        RETAINED[0].worker_protocol()
+    );
+}
+
+/// KR-REQ-26.07, KR-REQ-20.24: the local window outlasts the public one. A build that states a later
+/// major offers a worker its own version and the protocol of each level it retains, so a worker of
+/// the major before is reached; and the public table that retires that major leaves it out of the
+/// versions a device is offered, which the local offer does not read. This build offers a worker
+/// its own version alone, as it always has.
+#[test]
+fn a_build_of_a_later_major_offers_a_worker_the_major_before_though_its_table_retires_it() {
+    use kr_protocol::hello::{PublicMajor, supported_versions_of};
+
+    const ONE: ProtocolVersion = ProtocolVersion::new(1, 0);
+    const TWO: ProtocolVersion = ProtocolVersion::new(2, 0);
+    assert_eq!(worker_protocols(), [stated_protocol()]);
+    assert_eq!(worker_protocols_for(PROTOCOL_VERSION), [PROTOCOL_VERSION]);
+    assert_eq!(worker_protocols_for(TWO), [TWO, ONE]);
+
+    let retired = [
+        PublicMajor {
+            major: 1,
+            versions: &[ONE],
+            replaced: Some("2030-03-01"),
+            supported_until: Some("2031-09-01"),
+            retired: true,
+        },
+        current_major_two(),
+    ];
+    assert_eq!(
+        supported_versions_of(&retired),
+        [TWO],
+        "a device is not offered 1.0"
+    );
+    assert!(
+        worker_protocols_for(TWO).contains(&ONE),
+        "and a worker of major 1 still is"
+    );
 }

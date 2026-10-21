@@ -149,7 +149,8 @@ Only the current release's `kr` updates the host. An update, in order:
    release does not retain, a worker that does not answer its challenge and has not ended, and a
    session still being started each hold the update;
 6. switches `current` in one rename, records the switch, lets go of the locks, starts each daemon as
-   it was started before, now from the new release, and waits for each to answer as a daemon of it;
+   it was started before, now from the new release, and waits for each to answer as a daemon of it
+   (for a daemon of another public major than the `kr`'s, see below);
 7. removes the releases nothing needs: not the current one, not the previous one, not one staged
    for a later update, and not one a running program holds.
 
@@ -253,7 +254,18 @@ seconds, the environment cannot be looked at: the update says that, and names no
 A daemon that answers as the release asked for by the time it is looked at is serving, and is not
 named either.
 
-The control daemon supports communication with a worker both at its current compatibility level and one level below this (i. e. the previous release). The control daemon detects the level of each worker from the hello exchange and then reads and writes frames for that worker at the given level. If the control daemon meets a worker at any other level, it refuses to exchange anything but the hello with it (using the `UNSUPPORTED_SCHEMA` error) and logs which session it left running unreached, and why. If the daemon is started with a release whose manifest names a level it does not retain, it will not start up and prints that level.
+A release can be of another public major than the `kr` that updates to it, and a control daemon
+admits clients of its own major only. The updater's looks at the daemon of the release it makes
+current (the wait for it to answer, the look that names a holder, the service manager's start) also
+offer the majors that release's manifest lists in `public_majors`, admit a control daemon's answer
+of one of them, and read from it only the hello's answer, which names its build. Nothing else is
+sent to a daemon of another major, and a daemon that answers another major than the updater's is
+not asked to resume. A rollback to a release of an earlier major looks the same way, from the later
+release's `kr`. An updater of a release before this does not look at a daemon of another major, so it
+switches `current` to a release of the next major and then reports that the daemon did not start from
+it; `kr host update --archive` of that release, run by its own `kr`, finishes the update.
+
+The control daemon supports communication with a worker both at its current compatibility level and one level below this (i. e. the previous release). The control daemon detects the level of each worker from the hello exchange and then reads and writes frames for that worker at the given level. Its hello offers its own public protocol and the protocol each retained level records, and a worker answers with its own, so a worker of an earlier public major is reached as a worker of that major, whether or not the public table still lists it. If the control daemon meets a worker at any other level, it refuses to exchange anything but the hello with it (using the `UNSUPPORTED_SCHEMA` error) and logs which session it left running unreached, and why. If the daemon is started with a release whose manifest names a level it does not retain, it will not start up and prints that level.
 
 ## A session that runs the release before
 

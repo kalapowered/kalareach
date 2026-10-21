@@ -22,7 +22,7 @@ use std::time::Duration;
 use kr_client::shown;
 use kr_client::shown::{Said as _, Shown};
 use kr_controller::singleton::SingletonLock;
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{Listed, LocalClient};
 use kr_ipc::install::Store;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
@@ -174,16 +174,37 @@ pub enum Resumed {
     NotListening,
 }
 
+/// The public majors the manifest of `release`, a release in the store, lists: the majors its
+/// daemon may state besides this build's own, which an update's look at that daemon admits.
+///
+/// None where the manifest cannot be read, and then the look admits this build's major alone, as it
+/// always has.
+pub(super) fn majors_of(store: &Store, release: &ReleaseName) -> Vec<u16> {
+    super::installed_manifest(store, release)
+        .map(|manifest| manifest.public_majors)
+        .unwrap_or_default()
+}
+
 /// Asks the daemon that holds an environment to resume.
+///
+/// A daemon that states another public major than this build's, which the manifest of `target`
+/// lists, is not one this run prepared: only a daemon of this build's major begins an attempt, and
+/// every daemon an update stopped has gone before the switch. It is serving, and nothing is sent to
+/// it.
 ///
 /// # Errors
 ///
 /// Returns a failure naming the environment when the daemon answers neither way.
-pub async fn resume_holder(environment: &Environment, target: &ReleaseName) -> Result<Resumed> {
+pub async fn resume_holder(
+    store: &Store,
+    environment: &Environment,
+    target: &ReleaseName,
+) -> Result<Resumed> {
     let endpoint = environment.paths.controller_endpoint()?;
+    let majors = majors_of(store, target);
     let connected = tokio::time::timeout(
         DAEMON_ANSWER,
-        LocalClient::connect(&endpoint, LocalClientKind::Cli, crate::build_id()),
+        LocalClient::connect_listing(&endpoint, LocalClientKind::Cli, crate::build_id(), &majors),
     )
     .await;
     let failed = |said: Shown| {
@@ -194,7 +215,8 @@ pub async fn resume_holder(environment: &Environment, target: &ReleaseName) -> R
         ))
     };
     let mut client = match connected {
-        Ok(Ok(client)) => client,
+        Ok(Ok(Listed::Ours(client))) => client,
+        Ok(Ok(Listed::Other(_))) => return Ok(Resumed::Serving),
         Ok(Err(error)) if nothing_listening(&error) => return Ok(Resumed::NotListening),
         Ok(Err(error)) => return Err(failed(Shown::ipc(&error))),
         Err(_) => {
@@ -534,7 +556,7 @@ pub async fn still_running(
             let pid = SingletonLock::holder(&environment.paths.singleton_lock())
                 .ok()
                 .flatten();
-            let answers_as = answers_as_now(environment).await;
+            let answers_as = answers_as_now(store, environment, expected).await;
             holder_said(
                 environment.environment_id,
                 Some((pid, answers_as.as_ref())),
@@ -545,19 +567,30 @@ pub async fn still_running(
 }
 
 /// What a daemon holding an environment answers as, if it answers within [`DAEMON_ANSWER`]: a
-/// daemon that has taken the environment and does not yet listen is tried again until then.
-pub(super) async fn answers_as_now(environment: &Environment) -> Option<BuildId> {
+/// daemon that has taken the environment and does not yet listen is tried again until then. The
+/// daemon may state a public major that the manifest of `expected` lists.
+pub(super) async fn answers_as_now(
+    store: &Store,
+    environment: &Environment,
+    expected: &ReleaseName,
+) -> Option<BuildId> {
     let endpoint = environment.paths.controller_endpoint().ok()?;
+    let majors = majors_of(store, expected);
     let deadline = tokio::time::Instant::now() + DAEMON_ANSWER;
     loop {
         match tokio::time::timeout_at(
             deadline,
-            LocalClient::connect(&endpoint, LocalClientKind::Cli, crate::build_id()),
+            LocalClient::connect_listing(
+                &endpoint,
+                LocalClientKind::Cli,
+                crate::build_id(),
+                &majors,
+            ),
         )
         .await
         {
-            Ok(Ok(client)) => {
-                return client
+            Ok(Ok(listed)) => {
+                return listed
                     .acknowledgement()
                     .build
                     .as_ref()
@@ -678,15 +711,21 @@ pub async fn answers_as_or_gone(
 ) -> Result<Answered> {
     let endpoint = environment.paths.controller_endpoint()?;
     let expected = format!("kr-controller/{target}");
+    let majors = majors_of(store, target);
     let deadline = tokio::time::Instant::now() + DAEMON_START;
     loop {
         let connected = tokio::time::timeout(
             DAEMON_ANSWER,
-            LocalClient::connect(&endpoint, LocalClientKind::Cli, crate::build_id()),
+            LocalClient::connect_listing(
+                &endpoint,
+                LocalClientKind::Cli,
+                crate::build_id(),
+                &majors,
+            ),
         )
         .await;
-        if let Ok(Ok(client)) = connected {
-            let stated = client
+        if let Ok(Ok(listed)) = connected {
+            let stated = listed
                 .acknowledgement()
                 .build
                 .as_ref()

@@ -23,9 +23,11 @@ use kr_protocol::error::ProtocolError;
 use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, FrameCodec, StreamKind};
 use kr_protocol::hello::{ProtocolVersion, ReceiveLimits};
 use kr_protocol::ids::{ActionId, BuildId, RequestId};
-use kr_protocol::local::{BridgeOrigin, LocalClientKind, LocalHello, LocalHelloAck};
+use kr_protocol::local::{
+    BridgeOrigin, LocalBuild, LocalClientKind, LocalHello, LocalHelloAck, LocalRole,
+};
 use kr_protocol::method::{Method, MethodVersion};
-use kr_protocol::retained::{Level, stated_protocol};
+use kr_protocol::retained::{Level, stated_protocol, worker_protocols_for};
 use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable};
 use kr_protocol::wire::WireMessage;
 use kr_protocol::worker::{
@@ -70,11 +72,146 @@ impl Codec for Bound {
     }
 }
 
+/// What a hello offers, and which answers it admits.
+///
+/// A client admits an answer of the major it states itself. A control daemon's link to a worker, and
+/// the update's look at a worker, also admit the major of a retained level, from a worker, which
+/// answers its own; and the update's look at the daemon of the release it makes current also admits
+/// the majors that release's manifest lists, from a control daemon. Nothing else is admitted, so a
+/// client that does not name them keeps the one major it has always had.
+#[derive(Clone, Debug)]
+struct Offer {
+    /// The versions offered: the client's own first.
+    versions: Vec<ProtocolVersion>,
+    /// Whether an answer from a worker of another offered major is admitted.
+    from_workers: bool,
+    /// The majors, besides the client's own, that an answer from a control daemon may state.
+    from_daemons: Vec<u16>,
+}
+
+impl Offer {
+    /// A client that offers `own` alone and admits its major alone.
+    fn own(own: ProtocolVersion) -> Self {
+        Self {
+            versions: vec![own],
+            from_workers: false,
+            from_daemons: Vec::new(),
+        }
+    }
+
+    /// A client that reaches a worker: it offers `own` and the protocol of each level it retains,
+    /// and admits the major of any of them from a worker.
+    fn to_workers(own: ProtocolVersion) -> Self {
+        Self {
+            versions: worker_protocols_for(own),
+            from_workers: true,
+            from_daemons: Vec::new(),
+        }
+    }
+
+    /// A client that looks at the control daemon of a release which lists `majors`: it offers `own`
+    /// and the first version of each of those majors, and admits a control daemon's answer of one
+    /// of them.
+    fn to_daemons(own: ProtocolVersion, majors: &[u16]) -> Self {
+        let mut versions = vec![own];
+        for major in majors {
+            let version = ProtocolVersion::new(*major, 0);
+            if *major != own.major && !versions.contains(&version) {
+                versions.push(version);
+            }
+        }
+        Self {
+            versions,
+            from_workers: false,
+            from_daemons: majors.to_vec(),
+        }
+    }
+
+    /// The version the client states as its own.
+    fn own_version(&self) -> ProtocolVersion {
+        self.versions[0]
+    }
+
+    /// Whether an answer that selects `selected`, from a process in `role`, is admitted.
+    fn admits(&self, selected: ProtocolVersion, role: LocalRole) -> bool {
+        selected.major == self.own_version().major
+            || (self.from_workers
+                && role == LocalRole::Worker
+                && self.versions.iter().any(|v| v.major == selected.major))
+            || (role == LocalRole::Controller && self.from_daemons.contains(&selected.major))
+    }
+}
+
 /// A connected local client.
 pub type LocalClient = Client<ThisLevel>;
 
 /// A control daemon's link to one worker, bound to the level the worker stated.
 pub type BoundLink = Client<Bound>;
+
+/// A control daemon found by [`LocalClient::connect_listing`].
+#[derive(Debug)]
+pub enum Listed {
+    /// The daemon states this build's major, and this is the client of it.
+    Ours(Box<LocalClient>),
+    /// The daemon states another major that the release it belongs to lists. There is no client:
+    /// the hello's answer is all there is to read, and nothing can be sent.
+    Other(Box<LocalHelloAck>),
+}
+
+impl Listed {
+    /// What the daemon said in its answer to the hello.
+    #[must_use]
+    pub const fn acknowledgement(&self) -> &LocalHelloAck {
+        match self {
+            Self::Ours(client) => &client.acknowledgement,
+            Self::Other(acknowledgement) => acknowledgement,
+        }
+    }
+}
+
+/// A worker seen by [`LocalClient::look_at_worker`]: it can be proved to be the one a session
+/// names and asked what build it is, and it can be sent nothing else.
+#[derive(Debug)]
+pub struct WorkerLook {
+    client: LocalClient,
+}
+
+impl WorkerLook {
+    /// Proves the worker is the one `descriptor` names.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Client::verify_worker`] returns.
+    pub async fn verify_worker(
+        &mut self,
+        descriptor: &WorkerDescriptor,
+    ) -> Result<WorkerVerifyProof> {
+        self.client.verify_worker(descriptor).await
+    }
+
+    /// Challenges the worker for a key the caller already holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Client::challenge_worker`] returns.
+    pub async fn challenge_worker(
+        &mut self,
+        worker_public_key: &kr_protocol::scalars::AuthorisationKey,
+        session_id: kr_protocol::ids::SessionId,
+        session_epoch: kr_protocol::ids::SessionEpoch,
+        endpoint: &str,
+    ) -> Result<WorkerVerifyProof> {
+        self.client
+            .challenge_worker(worker_public_key, session_id, session_epoch, endpoint)
+            .await
+    }
+
+    /// The build the worker stated in its answer to the hello, if it stated one.
+    #[must_use]
+    pub const fn build(&self) -> Option<&LocalBuild> {
+        self.client.acknowledgement.build.as_ref()
+    }
+}
 
 /// A connected local client, under a codec.
 #[derive(Debug)]
@@ -140,9 +277,89 @@ impl LocalClient {
             build_id,
             ReceiveLimits::default(),
             Some(origin),
-            stated_protocol(),
+            &Offer::own(stated_protocol()),
         )
         .await
+    }
+
+    /// Connects to a worker to see what it is, and stops there.
+    ///
+    /// A worker of a build this one retains the level of may state another public major than this
+    /// build's own, and a client that offers only its own is refused by it before it can say which
+    /// build it is. This offers the protocol of each level this build retains as well, so the
+    /// worker answers its own, and the update can read its build and decide from it. The look has
+    /// no request to make of the worker: it proves the worker and reads its build, which are frozen
+    /// exchanges every level reads, and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`LocalClient::connect`] returns.
+    pub async fn look_at_worker(
+        endpoint: &Endpoint,
+        kind: LocalClientKind,
+        build_id: BuildId,
+    ) -> Result<WorkerLook> {
+        let client = Self::connecting(
+            endpoint,
+            kind,
+            build_id,
+            ReceiveLimits::default(),
+            None,
+            &Offer::to_workers(stated_protocol()),
+        )
+        .await?;
+        Ok(WorkerLook { client })
+    }
+
+    /// Connects to the control daemon of a release that lists the public `majors`, which may state
+    /// one of them and not this build's own.
+    ///
+    /// An update looks at the daemon of the release it makes current to see that it answers, and
+    /// that release may be of another major than the updater's. The look offers those majors too
+    /// and admits a control daemon's answer of one of them; a daemon that answers its own major is a
+    /// client like any other, and one that answers another is only its answer to the hello, since
+    /// nothing else this build says is read by a daemon of that major. With no majors this is
+    /// [`LocalClient::connect`].
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`LocalClient::connect`] returns.
+    pub async fn connect_listing(
+        endpoint: &Endpoint,
+        kind: LocalClientKind,
+        build_id: BuildId,
+        majors: &[u16],
+    ) -> Result<Listed> {
+        if kind == LocalClientKind::Controller {
+            return Err(IpcError::UnexpectedMessage(
+                "a control daemon's link to a worker is made with BoundLink, which speaks the \
+                 worker's level",
+            ));
+        }
+        let stated = stated_protocol();
+        let offer = Offer::to_daemons(stated, majors);
+        let (reader, writer, acknowledgement) = hello(
+            endpoint,
+            kind,
+            build_id,
+            ReceiveLimits::default(),
+            None,
+            &offer,
+        )
+        .await?;
+        if acknowledgement.selected_version.major != stated.major {
+            return Ok(Listed::Other(Box::new(acknowledgement)));
+        }
+        Ok(Listed::Ours(Box::new(Self {
+            codec: ThisLevel,
+            reader,
+            writer,
+            acknowledgement,
+            generation_challenge: None,
+            next_request: 0,
+            held: VecDeque::new(),
+            held_bytes: 0,
+        })))
     }
 
     /// Connects and says this client can receive `max_receive`, rather than the usual limits.
@@ -167,7 +384,7 @@ impl LocalClient {
             build_id,
             max_receive,
             None,
-            stated_protocol(),
+            &Offer::own(stated_protocol()),
         )
         .await
     }
@@ -192,7 +409,7 @@ impl LocalClient {
             build_id,
             ReceiveLimits::default(),
             None,
-            own,
+            &Offer::own(own),
         )
         .await
     }
@@ -210,7 +427,7 @@ impl LocalClient {
             build_id,
             max_receive,
             None,
-            stated_protocol(),
+            &Offer::own(stated_protocol()),
         )
         .await
     }
@@ -221,7 +438,7 @@ impl LocalClient {
         build_id: BuildId,
         max_receive: ReceiveLimits,
         origin: Option<BridgeOrigin>,
-        own: ProtocolVersion,
+        offer: &Offer,
     ) -> Result<Self> {
         if kind == LocalClientKind::Controller {
             return Err(IpcError::UnexpectedMessage(
@@ -230,7 +447,7 @@ impl LocalClient {
             ));
         }
         let (reader, writer, acknowledgement) =
-            hello(endpoint, kind, build_id, max_receive, origin, own).await?;
+            hello(endpoint, kind, build_id, max_receive, origin, offer).await?;
         Ok(Self {
             codec: ThisLevel,
             reader,
@@ -274,13 +491,13 @@ async fn hello(
     build_id: BuildId,
     max_receive: ReceiveLimits,
     origin: Option<BridgeOrigin>,
-    own: ProtocolVersion,
+    offer: &Offer,
 ) -> Result<(FrameReader, FrameWriter, LocalHelloAck)> {
     let connection = Connection::connect(endpoint).await?;
     let (mut reader, mut writer) = split(connection, StreamKind::Control);
     writer
         .write_message(&ControlFrame::Hello(LocalHello {
-            offered_versions: vec![own],
+            offered_versions: offer.versions.clone(),
             build_id,
             client: kind,
             capabilities: CanonicalSet::new(),
@@ -307,9 +524,9 @@ async fn hello(
             ));
         }
     };
-    if acknowledgement.selected_version.major != own.major {
+    if !offer.admits(acknowledgement.selected_version, acknowledgement.role) {
         return Err(IpcError::VersionMismatch {
-            host: own.to_string(),
+            host: offer.own_version().to_string(),
             offered: acknowledgement.selected_version.to_string(),
         });
     }
@@ -369,18 +586,35 @@ impl BoundLink {
         max_receive: ReceiveLimits,
         bound_to: Option<Level>,
     ) -> Result<Self> {
+        let stated = stated_protocol();
         let (reader, writer, acknowledgement) = hello(
             endpoint,
             LocalClientKind::Controller,
             build_id,
             max_receive,
             None,
-            stated_protocol(),
+            &Offer::to_workers(stated),
         )
         .await?;
         let level = match bound_to {
             Some(level) => level,
-            None => retained_level(acknowledgement.build.as_ref())?,
+            None => {
+                let level = retained_level(acknowledgement.build.as_ref())?;
+                // The two things the worker says of itself agree: the version its hello answered
+                // is the one its level names, so a worker that answered a major the level does not
+                // speak is not bound to it.
+                let named = level.protocol();
+                if named.is_none_or(|named| named.major != acknowledgement.selected_version.major) {
+                    return Err(IpcError::VersionMismatch {
+                        host: named.map_or_else(
+                            || "no protocol, for a level that records none".to_owned(),
+                            |named| named.to_string(),
+                        ),
+                        offered: acknowledgement.selected_version.to_string(),
+                    });
+                }
+                level
+            }
         };
         let mut link = Self {
             codec: Bound(level),
@@ -1276,5 +1510,58 @@ impl LinkWriter {
     #[must_use]
     pub fn is_mid_frame(&self) -> bool {
         self.writer.is_mid_frame()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ONE: ProtocolVersion = ProtocolVersion::new(1, 0);
+    const TWO: ProtocolVersion = ProtocolVersion::new(2, 0);
+
+    /// KR-REQ-26.07: which answers a client admits. A client states one major and admits it from
+    /// anyone; the majors a reach of workers offers are admitted from a worker alone; and the majors
+    /// the manifest of a release lists are admitted from a control daemon alone. Nothing else is, so
+    /// a client that does not name them keeps the one major it has always had.
+    #[test]
+    fn a_client_admits_another_major_only_from_the_peer_it_offered_it_to() {
+        let own = Offer::own(TWO);
+        assert!(own.admits(TWO, LocalRole::Controller));
+        assert!(own.admits(TWO, LocalRole::Worker));
+        assert!(
+            !own.admits(ONE, LocalRole::Worker),
+            "no retained major was offered"
+        );
+        assert!(!own.admits(ONE, LocalRole::Controller));
+
+        let workers = Offer {
+            versions: vec![TWO, ONE],
+            from_workers: true,
+            from_daemons: Vec::new(),
+        };
+        assert!(workers.admits(TWO, LocalRole::Controller));
+        assert!(workers.admits(ONE, LocalRole::Worker));
+        assert!(
+            !workers.admits(ONE, LocalRole::Controller),
+            "a daemon never answers a retained major"
+        );
+        assert!(!workers.admits(ProtocolVersion::new(3, 0), LocalRole::Worker));
+        assert!(!workers.admits(ONE, LocalRole::Rendezvous));
+
+        let daemons = Offer::to_daemons(ONE, &[2]);
+        assert_eq!(daemons.versions, [ONE, TWO]);
+        assert!(daemons.admits(ONE, LocalRole::Controller));
+        assert!(daemons.admits(TWO, LocalRole::Controller));
+        assert!(
+            !daemons.admits(TWO, LocalRole::Worker),
+            "a worker never answers a listed major"
+        );
+        assert!(!daemons.admits(ProtocolVersion::new(3, 0), LocalRole::Controller));
+        assert_eq!(
+            Offer::to_daemons(ONE, &[1]).versions,
+            [ONE],
+            "a release that lists this build's major adds nothing to the offer"
+        );
     }
 }

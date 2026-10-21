@@ -505,6 +505,28 @@ pub const PUBLIC_MAJORS: &[PublicMajor] = &[
 ];
 "#;
 
+    /// A level names the protocol of its workers by the newest major of the table its release
+    /// recorded, and a worker states the protocol its source declares: a source whose table ends at
+    /// another major than the declaration's is refused, whichever is the larger, so a cut, the
+    /// in-level check and the retained-surface check never meet a level that names a protocol its
+    /// workers do not speak.
+    #[test]
+    fn a_table_that_does_not_end_at_the_declared_protocol_is_refused() {
+        for declared in [1, 3] {
+            let source = TWO_ROWS.replace(
+                "ProtocolVersion::new(2, 0);\npub const PUBLIC_MAJORS",
+                &format!("ProtocolVersion::new({declared}, 0);\npub const PUBLIC_MAJORS"),
+            );
+            assert_ne!(source, TWO_ROWS, "the declaration was replaced");
+            let refused = record_of(&source).expect_err("a table that ends at another major");
+            assert!(
+                refused.contains("newest major of the table is 2"),
+                "{refused}"
+            );
+        }
+        assert!(record_of(TWO_ROWS).is_ok(), "the control: it ends at it");
+    }
+
     /// The table in this tree's own source reads as the one the build has.
     #[test]
     fn this_trees_table_is_read_as_it_is() {

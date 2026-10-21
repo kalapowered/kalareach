@@ -27,6 +27,16 @@
 //! decoder read the result. [`Level::encode`] does the reverse: the entries' write rewrites, then a
 //! check that the level's surface admits the frame, so a frame the level cannot read is refused by
 //! name and nothing is sent.
+//!
+//! # The protocol a worker is met at
+//!
+//! A level names the protocol of its workers: the newest version of the newest major in the table
+//! its release recorded ([`RetainedLevel::worker_protocol`]). A hello offers the build's own
+//! protocol and then each retained level's ([`worker_protocols`]), and a worker, which admits a
+//! hello that offers its own major, answers with its own. So a control daemon of a later public
+//! major reaches the workers of the levels it retains, though the public table no longer lists
+//! their major; and a worker of a level it does not retain is not reached, whatever major it
+//! speaks.
 
 pub mod surface;
 
@@ -255,6 +265,38 @@ impl RetainedLevel {
     pub fn record(&self, name: &str) -> Option<&'static str> {
         record(self.release, name)
     }
+
+    /// The protocol the workers of this level speak: the newest version of the newest major in the
+    /// table the level's release recorded.
+    ///
+    /// None where the level recorded no table, or the table does not read: a row that does not
+    /// name its major and versions, or a version of another major than its row's.
+    #[must_use]
+    pub fn worker_protocol(&self) -> Option<ProtocolVersion> {
+        let mut newest: Option<ProtocolVersion> = None;
+        for line in self.public_majors?.lines() {
+            let Some(row) = line.strip_prefix("major=") else {
+                continue;
+            };
+            let mut fields = row.split(' ');
+            let major: u16 = fields.next()?.parse().ok()?;
+            let versions = fields.next()?.strip_prefix("versions=")?;
+            let mut row_newest: Option<ProtocolVersion> = None;
+            for text in versions.split(',') {
+                let (row_major, minor) = text.split_once('.')?;
+                let version = ProtocolVersion::new(row_major.parse().ok()?, minor.parse().ok()?);
+                if version.major != major {
+                    return None;
+                }
+                row_newest = row_newest.max(Some(version));
+            }
+            let row_newest = row_newest?;
+            if newest.is_none_or(|known| row_newest.major > known.major) {
+                newest = Some(row_newest);
+            }
+        }
+        newest
+    }
 }
 
 /// The levels this release retains, in the order of [`RETAINED_WORKER_LEVELS`].
@@ -370,14 +412,16 @@ pub fn a_level_of_the_tests_own(
     drop_what_no_root_reaches(&mut document);
     let text = serde_json::to_string(&document).expect("a document is text");
     Surface::parse(&text).expect("an edited surface is a surface");
-    Level::retained(Box::leak(Box::new(RetainedLevel::new(
+    let mut own = RetainedLevel::new(
         kept.level,
         Box::leak(text.into_boxed_str()),
         kept.release,
         kept.plugin_host,
         declared,
         &[],
-    ))))
+    );
+    own.public_majors = kept.public_majors;
+    Level::retained(Box::leak(Box::new(own)))
 }
 
 /// Removes the definitions of a surface document that no root reaches any more, as an edit that
@@ -531,6 +575,31 @@ pub fn switched_protocol() -> Option<ProtocolVersion> {
     })
 }
 
+/// The protocol versions a build that states `own` offers a worker: `own`, and then the protocol
+/// of each level it retains, without repeating one.
+///
+/// A worker admits a hello that offers its own major, so a control daemon that offers the protocol
+/// of every level it retains reaches a worker of any of them, at that level's own version, whatever
+/// major the daemon states. A level names its protocol through the table its release recorded.
+#[must_use]
+pub fn worker_protocols_for(own: ProtocolVersion) -> Vec<ProtocolVersion> {
+    let mut offered = vec![own];
+    for retained in &RETAINED {
+        if let Some(protocol) = retained.worker_protocol()
+            && !offered.contains(&protocol)
+        {
+            offered.push(protocol);
+        }
+    }
+    offered
+}
+
+/// The protocol versions this build offers a worker ([`worker_protocols_for`] its stated protocol).
+#[must_use]
+pub fn worker_protocols() -> Vec<ProtocolVersion> {
+    worker_protocols_for(stated_protocol())
+}
+
 /* -------------------------------------------------------------------------------------------- */
 /* The check                                                                                    */
 /* -------------------------------------------------------------------------------------------- */
@@ -678,6 +747,12 @@ pub fn check() -> Result<(), Vec<String>> {
         for line in assessment.to_string().lines() {
             problems.push(format!("level {}: {line}", retained.level));
         }
+        if retained.worker_protocol().is_none() {
+            problems.push(format!(
+                "level {} records no table of public majors that names the protocol of its workers",
+                retained.level
+            ));
+        }
         if retained.plugin_host.trim() != PLUGIN_HOST_PROTOCOL {
             problems.push(format!(
                 "level {} kept the plugin host protocol {}, and this build speaks {PLUGIN_HOST_PROTOCOL}",
@@ -800,6 +875,16 @@ impl Level {
         match self.0 {
             Which::This => THIS_LEVEL,
             Which::Retained(retained) => retained.level,
+        }
+    }
+
+    /// The protocol a worker at this level speaks: this build's stated protocol for its own level,
+    /// and for a retained level the one its recorded table names ([`RetainedLevel::worker_protocol`]).
+    #[must_use]
+    pub fn protocol(self) -> Option<ProtocolVersion> {
+        match self.0 {
+            Which::This => Some(stated_protocol()),
+            Which::Retained(retained) => retained.worker_protocol(),
         }
     }
 

@@ -1584,7 +1584,7 @@ async fn hand_over(
                 // The daemon that did not prepare may have closed its gate all the same, and its
                 // answer been lost: whichever attempt it holds ends, this run being the only one
                 // that can have begun it.
-                let _ = handover::resume_holder(environment, &target.release).await;
+                let _ = handover::resume_holder(store, environment, &target.release).await;
                 forget_update(store, record);
                 return Err(refused);
             }
@@ -2048,7 +2048,7 @@ async fn start_one(
 ) -> Result<()> {
     let environment = restart.environment()?;
     if handover::held(store, &environment, handover::INSTALL_LOCK_WAIT).await? {
-        match handover::resume_holder(&environment, target).await? {
+        match handover::resume_holder(store, &environment, target).await? {
             handover::Resumed::Serving => {
                 return match handover::answers_as(store, &environment, current, None).await {
                     Ok(()) => Ok(()),
@@ -2078,7 +2078,7 @@ async fn start_one(
                 environment_id: environment.environment_id,
                 paths: environment.paths.clone(),
             };
-            crate::startup::start_by_service(&known).await?;
+            crate::startup::start_by_service(&known, &handover::majors_of(store, current)).await?;
             handover::answers_as(store, &environment, current, None).await
         }
         Start::Arguments {
@@ -2432,7 +2432,7 @@ async fn answering(store: &Store, update: &Transaction) -> std::result::Result<(
     );
     for restart in every {
         let environment = restart.environment().map_err(|error| error.said())?;
-        match handover::answers_as_now(&environment).await {
+        match handover::answers_as_now(store, &environment, &current).await {
             Some(build) if build.as_str() == expected => {}
             Some(build) => {
                 return Err(shown!(
@@ -2782,9 +2782,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_daemon_that_does_not_listen_yet_is_asked_again_before_it_is_said_silent() {
         let temp = kr_ipc::testing::TempHost::create();
-        let (_store, environment) = store_and_environment(&temp);
+        let (store, environment) = store_and_environment(&temp);
+        let target = ReleaseName::new("0.1.0+aaaaaaaaaaaa").expect("a release");
         let began = std::time::Instant::now();
-        assert!(handover::answers_as_now(&environment).await.is_none());
+        assert!(
+            handover::answers_as_now(&store, &environment, &target)
+                .await
+                .is_none()
+        );
         assert!(
             began.elapsed() >= std::time::Duration::from_secs(4),
             "asked again until the moment was over: {:?}",

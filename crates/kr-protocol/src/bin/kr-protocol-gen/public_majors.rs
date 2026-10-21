@@ -24,8 +24,8 @@ const PROTOCOL_DECLARATION: &str = "pub const PROTOCOL_VERSION: ProtocolVersion 
 ///
 /// Returns why when the source cannot be lexed (it holds a raw string, a quote and a backslash that
 /// make no character literal, or a block comment that does not end), names the table in a form this
-/// reader does not read, or the table is not a list of `PublicMajor { .. }` literals of the five
-/// known fields with known values.
+/// reader does not read, the table is not a list of `PublicMajor { .. }` literals of the five known
+/// fields with known values, or the source's `PROTOCOL_VERSION` is not of the table's newest major.
 pub fn record_of(source: &str) -> Result<Option<String>, String> {
     // Comments are taken out before anything is looked for, so a bracket or a declaration inside
     // one is neither the end of the table nor the table.
@@ -57,6 +57,22 @@ pub fn record_of(source: &str) -> Result<Option<String>, String> {
     }
     if rows.is_empty() {
         return Err("the table has no row".to_owned());
+    }
+    // A level names the protocol of its workers by the newest major of the table its release
+    // recorded, and the worker states the protocol its source declares, so the two are one major
+    // in every tree this reads: a tree where they differ is refused, never recorded.
+    let declared = version_of(&code, "PROTOCOL_VERSION")?;
+    let newest = rows.iter().map(|row| row.major).max().unwrap_or_default();
+    let declared_major = declared
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u16>().ok());
+    if declared_major != Some(newest) {
+        return Err(format!(
+            "the newest major of the table is {newest}, and PROTOCOL_VERSION is {declared}: a \
+             release's workers speak the protocol it declares, and its table has to end at that \
+             major"
+        ));
     }
     let mut seen = Vec::new();
     let mut record = String::new();

@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use kr_client::shown;
 use kr_client::shown::Shown;
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{Listed, LocalClient};
 use kr_ipc::install::Permit;
 use kr_ipc::paths::{EnvironmentPaths, HostPaths};
 use kr_protocol::hostinfo::configuration::{Change, ControllerStartup, DocumentState};
@@ -535,8 +535,8 @@ async fn open_or_start_within(
     bounds: Bounds,
 ) -> Result<(LocalClient, Option<Started>)> {
     let endpoint = environment.paths.controller_endpoint()?;
-    let error = match find(environment, &endpoint, bounds).await? {
-        Found::Answering(client) => return Ok((*client, None)),
+    let error = match find(environment, &endpoint, bounds, &[]).await? {
+        Found::Answering(client) => return Ok((ours(*client)?, None)),
         Found::Vacant(error) => error,
     };
     // The daemon beside this command serves the environment its roots name as this installation's
@@ -558,7 +558,9 @@ async fn open_or_start_within(
             standalone(paths, &environment.paths, &endpoint, bounds).await
         }
         Some(ControllerStartup::Service) => {
-            managed(&environment.paths, &endpoint, &error, bounds).await
+            let (client, started) =
+                managed(&environment.paths, &endpoint, &error, bounds, &[]).await?;
+            Ok((ours(client)?, started))
         }
         None => Err(resolve::not_running(&error, chosen.setup_action())),
     }
@@ -567,7 +569,7 @@ async fn open_or_start_within(
 /// Whether a control daemon answers at an environment's endpoint, or nothing listens there.
 enum Found {
     /// A daemon answered, and this is the connection to it.
-    Answering(Box<LocalClient>),
+    Answering(Box<Listed>),
     /// Nothing listens at the endpoint; the failure says so.
     Vacant(kr_ipc::IpcError),
 }
@@ -578,8 +580,9 @@ async fn find(
     environment: &KnownEnvironment,
     endpoint: &kr_ipc::paths::Endpoint,
     bounds: Bounds,
+    majors: &[u16],
 ) -> Result<Found> {
-    match reach(endpoint, bounds.answer).await {
+    match reach(endpoint, bounds.answer, majors).await {
         Reached::Answered(client) => Ok(Found::Answering(client)),
         Reached::Silent => Err(unanswered(shown!(
             "the control daemon listening for environment {} accepted the connection and \
@@ -609,19 +612,32 @@ async fn find(
 #[cfg(unix)]
 pub async fn start_by_service(
     environment: &KnownEnvironment,
-) -> Result<(LocalClient, Option<Started>)> {
+    majors: &[u16],
+) -> Result<Option<Started>> {
     let endpoint = environment.paths.controller_endpoint()?;
-    let error = match find(environment, &endpoint, BOUNDS).await? {
-        Found::Answering(client) => return Ok((*client, None)),
+    let error = match find(environment, &endpoint, BOUNDS, majors).await? {
+        Found::Answering(_) => return Ok(None),
         Found::Vacant(error) => error,
     };
-    managed(&environment.paths, &endpoint, &error, BOUNDS).await
+    let (_, started) = managed(&environment.paths, &endpoint, &error, BOUNDS, majors).await?;
+    Ok(started)
+}
+
+/// The client of a daemon found by a look that listed no other major than this command's: the
+/// daemon states this command's major, or the look would not have admitted it.
+fn ours(listed: Listed) -> Result<LocalClient> {
+    match listed {
+        Listed::Ours(client) => Ok(*client),
+        Listed::Other(_) => Err(CliError::Other(Shown::said(
+            "the control daemon states another public major than this command does",
+        ))),
+    }
 }
 
 /// What one attempt to reach a daemon found.
 enum Reached {
     /// A daemon answered, and this is the connection to it.
-    Answered(Box<LocalClient>),
+    Answered(Box<Listed>),
     /// Something accepted the connection and did not answer within the bound.
     Silent,
     /// The connection failed.
@@ -630,10 +646,10 @@ enum Reached {
 
 /// Makes one attempt to reach the daemon at `endpoint`, the connection and its hello together
 /// bounded by `bound`.
-async fn reach(endpoint: &kr_ipc::paths::Endpoint, bound: Duration) -> Reached {
+async fn reach(endpoint: &kr_ipc::paths::Endpoint, bound: Duration, majors: &[u16]) -> Reached {
     match tokio::time::timeout(
         bound,
-        LocalClient::connect(endpoint, LocalClientKind::Cli, crate::build_id()),
+        LocalClient::connect_listing(endpoint, LocalClientKind::Cli, crate::build_id(), majors),
     )
     .await
     {
@@ -671,11 +687,12 @@ fn nothing_listening(error: &kr_ipc::IpcError) -> bool {
 async fn answered_by(
     endpoint: &kr_ipc::paths::Endpoint,
     deadline: tokio::time::Instant,
+    majors: &[u16],
     mut between: impl FnMut(),
-) -> std::result::Result<LocalClient, Shown> {
+) -> std::result::Result<Listed, Shown> {
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let last = match reach(endpoint, left).await {
+        let last = match reach(endpoint, left, majors).await {
             Reached::Answered(client) => return Ok(*client),
             Reached::Silent => {
                 Shown::said("the endpoint accepted the connection and did not answer")
@@ -788,12 +805,12 @@ async fn standalone(
     // environment has its daemon, and it is the one the lock let through. The one started here is
     // collected as soon as it ends, so a daemon that could not take the environment is not left
     // waiting on this command.
-    let last = match answered_by(endpoint, deadline, || {
+    let last = match answered_by(endpoint, deadline, &[], || {
         let _ = child.try_wait();
     })
     .await
     {
-        Ok(client) => return Ok((client, Some(started))),
+        Ok(client) => return Ok((ours(client)?, Some(started))),
         Err(last) => last,
     };
     let state = child.try_wait().ok().flatten().map_or_else(
@@ -895,7 +912,8 @@ async fn managed(
     endpoint: &kr_ipc::paths::Endpoint,
     error: &kr_ipc::IpcError,
     bounds: Bounds,
-) -> Result<(LocalClient, Option<Started>)> {
+    majors: &[u16],
+) -> Result<(Listed, Option<Started>)> {
     let refused = |refusal| match refusal {
         service_manager::Refusal::NotSetUp(why) => resolve::not_running(error, why),
         service_manager::Refusal::Failed(why) => unanswered(shown!(
@@ -932,7 +950,7 @@ async fn managed(
         manager: Some(asked.manager),
     };
     let deadline = tokio::time::Instant::now() + bounds.start;
-    let last = match answered_by(endpoint, deadline, || {}).await {
+    let last = match answered_by(endpoint, deadline, majors, || {}).await {
         Ok(client) => return Ok((client, Some(started))),
         Err(last) => last,
     };
@@ -961,7 +979,8 @@ async fn managed(
     _endpoint: &kr_ipc::paths::Endpoint,
     error: &kr_ipc::IpcError,
     _bounds: Bounds,
-) -> Result<(LocalClient, Option<Started>)> {
+    _majors: &[u16],
+) -> Result<(Listed, Option<Started>)> {
     Err(resolve::not_running(
         error,
         Shown::said(
@@ -1023,13 +1042,13 @@ async fn standalone(
         start: ControllerStartup::Standalone,
         manager: None,
     };
-    let last = match answered_by(endpoint, deadline, || {}).await {
+    let last = match answered_by(endpoint, deadline, &[], || {}).await {
         Ok(client) => {
             // A daemon answered, whichever start it came from. The request is withdrawn, so no
             // starter the Task Scheduler runs later acts on it; one that took it already is past
             // the reach of this.
             let _ = kr_ipc::starter::withdraw_claim(environment, asked.request);
-            return Ok((client, Some(started)));
+            return Ok((ours(client)?, Some(started)));
         }
         Err(last) => last,
     };
@@ -2196,12 +2215,12 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         assert!(matches!(
-            reach(&endpoint, Duration::from_millis(300)).await,
+            reach(&endpoint, Duration::from_millis(300), &[]).await,
             Reached::Silent
         ));
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
         let mut attempts = 0;
-        let last = answered_by(&endpoint, deadline, || attempts += 1)
+        let last = answered_by(&endpoint, deadline, &[], || attempts += 1)
             .await
             .map(|_| ())
             .expect_err("nothing answers");

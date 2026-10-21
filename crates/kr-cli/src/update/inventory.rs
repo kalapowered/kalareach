@@ -201,10 +201,11 @@ pub async fn described(environment: &EnvironmentPaths) -> Vec<Stated> {
             continue;
         };
         let asked = tokio::time::timeout(WORKER_ANSWER, async {
-            let mut client =
-                LocalClient::connect(&endpoint, LocalClientKind::Cli, crate::build_id()).await?;
-            client.verify_worker(&descriptor).await?;
-            Ok::<_, kr_ipc::IpcError>(client.acknowledgement().build.clone())
+            let mut look =
+                LocalClient::look_at_worker(&endpoint, LocalClientKind::Cli, crate::build_id())
+                    .await?;
+            look.verify_worker(&descriptor).await?;
+            Ok::<_, kr_ipc::IpcError>(look.build().cloned())
         })
         .await;
         if let Ok(Ok(build)) = asked {
@@ -515,12 +516,11 @@ async fn challenge(
 ) -> Option<Option<LocalBuild>> {
     let endpoint_text = endpoint.as_text();
     tokio::time::timeout(WORKER_ANSWER, async {
-        let mut client =
-            LocalClient::connect(endpoint, LocalClientKind::Cli, crate::build_id()).await?;
-        client
-            .challenge_worker(key, session_id, SessionEpoch::V1, &endpoint_text)
+        let mut look =
+            LocalClient::look_at_worker(endpoint, LocalClientKind::Cli, crate::build_id()).await?;
+        look.challenge_worker(key, session_id, SessionEpoch::V1, &endpoint_text)
             .await?;
-        Ok::<_, kr_ipc::IpcError>(client.acknowledgement().build.clone())
+        Ok::<_, kr_ipc::IpcError>(look.build().cloned())
     })
     .await
     .ok()?
