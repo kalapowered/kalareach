@@ -2055,6 +2055,12 @@ mod tests {
             public_majors: vec![1],
             retained_levels: vec![CompatibilityLevel::of(PackageVersion::new(0, 48, 0))],
             shells: Vec::new(),
+            agents: Vec::new(),
+            dependencies: kr_protocol::update::ReleaseDependencies {
+                lock_sha256: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
+                pinned: Vec::new(),
+                vectors: Vec::new(),
+            },
             stores: vec![ReleaseStore {
                 store: "registry".to_owned(),
                 scope: StoreScope::Environment,

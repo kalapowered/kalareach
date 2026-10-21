@@ -359,6 +359,11 @@ pub struct ReleaseManifest {
     pub retained_levels: Vec<CompatibilityLevel>,
     /// The qualified shell packages under `shells/`.
     pub shells: Vec<ReleaseShell>,
+    /// The executable builds of the supported agents this release is qualified against, each as
+    /// the signed plugin index at the pinned commit names it. Empty while the index names none.
+    pub agents: Vec<ReleaseAgent>,
+    /// The cryptographic libraries the release is built with, and the lock they were resolved in.
+    pub dependencies: ReleaseDependencies,
     /// Every store the release's programs read, with the versions of each they read. A host
     /// switches to a release only when every store it keeps is at a version this says the release
     /// reads. Never empty.
@@ -504,14 +509,193 @@ impl<'de> Deserialize<'de> for FloorVersion {
 const FLOOR_FORM: &str = "a floor's version is `<major>.<minor>`";
 
 /// One qualified shell package a release carries.
+///
+/// It says what the package is made of: the upstream release it is built from, every reader patch
+/// applied to it, the bridge sources added to it, the module trees it loads and how a host starts
+/// it among the person's own startup files. The package's directory under `shells/<shell>/` holds
+/// the built files, each of them listed among the release's files.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseShell {
     /// Which shell: `zsh`, `bash`, `fish` or `powershell`.
     pub shell: String,
     /// The package's identity, which names its directory under `shells/<shell>/`.
     pub identity: String,
-    /// The reader patches built into it, by their revisions.
-    pub patch_revisions: Vec<String>,
+    /// The upstream release the package is built from.
+    pub upstream: ShellUpstream,
+    /// The reader patches built into it, in the order they are applied.
+    pub patches: Vec<ReleasePatch>,
+    /// The sources of the bridge the package adds to the shell.
+    pub sources: Vec<ReleaseSource>,
+    /// The module trees it loads.
+    pub modules: Vec<ReleaseModule>,
+    /// How a host starts it, and where its marked entry sits among the person's own startup files.
+    pub profile_order: Vec<ProfileLaunch>,
+}
+
+/// The upstream release a shell package is built from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellUpstream {
+    /// The shell's version.
+    pub version: String,
+    /// The upstream revision the patches apply to.
+    pub revision: String,
+    /// The archive the package is built from.
+    pub archive: String,
+    /// The archive's SHA-256 digest.
+    pub sha256: Digest256,
+}
+
+/// One reader patch built into a shell package.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleasePatch {
+    /// The patch's name.
+    pub name: String,
+    /// The patch's own revision in this repository.
+    pub revision: String,
+    /// The upstream revision it was applied to, which is the package's own base.
+    pub base_revision: String,
+    /// The upstream commit the patch was taken from, where it is a published upstream change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_commit: Option<String>,
+    /// The SHA-256 digest of the patch file.
+    pub sha256: Digest256,
+}
+
+/// A source file a release names by its digest: a file of the bridge a shell package adds to the
+/// shell, or a vector a library is held to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseSource {
+    /// The file, relative to the directory of sources it belongs to.
+    pub file: String,
+    /// Its SHA-256 digest.
+    pub sha256: Digest256,
+}
+
+/// One module tree a shell package loads.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseModule {
+    /// The module's name, as the shell loads it.
+    pub name: String,
+    /// The directory the shell searches for it, relative to the release's directory.
+    pub search_path: ReleasePath,
+    /// The editor ABI the module was built for.
+    pub editor_abi: String,
+}
+
+/// Which way a host starts a shell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchMode {
+    /// A login shell, which also reads the person's login startup files.
+    Login,
+    /// An interactive shell that is not a login shell.
+    Interactive,
+}
+
+/// How a host starts a shell in one mode, and the startup files it puts its entry in.
+///
+/// The arguments name no option that skips or replaces a startup file of the person's, and the
+/// entries go into files the shell reads itself, so every startup file runs in the order the shell
+/// reads them, the package's own entry among them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileLaunch {
+    /// The mode.
+    pub mode: LaunchMode,
+    /// The arguments the shell is started with.
+    pub arguments: Vec<String>,
+    /// The startup files that hold the package's marked entry.
+    pub entries: Vec<ProfileEntry>,
+}
+
+/// Where the package's marked entry goes in one startup file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileEntry {
+    /// The file, with the directories a person can move written as variables (`$ZDOTDIR`,
+    /// `$HOME`, `$XDG_CONFIG_HOME`).
+    pub location: String,
+    /// Where in the file the entry goes.
+    pub placement: EntryPlacement,
+    /// The line that opens the entry.
+    pub begin: String,
+    /// The line that closes it.
+    pub end: String,
+}
+
+/// Where in a startup file a marked entry goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryPlacement {
+    /// After everything the person wrote.
+    End,
+    /// Before every statement the person wrote, after the parts a PowerShell profile has to begin
+    /// with.
+    AfterPrologue,
+    /// After everything the person wrote, in a PowerShell profile, checked to be whole statements.
+    Last,
+}
+
+/// One executable build of a supported agent that the release is qualified against.
+///
+/// A build is named only when its record passes every part of the version qualification, and a
+/// named build opens every capability the release declares for its application.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseAgent {
+    /// The plugin that declares the application, as `<publisher>/<name>`.
+    pub plugin: String,
+    /// The plugin's version.
+    pub plugin_version: String,
+    /// The application the build is.
+    pub application: String,
+    /// Where the build was distributed from: a registry and its package, or the vendor's archive.
+    pub distribution: String,
+    /// The upstream version of the build.
+    pub version: String,
+    /// The operating system it runs on.
+    pub os: String,
+    /// The architecture it runs on.
+    pub architecture: String,
+    /// The SHA-256 digest of the executable.
+    pub sha256: Digest256,
+    /// The digest of the schema the build speaks, where its qualification record supplies one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_hash: Option<Digest256>,
+    /// The capabilities the plugin declares, which the build opens.
+    pub capabilities: Vec<String>,
+}
+
+/// The cryptographic libraries a release is built with, as they were resolved.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseDependencies {
+    /// The SHA-256 digest of the workspace's `Cargo.lock`.
+    pub lock_sha256: Digest256,
+    /// The pinned libraries, each with what it resolved.
+    pub pinned: Vec<PinnedCrate>,
+    /// The pairing vectors the pinned PAKE is held to.
+    pub vectors: Vec<ReleaseSource>,
+}
+
+/// One pinned library and the crates it resolved.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedCrate {
+    /// The library.
+    pub name: String,
+    /// Its exact version.
+    pub version: String,
+    /// Its registry checksum.
+    pub checksum: String,
+    /// Every crate it resolved to, itself excluded, sorted.
+    pub resolved: Vec<ResolvedCrate>,
+}
+
+/// One crate of a pinned library's resolved graph.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedCrate {
+    /// The crate.
+    pub name: String,
+    /// Its version.
+    pub version: String,
+    /// Its registry checksum.
+    pub checksum: String,
 }
 
 /// One file of a release.
@@ -1314,6 +1498,12 @@ mod tests {
             public_majors: vec![1],
             retained_levels: vec![CompatibilityLevel::of(PackageVersion::new(0, 48, 0))],
             shells: Vec::new(),
+            agents: Vec::new(),
+            dependencies: ReleaseDependencies {
+                lock_sha256: Digest256::from_bytes([9; 32]),
+                pinned: Vec::new(),
+                vectors: Vec::new(),
+            },
             stores: vec![store("registry", 7, 1)],
             files,
         }
@@ -1618,6 +1808,100 @@ mod tests {
                 .expect("a manifest"),
             written
         );
+    }
+
+    /// A shell package as a release lists it, with every member filled.
+    fn zsh_package() -> ReleaseShell {
+        ReleaseShell {
+            shell: "zsh".to_owned(),
+            identity: "0b26110c784907c9".to_owned(),
+            upstream: ShellUpstream {
+                version: "5.9".to_owned(),
+                revision: "zsh-5.9".to_owned(),
+                archive: "zsh-5.9.tar.xz".to_owned(),
+                sha256: Digest256::from_bytes([1; 32]),
+            },
+            patches: vec![
+                ReleasePatch {
+                    name: "zle-reader-mailbox".to_owned(),
+                    revision: "1".to_owned(),
+                    base_revision: "zsh-5.9".to_owned(),
+                    source_commit: None,
+                    sha256: Digest256::from_bytes([2; 32]),
+                },
+                ReleasePatch {
+                    name: "terminfo-variable-checks".to_owned(),
+                    revision: "1".to_owned(),
+                    base_revision: "zsh-5.9".to_owned(),
+                    source_commit: Some("4c89849c98172c951a9def3690e8647dae76308f".to_owned()),
+                    sha256: Digest256::from_bytes([3; 32]),
+                },
+            ],
+            sources: vec![ReleaseSource {
+                file: "src/kr_bridge.c".to_owned(),
+                sha256: Digest256::from_bytes([4; 32]),
+            }],
+            modules: vec![ReleaseModule {
+                name: "zsh/zle".to_owned(),
+                search_path: ReleasePath::new("shells/zsh/0b26110c784907c9/lib/zsh/5.9").expect("a path"),
+                editor_abi: "zle-5.9".to_owned(),
+            }],
+            profile_order: vec![ProfileLaunch {
+                mode: LaunchMode::Login,
+                arguments: vec!["-l".to_owned(), "-i".to_owned()],
+                entries: vec![ProfileEntry {
+                    location: "$ZDOTDIR/.zshrc".to_owned(),
+                    placement: EntryPlacement::End,
+                    begin: "# >>> KalaReach shell integration >>>".to_owned(),
+                    end: "# <<< KalaReach shell integration <<<".to_owned(),
+                }],
+            }],
+        }
+    }
+
+    /// A manifest that lists a shell package reads back as it was written, a patch's upstream
+    /// origin kept apart from the revision it was applied to.
+    #[test]
+    fn a_manifest_lists_what_a_shell_package_is_made_of() {
+        let mut written = manifest(vec![file("bin/kr")]);
+        written.shells = vec![zsh_package()];
+        let members = SignedMembers::of(&written).expect("serialises");
+        assert_eq!(members.manifest().expect("a manifest"), written);
+        let value = serde_json::to_value(&written).expect("encodes");
+        let patches = &value["shells"][0]["patches"];
+        assert!(patches[0].get("source_commit").is_none());
+        assert_eq!(
+            patches[1]["source_commit"],
+            "4c89849c98172c951a9def3690e8647dae76308f"
+        );
+        assert_eq!(patches[1]["base_revision"], "zsh-5.9");
+    }
+
+    /// A release says every one of its members: a manifest that leaves one out is not read, so a
+    /// tool that forgets what a release owes its readers cannot sign one.
+    #[test]
+    fn a_manifest_that_leaves_a_member_out_is_not_read() {
+        let mut written = manifest(vec![file("bin/kr")]);
+        written.shells = vec![zsh_package()];
+        let whole = serde_json::to_value(&written).expect("encodes");
+        for member in ["shells", "agents", "dependencies", "public_majors"] {
+            let mut without = whole.clone();
+            without.as_object_mut().expect("an object").remove(member);
+            let members: SignedMembers = serde_json::from_value(without).expect("reads");
+            assert!(members.manifest().is_err(), "a manifest without {member}");
+        }
+        for member in ["upstream", "patches", "sources", "modules", "profile_order"] {
+            let mut without = whole.clone();
+            without["shells"][0]
+                .as_object_mut()
+                .expect("an object")
+                .remove(member);
+            let members: SignedMembers = serde_json::from_value(without).expect("reads");
+            assert!(
+                members.manifest().is_err(),
+                "a shell package without {member}"
+            );
+        }
     }
 
     /// A release retains the levels it names and no others.
