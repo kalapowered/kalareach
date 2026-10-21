@@ -159,7 +159,7 @@ fn powershell_in_a_console(command: &str) -> (Pty, Box<dyn Read + Send>, RootShe
     let mut pty = Pty::open(Dimensions::new(80, 24)).expect("the console opens");
     let reader = pty.reader().expect("a reader");
     let shell = pty
-        .launch(&powershell_command(command))
+        .launch(&powershell_command(command), |_| Ok(()))
         .expect("PowerShell starts inside the console");
     (pty, reader, shell)
 }
