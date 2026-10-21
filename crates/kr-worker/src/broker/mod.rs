@@ -292,18 +292,32 @@ impl Binding {
     /// that was trusted for something else interpret this.
     #[must_use]
     pub fn may_decode(&self, method: &UpstreamMethod) -> bool {
-        self.rich_disabled.is_none()
-            && self.grants.holds(BrokerGrant::ApprovalInterpreter)
+        self.rich_disabled.is_none() && self.trusted_to_decode(method)
+    }
+
+    /// Returns true when this binding may encode an answer to the named method.
+    #[must_use]
+    pub fn may_encode(&self, method: &UpstreamMethod) -> bool {
+        self.may_decode(method) && self.trusted_to_encode(method)
+    }
+
+    /// Returns true when the grants and the trust record this binding holds cover decoding the
+    /// named method, whether or not its rich capabilities are disabled.
+    fn trusted_to_decode(&self, method: &UpstreamMethod) -> bool {
+        self.grants.holds(BrokerGrant::ApprovalInterpreter)
             && self
                 .trust
                 .as_ref()
                 .is_some_and(|trust| trust.covers(method))
     }
 
-    /// Returns true when this binding may encode an answer to the named method.
-    #[must_use]
-    pub fn may_encode(&self, method: &UpstreamMethod) -> bool {
-        self.may_decode(method)
+    /// Returns true when the grants and the trust record this binding holds cover answering the
+    /// named method, whether or not its rich capabilities are disabled.
+    ///
+    /// What an owner withdraws or a narrower installation takes away is this. A revocation or a
+    /// fault disables the binding's rich capabilities and lets what it already admitted finish.
+    pub(crate) fn trusted_to_encode(&self, method: &UpstreamMethod) -> bool {
+        self.trusted_to_decode(method)
             && self
                 .trust
                 .as_ref()
@@ -4708,26 +4722,7 @@ impl BrokerState {
         }
         // The turn a mutation names is the turn this instance is running, read here rather than
         // before the lock: a turn that ended between the two would otherwise be steered.
-        if let Some(turn_id) = turn_id.as_ref()
-            && instance.turn_id.as_ref() != Some(turn_id)
-        {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!("{turn_id} is not the turn this instance is running"),
-            });
-        }
-        // A prompt submitted over a running turn is not a queue: whether the application takes it
-        // as one is not something this host has qualified, so it is refused while a turn is
-        // known to run, and the caller queues it or steers the turn.
-        if operation == kr_protocol::gateway::RichOperation::PromptSubmit
-            && let Some(running) = instance.turn_id.as_ref()
-        {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!(
-                    "{running} is running, and a prompt submitted now would not be a queued one: \
-                     queue it or steer the turn"
-                ),
-            });
-        }
+        check_turn(operation, turn_id.as_ref(), instance.turn_id.as_ref())?;
         let binding_revision = instance.binding_revision;
         let thread_id = instance.thread_id.clone();
         self.check_responsible(application_instance_id, responsible)?;
@@ -5438,6 +5433,35 @@ impl BrokerState {
         Ok(())
     }
 
+    /// Checks, as an answer's permit is taken, that the decoder that interpreted the resource is
+    /// still trusted to answer it.
+    ///
+    /// The admission checked the whole of [`Self::recheck_answerable`], and a revocation or a fault
+    /// that came after it lets what was admitted finish. What an owner withdraws, or a narrower
+    /// installation takes away, is the trust itself: no answer is written on the strength of an
+    /// authority that is gone.
+    pub(crate) fn recheck_answer_trust(&self, resource_id: PendingResourceId) -> Result<()> {
+        let pending = self
+            .arbitration
+            .get(resource_id)
+            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?;
+        let Some(binding_id) = pending.decoder else {
+            return Ok(());
+        };
+        let binding = self
+            .bindings
+            .get(&binding_id)
+            .ok_or_else(|| unknown_binding(binding_id))?;
+        if binding.trusted_to_encode(&pending.resource.method) {
+            Ok(())
+        } else {
+            Err(BrokerError::denied(format!(
+                "the decoder that interpreted {resource_id} may no longer answer {}",
+                pending.resource.method
+            )))
+        }
+    }
+
     /// Checks that one pending resource is still one an answer may be dispatched for.
     fn recheck_answerable(&self, resource_id: PendingResourceId) -> Result<()> {
         let pending = self
@@ -5520,6 +5544,42 @@ impl BrokerState {
 /// Returns [`BrokerError::InvalidArgument`] when the text is not a valid action name.
 pub fn action_name(text: &str) -> Result<ActionName> {
     ActionName::new(text).map_err(|error| BrokerError::invalid(format!("{text}: {error}")))
+}
+
+/// Checks what an operation needs of the turn the instance is running: a turn it names is the
+/// one running, and a prompt is not submitted over a running one.
+///
+/// A prompt submitted over a running turn is not a queue: whether the application takes it as one
+/// is not something this host has qualified, so it is refused while a turn is known to run, and
+/// the caller queues it or steers the turn. The admission asks this, and so does the take, since a
+/// turn starts and ends without moving the binding's revision.
+///
+/// # Errors
+///
+/// Returns [`BrokerError::PreconditionFailed`] when either does not hold.
+pub(crate) fn check_turn(
+    operation: kr_protocol::gateway::RichOperation,
+    named: Option<&AgentTurnId>,
+    running: Option<&AgentTurnId>,
+) -> Result<()> {
+    if let Some(turn_id) = named
+        && running != Some(turn_id)
+    {
+        return Err(BrokerError::PreconditionFailed {
+            detail: format!("{turn_id} is not the turn this instance is running"),
+        });
+    }
+    if operation == kr_protocol::gateway::RichOperation::PromptSubmit
+        && let Some(running) = running
+    {
+        return Err(BrokerError::PreconditionFailed {
+            detail: format!(
+                "{running} is running, and a prompt submitted now would not be a queued one: \
+                 queue it or steer the turn"
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn unknown_instance(application_instance_id: ApplicationInstanceId) -> BrokerError {

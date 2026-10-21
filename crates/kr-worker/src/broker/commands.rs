@@ -2916,9 +2916,10 @@ async fn admit_claimed<'a>(
         *run.tables
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tables);
-        // The gateway carries the terminal's frames and reads no thread out of them, so nothing
-        // vouches for the conversation it has selected. Section 12 has rich mutations suspended
-        // until the binding is verified, the terminal available meanwhile.
+        // Until a reply the server sends names the conversation the terminal selected, nothing
+        // vouches for it, and a table that says nothing about where it is named never lifts that.
+        // Section 12 has rich mutations suspended until the binding is verified, the terminal
+        // available meanwhile.
         broker.withhold_thread(backend.application_instance_id)?;
     }
     // The directory the invocation was resolved in, for reading only and confined to its own

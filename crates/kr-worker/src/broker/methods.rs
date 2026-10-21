@@ -1576,6 +1576,13 @@ impl Broker {
                 params.action
             )));
         }
+        // A cancellation acts on the running turn and names no request.
+        if params.resource_id.is_present() {
+            return Err(BrokerError::invalid(format!(
+                "{} cancels the running turn, and this call names a pending request",
+                params.action
+            )));
+        }
         let admitted = self.admit_plugin_action(caller, binding_id, params, None, now)?;
         let effect = kr_protocol::broker::PreparedEffect {
             action: params.action.clone(),
@@ -2179,12 +2186,16 @@ impl Broker {
         dispatch: &std::sync::Arc<dyn UpstreamDispatch>,
         request: &UpstreamRequest,
     ) -> Result<()> {
-        self.recheck_broker(admitted)?;
+        self.recheck_broker(admitted, request)?;
         // The transport is asked outside the broker's lock: it takes locks of its own.
         dispatch.admit(request)
     }
 
-    fn recheck_broker(&self, admitted: &MutationAdmission) -> Result<()> {
+    fn recheck_broker(
+        &self,
+        admitted: &MutationAdmission,
+        request: &UpstreamRequest,
+    ) -> Result<()> {
         let state = self.state();
         state.volatile.require_rich_work()?;
         let application_instance_id = admitted.application_instance_id();
@@ -2205,6 +2216,18 @@ impl Broker {
                     instance.binding_revision
                 ),
             });
+        }
+        // A turn starts or ends without moving the binding's revision: what the operation names
+        // or needs of the turn is read again.
+        crate::broker::check_turn(
+            request.operation,
+            request.turn_id.as_ref(),
+            instance.turn_id.as_ref(),
+        )?;
+        // An answer is trusted to its decoder's authority, which an owner or a narrower
+        // installation withdraws without moving the revision either.
+        if let Some(resource_id) = admitted.resource_id() {
+            state.recheck_answer_trust(resource_id)?;
         }
         Ok(())
     }

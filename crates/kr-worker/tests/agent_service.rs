@@ -3423,6 +3423,70 @@ async fn kr_req_11_47_a_forwarded_action_needs_the_rights_of_its_class() {
     );
 }
 
+/// KR-REQ-12.08 and KR-REQ-11.28: an action the package declares as a cancellation of the running
+/// turn is held, before anything is admitted, to the right to cancel: a device whose grant holds
+/// the rights to prompt and to answer an approval, and to view, is refused `PERMISSION_DENIED`,
+/// and one that holds the right to cancel is not refused for its rights.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_08_a_declared_cancellation_needs_the_right_to_cancel() {
+    use kr_protocol::rights::ActionRight;
+    let host = host().await;
+    let upstream = Arc::new(CountingUpstream::default());
+    register(
+        &host,
+        Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
+    );
+    let cancel =
+        serde_json::from_value::<kr_plugin_sdk::effect::ActionDeclaration>(serde_json::json!({
+            "id": "turn.cancel",
+            "label": "Cancel the turn",
+            "effect": "upstream.cancel",
+            "implementation": { "type": "upstream_cancel" },
+            "parameters": { "parameters": [] },
+            "description": "Stop the turn that is running",
+            "confirmation_required": false,
+        }))
+        .expect("a declaration the manifest format reads");
+    let refused = host
+        .service
+        .broker()
+        .register_actions(binding(), &[cancel])
+        .expect("the action is registered");
+    assert!(refused.is_empty(), "{refused:?}");
+    let mut daemon = daemon(&host).await;
+    let window = || kr_protocol::ids::ActionWindowId::new("forwarded").expect("a window");
+
+    let without = forward_as_device(
+        &mut daemon,
+        &plugin_invocation(&host, 200, window(), "turn.cancel", Nullable::null(), b"{}"),
+        &[
+            ActionRight::AgentPrompt,
+            ActionRight::AgentApprovalRespond,
+            ActionRight::SessionView,
+        ],
+    )
+    .await
+    .expect_err("a grant without the right to cancel");
+    assert_eq!(without.code, ErrorCode::PermissionDenied, "{without:?}");
+    let with = forward_as_device(
+        &mut daemon,
+        &plugin_invocation(&host, 201, window(), "turn.cancel", Nullable::null(), b"{}"),
+        &[ActionRight::AgentCancel],
+    )
+    .await
+    .expect_err("this suite's connection spells no cancellation, so nothing is carried");
+    assert_ne!(
+        with.code,
+        ErrorCode::PermissionDenied,
+        "the right to cancel is the right the action needs: {with:?}"
+    );
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing was carried"
+    );
+}
+
 /// Admits the example declarative package to the suite's worker and binds it to the suite's
 /// instance, as an adoption binds it: the package registers `status.refresh`, which the host
 /// carries out itself by redrawing the package's own document. Returns the binding, and the

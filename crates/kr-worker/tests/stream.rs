@@ -9,10 +9,11 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.06 | the thread a success reply to a selecting request names is the instance's binding, the revision advances only when the thread changed, and rich mutations resume; they wait while a selection is in flight and after one whose outcome is unknown, an older reply never restores a conversation the terminal left, a conversation another execution owns is never published, a turn or a leave about another thread changes nothing, replies are applied in the order their requests were admitted once none is in flight (a success whose newer request is then refused is the binding; a leave of another conversation does not hide an older selection; a leave of the bound conversation survives a newer request that is refused), and a request given up at its deadline keeps the instance suspended until a selection names the conversation |
+//! | KR-REQ-12.06 | the thread a success reply to a selecting request names is the instance's binding, the revision advances only when the thread changed, and rich mutations resume; they wait while a selection is in flight and after one whose outcome is unknown, an older reply never restores a conversation the terminal left, a conversation another execution owns is never published, a turn or a leave about another thread changes nothing, replies are applied in the order their requests were admitted once none is in flight (a success whose newer request is then refused is the binding; a leave of another conversation does not hide an older selection; a leave of the bound conversation survives a newer request that is refused), a notification that closes a conversation a kept reply selected, or reports a turn in it, leaves the terminal's conversation unknown instead of letting the reply restore it; and a request given up at its deadline keeps the instance suspended until a selection names the conversation |
+//! | KR-REQ-12.04 | a prompt, a steer or a cancellation admitted before a turn began or ended is stopped at its take, which reads the turn again; a turn reported in a conversation a kept reply selected is not taken without that reply being weighed |
 //! | KR-REQ-11.30 | an unlisted frame keeps rich mutations suspended until a selection admitted after it has named the thread and every unlisted request before that has been answered |
 //! | KR-REQ-12.08 | a gateway connection's capability evidence says what its tables let a client do, follows each change of binding, and ends with the connection |
-//! | KR-REQ-11.33 | a request the connector's table answers as a response is interpreted under the binding's trust; the server's own word that it was answered settles what nobody answered and leaves an answer that is being written to its writer |
+//! | KR-REQ-11.33 | a request the connector's table answers as a response is interpreted under the binding's trust; the server's own word that it was answered settles what nobody answered and leaves an answer that is being written to its writer; an answer admitted before its decoder's authority was withdrawn is stopped at its take, and one admitted before a fault finishes |
 //! | KR-REQ-11.36 | a typed prompt reaches the server as the request the connector's table spells, naming the thread the binding holds, and the reply's turn is read where the table says |
 //! | KR-REQ-11.28 | an action the package declares as a cancellation is admitted with a token the host issues and spends against its own plan, and is written as the connector's template for a cancellation naming the thread and the running turn; with no turn running it is refused with nothing written |
 //! | KR-REQ-23.30 | a component's plan for the action declared as a cancellation is validated against the token the host issued and is written through the same template; a plan that prepares another operation, or whose arguments are not the ones the token covers, is refused before anything is written; a component's prompt has no source in the table and is refused before the marker |
@@ -457,7 +458,7 @@ async fn kr_req_12_12_a_steer_and_a_cancellation_name_the_turn_and_the_thread_th
                 .agent_steer(&World::owner_caller(), &steer, NOW)
                 .await
         },
-        world.served(r#""result":{"turnId":"turn-7"}"#),
+        world.served(r#""result":{"turnId":"turn-8"}"#),
     );
     assert_eq!(sent["method"], "turn/steer");
     assert_eq!(
@@ -475,7 +476,8 @@ async fn kr_req_12_12_a_steer_and_a_cancellation_name_the_turn_and_the_thread_th
             .0
             .map(|turn| turn.to_string())
             .as_deref(),
-        Some("turn-7")
+        Some("turn-8"),
+        "the turn the reply names, where the table says it does, and not the one asked for"
     );
 
     let cancel = kr_protocol::agent::AgentCancelParams {
@@ -527,11 +529,15 @@ async fn kr_req_12_12_an_operation_the_table_does_not_spell_or_cannot_fill_write
     named.draft_id = kr_protocol::scalars::Nullable::some(kr_protocol::ids::DraftId::new(
         kr_protocol::scalars::Uuid::from_bytes([5; 16]),
     ));
-    world
+    let drafted = world
         .broker
         .agent_prompt(&caller, &named, false, NOW)
         .await
         .expect_err("a draft's content is not carried");
+    assert!(
+        drafted.to_string().contains("draft"),
+        "the refusal says why: {drafted}"
+    );
     world.nothing_written().await;
 
     // A steer of a turn that is not the one running, and a cancellation with none running.
@@ -605,7 +611,8 @@ async fn kr_req_11_28_a_declared_cancellation_is_written_from_the_template_under
     };
     let caller = World::owner_caller();
 
-    // No turn is running: the action is refused at its admission, before a token is issued.
+    // No turn is running: the template cannot be filled, so the action is refused before its
+    // marker, and the token the admission spent is consumed with it.
     let none = world
         .broker
         .admit_host_cancel(&caller, binding_id, &invoke(&world), NOW)
@@ -623,6 +630,23 @@ async fn kr_req_11_28_a_declared_cancellation_is_written_from_the_template_under
     world
         .server_says(&turn_event("turn/started", "thread-1", "turn-7"))
         .await;
+    // A cancellation names no request.
+    let mut naming = invoke(&world);
+    naming.resource_id = kr_protocol::scalars::Nullable::some(
+        kr_protocol::ids::PendingResourceId::new(Uuid::from_bytes([6; 16])),
+    );
+    let named_one = world
+        .broker
+        .admit_host_cancel(&caller, binding_id, &naming, NOW)
+        .expect_err("a cancellation acts on the running turn");
+    assert!(
+        matches!(
+            named_one,
+            kr_worker::broker::BrokerError::InvalidArgument(_)
+        ),
+        "{named_one:?}"
+    );
+    world.nothing_written().await;
     let admitted = world
         .broker
         .admit_host_cancel(&caller, binding_id, &invoke(&world), NOW)
@@ -720,6 +744,26 @@ async fn kr_req_23_30_a_components_cancellation_is_carried_and_what_it_may_not_p
         parameters: kr_protocol::scalars::Bytes::new(b"{}".to_vec()),
     };
     let caller = World::owner_caller();
+
+    // An action that is not registered as a cancellation the host carries out is not carried out
+    // by the host's own route, whatever it is called.
+    let not_the_hosts = world
+        .broker
+        .admit_host_cancel(
+            &caller,
+            binding,
+            &invoke(&world, "cancel.by.component"),
+            NOW,
+        )
+        .expect_err("a component's action is not the host's cancellation");
+    assert!(
+        matches!(
+            not_the_hosts,
+            kr_worker::broker::BrokerError::InvalidArgument(_)
+        ),
+        "{not_the_hosts:?}"
+    );
+    world.nothing_written().await;
 
     // A plan that prepares another operation than the action's declaration says.
     let admitted = world
@@ -2096,8 +2140,8 @@ async fn kr_req_11_35_a_committed_marker_followed_by_a_failed_transmission_leave
 }
 
 /// KR-REQ-12.06: a prompt, a steer or a declared cancellation admitted before the terminal asked
-/// to change its conversation is stopped when its permit is taken: nothing is written, the refusal
-/// is proven, and the token a cancellation spent goes with it.
+/// to change its conversation is stopped when its permit is taken: nothing is written and the
+/// refusal is proven.
 ///
 /// Not claimed: Windows, where no gateway runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2139,8 +2183,8 @@ async fn kr_req_12_06_a_mutation_and_an_action_admitted_before_a_selection_are_s
     world.nothing_written().await;
 }
 
-/// KR-REQ-12.06 and KR-REQ-11.28: the same for the declared cancellation, whose token is retired
-/// when the take refuses it.
+/// KR-REQ-12.06 and KR-REQ-11.28: the same for the declared cancellation, whose token the
+/// admission spent.
 ///
 /// Not claimed: Windows, where no gateway runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2177,4 +2221,269 @@ async fn kr_req_11_28_a_declared_cancellation_admitted_before_a_leave_is_stopped
     };
     assert!(stopped.proven_unsent(), "{stopped:?}");
     world.nothing_written().await;
+}
+
+/// KR-REQ-12.06 and KR-REQ-12.04: a success reply kept for the requests before it is not applied
+/// after the server said something that changes what applying it would mean: it closed the
+/// conversation the reply selected, or reported a turn in one the terminal is not bound to. The
+/// instance then waits for the next selection that is answered, and a notification about another
+/// conversation changes nothing.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_06_a_notification_after_a_kept_reply_decides_what_the_terminal_is_in() {
+    const RESUME_ONE: &str =
+        r#"{"id":5,"method":"thread/resume","params":{"threadId":"thread-1"}}"#;
+    let closed = |thread: &str| {
+        format!(r#"{{"method":"thread/closed","params":{{"threadId":"{thread}"}}}}"#)
+    };
+
+    // The bound conversation is resumed again, its reply kept while another selection is open, and
+    // the server closes it: no later refusal restores it.
+    let world = World::new(1 << 20);
+    let first = world.terminal_asks(START).await;
+    world.server_answers(&first, &named("thread-1")).await;
+    let again = world.terminal_asks(RESUME_ONE).await;
+    let other = world.terminal_asks(RESUME).await;
+    world.server_answers(&again, &named("thread-1")).await;
+    world.server_says(&closed("thread-1")).await;
+    world.server_answers(&other, REFUSED).await;
+    assert_eq!(
+        world.thread(),
+        None,
+        "the server closed the conversation the terminal had selected"
+    );
+    assert!(world.waiting().is_some());
+
+    // Another conversation is selected, its reply kept, and the server closes it: the binding is
+    // not that conversation, and the instance does not stay on the old one as though nothing
+    // happened.
+    let world = World::new(1 << 20);
+    let first = world.terminal_asks(START).await;
+    world.server_answers(&first, &named("thread-1")).await;
+    let older = world.terminal_asks(RESUME).await;
+    let newer = world.terminal_asks(START).await;
+    world.server_answers(&older, &named("thread-2")).await;
+    world.server_says(&closed("thread-2")).await;
+    world.server_answers(&newer, REFUSED).await;
+    assert_ne!(world.thread().as_deref(), Some("thread-2"));
+    assert!(
+        world
+            .waiting()
+            .is_some_and(|reason| reason.contains("unknown")),
+        "{:?}",
+        world.waiting()
+    );
+    // The next selection that is answered names the conversation and ends the wait.
+    let selecting = world.terminal_asks(RESUME).await;
+    world.server_answers(&selecting, &named("thread-3")).await;
+    assert_eq!(world.thread().as_deref(), Some("thread-3"));
+    assert_eq!(world.waiting(), None);
+
+    // A turn reported in the conversation a kept reply selected comes before the binding names it,
+    // so the binding is not taken without it.
+    let world = World::new(1 << 20);
+    let first = world.terminal_asks(START).await;
+    world.server_answers(&first, &named("thread-1")).await;
+    let older = world.terminal_asks(RESUME).await;
+    let newer = world.terminal_asks(START).await;
+    world.server_answers(&older, &named("thread-2")).await;
+    world
+        .server_says(&turn_event("turn/started", "thread-2", "turn-5"))
+        .await;
+    world.server_answers(&newer, REFUSED).await;
+    assert_ne!(world.thread().as_deref(), Some("thread-2"));
+    assert!(world.waiting().is_some());
+
+    // A notification about a conversation no kept reply named changes nothing.
+    let world = World::new(1 << 20);
+    let first = world.terminal_asks(START).await;
+    world.server_answers(&first, &named("thread-1")).await;
+    let older = world.terminal_asks(RESUME).await;
+    let newer = world.terminal_asks(START).await;
+    world.server_answers(&older, &named("thread-2")).await;
+    world.server_says(&closed("thread-9")).await;
+    world
+        .server_says(&turn_event("turn/started", "thread-9", "turn-5"))
+        .await;
+    world.server_answers(&newer, REFUSED).await;
+    assert_eq!(world.thread().as_deref(), Some("thread-2"));
+    assert_eq!(world.waiting(), None);
+}
+
+/// KR-REQ-12.04, KR-REQ-12.12 and KR-REQ-11.36: a prompt admitted while no turn ran is stopped at
+/// its take once a turn started, and a steer or a cancellation admitted for a turn is stopped once
+/// that turn ended or another began: the binding's revision does not move with a turn, so the take
+/// reads the turn again. Nothing is written, and the refusal is proven.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_04_a_mutation_admitted_before_a_turn_began_or_ended_is_stopped_at_its_take() {
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    let caller = World::owner_caller();
+
+    // A prompt admitted while no turn ran, and a turn that started before it was taken.
+    let admitted = world
+        .broker
+        .admit_prompt(&caller, &world.prompt("hello"), false, NOW)
+        .expect("a prompt is admitted while no turn runs");
+    world
+        .server_says(&turn_event("turn/started", "thread-1", "turn-7"))
+        .await;
+    let Err(stopped) = world.broker.take_mutation(&admitted) else {
+        panic!("a prompt over a turn that began is stopped at its take");
+    };
+    assert!(stopped.proven_unsent(), "{stopped:?}");
+    world.nothing_written().await;
+
+    // A steer admitted for the running turn, and the turn ended before it was taken.
+    let steer = kr_protocol::agent::AgentSteerParams {
+        target: world.target(),
+        turn_id: World::turn_id("turn-7"),
+        text: kr_protocol::agent::PromptText::new("steer").expect("a steer"),
+    };
+    let admitted = world
+        .broker
+        .admit_steer(&caller, &steer, NOW)
+        .expect("the steer is admitted");
+    world
+        .server_says(&turn_event("turn/completed", "thread-1", "turn-7"))
+        .await;
+    let Err(stopped) = world.broker.take_mutation(&admitted) else {
+        panic!("a steer of a turn that ended is stopped at its take");
+    };
+    assert!(stopped.proven_unsent(), "{stopped:?}");
+    world.nothing_written().await;
+
+    // A cancellation admitted for one turn, and another began in its place.
+    world
+        .server_says(&turn_event("turn/started", "thread-1", "turn-8"))
+        .await;
+    let cancel = kr_protocol::agent::AgentCancelParams {
+        target: world.target(),
+        turn_id: World::turn_id("turn-8"),
+    };
+    let admitted = world
+        .broker
+        .admit_cancel(&caller, &cancel, NOW)
+        .expect("the cancellation is admitted");
+    world
+        .server_says(&turn_event("turn/started", "thread-1", "turn-9"))
+        .await;
+    let Err(stopped) = world.broker.take_mutation(&admitted) else {
+        panic!("a cancellation of a turn that was replaced is stopped at its take");
+    };
+    assert!(stopped.proven_unsent(), "{stopped:?}");
+    world.nothing_written().await;
+
+    // The turn is the one it was admitted for: the take goes through and the frame is written.
+    let admitted = world
+        .broker
+        .admit_cancel(
+            &caller,
+            &kr_protocol::agent::AgentCancelParams {
+                target: world.target(),
+                turn_id: World::turn_id("turn-9"),
+            },
+            NOW,
+        )
+        .expect("the cancellation is admitted");
+    let taken = world
+        .broker
+        .take_mutation(&admitted)
+        .expect("nothing changed since the admission");
+    let (dispatch, request) = taken.transmission();
+    let _pending = dispatch
+        .submit(&request)
+        .expect("the frame is queued for the server");
+    assert_eq!(world.server_reads().await["method"], "turn/interrupt");
+}
+
+/// KR-REQ-11.33 and KR-REQ-12.08: a rich answer admitted before its decoder's authority was
+/// withdrawn, by the owner or by a narrower installation, is stopped at its take: no marker, no
+/// byte, the request answerable again. A revocation or a fault disables the binding's rich
+/// capabilities and lets what it already admitted finish.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_33_an_answer_admitted_before_its_authority_was_withdrawn_is_stopped_at_its_take()
+{
+    // The owner withdraws the right to answer.
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    world.server_says(ASK).await;
+    let id = world.broker.pending_resources()[0].resource_id;
+    let admitted = world
+        .broker
+        .admit_approval(&World::owner_caller(), &world.rich_answer("accept"), NOW)
+        .expect("the rich answer is admitted");
+    world
+        .broker
+        .withdraw_answering(binding_id())
+        .expect("the right is withdrawn");
+    let refused = world
+        .broker
+        .record_approval(&admitted, NOW)
+        .expect_err("the decoder may no longer answer");
+    assert!(refused.proven_unsent(), "{refused:?}");
+    assert_eq!(
+        world.broker.pending(id).expect("held").state,
+        PendingState::Pending,
+        "the claim was given back"
+    );
+    world.nothing_written().await;
+
+    // A narrower installation takes the grant away.
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    world.server_says(ASK).await;
+    let id = world.broker.pending_resources()[0].resource_id;
+    let admitted = world
+        .broker
+        .admit_approval(&World::owner_caller(), &world.rich_answer("accept"), NOW)
+        .expect("the rich answer is admitted");
+    world.source.granted.retain(|capability| {
+        *capability != kr_plugin_sdk::capability::PluginCapability::ApprovalRespond
+    });
+    testing::admit(
+        &world.admissions,
+        &world.sources,
+        &world.broker,
+        vec![testing::admitted(&world.source)],
+        2,
+    );
+    let refused = world
+        .broker
+        .record_approval(&admitted, NOW)
+        .expect_err("the installation no longer lets the package answer");
+    assert!(refused.proven_unsent(), "{refused:?}");
+    assert_eq!(
+        world.broker.pending(id).expect("held").state,
+        PendingState::Pending
+    );
+    world.nothing_written().await;
+
+    // A component fault disables the binding's rich capabilities after the admission, and the
+    // answer that was admitted goes.
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    world.server_says(ASK).await;
+    let id = world.broker.pending_resources()[0].resource_id;
+    let admitted = world
+        .broker
+        .admit_approval(&World::owner_caller(), &world.rich_answer("accept"), NOW)
+        .expect("the rich answer is admitted");
+    world.broker.disable_rich(binding_id(), "a component fault");
+    world
+        .broker
+        .record_approval(&admitted, NOW)
+        .expect("what was admitted finishes")
+        .settled(NOW)
+        .await
+        .expect("and completes");
+    state_of(&world, id, PendingState::Resolved).await;
+    let written = world.server_reads().await;
+    assert_eq!(written["id"], "approval-1");
+    assert_eq!(written["result"]["decision"], "accept");
 }

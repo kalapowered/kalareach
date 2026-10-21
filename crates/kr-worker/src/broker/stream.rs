@@ -25,6 +25,10 @@
 //! conversation, a leave ends the conversation it names when that is the one bound by then, and an
 //! older reply never restores a conversation a later request has left. A request whose reply
 //! never came leaves the instance suspended until a later selection has named the conversation.
+//! A notification that closes a conversation, or reports a turn in one the terminal is not bound
+//! to, arrives in the server's order, which a reply kept this way no longer has: where it names
+//! the conversation such a reply selected, that reply is not applied and the instance waits for
+//! the next selection that is answered.
 //!
 //! A permit admitted before any of this happened is checked again when it is taken: see
 //! [`Broker::take_mutation`](crate::broker::Broker::take_mutation).
@@ -685,7 +689,9 @@ impl Broker {
     /// A notification that a turn started or ended in the bound conversation names the running
     /// turn; one that ends the bound conversation leaves the instance with none; and one that says
     /// a request was answered or cleared settles a pending resource nobody answered. A frame about
-    /// another conversation changes nothing.
+    /// another conversation changes nothing, except where a success reply that named that
+    /// conversation is still waiting for older requests to be answered: what the terminal is in
+    /// then depends on an order the notification is part of, so it is left unknown.
     pub fn read_upstream_frame(
         &self,
         connection: GatewayConnectionId,
@@ -715,6 +721,9 @@ impl Broker {
             .instances
             .get(&application_instance_id)
             .and_then(|instance| instance.thread_id.as_ref().map(ToString::to_string));
+        // The conversations this notification names that the terminal is not bound to, and the one
+        // it ends.
+        let mut mentioned: Vec<String> = Vec::new();
         for (places, started) in [(&reading.turn_started, true), (&reading.turn_ended, false)] {
             let Some(places) = places.as_ref().filter(|places| &places.method == method) else {
                 continue;
@@ -725,6 +734,7 @@ impl Broker {
                 continue;
             };
             if bound.as_deref() != Some(thread.as_str()) {
+                mentioned.push(thread);
                 continue;
             }
             let Ok(turn) = AgentTurnId::new(turn) else {
@@ -740,9 +750,15 @@ impl Broker {
             }
         }
         if let Some(path) = reading.leaves.get(method)
-            && named(&body, path).is_some_and(|thread| bound.as_deref() == Some(thread.as_str()))
+            && let Some(thread) = named(&body, path)
         {
-            state.adopt_thread_left(application_instance_id, now);
+            if bound.as_deref() == Some(thread.as_str()) {
+                state.adopt_thread_left(application_instance_id, now);
+            }
+            mentioned.push(thread);
+        }
+        if !mentioned.is_empty() {
+            state.stream_notified(application_instance_id, &mentioned, now);
         }
         if let Some((resolved, path)) = reading.request_resolved.as_ref()
             && resolved == method
@@ -839,6 +855,41 @@ impl BrokerState {
             instance.thread_unread = Some(THREAD_NOT_READ);
         }
         self.renew_gateway_evidence(application_instance_id, now);
+    }
+
+    /// Leaves unknown what the terminal is in, where a notification names a conversation that a
+    /// success reply still waiting for an older request had named.
+    ///
+    /// Such a reply is applied when the requests before it are answered, and the notification
+    /// came after it: a conversation closed, or a turn started or ended in one the terminal is not
+    /// bound to, changes what applying the reply would mean. The reply is not applied, and the
+    /// instance waits for the next selection that is answered. A turn in the conversation the
+    /// terminal is bound to is read as it comes and is not named here; a leave of any is.
+    fn stream_notified(
+        &mut self,
+        application_instance_id: ApplicationInstanceId,
+        mentioned: &[String],
+        now: TimestampMs,
+    ) {
+        let Some(instance) = self.instances.get_mut(&application_instance_id) else {
+            return;
+        };
+        let stream = &mut instance.stream;
+        for thread in mentioned {
+            let waiting: Vec<u64> = stream
+                .proven
+                .iter()
+                .filter(|(_, effect)| {
+                    matches!(effect, Effect::Select { thread: held, .. } if held.as_str() == thread)
+                })
+                .map(|(seq, _)| *seq)
+                .collect();
+            for seq in waiting {
+                stream.proven.remove(&seq);
+                stream.hold_unknown(seq);
+            }
+        }
+        self.apply_stream(application_instance_id, now);
     }
 
     /// Settles a pending resource the server says was answered or cleared.

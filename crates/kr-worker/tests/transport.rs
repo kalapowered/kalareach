@@ -2150,6 +2150,162 @@ async fn kr_req_11_33_an_answer_needs_no_rich_method_of_its_own() {
     drained.abort();
 }
 
+/// KR-REQ-11.33 and section 9: an answer larger than the connection carries is refused before its
+/// marker, by the admission that asks the transport and by the take, so the request stays
+/// answerable and nothing is written. The writer would refuse it only after the marker, and the
+/// request would then be uncertain with nobody able to answer it.
+#[tokio::test]
+async fn kr_req_11_33_an_answer_larger_than_the_connection_carries_is_refused_before_its_marker() {
+    let broker = broker();
+    let Served {
+        owner,
+        upstream,
+        client,
+        drained,
+        ..
+    } = duplex_watched_framed(
+        &broker,
+        GatewayConnectionId::new(1),
+        Framing::within(NativeFraming::JsonLines, 1),
+    )
+    .await;
+    let mut client_reader = tokio::io::BufReader::new(client);
+    let mut upstream_reader = tokio::io::BufReader::new(upstream);
+    let carried = owner
+        .from_upstream(
+            br#"{"id":11,"method":"session/request_permission","params":{}}"#,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the request is carried");
+    let Carried::UpstreamRequest { resource_id, .. } = carried else {
+        panic!("a request is what this was");
+    };
+    let resource_id = resource_id.expect("it expects a response");
+    let _ = next_line(&mut client_reader).await;
+    // A decision whose identifier, at the longest a trust record allows, makes the answer larger
+    // than this connection's limit and what an identifier may add to it.
+    let long = "x".repeat(kr_protocol::broker::MAX_DECISION_TEXT_LEN);
+    broker
+        .interpret(
+            binding(),
+            resource_id,
+            DecodedProjection {
+                decisions: vec![
+                    OfferedDecision {
+                        option_id: "allow".to_owned(),
+                        label: "Allow".to_owned(),
+                    },
+                    OfferedDecision {
+                        option_id: long.clone(),
+                        label: "A decision too long to write".to_owned(),
+                    },
+                ],
+                ..projection()
+            },
+            None,
+            TimestampMs::new(3),
+        )
+        .expect("the interpretation is accepted");
+    broker.bind_connection_dispatch(
+        GatewayConnectionId::new(1),
+        owner.dispatch().expect("the link carries operations"),
+    );
+    let respond = |option: &str| kr_protocol::agent::AgentApprovalRespondParams {
+        target: target(),
+        resource_id,
+        option_id: option.to_owned(),
+    };
+    let caller = kr_worker::broker::Caller {
+        actor_id: ActorId::new("device-1").expect("valid"),
+        grant_id: None,
+    };
+
+    // The admission asks the transport, and refuses.
+    broker
+        .agent_approval_respond(&caller, &respond(&long), TimestampMs::new(4))
+        .await
+        .expect_err("the connection cannot carry this answer");
+    assert_eq!(
+        broker.pending(resource_id).expect("held").state,
+        PendingState::Pending,
+        "no marker was written, so the request is still answerable"
+    );
+
+    // A short decision still goes on the same connection.
+    let admitted = broker
+        .admit_approval(&caller, &respond("allow"), TimestampMs::new(5))
+        .expect("a short answer is admitted");
+    broker
+        .record_approval(&admitted, TimestampMs::new(6))
+        .expect("the short answer goes")
+        .settled(TimestampMs::new(7))
+        .await
+        .expect("and completes");
+    let written: serde_json::Value =
+        serde_json::from_str(next_line(&mut upstream_reader).await.trim()).expect("readable");
+    assert_eq!(written["id"], serde_json::json!(11));
+    assert_eq!(written["result"]["behavior"], serde_json::json!("allow"));
+
+    drop(owner);
+    drop(client_reader);
+    drop(upstream_reader);
+    drained.abort();
+}
+
+/// KR-REQ-12.12 and section 9: an operation larger than the connection carries is refused at its
+/// admission, which writes the frame as it will go and asks the transport, so nothing is marked and
+/// nothing is written.
+#[tokio::test]
+async fn kr_req_12_12_an_operation_larger_than_the_connection_carries_is_refused_at_its_admission()
+{
+    let broker = broker();
+    let served = duplex_watched_framed(
+        &broker,
+        GatewayConnectionId::new(1),
+        Framing::within(NativeFraming::JsonLines, 128),
+    )
+    .await;
+    broker
+        .bind_dispatch(
+            instance(),
+            served.owner.dispatch().expect("it carries operations"),
+        )
+        .expect("the transport is bound");
+    let mut upstream = tokio::io::BufReader::new(served.upstream);
+    let caller = kr_worker::broker::Caller {
+        actor_id: ActorId::new("device-1").expect("valid"),
+        grant_id: None,
+    };
+    let refused = broker
+        .agent_prompt(
+            &caller,
+            &kr_protocol::agent::AgentPromptParams {
+                target: target(),
+                draft_id: Nullable::null(),
+                text: Nullable::some(
+                    kr_protocol::agent::PromptText::new("x".repeat(600)).expect("valid"),
+                ),
+            },
+            false,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect_err("the connection cannot carry this prompt");
+    assert!(
+        refused.to_string().contains("this operation is"),
+        "refused by the admission and not by the writer after a marker: {refused}"
+    );
+    let mut line = String::new();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_millis(150),
+        upstream.read_line(&mut line),
+    )
+    .await;
+    assert!(read.is_err(), "the upstream was sent {line:?}");
+    served.drained.abort();
+}
+
 /// A broker with nothing registered yet, for a launch that will register the instance itself.
 ///
 /// The production composition is what registers the instance, with the process it actually

@@ -1610,8 +1610,16 @@ impl UpstreamDispatch for Dispatch {
             });
         }
         // An approval's answer is the frame the core prepared, which needs no method of this
-        // table; everything else needs one, and the table has to spell it.
-        if matches!(request.body, UpstreamBody::Approval { .. }) {
+        // table; it has to fit what this connection carries, since the writer refuses it after the
+        // marker otherwise. Everything else needs a method, and the table has to spell it.
+        if let UpstreamBody::Approval { response, .. } = &request.body {
+            let most = self.upstream.largest_body();
+            if response.frame().len() > most {
+                return Err(BrokerError::invalid(format!(
+                    "this answer is {} bytes and this connection carries at most {most}",
+                    response.frame().len()
+                )));
+            }
             return Ok(());
         }
         // An action no plan has named yet has nothing to write; asking again once a plan names it
