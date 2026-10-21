@@ -753,21 +753,17 @@ impl Controller {
                 // none can take the variables of a create that has stopped waiting. A reservation
                 // that is spawned, with no create waiting for it, is refused every claim, which
                 // privacy mode's tick relies on to forget its session.
-                let claimed = hold.end_wait().await;
+                hold.end_wait().await;
                 let launched =
                     pid.and_then(|pid| kr_ipc::identity::process_start_identity(pid).ok());
                 if let Some(identity) = &launched {
                     let mut registry = self.registry.lock().await;
                     registry.record_launch(reservation.reservation_id, identity)?;
-                    // No claim took the launch's variables before the create stopped waiting, and
-                    // none can now, so no session can come of this worker: the session stops being
-                    // a writer when the kernel says its process has ended. A launch that was
-                    // claimed may yet report itself and run, and its closure decides. Without an
-                    // identity there is nothing to ask, and the registration stays until the
+                    // The session stops being a writer when the kernel says the worker's process
+                    // has ended and the worker's own record shows it left nothing running. Without
+                    // an identity there is nothing to ask, and the registration stays until the
                     // daemon restarts.
-                    if !claimed {
-                        self.end_session_when_ended(reservation.session_id, identity.clone());
-                    }
+                    self.end_session_when_ended(reservation.session_id, identity.clone());
                 }
                 self.retire_job_when_ended(reservation.reservation_id, launched);
                 return Err(ControllerError::Supervision { detail });
@@ -803,14 +799,12 @@ impl Controller {
             }
             Ok(Err(_)) | Err(_) => {
                 let claimed = hold.end_wait().await;
-                // A launch no claim took cannot come to a session, and its registration ends when
-                // the kernel says the worker's process has. One that was claimed may yet report
-                // itself and run, and then its closure decides, whatever a surviving process of
-                // its own means for the registration; if it never reports, the registration stays
-                // until the daemon restarts.
-                if !claimed {
-                    self.end_session_when_ended(reservation.session_id, identity.clone());
-                }
+                // A launch that was claimed may yet report itself and run, and then its closure
+                // decides; one that never runs, or that reports a failure after this create has
+                // stopped waiting, ends when the kernel says its worker's process has and its own
+                // record shows it left nothing running. A worker that never ends, or that left
+                // something running, keeps the registration until the daemon restarts.
+                self.end_session_when_ended(reservation.session_id, identity.clone());
                 self.retire_job_when_ended(reservation.reservation_id, Some(identity));
                 // A claim that took the variables has a launch that may still complete, and its
                 // worker may yet report itself: what became of this create is not known, and its

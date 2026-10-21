@@ -1217,19 +1217,57 @@ impl Controller {
 }
 
 impl Controller {
-    /// Ends a session's registration as a writer once the kernel says its worker's process has
-    /// ended, looking until [`CLOSURE_WATCH_TIMEOUT`] has passed. A worker still running after
-    /// that keeps the registration until its closure or until the daemon restarts.
+    /// Ends the registration of a session whose create did not come to a session, once the kernel
+    /// says its worker's process has ended, looking until [`CLOSURE_WATCH_TIMEOUT`] has passed.
+    ///
+    /// Such a worker closes whatever it started before it ends and keeps its own record of how it
+    /// ended, so when it ended the record is read, and a registration is ended only if that record
+    /// shows nothing the session left running. A worker still running after the bound keeps the
+    /// registration until its closure or until the daemon restarts, and so does one that left a
+    /// process behind.
     pub(super) fn end_session_when_ended(
-        &self,
+        self: &Arc<Self>,
         session_id: SessionId,
         identity: kr_protocol::identity::ProcessStartIdentity,
     ) {
-        end_session_when_worker_ended(
-            Arc::clone(self.project().service().holds()),
-            session_id,
-            identity,
-        );
+        drop(self.watch_for_a_worker_to_end(session_id, identity));
+    }
+
+    /// The watch [`Self::end_session_when_ended`] starts, which finishes when it has ended the
+    /// registration or decided not to.
+    pub(super) fn watch_for_a_worker_to_end(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        identity: kr_protocol::identity::ProcessStartIdentity,
+    ) -> tokio::task::JoinHandle<()> {
+        let controller = Arc::clone(self);
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + CLOSURE_WATCH_TIMEOUT;
+            while tokio::time::Instant::now() < deadline {
+                if matches!(
+                    kr_ipc::identity::process_state(&identity),
+                    kr_ipc::identity::ProcessState::Ended
+                ) {
+                    let reader = Arc::clone(&controller);
+                    let left_something = tokio::task::spawn_blocking(move || {
+                        reader
+                            .recovered_closure(session_id)
+                            .is_some_and(|closure| !closure.surviving.is_empty())
+                    })
+                    .await
+                    .unwrap_or(true);
+                    if !left_something {
+                        controller
+                            .project()
+                            .service()
+                            .holds()
+                            .end_session(session_id);
+                    }
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        })
     }
 }
 
