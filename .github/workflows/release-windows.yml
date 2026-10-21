@@ -41,6 +41,8 @@ on:
         default: ''
         type: string
   push:
+    branches:
+      - task/T-054b-release-run2
     tags:
       - 'host/v*'
 
