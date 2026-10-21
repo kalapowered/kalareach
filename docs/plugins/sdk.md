@@ -94,6 +94,77 @@ It refuses a request of any other method, a decision the table does not map, an 
 not a JSON string or number, and a table with no destination. The identifier goes back exactly as it
 arrived and the value comes from `decisions`, so a caller supplies neither.
 
+## An answer that is a response
+
+A table of an application server may read the answer to an approval as the response to the request it
+asked, with the request's own identifier and one member of the result that carries the decision. It
+says so with a `decision_response` member instead of a `decision_destination`, and the table answers
+one way. A table with a response leaves `decision_destination` as `null`.
+
+```json
+"decision_response": {
+  "answers": [
+    "item.command-execution.request-approval",
+    "item.file-change.request-approval"
+  ],
+  "result_member": "decision",
+  "decisions": [
+    { "decision": "accept", "value": "accept" },
+    { "decision": "accept-for-session", "value": "acceptForSession" },
+    { "decision": "decline", "value": "decline" },
+    { "decision": "decline-and-stop", "value": "cancel" }
+  ]
+}
+```
+
+`answers` lists one to eight routed methods that the application sends and that the table does not
+classify as unsupported. The answer to one is `{"id": <the request's id>, "result": {"decision":
+<the value>}}`, written from the table alone. Each decision maps to its own value, and the table
+matches responses to requests by the identifier they repeat. The member needs the table's `messages`
+member, and it must not name one the table reads a message by. A package whose table declares it
+needs `approval.decode` and `approval.respond`, and its answer action is the `decision_destination`
+implementation, whose choices the response maps.
+
+## What the host reads from a stream
+
+An `observation` member says where the messages of an application server name the conversation and
+the turn the terminal is in:
+
+```json
+"observation": {
+  "selections": [
+    { "method": "thread.start", "thread": { "segments": [
+      { "type": "member", "name": "result" },
+      { "type": "member", "name": "thread" },
+      { "type": "member", "name": "id" } ] } }
+  ],
+  "leaves": [
+    { "method": "thread.closed", "thread": { "segments": [
+      { "type": "member", "name": "params" },
+      { "type": "member", "name": "threadId" } ] } }
+  ],
+  "turn_started": { "method": "turn.started",
+    "thread": { "segments": [{ "type": "member", "name": "params" }, { "type": "member", "name": "threadId" }] },
+    "turn": { "segments": [{ "type": "member", "name": "params" }, { "type": "member", "name": "turn" }, { "type": "member", "name": "id" }] } },
+  "turn_ended": { "method": "turn.completed",
+    "thread": { "segments": [{ "type": "member", "name": "params" }, { "type": "member", "name": "threadId" }] },
+    "turn": { "segments": [{ "type": "member", "name": "params" }, { "type": "member", "name": "turn" }, { "type": "member", "name": "id" }] } },
+  "request_resolved": { "method": "request.resolved",
+    "request_id": { "segments": [{ "type": "member", "name": "params" }, { "type": "member", "name": "requestId" }] } }
+}
+```
+
+A selection is a request of the terminal's, and the path names the thread in its success reply, from
+the root of the reply. A leave is a request of the terminal's or a notification of the application's
+that ends the conversation it names. The turn and the cleared request are notifications of the
+application's. Every method is one the table routes the way the message travels, a path begins with
+the member the table names for that kind of message (`result` for a reply, `params` for the rest),
+and a method has one role. A table lists at most eight selections and eight leaves, needs its
+`messages` member, and matches responses by identifier.
+
+The package declares places and the host does the reading. A package cannot say that a conversation
+changed, and the host never takes one from prompt text or timestamps.
+
 ## The action that answers
 
 An action answers through the destination with the `decision_destination` implementation:

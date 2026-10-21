@@ -6234,17 +6234,20 @@ A request the table does not classify is presumed mutation-capable, forwarded ex
 suspends that instance's rich mutations until the binding is reconciled. The terminal stays usable
 throughout: suspension is a state a client reads, not an error it hits.
 
-A terminal served by a gateway has a second reason, of its own, which is set before the launch
-commits and holds for the instance's life. The gateway carries the terminal's frames without
-reading out of them which conversation the terminal has selected, so the binding names no thread
-and nothing vouches for one. Rich mutations are suspended for that reason whatever the table lists,
-and the binding reads `rich_mutations_suspended` with it. The binding names one reason at a time:
-one an unclassified request placed, else a native bridge's, else this. Once the instance has an
-upstream transport, and while rich work is not fenced (see *Volatile-native mode*), a prompt
-submitted at the revision read is refused `DRAFT_CONFLICT`, naming this reason when no other is
-placed; until then the refusal is `UNSUPPORTED_CAPABILITY`, as for any instance with no transport.
+A terminal served by a gateway has reasons of its own for rich mutations to wait. The binding names
+one at a time: the one an unclassified request placed, else a native bridge's, else the stream's
+(see [What the gateway reads from the stream](#what-the-gateway-reads-from-the-stream)), else the
+unread thread. The unread thread is set before the launch commits and holds until a reply from the
+server has named the conversation the terminal selected: until then the binding names no thread and
+nothing vouches for one. A table that says where its messages name a thread lifts it with the first
+such reply. A table that says nothing never lifts it, and rich mutations stay suspended for the
+instance's life. While a reason holds, the binding reads `rich_mutations_suspended`. Once the
+instance has an upstream transport, and while rich work is not fenced (see *Volatile-native mode*),
+a prompt submitted at the revision read is refused `DRAFT_CONFLICT`, naming the reason when no other
+is placed; until then the refusal is `UNSUPPORTED_CAPABILITY`, as for any instance with no transport.
 The terminal runs as it does without the suspension. The reasons are kept apart: the next
-unclassified request does not replace this one, and reconciling the binding does not lift it.
+unclassified request does not replace the unread thread or the stream's wait, and reconciling an
+unclassified request's suspension does not lift either.
 
 Downstream request identifiers are namespaced by connection, so two connections that both call
 their first request `1` are two different pending resources, and a restarted worker numbers its
@@ -6322,6 +6325,73 @@ ending began. A control daemon that finds the worker gone ends the same recorded
 same order: it asks, waits, and forces. A control daemon that is killed and started again changes
 none of this: the worker, the terminal, the server and the pending resource go on, and the new
 daemon serves them once its first round of admissions has reached the worker.
+
+### What the gateway reads from the stream
+
+A table of an application server can say which of the stream's messages name the conversation the
+terminal is in. Its `observation` member lists the terminal's requests whose success reply names the
+thread it selected, the messages after which the terminal has none (a request of the terminal's, or
+a notification of the server's), the notifications that say a turn started and ended, and the
+notification that says a request was answered or cleared. Each names a routed method and the place in
+its message, from the root of the message, inside the member the table names for that kind of
+message. The core reads those places itself; nothing a component says is read, and a conversation is
+never taken from matching prompt text and timestamps.
+
+A success reply to a selecting request names a thread, and the binding takes it. The revision
+advances only when the thread changed, and the unread thread's reason ends. A conversation another
+live execution owns is not taken: the binding then names none, and the instance waits and says why.
+A leave ends the binding's thread. A turn the server says started in the bound conversation is the
+running turn, and one that ended clears it only when it names the running turn; a message about
+another conversation changes nothing. The turn is not read out of a selection's reply, so after a
+resume into a thread that is already running, a steer or a cancel is refused until the server says a
+turn started.
+
+Rich mutations wait while a request of the terminal's that selects or leaves a conversation has not
+been answered, and after one whose outcome is unknown: its reply could not be read, it was given up
+at its deadline or with its connection, or its bytes went in part. A refusal from the server is
+proven, and changes nothing. A request whose bytes never went leaves nothing behind. Only the reply
+to the newest request that has not been refused is taken: an older reply never restores a
+conversation the terminal has left, and never clears the uncertainty of a later request.
+
+An operation admitted before any of that, and not yet taken, is checked again when its permit is
+taken: the binding revision, every reason rich mutations wait, and the journal's fence. What nothing
+orders is the interval between the take and the bytes reaching the transport's queue. A frame the
+host writes names its thread (an approval's answer names its request), so a frame past the take
+reaches the thread the binding named when it was admitted and never another, though that can be one
+the terminal has just left, as a frame the terminal itself wrote can be.
+
+A frame of a method the table does not classify suspends rich mutations, as described above. That
+suspension lifts when a selection admitted after the frame has named the conversation and every
+request of the terminal's that the table does not classify, admitted before that selection, has been
+answered. It confirms what a selection names and no more: it cannot see what an unlisted method
+changed that no selection names, nor a change of conversation that has no message. A terminal that
+routinely sends such a method keeps rich mutations suspended until it selects a thread again, which
+a resume of the same thread does.
+
+The connection records its own capability evidence. `agent.approval` is available when the table
+answers approvals and the binding holds `approval.decode` and `approval.respond`;
+`agent.prompt`, `agent.prompt.queue`, `agent.steer` and `agent.cancel` are available when the rich
+table names the operation, and are otherwise recorded unavailable with the reason. The evidence is
+written again after every change of binding and every change of the binding's grants, and withdrawn
+when the connection ends.
+
+A request the table's `decision_response` answers is recorded, forwarded to the terminal and then
+interpreted, in that order, so the terminal's own answer never waits for a meaning. When the binding
+holds `approval.decode`, the decisions the table maps, labelled as the package's answer action labels
+them, are what a client is offered; a request nothing may decode stays opaque and the terminal
+answers it. A rich answer is written as the response to the request: the request's own identifier
+and, in the member the table names, the value the table maps the decision to.
+
+The terminal and a rich client can answer one request. A native answer that arrives while a rich
+answer is only reserved takes its transmission. The rich answer then reaches its marker, finds the
+resource taken, sends nothing, and returns where the resource stands with `QUESTION_RESOLVED`
+(`claimed` while the terminal's answer is being written, its end once that is known). Its receipt is
+`refused`, since nothing went, where a failure after the marker stays an outcome nobody can
+establish. A native answer that arrives after a rich answer's marker, or after the request ended, is
+not forwarded and does not end the connection. The server's notice that the request was answered is
+what clears the terminal's prompt. For a request nobody answered, or whose rich answer is only
+reserved, that notice settles it as cancelled. For an answer that is being written it changes
+nothing, and the writer's settlement says whether the answer went.
 
 ## The connection owner
 

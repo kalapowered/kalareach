@@ -558,9 +558,26 @@ component fault disables rich meaning without stalling or discarding valid nativ
   the decision, and the application's own value for each decision. A table that answers none says
   `null`. The destination is also what an installation's `approval.decode` grant trusts a package
   to interpret: exactly the requests it answers, whether the table's own reading or the package's
-  component interprets them. A table that answers none gives its package no such trust, so a
-  protocol whose answer is a response to the request itself, rather than a request of its own, is
-  answered by the native client alone.
+  component interprets them. A table that answers none gives its package no such trust.
+- **Decision response:** for a table of an application server that reads the answer as the response
+  to the request it asked, the requests that ask for a decision (one to eight routed methods the
+  application sends), the member of the response's result that carries the decision, and the
+  application's own value for each decision. A table answers one way, through a destination or
+  through a response. The response carries the request's own identifier, which the host takes from
+  the pending request, so a caller supplies neither it nor the value. Interpretation and the trust an
+  installation's `approval.decode` grant gives work as they do for a destination. A package that
+  declares one states `"sdk_range": ">=0.1.6, <0.2.0"`.
+- **Observation:** for a table of an application server, where the stream's messages name the
+  conversation and the turn the terminal is in. It lists the terminal's requests whose success reply
+  names the thread it selected, the messages after which the terminal has none, the notifications that
+  say a turn started and ended, and the notification that says a request was answered or cleared.
+  Each names a routed method and a path from the root of the message that begins with the member the
+  table names for that kind of message: `result` for a reply, `params` for the rest. A method has one
+  role, and a selection is a request of the terminal's while a turn or a cleared request is a
+  notification of the application's. The host reads the places itself, as
+  [the host's account of the gateway](../host/README.md#what-the-gateway-reads-from-the-stream)
+  describes. A table that leaves the member out has the host read no thread from the stream, and a
+  package that declares it states `"sdk_range": ">=0.1.6, <0.2.0"`.
 - **Messages:** The `messages` member of an application server's table names the top-level members,
   other than the message identifier and method, that a message is read by: `params`, `result` and
   `error` each hold the name of one. A request names the method member, and a response names exactly
