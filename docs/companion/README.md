@@ -464,6 +464,39 @@ Acknowledgements are read from the authority feed. The authority feed stores the
 but does not interpret them, so they are the service's word for what the host answered, and not
 something this computer can check.
 
+A request published to a feed carries an announcement for the host. Native code seals it from this
+computer's stored-envelope key to the host's, and the service places it in the host's mailbox beside
+the request. The host reads its mailbox, finds the announcement and reads the feed at once instead
+of at its next poll. The announcement says that the feed changed and nothing about what changed. It
+expires 55 minutes after it is sealed. The service refuses a change whose announcement expires more
+than an hour after the service's own clock, and it admits a request signed up to five minutes ahead
+of that clock, so a longer expiry would let a computer with a fast clock lose the whole revocation.
+A request whose announcement cannot be sealed is published without one.
+
+The host announces back. When it acknowledges a request, it places an announcement that the feed
+changed in the mailbox of the owner that published the request. It does so for the first
+acknowledgement, and again when how much of the revocation the host's sessions have confirmed
+changes. The answer itself is read from the feed.
+
+This computer reads its own mailbox at the sync service (`src-tauri/src/mailbox.rs`) each time the
+devices screen looks, but only when the screen reads at least one feed, which is when this computer
+owns a host other than the one on it. A computer that owns no such host contacts nothing. A service
+that asks to be left alone is left alone for as long as it asked, up to an hour. The pass has the
+time a feed read has, and taking the lock is part of it. A stop of the mailbox never fails the
+screen: the screen says in one line that announcements cannot be read and that answers to
+revocations are still read from each feed.
+
+The rules for taking an item are the shared reader's (`kr_client::mailbox_reader`). It opens an item
+only against the stored-envelope key of a host this computer is paired with, holds the routing
+record outside the box to the fields inside it, refuses an identifier it has accepted, and refuses a
+payload that bears authority whoever sealed it. An item that opens is written down, and an
+announcement that a feed changed is counted; nothing else is done with it. The accepted identifiers
+are kept in `mailbox/replay.json` in the application's data directory, each until its item expired
+and a day more, up to 4,096 of them. At that limit the reader accepts nothing more, says so, and
+leaves the items on the service. A pass holds `mailbox/replay.lock` and does not wait for another
+window of the application that holds it. A record of a version this build does not read, or one that
+cannot be read, is left as found and nothing is acknowledged.
+
 No answer a host gives says which sync service it reads its revocations from, as the host chooses
 which to use with its own `authority.origin` setting. As the local computer doesn't know which sync
 service the host is using, it publishes every revocation request at the sync service that it is set

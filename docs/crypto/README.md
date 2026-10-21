@@ -264,7 +264,8 @@ trusted.
 
 Opening an envelope also checks the expiry, and `ReplayLedger` refuses an envelope that has expired
 as well as one it has already seen, so the retention window cannot be outlasted. The ledger's
-durable store belongs to the controller: `entries` and `restore` are how it survives a restart.
+durable store belongs to the reader that owns it: the reader writes each accepted identifier down
+and rebuilds the ledger from what it wrote with `restore`, so a restart does not reopen the window.
 
 ### Opening what a service delivered
 
@@ -277,8 +278,8 @@ The order is fixed. The keyless rules of the item's own shape run first, so a ma
 no key at all. An identifier the ledger already holds is refused next, on the record's own claim, so
 a redelivery costs no decryption; the claim is untrusted and that is only an early exit. Then the
 sender is selected, the box is opened, every binding is checked and a payload that bears authority
-is refused. The replay identifier is recorded **last**, so that only an item that was accepted is
-recorded, and an item that was accepted is one that will never be accepted again.
+is refused. The replay identifier is recorded **last**, after every check has passed, so an item that
+is refused is not recorded and one that was accepted is never accepted again.
 
 `open_envelope` stays public beneath it, for a caller that already knows which key it means. That
 caller takes on the two duties the delivery path discharges: selecting the sender from what it has
@@ -347,16 +348,17 @@ and section 20 says what follows: an authorisation-bearing payload is signed by 
 encryption, so pairwise message authentication never substitutes for an issuer's grant signature.
 
 No reader of a mailbox in this product takes authority from one. A host takes its authority from its
-own records and its authority feed, and a device from its paired hosts' records, so the mailbox is a
-way of telling a reader that something is there to read. `open_envelope` and
-`open_delivered_envelope` therefore refuse a payload that bears authority (`SignedAuthorityObject`)
-with `AuthorityNotAccepted`, after the box, the bindings and the expiry have passed: an object its
-issuer never signed, inside an envelope that is valid in every other way, is refused, and so is a
-signed one. The refusal does not record the replay identifier.
+own records and its authority feed, and a device from its paired hosts' records, so a mailbox only
+tells a reader that something is there to read. `open_envelope` and `open_delivered_envelope`
+therefore refuse a payload that bears authority (`SignedAuthorityObject`) with
+`AuthorityNotAccepted`, after the box, the bindings and the expiry have passed. An object its issuer
+never signed, inside an envelope that is valid in every other way, is refused, and so is a signed
+one. The refusal does not record the replay identifier.
 
 `ForwardedAuthority` is the closed set of signed objects that kind names: a signed revocation
-request and a host's ordered authority revision record. Their signatures and the bytes they cover
-are published in `fixtures/crypto/envelopes.json`, and the TypeScript package reads the same bytes.
+request and a host's ordered authority revision record. The signature of a revocation request, and
+the bytes it covers, are published as a vector in `fixtures/crypto/envelopes.json`, and the
+TypeScript package reads the same bytes.
 
 ## Recovery
 

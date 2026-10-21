@@ -461,6 +461,21 @@ revocation from the feed, and an announcement that is forged, repeated or lost c
 feed does not already say. A host with no feed reads no mailbox. The service that `mailbox.origin`
 names, where the host places the objects of its notifications, is a separate choice.
 
+The host announces back. When its carrier acknowledges a request, it places an announcement that
+the feed changed in the mailbox of the owner that published the request, at the same service. The
+owner's companion reads its mailbox when its devices screen looks, takes the announcement and counts
+it; the owner reads the host's answer from the feed itself. The carrier seals the announcement at
+that attempt, from the host's stored-envelope key to the owner's, and only while the owner's pairing
+is in force and its key is recorded. It makes one when the acknowledgement tells the owner something
+new: the first acknowledgement, or a change in how many of the host's sessions have confirmed the
+revocation. A request left pending is therefore not announced on every pass. A refusal carries no
+announcement, because the service takes none on one, and the owner learns of a refusal from the
+feed. The service places an announcement after the change has committed, so one it declines leaves
+the acknowledgement as it was. A service that reads an announcement as invalid refuses the whole
+acknowledgement instead: the carrier stops that pass at the record and seals a new announcement
+when it acknowledges the record again. The host and the companion open what they find in their own
+mailboxes by the same rules, which live in the client library.
+
 The daemon reads the mailbox when it starts and every ten seconds after that. It takes an item only
 if the item opens against the stored-envelope key of a device the host has paired and whose pairing
 is in force: a device that is revoked, or whose grant has run out and the end is on record, is no
@@ -5841,11 +5856,13 @@ signs as the host, with the authorisation key its pairings recorded, which is wh
 addressed by. It reads the feed at five moments: when the daemon starts, when a connection is
 established, every 30 seconds after that, when an owner is paired or revoked, and when the host
 finds an announcement in its own mailbox, which it reads every ten seconds (see "The host's own
-mailbox"). A connection waits for a read that began after it was admitted, for at most five seconds,
-before anything it asks is answered. So a device the feed holds a revocation for is kept out before
-its first request is answered, by a refusal of the request or by the connection ending before
-anything is served, and not at the next poll. A feed that does not answer in that time leaves the
-connection served, and the status goes stale when the pass that was held ends without an answer.
+mailbox"). When it acknowledges a request, it also announces the acknowledgement to the owner that
+published the request, as that section describes. A connection waits for a read that began after it
+was admitted, for at most five seconds, before anything it asks is answered. So a device the feed
+holds a revocation for is kept out before its first request is answered, by a refusal of the request
+or by the connection ending before anything is served, and not at the next poll. A feed that does
+not answer in that time leaves the connection served, and the status goes stale when the pass that
+was held ends without an answer.
 
 The host judges each request from its own records. A request addressed to another host, or that
 names nothing this host knows, is refused to the feed as an unknown target. A request signed by a

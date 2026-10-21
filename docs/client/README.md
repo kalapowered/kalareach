@@ -989,12 +989,31 @@ challenge, that mailbox and nothing else; the private key stays where it was. Th
 the key that answered, so a mailbox is read and acknowledged by one device and a peer that knows
 the public key is refused rather than served.
 
-The client seals nothing and opens nothing here: `kr_crypto::envelope` produces and opens
+`services::mailbox` seals nothing and opens nothing: `kr_crypto::envelope` produces and opens
 envelopes, and `services::mailbox` carries them. Everything outside the box stays untrusted on the
 way back. The routing record selects a sender's key out of the paired set rather than supplying
 one, the fields outside the box are held to the fields inside it, an identifier already accepted is
-refused by the reader's own replay ledger, and the bytes a mailbox counts are the declared size
-bucket rather than the length of the plaintext padded into it.
+refused by the reader's own replay ledger, a payload that bears authority is refused whoever sealed
+it, and the bytes a mailbox counts are the declared size bucket rather than the length of the
+plaintext padded into it.
+
+`mailbox_reader` applies those rules in one place, for the host's reader and the companion's.
+`read_mailbox` makes one pass for a reader that implements `Reading`. Each pass takes the senders
+the reader has paired with and the identifiers it has accepted from the reader's own records, then
+reads the mailbox page by page. It opens each item against the clock at that item, and it writes each
+accepted identifier down before it does anything with the item. It acknowledges a page to the
+service only when every accepted item on the page is on record. When a write fails, the pass ends
+with that page unacknowledged, and the items accepted before the failure have already been handed
+to the reader, so a failure on a later item does not lose them. A pass reads at most 16 pages. The
+reader keeps its own storage, transport and wait, and honours the delay a service asks for.
+
+`services::authority` also seals the announcement a caller places beside a feed change
+(`FeedAnnouncement::sealed_for`). Its payload is empty, and it expires 55 minutes after it is sealed.
+The service refuses the whole change when an announcement expires more than an hour after the
+service's own clock, and it admits a signed request whose time is up to five minutes ahead of that
+clock. An expiry of 55 minutes therefore stays within the service's bound for any sender whose
+request the service admits, as long as the sender seals the announcement on the clock that signs
+the request, no later than it signs it.
 
 `services::http` is the exchange underneath them: `HttpService` addresses one gateway origin, which
 it compares as a parsed scheme, host and port before it makes contact, and refuses an address that
