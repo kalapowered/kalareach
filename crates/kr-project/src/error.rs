@@ -172,6 +172,11 @@ pub enum ProjectError {
         /// Which sessions, and how many.
         detail: Diagnostic,
     },
+    /// A capture is holding the repository still, so a writer of this host asks again later.
+    Held {
+        /// Which writer was refused, and that a hold is the reason.
+        detail: Diagnostic,
+    },
     /// The caller's authority does not reach this operation.
     PermissionDenied {
         /// What was refused.
@@ -278,6 +283,7 @@ impl ProjectError {
             Self::GitFailed { .. } => "GitFailed",
             Self::WrongState { .. } => "WrongState",
             Self::StillBound { .. } => "StillBound",
+            Self::Held { .. } => "Held",
             Self::PermissionDenied { .. } => "PermissionDenied",
             Self::IdConflict { .. } => "IdConflict",
             Self::OutcomeUnknown { .. } => "OutcomeUnknown",
@@ -319,6 +325,7 @@ impl ProjectError {
             | Self::GitFailed { detail }
             | Self::WrongState { detail }
             | Self::StillBound { detail }
+            | Self::Held { detail }
             | Self::PermissionDenied { detail }
             | Self::OutcomeUnknown { detail }
             | Self::NotAdmitted { detail, .. }
@@ -368,7 +375,7 @@ impl ProjectError {
             Self::GitUnavailable { .. } => ErrorCode::HostNotConfigured,
             Self::GitFailed { .. } => ErrorCode::UpstreamUnavailable,
             Self::WrongState { .. } => ErrorCode::InvalidArgument,
-            Self::StillBound { .. } => ErrorCode::ResourceUnavailable,
+            Self::StillBound { .. } | Self::Held { .. } => ErrorCode::ResourceUnavailable,
             Self::QuotaExceeded { .. } => ErrorCode::QuotaExceeded,
             Self::Cancelled { .. } => ErrorCode::ResourceUnavailable,
             Self::PermissionDenied { .. } => ErrorCode::PermissionDenied,
@@ -476,6 +483,9 @@ mod tests {
                 detail: HOSTILE.to_owned().into(),
             },
             ProjectError::StillBound {
+                detail: HOSTILE.to_owned().into(),
+            },
+            ProjectError::Held {
                 detail: HOSTILE.to_owned().into(),
             },
             ProjectError::PermissionDenied {
@@ -618,6 +628,13 @@ mod tests {
         assert_eq!(
             ProjectError::StillBound {
                 detail: "one session is live".to_owned().into()
+            }
+            .code(),
+            ErrorCode::ResourceUnavailable
+        );
+        assert_eq!(
+            ProjectError::Held {
+                detail: "a capture is holding the repository".to_owned().into()
             }
             .code(),
             ErrorCode::ResourceUnavailable

@@ -98,6 +98,7 @@ pub mod credential;
 pub mod discovery;
 pub mod error;
 pub mod git;
+pub mod holds;
 pub mod identity;
 pub mod operation;
 pub mod policy;

@@ -165,6 +165,9 @@ pub struct ProjectService {
     /// Taken for as long as one map operation, never across a subprocess and never while the
     /// journal's lock is held, so there is one order and no way to deadlock against the store.
     running: Mutex<BTreeMap<ActionId, Arc<Cancellation>>>,
+    /// The writers, sessions and holds of this environment: who may write a repository while a
+    /// capture holds it still.
+    pub(crate) holds: Arc<crate::holds::WorkspaceHolds>,
     /// What a test runs immediately before a reconciliation reads or removes anything beneath its
     /// location.
     #[cfg(feature = "git-fixtures")]
@@ -226,6 +229,7 @@ impl ProjectService {
             challenges: crate::policy::Challenges::default(),
             transitions: crate::policy::Transitions::default(),
             running: Mutex::new(BTreeMap::new()),
+            holds: Arc::new(crate::holds::WorkspaceHolds::new()),
             #[cfg(feature = "git-fixtures")]
             reconciling: None,
             #[cfg(feature = "git-fixtures")]
@@ -2025,6 +2029,12 @@ impl ProjectService {
         // The probe asks the destination's location first, as every read beneath it does.
         let state = destination.probe()?;
         check_destination(&plan, state, &destination)?;
+        // A new repository is made beside the entries of a directory that may be inside a working
+        // tree a capture holds still. An adoption writes nothing there.
+        let _writer = match plan {
+            CreatePlan::Adopt { .. } => None,
+            _ => Some(self.writer_in_directory(plan.method(), destination.parent_path())?),
+        };
         let project_repository_id = ProjectRepositoryId::new(new_uuid());
         let action_id = performed
             .action()
@@ -2412,6 +2422,12 @@ impl ProjectService {
             return answer();
         }
         let reach = self.recorded_reach(location_id, &shown, "the staging directory")?;
+        // The staging directory is removed from beside the entries of a directory that may be
+        // inside a working tree a capture holds still.
+        let _writer = self.writer_in_directory(
+            "the cleanup of a project operation's staging directory",
+            Path::new(&row.parent_path),
+        )?;
         // The guard is released at the end of this statement: answering from the record below
         // takes the same lock.
         let begun = self
@@ -2710,6 +2726,23 @@ impl ProjectService {
                 unapplied: Vec::new(),
             });
         }
+        // A linked worktree writes into the source repository's own administration, and every
+        // isolated workspace is a new directory beside the entries of a directory that may be
+        // inside a working tree a capture holds still. The guard lasts until the workspace is
+        // ready.
+        let _writer = match (params.isolation.0, destination.as_ref()) {
+            (Some(IsolationMechanism::GitWorktree), Some(destination)) => {
+                Some(self.writer_of_git_directory(
+                    "workspace.create",
+                    repository.identity().git_dir,
+                    Some(destination.parent_path()),
+                )?)
+            }
+            (_, Some(destination)) => {
+                Some(self.writer_in_directory("workspace.create", destination.parent_path())?)
+            }
+            (_, None) => None,
+        };
         let workspace_id = WorkspaceId::new(new_uuid());
         let (display_path, isolation) = match destination.as_ref() {
             None => (project.display_path.clone(), None),
@@ -3187,6 +3220,13 @@ impl ProjectService {
                 }
             }
         };
+        // A removal takes the working tree away with every tree recorded inside it and prunes the
+        // repository's administration, so it is a writer of both. The identities are the ones the
+        // repository has now when it can be opened, and the recorded ones when it cannot.
+        let _writer = match recorded.as_ref() {
+            Some(row) => Some(self.writer_removing(row, &reach)?),
+            None => None,
+        };
         // The claim, the holder count and the reservation are one transaction, and they come
         // first. From this moment nothing new may hold the workspace and nothing new may be
         // recorded against it, so the measurement below and the decision after it see a workspace
@@ -3228,6 +3268,29 @@ impl ProjectService {
         self.writable()?
             .release_removal(params.workspace_id, reserved.token)?;
         answered
+    }
+
+    /// Registers a removal as a writer of the workspace's tree and its repository's Git directory,
+    /// with the identities the repository has now when it can be opened and the recorded ones when
+    /// it cannot. An isolated workspace's tree is removed with every tree recorded inside it.
+    fn writer_removing(
+        &self,
+        row: &WorkspaceRow,
+        reach: &TreeReach,
+    ) -> Result<crate::holds::Writer> {
+        let footprint = match self.open_recorded_workspace(row, reach) {
+            Ok(open) => {
+                let identity = open.opened.identity();
+                let footprint = crate::holds::Footprint::of_repository(&open.opened);
+                if row.kind == WorkspaceKind::Isolated {
+                    footprint.removing(identity.work_tree)
+                } else {
+                    footprint
+                }
+            }
+            Err(_) => self.recorded_footprint(row.workspace_id)?,
+        };
+        self.holds.begin_write("workspace.remove", footprint)
     }
 
     /// Records what uncommitted work a workspace's own tree holds now.
