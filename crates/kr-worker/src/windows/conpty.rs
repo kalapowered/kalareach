@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 
-/// The identifier of the process this thread last created in a console, for this host's own tests:
-/// a start can be refused at the moment its process exists, and that is how a case knows it does.
+// The identifier of the process this thread last created in a console, for this host's own tests:
+// a start can be refused at the moment its process exists, and that is how a case knows it does.
 #[cfg(test)]
 thread_local! {
     pub(crate) static CREATED: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
