@@ -3066,3 +3066,119 @@ async fn a_launch_waiting_on_the_service_manager_does_not_hold_up_the_daemon() {
     let outcome = creating.await.expect("the create finishes");
     assert!(outcome.is_err(), "this test's supervisor starts nothing");
 }
+
+/// A workflow node's create under `token`, whose admission passes and counts how often it is
+/// asked.
+fn a_nodes_create(
+    environment_id: kr_protocol::ids::EnvironmentId,
+    token: ActionId,
+    asked: &Arc<std::sync::atomic::AtomicUsize>,
+    answer: impl Fn() -> crate::error::Result<Option<u64>> + Send + Sync + 'static,
+) -> crate::service::WorkflowCreate {
+    let asked = Arc::clone(asked);
+    crate::service::WorkflowCreate {
+        actor_id: kr_protocol::ids::ActorId::new("workflow:test").expect("a principal"),
+        token,
+        digest: kr_protocol::scalars::Digest256::from_bytes([7; 32]),
+        create: create_params(environment_id),
+        command: None,
+        admit: Arc::new(move |_| {
+            asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            answer()
+        }),
+    }
+}
+
+/// KR-REQ-25.19 and KR-REQ-26.13: a create the document refuses commits nothing of the workflow
+/// node it is for. The create is usable when it begins, stops between its reservation and its
+/// launch, and the document breaks and is accepted while it waits; the launch section then
+/// refuses it for the document, and the node's admission, which commits the node to the session
+/// it is about to make, is not asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workflow_create_the_document_refuses_commits_nothing_of_its_node() {
+    let (temp, controller, started) = daemon().await;
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let order = a_nodes_create(
+        temp.environment_id(),
+        ActionId::new(kr_ipc::new_uuid()),
+        &asked,
+        || Ok(None),
+    );
+
+    let paused_pending = controller.pending.lock().await;
+    let create = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        async move { controller.workflow_session_create(order).await }
+    });
+    reserved(&controller).await;
+    kr_ipc::paths::write_owner_only_file(
+        &kr_worker::config::document_path(&temp.environment()),
+        br#"{"version": 99}"#,
+    )
+    .expect("a document this build does not read");
+    let _ = controller.effective_configuration().await;
+    assert!(
+        controller.in_force().unusable.is_some(),
+        "the daemon holds a document it cannot use"
+    );
+    drop(paused_pending);
+
+    let refused = create
+        .await
+        .expect("the create finishes")
+        .expect_err("a create that waited across the acceptance starts nothing");
+    assert_eq!(refused.code(), ErrorCode::HostNotConfigured, "{refused}");
+    assert_eq!(
+        asked.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the node's admission was not asked, so the node is not committed to a session it never got"
+    );
+    assert!(
+        started
+            .lock()
+            .expect("the record is not poisoned")
+            .is_empty(),
+        "and no worker was started"
+    );
+}
+
+/// KR-REQ-25.19: a workflow node's create whose token has been used asks the node's admission as
+/// well, so the node that is handed the session its first attempt made is committed to it, and
+/// one whose authority has gone since is refused rather than handed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workflow_create_under_a_used_token_asks_the_nodes_admission() {
+    let (temp, controller, _started) = daemon().await;
+    let token = ActionId::new(kr_ipc::new_uuid());
+    let first = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    controller
+        .workflow_session_create(a_nodes_create(temp.environment_id(), token, &first, || {
+            Ok(None)
+        }))
+        .await
+        .expect_err("this test's supervisor starts nothing, so the first attempt fails");
+    assert_eq!(first.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // The same token again, as a node run again after a restart sends it.
+    let again = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _ = controller
+        .workflow_session_create(a_nodes_create(temp.environment_id(), token, &again, || {
+            Ok(None)
+        }))
+        .await;
+    assert_eq!(
+        again.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the node's admission was asked for the replay, and so commits the node"
+    );
+
+    let gone = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let refused = controller
+        .workflow_session_create(a_nodes_create(temp.environment_id(), token, &gone, || {
+            Err(ControllerError::PermissionDenied {
+                detail: "the node's grant has gone".to_owned(),
+            })
+        }))
+        .await
+        .expect_err("a node whose authority has gone is not handed the session");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+}
