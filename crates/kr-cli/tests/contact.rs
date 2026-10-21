@@ -1937,6 +1937,20 @@ async fn cancellable_call(
         .unwrap_or_else(|error| panic!("{name} is sent: {error}"))
 }
 
+/// Waits until the worker holds the question subscription of a `wait_for_answer` call, which is
+/// the moment the agent's wait is in flight there. A change made before it is a change the wait
+/// finds already made, and says nothing about a wait that was running when it happened.
+async fn until_a_wait_is_held(hosted: &Hosted) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while hosted.service.subscriptions_held() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker held no wait within sixty seconds"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Reads every question in the session through the answering surface, as any client reads them.
 async fn every_question(hosted: &Hosted) -> Vec<kr_protocol::question::Question> {
     let mut client = hosted.worker().await;
@@ -2279,7 +2293,7 @@ async fn a_question_asked_for_a_launched_agent_ends_with_the_agents_instance() {
         }),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    until_a_wait_is_held(&hosted).await;
     assert!(broker.end(instance));
 
     // Every client reads the invalidation, and the other question is untouched.
