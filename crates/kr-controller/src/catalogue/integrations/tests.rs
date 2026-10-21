@@ -580,6 +580,34 @@ fn the_doctor_says_a_connector_without_a_tested_volatile_forwarding_mode_is_serv
         "{reason}"
     );
 
+    // An executable no record names is told as the declaration too: it is the first reason the
+    // doctor gives, whatever record is missing.
+    let unrecorded = Integrations::new().read(&[store.admitted(
+        &fixture::Shape {
+            volatile_forwarding: false,
+            ..fixture::Shape::codex_backend()
+        },
+        |_| {},
+    )]);
+    let unnamed = report(
+        Some(&unrecorded),
+        &[],
+        &enabled(&["codex"]),
+        &able(vec![store.0.join("bin")]),
+    )
+    .reports
+    .remove(0);
+    assert_eq!(unnamed.mode, IntegrationMode::NativeTerminal);
+    assert!(
+        unnamed
+            .reason
+            .0
+            .as_deref()
+            .is_some_and(|reason| reason.contains("volatile forwarding")),
+        "{:?}",
+        unnamed.reason
+    );
+
     // With no executable on the search path the worker refuses every launch of the connector all
     // the same, so the doctor does not say that a gateway would serve one.
     let nowhere = report(
@@ -590,6 +618,7 @@ fn the_doctor_says_a_connector_without_a_tested_volatile_forwarding_mode_is_serv
     )
     .reports
     .remove(0);
+    assert!(nowhere.executable.0.is_none(), "{:?}", nowhere.executable);
     assert_eq!(nowhere.state, CommandIntegrationState::On);
     assert_eq!(nowhere.mode, IntegrationMode::NativeTerminal);
     assert!(
