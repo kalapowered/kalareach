@@ -515,11 +515,21 @@ async fn working_host_apart() -> (Host, Apart) {
 /// Ends the daemon that runs apart and starts another on the same tree, as a restart does: the
 /// workers it started go on running, and the new daemon finds them.
 async fn restarted(host: Host, apart: Apart) -> Host {
+    restarted_after(host, apart, |_| ()).await
+}
+
+/// [`restarted`], with something done to the environment while no daemon runs on it.
+async fn restarted_after(
+    host: Host,
+    apart: Apart,
+    between: impl FnOnce(&kr_ipc::paths::EnvironmentPaths),
+) -> Host {
     let Host {
         _temp, controller, ..
     } = host;
     drop(controller);
     apart.end();
+    between(&_temp.environment());
     working_host_on(_temp, |supervisor| supervisor).await
 }
 
@@ -6578,6 +6588,62 @@ async fn a_restarted_daemon_counts_the_sessions_it_finds_alive() {
             .hold_workspace(tree, opened.work_tree, opened.git_dir)
             .expect("the records read")
             .expect_err("the session an earlier daemon started is alive"),
+        kr_project::holds::Refusal::SessionsBound(1)
+    );
+    let mut control = client(&host).await;
+    close_session(&mut control, &host, &created).await;
+    assert!(
+        service
+            .hold_workspace(tree, opened.work_tree, opened.git_dir)
+            .expect("the records read")
+            .is_ok(),
+        "and not once it has closed"
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-14.32: a live session whose recorded request cannot be read is placed nowhere, so a
+/// daemon that starts finds it in the way of every hold until it closes, wherever it began. The
+/// session here began outside every tree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_daemon_counts_a_session_with_no_readable_request_against_every_hold() {
+    let (host, apart) = working_host_apart().await;
+    let mut control = client(&host).await;
+    let (project, _checkout) =
+        adopted_project(&mut control, host.environment_id, host.work()).await;
+    let tree = worktree_of(
+        &mut control,
+        host.environment_id,
+        project,
+        host.work(),
+        "tree",
+    )
+    .await;
+    let elsewhere = host.work().join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("a directory outside every tree");
+    let created = session_in(&mut control, &host, &elsewhere).await;
+    drop(control);
+    host.clients.abort();
+
+    let host = restarted_after(host, apart, |environment| {
+        let registry = rusqlite::Connection::open(environment.registry_database())
+            .expect("the registry opens while no daemon runs");
+        let erased = registry
+            .execute("UPDATE reservations SET create_intent = NULL", [])
+            .expect("the recorded requests are erased");
+        assert_eq!(erased, 1, "the one session's reservation");
+    })
+    .await;
+    let service = Arc::clone(host.controller.project().service());
+    let opened = service
+        .open_workspace_repository(tree)
+        .expect("the worktree opens")
+        .identity();
+    assert_eq!(
+        service
+            .hold_workspace(tree, opened.work_tree, opened.git_dir)
+            .expect("the records read")
+            .expect_err("a session that cannot be placed is in the way of every hold"),
         kr_project::holds::Refusal::SessionsBound(1)
     );
     let mut control = client(&host).await;
