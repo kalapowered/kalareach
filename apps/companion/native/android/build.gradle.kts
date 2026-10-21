@@ -18,6 +18,8 @@ apply(plugin = "org.jetbrains.kotlin.jvm")
 layout.buildDirectory.set(rootProject.layout.buildDirectory.dir("krnative"))
 
 dependencies {
+    // Reads a QR code from a camera frame or a picture: plain Java, with no Android class in it.
+    add("implementation", "com.google.zxing:core:3.5.3")
     // The platform's own `org.json` is what runs on a phone, so the library is only compiled
     // against here, and is what the tests on a developer's machine run with.
     add("compileOnly", "org.json:json:20240303")
@@ -34,4 +36,6 @@ tasks.withType<Test>().configureEach {
     useJUnit()
     // The cases the Rust and Swift halves are tested against, which these tests decode as well.
     systemProperty("kr.fixtures", file("../platform/fixtures").path)
+    // The pairing fixtures, whose two QR pictures the decoder is held to.
+    systemProperty("kr.pairing.fixtures", file("../../../../fixtures/pairing").path)
 }

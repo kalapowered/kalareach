@@ -29,7 +29,9 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSCameraUsageDescription</key>
-	<string>Take a photo to attach it to a session on one of your hosts.</string>
+	<string>Scan a pairing code, or take a photo to attach it to a session on one of your hosts.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Reach a host on your local network, to pair with it and to use it.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Speak to a session on one of your hosts. The microphone is open only during a call you started, and keeps running if the screen locks during that call.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
