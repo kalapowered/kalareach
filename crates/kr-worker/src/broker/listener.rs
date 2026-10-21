@@ -50,7 +50,7 @@ pub const PIPE_PREFIX: &str = r"\\.\pipe\";
 const LAUNCH_SOCKET_DIGITS: usize = 12;
 
 /// The file name of a launch's private socket, for a fresh identifier's hexadecimal digits: `a-`,
-/// the first [`LAUNCH_SOCKET_DIGITS`] of them and `.sock`.
+/// the first `LAUNCH_SOCKET_DIGITS` of them and `.sock`.
 ///
 /// # Panics
 ///
