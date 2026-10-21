@@ -64,6 +64,10 @@ pub enum FailureKind {
     NewerInvitation,
     /// The pasteboard holds no invitation.
     NothingToPaste,
+    /// The camera is not allowed to this application, so a code cannot be scanned.
+    CameraDenied,
+    /// The picture the person chose shows no QR code.
+    NoCodeFound,
     /// This device could not keep its pairing records safely, so it stopped.
     StoreFailed,
     /// The host may have approved this device while it could not ask, and that cannot be
@@ -95,6 +99,8 @@ impl Said for FailureKind {
             Self::NotAnInvitation => "NotAnInvitation",
             Self::NewerInvitation => "NewerInvitation",
             Self::NothingToPaste => "NothingToPaste",
+            Self::CameraDenied => "CameraDenied",
+            Self::NoCodeFound => "NoCodeFound",
             Self::StoreFailed => "StoreFailed",
             Self::ApprovalUnknown => "ApprovalUnknown",
         })
