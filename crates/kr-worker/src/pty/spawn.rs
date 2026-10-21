@@ -93,7 +93,8 @@ pub(super) struct TableRoom {
 impl TableRoom {
     #[cfg(target_vendor = "apple")]
     fn make() -> Self {
-        /// Descriptors that can be opened between asking how many there are and the fork.
+        /// Room for descriptors opened between asking how many there are and the fork. With more,
+        /// the list is full and the start fails.
         const OPENED_SINCE: usize = 512;
 
         // SAFETY: a null buffer of no size asks only how much room the list needs.
@@ -484,6 +485,14 @@ pub(super) mod tests {
                 assert!(
                     mark_close_on_exec(&mut cramped).is_err(),
                     "a list that may not hold every descriptor fails the start"
+                );
+                // A call the kernel refuses gives no list: room for none is refused before anything
+                // is listed, and the refusal is not the full room's.
+                let mut none = TableRoom { list: Vec::new() };
+                assert!(
+                    mark_close_on_exec(&mut none)
+                        .is_err_and(|refusal| refusal.raw_os_error() != Some(libc::ENOBUFS)),
+                    "a call the kernel refuses fails the start, as a refusal"
                 );
             }
             return;
