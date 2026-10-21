@@ -6991,7 +6991,7 @@ async fn a_daemon_the_service_manager_started_is_started_again_by_it() {
     // KR-REQ-26.07: across a public major the same holds. The manager starts the daemon of a release
     // that states major 2 and lists only that major, which the updater of release one reaches by the
     // majors the release's manifest lists, and it starts release one's again in the rollback that
-    // release two's `kr` makes.
+    // release three's `kr` makes.
     let three = stating_the_later_major_with_keys_in_files(Assembled::at_this_level(
         "0.3.0+cccccccccccc",
         3,

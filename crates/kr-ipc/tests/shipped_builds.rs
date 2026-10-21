@@ -14,14 +14,23 @@ fn root() -> PathBuf {
 }
 
 /// The text of every file that decides how a program is built: the workspace's manifest, cargo's
-/// configuration, and each workflow.
+/// configuration, and each workflow and action.
 fn build_files() -> Vec<(PathBuf, String)> {
     let mut files = vec![root().join("Cargo.toml"), root().join(".cargo/config.toml")];
-    let workflows = root().join(".github/workflows");
-    for entry in std::fs::read_dir(&workflows).expect("the workflows") {
-        let path = entry.expect("an entry").path();
-        if path.extension().is_some_and(|extension| extension == "yml") {
-            files.push(path);
+    // The workflows, and the actions they run, which can set a build's environment as well.
+    let github = root().join(".github");
+    let mut pending = vec![github.join("workflows"), github.join("actions")];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).expect("a directory of workflows or actions") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "yml" || extension == "yaml")
+            {
+                files.push(path);
+            }
         }
     }
     files
