@@ -335,15 +335,28 @@ jobs:
       # the step that keeps the legs' logs, which runs whatever happened.
       #
       # Each leg writes its whole output to a log of its own in a `deployment-*` directory under
-      # `KR_TEST_ARTIFACTS_DIR`, which "Keep the deployment legs' logs" below uploads as the
-      # `deployment-legs` artifact, so a leg that failed is read from its log there. The logs carry no
-      # credential: a leg prints the rule it proved, what it could not give back, the failure of its
+      # `KR_TEST_ARTIFACTS_DIR`, which "Keep the deployment legs' logs" below uploads, with the
+      # checkpoint's own, as the `deployment-legs` artifact, so a leg that failed is read from its
+      # log there. The logs carry no credential: a leg prints the rule it proved, what it could not give back, the failure of its
       # own assertions and the error of a request it could not carry, which names the origin, the
       # path and the fault. It never prints a request, a token or a key, and the keys it holds print
       # as redacted.
       - name: The deployment answers every leg
         if: ${{ !cancelled() }}
         run: bash scripts/e2e-deployment.sh "$KR_CHECKPOINT_ORIGIN"
+
+      # The cross-boundary checkpoint's pairing leg, against the same deployment: a device pairs by
+      # short code through the rendezvous and by direct QR over loopback iroh, and both connect with
+      # kr-connect/1. It makes its own host and its own keys on this runner and keeps nothing: the
+      # code leg reserves one locator, which the host releases when its invitation ends, and spends
+      # one wrong code on it. The checkpoint's other legs need managed shell packages and a published
+      # catalogue release that this job does not build, so the selection names this one.
+      - name: The checkpoint's pairing leg
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          KR_M1B_LEGS: pairing
+        run: bash scripts/e2e-m1b.sh "$KR_CHECKPOINT_ORIGIN"
 
       # The log of every leg the step ran, kept whatever the step did: a leg that failed, a step that
       # stopped before the legs and a step that was cancelled all leave what they wrote. It is an
@@ -355,7 +368,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: deployment-legs
-          path: /tmp/kr-test-artifacts/deployment-*
+          path: |
+            /tmp/kr-test-artifacts/deployment-*
+            /tmp/kr-test-artifacts/m1b-*
           if-no-files-found: warn
 
       # A collection key belongs in the operating system's own credential store, and on this system
@@ -445,6 +460,7 @@ jobs:
           path: |
             /tmp/kr-test-artifacts
             !/tmp/kr-test-artifacts/deployment-*
+            !/tmp/kr-test-artifacts/m1b-*
           if-no-files-found: error
 
       # What the disk had left once the build and every check above it were done, beside the
