@@ -140,6 +140,10 @@ fn kr_release_binary(arguments: &[&str]) -> Output {
 }
 
 fn manifest_arguments(tree: &Path) -> Vec<String> {
+    manifest_arguments_for(tree, target(), floor())
+}
+
+fn manifest_arguments_for(tree: &Path, target: &str, floor: &str) -> Vec<String> {
     [
         "manifest",
         "--tree",
@@ -153,9 +157,9 @@ fn manifest_arguments(tree: &Path) -> Vec<String> {
         "--commit",
         COMMIT,
         "--target",
-        target(),
+        target,
         "--floor",
-        floor(),
+        floor,
     ]
     .iter()
     .map(|argument| (*argument).to_owned())
@@ -576,5 +580,65 @@ fn a_signed_tree_verifies_and_a_changed_or_short_signed_one_does_not() {
         why(&changed).contains("not what its manifest says"),
         "{}",
         why(&changed)
+    );
+}
+
+/// KR-REQ-07.86: a Windows release carries the PowerShell package as files, with no shell build to
+/// state, and its executables are the `.exe` programs of `bin/`; a directory under `shells/` that is
+/// not a package this tool knows is refused, which is the control that the package is let through
+/// for what it is and not because nothing under `shells/` is held to anything.
+#[test]
+fn a_windows_tree_carries_the_powershell_package_as_files() {
+    const WINDOWS: &str = "x86_64-pc-windows-msvc";
+    let directory = tempfile::Builder::new()
+        .prefix("kr-release-windows-")
+        .tempdir()
+        .expect("a directory");
+    let programs = directory.path().join("programs");
+    std::fs::create_dir_all(&programs).expect("programs");
+    for program in kr_protocol::update::required_programs(WINDOWS) {
+        std::fs::write(programs.join(format!("{program}.exe")), "MZ").expect("a program");
+    }
+    let keys = directory.path().join("keys");
+    let made = kr_release_binary(&["dev-keys", "--out", keys.to_str().expect("utf-8")]);
+    assert!(made.status.success(), "{}", why(&made));
+    let tree = directory.path().join("release");
+    let built = Command::new("bash")
+        .arg(checkout().join("scripts/build-release.sh"))
+        .args(["--target", WINDOWS, "--release", "0.1.0+4254aa6e62e5"])
+        .args(["--sequence", "3", "--commit", COMMIT, "--floor", "windows=10.0"])
+        .arg("--programs")
+        .arg(&programs)
+        .arg("--root")
+        .arg(keys.join("root.json"))
+        .arg("--out")
+        .arg(&tree)
+        .arg("--kr-release")
+        .arg(env!("CARGO_BIN_EXE_kr-release"))
+        .output()
+        .expect("the script runs");
+    assert!(built.status.success(), "{}", why(&built));
+
+    let manifest = manifest_of(&tree);
+    assert!(manifest.shells.is_empty(), "no shell build is stated");
+    let listed = |path: &str| manifest.files.iter().find(|file| file.path.as_str() == path);
+    assert_eq!(
+        listed("bin/kr.exe").map(|file| file.mode),
+        Some(FileMode::Executable)
+    );
+    assert_eq!(
+        listed("shells/psreadline/module/KalaReach.ShellBridge.psd1").map(|file| file.mode),
+        Some(FileMode::Regular)
+    );
+    assert!(listed("shells/psreadline/startup/kr-profile.ps1").is_some());
+
+    std::fs::create_dir_all(tree.join("shells/another")).expect("a directory");
+    std::fs::write(tree.join("shells/another/file"), "x").expect("a file");
+    let refused = run(&manifest_arguments_for(&tree, WINDOWS, "windows=10.0"));
+    assert!(!refused.status.success());
+    assert!(
+        why(&refused).contains("shells/another is not a shell package this tool assembles"),
+        "{}",
+        why(&refused)
     );
 }
