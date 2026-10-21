@@ -1059,7 +1059,7 @@ fn a_store_of_applied_policies_is_never_written_larger_than_a_start_reads() {
         adapter_allowlist: Nullable::some(
             (0..64)
                 .map(|index| {
-                    PluginId::new(&format!("kalareach/an-adapter-with-a-long-name-{index:03}"))
+                    PluginId::new(format!("kalareach/an-adapter-with-a-long-name-{index:03}"))
                         .expect("a plugin identifier")
                 })
                 .collect(),
