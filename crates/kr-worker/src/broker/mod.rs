@@ -3104,6 +3104,35 @@ impl Broker {
         Ok(())
     }
 
+    /// Pins what the core reads out of the stream and how it writes its operations, for tables
+    /// pinned by [`Broker::pin_table`], without compiling a connector.
+    ///
+    /// A shipped build pins a connector's reading only by compiling its table. This is for a case
+    /// that pins hand-made tables and says what they spell.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when no table is pinned for the package.
+    #[cfg(feature = "testing")]
+    pub fn pin_reading(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        plugin_id: &PluginId,
+        reading: reading::Reading,
+    ) -> Result<()> {
+        let mut state = self.state();
+        let pinned = state
+            .pinned_tables
+            .get_mut(&(application_instance_id, plugin_id.clone()))
+            .ok_or_else(|| {
+                BrokerError::unknown(format!(
+                    "no table of {plugin_id} is pinned for {application_instance_id}"
+                ))
+            })?;
+        pinned.reading = Some(Arc::new(reading));
+        Ok(())
+    }
+
     /// Compiles one installed connector's table for the executable that runs and pins it for one
     /// instance.
     ///
@@ -4686,7 +4715,21 @@ impl BrokerState {
                 detail: format!("{turn_id} is not the turn this instance is running"),
             });
         }
+        // A prompt submitted over a running turn is not a queue: whether the application takes it
+        // as one is not something this host has qualified, so it is refused while a turn is
+        // known to run, and the caller queues it or steers the turn.
+        if operation == kr_protocol::gateway::RichOperation::PromptSubmit
+            && let Some(running) = instance.turn_id.as_ref()
+        {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!(
+                    "{running} is running, and a prompt submitted now would not be a queued one: \
+                     queue it or steer the turn"
+                ),
+            });
+        }
         let binding_revision = instance.binding_revision;
+        let thread_id = instance.thread_id.clone();
         self.check_responsible(application_instance_id, responsible)?;
         // The capability is rechecked independently of everything else, because it answers its own
         // question: the grant says whether this actor may, and this says whether it would work. An
@@ -4700,6 +4743,7 @@ impl BrokerState {
             application_instance_id,
             binding_revision,
             operation,
+            thread_id,
             turn_id,
             body,
         };
@@ -4867,6 +4911,17 @@ impl BrokerState {
     fn mint_connection(&mut self) -> GatewayConnectionId {
         self.next_connection = self.next_connection.saturating_add(1);
         GatewayConnectionId::new(self.next_connection)
+    }
+
+    /// Returns the turn one instance is running, where it is running one.
+    fn running_turn(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Result<Option<AgentTurnId>> {
+        self.instances
+            .get(&application_instance_id)
+            .map(|instance| instance.turn_id.clone())
+            .ok_or_else(|| unknown_instance(application_instance_id))
     }
 
     /// Returns what one resource a caller names is: the live record while the live arbitration

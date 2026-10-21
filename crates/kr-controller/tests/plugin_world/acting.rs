@@ -315,6 +315,13 @@ impl Acting {
             .pin_table(instance(), installed(), table(), rich())
             .expect("the installed tables are pinned");
         broker
+            .pin_reading(
+                instance(),
+                &package(),
+                kr_worker::broker::reading::Reading::spelling(&rich()),
+            )
+            .expect("what the connector spells is pinned");
+        broker
             .open_native_connection(instance(), &[9; 32], &process, &package(), "1")
             .expect("the native connection is authenticated");
         let (here, there) = tokio::net::UnixStream::pair().expect("a socket pair");

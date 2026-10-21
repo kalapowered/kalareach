@@ -6875,6 +6875,21 @@ impl WorkerService {
                         },
                     )));
                 }
+                // An action the host carries out itself as a cancellation of the running turn is
+                // admitted with the declaration as its plan: the same token, issued and spent, and
+                // the same checks a component's plan passes, with nothing asked of a component.
+                if registered
+                    .as_ref()
+                    .is_some_and(|registered| registered.host_cancel)
+                {
+                    let admitted = self.broker.admit_host_cancel(
+                        &Self::broker_caller(caller),
+                        binding_id,
+                        &params,
+                        kr_ipc::now_ms(),
+                    )?;
+                    return Ok(Some(self.handoff(admitted, UpstreamKind::PluginAction)));
+                }
                 self.broker.check_invocable(
                     &Self::broker_caller(caller),
                     binding_id,

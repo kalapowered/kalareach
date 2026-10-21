@@ -530,10 +530,13 @@ impl InstalledConnector {
                 "the compiled table is not one the gateway interprets: {error}"
             ))
         })?;
+        // The rich table lists exactly the operations the table spells: an operation it does not
+        // declare is one this host does not send, and a table that declares none lists none.
+        let reading = Reading::compile(table, self.offered_decisions());
         let rich = RichMethodTable {
             table_version: MethodTableVersion::new(1),
             upstream_protocol_version: version.to_owned(),
-            entries: Vec::new(),
+            entries: reading.rich_entries(),
         };
         rich.qualify(version).map_err(|error| {
             ConnectorRefusal::new(format!(
@@ -544,7 +547,7 @@ impl InstalledConnector {
         Ok(NativeTables {
             table: compiled,
             rich,
-            reading: Arc::new(Reading::compile(table, self.offered_decisions())),
+            reading: Arc::new(reading),
             protocol_version: version.to_owned(),
             framing: Framing::within(
                 NativeFraming::JsonLines,
@@ -1464,6 +1467,20 @@ pub mod fixture {
                 "Reports a request was answered or cleared",
             ),
             (
+                "turn.steer",
+                "turn/steer",
+                "host_to_upstream",
+                "mutation",
+                "Adds input to the turn that is running",
+            ),
+            (
+                "turn.interrupt",
+                "turn/interrupt",
+                "host_to_upstream",
+                "mutation",
+                "Stops the turn that is running",
+            ),
+            (
                 "item.command-execution.request-approval",
                 "item/commandExecution/requestApproval",
                 "upstream_to_host",
@@ -1498,6 +1515,30 @@ pub mod fixture {
                 { "decision": "decline", "value": "decline" },
                 { "decision": "decline-and-stop", "value": "cancel" }
             ]
+        });
+        // The operations the core writes, as a server of this shape reads them: a prompt starts a
+        // turn, a steer names the turn it expects to be running and a cancellation names the one
+        // it stops. The queue is not declared.
+        let input = serde_json::json!([{ "type": "text", "text": { "$": "text" } }]);
+        table["operations"] = serde_json::json!({
+            "prompt_submit": {
+                "method": "turn.start",
+                "params": { "threadId": { "$": "thread_id" }, "input": input },
+                "reply_turn": path(&["result", "turn", "id"])
+            },
+            "turn_steer": {
+                "method": "turn.steer",
+                "params": {
+                    "threadId": { "$": "thread_id" },
+                    "expectedTurnId": { "$": "turn_id" },
+                    "input": input
+                },
+                "reply_turn": path(&["result", "turnId"])
+            },
+            "turn_cancel": {
+                "method": "turn.interrupt",
+                "params": { "threadId": { "$": "thread_id" }, "turnId": { "$": "turn_id" } }
+            }
         });
         table["observation"] = serde_json::json!({
             "selections": [
@@ -1587,6 +1628,9 @@ pub mod fixture {
         if shape.native_bridge {
             capabilities.push(serde_json::json!({ "capability": "native_bridge.install", "reason": "Register the forwarder Claude Code starts" }));
         }
+        if shape.gateway && shape.answers {
+            capabilities.push(serde_json::json!({ "capability": "upstream.action", "reason": "Cancel the turn that is running" }));
+        }
         if !shape.gateway || shape.answers {
             capabilities.push(serde_json::json!({ "capability": "approval.decode", "reason": "Recognise a relayed tool approval" }));
             capabilities.push(serde_json::json!({ "capability": "approval.respond", "reason": "Answer a relayed tool approval" }));
@@ -1599,6 +1643,14 @@ pub mod fixture {
         }
         let actions = if shape.gateway && shape.answers {
             serde_json::json!([{
+                "id": "turn.cancel",
+                "label": "Cancel the turn",
+                "effect": "upstream.cancel",
+                "implementation": { "type": "upstream_cancel" },
+                "parameters": { "parameters": [] },
+                "description": "Stop the turn that is running",
+                "confirmation_required": false
+            }, {
                 "id": "approval.answer",
                 "label": "Answer",
                 "effect": "approval.respond",
@@ -1853,12 +1905,10 @@ pub mod fixture {
         ]
         .into_iter()
         .collect();
-        if shape.gateway {
+        if shape.gateway && !shape.answers {
             granted.remove(&PluginCapability::UpstreamAction);
-            if !shape.answers {
-                granted.remove(&PluginCapability::ApprovalDecode);
-                granted.remove(&PluginCapability::ApprovalRespond);
-            }
+            granted.remove(&PluginCapability::ApprovalDecode);
+            granted.remove(&PluginCapability::ApprovalRespond);
         }
         if shape.native_bridge {
             granted.insert(PluginCapability::NativeBridgeInstall);

@@ -2086,6 +2086,13 @@ async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_
         .pin_table(instance(), installed(), upstream_table(), upstream_rich())
         .expect("the installed tables are pinned");
     broker
+        .pin_reading(
+            instance(),
+            &PluginId::new("kalareach.codex").expect("valid"),
+            kr_worker::broker::reading::Reading::spelling(&upstream_rich()),
+        )
+        .expect("what the connector spells is pinned");
+    broker
         .open_native_connection(
             instance(),
             &[9; 32],

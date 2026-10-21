@@ -771,6 +771,7 @@ mod tests {
             application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([2; 16])),
             binding_revision: AgentBindingRevision::new(1),
             operation,
+            thread_id: None,
             turn_id: None,
             body,
         }

@@ -385,6 +385,12 @@ impl Sink {
         *self.admitting()
     }
 
+    /// Returns the most bytes one body may have on this end.
+    #[must_use]
+    pub const fn largest_body(&self) -> usize {
+        self.framing.largest_body()
+    }
+
     fn admitting(&self) -> std::sync::MutexGuard<'_, bool> {
         self.admission
             .lock()
@@ -757,8 +763,9 @@ impl UpstreamFailure {
 pub struct UpstreamReply {
     /// The identifier this host sent the request under.
     pub upstream_request_id: UpstreamRequestId,
-    /// The turn the upstream named in its answer, where it named one.
-    pub turn_id: Option<kr_protocol::ids::AgentTurnId>,
+    /// The whole reply, for the request that sent it to read what it asked to be told: the turn an
+    /// operation started is where the connector's table says the reply names it.
+    pub body: serde_json::Value,
     /// What the upstream said went wrong, when it did not succeed.
     pub refusal: Option<UpstreamFailure>,
 }
@@ -1189,9 +1196,19 @@ pub struct Dispatch {
     upstream: Sink,
     outstanding: Arc<Outstanding>,
     rich: kr_protocol::gateway::RichMethodTable,
+    /// How the connector's table spells each of the core's operations.
+    reading: Arc<crate::broker::reading::Reading>,
     params_field: String,
     request_id_field: String,
     method_field: String,
+}
+
+/// What a connection writes for one prepared request of the core's own.
+struct Planned {
+    method: kr_protocol::ids::UpstreamMethod,
+    params: serde_json::Value,
+    /// Where the reply names the turn the request started, where the table says.
+    reply_turn: Option<kr_plugin_sdk::connector::FieldPath>,
 }
 
 /// Returns the rights the effect class of one prepared operation carries, as the package contract
@@ -1267,98 +1284,95 @@ impl Dispatch {
             .map_err(BrokerError::from)
     }
 
-    /// Builds the parameter member of one prepared operation.
+    /// Builds the frame the host's own plugin action is carried as, for a connector whose table
+    /// spells no operation.
     ///
-    /// The turn travels with every operation that names one. Section 12 binds observation and
-    /// mutation to instance, execution owner, session **and turn**, and a steer or a cancellation
-    /// that reached the upstream without its turn would act on whatever is running when it lands.
-    fn parameters(request: &UpstreamRequest) -> Result<serde_json::Value> {
-        let mut parameters = match &request.body {
-            UpstreamBody::Prompt { draft_id, text } => serde_json::json!({
-                "draft_id": draft_id.as_ref().map(ToString::to_string),
-                "text": text,
-            }),
-            UpstreamBody::Steer { text } => serde_json::json!({ "text": text }),
-            UpstreamBody::Cancel => serde_json::json!({}),
-            // An approval's answer is the frame the core prepared at admission, written by
-            // `submit` before it reaches here. There is no second encoding of one.
-            UpstreamBody::Approval { .. } => {
+    /// No connector installed from a package reaches this: such a package's table is compiled to a
+    /// closed rich table that lists only what it spells, and an action is carried as the operation
+    /// its plan names. What remains is the frame an action's attachment is written as, which no
+    /// table spells yet. It is kept until a table can: when a connector declares an attachment
+    /// template, this frame and the connections that still write it are deleted.
+    ///
+    /// The turn travels with an operation that names one. Section 12 binds observation and
+    /// mutation to instance, execution owner, session **and turn**, and a cancellation that
+    /// reached the upstream without its turn would act on whatever is running when it lands.
+    fn legacy_action_parameters(request: &UpstreamRequest) -> Result<serde_json::Value> {
+        let UpstreamBody::PluginAction {
+            plugin_id,
+            action,
+            draft_id,
+            draft_revision,
+            attachment,
+            parameters,
+            operation,
+            token,
+        } = &request.body
+        else {
+            return Err(BrokerError::invalid(
+                "only a plugin action is written as the host's own frame",
+            ));
+        };
+        let mut parameters = {
+            // The arguments the invocation was admitted with, read as they are. Substituting
+            // anything for an encoding this host cannot read would send something other than
+            // what the token's digest covers; the admission refuses such an invocation, and
+            // this refuses it again rather than trusting that.
+            let arguments: serde_json::Value =
+                serde_json::from_slice(parameters).map_err(|error| {
+                    BrokerError::invalid(format!(
+                        "this invocation's parameters will not encode: {error}"
+                    ))
+                })?;
+            // The operation the host validated, which is absent until a plan has been checked
+            // against this invocation.
+            let operation = operation.ok_or_else(|| {
+                BrokerError::invalid(
+                    "this invocation has no validated operation to name, so there is nothing \
+                 to encode",
+                )
+            })?;
+            // An action that names a draft names the revision this host checked it at. The
+            // identifier on its own denotes whatever the draft holds when the frame lands,
+            // and an upstream given only that would act on a draft nobody admitted.
+            if draft_id.is_some() != draft_revision.is_some() {
                 return Err(BrokerError::invalid(
-                    "an approval is answered with the frame the core prepared for it, and this \
-                     path encodes a request",
+                    "a draft-bearing action carries the revision its draft was admitted at",
                 ));
             }
-            UpstreamBody::PluginAction {
-                plugin_id,
-                action,
-                draft_id,
-                draft_revision,
-                attachment,
-                parameters,
-                operation,
-                token,
-            } => {
-                // The arguments the invocation was admitted with, read as they are. Substituting
-                // anything for an encoding this host cannot read would send something other than
-                // what the token's digest covers; the admission refuses such an invocation, and
-                // this refuses it again rather than trusting that.
-                let arguments: serde_json::Value =
-                    serde_json::from_slice(parameters).map_err(|error| {
-                        BrokerError::invalid(format!(
-                            "this invocation's parameters will not encode: {error}"
-                        ))
-                    })?;
-                // The operation the host validated, which is absent until a plan has been checked
-                // against this invocation.
-                let operation = operation.ok_or_else(|| {
-                    BrokerError::invalid(
-                        "this invocation has no validated operation to name, so there is nothing \
-                         to encode",
-                    )
-                })?;
-                // An action that names a draft names the revision this host checked it at. The
-                // identifier on its own denotes whatever the draft holds when the frame lands,
-                // and an upstream given only that would act on a draft nobody admitted.
-                if draft_id.is_some() != draft_revision.is_some() {
+            let mut frame = serde_json::json!({
+                "plugin_id": plugin_id.as_str(),
+                "action": action.as_str(),
+                "operation": operation.as_str(),
+                "draft_id": draft_id.as_ref().map(ToString::to_string),
+                "draft_revision": draft_revision.map(kr_protocol::scalars::U64::get),
+                "parameters": arguments,
+                // Section 11: the effect plan may use only what this invocation permits, and
+                // the token is what says which invocation that is.
+                "action_token": token.as_ref().map(|token| token.token_id.as_str()),
+            });
+            // An offered attachment travels as identifiers and the read grant over its file:
+            // where it is, until when, and what its bytes must hash to. Its original name is
+            // metadata and is not sent.
+            if let Some(attachment) = attachment {
+                if draft_id.is_none() {
                     return Err(BrokerError::invalid(
-                        "a draft-bearing action carries the revision its draft was admitted at",
+                        "an attachment is offered from a draft, and this action names none",
                     ));
                 }
-                let mut frame = serde_json::json!({
-                    "plugin_id": plugin_id.as_str(),
-                    "action": action.as_str(),
-                    "operation": operation.as_str(),
-                    "draft_id": draft_id.as_ref().map(ToString::to_string),
-                    "draft_revision": draft_revision.map(kr_protocol::scalars::U64::get),
-                    "parameters": arguments,
-                    // Section 11: the effect plan may use only what this invocation permits, and
-                    // the token is what says which invocation that is.
-                    "action_token": token.as_ref().map(|token| token.token_id.as_str()),
+                frame["attachment"] = serde_json::json!({
+                    "transfer_id": attachment.transfer_id.to_string(),
+                    "media_type": attachment.media_type,
+                    "byte_len": attachment.byte_len.get(),
+                    "content_digest": serde_json::to_value(attachment.content_digest)
+                        .map_err(|error| BrokerError::invalid(error.to_string()))?,
+                    "read_grant": {
+                        "path": attachment.path,
+                        "expires_at_ms": attachment.expires_at_ms.get(),
+                        "environment_id": attachment.environment_id.to_string(),
+                    },
                 });
-                // An offered attachment travels as identifiers and the read grant over its file:
-                // where it is, until when, and what its bytes must hash to. Its original name is
-                // metadata and is not sent.
-                if let Some(attachment) = attachment {
-                    if draft_id.is_none() {
-                        return Err(BrokerError::invalid(
-                            "an attachment is offered from a draft, and this action names none",
-                        ));
-                    }
-                    frame["attachment"] = serde_json::json!({
-                        "transfer_id": attachment.transfer_id.to_string(),
-                        "media_type": attachment.media_type,
-                        "byte_len": attachment.byte_len.get(),
-                        "content_digest": serde_json::to_value(attachment.content_digest)
-                            .map_err(|error| BrokerError::invalid(error.to_string()))?,
-                        "read_grant": {
-                            "path": attachment.path,
-                            "expires_at_ms": attachment.expires_at_ms.get(),
-                            "environment_id": attachment.environment_id.to_string(),
-                        },
-                    });
-                }
-                frame
             }
+            frame
         };
         if let Some(turn_id) = request.turn_id.as_ref() {
             let Some(members) = parameters.as_object_mut() else {
@@ -1406,24 +1420,144 @@ impl Dispatch {
         }))
     }
 
-    /// Queues a request of this host's own and waits for the upstream to answer it.
-    fn request(&self, request: &UpstreamRequest) -> Result<PendingTransmission> {
-        let upstream_request_id = self.outstanding.allocate()?;
-        let method = self.method_for(request)?;
-        let identifier: serde_json::Value = serde_json::from_str(upstream_request_id.as_str())
-            .map_err(|error| {
-                BrokerError::invalid(format!("this identifier will not encode: {error}"))
+    /// Returns the operation of the connector's table that one prepared request is.
+    ///
+    /// A plugin action is the operation its validated plan names, and only a cancellation is one
+    /// this table can spell for it: a component's submit carries text the table has no place for,
+    /// and an attachment or terminal text is no operation of the table. Before a plan names the
+    /// operation there is nothing to ask.
+    fn operation_of(
+        request: &UpstreamRequest,
+    ) -> Result<Option<kr_protocol::gateway::RichOperation>> {
+        use kr_protocol::broker::PreparedOperation;
+        use kr_protocol::gateway::RichOperation;
+        Ok(match &request.body {
+            UpstreamBody::Prompt { .. } => Some(request.operation),
+            UpstreamBody::Steer { .. } => Some(RichOperation::TurnSteer),
+            UpstreamBody::Cancel => Some(RichOperation::TurnCancel),
+            UpstreamBody::PluginAction {
+                action, operation, ..
+            } => match operation {
+                None => None,
+                Some(PreparedOperation::UpstreamCancel) => Some(RichOperation::TurnCancel),
+                Some(other) => {
+                    return Err(BrokerError::UnsupportedCapability {
+                        detail: format!(
+                            "{action} prepares {other}, and this connector's table spells no \
+                             source for what that operation carries, so nothing is transmitted \
+                             for it"
+                        ),
+                    });
+                }
+            },
+            UpstreamBody::Approval { .. } => {
+                return Err(BrokerError::invalid(
+                    "an approval is answered with the frame the core prepared for it",
+                ));
+            }
+        })
+    }
+
+    /// Returns what this connection writes for one prepared request, or why it writes nothing.
+    ///
+    /// The connector's table says how each operation is spelled: the method it travels as and a
+    /// template for its parameters, with the thread, the turn and the text filled in by the core.
+    /// An operation the table does not spell is one this host does not send. Everything that can
+    /// refuse an operation refuses it here, which is what the admission asks before the marker:
+    /// an operation the table does not declare, a prompt that names a draft, whose content would
+    /// be left out, and a value the template needs that the core does not have.
+    fn planned(&self, request: &UpstreamRequest) -> Result<Planned> {
+        let legacy = matches!(request.body, UpstreamBody::PluginAction { .. })
+            && self.reading.operations.is_empty();
+        if legacy {
+            return Ok(Planned {
+                method: self.method_for(request)?,
+                params: Self::legacy_action_parameters(request)?,
+                reply_turn: None,
+            });
+        }
+        let Some(operation) = Self::operation_of(request)? else {
+            return Err(BrokerError::invalid(
+                "this action has no validated operation to name, so there is nothing to encode",
+            ));
+        };
+        // The closed table's own admission: an operation it does not list, or lists as
+        // unsupported, is refused rather than written.
+        let entry = self
+            .rich
+            .for_operation(operation)
+            .map_err(BrokerError::from)?;
+        let template = self.reading.operations.get(&operation).ok_or_else(|| {
+            BrokerError::UnsupportedCapability {
+                detail: format!(
+                    "this connector's table does not spell {operation}, so the host sends nothing \
+                     for it"
+                ),
+            }
+        })?;
+        let text = match &request.body {
+            UpstreamBody::Prompt {
+                draft_id: Some(_), ..
+            } => {
+                return Err(BrokerError::invalid(
+                    "a prompt that names a draft is not carried: the connector's table writes the \
+                     prompt's text, and the draft's content would be left out",
+                ));
+            }
+            UpstreamBody::Prompt { text, .. } => text.as_deref(),
+            UpstreamBody::Steer { text } => Some(text.as_str()),
+            _ => None,
+        };
+        let params = template
+            .expand(crate::broker::reading::Fill {
+                thread: request
+                    .thread_id
+                    .as_ref()
+                    .map(kr_protocol::ids::AgentThreadId::as_str),
+                turn: request
+                    .turn_id
+                    .as_ref()
+                    .map(kr_protocol::ids::AgentTurnId::as_str),
+                text,
+            })
+            .map_err(|hole| BrokerError::PreconditionFailed {
+                detail: format!(
+                    "{operation} needs the {} and the host has none to write, so nothing is \
+                     transmitted for it",
+                    hole.as_str()
+                ),
             })?;
+        Ok(Planned {
+            method: entry.method.clone(),
+            params,
+            reply_turn: template.reply_turn.clone(),
+        })
+    }
+
+    /// Writes one planned request as a frame under an identifier.
+    fn encode(&self, identifier: serde_json::Value, planned: &Planned) -> Result<Vec<u8>> {
         let mut frame = serde_json::Map::new();
         frame.insert(self.request_id_field.clone(), identifier);
         frame.insert(
             self.method_field.clone(),
-            serde_json::Value::String(method.as_str().to_owned()),
+            serde_json::Value::String(planned.method.as_str().to_owned()),
         );
-        frame.insert(self.params_field.clone(), Self::parameters(request)?);
-        let body = serde_json::to_vec(&serde_json::Value::Object(frame)).map_err(|error| {
+        frame.insert(self.params_field.clone(), planned.params.clone());
+        serde_json::to_vec(&serde_json::Value::Object(frame)).map_err(|error| {
             BrokerError::invalid(format!("this operation will not encode: {error}"))
-        })?;
+        })
+    }
+
+    /// Queues a request of this host's own and waits for the upstream to answer it.
+    fn request(&self, request: &UpstreamRequest) -> Result<PendingTransmission> {
+        let planned = self.planned(request)?;
+        let upstream_request_id = self.outstanding.allocate()?;
+        let identifier: serde_json::Value = serde_json::from_str(upstream_request_id.as_str())
+            .map_err(|error| {
+                BrokerError::invalid(format!("this identifier will not encode: {error}"))
+            })?;
+        let body = self.encode(identifier, &planned)?;
+        let reply_turn = planned.reply_turn;
         // The waiter is registered before the bytes are queued. Registering it afterwards would
         // leave a window in which the upstream's answer arrived and nothing was listening for it.
         let answered = self.outstanding.expect(&upstream_request_id);
@@ -1447,9 +1581,15 @@ impl Dispatch {
             if let Some(refusal) = reply.refusal {
                 return Err(refusal.into_failure());
             }
+            // The turn the operation started, where the table says where the reply names it.
+            let named = reply_turn
+                .as_ref()
+                .and_then(|path| crate::broker::gateway::member_at(&reply.body, path))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|text| kr_protocol::ids::AgentTurnId::new(text).ok());
             Ok(UpstreamOutcome {
                 upstream_request_id: Some(upstream_request_id),
-                turn_id: reply.turn_id.or(turn_id),
+                turn_id: named.or(turn_id),
                 provenance: ActionProvenance::UpstreamTypedRpc,
             })
         }))
@@ -1470,11 +1610,34 @@ impl UpstreamDispatch for Dispatch {
             });
         }
         // An approval's answer is the frame the core prepared, which needs no method of this
-        // table; everything else needs one, and the table has to name exactly one for it.
+        // table; everything else needs one, and the table has to spell it.
         if matches!(request.body, UpstreamBody::Approval { .. }) {
             return Ok(());
         }
-        self.method_for(request).map(|_| ())
+        // An action no plan has named yet has nothing to write; asking again once a plan names it
+        // is what refuses an action this table does not spell.
+        if matches!(
+            request.body,
+            UpstreamBody::PluginAction {
+                operation: None,
+                ..
+            }
+        ) {
+            return Ok(());
+        }
+        let planned = self.planned(request)?;
+        // The frame is written once, as it will be, so one the connection could not carry is
+        // refused here and not after the marker. Its identifier is the longest this host mints.
+        let longest = serde_json::Value::String(format!("{HOST_REQUEST_PREFIX}{}", u64::MAX));
+        let frame = self.encode(longest, &planned)?;
+        let most = self.upstream.largest_body();
+        if frame.len() > most {
+            return Err(BrokerError::invalid(format!(
+                "this operation is {} bytes and this connection carries at most {most}",
+                frame.len()
+            )));
+        }
+        Ok(())
     }
 
     fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission> {
@@ -1795,6 +1958,7 @@ impl Duplex {
             upstream: self.ends.upstream.clone(),
             outstanding: Arc::clone(&self.outstanding),
             rich: connection.rich.clone(),
+            reading: connection.reading.clone().unwrap_or_default(),
             params_field: connection.table.params_field.clone(),
             request_id_field: connection.table.request_id_field.clone(),
             method_field: connection.table.method_field.clone(),
@@ -2636,14 +2800,9 @@ fn read_reply(
                 .and_then(serde_json::Value::as_str)
                 .map_or_else(|| error.to_string(), ToOwned::to_owned),
         });
-    let turn_id = body
-        .get(&held.table.result_field)
-        .and_then(|result| result.get("turn_id"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(|text| kr_protocol::ids::AgentTurnId::new(text).ok());
     Ok(UpstreamReply {
         upstream_request_id: upstream_request_id.clone(),
-        turn_id,
+        body,
         refusal,
     })
 }
@@ -2677,6 +2836,7 @@ mod tests {
             ),
             binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
             operation: kr_protocol::gateway::RichOperation::PluginAction,
+            thread_id: None,
             turn_id: None,
             body: UpstreamBody::PluginAction {
                 plugin_id: kr_protocol::ids::PluginId::new("kalareach.codex").expect("valid"),
@@ -2700,7 +2860,7 @@ mod tests {
     fn a_draft_bearing_action_encodes_the_revision_it_was_admitted_at() {
         let draft_id =
             kr_protocol::ids::DraftId::new(kr_protocol::scalars::Uuid::from_bytes([4; 16]));
-        let encoded = Dispatch::parameters(&plugin_action(
+        let encoded = Dispatch::legacy_action_parameters(&plugin_action(
             Some(draft_id),
             Some(kr_protocol::scalars::U64::new(7)),
         ))
@@ -2717,11 +2877,12 @@ mod tests {
         );
 
         // An action that names no draft names no revision, and neither half travels alone.
-        let none = Dispatch::parameters(&plugin_action(None, None)).expect("it encodes");
+        let none =
+            Dispatch::legacy_action_parameters(&plugin_action(None, None)).expect("it encodes");
         assert_eq!(none["draft_id"], serde_json::Value::Null);
         assert_eq!(none["draft_revision"], serde_json::Value::Null);
         assert!(
-            Dispatch::parameters(&plugin_action(Some(draft_id), None)).is_err(),
+            Dispatch::legacy_action_parameters(&plugin_action(Some(draft_id), None)).is_err(),
             "a draft with no checked revision is not something this host transmits"
         );
     }
@@ -3184,6 +3345,7 @@ mod tests {
                 upstream: sink,
                 outstanding: Arc::new(Outstanding::default()),
                 rich: named_rich_table(),
+                reading: Arc::default(),
                 params_field: "params".to_owned(),
                 request_id_field: "id".to_owned(),
                 method_field: "method".to_owned(),

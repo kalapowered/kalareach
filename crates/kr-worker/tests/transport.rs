@@ -353,6 +353,27 @@ fn broker_from(broker: Broker, rich: RichMethodTable) -> (Arc<Broker>, GatewayCo
     (broker, connection)
 }
 
+/// Pins the tables of the instance's connector, and what it spells for each operation its rich
+/// table lists: the fixture upstreams of this suite read a prompt's text under `text` and the turn
+/// a steer and a cancellation act on under `turn_id`.
+fn pin_spelling(
+    broker: &Broker,
+    application_instance_id: ApplicationInstanceId,
+    rich: RichMethodTable,
+) {
+    let reading = kr_worker::broker::reading::Reading::spelling(&rich);
+    broker
+        .pin_table(application_instance_id, installed(), table(), rich)
+        .expect("the installed tables are pinned");
+    broker
+        .pin_reading(
+            application_instance_id,
+            &PluginId::new("kalareach.codex").expect("valid"),
+            reading,
+        )
+        .expect("what the connector spells is pinned");
+}
+
 /// Registers the instance, pins its tables and opens one native connection on a broker.
 fn prepare_broker(broker: &Arc<Broker>, rich: RichMethodTable) -> GatewayConnectionId {
     broker
@@ -370,9 +391,7 @@ fn prepare_broker(broker: &Arc<Broker>, rich: RichMethodTable) -> GatewayConnect
             TimestampMs::new(1),
         )
         .expect("the binding is recorded");
-    broker
-        .pin_table(instance(), installed(), table(), rich)
-        .expect("the installed tables are pinned");
+    pin_spelling(broker, instance(), rich);
     let connection = broker
         .open_native_connection(
             instance(),
@@ -1881,9 +1900,6 @@ async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_
         .bind_dispatch(instance(), owner.dispatch().expect("it carries operations"))
         .expect("the transport is bound");
     let turn = kr_protocol::ids::AgentTurnId::new("turn-7").expect("valid");
-    broker
-        .set_turn(instance(), Some(turn.clone()))
-        .expect("a turn is running");
     let caller = kr_worker::broker::Caller {
         actor_id: ActorId::new("device-1").expect("valid"),
         grant_id: None,
@@ -1898,10 +1914,15 @@ async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_
 
     // Four operations, three of which need one right between them. Each goes out as its own
     // method, with its own parameters, and never as whichever the table happened to list first.
+    // A prompt is submitted while no turn runs, because one submitted over a running turn would
+    // not be a queued one; the turn then starts, and the rest act on it.
     broker
         .agent_prompt(&caller, &prompt("hello"), false, TimestampMs::new(2))
         .await
         .expect("the prompt is applied");
+    broker
+        .set_turn(instance(), Some(turn.clone()))
+        .expect("a turn is running");
     broker
         .agent_prompt(&caller, &prompt("and then this"), true, TimestampMs::new(3))
         .await
@@ -1983,8 +2004,7 @@ async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_
             entry.class = NativeMethodClass::Unsupported;
         }
     }
-    bare.pin_table(instance(), installed(), table(), narrowed)
-        .expect("the installed tables are pinned");
+    pin_spelling(&bare, instance(), narrowed);
     bare.open_native_connection(
         instance(),
         &CREDENTIAL,
@@ -2165,9 +2185,7 @@ fn broker_expecting_this_process() -> (Arc<Broker>, ProcessStartIdentity) {
             )),
         )
         .expect("the instance is registered");
-    broker
-        .pin_table(instance(), installed(), table(), rich())
-        .expect("the installed tables are pinned");
+    pin_spelling(&broker, instance(), rich());
     bind_component(&broker);
     record_capabilities(&broker);
     (Arc::new(broker), running)
@@ -2433,9 +2451,7 @@ async fn kr_req_12_14_a_bridge_that_reaches_the_endpoint_becomes_a_served_connec
     // everything it needs is published once it exists: the endpoint it connects to, the private
     // exchange it presents, and the process identity this host will compare it against.
     let (gateway, mut launched) = launched_forwarder(&broker, &directory);
-    broker
-        .pin_table(instance(), installed(), table(), rich())
-        .expect("the installed tables are pinned");
+    pin_spelling(&broker, instance(), rich());
     bind_component(&broker);
     record_capabilities(&broker);
     assert!(
@@ -2872,9 +2888,7 @@ async fn kr_req_12_11_every_transition_is_recorded_with_its_event_and_announced_
             Some(managed_for(elsewhere)),
         )
         .expect("the other instance is registered");
-    broker
-        .pin_table(elsewhere, installed(), table(), rich())
-        .expect("its tables are pinned");
+    pin_spelling(&broker, elsewhere, rich());
     broker
         .open_native_connection(elsewhere, &CREDENTIAL, &process_identity(), &package(), "1")
         .expect("its connection is authenticated");

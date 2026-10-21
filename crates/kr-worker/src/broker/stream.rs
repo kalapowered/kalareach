@@ -455,9 +455,13 @@ impl BrokerState {
         let Some(connection) = self.gateway.native_connection_of(application_instance_id) else {
             return;
         };
-        // A connection pinned with no reading of its own says nothing about what a client can do
-        // here: its evidence is whatever else recorded it.
-        let Some(reading) = connection.reading.clone() else {
+        // A connection whose table says nothing the core reads or answers says nothing about what
+        // a client can do here: its evidence is whatever else recorded it.
+        let Some(reading) = connection
+            .reading
+            .clone()
+            .filter(|reading| reading.reads_the_stream() || reading.answers.is_some())
+        else {
             return;
         };
         let rich = connection.rich.clone();

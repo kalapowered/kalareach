@@ -13,6 +13,10 @@
 //! | KR-REQ-11.30 | an unlisted frame keeps rich mutations suspended until a selection admitted after it has named the thread and every unlisted request before that has been answered |
 //! | KR-REQ-12.08 | a gateway connection's capability evidence says what its tables let a client do, follows each change of binding, and ends with the connection |
 //! | KR-REQ-11.33 | a request the connector's table answers as a response is interpreted under the binding's trust; the server's own word that it was answered settles what nobody answered and leaves an answer that is being written to its writer |
+//! | KR-REQ-11.36 | a typed prompt reaches the server as the request the connector's table spells, naming the thread the binding holds, and the reply's turn is read where the table says |
+//! | KR-REQ-11.28 | an action the package declares as a cancellation is admitted with a token the host issues and spends against its own plan, and is written as the connector's template for a cancellation naming the thread and the running turn; with no turn running it is refused with nothing written |
+//! | KR-REQ-23.30 | a component's plan for the action declared as a cancellation is validated against the token the host issued and is written through the same template; a plan that prepares another operation, or whose arguments are not the ones the token covers, is refused before anything is written; a component's prompt has no source in the table and is refused before the marker |
+//! | KR-REQ-12.12 | the rich table lists exactly the operations the table declares; one it does not declare is refused with nothing written, and so is a prompt over a running turn, one that names a draft and a steer of a turn that is not the running one |
 //!
 //! Not claimed: Windows, where no gateway runs.
 
@@ -336,6 +340,497 @@ fn turn_event(method: &str, thread: &str, turn: &str) -> String {
     )
 }
 
+impl World {
+    /// What a rich client sends to act on the instance, at the binding now.
+    fn target(&self) -> kr_protocol::agent::AgentMutationTarget {
+        kr_protocol::agent::AgentMutationTarget {
+            subject: kr_worker::broker::subject(session(), instance()),
+            binding_revision: self.state().binding_revision,
+        }
+    }
+
+    fn prompt(&self, text: &str) -> kr_protocol::agent::AgentPromptParams {
+        kr_protocol::agent::AgentPromptParams {
+            target: self.target(),
+            draft_id: kr_protocol::scalars::Nullable::null(),
+            text: kr_protocol::scalars::Nullable::some(
+                kr_protocol::agent::PromptText::new(text).expect("a prompt"),
+            ),
+        }
+    }
+
+    fn turn_id(turn: &str) -> kr_protocol::ids::AgentTurnId {
+        kr_protocol::ids::AgentTurnId::new(turn).expect("a turn")
+    }
+
+    /// Reads the one request the host sends the server and answers it as the server would, with
+    /// `rest` as what follows the identifier. What was sent is returned.
+    async fn served(&mut self, rest: &str) -> serde_json::Value {
+        let sent = self.server_reads().await;
+        let id = UpstreamRequestId::new(sent["id"].to_string()).expect("an identifier");
+        self.server_answers(&id, rest).await;
+        sent
+    }
+
+    /// Asserts nothing was written to the server.
+    async fn nothing_written(&mut self) {
+        assert_eq!(self.owner.queued_to_upstream(), 0, "nothing is queued");
+        let mut byte = [0_u8; 1];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            self.upstream.read_exact(&mut byte),
+        )
+        .await;
+        assert!(read.is_err(), "the server was sent a byte: {byte:?}");
+    }
+}
+
+/// KR-REQ-11.36: a prompt a rich client types reaches the server as the request the connector's
+/// table spells for it, with the thread the binding holds and the text it carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_36_a_typed_prompt_is_the_request_the_connectors_table_spells() {
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    let params = world.prompt("hello");
+    let broker = Arc::clone(&world.broker);
+    let (result, sent) = tokio::join!(
+        async {
+            broker
+                .agent_prompt(&World::owner_caller(), &params, false, NOW)
+                .await
+        },
+        world.served(r#""result":{"turn":{"id":"turn-7"}}"#),
+    );
+    assert_eq!(sent["method"], "turn/start");
+    assert_eq!(
+        sent["params"],
+        serde_json::json!({
+            "threadId": "thread-1",
+            "input": [{ "type": "text", "text": "hello" }]
+        })
+    );
+    let result = result.expect("the prompt is carried");
+    assert_eq!(
+        result.turn_id.0.map(|turn| turn.to_string()).as_deref(),
+        Some("turn-7"),
+        "the turn the reply names, where the table says it does"
+    );
+}
+
+/// KR-REQ-12.12 and KR-REQ-11.36: a steer names the turn it expects to be running and a
+/// cancellation the turn it stops, each with the thread, and the reply to a steer names its turn
+/// where the table says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_12_a_steer_and_a_cancellation_name_the_turn_and_the_thread_the_table_spells() {
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    world
+        .server_says(&turn_event("turn/started", "thread-1", "turn-7"))
+        .await;
+    assert_eq!(world.turn().as_deref(), Some("turn-7"));
+
+    let steer = kr_protocol::agent::AgentSteerParams {
+        target: world.target(),
+        turn_id: World::turn_id("turn-7"),
+        text: kr_protocol::agent::PromptText::new("the other file").expect("a steer"),
+    };
+    let broker = Arc::clone(&world.broker);
+    let (steered, sent) = tokio::join!(
+        async {
+            broker
+                .agent_steer(&World::owner_caller(), &steer, NOW)
+                .await
+        },
+        world.served(r#""result":{"turnId":"turn-7"}"#),
+    );
+    assert_eq!(sent["method"], "turn/steer");
+    assert_eq!(
+        sent["params"],
+        serde_json::json!({
+            "threadId": "thread-1",
+            "expectedTurnId": "turn-7",
+            "input": [{ "type": "text", "text": "the other file" }]
+        })
+    );
+    assert_eq!(
+        steered
+            .expect("the steer is carried")
+            .turn_id
+            .0
+            .map(|turn| turn.to_string())
+            .as_deref(),
+        Some("turn-7")
+    );
+
+    let cancel = kr_protocol::agent::AgentCancelParams {
+        target: world.target(),
+        turn_id: World::turn_id("turn-7"),
+    };
+    let (cancelled, sent) = tokio::join!(
+        async {
+            broker
+                .agent_cancel(&World::owner_caller(), &cancel, NOW)
+                .await
+        },
+        world.served(r#""result":{}"#),
+    );
+    assert_eq!(sent["method"], "turn/interrupt");
+    assert_eq!(
+        sent["params"],
+        serde_json::json!({ "threadId": "thread-1", "turnId": "turn-7" })
+    );
+    cancelled.expect("the cancellation is carried");
+}
+
+/// KR-REQ-12.12: what the table does not declare, and what its template cannot be filled for, is
+/// refused before the marker with nothing written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_12_an_operation_the_table_does_not_spell_or_cannot_fill_writes_nothing() {
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    let caller = World::owner_caller();
+
+    // The table spells no queue, so the capability map says so and the call is refused.
+    let queued = world
+        .broker
+        .agent_prompt(&caller, &world.prompt("later"), true, NOW)
+        .await
+        .expect_err("a queue is not declared");
+    assert!(
+        matches!(
+            queued,
+            kr_worker::broker::BrokerError::UnsupportedCapability { .. }
+        ),
+        "{queued:?}"
+    );
+    world.nothing_written().await;
+
+    // A prompt that names a draft would leave the draft's content out.
+    let mut named = world.prompt("unused");
+    named.text = kr_protocol::scalars::Nullable::null();
+    named.draft_id = kr_protocol::scalars::Nullable::some(kr_protocol::ids::DraftId::new(
+        kr_protocol::scalars::Uuid::from_bytes([5; 16]),
+    ));
+    world
+        .broker
+        .agent_prompt(&caller, &named, false, NOW)
+        .await
+        .expect_err("a draft's content is not carried");
+    world.nothing_written().await;
+
+    // A steer of a turn that is not the one running, and a cancellation with none running.
+    let steer = kr_protocol::agent::AgentSteerParams {
+        target: world.target(),
+        turn_id: World::turn_id("turn-9"),
+        text: kr_protocol::agent::PromptText::new("x").expect("a steer"),
+    };
+    world
+        .broker
+        .agent_steer(&caller, &steer, NOW)
+        .await
+        .expect_err("no turn is running");
+    world.nothing_written().await;
+
+    // A prompt over a running turn is not a queued one.
+    world
+        .server_says(&turn_event("turn/started", "thread-1", "turn-7"))
+        .await;
+    let over = world
+        .broker
+        .agent_prompt(&caller, &world.prompt("again"), false, NOW)
+        .await
+        .expect_err("a turn is running");
+    assert!(
+        matches!(
+            over,
+            kr_worker::broker::BrokerError::PreconditionFailed { .. }
+        ),
+        "{over:?}"
+    );
+    world.nothing_written().await;
+}
+
+/// The declaration of the action the Codex-shaped package registers for cancelling a turn.
+fn cancel_declaration() -> kr_plugin_sdk::effect::ActionDeclaration {
+    serde_json::from_value(serde_json::json!({
+        "id": "turn.cancel",
+        "label": "Cancel the turn",
+        "effect": "upstream.cancel",
+        "implementation": { "type": "upstream_cancel" },
+        "parameters": { "parameters": [] },
+        "description": "Stop the turn that is running",
+        "confirmation_required": false
+    }))
+    .expect("the declaration reads")
+}
+
+/// KR-REQ-11.28 and KR-REQ-23.30: an action the package declares as a cancellation of the running
+/// turn is carried out by the host from the connector's own template. The host issues the token
+/// for the invocation and spends it against its own plan, so the admission has the checks a
+/// component's plan passes, and with no turn running nothing is admitted and nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_28_a_declared_cancellation_is_written_from_the_template_under_its_own_token() {
+    let mut world = World::new(1 << 20);
+    let binding_id = BrokerBindingId::new(Uuid::from_bytes([7; 16]));
+    let declaration = cancel_declaration();
+    let refused = world
+        .broker
+        .register_actions(binding_id, [&declaration])
+        .expect("the action is registered");
+    assert!(refused.is_empty(), "{refused:?}");
+    world.terminal_selects("thread-1").await;
+    let invoke = |world: &World| kr_protocol::agent::PluginActionInvokeParams {
+        target: world.target(),
+        plugin_id: kr_protocol::ids::PluginId::new("kalareach.codex").expect("a plugin"),
+        action: kr_protocol::broker::ActionName::new("turn.cancel").expect("an action"),
+        draft_id: kr_protocol::scalars::Nullable::null(),
+        resource_id: kr_protocol::scalars::Nullable::null(),
+        parameters: kr_protocol::scalars::Bytes::new(b"{}".to_vec()),
+    };
+    let caller = World::owner_caller();
+
+    // No turn is running: the action is refused at its admission, before a token is issued.
+    let none = world
+        .broker
+        .admit_host_cancel(&caller, binding_id, &invoke(&world), NOW)
+        .expect_err("no turn is running");
+    assert!(
+        matches!(
+            none,
+            kr_worker::broker::BrokerError::PreconditionFailed { .. }
+        ),
+        "{none:?}"
+    );
+    world.nothing_written().await;
+
+    // A turn runs. The admission carries a plan, and taking it writes the template.
+    world
+        .server_says(&turn_event("turn/started", "thread-1", "turn-7"))
+        .await;
+    let admitted = world
+        .broker
+        .admit_host_cancel(&caller, binding_id, &invoke(&world), NOW)
+        .expect("the declared cancellation is admitted");
+    assert!(
+        admitted.carries_a_validated_plan(),
+        "the host's plan is the declaration"
+    );
+    let taken = world
+        .broker
+        .take_plugin_action(&admitted)
+        .expect("its permit is taken");
+    let (dispatch, request) = taken.transmission();
+    let pending = dispatch.submit(&request).expect("the request is queued");
+    let in_flight = taken.submitted(pending);
+    let (settled, sent) = tokio::join!(in_flight.settled(), world.served(r#""result":{}"#));
+    assert_eq!(sent["method"], "turn/interrupt");
+    assert_eq!(
+        sent["params"],
+        serde_json::json!({ "threadId": "thread-1", "turnId": "turn-7" })
+    );
+    assert_eq!(
+        settled
+            .expect("the upstream answered")
+            .mutation
+            .0
+            .expect("the action reached the upstream")
+            .turn_id
+            .0
+            .map(|turn| turn.to_string())
+            .as_deref(),
+        Some("turn-7"),
+        "the receipt names the turn it cancelled"
+    );
+
+    // The token was spent with the admission, so the same invocation cannot be carried twice: its
+    // permit is gone.
+    assert!(world.broker.take_plugin_action(&admitted).is_err());
+}
+
+fn component_declaration(id: &str, effect: &str) -> kr_plugin_sdk::effect::ActionDeclaration {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "label": "A component's action",
+        "effect": effect,
+        "implementation": { "type": "component" },
+        "parameters": { "parameters": [] },
+        "description": "An action the package's component prepares",
+        "confirmation_required": false
+    }))
+    .expect("the declaration reads")
+}
+
+/// A plan a component returns, claiming `operation` for `action` over the empty arguments.
+fn component_plan(
+    action: &str,
+    operation: kr_protocol::broker::PreparedOperation,
+    arguments: &[u8],
+) -> kr_protocol::broker::PreparedEffect {
+    kr_protocol::broker::PreparedEffect {
+        action: kr_protocol::broker::ActionName::new(action).expect("an action"),
+        class: kr_protocol::authority::EffectClass::Write,
+        operation,
+        draft_id: kr_protocol::scalars::Nullable::null(),
+        argument_hash: Digest256::from_bytes(kr_cbor::sha256(arguments)),
+    }
+}
+
+/// KR-REQ-23.30 and KR-REQ-11.28: a component's plan for a cancellation is carried through the
+/// table's template under the token the host issued for the invocation, and what it may not
+/// prepare, or prepare for other arguments, is refused before anything is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_23_30_a_components_cancellation_is_carried_and_what_it_may_not_prepare_is_refused()
+{
+    use kr_protocol::broker::PreparedOperation;
+    let mut world = World::new(1 << 20);
+    let binding = binding_id();
+    let cancel = component_declaration("cancel.by.component", "upstream.cancel");
+    let prompt = component_declaration("prompt.by.component", "upstream.prompt");
+    let refused = world
+        .broker
+        .register_actions(binding, [&cancel, &prompt])
+        .expect("the actions are registered");
+    assert!(refused.is_empty(), "{refused:?}");
+    world.terminal_selects("thread-1").await;
+    world
+        .server_says(&turn_event("turn/started", "thread-1", "turn-7"))
+        .await;
+    let invoke = |world: &World, action: &str| kr_protocol::agent::PluginActionInvokeParams {
+        target: world.target(),
+        plugin_id: kr_protocol::ids::PluginId::new("kalareach.codex").expect("a plugin"),
+        action: kr_protocol::broker::ActionName::new(action).expect("an action"),
+        draft_id: kr_protocol::scalars::Nullable::null(),
+        resource_id: kr_protocol::scalars::Nullable::null(),
+        parameters: kr_protocol::scalars::Bytes::new(b"{}".to_vec()),
+    };
+    let caller = World::owner_caller();
+
+    // A plan that prepares another operation than the action's declaration says.
+    let admitted = world
+        .broker
+        .admit_plugin_action(
+            &caller,
+            binding,
+            &invoke(&world, "cancel.by.component"),
+            None,
+            NOW,
+        )
+        .expect("the invocation is admitted");
+    let wrong = world
+        .broker
+        .validate_effect(
+            &admitted,
+            &component_plan(
+                "cancel.by.component",
+                PreparedOperation::UpstreamSubmit,
+                b"{}",
+            ),
+        )
+        .expect_err("a cancellation action cannot prepare a prompt");
+    assert!(
+        matches!(wrong, kr_worker::broker::BrokerError::InvalidArgument(_)),
+        "{wrong:?}"
+    );
+    world.broker.abandon(&admitted);
+    world.nothing_written().await;
+
+    // A plan over arguments the token does not cover.
+    let admitted = world
+        .broker
+        .admit_plugin_action(
+            &caller,
+            binding,
+            &invoke(&world, "cancel.by.component"),
+            None,
+            NOW,
+        )
+        .expect("the invocation is admitted");
+    let other = world
+        .broker
+        .validate_effect(
+            &admitted,
+            &component_plan(
+                "cancel.by.component",
+                PreparedOperation::UpstreamCancel,
+                b"{\"x\":1}",
+            ),
+        )
+        .expect_err("another argument hash");
+    assert!(
+        matches!(other, kr_worker::broker::BrokerError::Token(_)),
+        "{other:?}"
+    );
+    world.broker.abandon(&admitted);
+    world.nothing_written().await;
+
+    // The plan the declaration allows is written as the cancellation template.
+    let admitted = world
+        .broker
+        .admit_plugin_action(
+            &caller,
+            binding,
+            &invoke(&world, "cancel.by.component"),
+            None,
+            NOW,
+        )
+        .expect("the invocation is admitted");
+    world
+        .broker
+        .validate_effect(
+            &admitted,
+            &component_plan(
+                "cancel.by.component",
+                PreparedOperation::UpstreamCancel,
+                b"{}",
+            ),
+        )
+        .expect("the plan is the action's own");
+    let taken = world
+        .broker
+        .take_plugin_action(&admitted)
+        .expect("its permit is taken");
+    let (dispatch, request) = taken.transmission();
+    let pending = dispatch.submit(&request).expect("the request is queued");
+    let in_flight = taken.submitted(pending);
+    let (settled, sent) = tokio::join!(in_flight.settled(), world.served(r#""result":{}"#));
+    assert_eq!(sent["method"], "turn/interrupt");
+    assert_eq!(
+        sent["params"],
+        serde_json::json!({ "threadId": "thread-1", "turnId": "turn-7" })
+    );
+    settled.expect("the upstream answered");
+
+    // A component's prompt has no source in the table: it is refused when the plan names it,
+    // before the marker, and nothing is written.
+    let admitted = world
+        .broker
+        .admit_plugin_action(
+            &caller,
+            binding,
+            &invoke(&world, "prompt.by.component"),
+            None,
+            NOW,
+        )
+        .expect("the invocation is admitted");
+    let unsourced = world
+        .broker
+        .validate_effect(
+            &admitted,
+            &component_plan(
+                "prompt.by.component",
+                PreparedOperation::UpstreamSubmit,
+                b"{}",
+            ),
+        )
+        .expect_err("the table spells no source for a component's prompt");
+    assert!(
+        matches!(&unsourced, kr_worker::broker::BrokerError::UnsupportedCapability { detail } if detail.contains("source")),
+        "{unsourced:?}"
+    );
+    world.broker.abandon(&admitted);
+    world.nothing_written().await;
+}
+
 /// KR-REQ-12.06: a terminal behind the gateway selects a conversation, and the instance's binding
 /// is the conversation the server's reply names, from the stream and nowhere else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -647,8 +1142,8 @@ async fn kr_req_12_08_a_gateway_connections_capability_evidence_follows_its_tabl
             .cloned()
             .unwrap_or_else(|| panic!("{name} is recorded"))
     };
-    // The package answers an approval and is trusted to; it declares no way to submit, queue,
-    // steer or cancel, and says so.
+    // The package answers an approval and is trusted to, and spells a way to submit a prompt, steer
+    // a turn and cancel it. It spells none to queue a prompt, and says so.
     let approval = capability("agent.approval");
     assert_eq!(
         approval.state,
@@ -656,21 +1151,24 @@ async fn kr_req_12_08_a_gateway_connections_capability_evidence_follows_its_tabl
         "{:?}",
         approval.disabled_reason
     );
-    for name in [
-        "agent.prompt",
-        "agent.prompt.queue",
-        "agent.steer",
-        "agent.cancel",
-    ] {
+    for name in ["agent.prompt", "agent.steer", "agent.cancel"] {
         let held = capability(name);
-        assert_eq!(held.state, InstanceCapabilityState::Incompatible, "{name}");
-        assert!(
+        assert_eq!(
+            held.state,
+            InstanceCapabilityState::QualifiedAvailable,
+            "{name}: {:?}",
             held.disabled_reason
-                .0
-                .is_some_and(|reason| reason.contains("declares no way")),
-            "{name}"
         );
     }
+    let queue = capability("agent.prompt.queue");
+    assert_eq!(queue.state, InstanceCapabilityState::Incompatible);
+    assert!(
+        queue
+            .disabled_reason
+            .0
+            .is_some_and(|reason| reason.contains("declares no way to queue a prompt")),
+        "the reason names the table"
+    );
 
     // A change of binding invalidates evidence about the old one, and the connection writes it
     // again: the capability is usable and its revision moved.

@@ -66,6 +66,9 @@ pub struct UpstreamRequest {
     pub binding_revision: kr_protocol::ids::AgentBindingRevision,
     /// What it asks for.
     pub operation: RichOperation,
+    /// The conversation it acts in: the one the binding named when it was admitted, where the
+    /// binding names one.
+    pub thread_id: Option<kr_protocol::ids::AgentThreadId>,
     /// The turn it acts on, where it acts on one.
     pub turn_id: Option<kr_protocol::ids::AgentTurnId>,
     /// What the operation is, with everything the connector needs to encode it.
@@ -814,6 +817,10 @@ pub struct RegisteredAction {
     pub presentation: bool,
     /// True for an action the package's component prepares.
     pub component: bool,
+    /// True for an action the host carries out itself as a cancellation of the running turn,
+    /// written from the connector table's own template: no component prepares anything, and the
+    /// host's plan is the declaration.
+    pub host_cancel: bool,
     /// The parameters the declaration names, which every invocation's arguments are read against.
     pub parameters: kr_plugin_sdk::effect::ParameterSchema,
 }
@@ -919,6 +926,10 @@ impl RegisteredAction {
                 ActionImplementation::Presentation {}
             ),
             component: declaration.implementation.needs_component(),
+            host_cancel: matches!(
+                declaration.implementation,
+                ActionImplementation::UpstreamCancel {}
+            ),
             parameters: declaration.parameters.clone(),
         })
     }
@@ -1484,11 +1495,30 @@ impl Broker {
             });
         }
         let invocation = Self::invocation_for(caller, &registered, params, arguments.clone());
+        // A cancellation acts on the turn this instance is running, read here under the lock the
+        // admission is made under: the action names none, and one that is not running is refused
+        // rather than cancelled by whatever turn is running when it lands.
+        let turn_id = if registered.operation
+            == Some(kr_protocol::broker::PreparedOperation::UpstreamCancel)
+        {
+            Some(
+                state
+                    .running_turn(params.target.subject.application_instance_id)?
+                    .ok_or_else(|| BrokerError::PreconditionFailed {
+                        detail: format!(
+                            "{} cancels the turn this instance is running, and none is known",
+                            params.action
+                        ),
+                    })?,
+            )
+        } else {
+            None
+        };
         let admitted = state.admit_mutation_in(
             &params.target,
             registered.capability.clone(),
             RichOperation::PluginAction,
-            None,
+            turn_id,
             Responsible::Binding(binding_id),
             UpstreamBody::PluginAction {
                 plugin_id: params.plugin_id.clone(),
@@ -1524,6 +1554,53 @@ impl Broker {
             .with_draft(draft)
             .with_declaration(registered);
         admitted.check_transport()?;
+        Ok(admitted)
+    }
+
+    /// Admits `plugin.action.invoke` for an action the host carries out itself as a cancellation
+    /// of the running turn.
+    ///
+    /// It is the admission a component's action makes, with the plan the declaration is: nothing
+    /// is asked of a component, and the plan is validated against the token this admission issues
+    /// and spends exactly as a component's is. The request that goes is the connector table's own
+    /// template for a cancellation, filled in with the thread and the running turn this admission
+    /// read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] for an action that is not registered as one the
+    /// host cancels with, and whatever [`Broker::admit_plugin_action`] and the plan's validation
+    /// refuse.
+    pub fn admit_host_cancel(
+        &self,
+        caller: &Caller,
+        binding_id: BrokerBindingId,
+        params: &PluginActionInvokeParams,
+        now: TimestampMs,
+    ) -> Result<MutationAdmission> {
+        let registered = self.check_action(binding_id, params)?;
+        if !registered.host_cancel {
+            return Err(BrokerError::invalid(format!(
+                "{} is not registered as an action the host carries out as a cancellation",
+                params.action
+            )));
+        }
+        let admitted = self.admit_plugin_action(caller, binding_id, params, None, now)?;
+        let effect = kr_protocol::broker::PreparedEffect {
+            action: params.action.clone(),
+            class: registered.effect,
+            operation: kr_protocol::broker::PreparedOperation::UpstreamCancel,
+            draft_id: Nullable::null(),
+            argument_hash: kr_protocol::scalars::Digest256::from_bytes(kr_cbor::sha256(
+                Self::executable_arguments(params)?.as_slice(),
+            )),
+        };
+        if let Err(error) = self.validate_effect(&admitted, &effect) {
+            // The admission spent a token and holds a permit; a refused plan leaves neither
+            // behind.
+            self.abandon(&admitted);
+            return Err(error);
+        }
         Ok(admitted)
     }
 
