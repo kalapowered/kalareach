@@ -1516,12 +1516,12 @@ async fn a_restart_comes_back_fenced_and_numbers_its_connections_above_what_it_w
 }
 
 /// KR-REQ-11.37: the pass that settles a connection nobody holds writes each settlement with its
-/// record, and a store that refuses it leaves the request, its row and the recovery's debt as they
-/// were.
+/// record, and a store that refuses it leaves the request and its row as they were.
 ///
 /// A broker opened on a ledger that holds an unfinished recovery owes a connection no process
 /// holds. The store refuses the first pass's write: nothing is settled, live or in the row, the
-/// fence is back over the gap and rich work stays refused. Once the store takes writes again the
+/// fence is back over the gap (which drops what the recovery owed; the recovery that commits the
+/// gap again owes it afresh) and rich work stays refused. Once the store takes writes again the
 /// gap is committed again and the next pass settles the request and finishes the recovery.
 #[tokio::test]
 async fn kr_req_11_37_a_pass_over_a_connection_nobody_holds_settles_nothing_the_store_refuses() {
