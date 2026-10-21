@@ -937,8 +937,9 @@ async fn an_expired_grant_stays_out_in_a_new_boot_and_the_owners_establishment_k
         "a grant that has not run out is decided again"
     );
     held_out(&controller);
-    // The stored grant's own lifetime, now that the clock is proven again, is read from the end on
-    // record and not derived afresh from a wall clock that reads before its expiry.
+    // The stored grant's own lifetime, now that the clock is proven again, is still over: the
+    // wall clock reads before its expiry, and what keeps the grant out is what the host wrote
+    // down when it ran out (its tombstone, and the floor the end was found at).
     assert_eq!(
         controller
             .lifetimes()
