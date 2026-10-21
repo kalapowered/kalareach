@@ -1449,14 +1449,15 @@ async fn a_mutation_of_a_paired_device_is_performed_by_the_worker_of_the_release
     drop(owner);
 }
 
-/// KR-REQ-26.06, KR-REQ-26.08, KR-REQ-09.10: a host on the newest release of this build's own level
-/// is updated to this build, by that release's own `kr`, while a session's worker still runs the
-/// release. The worker is the process it was; a device paired with the new daemon has the mutation
-/// it makes forwarded, with the dispatch lease this level's frames carry, to that worker, which
-/// admits it; and this build's `kr` reads that worker's frames itself (`kr status`, which never hands
-/// a session over) and a person types at the session through `kr attach`. A level is one surface,
-/// so none of it needs a rewrite, and a release at the level that lacked a member of the level
-/// would fail here.
+/// KR-REQ-26.06, KR-REQ-26.08, KR-REQ-20.23, KR-REQ-09.10: a host on the newest release of this
+/// build's own level is updated to this build, by that release's own `kr`, while a session's worker
+/// still runs the release. The worker is the process it was; a device paired with the new daemon has
+/// the mutation it makes forwarded, with the dispatch lease this level's frames carry, to that
+/// worker, which admits it, so the updated control daemon speaks the protocol of the worker that
+/// stays alive; and this build's `kr` reads that worker's frames itself (`kr status`, which never
+/// hands a session over) and a person types at the session through `kr attach`. A level is one
+/// surface, so none of it needs a rewrite, and a release at the level that lacked a member of the
+/// level would fail here.
 #[tokio::test(flavor = "multi_thread")]
 async fn inside_the_level_an_update_leaves_the_worker_running_and_serves_a_device_and_kr_attach() {
     use kr_protocol::attachment::{
