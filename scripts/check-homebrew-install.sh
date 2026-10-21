@@ -102,7 +102,9 @@ fi
 
 brew_prefix="$("$brew" --prefix)"
 tap="check/kalareach"
+# What an earlier run of this check left behind, whichever way it ended.
 if "$brew" tap | grep -qx "$tap"; then
+  "$brew" uninstall "$stanza" "$tap/kalareach" > /dev/null 2>&1 || true
   "$brew" untap "$tap"
 fi
 "$brew" tap-new --no-git "$tap" > /dev/null
@@ -134,16 +136,16 @@ esac
 # and who put them there.
 inspect() {
   kr_run --json host versions > "$work/versions.json"
-  python3 - "$work/versions.json" "$store/install.json" "$@" <<'PY'
+  python3 - "$work/versions.json" "$store/installer" "$@" <<'PY'
 import json, sys
 versions = json.load(open(sys.argv[1]))
-record = json.load(open(sys.argv[2]))
+installer = open(sys.argv[2]).read().strip()
 current, kept = sys.argv[3], sys.argv[4:]
 names = [entry["release"] for entry in versions["releases"]]
 now = [entry["release"] for entry in versions["releases"] if entry["current"]]
 assert now == [current], f"the current release is {now}, and it should be {current}"
 assert sorted(names) == sorted(kept), f"the store holds {names}, and it should hold {kept}"
-assert record.get("installer") == "homebrew", f"the store's record names {record.get('installer')} as the installer"
+assert installer == "homebrew", f"the store names {installer} as the installer"
 PY
 }
 
