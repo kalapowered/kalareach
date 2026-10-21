@@ -46,6 +46,13 @@ pub const MAX_PIPE_NAME: usize = 64;
 /// The prefix every local pipe's path has.
 pub const PIPE_PREFIX: &str = r"\\.\pipe\";
 
+/// The digits of a fresh identifier in the file name of a launch's private socket.
+const LAUNCH_SOCKET_DIGITS: usize = 12;
+
+/// How long the file name of a launch's private socket is, with the separator before it: `a-`, the
+/// digits and `.sock`.
+pub const LAUNCH_SOCKET_NAME_BYTES: usize = 1 + "a-".len() + LAUNCH_SOCKET_DIGITS + ".sock".len();
+
 /// Where the launched agent connects.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ListenerAddress {
@@ -127,7 +134,9 @@ impl ListenerAddress {
             // and a runtime directory a person chose can already be most of it, so the part this
             // host adds stays out of the way: enough of a fresh identifier not to collide, and no
             // more.
-            Self::PrivateSocket(runtime_directory.join(format!("a-{}.sock", &fresh[..12])))
+            Self::PrivateSocket(
+                runtime_directory.join(format!("a-{}.sock", &fresh[..LAUNCH_SOCKET_DIGITS])),
+            )
         } else {
             Self::NamedPipe(format!("kr-a-{fresh}"))
         };

@@ -315,13 +315,6 @@ struct Backend {
     started_signal: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
-/// The longest path a Unix socket can be bound at, in bytes.
-///
-/// The smaller of the two limits Unix systems have (macOS 104, Linux 108), less the byte that ends
-/// the name and a little for the prefix a system may add.
-#[cfg(unix)]
-const SOCKET_PATH_LIMIT: usize = 100;
-
 /// The file name of the socket a program connects to the gateway at, in its backend's directory.
 #[cfg(unix)]
 const GATEWAY_SOCKET: &str = "gw.sock";
@@ -385,17 +378,9 @@ impl GatewayRun {
         delivery_bound: std::time::Duration,
         #[cfg(feature = "testing")] delivery_hold: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<Self> {
+        // Its length was judged before the backend's directory was made, with the bridge socket's
+        // (`CommandBackends::refuse_a_runtime_directory_with_no_room_for_a_socket`).
         let socket = directory.join(GATEWAY_SOCKET);
-        if socket.as_os_str().len() > SOCKET_PATH_LIMIT {
-            return Err(BrokerError::UnsupportedCapability {
-                detail: format!(
-                    "the gateway's socket would be at {}, {} bytes, and a socket's path is at most \
-                     {SOCKET_PATH_LIMIT}",
-                    socket.display(),
-                    socket.as_os_str().len()
-                ),
-            });
-        }
         let address = format!("unix://{}", socket.display());
         let mut expanded = answered.to_vec();
         for element in expanded.iter_mut().skip(at).take(count) {
@@ -1094,6 +1079,11 @@ impl CommandBackends {
             self.check_gateway_route(request, connector.plugin_id())?;
         }
 
+        // The last of what can refuse before anything is made: where the backend's sockets would be
+        // is known from the runtime directory alone.
+        #[cfg(unix)]
+        self.refuse_a_runtime_directory_with_no_room_for_a_socket()?;
+
         let invocation = Invocation {
             typed: request.typed.to_vec(),
             arguments: request.arguments.to_vec(),
@@ -1267,7 +1257,7 @@ impl CommandBackends {
         if let Some(root) = root.as_ref() {
             return Ok(root.clone());
         }
-        let made = new_private_directory(&self.runtime_dir, "c")?;
+        let made = new_private_directory(&self.runtime_dir, SESSION_ROOT_PREFIX)?;
         *root = Some(made.clone());
         Ok(made)
     }
@@ -1303,6 +1293,44 @@ impl CommandBackends {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone()
             })
+    }
+
+    /// Refuses a runtime directory with no room for the sockets a backend binds below it.
+    ///
+    /// A socket's address is a path, and a platform bounds it ([`kr_ipc::paths::MAX_SOCKET_PATH_LEN`]).
+    /// A backend's sockets are three levels below the runtime directory: the session's root, the
+    /// backend's own directory, and the socket's file name. How long the runtime directory is
+    /// depends on where the host keeps its runtime files: a Mac's default is the system's per-user
+    /// temporary directory, which is the same length for every user, but the directory a person
+    /// names (`KR_RUNTIME_DIR`) is theirs, and on Linux the default is below the home directory
+    /// where no runtime directory is set. So the longest of the two sockets this host binds (the
+    /// launch's bridge socket and a gateway's) is measured against the limit before anything is made,
+    /// and a directory that leaves no room is refused by name, once, here, rather than by a failed
+    /// bind after the directories exist.
+    #[cfg(unix)]
+    fn refuse_a_runtime_directory_with_no_room_for_a_socket(
+        &self,
+    ) -> std::result::Result<(), String> {
+        use crate::broker::listener::LAUNCH_SOCKET_NAME_BYTES;
+
+        // The separator before the session's root, its name, the separator before the backend's
+        // directory and its name, and then the longer socket's file name with its own separator.
+        let below_the_runtime_directory =
+            1 + SESSION_ROOT_PREFIX.len() + NAME_DIGITS + 1 + NAME_DIGITS;
+        let longest_socket = LAUNCH_SOCKET_NAME_BYTES.max(1 + GATEWAY_SOCKET.len());
+        let runtime = self.runtime_dir.as_os_str().len();
+        let longest = runtime + below_the_runtime_directory + longest_socket;
+        let limit = kr_ipc::paths::MAX_SOCKET_PATH_LEN;
+        if longest > limit {
+            return Err(format!(
+                "the runtime directory {} is {runtime} bytes, so a backend's longest socket path \
+                 below it would be {longest} bytes, and a socket's path is at most {limit} on this \
+                 platform; a shorter runtime directory ({}) leaves room",
+                self.runtime_dir.display(),
+                kr_ipc::paths::RUNTIME_DIR_VARIABLE
+            ));
+        }
+        Ok(())
     }
 
     /// Says why a launch of a program that has a server cannot be served by a gateway on this
@@ -3267,12 +3295,17 @@ fn create_new_private_directory(directory: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// What the name of a session's root begins with, before its [`NAME_DIGITS`] digits.
+const SESSION_ROOT_PREFIX: &str = "c";
+
 /// The hexadecimal digits in the name of a session's root and of a backend's directory.
 ///
 /// A backend's socket is below both, and a socket path has 103 bytes on macOS, where the runtime
 /// directory by default is already 67: the two names, their separators and the socket's own name
 /// have to fit in the 36 that are left. Four digits keep them at 31. The name only has to differ
-/// from the ones in the same directory, and a name that is taken is drawn again.
+/// from the ones in the same directory, and a name that is taken is drawn again. A runtime
+/// directory longer than the default leaves less, and one that leaves too little is refused before
+/// anything is made (`CommandBackends::refuse_a_runtime_directory_with_no_room_for_a_socket`).
 const NAME_DIGITS: usize = 4;
 
 /// Makes a new owner-only directory with a short fresh name, `prefix` then [`NAME_DIGITS`]
