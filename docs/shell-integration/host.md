@@ -359,12 +359,22 @@ session answers with the argument vector to run: the command name and the vector
 plus the flags an enabled integration for that command adds. Several things bypass it, and each keeps
 the invocation exactly as typed and is given no backend at all: a command invoked by absolute path,
 an integration the user has not enabled, a line of a script rather than an interactive invocation,
-a shell whose integration is not a managed KalaReach root shell yet, and a session that is closing. An invocation that would take the
-integration is answered as a bypass too, for a fifth reason: this host establishes no worker-owned
-backend. Section 12 requires the backend and its gateway to exist before the native program does,
-and the gateway an integrated agent speaks to is supplied by that agent's own plugin rather than by
-the worker, so there is nothing here to bind an invocation to. Adding the flags without it would
-start an agent that expects a gateway and has none, so the flags are not added.
+a shell whose integration is not a managed KalaReach root shell yet, and a session that is closing.
+
+An invocation that takes the integration is given its backend before the answer is sent. The answer
+carries the flags, the registration file of the backend and the installation's launcher, and the
+shell runs the launcher in front of the program. The launcher starts the program once the worker has
+committed the launch. For a package that declares an application server, the backend is that server
+and the gateway between it and the program: the worker starts the server as its own child, in a
+process group of its own, and binds the gateway's socket, and only then does the launcher write the
+socket's address where the package's flags hold `{gateway}` and run the program. Where the worker can
+establish no backend, the invocation is answered as a bypass with `backend_unavailable` and runs as
+typed: an agent started with the integration's flags and nothing behind them is worse off than one
+started without them. That covers a launch the route cannot serve: an option typed for the program,
+a word that is the name of another subcommand, a program that is a script, and, on Windows, where
+no gateway runs, a package that declares a server. The worker's diagnostics say which. A build no
+signed qualification record names is refused later, when the launcher presents itself after an
+integrated answer, and the launcher then runs the command as typed.
 
 The block hook reports one command block: the command line the editor accepted, when it
 started, how long it ran, what it exited with and the directory it ran in, with the

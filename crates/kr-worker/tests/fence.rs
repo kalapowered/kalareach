@@ -3101,9 +3101,10 @@ fn the_recording_program_works_where_its_directory_holds_an_apostrophe() {
 /// root shell does not start itself ask nothing; the line's capability and its block reach the
 /// worker.
 ///
-/// This host establishes no command backend yet, so every answer here is a bypass: `not_integrated`
-/// for a session created with no integration, and `backend_unavailable` for one created with an
-/// integration for the name.
+/// The worker here is given no command backends to establish, so every answer is a bypass:
+/// `not_integrated` for a session created with no integration, and `backend_unavailable` for one
+/// created with an integration for the name. The real daemon, worker, shell package and launcher
+/// that do establish one are in the `gateway` suite of the end-to-end checkpoint.
 ///
 /// Each package runs it twice: once as the host runs, and once with every published fence kept
 /// from the bridge's writer for [`PACKAGE_FENCE_HOLD`], as a writer on a loaded machine now and
@@ -4002,12 +4003,12 @@ async fn a_bridge_that_declares_another_build_is_refused_on_the_real_endpoint() 
     bridge_task.abort();
 }
 
-/// KR-REQ-12.07: an integration this host can put no backend behind adds no flags.
+/// KR-REQ-12.07: an integration a worker can put no backend behind adds no flags.
 ///
 /// Section 12 requires the worker-owned backend and its gateway to exist before the native program
-/// does. This host establishes none, so an invocation that would need one runs exactly as it was
-/// typed: an agent started with integration flags and nothing behind them is worse off than one
-/// started without them.
+/// does. The worker here has no command backends, so an invocation that would need one runs
+/// exactly as it was typed: an agent started with integration flags and nothing behind them is
+/// worse off than one started without them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_integration_with_no_backend_behind_it_runs_the_invocation_as_typed() {
     let mut wired = wired_profiled(

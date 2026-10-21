@@ -6184,8 +6184,9 @@ application reads.
 
 ### What a native exit ends
 
-A native terminal application's intentional exit ends its instance. Closing a KalaReach attachment
-ends nothing: the application keeps running in the worker's pseudo-terminal.
+A native terminal application's intentional exit ends its instance, and the application server a
+gateway-served terminal runs against with it. Closing a KalaReach attachment ends nothing: the
+application keeps running in the worker's pseudo-terminal.
 
 The terminal is watched as a process, for as long as it runs. A socket reaching end of file and the
 process behind it exiting are two events in either order, and neither bounds the other: a terminal
@@ -6215,6 +6216,18 @@ cannot carry the digest of the one that was qualified.
 A request the table does not classify is presumed mutation-capable, forwarded exactly as it is, and
 suspends that instance's rich mutations until the binding is reconciled. The terminal stays usable
 throughout: suspension is a state a client reads, not an error it hits.
+
+A terminal served by a gateway has a second reason, of its own, which is set before the launch
+commits and holds for the instance's life. The gateway carries the terminal's frames without
+reading out of them which conversation the terminal has selected, so the binding names no thread
+and nothing vouches for one. Rich mutations are suspended for that reason whatever the table lists,
+and the binding reads `rich_mutations_suspended` with it. The binding names one reason at a time:
+one an unclassified request placed, else a native bridge's, else this. Once the instance has an
+upstream transport, a prompt submitted at the revision read is refused `DRAFT_CONFLICT`, naming
+this reason when no other is placed; until then the refusal is `UNSUPPORTED_CAPABILITY`, as for any
+instance with no transport. The terminal runs as it does without the suspension. The reasons are
+kept apart: the next unclassified request does not replace this one, and reconciling the binding
+does not lift it.
 
 Downstream request identifiers are namespaced by connection, so two connections that both call
 their first request `1` are two different pending resources, and a restarted worker numbers its
@@ -6260,6 +6273,37 @@ at another application, another environment or another user. How it is performed
 Every action records how it reached the upstream: a typed remote procedure call, an authenticated
 hook response, or terminal input. Terminal input is never an authoritative typed result, and the
 vocabulary says so rather than leaving it to a caller's judgement.
+
+### A terminal served by a gateway
+
+A command typed in a managed root shell whose package declares an application server, and whose
+integration is enabled, is served by the worker as follows. The worker answers the shell's question
+with the integration's flags and a backend, and the shell runs the installation's launcher in front
+of the program. The typed vector has no option and, if it has a first word, one the package lists,
+and the program is not a script; otherwise the worker answers with a bypass and the command runs as
+typed. When the launcher presents itself, a signed qualification record has to name the program's
+build and the package's table has to be qualified for its version, or the launch fails and the
+launcher runs the command as typed. The worker starts the server, which is its own
+child on pipes, in a process group of its own, in the directory the invocation runs in; it records
+the server among the processes the session owns, binds the gateway's socket in the backend's
+directory, and only then commits the launch. The launcher writes the socket's address where the
+flags have `{gateway}` and becomes the program, which connects.
+
+The worker accepts one connection on the socket, from the process the launch registered. The
+upgrade must arrive within five seconds, be at most 16 KiB and be a plain `GET`; a request with a
+header a browser adds is refused and does not use the connection up. The frames of the terminal and
+the server pass through the gateway one message at a time. A request the server makes of the
+terminal is recorded as an opaque pending resource before it is forwarded, and the terminal's
+answer resolves it once. The instance is the terminal's, and the server is placed under it.
+
+The server is ended when the terminal ends, when its connection ends, when thirty seconds pass
+after the commit with no connection, and when the session closes. The worker closes the server's
+input, lets it end the commands it started, asks it and every process the session recorded below it
+to terminate by their identities, and ends by force what is still running five seconds after the
+ending began. A control daemon that finds the worker gone ends the same recorded processes in the
+same order: it asks, waits, and forces. A control daemon that is killed and started again changes
+none of this: the worker, the terminal, the server and the pending resource go on, and the new
+daemon serves them once its first round of admissions has reached the worker.
 
 ## The connection owner
 
@@ -6526,19 +6570,20 @@ transport back, closes the connection and withdraws the subscription. It stops n
 terminal's: what the terminal does is the terminal's own supervision's, and that is still running
 when the connection has gone.
 
-Launching is the other half of the same composition, though this host starts no agent through it: an
-agent starts from the managed shell (see *Launch profiles*). The launch first asks everything that
-can refuse without starting anything: whether this platform can publish the credential file, whether
-the runtime directory is the owner's alone, whether a private exchange can be drawn, and whether the
-launch intent still holds against the foreground it was prepared against. Only then does it start
-the executable the profile names, with the registration path, which names the credential file, in
-its environment and nothing secret in its arguments, read back from the kernel what it started,
-write the owner-only credential file, register the instance against that record, and write the
-registration file last, so a forwarder that reads it reads a complete one and the credential it
-names already exists. A launch that fails after the start leaves nothing running and nothing
-reserved: the process is ended and waited for before the launch returns, the credential file it
-wrote is removed, and the broker gives back the instance and the conversation the launch took, so a
-retry is not refused for a launch that never happened.
+Launching is the other half of the same composition. The host starts no agent itself: an agent
+starts from the managed shell, through the installation's launcher (see *Launch profiles* and
+*Native bridges an application starts*). Before the worker answers the shell, it asks everything
+that can refuse without creating anything: whether this platform can publish the credential file,
+whether the runtime directory is the owner's alone, and whether a private exchange can be drawn.
+The credential goes in an owner-only file before the launcher presents itself. When it does, the
+worker admits the launch only if its intent still holds against the foreground it was prepared
+against, and writes the registration file last, so a forwarder that reads it reads a complete one
+and the credential it names already exists. A launch that fails after the launcher has presented
+leaves nothing reserved: the registration file is removed, the broker gives back the instance and
+the conversation the launch took, a server the launch started is set to end (the ending runs on
+its own, after the launch has returned), and the launcher runs the command as typed. The backend
+stays for a retry of the same invocation unless its line has ended meanwhile, so a retry is not
+refused for a launch that never happened.
 
 On Windows the spawned programs must be `.exe` or `.com`: a batch file, a PowerShell script or a
 script that a runtime runs is refused by name, because the process that would start is the

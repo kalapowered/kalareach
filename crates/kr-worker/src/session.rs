@@ -1004,9 +1004,10 @@ impl Session {
     /// Decides what one interactive invocation resolves to.
     ///
     /// Section 12's order is the point: the worker-owned backend has to exist before the native
-    /// program does. This host establishes none, so an invocation that would take the integration
+    /// program does. An invocation that takes the integration is given its backend here, before
+    /// the answer the shell runs the program from. Where none can be established, the invocation
     /// runs exactly as it was typed, with no flags added, and is told why. An agent started with
-    /// the integration's flags and no gateway behind them is worse off than one started without.
+    /// the integration's flags and nothing behind them is worse off than one started without.
     fn resolve_invocation(
         &mut self,
         params: &kr_protocol::root::RootCommandResolveParams,
