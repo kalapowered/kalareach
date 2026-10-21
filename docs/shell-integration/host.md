@@ -356,15 +356,26 @@ neither is a method a client could name.
 
 The resolve hook runs in front of an interactive invocation, before the command starts. The
 session answers with the argument vector to run: the command name and the vector the person typed,
-plus the flags an enabled integration for that command adds. Several things bypass it, and each keeps
-the invocation exactly as typed and is given no backend at all: a command invoked by absolute path,
-an integration the user has not enabled, a line of a script rather than an interactive invocation,
-a shell whose integration is not a managed KalaReach root shell yet, and a session that is closing. An invocation that would take the
-integration is answered as a bypass too, for a fifth reason: this host establishes no worker-owned
-backend. Section 12 requires the backend and its gateway to exist before the native program does,
-and the gateway an integrated agent speaks to is supplied by that agent's own plugin rather than by
-the worker, so there is nothing here to bind an invocation to. Adding the flags without it would
-start an agent that expects a gateway and has none, so the flags are not added.
+plus the flags an enabled integration for that command adds. Several things bypass it, and each
+keeps the invocation exactly as typed, is given no backend at all, and is named in the answer's
+`bypass`: a command invoked by absolute path (`absolute_path`), a command no integration names
+(`not_integrated`), an integration the user has not enabled (`disabled`), a line of a script
+rather than an interactive invocation (`not_interactive`), a shell whose integration is not a
+managed KalaReach root shell yet (`unmanaged_shell`), a session that is closing
+(`session_closing`), and an invocation that already uses the integration's flags other than as the
+one whole run the integration declares (`flags_conflict`): part of the run, the run out of its
+order, one of its options with a value attached, or the run together with another use of one of
+its options. The flags are added as one run or not at all, and nothing the person typed is
+changed.
+
+An invocation that would take the integration is answered as a bypass too, as `backend_unavailable`,
+when the worker cannot establish the backend that has to exist before the native program does
+(section 12). Among the reasons are a session with no command backends, no installed connector
+that integrates the command or recognises where the shell found it, a platform that cannot
+publish a credential file, and a runtime directory too long for the socket a backend binds. The
+worker records the reason in its own diagnostics, and the shell is told only that none could be
+established. Adding the flags without a backend would start an agent that expects a gateway and
+has none, so the flags are not added.
 
 The block hook reports one command block: the command line the editor accepted, when it
 started, how long it ran, what it exited with and the directory it ran in, with the

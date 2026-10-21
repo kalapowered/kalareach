@@ -289,7 +289,7 @@ The nested objects those fields carry:
 | `event_result.editor_left` | `state` |
 | `event_result.detached` | `detached_attachment`, `state`, `discarded_input_bytes` |
 | `event_result.command_recorded` | `origin`, `detach_token`, `state` |
-| `event_result.command_resolved` | `arguments`, `added`, `bypass` (`not_integrated`, `disabled`, `absolute_path`, `unmanaged_shell`, `not_interactive`, `backend_unavailable`, `session_closing`, or null), `backend` |
+| `event_result.command_resolved` | `arguments`, `added`, `bypass` (`not_integrated`, `disabled`, `absolute_path`, `unmanaged_shell`, `not_interactive`, `backend_unavailable`, `session_closing`, `flags_conflict`, or null), `backend` |
 | `event_result.command_block_recorded` | `prompt_generation`, `retained` |
 
 Three ordering rules apply. Leaving invalidates the fence, so `command_accepted` is sent first, from
