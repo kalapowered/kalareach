@@ -4005,9 +4005,9 @@ async fn a_bridge_that_declares_another_build_is_refused_on_the_real_endpoint() 
 /// KR-REQ-12.07: an integration this host can put no backend behind adds no flags.
 ///
 /// Section 12 requires the worker-owned backend and its gateway to exist before the native program
-/// does. This host establishes none, so an invocation that would need one runs exactly as it was
-/// typed: an agent started with integration flags and nothing behind them is worse off than one
-/// started without them.
+/// does. A session with no command backends establishes none, so an invocation that would need one
+/// runs exactly as it was typed: an agent started with integration flags and nothing behind them is
+/// worse off than one started without them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_integration_with_no_backend_behind_it_runs_the_invocation_as_typed() {
     let mut wired = wired_profiled(

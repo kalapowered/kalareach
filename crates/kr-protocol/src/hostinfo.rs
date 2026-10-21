@@ -2056,10 +2056,12 @@ pub mod configuration {
         /// Section 7 lets an agent whose own sandbox cannot nest under the session's job run under
         /// an **explicitly selected** reduced-ownership profile. A launch runs an agent under the
         /// `ownership` its profile records, and nothing reads this section for a launch: every
-        /// profile this host writes records `full`, and this host starts no agent through the
-        /// worker's launch. So the section is validated, kept and reported as `agents.ownership`,
-        /// and a change to it changes nothing a launch does. An entry names `reduced` or `full` for
-        /// one package, and nothing else; a package with no entry is `full`.
+        /// profile this host writes records `full`, because the program of a command route runs in
+        /// the shell's own job and the worker starts only the application server a gateway route
+        /// declares, as part of the session. So the section is validated, kept and reported as
+        /// `agents.ownership`, and a change to it changes nothing a launch does. An entry names
+        /// `reduced` or `full` for one package, and nothing else; a package with no entry is
+        /// `full`.
         pub agents: BTreeMap<String, AgentChoice>,
     }
 

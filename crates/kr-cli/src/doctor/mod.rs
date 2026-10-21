@@ -1041,8 +1041,8 @@ pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<Line> {
 /// it and what a launch whose profile records it gives up.
 ///
 /// Section 7 allows the profile only where it is explicitly selected. A launch takes its ownership
-/// from the profile it is given and this host starts no agent through the worker's launch, so a
-/// person who wrote the entry is told that nothing acts on it. They are also told what a launch
+/// from the profile it is given, and every profile this host writes records full, so a person who
+/// wrote the entry is told that nothing acts on it. They are also told what a launch
 /// under the profile gives up on Windows, where jobs hold agents: the agent is held by a job of its
 /// own instead of the session's, its processes are tracked by start identity, and the session's
 /// closure never reads its ownership coverage as complete. The program a command route starts runs
