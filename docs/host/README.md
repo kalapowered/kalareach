@@ -6318,9 +6318,13 @@ asked again.
 The settlement is made while the connection still observes its instance, so the session's attached
 views are told, and the ledger keeps every record. A view that cannot be told within a short bound
 is told to resynchronise instead, which covers what it missed. A client that answers a settled
-request is told it is resolved, and nothing is written to any upstream. A settlement the store
-cannot record is kept in memory as a transition of the gap, and a recovery commits it. Not claimed:
-Windows, where no gateway runs.
+request is told it is resolved, and nothing is written to any upstream. An answer of the host's
+own whose bytes went and that nothing confirmed becomes uncertain at the connection's end, before
+its writer records the outcome, so its caller is told the outcome is unknown. A settlement the
+store cannot record is kept in memory as a transition of the gap, and a recovery commits it. The
+pass of a recovery settles a connection nobody holds with no observer to tell, so the attached
+views see that settlement at their next replay or resynchronisation. Not claimed: Windows, where
+no gateway runs.
 
 Every durable change a resource undergoes is committed with the record that announces it, in one
 transaction, because a crash between the two would lose an event about a change that did happen.

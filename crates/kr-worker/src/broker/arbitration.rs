@@ -37,9 +37,9 @@ pub struct Pending {
     pub claim: Option<Claim>,
     /// True once an answer has left this host for the upstream.
     ///
-    /// This is the flag that decides what a reconnect does. A claimed resource that was never
-    /// dispatched can go back to pending; one that was dispatched and never confirmed is
-    /// uncertain, and an uncertain resource is never answered a second time.
+    /// This is the flag that decides what a reconciliation does. A resource that was never
+    /// dispatched is settled by what its upstream still holds; one that was dispatched and never
+    /// confirmed is uncertain, and an uncertain resource is never answered a second time.
     pub dispatched: bool,
     /// Which writer holds the one admission to transmit an answer, once one does.
     ///
@@ -96,9 +96,8 @@ impl Transmitter {
 
 /// What a claim gives its holder.
 ///
-/// The identifier is the point. Checking only the actor would let a claim that a reconnect
-/// released resolve the *next* claim the same actor takes, which is two answers under one
-/// authority.
+/// The identifier is the point. Checking only the actor would let a claim that was released
+/// resolve the *next* claim the same actor takes, which is two answers under one authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Claim {
     /// This claim, distinct from every other claim on this resource.
@@ -269,7 +268,7 @@ impl Arbitration {
     /// Recovery is not a second record: the identifiers were already unique when they were
     /// written, and refusing them now would drop what a restart is meant to recover. The claim is
     /// not restored, because the client that held it is gone; what is restored is whether an
-    /// answer had already been dispatched, which is what a reconnect needs.
+    /// answer had already been dispatched, which is what a later reconciliation needs.
     pub fn restore(
         &mut self,
         resource: PendingResource,
@@ -1053,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reconnect_never_reissues_an_uncertain_answer() {
+    fn a_reconciliation_never_reissues_an_uncertain_answer() {
         let mut arbitration = Arbitration::new();
         let dispatched = resource(7, "11");
         let dispatched_id = dispatched.resource_id;
@@ -1098,7 +1097,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reconnect_touches_only_the_upstream_it_speaks_for() {
+    fn a_reconciliation_touches_only_the_connection_it_speaks_for() {
         let mut arbitration = Arbitration::new();
         let mine = resource(7, "11");
         let mine_id = mine.resource_id;
@@ -1122,7 +1121,7 @@ mod tests {
             .record(another_connection, None, None)
             .expect("recorded");
 
-        // The reconnect lists nothing. Only its own resource is withdrawn.
+        // The connection lists nothing. Only its own resource is withdrawn.
         reconcile(&mut arbitration, scope(), &[]);
         assert_eq!(state_of(&arbitration, mine_id), PendingState::Cancelled);
         assert_eq!(

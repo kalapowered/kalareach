@@ -20,7 +20,7 @@
 //! | Module | What it owns |
 //! | --- | --- |
 //! | [`agents`] | Which launched agent a process belongs to, and its binding, for the question ledger |
-//! | [`arbitration`] | Pending resources, one resolution each, and what a reconnect does |
+//! | [`arbitration`] | Pending resources, one resolution each, and what a reconciliation does |
 //! | [`capability`] | The per-installation capability map and the probes behind it |
 //! | [`component`] | The components the bindings' packages ship, and where each stands in the plugin runtime |
 //! | [`endpoint`] | The bound local socket, and who the kernel says connected to it |
@@ -45,7 +45,7 @@
 //! granted trust for the exact package, method and projection schema it decoded. It does not let
 //! the same source event become two resources. It does not paste a launch command into an
 //! application that took the foreground. And it does not answer a request twice, whatever
-//! reconnects.
+//! becomes of its connection.
 
 #[cfg(unix)]
 pub mod adoption;
@@ -373,8 +373,7 @@ struct RetainedFrame {
     ///
     /// A request belongs to that package, and only that package's decoder gives it a meaning. It
     /// is kept with the frame rather than read from the connection later, so a connection that
-    /// closes, or whose identifier is restored under another package's tables, changes nothing
-    /// about whose request this is.
+    /// closes changes nothing about whose request this is.
     recorder: Option<PackageIdentity>,
 }
 
@@ -680,12 +679,13 @@ enum OnStoreFault {
     ///
     /// Native traffic keeps its in-memory arbitration, and the record of something that has
     /// already happened (an answer that went, a request the upstream withdrew, a claim given
-    /// back) follows what happened rather than being refused after the fact.
+    /// back, a request settled because its connection ended) follows what happened rather than
+    /// being refused after the fact.
     CarryOn,
     /// It is refused, when the store fails under it and while the fence is up.
     ///
-    /// New rich work and a reconciliation are never taken without their record, and while the
-    /// fence is up nothing is recorded, so neither is taken then at all.
+    /// New rich work and the recovery pass's reconciliation are never taken without their record,
+    /// and while the fence is up nothing is recorded, so neither is taken then at all.
     Refuse,
 }
 
@@ -879,17 +879,18 @@ impl Broker {
         let faults_applied = health.faults_opened();
         let mut arbitration = Arbitration::new();
         // A restarted worker starts from what it wrote, not from nothing. The dispatch marker is
-        // read back with each resource: one that was answered comes back so a reconnect can
-        // reconcile it to uncertain, and one that was not comes back answerable.
+        // read back with each resource: one that was answered comes back with its admission
+        // spent, so nothing answers it again and a reconciliation settles it uncertain, and one
+        // that was not comes back pending.
         for record in ledger.unresolved()? {
             arbitration.restore(record.resource, record.dispatched, record.decoder);
         }
         let mut profiles = ProfileStore::new();
         profiles.restore(ledger.profiles()?);
-        // A recovery this host began and did not finish comes back as a recovery: what ends one
-        // is an upstream saying what it still holds, and no upstream has spoken to this process.
-        // Starting normal would make a resource this host may already have answered claimable
-        // again.
+        // A recovery this host began and did not finish comes back as a recovery: it owes the
+        // connection of every unresolved resource, and none of those is open in this process, so
+        // its first pass settles them. Starting normal would make a resource this host may already
+        // have answered claimable again.
         let mut volatile = VolatileState::new();
         if let Some((row, gap)) = ledger.unfinished_recovery()? {
             let owed: Vec<(ApplicationInstanceId, GatewayConnectionId)> = arbitration
@@ -919,8 +920,8 @@ impl Broker {
         let announced: BTreeMap<PendingResourceId, u64> =
             ledger.latest_events()?.into_iter().collect();
         // And each identifier that still holds an unresolved resource keeps the package it
-        // recorded its requests under, so a restart refuses a restoration under another package's
-        // tables as the process before it did.
+        // recorded its requests under, so a restart reads them as that package's as the process
+        // before it did.
         let connection_packages: BTreeMap<GatewayConnectionId, PackageIdentity> =
             ledger.connection_packages()?.into_iter().collect();
         Ok(Self {
@@ -2596,14 +2597,13 @@ impl Broker {
         self.state().volatile.gap().cloned()
     }
 
-    /// Commits the gap and what lived inside it, and owes each upstream a reconciliation.
+    /// Commits the gap and what lived inside it, and owes each connection a reconciliation.
     ///
     /// Recovery is two steps because it can fail halfway. This is the first: the journal has
     /// written its own gap and called itself healthy again, and this commits the broker's gap and
     /// every resource the gap touched, in whatever state each actually reached. Rich work does not
-    /// come back here; it comes back when every upstream that still had an unresolved resource has
-    /// been reconciled, which is [`Broker::reconcile_recovered`] and
-    /// [`Broker::reconcile_owed`].
+    /// come back here; it comes back when every connection that still had an unresolved resource
+    /// has been reconciled, which is [`Broker::reconcile_owed`].
     ///
     /// The fence stays up while the gap is written, and the write is made off the broker's lock
     /// through the recovery's own connection, so native arbitration never waits on a store that
@@ -2709,7 +2709,7 @@ impl Broker {
                 continue;
             }
             let beginning = state.volatile.begin_recovery(now)?;
-            // Every upstream that still has an unresolved resource owes a reconciliation before
+            // Every connection that still has an unresolved resource owes a reconciliation before
             // rich work comes back. Reconciling one says nothing about another's pending
             // identifiers.
             let owed: Vec<(ApplicationInstanceId, GatewayConnectionId)> = state
@@ -4841,8 +4841,8 @@ impl BrokerState {
         self.remember(&event);
         let settled = self.arbitration.commit(transition)?;
         self.publish(&settled, &event);
-        // A resource whose connection has already gone, restored after a restart or reconciled
-        // after a reconnect, is final as soon as its settlement is written.
+        // A resource whose connection has already gone, restored after a restart or settled by a
+        // recovery's pass, is final as soon as its settlement is written.
         if settled.state.is_terminal() && !self.gateway.contains(settled.request.connection) {
             self.forget_resolved();
         }

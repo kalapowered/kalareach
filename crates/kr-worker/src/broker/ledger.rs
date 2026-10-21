@@ -17,12 +17,12 @@
 //! * **Consumed sources** are the non-reuse check. A decoder may offer a resource from a fresh
 //!   source event handle once; the same handle offered twice is refused, and that has to survive a
 //!   restart or the second offer would succeed after one.
-//! * **Pending resources** are what reconnect reconciles against. Their durable state is what
-//!   stops a second response from being emitted for an identifier the host may already have
-//!   answered.
+//! * **Pending resources** are what a reconciliation settles, at a connection's end and in a
+//!   storage recovery. Their durable state is what stops a second response from being emitted for
+//!   an identifier the host may already have answered.
 //! * **Connection packages** name the installed package each connection identifier recorded its
 //!   requests under, written with its first one. An identifier keeps that package for good, so a
-//!   restarted worker still refuses to restore it under another package's tables.
+//!   restarted worker still reads the requests of an old identifier as that package's.
 //! * **Launch profiles** record what was actually resolved and run.
 //! * **Evidence gaps** record each spell of volatile operation, so the gap is committed when
 //!   storage returns rather than quietly forgotten.
@@ -195,8 +195,8 @@ pub enum TransitionCause {
     HostAnswer,
     /// The upstream answered or withdrew its own request.
     Upstream,
-    /// A reconciliation after a reconnection settled it, or a recovery wrote down the state it
-    /// reached while the journal was out.
+    /// A reconciliation settled it, as the end of its connection or a storage recovery does, or a
+    /// recovery wrote down the state it reached while the journal was out.
     Reconciliation,
 }
 
