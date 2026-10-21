@@ -1,7 +1,24 @@
 name: release-windows
 
-# Builds the Windows host artefacts for one commit, signs every one of them, refuses anything the
-# signature does not hold for, and only then publishes.
+# Builds the Windows host release of each Windows target, with everything about it that can be
+# proved without the release's own keys, and then signs each tree for release behind the
+# `release-signing` environment and publishes the two archives.
+#
+# The `build` job builds the host's programs natively on the runner each target is for (x64 on
+# `windows-2025`, Arm on `windows-11-arm`), assembles the release tree (`scripts/build-release.sh`:
+# `bin/`, `shells/psreadline/`, `share/` and the manifest), refuses a key anywhere in it, signs the
+# manifest with keys and a channel root that this run made, packs it and holds the archive to what a
+# host stages. No environment and no secret is read, and the job is given no token to ask for one.
+# What it signs is not a release, because no host trusts a root it made: the archive it keeps says so
+# in its name. A Windows host keeps no store of releases, so the install into a store that the macOS
+# and Linux jobs make has no counterpart here.
+#
+# The `release` job is the release. It runs for a release tag and for the default branch, and a run
+# on any other ref shows it skipped, so a run that proves the trees never reaches the environment.
+# It takes the trees the `build` job made, signs the files that carry a signature, holds each of them
+# to what a release requires, and then writes each manifest again, since signing changed the files,
+# and signs it with the channel's release keys. Those keys do not exist yet, so the job stops there
+# with a named refusal until they do.
 #
 # The signing key is an Azure Artifact Signing key. It stays inside the service, in hardware, and
 # what comes back over the wire is a signature: no copy of it exists in this repository, on a
@@ -27,11 +44,10 @@ on:
     tags:
       - 'host/v*'
 
-# `id-token: write` is what lets the runner ask GitHub for the token Entra exchanges; it grants
-# nothing in this repository. Everything else reads.
+# Everything reads. `id-token: write` is what lets a runner ask GitHub for the token Entra
+# exchanges, and only the job that signs is given it.
 permissions:
   contents: read
-  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -94,33 +110,37 @@ jobs:
         shell: bash
         run: bash scripts/check-release-sums.sh self-test
 
-      # The check the release job holds its finished archive to, for the executables an installed
-      # host cannot do without, is put through archives that each lack one of them.
-      - name: Drive the archive check with archives made to fail
+      # What a host does with an archive, and what packs one, are put through inputs made to fail:
+      # the check that holds an archive to its manifest, the packer, the scan for a key and the
+      # step that sets apart the files to be signed.
+      - name: Drive the archive, packing and signing-set checks with inputs made to fail
+        shell: bash
         run: |
-          & "$env:GITHUB_WORKSPACE\scripts\check-windows-archive.ps1" -SelfTest
-          exit $LASTEXITCODE
+          python scripts/check-release-archive.py self-test
+          python scripts/pack-release-zip.py self-test
+          python scripts/check-release-secrets.py self-test
+          python scripts/stage-windows-signing.py self-test
 
-  release:
-    name: build, sign and publish
+  build:
+    name: build the tree of ${{ matrix.target }}
     needs: gate
-    runs-on: windows-2025
-    timeout-minutes: 90
-    # The federated credential Entra holds names this environment, so a run without it cannot
-    # exchange its token for one the signing service accepts. The environment also carries the
-    # deployment policy and the reviewer, which is what puts a person in front of every signature.
-    environment: release-signing
-    # One tag is one release, and the refusal below cannot see a run that has not created its draft
-    # yet: two runs for the same tag would both pass it and both go on to create one. So runs for
-    # one ref are serialised here instead, and a run that has already begun is never cancelled for a
-    # later one, because it is the run that holds the draft.
-    concurrency:
-      group: release-windows-${{ github.ref }}
-      cancel-in-progress: false
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
     permissions:
-      contents: write
-      id-token: write
+      contents: read
+    strategy:
+      # One target's failure says nothing about another's, and each is worth seeing.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+    outputs:
+      release: ${{ steps.release.outputs.release }}
     env:
+      TARGET: ${{ matrix.target }}
       # What this job does not set is RUSTFLAGS. The link needs arguments about the vendored C
       # library: leave the static C runtime out, and stop the linker naming the library's missing
       # debug database once per object file. `.cargo/config.toml` carries them so that every Windows
@@ -130,23 +150,38 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       # By identifier, not by ref: the commit the gate job settled, whatever has happened to the
-      # branch since.
+      # branch since. The whole history, since a release's place among releases is the number of
+      # commits behind it.
       - name: Check out the commit the gate settled
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.gate.outputs.commit }}
+          fetch-depth: 0
 
-      # Every executable this release carries, as the package that builds it and its name, read
-      # from `scripts/release-programs.json`: the one list the release builds, the archive check
-      # below and the host's own check of a release read. Whatever builds, stages, starts or looks
-      # for an executable further down takes it from here, so none of them keeps a list of its own.
-      # The reader is put through what each target needs before it is trusted with this one.
+      # Some runner images carry no Rust at all. The installer is rustup's own, and it installs no
+      # toolchain: the next step installs the one this repository pins.
+      - name: Install rustup where the image has none
+        run: |
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            $architecture = if ($env:RUNNER_ARCH -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+            $installer = Join-Path $env:RUNNER_TEMP 'rustup-init.exe'
+            Invoke-WebRequest -Uri "https://static.rust-lang.org/rustup/dist/$architecture-pc-windows-msvc/rustup-init.exe" -OutFile $installer
+            & $installer -y --no-modify-path --profile minimal --default-toolchain none
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:USERPROFILE '.cargo\bin')
+          }
+
+      # Every executable this target carries, as the package that builds it and its name, read from
+      # `scripts/release-programs.json`: the one list the release builds, the tree assembly and the
+      # host's own check of a release read. Whatever builds, stages, starts or looks for an
+      # executable further down takes it from here, so none of them keeps a list of its own. The
+      # reader is put through what each target needs before it is trusted with this one.
       - name: Name the executables
         run: |
           $ErrorActionPreference = 'Stop'
           python scripts/release-programs.py self-test
           if ($LASTEXITCODE -ne 0) { throw 'The reader of the program list failed its own test.' }
-          $builds = @(python scripts/release-programs.py builds --target x86_64-pc-windows-msvc)
+          $builds = @(python scripts/release-programs.py builds --target $env:TARGET)
           if ($LASTEXITCODE -ne 0 -or $builds.Count -eq 0) {
             throw 'The program list names no executable for this release.'
           }
@@ -161,7 +196,7 @@ jobs:
 
       # libsodium's prebuilt libraries come from files this places, not from a download in the
       # middle of the compile. The crate's build script checks both archives against libsodium's
-      # public key, as it does for a download. This job signs what it builds, so it restores no
+      # public key, as it does for a download. What this builds is signed later, so it restores no
       # cache that another job could have written: the prebuilt archive and its signature come from
       # libsodium's host.
       - name: Place libsodium's archives
@@ -224,9 +259,14 @@ jobs:
             }
           }
 
-          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "archive=kalareach-windows-x64-$version+$short" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "version $version, commit $commit"
+          $release = "$version+$short"
+          $sequence = (git rev-list --count HEAD).Trim()
+          "release=$release" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "COMMIT=$commit" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RELEASE=$release" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SEQUENCE=$sequence" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TOP=kalareach-$($env:TARGET)-$release" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "release $release at $commit for $($env:TARGET)"
 
       # RUSTFLAGS in the environment replaces the flags in `.cargo/config.toml`, the link flags
       # among them, even when it is empty, and the link then says whatever it says. Nothing here
@@ -282,83 +322,160 @@ jobs:
           fi
           echo 'No link reported LNK4098.'
 
-      # Two directories, because an archive carries two kinds of file and they are not held to the
-      # same thing. Everything under `staging` is signed and verified, and the signing step is
-      # pointed at the directory rather than at a list, so nothing in it can be missed. Everything
-      # under `data` is a package manifest or a licence: data, not code, and nothing SignTool would
-      # sign. Both are named here and both are hashed into the record the archive carries.
-      #
-      # The executables are named, by the program list, rather than swept up out of
-      # `target\release`, so that the list alone decides what the archive holds: an executable it
-      # names that is not there stops the copy by its name. The step that settles what this release
-      # is holds that list to what the workspace declares.
-      #
-      # The PowerShell package's module goes in whole, with its startup script. The manifest loads
-      # the module, the module dot-sources the three scripts beside it and reads the manifest and
-      # the startup script by path, and PowerShell will not run any of the code under an all-signed
-      # policy unless every file of it carries a signature.
-      - name: Assemble what this release signs
+      - name: Build the release tool
+        shell: bash
+        run: cargo build --locked --release -p kr-release
+
+      # The plugins repository at the commit the bundled catalogue was taken from, to read the
+      # records the release cites from it.
+      - name: Name the plugins commit the bundled catalogue was taken from
+        id: plugins
+        shell: bash
+        run: echo "commit=$(python -c 'import json; print(json.load(open("bundled-plugins.lock"))["source"]["commit"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the plugins repository at that commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: kalapowered/kalareach-plugins
+          ref: ${{ steps.plugins.outputs.commit }}
+          path: plugins-source
+
+      # The channel's root and the keys that sign for it are this run's own, and stay outside the
+      # tree: no host trusts them.
+      - name: Make this run's keys and channel root
+        shell: bash
+        run: target/release/kr-release.exe dev-keys --out "$(cygpath -m "$RUNNER_TEMP")/keys"
+
+      # `bin/` with the host's programs, `shells/psreadline/` with the PowerShell package, and
+      # `share/` with the channel's root, the record of what the release was qualified against and
+      # the licence, then `release.json`, unsigned. A package the build left other than the
+      # repository's pins, and a file a release does not hold, stop it here.
+      - name: Assemble the tree
+        shell: bash
+        env:
+          PYTHON: python
         run: |
-          $ErrorActionPreference = 'Stop'
-          $staging = Join-Path $env:RUNNER_TEMP 'staging'
-          $data = Join-Path $env:RUNNER_TEMP 'data'
-          foreach ($directory in @($staging, $data)) {
-            if (Test-Path -LiteralPath $directory) {
-              Remove-Item -LiteralPath $directory -Recurse -Force
-            }
-            New-Item -ItemType Directory -Path $directory -Force | Out-Null
-          }
-
-          function Copy-Into {
-            param([string] $Root, [string] $Relative, [string] $From)
-            $destination = Join-Path $Root $Relative
-            New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
-            if (-not (Test-Path -LiteralPath $From -PathType Leaf)) {
-              throw "$From is not there, so $Relative cannot go in the archive."
-            }
-            Copy-Item -LiteralPath $From -Destination $destination
-          }
-
-          $target = Join-Path $env:GITHUB_WORKSPACE 'target\release'
-          $executables = @($env:KR_BUILDS -split ' ' | Where-Object { $_ } | ForEach-Object { ($_ -split '/')[1] + '.exe' })
-          foreach ($executable in $executables) {
-            Copy-Into -Root $staging -Relative $executable -From (Join-Path $target $executable)
-          }
-
-          $moduleSource = Join-Path $env:GITHUB_WORKSPACE 'shells\psreadline\module'
-          foreach ($file in (Get-ChildItem -LiteralPath $moduleSource -File -Force | Sort-Object Name)) {
-            Copy-Into -Root $staging -Relative "shells\psreadline\module\$($file.Name)" -From $file.FullName
-          }
-          Copy-Into -Root $staging -Relative 'shells\psreadline\startup\kr-profile.ps1' `
-            -From (Join-Path $env:GITHUB_WORKSPACE 'shells\psreadline\startup\kr-profile.ps1')
-
-          foreach ($file in @('LICENSE', 'shells\psreadline\manifest.json', 'shells\psreadline\LICENSE')) {
-            Copy-Into -Root $data -Relative $file -From (Join-Path $env:GITHUB_WORKSPACE $file)
-          }
-
-          Write-Host 'signed:'
-          Get-ChildItem -LiteralPath $staging -File -Recurse -Force |
-            ForEach-Object { Write-Host ('  ' + $_.FullName.Substring($staging.Length).TrimStart('\')) }
-          Write-Host 'data:'
-          Get-ChildItem -LiteralPath $data -File -Recurse -Force |
-            ForEach-Object { Write-Host ('  ' + $_.FullName.Substring($data.Length).TrimStart('\')) }
+          temp="$(cygpath -m "$RUNNER_TEMP")"
+          bash scripts/build-release.sh \
+            --target "$TARGET" --release "$RELEASE" --sequence "$SEQUENCE" --commit "$COMMIT" --floor windows=10.0 \
+            --programs target/release --root "$temp/keys/root.json" --out "$temp/tree/$TOP" \
+            --kr-release target/release/kr-release.exe --plugins plugins-source
 
       # Each executable in the layout the archive will carry is started once, from where it is
-      # staged, and asked its version. The description process and the forwarder are found beside
-      # the worker, so an archive whose layout lost either of them, or whose build cannot start
-      # here, stops this run before anything is signed.
-      - name: Start each staged executable
+      # assembled, and asked its version. The description process and the forwarder are found beside
+      # the worker, so a tree whose layout lost either of them, or whose build cannot start here,
+      # stops this run before anything is signed.
+      - name: Start each executable of the tree
         run: |
           $ErrorActionPreference = 'Stop'
-          $staging = Join-Path $env:RUNNER_TEMP 'staging'
-          $executables = @($env:KR_BUILDS -split ' ' | Where-Object { $_ } | ForEach-Object { ($_ -split '/')[1] + '.exe' })
-          foreach ($executable in $executables) {
-            $path = Join-Path $staging $executable
-            $said = & $path --version
+          $tree = Join-Path $env:RUNNER_TEMP "tree\$env:TOP"
+          $names = @(python scripts/release-programs.py names --target $env:TARGET)
+          foreach ($name in $names) {
+            $said = & (Join-Path $tree "bin\$name.exe") --version
             if ($LASTEXITCODE -ne 0) {
-              throw "$executable exited with $LASTEXITCODE when it was asked its version."
+              throw "$name exited with $LASTEXITCODE when it was asked its version."
             }
-            Write-Host "$executable said: $said"
+            Write-Host "$name said: $said"
+          }
+
+      - name: Refuse a private key in the tree
+        shell: bash
+        run: python scripts/check-release-secrets.py scan "$(cygpath -m "$RUNNER_TEMP")/tree/$TOP"
+
+      # The tree the `release` job takes, before this run's signature is on it.
+      - name: Keep the tree for signing
+        if: ${{ github.ref_type == 'tag' || github.ref_name == github.event.repository.default_branch }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-${{ env.TOP }}
+          path: ${{ runner.temp }}\tree
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Sign the manifest with this run's keys, and verify it
+        shell: bash
+        run: |
+          temp="$(cygpath -m "$RUNNER_TEMP")"
+          target/release/kr-release.exe sign --tree "$temp/tree/$TOP" --checkout . \
+            --key "$temp/keys/targets-1.pk8" --key "$temp/keys/targets-2.pk8" --plugins plugins-source
+          target/release/kr-release.exe verify --tree "$temp/tree/$TOP" --root "$temp/keys/root.json"
+
+      # What a host does with an archive: it is read as a host stages one, every member against the
+      # manifest it carries, and the sums are held to what their checkers read.
+      - name: Pack the archive and hold it to what a host stages
+        shell: bash
+        run: |
+          temp="$(cygpath -m "$RUNNER_TEMP")"
+          python scripts/pack-release-zip.py pack --tree "$temp/tree/$TOP" --out "$temp/archive"
+          python scripts/check-release-archive.py check --archive "$temp/archive/$TOP.zip" --sums "$temp/archive/SHA256SUMS"
+          python scripts/check-release-secrets.py scan "$temp/archive/$TOP.zip"
+          bash scripts/check-release-sums.sh "$(cygpath -u "$RUNNER_TEMP")/archive"
+
+      - name: Keep the archive this run proved
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.TOP }}-signed-with-this-runs-keys-not-a-release
+          path: ${{ runner.temp }}/archive
+          retention-days: 7
+          if-no-files-found: error
+
+  release:
+    name: sign and publish
+    needs: [gate, build]
+    # A release tag and the default branch only: a run on any other ref skips this job and never
+    # reaches the environment.
+    if: ${{ github.ref_type == 'tag' || github.ref_name == github.event.repository.default_branch }}
+    runs-on: windows-2025
+    timeout-minutes: 90
+    # The federated credential Entra holds names this environment, so a run without it cannot
+    # exchange its token for one the signing service accepts. The environment also carries the
+    # deployment policy and the reviewer, which is what puts a person in front of every signature.
+    environment: release-signing
+    # One tag is one release, and the refusal below cannot see a run that has not created its draft
+    # yet: two runs for the same tag would both pass it and both go on to create one. So runs for
+    # one ref are serialised here instead, and a run that has already begun is never cancelled for a
+    # later one, because it is the run that holds the draft.
+    concurrency:
+      group: release-windows-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      # By identifier, not by ref: the commit the gate job settled, whatever has happened to the
+      # branch since.
+      - name: Check out the commit the gate settled
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ needs.gate.outputs.commit }}
+
+      - name: Take the trees the build job made
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: unsigned-kalareach-*-windows-msvc-*
+          path: ${{ runner.temp }}\unsigned
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+
+      - name: Build the release tool
+        shell: bash
+        run: cargo build --locked --release -p kr-release
+
+      # Each tree's files that carry a signature, set apart at the path they have in it. The
+      # signing service signs these directories and nothing else of the tree.
+      - name: Set apart the files each tree has signed
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($target in @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')) {
+            $trees = @(Get-ChildItem -Path "$env:RUNNER_TEMP\unsigned\unsigned-kalareach-$target-*\kalareach-$target-*" -Directory)
+            if ($trees.Count -ne 1) { throw "The build job left $($trees.Count) trees for $target, and a release has one." }
+            python scripts/stage-windows-signing.py stage --tree $trees[0].FullName --staging "$env:RUNNER_TEMP\staging\$target"
+            if ($LASTEXITCODE -ne 0) { throw "The files of the $target tree could not be set apart." }
           }
 
       # The token exchange. `client-id`, `tenant-id` and `subscription-id` are repository variables
@@ -384,14 +501,14 @@ jobs:
       # The action keeps its own tools in the Actions cache unless it is told not to, and a run on a
       # tag would save a copy of them that no other run can read. The tools are fetched on every
       # run instead, which takes about a minute of a release.
-      - name: Sign every Windows artefact
+      - name: Sign every Windows artefact of the x64 tree
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           cache-dependencies: false
           endpoint: https://eus.codesigning.azure.net/
           signing-account-name: kalareach
           certificate-profile-name: kalareach-public-trust
-          files-folder: ${{ runner.temp }}\staging
+          files-folder: ${{ runner.temp }}\staging\x86_64-pc-windows-msvc
           files-folder-recurse: true
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
@@ -409,185 +526,104 @@ jobs:
           exclude-azure-developer-cli-credential: true
           exclude-interactive-browser-credential: true
 
+
+      - name: Sign every Windows artefact of the Arm tree
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          cache-dependencies: false
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: kalareach
+          certificate-profile-name: kalareach-public-trust
+          files-folder: ${{ runner.temp }}\staging\aarch64-pc-windows-msvc
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: KalaReach
+          description-url: https://github.com/kalapowered/kalareach
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+
+
       # The refusal. Every artefact is held to the default Authenticode policy, to carrying a
       # timestamp, and to the name this project signs as; signtool's whole verdict on each one goes
-      # into this run's log; and what comes out is a record of what passed. Nothing below reads the
-      # staging directory on its own account: the step that packs the archive takes its file list
-      # from this record, so an artefact that did not pass through here has no way into a release.
+      # into this run's log; and what comes out is a record of what passed. Nothing below takes a
+      # signed file from anywhere but a directory this passed, and each file goes back into its tree
+      # only if it is the one the record names.
       - name: Refuse any artefact the signature does not hold for
         run: |
-          & "$env:GITHUB_WORKSPACE\scripts\verify-windows-signatures.ps1" `
-            -Path "$env:RUNNER_TEMP\staging" `
-            -ExpectedSubject "$env:KR_SIGNING_SUBJECT" `
-            -Receipt "$env:RUNNER_TEMP\gate\signatures.txt"
-          exit $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          foreach ($target in @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')) {
+            & "$env:GITHUB_WORKSPACE\scripts\verify-windows-signatures.ps1" `
+              -Path "$env:RUNNER_TEMP\staging\$target" `
+              -ExpectedSubject "$env:KR_SIGNING_SUBJECT" `
+              -Receipt "$env:RUNNER_TEMP\gate\$target\signatures.txt"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
-      # Built from the record the gate wrote, and from an explicit list of the files that carry no
-      # signature because they are data. Each one is hashed after it has been copied, so what is
-      # held to the record is the byte sequence that goes into the archive rather than the one that
-      # was read; the counts are held to the record's, so a file that appeared after the gate ran
-      # cannot travel with the ones that passed; and the finished archive is opened and every member
-      # in it checked against the same list before anything can upload it.
-      - name: Pack what the gate accepted
-        id: pack
-        env:
-          KR_ARCHIVE: ${{ steps.release.outputs.archive }}
+      # Each signed file goes back into its tree, and the record of what passed goes in beside them
+      # as `share\signatures.txt`.
+      - name: Put the signed files back into their trees
         run: |
           $ErrorActionPreference = 'Stop'
-          $staging = Join-Path $env:RUNNER_TEMP 'staging'
-          $data = Join-Path $env:RUNNER_TEMP 'data'
-          $receipt = Join-Path $env:RUNNER_TEMP 'gate\signatures.txt'
-          $payload = Join-Path $env:RUNNER_TEMP 'payload'
-          $release = Join-Path $env:RUNNER_TEMP 'release'
-          foreach ($directory in @($payload, $release)) {
-            if (Test-Path -LiteralPath $directory) {
-              Remove-Item -LiteralPath $directory -Recurse -Force
-            }
-            New-Item -ItemType Directory -Path $directory -Force | Out-Null
+          foreach ($target in @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')) {
+            $tree = @(Get-ChildItem -Path "$env:RUNNER_TEMP\unsigned\unsigned-kalareach-$target-*\kalareach-$target-*" -Directory)[0].FullName
+            python scripts/stage-windows-signing.py restore --tree $tree --staging "$env:RUNNER_TEMP\staging\$target" --receipt "$env:RUNNER_TEMP\gate\$target\signatures.txt"
+            if ($LASTEXITCODE -ne 0) { throw "The signed files of the $target tree could not be put back." }
           }
 
-          $inventory = [ordered]@{}
-
-          function Add-ToPayload {
-            param([string] $Relative, [string] $From, [string] $Expected)
-
-            $destination = Join-Path $payload $Relative
-            New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
-            Copy-Item -LiteralPath $From -Destination $destination
-            $digest = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($Expected -and $digest -ne $Expected) {
-              throw "$Relative changed between being verified and being packed: expected $Expected, packed $digest."
-            }
-            $inventory[($Relative -replace '\\', '/')] = $digest
-            return $digest
-          }
-
-          $signed = 0
-          foreach ($line in (Get-Content -LiteralPath $receipt)) {
-            if ($line.StartsWith('#') -or -not $line.Trim()) { continue }
-            $fields = $line -split '\s\s+', 3
-            $expected = $fields[0]
-            $relative = $fields[1]
-
-            $source = Join-Path $staging $relative
-            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
-              throw "$relative passed the gate and is no longer where it was."
-            }
-            Add-ToPayload -Relative $relative -From $source -Expected $expected | Out-Null
-            $signed += 1
-          }
-
-          $staged = @(Get-ChildItem -LiteralPath $staging -File -Recurse -Force).Count
-          if ($signed -ne $staged) {
-            throw "The gate recorded $signed artefacts and the staging directory holds $staged."
-          }
-          if ($signed -eq 0) {
-            throw 'The gate recorded no artefacts.'
-          }
-
-          # The unsigned half, named one by one rather than swept up, and recorded with its digests
-          # in the same file so that a reader can tell which is which.
-          $unsigned = @(Get-ChildItem -LiteralPath $data -File -Recurse -Force | Sort-Object FullName)
-          $notes = @(
-            '',
-            '# The files below carry no signature. They are data rather than code: a package',
-            '# manifest and licence text. Their digests are recorded here for the same reason the',
-            '# signed artefacts are.',
-            '#',
-            '# sha256  path'
-          )
-          foreach ($file in $unsigned) {
-            $relative = $file.FullName.Substring($data.Length).TrimStart('\')
-            $digest = Add-ToPayload -Relative $relative -From $file.FullName -Expected ''
-            $notes += ('{0}  {1}' -f $digest, $relative)
-          }
-
-          # Each record people check ends its lines in a line feed alone, whatever the runner's own
-          # convention: a Unix tool reads a carriage return as part of a line's last field, and
-          # shasum, like the sha256sum macOS ships, then reports the named file missing.
-          Copy-Item -LiteralPath $receipt -Destination (Join-Path $payload 'signatures.txt')
-          Add-Content -LiteralPath (Join-Path $payload 'signatures.txt') `
-            -Value (($notes -join "`n") + "`n") -NoNewline -Encoding utf8NoBOM
-          $inventory['signatures.txt'] =
-            (Get-FileHash -LiteralPath (Join-Path $payload 'signatures.txt') -Algorithm SHA256).Hash.ToLowerInvariant()
-
-          $archive = Join-Path $release ($env:KR_ARCHIVE + '.zip')
-          Compress-Archive -Path (Join-Path $payload '*') -DestinationPath $archive -CompressionLevel Optimal
-
-          # What is in the archive, rather than what was meant to be. Every member is read back out
-          # and held to the list above, and the list is held to the members, before this archive can
-          # be uploaded anywhere.
-          $seen = 0
-          $zip = [System.IO.Compression.ZipFile]::OpenRead($archive)
-          try {
-            foreach ($entry in $zip.Entries) {
-              if (-not $entry.Name) { continue }
-              $name = $entry.FullName -replace '\\', '/'
-              if (-not $inventory.Contains($name)) {
-                throw "The archive carries $name, which nothing put there."
-              }
-              $stream = $entry.Open()
-              try {
-                $sha = [System.Security.Cryptography.SHA256]::Create()
-                try {
-                  $digest = (($sha.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') }) -join '')
-                } finally {
-                  $sha.Dispose()
-                }
-              } finally {
-                $stream.Dispose()
-              }
-              if ($digest -ne $inventory[$name]) {
-                throw "The archive's copy of $name is not the one that was packed."
-              }
-              $seen += 1
-            }
-          } finally {
-            $zip.Dispose()
-          }
-          if ($seen -ne $inventory.Count) {
-            throw "The archive holds $seen files and $($inventory.Count) were packed."
-          }
-
-          $digest = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          Set-Content -LiteralPath (Join-Path $release 'SHA256SUMS') `
-            -Value "$digest  $(Split-Path -Leaf $archive)`n" -NoNewline -Encoding utf8NoBOM
-
-          Write-Host "$signed signed artefacts and $($unsigned.Count) data files in $(Split-Path -Leaf $archive)"
-          "directory=$release" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      # What the archive holds is checked against what an installed host cannot do without, as well
-      # as against what was packed: the step above holds the archive to its own inventory, which a
-      # build that left an executable out would still match. Each executable the program list names
-      # has to be a file at the archive's top level, so an archive without one of them, the
-      # forwarder and the plugin host among them, goes no further than this.
-      - name: Refuse an archive that lacks a host executable
-        env:
-          KR_ARCHIVE: ${{ steps.release.outputs.archive }}
-          KR_RELEASE_DIR: ${{ steps.pack.outputs.directory }}
+      # The manifest is written again, since signing changed the files, and signed by a threshold of
+      # the channel's release keys. Those keys do not exist yet: they are made at a key ceremony,
+      # held in hardware and on offline media, and no mechanism of this repository gives a run one.
+      # This is where the job stops, with the same words on every platform, until they do.
+      - name: Write the manifest again and sign it with the channel's release keys
         run: |
-          & "$env:GITHUB_WORKSPACE\scripts\check-windows-archive.ps1" `
-            -Archive (Join-Path $env:KR_RELEASE_DIR ($env:KR_ARCHIVE + '.zip'))
-          exit $LASTEXITCODE
+          Write-Host "::error::the channel's release keys do not exist yet, so this release cannot be signed. Publishing a release waits for the key ceremony, which is the project owner's to hold. The trees are signed and checked up to this step."
+          exit 1
+
+      # Each tree is packed, and each archive is read as a host stages one: every member against the
+      # manifest it carries.
+      - name: Pack what the gate accepted
+        id: pack
+        shell: bash
+        run: |
+          temp="$(cygpath -m "$RUNNER_TEMP")"
+          for target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+            tree="$(ls -d "$temp"/unsigned/unsigned-kalareach-"$target"-*/kalareach-"$target"-*)"
+            python scripts/pack-release-zip.py pack --tree "$tree" --out "$temp/release"
+            python scripts/check-release-archive.py check --archive "$temp/release/$(basename "$tree").zip" --sums "$temp/release/SHA256SUMS"
+          done
+          echo "directory=$temp/release" >> "$GITHUB_OUTPUT"
 
       # The two records people check a download with, held to what their checkers read before
-      # anything can upload them: SHA256SUMS beside the archive, and signatures.txt inside it. The
-      # copy read here is the one packed, whose digest the step above held the archive's copy to.
-      # Each line must end in a line feed alone, and sha256sum -c must pass over the archive.
-      - name: Hold the sums and the signature record to what checkers read
+      # anything can upload them: SHA256SUMS beside the archives, and each tree's signatures.txt
+      # inside its archive. Each line must end in a line feed alone, and sha256sum -c must pass over
+      # both archives.
+      - name: Hold the sums and the signature records to what checkers read
         shell: bash
         env:
           KR_RELEASE_DIR: ${{ steps.pack.outputs.directory }}
         run: |
           set -euo pipefail
-          bash scripts/check-release-sums.sh "$(cygpath -u "$KR_RELEASE_DIR")" \
-            "$(cygpath -u "$RUNNER_TEMP")/payload/signatures.txt"
+          records=()
+          for tree in "$(cygpath -u "$RUNNER_TEMP")"/unsigned/unsigned-kalareach-*/kalareach-*; do
+            records+=("$tree/share/signatures.txt")
+          done
+          bash scripts/check-release-sums.sh "$(cygpath -u "$KR_RELEASE_DIR")" "${records[@]}"
 
       # Every run keeps what it signed, whether or not a release follows.
-      - name: Keep the signed archive
+      - name: Keep the signed archives
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ steps.release.outputs.archive }}
+          name: windows-host-release
           path: ${{ runner.temp }}/release
           if-no-files-found: error
 
@@ -633,13 +669,14 @@ jobs:
           # rebuilds the notes around it with the URLs GitHub reports.
           {
             echo
-            echo 'Every executable and every PowerShell file in the archive is signed by'
-            echo 'Kala Holdings Inc. and timestamped. The manifest and the licences are not signed;'
-            echo 'they are data, and signatures.txt inside the archive records the digest of every'
-            echo 'file either way. Check one signature for yourself after unpacking:'
+            echo 'Every executable and every PowerShell file in each archive is signed by'
+            echo 'Kala Holdings Inc. and timestamped. The manifest, release.json, is signed by the'
+            echo 'update channel'"'"'s release keys. The licences are data and carry no signature, and'
+            echo 'share\signatures.txt inside each archive records the digest of every file either'
+            echo 'way. Check one signature for yourself after unpacking:'
             echo
-            echo '    Get-AuthenticodeSignature .\kr.exe | Format-List'
-            echo '    signtool verify /pa /v .\kr.exe'
+            echo '    Get-AuthenticodeSignature .\bin\kr.exe | Format-List'
+            echo '    signtool verify /pa /v .\bin\kr.exe'
             echo
             echo 'Verify the archive itself against the sum:'
             echo
@@ -654,7 +691,7 @@ jobs:
           } >"$temp/notes-tail.md"
 
           {
-            echo "The signed Windows host artefacts, built from commit $GITHUB_SHA."
+            echo "The signed Windows host releases for x64 and Arm, built from commit $GITHUB_SHA."
             cat "$temp/notes-tail.md"
           } >"$temp/notes-draft.md"
 
@@ -832,7 +869,7 @@ jobs:
           (cd "$served" && sha256sum -c SHA256SUMS)
 
           {
-            echo "The signed Windows host artefacts, built from commit $GITHUB_SHA."
+            echo "The signed Windows host releases for x64 and Arm, built from commit $GITHUB_SHA."
             echo
             while read -r name _ url; do
               case "$name" in
