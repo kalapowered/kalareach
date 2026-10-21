@@ -16,7 +16,8 @@
 //! The shell is to have the terminal and nothing else of the worker's descriptors. Every descriptor
 //! the child holds is marked to close when the shell is run, found in the child itself at the
 //! moment it is made, so that nothing the worker opened, whenever and above whatever limit, is
-//! missed (on the systems this ships on; the one that is walked instead is named where it is).
+//! missed. Where the system cannot give the list, the start fails; only a Unix system this does not
+//! ship on is walked as far as its soft limit instead, and says so where it is.
 
 #![expect(
     unsafe_code,
@@ -87,10 +88,6 @@ pub(super) struct TableRoom {
     /// for any opened before the fork.
     #[cfg(target_vendor = "apple")]
     list: Vec<libc::proc_fdinfo>,
-    /// One past the highest number the system gives a descriptor, which is walked as far as when
-    /// the list does not hold them all.
-    #[cfg(target_vendor = "apple")]
-    table_end: libc::c_int,
 }
 
 impl TableRoom {
@@ -120,7 +117,6 @@ impl TableRoom {
                 };
                 entries
             ],
-            table_end: table_end(),
         }
     }
 
@@ -129,36 +125,6 @@ impl TableRoom {
         Self {}
     }
 }
-
-/// One past the highest number the system gives any descriptor of a process.
-///
-/// Apple systems refuse a descriptor at or above `kern.maxfilesperproc` whatever the soft limit
-/// says; the limit is read here, and the call that reads it is not one for the child.
-#[cfg(target_vendor = "apple")]
-fn table_end() -> libc::c_int {
-    let mut limit: libc::c_int = 0;
-    let mut size = std::mem::size_of::<libc::c_int>();
-    // SAFETY: the name is a NUL-terminated string, and the value and its size are this function's
-    // own and outlive the call.
-    let read = unsafe {
-        libc::sysctlbyname(
-            c"kern.maxfilesperproc".as_ptr(),
-            (&raw mut limit).cast(),
-            &raw mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if read == 0 && limit > 0 {
-        limit
-    } else {
-        FALLBACK_TABLE_END
-    }
-}
-
-/// The end of the table where the system will not say: well above what it gives by default.
-#[cfg(target_vendor = "apple")]
-const FALLBACK_TABLE_END: libc::c_int = 1 << 20;
 
 /// Opens a directory for the one thing the start does with it, which is to enter it.
 ///
@@ -192,14 +158,12 @@ fn open_directory(path: &std::path::Path) -> std::io::Result<OwnedFd> {
 /// * Linux marks them all in one call from kernel 5.11, and where that call is not available lists
 ///   the child's own table (`/proc/self/fd`) and marks each. Where neither can be done the start
 ///   fails, rather than going ahead with descriptors it could not account for.
-/// * Apple systems list the process's descriptors in the room made for it before the fork, which
-///   is complete when the list leaves room over. When it does not (more descriptors than the room
-///   made for, or the list is refused), every number is marked up to the larger of what the list
-///   named and `kern.maxfilesperproc`, above which the system gives no descriptor a number: about
-///   7 ms at the default of 92,160, in the child, before the shell runs. A system that will not
-///   say that number is walked as far as 2^20, which is a guess. A descriptor opened above a limit
-///   that was lowered by an administrator after it was opened is in the list, and in the walk only
-///   if the walk reaches it.
+/// * Apple systems ask the kernel for the list of the process's descriptors, into the room made
+///   for it before the fork, and mark each. The list is the whole of them when it leaves room over
+///   (the kernel fills what fits and reports what it filled). When it does not (more descriptors
+///   than the room made for, or the call is refused), the start fails: a walk to some number would
+///   leave open any descriptor above it, such as one opened above a limit an administrator has
+///   since lowered, and nothing here can say there is none.
 /// * Other Unix systems are walked as far as the soft limit, which does not cover a descriptor
 ///   above a limit lowered since it was opened.
 ///
@@ -227,7 +191,7 @@ fn mark_close_on_exec(room: &mut TableRoom) -> std::io::Result<()> {
     }
     #[cfg(target_vendor = "apple")]
     {
-        mark_by_the_kernels_list(room).map(|_| ())
+        mark_by_the_kernels_list(room)
     }
     #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
     {
@@ -247,16 +211,19 @@ fn mark_close_on_exec(room: &mut TableRoom) -> std::io::Result<()> {
     }
 }
 
-/// Marks each descriptor the kernel lists for this process, and, when the list may not hold them
-/// all, every number up to where the system gives descriptors. Says whether the list was complete.
+/// Marks each descriptor the kernel lists for this process, or fails when the list may not hold
+/// them all.
+///
+/// # Errors
+///
+/// Returns "no buffer space" when the room made does not leave room over, and the system's error
+/// when the call is refused; neither allocates.
 #[cfg(target_vendor = "apple")]
-fn mark_by_the_kernels_list(room: &mut TableRoom) -> std::io::Result<bool> {
+fn mark_by_the_kernels_list(room: &mut TableRoom) -> std::io::Result<()> {
+    let too_small = || std::io::Error::from_raw_os_error(libc::ENOBUFS);
     let entry = std::mem::size_of::<libc::proc_fdinfo>();
     let capacity = room.list.len() * entry;
-    let Ok(capacity_bytes) = libc::c_int::try_from(capacity) else {
-        mark_range_close_on_exec(3, room.table_end)?;
-        return Ok(false);
-    };
+    let capacity_bytes = libc::c_int::try_from(capacity).map_err(|_| too_small())?;
     // SAFETY: the buffer is the room made before the fork, `capacity` bytes of it, and nothing else
     // holds it; the call is a thin wrapper of the system call and allocates nothing.
     let bytes = unsafe {
@@ -268,21 +235,27 @@ fn mark_by_the_kernels_list(room: &mut TableRoom) -> std::io::Result<bool> {
             capacity_bytes,
         )
     };
-    let filled = usize::try_from(bytes).unwrap_or(0).min(capacity) / entry;
+    if bytes <= 0 {
+        // Refused: the call reports it as zero, and the system's error says why.
+        let refusal = std::io::Error::last_os_error();
+        return Err(if refusal.raw_os_error().is_some_and(|code| code != 0) {
+            refusal
+        } else {
+            std::io::Error::from_raw_os_error(libc::EIO)
+        });
+    }
+    let bytes = usize::try_from(bytes).map_err(|_| too_small())?;
     // The kernel fills what fits and reports what it filled, so a list that leaves room over is
     // the whole of them, and a full one may not be.
-    let complete = bytes > 0 && usize::try_from(bytes).is_ok_and(|bytes| bytes < capacity);
-    let mut end = 3;
-    for listed in &room.list[..filled] {
-        end = end.max(listed.proc_fd.saturating_add(1));
+    if bytes >= capacity {
+        return Err(too_small());
+    }
+    for listed in &room.list[..bytes / entry] {
         if listed.proc_fd > 2 {
             mark_range_close_on_exec(listed.proc_fd, listed.proc_fd + 1)?;
         }
     }
-    if !complete {
-        mark_range_close_on_exec(3, end.max(room.table_end))?;
-    }
-    Ok(complete)
+    Ok(())
 }
 
 /// Marks each descriptor the child's own table lists to close when the shell is run, reading the
@@ -424,7 +397,8 @@ pub(super) mod tests {
     /// after (as the ones opened between the making and the fork are), the soft limit is lowered
     /// below both, and every way of finding them is run on a pair of its own: the start's, and on
     /// Linux the listing of the table as well as the one call that marks it, which the other would
-    /// hide; on Apple systems it is also said that the kernel's list was the whole of them.
+    /// hide; on Apple systems it is also said that a list that may not hold every descriptor fails
+    /// the start.
     #[test]
     fn every_descriptor_the_child_holds_is_marked_to_close_when_the_shell_is_run() {
         const IN_CHILD: &str = "KR_MARK_DESCRIPTORS_IN_CHILD";
@@ -465,10 +439,8 @@ pub(super) mod tests {
             #[cfg(target_os = "linux")]
             mark_listed_close_on_exec().expect("marks by the listing");
             #[cfg(target_vendor = "apple")]
-            assert!(
-                mark_by_the_kernels_list(&mut room).expect("marks by the list"),
-                "the kernel's list held all of the descriptors"
-            );
+            mark_by_the_kernels_list(&mut room)
+                .expect("the kernel's list held all of the descriptors, and marks them");
             #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
             mark_close_on_exec(&mut room).expect("marks");
             assert!(
@@ -508,7 +480,6 @@ pub(super) mod tests {
                         };
                         1
                     ],
-                    table_end: table_end(),
                 };
                 assert!(
                     mark_close_on_exec(&mut cramped).is_err(),
