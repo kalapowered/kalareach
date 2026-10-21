@@ -1565,7 +1565,9 @@ impl Session {
     ///
     /// Every key of the teardown goes in only once the reader has said it read the one before it,
     /// and the command only once it has said it read the last: see
-    /// [`Session::recover_one_key_at_a_time`] for what a key typed sooner can do.
+    /// [`Session::recover_one_key_at_a_time`] for what a key typed sooner can do. Where a shell
+    /// keeps an interrupt it was too busy to take up, an empty line goes in before the command
+    /// (see [`Dialect::late_interrupt_waits_for_a_line`]).
     ///
     /// # Errors
     ///
@@ -1598,9 +1600,38 @@ impl Session {
                 )
             })?;
         let left = format!("the teardown left {}", typing.describe());
+        if dialect(self.package_kind).late_interrupt_waits_for_a_line {
+            self.give_a_kept_interrupt_a_line().map_err(|why| {
+                format!(
+                    "an empty line did not come back to a reader, so no command was typed: {why}"
+                )
+            })?;
+        }
         self.still_serving(marker)
             .map_err(|why| format!("nothing was working after the teardown: {why}; {left}"))?;
         Ok(left)
+    }
+
+    /// Gives an interrupt the shell has kept a line to be acted on at, and waits for the reader to
+    /// come back from it.
+    ///
+    /// The key before it has been read, so an interrupt it raised has reached the shell: it was
+    /// delivered before the shell could read what was typed after it. The shell has either acted
+    /// on it or keeps it for the next line it accepts, and nothing the reader reports says which.
+    /// An empty line costs nothing in the second case, and in the first it is an empty command. The
+    /// command that proves the shell works goes to a shell that holds no interrupt.
+    ///
+    /// # Errors
+    ///
+    /// Returns which of the two the reader never reported: the empty line handed back, or a reader
+    /// entering after it.
+    fn give_a_kept_interrupt_a_line(&mut self) -> Result<(), String> {
+        let lifecycle = self.reader_lifetime;
+        self.type_line("");
+        let deadline = self.deadline_for(REPLY);
+        self.return_from_a_command(lifecycle, deadline)
+            .map(|_| ())
+            .map_err(str::to_owned)
     }
 
     /// Offers `keys` until the reader says a typed line would be text, and returns what it said.
@@ -2256,12 +2287,11 @@ impl Session {
     /// Puts the reader back where a drive left it, one key at a time.
     ///
     /// The keys are the ones [`Session::recover`] types, but each goes in only when the reader has
-    /// read the one before it. An interrupt that reaches a shell while it is still busy with an
-    /// earlier key is not acted on where it is: the shell goes on with that key and takes the
-    /// interrupt up later, at the next line it reads, which it then abandons after its first
-    /// character. The line a person types after the interrupt is the one that suffers, and no
-    /// length of waiting afterwards undoes it, so what is waited for is the reader's own word that
-    /// it has read what was typed.
+    /// said it read the one before it. The terminal passes keys on in order, and raises the
+    /// interrupt before it hands on the key that follows, so an interrupt has reached the shell by
+    /// the time the key after it has been read. Keys typed with no such wait are read together by a
+    /// shell that has fallen behind, and the interrupt can arrive while the shell is busy with the
+    /// key before it: see [`Dialect::late_interrupt_waits_for_a_line`] for what that leaves.
     ///
     /// `said` is what the reader last said of itself, if it has said anything since the drive
     /// began. Returns what it said of itself once it had read the last key.
@@ -2327,18 +2357,18 @@ impl Session {
                 deadline_ms: FENCE_EXCHANGE_TIMEOUT,
                 cause: FenceCause::Retry,
             }));
-            match self.answer_by(id, deadline) {
-                Some(BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement))) => {
+            match self.stamped_answer_by(id, deadline) {
+                Some((
+                    BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement)),
+                    lifetime,
+                )) => {
                     if acknowledgement.queues.all_drained() && acknowledgement.snapshot.is_drained()
                     {
-                        return Ok(ReaderMark::of_acknowledgement(
-                            &acknowledgement,
-                            self.reader_lifetime,
-                        ));
+                        return Ok(ReaderMark::of_acknowledgement(&acknowledgement, lifetime));
                     }
                     self.pump(Duration::from_millis(25));
                 }
-                Some(BridgeAnswer::Fence(RootEditorFenceResult::Refused(refusal)))
+                Some((BridgeAnswer::Fence(RootEditorFenceResult::Refused(refusal)), _))
                     if refusal.reason == kr_protocol::root::FenceRefusalReason::ReaderMoved =>
                 {
                     let Some(report) = self.next_reader_report(deadline, |_| true) else {
@@ -2356,7 +2386,7 @@ impl Session {
                          not say it had read what was typed"
                     ));
                 }
-                other => {
+                Some((other, _)) => {
                     return Err(format!(
                         "the reader answered a fence about what was typed with {other:?}"
                     ));

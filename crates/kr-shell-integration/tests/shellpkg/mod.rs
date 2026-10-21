@@ -637,8 +637,9 @@ pub struct Session {
     /// counted as they arrived.
     events: Inbox,
     /// Each answer the reader sent, with the instant it was taken off the endpoint: a wait under a
-    /// deadline accepts an answer that arrived inside its window, however late it notices it.
-    answers: HashMap<RequestId, (Instant, BridgeAnswer)>,
+    /// deadline accepts an answer that arrived inside its window, however late it notices it. The
+    /// number is how many readers of this session had entered or left when it arrived.
+    answers: HashMap<RequestId, (Instant, BridgeAnswer, u64)>,
     next_request: u64,
     /// What this session answers for the commands a line runs, and what the bridge reported.
     pub commands: Commands,
@@ -1324,7 +1325,8 @@ impl Session {
                 }
                 BridgeFrame::Answer { id, answer } => {
                     self.commands.arrivals.push(Arrival::Answer(id));
-                    self.answers.insert(id, (Instant::now(), answer));
+                    self.answers
+                        .insert(id, (Instant::now(), answer, self.reader_lifetime));
                 }
                 other => panic!("a bridge sent {other:?}"),
             }
@@ -1617,7 +1619,7 @@ impl Session {
     /// it.
     pub fn answer_before(&mut self, id: RequestId, deadline: Instant) -> BridgeAnswer {
         loop {
-            if let Some((arrived, answer)) = self.answers.remove(&id) {
+            if let Some((arrived, answer, _)) = self.answers.remove(&id) {
                 assert!(
                     arrived <= deadline,
                     "the reader answered request {id:?} {:?} after the deadline of this wait\nterminal output:\n{}",
@@ -1643,9 +1645,21 @@ impl Session {
     /// waited for another. An answer counts by the instant it came off the endpoint, as it does for
     /// [`Session::answer_before`]: one that arrived after the deadline is no answer inside it.
     pub fn answer_by(&mut self, id: RequestId, deadline: Deadline) -> Option<BridgeAnswer> {
+        self.stamped_answer_by(id, deadline)
+            .map(|(answer, _)| answer)
+    }
+
+    /// Waits as [`Session::answer_by`] does, and returns with the answer how many readers of this
+    /// session had entered or left when it arrived: an answer is about the reader that was running
+    /// then, whatever entered or left while this was still reading what came behind it.
+    pub fn stamped_answer_by(
+        &mut self,
+        id: RequestId,
+        deadline: Deadline,
+    ) -> Option<(BridgeAnswer, u64)> {
         loop {
-            if let Some((arrived, answer)) = self.answers.remove(&id) {
-                return (arrived <= deadline.0).then_some(answer);
+            if let Some((arrived, answer, lifetime)) = self.answers.remove(&id) {
+                return (arrived <= deadline.0).then_some((answer, lifetime));
             }
             // A bridge that has closed its side sends nothing more, so once every whole frame it
             // did send has been read, no answer is coming, and waiting out the deadline would be

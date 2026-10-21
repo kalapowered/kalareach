@@ -102,6 +102,15 @@ pub struct Dialect {
     /// discipline instead, which delivers a line feed, and this editor binds nothing to that. A
     /// person types at a drawn prompt, and against such an editor this session does the same.
     pub types_at_the_prompt: bool,
+    /// Whether an interrupt that reaches this editor's shell while it is busy with something else
+    /// is acted on at the next line it reads.
+    ///
+    /// The shell takes an interrupt up straight away only when it arrives while the editor waits
+    /// for a key. One that arrives while it is reading an earlier key is kept, and the next line
+    /// the shell accepts is cut short at its first character, the rest of it running as a command
+    /// of its own. Nothing the editor reports shows an interrupt kept: its queues are empty before
+    /// the shell takes it up and after.
+    pub late_interrupt_waits_for_a_line: bool,
 }
 
 /// A command that prints `marker` out of pieces it puts together as it runs.
@@ -186,6 +195,7 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             driven_exclusions: 9,
             answers_at_the_next_step: false,
             types_at_the_prompt: false,
+            late_interrupt_waits_for_a_line: false,
         },
         ShellKind::Bash => Dialect {
             bootstrap_probe: "echo \"kr-endpoint=[${KR_SHELL_BRIDGE:-unset}] kr-secret=[${KR_SHELL_BRIDGE_SECRET:-unset}]\"",
@@ -207,6 +217,7 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             driven_exclusions: 9,
             answers_at_the_next_step: false,
             types_at_the_prompt: false,
+            late_interrupt_waits_for_a_line: true,
         },
         ShellKind::Fish => Dialect {
             bootstrap_probe: "echo \"kr-endpoint=[$(set -q KR_SHELL_BRIDGE; and echo $KR_SHELL_BRIDGE; or echo unset)] kr-secret=[$(set -q KR_SHELL_BRIDGE_SECRET; and echo $KR_SHELL_BRIDGE_SECRET; or echo unset)]\"",
@@ -226,6 +237,7 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             driven_exclusions: 7,
             answers_at_the_next_step: false,
             types_at_the_prompt: false,
+            late_interrupt_waits_for_a_line: false,
         },
         ShellKind::PowerShell => Dialect {
             // Short on purpose: every character of a command is drawn again by this editor as it
@@ -246,6 +258,7 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             driven_exclusions: 1,
             answers_at_the_next_step: true,
             types_at_the_prompt: true,
+            late_interrupt_waits_for_a_line: false,
         },
     }
 }
