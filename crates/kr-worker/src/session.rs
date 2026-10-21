@@ -750,7 +750,9 @@ impl Session {
         // moment before its process exists. The terminal reads the directory first and asks the
         // terms after, and on Unix reads nothing once they have admitted the start, so a delay in
         // any of that cannot carry the session past its moment and a directory that goes after the
-        // terms have looked is not looked for again.
+        // terms have looked is not looked for again. On Windows the system reads the directory as
+        // it creates the process, so the terms are asked again once the process exists and before
+        // it runs, and a start whose moment passed in that read is ended unstarted.
         let terms = self.start_terms;
         let admit = |directory_is_there: bool| {
             terms.admits(
