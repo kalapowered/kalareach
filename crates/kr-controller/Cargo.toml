@@ -126,6 +126,10 @@ kr-worker = { workspace = true, features = ["testing"] }
 # Certificates a test issues for a loopback TLS server of its own, so a rendezvous request, the
 # room's WebSocket and mail submission are checked against a real handshake.
 rcgen.workspace = true
+# The pictures of the QR codes the device runs show a phone's camera and photo library, which the
+# host's own terminal drawing is rendered into.
+image.workspace = true
+qrcodegen.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 tempfile.workspace = true
 # The catalogue's fetch, asked directly, to show which proxy a repository is fetched through.
