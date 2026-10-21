@@ -1435,9 +1435,9 @@ async fn a_created_sessions_shell_reads_the_private_database_and_the_worker_says
              echo \"TERMINFO_DIRS=$TERMINFO_DIRS\"\n\
              echo \"file=$(infocmp -x xterm-256color | head -n 1)\"\n\
              if tput -T xterm-256color Tc >/dev/null 2>&1; then echo tc=yes; else echo tc=no; fi\n\
-             }} > '{seen}.part' && mv '{seen}.part' '{seen}'\n\
+             }} > {seen}.part && mv {seen}.part {seen}\n\
              exec cat\n",
-            seen = seen.display()
+            seen = kr_worker::testing::shell_quoted(&seen)
         ),
     )
     .expect("a shell script");

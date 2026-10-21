@@ -740,12 +740,6 @@ impl Drop for SessionTasks {
     }
 }
 
-/// Quotes a path for the shell a test session runs.
-#[cfg(unix)]
-fn quoted(path: &std::path::Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
-}
-
 /// The line a drain test's shell prints, and the only output it gives.
 #[cfg(unix)]
 const LAST_LINE: &[u8] = b"kr-read-before-the-closure";
@@ -768,7 +762,7 @@ const RECORD_ALLOWANCE: Duration = Duration::from_secs(2);
 fn prints_once(gate: &std::path::Path) -> String {
     format!(
         "until [ -e {} ]; do sleep 0.05; done; printf '{}\\n'; read -r _",
-        quoted(gate),
+        kr_worker::testing::shell_quoted(gate),
         String::from_utf8_lossy(LAST_LINE)
     )
 }

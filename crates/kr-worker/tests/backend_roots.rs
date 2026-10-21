@@ -97,9 +97,9 @@ impl Server {
         let command = format!(
             "perl -MPOSIX -e '$SIG{{HUP}} = q(DEFAULT); POSIX::setsid(); exec @ARGV' \
              /bin/sh -c '{script}' & \
-             echo $! > '{file}.part' && mv '{file}.part' '{file}'; \
+             echo $! > {file}.part && mv {file}.part {file}; \
              while :; do sleep 0.2; done",
-            file = written.display()
+            file = kr_worker::testing::shell_quoted(&written)
         );
         let process = Reaped(start("/bin/sh", &["-c", &command]));
         let identity = identity_of(&process.0);
@@ -236,8 +236,8 @@ fn kr_req_07_60_a_command_whose_server_has_gone_is_still_read_and_stopped() {
     // its own, so that process is one the walk can only find from the command.
     let script = format!(
         "while [ ! -e {go} ]; do sleep 0.05; done; sleep 600 & echo $! > {grandchild}.part; mv {grandchild}.part {grandchild}; wait",
-        go = go.display(),
-        grandchild = grandchild.display()
+        go = kr_worker::testing::shell_quoted(&go),
+        grandchild = kr_worker::testing::shell_quoted(&grandchild)
     );
     let shell = a_shell();
     let mut server = Server::start(directory.root(), "command", &script);

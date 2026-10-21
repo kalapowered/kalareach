@@ -101,8 +101,8 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
         environment_id,
         display_number: display,
         shell: kr_worker::testing::posix_script(&format!(
-            "while [ ! -e '{}' ]; do sleep 0.05; done; while true; do i=0; while [ $i -lt 2000 ]; do printf 'line-%s-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' $i; i=$((i+1)); done; sleep 1; done",
-            go.display()
+            "while [ ! -e {} ]; do sleep 0.05; done; while true; do i=0; while [ $i -lt 2000 ]; do printf 'line-%s-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' $i; i=$((i+1)); done; sleep 1; done",
+            kr_worker::testing::shell_quoted(&go)
         )),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,

@@ -78,6 +78,37 @@ pub fn posix_script(script: &str) -> ShellCommand {
     }
 }
 
+/// A path as one single-quoted word of the POSIX shell a test session is given, whatever
+/// characters it holds.
+///
+/// Inside single quotes every character stands for itself except the quote, which ends them, so a
+/// quote in the path is closed over, given as an escaped quote of its own, and reopened. On Windows
+/// its separators are forward slashes: the command line that shell is given reads a pair of
+/// backslashes inside a quoted argument as one, so a UNC prefix would lose one of its two. The
+/// backslash of an escaped quote stands alone before a quote, which that reading keeps. The line is
+/// text, as the session's environment and the keys typed into it are, so a path that is not text is
+/// refused rather than quoted as some other path its lossy spelling would name.
+///
+/// # Panics
+///
+/// Panics when the path is not valid UTF-8.
+#[must_use]
+pub fn shell_quoted(path: &std::path::Path) -> String {
+    let text = path.to_str().unwrap_or_else(|| {
+        panic!(
+            "{} is not UTF-8, and a shell line, the keys typed into a session and its \
+             environment are all text, so a test cannot put it in one",
+            path.display()
+        )
+    });
+    let text = if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.to_owned()
+    };
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
 /// Returns the path of this machine's POSIX shell.
 ///
 /// On Windows the first call in a process also starts one copy of the shell and keeps it running
@@ -338,6 +369,20 @@ fn find_powershell() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A path that is not UTF-8 is refused, rather than quoted as the other path its lossy
+    /// spelling would name. The path is only a value here: no file system is asked to hold it.
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "is not UTF-8")]
+    fn a_path_that_is_not_text_is_refused_rather_than_quoted() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            b"/tmp/kr-probes-\xff/bin/kr-probe".to_vec(),
+        ));
+        let _ = shell_quoted(&path);
+    }
 
     #[test]
     fn this_machine_has_a_posix_shell_to_run_a_script_with() {

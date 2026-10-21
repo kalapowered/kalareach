@@ -572,7 +572,7 @@ async fn a_forced_close_ends_what_the_session_owns_when_the_root_shells_status_c
         &host,
         &format!(
             "nohup sleep 300 >/dev/null 2>&1 & echo $! > {}; exec cat",
-            quoted(&named)
+            kr_worker::testing::shell_quoted(&named)
         ),
     );
     let mut session = Session::open(config).expect("opens");
@@ -2329,26 +2329,7 @@ async fn the_palette_a_create_request_names_reaches_the_launched_session() {
 ///
 /// The shell's own redirection makes the file, so no utility has to be on its path.
 fn leaves_mark(marker: &std::path::Path) -> String {
-    format!(": > {}", quoted(marker))
-}
-
-/// A path as one single-quoted word of the POSIX shell a session is given.
-///
-/// A quote in it is closed over, given as an escaped quote of its own and reopened. On Windows its
-/// separators are forward slashes: the command line that shell is given reads a pair of backslashes
-/// inside a quoted argument as one, so a UNC prefix would lose one of its two. The backslash of an
-/// escaped quote stands alone before a quote, which that reading keeps. A path that is not text is
-/// refused rather than named as some other path.
-fn quoted(path: &std::path::Path) -> String {
-    let text = path
-        .to_str()
-        .expect("the host's temporary directory is text");
-    let text = if cfg!(windows) {
-        text.replace('\\', "/")
-    } else {
-        text.to_owned()
-    };
-    format!("'{}'", text.replace('\'', r"'\''"))
+    format!(": > {}", kr_worker::testing::shell_quoted(marker))
 }
 
 /// A start that was refused created no process, and so left no mark.

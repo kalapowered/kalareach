@@ -725,7 +725,11 @@ async fn a_command_that_ended_elsewhere_reports_where_the_shell_is_now() {
     let root = tempfile::tempdir().expect("a directory");
     let inside = root.path().join("moved-to");
     std::fs::create_dir_all(&inside).expect("a directory to be in");
-    let host = host(&format!("cd '{}' && exec cat", inside.display())).await;
+    let host = host(&format!(
+        "cd {} && exec cat",
+        kr_worker::testing::shell_quoted(&inside)
+    ))
+    .await;
     let mut link = daemon(&host, ControllerConnectionRole::Descriptions).await;
     let base = ask(&mut link, 1, 0, 0, Some(0)).await;
     assert_eq!(base.facts.0, None);
