@@ -117,6 +117,7 @@ jobs:
           python3 scripts/check-release-floors.py self-test
           python3 scripts/check-release-secrets.py self-test
           python3 scripts/check-release-archive.py self-test
+          python3 scripts/package-managers.py self-test
 
       - name: Name the executables
         run: |
