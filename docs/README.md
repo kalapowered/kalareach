@@ -74,6 +74,7 @@ Releases:
 | [releases/packages.md](releases/packages.md) | How the generated protocol and plugin SDK packages are released and pinned, and the managed shell packages' update target |
 | [releases/manifest.md](releases/manifest.md) | What a release tree and its signed manifest state, the record of what a release was qualified against, how a tree is built, signed and installed by a package manager, and why publishing waits for the channel's release keys |
 | [releases/windows-signing.md](releases/windows-signing.md) | How Windows executables and PowerShell packages are signed, and the identity behind the signatures |
+| [releases/independent-builds.md](releases/independent-builds.md) | What an independently signed build of the companion app supplies for push (its own Firebase project, APNs key and gateway origin), and the scan that keeps every official credential out of the repository, a release tree and an archive |
 | [releases/platforms.md](releases/platforms.md) | The platforms and oldest releases a release runs on, where each executable is built, how each one's floor is read back, and the Linux distributions tested |
 | [releases/evidence-gates.md](releases/evidence-gates.md) | The seven gates a release is made against, the evidence that closes each and the commands that produce it, and the pairing review exception |
 | [releases/support-window.md](releases/support-window.md) | The public protocol majors a host negotiates and how long each is supported, the retained levels, and how a running session keeps working across an update |
