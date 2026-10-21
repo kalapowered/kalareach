@@ -34,7 +34,7 @@
 //!
 //! # What is signed
 //!
-//! Three domains, each covering `CBOR([domain, payload])` where the payload is the record without
+//! Four domains, each covering `CBOR([domain, payload])` where the payload is the record without
 //! its signature:
 //!
 //! | Domain | Payload |
@@ -42,6 +42,7 @@
 //! | [`MEMBERSHIP_LEASE_DOMAIN`] | [`MembershipLeasePayload`] |
 //! | [`POLICY_AUTHORITY_DOMAIN`] | [`PolicyAuthorityLinkPayload`] |
 //! | [`POLICY_AUTHORITY_HEAD_DOMAIN`] | [`PolicyAuthorityHeadPayload`] |
+//! | [`ORGANISATION_POLICY_DOMAIN`] | [`OrganisationPolicyPayload`] |
 //!
 //! Every payload is a closed schema and every map is in KR-CBOR-1 key order, so an issuer and a
 //! verifier that both build the payload from these types cover identical bytes. `fixtures/accounts`
@@ -419,7 +420,8 @@ pub struct BackupPolicy {
 pub struct OrganisationPolicyPayload {
     /// The organisation the policy belongs to.
     pub organisation_id: OrganisationId,
-    /// The revision this record establishes. A host refuses one below the revision it holds.
+    /// The revision this record establishes. A host refuses one at or below the revision it holds,
+    /// except the same policy again.
     pub policy_revision: OrganisationPolicyRevision,
     /// The adapters members may run, or null for every adapter the host qualifies.
     pub adapter_allowlist: Nullable<CanonicalSet<PluginId>>,
@@ -546,9 +548,10 @@ impl OrganisationPolicyPayload {
 
 /// One organisation's host policy, signed by its policy-signing key.
 ///
-/// A host that pinned the organisation's policy-signing authority follows the chain to the revision
-/// signing now and checks this signature against it, so what a host applies is the organisation's
-/// own statement rather than the service's word about it.
+/// A host that pinned the organisation's policy-signing authority checks this signature under the
+/// key its chain ends with, which is the revision `key_revision` names: a policy under a later
+/// revision needs the chain beside it, and one under an earlier revision is refused. So what a host
+/// applies is the organisation's own statement rather than the service's word about it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OrganisationPolicy {

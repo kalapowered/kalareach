@@ -154,7 +154,7 @@ use crate::organisation::{
     OrganisationEnrolParams, OrganisationEnrolResult, OrganisationEnrolmentView,
     OrganisationExclusiveSetParams, OrganisationExclusiveSetResult, OrganisationLeaseView,
     OrganisationListParams, OrganisationListResult, OrganisationMemberView,
-    OrganisationWithdrawParams,
+    OrganisationPolicyApplyParams, OrganisationPolicyApplyResult, OrganisationWithdrawParams,
 };
 use crate::pairing::{
     AuthorityRevisionRecord, DirectChallenge, DirectRedeemProof, GenerationCheckpoint,
@@ -918,6 +918,8 @@ pub fn protocol_schema() -> Value {
         "organisation_list_params" => OrganisationListParams,
         "organisation_list_result" => OrganisationListResult,
         "organisation_member_view" => OrganisationMemberView,
+        "organisation_policy_apply_params" => OrganisationPolicyApplyParams,
+        "organisation_policy_apply_result" => OrganisationPolicyApplyResult,
         "organisation_withdraw_params" => OrganisationWithdrawParams,
     }
     properties.insert(

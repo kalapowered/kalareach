@@ -142,6 +142,14 @@ impl Controller {
         if let Some(marker) = self.organisation_marker(mutation, &record) {
             return self.answered_from_the_barrier(marker).await;
         }
+        // A policy the owner applied is the answer once the adapters it allows are in force: the
+        // action that applied it may have been told they were not, and a repeat is not given the
+        // recorded success while that stands.
+        if mutation.method.method() == Some(Method::OrganisationPolicyApply)
+            && matches!(record, crate::grants::ActionRecord::Answered { .. })
+        {
+            self.put_the_adapters_the_policy_allows().await?;
+        }
         match self.answer_without_fence(actor_id, mutation, &record) {
             Some(answer) => answer,
             None => self.revocation_on_record(actor_id, mutation).await,
@@ -976,6 +984,10 @@ impl Controller {
                 Method::OrganisationWithdraw => {
                     self.organisation_withdraw(mutation, carried, &hold).await
                 }
+                Method::OrganisationPolicyApply => {
+                    self.organisation_policy_apply(mutation, carried, &hold)
+                        .await
+                }
                 Method::DevicePreviewKeyUpdate => {
                     self.device_preview_key_update(actor_id, mutation, carried)
                         .await
@@ -1003,6 +1015,7 @@ impl Controller {
         let kept = matches!(
             method,
             Method::OrganisationEnrol
+                | Method::OrganisationPolicyApply
                 | Method::OrganisationWithdraw
                 | Method::OrganisationExclusiveSet
         ) && outcome.is_ok();

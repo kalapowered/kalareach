@@ -29,23 +29,25 @@
 //! requires an organisation answers to the lease of the account and key its recipient device is
 //! bound to, and to no other.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use kr_crypto::sign::SigningTranscript;
 use kr_protocol::account::{
     ChainError, MEMBERSHIP_LEASE_DOMAIN, MEMBERSHIP_LEASE_MAX_LIFETIME_MS, MembershipLease,
-    POLICY_AUTHORITY_DOMAIN, POLICY_AUTHORITY_HEAD_DOMAIN, PolicyAuthority, PolicyAuthorityHead,
-    PolicyAuthorityLink,
+    ORGANISATION_POLICY_DOMAIN, OrganisationPolicy, POLICY_AUTHORITY_DOMAIN,
+    POLICY_AUTHORITY_HEAD_DOMAIN, PolicyAuthority, PolicyAuthorityHead, PolicyAuthorityLink,
+    PolicyError,
 };
 use kr_protocol::ids::{
-    AccountId, AuthorityRevision, ControllerGeneration, DeviceId, OrganisationId, PolicyKeyRevision,
+    AccountId, AuthorityRevision, ControllerGeneration, DeviceId, OrganisationId,
+    OrganisationPolicyRevision, PluginId, PolicyKeyRevision,
 };
-use kr_protocol::scalars::{AuthorisationKey, Digest256, Signature64};
+use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Digest256, Nullable, Signature64};
 use kr_transport::clock::ContinuousInstant;
 
-use super::durable::{StoredBinding, StoredEnrolment, StoredLeaseRecord};
+use super::durable::{StoredAppliedPolicy, StoredBinding, StoredEnrolment, StoredLeaseRecord};
 use super::policy::{BoundCell, BoundIdentity, HeldBound};
 use crate::service::net::devices::ObservedUtc;
 
@@ -110,6 +112,103 @@ impl core::fmt::Display for ChainRefused {
             Self::HeadNotCurrent => formatter.write_str("the head is not current"),
             Self::ClockUntrusted => formatter.write_str(super::CLOCK_DISTRUSTED),
             Self::FloorUnrecorded => formatter.write_str(super::FLOOR_UNRECORDED),
+        }
+    }
+}
+
+/// Why an organisation's policy was not applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyRefused {
+    /// The host is not enrolled in the policy's organisation.
+    NotEnrolled,
+    /// The policy breaks a rule of its own, which needs neither a signature nor the clock.
+    Structure(PolicyError),
+    /// The chain beside the policy is another organisation's.
+    ForeignChain,
+    /// The chain beside the policy was not followed.
+    Chain(ChainRefused),
+    /// The chain beside the policy shows an installed lease was signed after its key was
+    /// succeeded, and dropping it owes a fence this request does not raise.
+    ChainDropsLeases,
+    /// The policy is signed under a revision later than the one this host has accepted.
+    LaterRevision {
+        /// The highest key revision this host has accepted.
+        held: PolicyKeyRevision,
+    },
+    /// The policy is signed under an earlier revision than the one this host has accepted.
+    EarlierRevision {
+        /// The highest key revision this host has accepted.
+        held: PolicyKeyRevision,
+    },
+    /// The signature is not the accepted revision's over the policy's signing input.
+    BadSignature,
+    /// The policy was issued before the revision that signed it took over.
+    IssuedBeforeActivation,
+    /// The policy's revision is at or below the one this host holds, and it is not that policy
+    /// again.
+    NotNewer {
+        /// The revision this host holds.
+        held: OrganisationPolicyRevision,
+    },
+}
+
+impl PolicyRefused {
+    /// The rule's stable name, which a refusal carries so an owner's tooling can tell one from
+    /// another without reading the sentence.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::NotEnrolled => "not_enrolled",
+            Self::Structure(_) => "structure",
+            Self::ForeignChain => "foreign_chain",
+            Self::Chain(_) => "chain",
+            Self::ChainDropsLeases => "chain_drops_leases",
+            Self::LaterRevision { .. } => "later_revision",
+            Self::EarlierRevision { .. } => "earlier_revision",
+            Self::BadSignature => "bad_signature",
+            Self::IssuedBeforeActivation => "issued_before_activation",
+            Self::NotNewer { .. } => "not_newer",
+        }
+    }
+}
+
+impl core::fmt::Display for PolicyRefused {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotEnrolled => {
+                formatter.write_str("this host is not enrolled in that organisation")
+            }
+            Self::Structure(error) => write!(formatter, "the policy is malformed: {error}"),
+            Self::ForeignChain => {
+                formatter.write_str("the chain beside the policy is another organisation's")
+            }
+            Self::Chain(error) => write!(formatter, "{error}"),
+            Self::ChainDropsLeases => formatter.write_str(
+                "the chain shows that a lease this host holds was signed after its key was \
+                 succeeded; present the chain with a lease first, so the host fences it",
+            ),
+            Self::LaterRevision { held } => write!(
+                formatter,
+                "the policy is signed under a key revision later than {}, the one this host has \
+                 accepted; give the organisation's chain beside the policy",
+                held.get()
+            ),
+            Self::EarlierRevision { held } => write!(
+                formatter,
+                "the policy is signed under a key revision earlier than {}, the one this host has \
+                 accepted; the organisation must sign its policy with its current key",
+                held.get()
+            ),
+            Self::BadSignature => formatter
+                .write_str("the policy is not signed by the key revision this host has accepted"),
+            Self::IssuedBeforeActivation => {
+                formatter.write_str("the policy was issued before its signing revision took over")
+            }
+            Self::NotNewer { held } => write!(
+                formatter,
+                "the policy is not newer than revision {}, which this host holds",
+                held.get()
+            ),
         }
     }
 }
@@ -504,6 +603,16 @@ pub enum ChainOutcome {
     },
 }
 
+/// What this host keeps of an organisation's policy once it has verified and applied it: the
+/// revision the floor stands at, and the adapters the policy allows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppliedPolicy {
+    /// The revision of the policy. A policy at or below it is not applied again.
+    pub revision: OrganisationPolicyRevision,
+    /// The adapters the policy allows, or none stated for every adapter this host qualifies.
+    pub adapter_allowlist: Option<BTreeSet<PluginId>>,
+}
+
 /// One organisation this host is enrolled in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Enrolment {
@@ -513,6 +622,8 @@ pub struct Enrolment {
     links: Vec<PolicyAuthorityLink>,
     accepted_head: PolicyKeyRevision,
     enrolment_revision: AuthorityRevision,
+    /// The organisation policy the owner applied, once one has been.
+    applied: Option<AppliedPolicy>,
     /// The devices bound to member accounts, each by the first verified lease it presented.
     members: BTreeMap<DeviceId, Binding>,
     /// The leases installed now, one per member account and device key. Private: only
@@ -528,6 +639,7 @@ impl Enrolment {
             links: vec![verified.anchor],
             root: verified.root,
             enrolment_revision,
+            applied: None,
             members: BTreeMap::new(),
             installed: BTreeMap::new(),
         }
@@ -540,6 +652,13 @@ impl Enrolment {
             links: stored.links.clone(),
             accepted_head: stored.accepted_head,
             enrolment_revision: stored.enrolment_revision,
+            applied: stored.applied_policy.as_ref().map(|applied| AppliedPolicy {
+                revision: applied.organisation_policy_revision,
+                adapter_allowlist: applied
+                    .adapter_allowlist
+                    .as_ref()
+                    .map(|adapters| adapters.iter().cloned().collect()),
+            }),
             members: stored
                 .members
                 .iter()
@@ -567,6 +686,15 @@ impl Enrolment {
             links: self.links.clone(),
             accepted_head: self.accepted_head,
             enrolment_revision: self.enrolment_revision,
+            applied_policy: self.applied.as_ref().map(|applied| StoredAppliedPolicy {
+                organisation_policy_revision: applied.revision,
+                adapter_allowlist: Nullable(
+                    applied
+                        .adapter_allowlist
+                        .as_ref()
+                        .map(|adapters| adapters.iter().cloned().collect::<CanonicalSet<_>>()),
+                ),
+            }),
             members: self
                 .members
                 .iter()
@@ -652,6 +780,12 @@ impl Enrolment {
     #[must_use]
     pub fn links(&self) -> &[PolicyAuthorityLink] {
         &self.links
+    }
+
+    /// The organisation policy the owner applied, once one has been.
+    #[must_use]
+    pub const fn applied_policy(&self) -> Option<&AppliedPolicy> {
+        self.applied.as_ref()
     }
 
     /// The highest head revision this host has accepted.
@@ -775,6 +909,68 @@ impl Enrolment {
         {
             self.links.remove(0);
         }
+    }
+
+    /// Applies an organisation's policy to this enrolment, once it has verified it.
+    ///
+    /// Only the anchor signs a policy: the revision the policy names is the highest this host has
+    /// accepted, so the key that signs it is the one the chain ends with, and the same policy gets
+    /// the same answer from every host that follows the same chain, whatever links each keeps for
+    /// the leases it holds. Then the signature, that the anchor had taken over when the policy was
+    /// issued, and the floor: a policy at or below the revision held is refused, except the same
+    /// revision with the same allowlist, which changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first rule the policy breaks. Nothing changes then.
+    pub(crate) fn apply_policy(
+        &mut self,
+        policy: &OrganisationPolicy,
+    ) -> Result<(), PolicyRefused> {
+        let payload = &policy.payload;
+        let held = self.accepted_head;
+        match payload.key_revision.get().cmp(&held.get()) {
+            core::cmp::Ordering::Greater => return Err(PolicyRefused::LaterRevision { held }),
+            core::cmp::Ordering::Less => return Err(PolicyRefused::EarlierRevision { held }),
+            core::cmp::Ordering::Equal => {}
+        }
+        let anchor = self.anchor();
+        let signed = payload.signing_input().ok().is_some_and(|input| {
+            verifies(
+                ORGANISATION_POLICY_DOMAIN,
+                input,
+                &anchor.payload.public_key,
+                &policy.signature,
+            )
+        });
+        if !signed {
+            return Err(PolicyRefused::BadSignature);
+        }
+        if anchor.payload.not_before_ms.get() > payload.issued_at_ms.get() {
+            return Err(PolicyRefused::IssuedBeforeActivation);
+        }
+        let allowlist: Option<BTreeSet<PluginId>> = payload
+            .adapter_allowlist
+            .as_ref()
+            .map(|adapters| adapters.iter().cloned().collect());
+        if let Some(applied) = &self.applied
+            && !payload.follows(applied.revision)
+        {
+            return if payload.policy_revision == applied.revision
+                && allowlist == applied.adapter_allowlist
+            {
+                Ok(())
+            } else {
+                Err(PolicyRefused::NotNewer {
+                    held: applied.revision,
+                })
+            };
+        }
+        self.applied = Some(AppliedPolicy {
+            revision: payload.policy_revision,
+            adapter_allowlist: allowlist,
+        });
+        Ok(())
     }
 
     /// Checks a lease against this enrolment's links and the presenting connection's key: the

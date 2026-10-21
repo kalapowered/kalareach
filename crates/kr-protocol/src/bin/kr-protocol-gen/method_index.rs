@@ -127,6 +127,7 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         Method::HostUpdateHandover => at(HOST_UPDATES, "The handover"),
         Method::OrganisationEnrol
         | Method::OrganisationList
+        | Method::OrganisationPolicyApply
         | Method::OrganisationExclusiveSet
         | Method::OrganisationWithdraw
         | Method::MembershipPresent => at(HOST, "Organisation policy"),

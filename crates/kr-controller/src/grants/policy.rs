@@ -27,14 +27,14 @@
 //! whatever its policy file holds will happily load last month's file. The floor is separate from
 //! the loaded document for that reason, and it only ever goes up.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kr_protocol::account::{MEMBERSHIP_LEASE_MAX_LIFETIME_MS, PolicyAuthority};
+use kr_protocol::account::{MEMBERSHIP_LEASE_MAX_LIFETIME_MS, OrganisationPolicy, PolicyAuthority};
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::grant::{Grant, GrantExpiry};
-use kr_protocol::ids::{AccountId, AuthorityRevision, DeviceId, OrganisationId};
+use kr_protocol::ids::{AccountId, AuthorityRevision, DeviceId, OrganisationId, PluginId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{AuthorisationKey, CanonicalSet};
@@ -44,7 +44,7 @@ use kr_transport::clock::ContinuousInstant;
 use super::durable::StoredPolicy;
 use super::organisation::{
     self, ChainOutcome, ChainRefused, Enrolment, LeaseHolder, LeaseInstalled, LeasePresentation,
-    LeaseRecord, LeaseRefused, LeaseTime, MemberLease, VerifiedEnrolment,
+    LeaseRecord, LeaseRefused, LeaseTime, MemberLease, PolicyRefused, VerifiedEnrolment,
 };
 use super::{AccessRequest, Refusal};
 use crate::service::net::devices::ObservedUtc;
@@ -902,6 +902,72 @@ impl HostPolicy {
         self.enrolments
             .iter()
             .map(|(organisation_id, enrolment)| (*organisation_id, enrolment))
+    }
+
+    /// The adapters this host admits under the policies its organisations applied: the adapters
+    /// every enrolled organisation that states a list allows, which is the intersection of the
+    /// lists, or none stated while no enrolled organisation states one.
+    ///
+    /// Two organisations whose lists share nothing leave an empty set, which admits no adapter.
+    #[must_use]
+    pub fn adapter_allowlist(&self) -> Option<BTreeSet<PluginId>> {
+        self.enrolments
+            .values()
+            .filter_map(|enrolment| enrolment.applied_policy()?.adapter_allowlist.as_ref())
+            .fold(None, |allowed, list| {
+                Some(match allowed {
+                    None => list.clone(),
+                    Some(allowed) => allowed.intersection(list).cloned().collect(),
+                })
+            })
+    }
+
+    /// Applies an organisation's signed policy, with the organisation's chain beside it when the
+    /// chain has moved.
+    ///
+    /// The rules are in the order [`PolicyRefused`] lists them. A chain is followed first, on this
+    /// policy, because the key that signs a policy is the one the chain ends with; a chain that is
+    /// not newer changes nothing, and one that would drop an installed lease is refused, since
+    /// dropping a lease owes a fence that presenting the chain with a lease raises.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first rule the policy or the chain breaks. The caller applies it to a copy, and
+    /// nothing is kept then.
+    pub fn apply_organisation_policy(
+        &mut self,
+        policy: &OrganisationPolicy,
+        authority: Option<&PolicyAuthority>,
+        reading: Option<&ObservedUtc>,
+    ) -> std::result::Result<(), PolicyRefused> {
+        let organisation_id = policy.payload.organisation_id;
+        if !self.enrolments.contains_key(&organisation_id) {
+            return Err(PolicyRefused::NotEnrolled);
+        }
+        policy
+            .payload
+            .check_structure()
+            .map_err(PolicyRefused::Structure)?;
+        if let Some(authority) = authority {
+            if authority.organisation_id != organisation_id {
+                return Err(PolicyRefused::ForeignChain);
+            }
+            match self
+                .accept_chain(authority, reading)
+                .map_err(PolicyRefused::Chain)?
+            {
+                ChainOutcome::Advanced { dropped, .. } if !dropped.is_empty() => {
+                    return Err(PolicyRefused::ChainDropsLeases);
+                }
+                ChainOutcome::Advanced { .. }
+                | ChainOutcome::Unchanged
+                | ChainOutcome::Stale { .. } => {}
+            }
+        }
+        self.enrolments
+            .get_mut(&organisation_id)
+            .ok_or(PolicyRefused::NotEnrolled)?
+            .apply_policy(policy)
     }
 
     /// Whether `device_id` is bound to a member account in any organisation this host is enrolled

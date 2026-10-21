@@ -11,16 +11,21 @@ use kr_controller::service::net::devices::ObservedUtc;
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::SigningTranscript;
 use kr_protocol::account::{
-    MEMBERSHIP_LEASE_DOMAIN, MEMBERSHIP_LEASE_MAX_LIFETIME_MS, MembershipLease,
-    MembershipLeasePayload, POLICY_AUTHORITY_DOMAIN, POLICY_AUTHORITY_HEAD_DOMAIN,
-    POLICY_AUTHORITY_HEAD_MAX_LIFETIME_MS, PolicyAuthority, PolicyAuthorityHead,
-    PolicyAuthorityHeadPayload, PolicyAuthorityLink, PolicyAuthorityLinkPayload, TeamRole,
+    BackupPolicy, ExternalProviderPolicy, MEMBERSHIP_LEASE_DOMAIN,
+    MEMBERSHIP_LEASE_MAX_LIFETIME_MS, MembershipLease, MembershipLeasePayload,
+    ORGANISATION_POLICY_DOMAIN, OrganisationPolicy, OrganisationPolicyPayload,
+    POLICY_AUTHORITY_DOMAIN, POLICY_AUTHORITY_HEAD_DOMAIN, POLICY_AUTHORITY_HEAD_MAX_LIFETIME_MS,
+    PolicyAuthority, PolicyAuthorityHead, PolicyAuthorityHeadPayload, PolicyAuthorityLink,
+    PolicyAuthorityLinkPayload, TeamRole,
 };
 use kr_protocol::ids::{
-    AccountId, ControllerGeneration, DeviceId, OrganisationId, PolicyKeyRevision,
+    AccountId, ControllerGeneration, DeviceId, OrganisationId, OrganisationPolicyRevision,
+    PluginId, PolicyKeyRevision,
 };
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{AuthorisationKey, Nullable, Signature64, TimestampMs, Uuid};
+use kr_protocol::scalars::{
+    AuthorisationKey, CanonicalSet, Nullable, Signature64, TimestampMs, U64, Uuid,
+};
 use kr_transport::clock::ContinuousInstant;
 
 /// The moment the tests' clocks start from: 2026-01-01T00:00:00Z, in UTC milliseconds.
@@ -196,6 +201,72 @@ impl Organisation {
             ),
             payload,
         }
+    }
+
+    /// The payload of this organisation's policy at `policy_revision`, naming `adapters` (every
+    /// adapter when there is none), issued at `issued_ms` under key revision `key_revision`.
+    #[must_use]
+    pub fn policy_payload(
+        &self,
+        key_revision: u64,
+        policy_revision: u64,
+        adapters: Option<&[&str]>,
+        issued_ms: u64,
+    ) -> OrganisationPolicyPayload {
+        OrganisationPolicyPayload {
+            organisation_id: self.organisation_id,
+            policy_revision: OrganisationPolicyRevision::new(policy_revision),
+            adapter_allowlist: Nullable(adapters.map(|names| {
+                names
+                    .iter()
+                    .map(|name| PluginId::new(*name).expect("a plugin identifier"))
+                    .collect::<CanonicalSet<PluginId>>()
+            })),
+            minimum_client_version: Nullable::null(),
+            maximum_grant_lifetime_ms: Nullable::null(),
+            external_providers: ExternalProviderPolicy::OrganisationOnly,
+            backup: BackupPolicy {
+                required: false,
+                recovery_recipient: Nullable::null(),
+            },
+            audit_retention_days: U64::new(365),
+            issued_at_ms: TimestampMs::new(issued_ms),
+            key_revision: PolicyKeyRevision::new(key_revision),
+        }
+    }
+
+    /// This organisation's policy as the revision `key_revision` signs it: `payload` as given, and
+    /// that revision's signature over it.
+    #[must_use]
+    pub fn signed_policy(
+        &self,
+        key_revision: u64,
+        payload: OrganisationPolicyPayload,
+    ) -> OrganisationPolicy {
+        OrganisationPolicy {
+            signature: sign(
+                self.key(key_revision),
+                ORGANISATION_POLICY_DOMAIN,
+                payload.signing_input(),
+            ),
+            payload,
+        }
+    }
+
+    /// A policy at `policy_revision` naming `adapters`, signed by `key_revision` and issued at
+    /// `issued_ms`.
+    #[must_use]
+    pub fn policy(
+        &self,
+        key_revision: u64,
+        policy_revision: u64,
+        adapters: Option<&[&str]>,
+        issued_ms: u64,
+    ) -> OrganisationPolicy {
+        self.signed_policy(
+            key_revision,
+            self.policy_payload(key_revision, policy_revision, adapters, issued_ms),
+        )
     }
 
     /// Enrols `policy` in this organisation from the authority published at `at_ms`.

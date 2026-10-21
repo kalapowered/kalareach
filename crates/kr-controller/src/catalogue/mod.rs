@@ -638,21 +638,35 @@ impl CatalogueModule {
         record_disable_policy(&mut catalogue, wanted).map_err(ProtocolError::from)
     }
 
-    /// Puts the adapters an organisation's policy allows in force for the admissions that follow,
-    /// or every adapter with `None`, and returns true when that changed what was in force, so the
-    /// caller sends every worker a round.
+    /// Puts the adapters the organisations' policies allow in force for the admissions that
+    /// follow, or every adapter with `None`, and returns true when that changed what was in force,
+    /// so the caller sends every worker a round.
+    ///
+    /// `allowed` is read once this call holds the catalogue, which is what the host's policy says
+    /// at that moment: two changes cannot leave the list of the older one in force. The wait for
+    /// the catalogue, which a synchronisation holds across its network work, ends at `deadline`.
     ///
     /// # Errors
     ///
-    /// Returns the refusal the catalogue gave when the revision could not be raised, and then the
-    /// list in force is the one before.
+    /// Returns `RESOURCE_UNAVAILABLE` when the catalogue is still busy at `deadline`, and the
+    /// refusal the catalogue gave when the revision could not be raised. The list in force is the
+    /// one before then, and the same call again tries again.
     pub async fn put_allowed_adapters(
         &self,
-        allowed: Option<std::collections::BTreeSet<PluginId>>,
+        allowed: impl FnOnce() -> Option<std::collections::BTreeSet<PluginId>>,
+        deadline: tokio::time::Instant,
     ) -> Answer<bool> {
-        let mut catalogue = self.catalogue.lock().await;
+        let mut catalogue = tokio::time::timeout_at(deadline, self.catalogue.lock())
+            .await
+            .map_err(|_| {
+                ProtocolError::new(
+                    ErrorCode::ResourceUnavailable,
+                    "the catalogue is busy with another change or a package is slow to read, so \
+                     the adapters the organisations allow were not put in force",
+                )
+            })?;
         let moved = catalogue
-            .set_allowed_adapters(allowed, &Owner::acting())
+            .set_allowed_adapters(allowed(), &Owner::acting())
             .map_err(ProtocolError::from)?;
         if moved {
             // The list changed which packages may run in an application's name, so each bridge

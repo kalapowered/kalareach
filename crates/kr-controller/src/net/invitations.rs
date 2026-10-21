@@ -155,8 +155,8 @@ pub fn prepare(directory: &DeviceDirectory) -> Result<()> {
             transaction
                 .execute(
                     "INSERT INTO host_owner (id, how, device_id, invitation_id, established_at_ms)
-                     VALUES (0, 'migrated', NULL, NULL, ?1)",
-                    params![to_sql(kr_ipc::now_ms().get())],
+                     VALUES (0, ?1, NULL, NULL, ?2)",
+                    params![HOST_OWNER_MIGRATED, to_sql(kr_ipc::now_ms().get())],
                 )
                 .map_err(ControllerError::registry)?;
         }
@@ -179,6 +179,20 @@ fn holds_owner_device(connection: &Connection) -> Result<bool> {
             .map_or(true, |grant| grant.permits(ActionRight::HostManage))
     }))
 }
+
+/// The words the host owner record's `how` column holds, which the stored-format lock holds.
+pub const HOST_OWNER_WORDS: [&str; 2] = [HOST_OWNER_MIGRATED, HOST_OWNER_FIRST];
+
+/// The words the invitation record's `state` column holds, which the stored-format lock holds.
+pub const INVITATION_STATE_WORDS: [&str; 4] =
+    [STATE_OPEN, STATE_LOCKED, STATE_COMMITTED, STATE_CONSUMED];
+
+const HOST_OWNER_MIGRATED: &str = "migrated";
+const HOST_OWNER_FIRST: &str = "first_owner";
+const STATE_OPEN: &str = "open";
+const STATE_LOCKED: &str = "locked";
+const STATE_COMMITTED: &str = "committed";
+const STATE_CONSUMED: &str = "consumed";
 
 /// How this host has an owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -537,8 +551,8 @@ impl InvitationRows {
                     .optional()
             })?
             .map(|(how, device, invitation)| match how.as_str() {
-                "migrated" => Ok(HostOwner::Migrated),
-                "first_owner" => Ok(HostOwner::FirstOwner {
+                HOST_OWNER_MIGRATED => Ok(HostOwner::Migrated),
+                HOST_OWNER_FIRST => Ok(HostOwner::FirstOwner {
                     device_id: DeviceId::new(uuid(device.as_deref())?),
                     invitation_id: InvitationId::new(uuid(invitation.as_deref())?),
                 }),
@@ -1080,11 +1094,12 @@ fn commit_pairing(
         transaction
             .execute(
                 "INSERT INTO host_owner (id, how, device_id, invitation_id, established_at_ms)
-                 VALUES (0, 'first_owner', ?1, ?2, ?3)",
+                 VALUES (0, ?4, ?1, ?2, ?3)",
                 params![
                     commitment.device_id.get().as_bytes().as_slice(),
                     commitment.invitation_id.get().as_bytes().as_slice(),
                     to_sql(commitment.committed_at_ms.get()),
+                    HOST_OWNER_FIRST,
                 ],
             )
             .map_err(ControllerError::registry)?;
@@ -1622,12 +1637,12 @@ fn read_record(
 
 fn decode_record(raw: &RawRow) -> Result<InvitationRecord> {
     let state = match raw.state.as_str() {
-        "open" => InvitationState::Open,
-        "locked" => InvitationState::Locked {
+        STATE_OPEN => InvitationState::Open,
+        STATE_LOCKED => InvitationState::Locked {
             attempt_id: AttemptId::new(uuid(raw.locked_attempt.as_deref())?),
         },
-        "committed" => InvitationState::Committed,
-        "consumed" => InvitationState::Consumed {
+        STATE_COMMITTED => InvitationState::Committed,
+        STATE_CONSUMED => InvitationState::Consumed {
             reason: reason_from(raw.consumed_reason.as_deref())?,
         },
         other => {
@@ -1785,12 +1800,14 @@ struct StateColumns {
 
 fn state_columns(state: InvitationState) -> Result<StateColumns> {
     let (state, locked, reason) = match state {
-        InvitationState::Open => ("open", None, None),
-        InvitationState::Locked { attempt_id } => {
-            ("locked", Some(attempt_id.get().as_bytes().to_vec()), None)
-        }
-        InvitationState::Committed => ("committed", None, None),
-        InvitationState::Consumed { reason } => ("consumed", None, Some(text_of(&reason)?)),
+        InvitationState::Open => (STATE_OPEN, None, None),
+        InvitationState::Locked { attempt_id } => (
+            STATE_LOCKED,
+            Some(attempt_id.get().as_bytes().to_vec()),
+            None,
+        ),
+        InvitationState::Committed => (STATE_COMMITTED, None, None),
+        InvitationState::Consumed { reason } => (STATE_CONSUMED, None, Some(text_of(&reason)?)),
     };
     Ok(StateColumns {
         state,

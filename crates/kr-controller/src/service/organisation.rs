@@ -20,15 +20,16 @@ use kr_protocol::organisation::{
     HostDeviceView, MembershipPresentParams, MembershipPresentResult, OrganisationChangeMarker,
     OrganisationEnrolParams, OrganisationEnrolResult, OrganisationEnrolmentView,
     OrganisationExclusiveSetParams, OrganisationExclusiveSetResult, OrganisationLeaseView,
-    OrganisationListResult, OrganisationMemberView, OrganisationWithdrawParams,
+    OrganisationListResult, OrganisationMemberView, OrganisationPolicyApplyParams,
+    OrganisationPolicyApplyResult, OrganisationWithdrawParams,
 };
 use kr_protocol::pairing::{ConfirmationChannel, KeyPurpose, SensitiveAction, key_id};
 use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, KeyId, Nullable, TimestampMs};
 
 use crate::error::{ControllerError, Result};
-use crate::grants::LeaseRefused;
 use crate::grants::organisation::{ChainRefused, LeaseInstalled};
 use crate::grants::{CLOCK_DISTRUSTED, FLOOR_UNRECORDED};
+use crate::grants::{LeaseRefused, PolicyRefused};
 use crate::sharing::ConfirmedAction;
 
 use super::Audience;
@@ -64,6 +65,13 @@ fn policy_key_id(key: &AuthorisationKey) -> KeyId {
     key_id(KeyPurpose::Authorisation, key.as_bytes())
 }
 
+/// An adapter list as the protocol says it: a set, or null where none is stated.
+fn allowlist_on_the_wire(
+    list: Option<&std::collections::BTreeSet<kr_protocol::ids::PluginId>>,
+) -> Nullable<CanonicalSet<kr_protocol::ids::PluginId>> {
+    Nullable(list.map(|adapters| adapters.iter().cloned().collect()))
+}
+
 /// The refusal a chain or a clock that cannot enrol this host is reported as.
 ///
 /// A chain that does not verify is a bad argument from a caller that already manages the host.
@@ -81,6 +89,23 @@ pub(super) fn chain_refusal(refused: ChainRefused) -> ControllerError {
         other => ControllerError::Refused {
             code: ErrorCode::InvalidArgument,
             detail: other.to_string(),
+        },
+    }
+}
+
+/// The refusal an organisation's policy that is not applied is reported as.
+///
+/// As with a chain, a policy that breaks a rule is a bad argument from a caller that already
+/// manages this host, and it names the rule that refused it. A chain beside it that a distrusted
+/// clock or an unrecorded floor refuses keeps the answers every other decision of the clock has.
+fn policy_refusal(refused: PolicyRefused) -> ControllerError {
+    match refused {
+        PolicyRefused::Chain(
+            chain @ (ChainRefused::ClockUntrusted | ChainRefused::FloorUnrecorded),
+        ) => chain_refusal(chain),
+        other => ControllerError::Refused {
+            code: ErrorCode::InvalidArgument,
+            detail: format!("{other} ({})", other.name()),
         },
     }
 }
@@ -350,6 +375,117 @@ impl Controller {
         encode(&answer)
     }
 
+    /// `organisation.policy.apply`: applies the policy an organisation signed, under the claim of
+    /// the action that asked, and puts the adapters it allows in force.
+    ///
+    /// The registry's guard is taken first, and the policy and the action's answer are written in
+    /// one transaction, in which the admission is asked again once the store's lock is held. Only
+    /// that the owner asked decides it: the organisation's own statement binds this host through
+    /// the keys the owner confirmed when enrolling, and it never enlarges what this host allows
+    /// without one, so it asks for no new confirmation and owes no fence. A narrower list ends the
+    /// bindings of the packages it leaves out through the admission round every restriction on a
+    /// package uses.
+    ///
+    /// The list is put in force once the guard is let go, because the catalogue may be held by a
+    /// synchronisation: the wait is bounded, and a list that could not be put in force is told to
+    /// the caller after the policy is recorded. The recorded answer is given again to a repeat of
+    /// the action only once the list is in force ([`Self::recorded_authority_change`]), and a
+    /// repeat of the same policy by a new action completes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the rule that refuses the policy, what the admission, the clock or the store refuses
+    /// with, and `RESOURCE_UNAVAILABLE` or `STORAGE_UNAVAILABLE` when the policy is recorded and its
+    /// list is not yet in force.
+    pub(super) async fn organisation_policy_apply(
+        &self,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+        hold: &crate::grants::ClaimHold,
+    ) -> Result<ParamsValue> {
+        let params: OrganisationPolicyApplyParams = parse(&mutation.params)?;
+        let organisation_id = params.policy.payload.organisation_id;
+        let reading = self.lifetimes.clock_trust().sample(&self.devices)?;
+        let answer = {
+            let registry = self.registry.lock().await;
+            self.check_admission(&registry, &carried)?;
+            self.update_policy_claimed(
+                hold,
+                |policy| {
+                    policy
+                        .apply_organisation_policy(
+                            &params.policy,
+                            params.authority.as_ref(),
+                            reading.as_ref(),
+                        )
+                        .map_err(policy_refusal)?;
+                    let applied = policy
+                        .enrolment(organisation_id)
+                        .and_then(|enrolment| enrolment.applied_policy())
+                        .ok_or_else(|| {
+                            ControllerError::InvalidArgument(
+                                "this host is not enrolled in that organisation".to_owned(),
+                            )
+                        })?;
+                    let answer = OrganisationPolicyApplyResult {
+                        organisation_id,
+                        organisation_policy_revision: applied.revision,
+                        adapter_allowlist: allowlist_on_the_wire(
+                            applied.adapter_allowlist.as_ref(),
+                        ),
+                        effective_adapter_allowlist: allowlist_on_the_wire(
+                            policy.adapter_allowlist().as_ref(),
+                        ),
+                    };
+                    let bytes = kr_cbor::encode(encode(&answer)?.as_value());
+                    Ok((answer, bytes))
+                },
+                || self.check_admission(&registry, &carried),
+            )?
+        };
+        self.put_the_adapters_the_policy_allows().await?;
+        encode(&answer)
+    }
+
+    /// Puts the adapters the organisations' policies allow in force, within the time a request may
+    /// wait for the catalogue, and sends the workers a round when that changed them.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the list is not in force. The policy it follows is recorded, and the host puts
+    /// the list in force at its next admissions pass.
+    pub(crate) async fn put_the_adapters_the_policy_allows(&self) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + super::WORKER_EXCHANGE;
+        match self.put_the_adapter_allowlist_by(deadline).await {
+            Ok(moved) => {
+                if moved {
+                    self.admissions_due();
+                }
+                Ok(())
+            }
+            Err(error) => Err(ControllerError::Refused {
+                code: error.code,
+                detail: format!(
+                    "the organisation's policy is recorded, but the adapters it allows are not in \
+                     force yet, and the host puts them in force at its next admissions pass: {}",
+                    error.message
+                ),
+            }),
+        }
+    }
+
+    /// Puts the adapters the organisations' policies allow in force for the admissions that follow,
+    /// and returns true when that changed what was in force. The list is read from the policy once
+    /// the catalogue is held, so it is the policy as it stands then.
+    pub(crate) async fn put_the_adapter_allowlist_by(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<bool, kr_protocol::error::ProtocolError> {
+        self.catalogue
+            .put_allowed_adapters(|| self.policy().adapter_allowlist(), deadline)
+            .await
+    }
+
     /// `organisation.withdraw`: this host leaves an organisation's policy, and is fenced for it.
     ///
     /// A withdrawal restricts work already admitted: every grant that requires the organisation
@@ -410,6 +546,18 @@ impl Controller {
                 let completed = self
                     .complete_revocation(Audience::Host, None, CanonicalSet::new(), own)
                     .await?;
+                // The organisation's list goes with its enrolment. A withdrawal only widens the
+                // adapters the host admits, so a put that does not land waits for the next pass.
+                let deadline = tokio::time::Instant::now() + super::WORKER_EXCHANGE;
+                match self.put_the_adapter_allowlist_by(deadline).await {
+                    Ok(true) => self.admissions_due(),
+                    Ok(false) => {}
+                    Err(error) => eprintln!(
+                        "kr-controller: the adapters the organisations allow could not be put in \
+                         force after a withdrawal: {}",
+                        error.message
+                    ),
+                }
                 encode(&completed)
             }
             // The debt is published and its barrier is the debt pass's.
@@ -879,12 +1027,21 @@ impl Controller {
                     anchor_key_id: policy_key_id(&enrolment.anchor().payload.public_key),
                     accepted_head: enrolment.accepted_head(),
                     enrolment_revision: enrolment.enrolment_revision(),
+                    organisation_policy_revision: Nullable(
+                        enrolment.applied_policy().map(|applied| applied.revision),
+                    ),
+                    adapter_allowlist: allowlist_on_the_wire(
+                        enrolment
+                            .applied_policy()
+                            .and_then(|applied| applied.adapter_allowlist.as_ref()),
+                    ),
                     members,
                 }
             })
             .collect();
         encode(&OrganisationListResult {
             enrolments,
+            effective_adapter_allowlist: allowlist_on_the_wire(policy.adapter_allowlist().as_ref()),
             exclusive: policy.is_exclusively_managed(),
             clock_trusted,
             exclusive_events: self.sharing.grants().exclusive_management_events()?,

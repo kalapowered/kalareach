@@ -1780,6 +1780,10 @@ export type NodeOutput =
 export type NodeStatus =
   'pending' | 'running' | 'success' | 'failed' | 'unknown' | 'paused' | 'cancelled'
 /**
+ * The revision of one organisation's signed policy, advanced on every policy change.
+ */
+export type OrganisationPolicyRevision = string
+/**
  * The least client version a policy accepts: alphanumeric with dots, hyphens and plus signs.
  */
 export type ClientVersion = string
@@ -2998,6 +3002,8 @@ export interface KalaReachProtocol {
   organisation_list_result?: OrganisationListResult
   organisation_member_view?: OrganisationMemberView
   organisation_policy?: OrganisationPolicy
+  organisation_policy_apply_params?: OrganisationPolicyApplyParams
+  organisation_policy_apply_result?: OrganisationPolicyApplyResult
   organisation_withdraw_params?: OrganisationWithdrawParams
   output_event?: OutputEvent
   owner_confirmation_complete_params?: OwnerConfirmationCompleteParams
@@ -18800,6 +18806,7 @@ export interface MethodEntry {
     | 'machine.split'
     | 'organisation.enrol'
     | 'organisation.list'
+    | 'organisation.policy.apply'
     | 'organisation.exclusive.set'
     | 'organisation.withdraw'
     | 'membership.present'
@@ -19297,6 +19304,11 @@ export interface OrganisationEnrolmentView {
    */
   accepted_head: string
   /**
+   * The adapters that policy allows, or null when it allows every adapter the host qualifies or
+   * the host has applied none.
+   */
+  adapter_allowlist: PluginId[] | null
+  /**
    * The identifier of that key.
    */
   anchor_key_id: string
@@ -19316,6 +19328,11 @@ export interface OrganisationEnrolmentView {
    * One organisation whose signed policy a host has opted into.
    */
   organisation_id: string
+  /**
+   * The revision of the policy the host applied for this organisation, or null while it has
+   * applied none. It is not the enrolment revision a grant that requires the organisation names.
+   */
+  organisation_policy_revision: OrganisationPolicyRevision | null
   /**
    * The identifier of its first key, which is its identity.
    */
@@ -19430,6 +19447,12 @@ export interface OrganisationListResult {
    */
   clock_trusted: boolean
   /**
+   * The adapters the host admits: the adapters every enrolled organisation that states a list
+   * allows, or null while none does. Two organisations whose lists share nothing leave an empty
+   * set, which admits no adapter.
+   */
+  effective_adapter_allowlist: PluginId[] | null
+  /**
    * The organisations this host is enrolled in, by organisation identity.
    */
   enrolments: OrganisationEnrolmentView[]
@@ -19468,9 +19491,10 @@ export interface HostDeviceView {
 /**
  * One organisation's host policy, signed by its policy-signing key.
  *
- * A host that pinned the organisation's policy-signing authority follows the chain to the revision
- * signing now and checks this signature against it, so what a host applies is the organisation's
- * own statement rather than the service's word about it.
+ * A host that pinned the organisation's policy-signing authority checks this signature under the
+ * key its chain ends with, which is the revision `key_revision` names: a policy under a later
+ * revision needs the chain beside it, and one under an earlier revision is refused. So what a host
+ * applies is the organisation's own statement rather than the service's word about it.
  */
 export interface OrganisationPolicy {
   payload: OrganisationPolicyPayload
@@ -19518,7 +19542,7 @@ export interface OrganisationPolicyPayload {
    */
   organisation_id: string
   /**
-   * The revision this record establishes. A host refuses one below the revision it holds.
+   * The revision of one organisation's signed policy, advanced on every policy change.
    */
   policy_revision: string
 }
@@ -19560,6 +19584,61 @@ export interface OrganisationRecoveryRecipient {
    * The recipient's stored-envelope key identifier.
    */
   recipient_key_id: string
+}
+/**
+ * The parameters of `organisation.policy.apply`.
+ */
+export interface OrganisationPolicyApplyParams {
+  /**
+   * The organisation's chain, when it has moved since the host last accepted one. The key that
+   * signs a policy is the one the chain ends with, so a policy under a newer key needs the chain
+   * beside it. A chain that is not newer changes nothing. A newer chain that does not verify,
+   * or that shows an installed lease was signed after its key was succeeded, refuses the whole
+   * request and keeps nothing: a lease that has to be dropped is fenced when the chain is
+   * presented with `membership.present`.
+   */
+  authority: PolicyAuthority | null
+  policy: OrganisationPolicy1
+}
+/**
+ * The policy the organisation signed, as a member exported it. The host applies it only when
+ * it is signed by the key the host's chain ends with, names a revision above the one it
+ * holds, and states a structure this contract admits.
+ */
+export interface OrganisationPolicy1 {
+  payload: OrganisationPolicyPayload
+  /**
+   * The policy-signing key's signature over [`OrganisationPolicyPayload::signing_input`].
+   */
+  signature: string
+}
+/**
+ * The result of `organisation.policy.apply`, and what a repeat of the action is answered with.
+ *
+ * The host verifies the whole policy and keeps its revision and its adapter allowlist. It neither
+ * keeps nor applies the other settings the policy states: the least client version, the longest
+ * grant, what members' clients may reach outside KalaReach, the backup requirements and the audit
+ * retention.
+ */
+export interface OrganisationPolicyApplyResult {
+  /**
+   * The adapters this organisation allows, or null for every adapter the host qualifies.
+   */
+  adapter_allowlist: PluginId[] | null
+  /**
+   * The adapters the host admits as the answer was made: the adapters every enrolled
+   * organisation that states a list allows, or null while none does. A repeat of the action is
+   * given this list, not the one in force now; `organisation.list` reports the list in force.
+   */
+  effective_adapter_allowlist: PluginId[] | null
+  /**
+   * One organisation whose signed policy a host has opted into.
+   */
+  organisation_id: string
+  /**
+   * The revision of one organisation's signed policy, advanced on every policy change.
+   */
+  organisation_policy_revision: string
 }
 /**
  * The parameters of `organisation.withdraw`. Its result is the revocation result every fence
@@ -27676,6 +27755,7 @@ export interface ServiceRequestPayload {
     | 'machine.split'
     | 'organisation.enrol'
     | 'organisation.list'
+    | 'organisation.policy.apply'
     | 'organisation.exclusive.set'
     | 'organisation.withdraw'
     | 'membership.present'

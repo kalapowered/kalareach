@@ -735,6 +735,7 @@ impl Controller {
             | Method::DeliveryDestinationRemove
             | Method::DeliveryDestinationSecretSet
             | Method::OrganisationEnrol
+            | Method::OrganisationPolicyApply
             | Method::OrganisationExclusiveSet
             | Method::OrganisationWithdraw => {
                 self.authority_change(

@@ -52,7 +52,7 @@ use kr_protocol::sharing::MembershipRefusal;
 
 pub use durable::{StoredFeed, StoredPolicy, StoredRemoval};
 pub use feed::{AuthorityFeed, FeedRefusal, RetainedRevocation};
-pub use organisation::LeaseRefused;
+pub use organisation::{LeaseRefused, PolicyRefused};
 pub use policy::{HostPolicy, PolicyIntersection};
 pub use store::{
     ActionClaim, ActionRecord, ClaimHold, CloseHold, ExclusiveEnding, GrantDirectory, GrantRecord,

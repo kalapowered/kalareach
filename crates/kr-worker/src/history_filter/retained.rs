@@ -218,6 +218,7 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::OwnerConfirmationRequest
         | Method::OwnerConfirmationComplete
         | Method::OrganisationEnrol
+        | Method::OrganisationPolicyApply
         | Method::OrganisationExclusiveSet
         | Method::OrganisationWithdraw
         | Method::MembershipPresent

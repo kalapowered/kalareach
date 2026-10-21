@@ -634,15 +634,16 @@ rules, the state machine and the cross-shell scenarios.
 
 ## Account authority objects
 
-An organisation states membership with a signed object, so a host can check it while the service is
-unreachable. `crates/kr-protocol/src/account.rs` holds three of them, and `packages/protocol`
-builds the same bytes in TypeScript.
+An organisation states membership and policy with signed objects, so a host can check them while the
+service is unreachable. `crates/kr-protocol/src/account.rs` holds four of them, and
+`packages/protocol` builds the same bytes in TypeScript.
 
 | Domain | Payload | What it says |
 | --- | --- | --- |
 | `kr-membership-lease/2` | `MembershipLeasePayload` | One account held one role in one organisation until a stated time, for one device |
 | `kr-policy-authority/1` | `PolicyAuthorityLinkPayload` | One revision of an organisation's policy-signing key, signed by the revision it follows |
 | `kr-policy-authority-head/1` | `PolicyAuthorityHeadPayload` | Which revision signs leases now, signed by that revision |
+| `kr-organisation-policy/1` | `OrganisationPolicyPayload` | One revision of an organisation's host policy: the adapters its members may run and the other settings it states |
 
 Each signature covers `CBOR([domain, payload])`, where the payload is the record without its
 signature, encoded as a canonical map. The domain is what stops one statement being read as
@@ -681,6 +682,13 @@ A chain authenticates forward. `PolicyAuthority::authenticated_from` returns the
 verify anything against, given the revision it pinned: the pin and everything after it. A lease
 naming a revision from before the pin is refused rather than checked against a key nothing the host
 holds authenticates.
+
+A host applies a policy only when it is signed by the key the chain ends with, the revision the host
+has accepted: a policy under a later revision needs the chain beside it, and one under an earlier
+revision is refused, so a key the organisation retired signs nothing a host applies. The policy's
+own `policy_revision` is a floor, and a host refuses a policy at or below the one it holds, except
+the same policy again. The host reads no clock for a policy, which has no lifetime. What a host
+does with one is in [Applying a policy](../host/README.md#applying-a-policy).
 
 What that proves has a limit. A head expires, so a captured head stops being usable, and a host that
 has accepted a later revision refuses one naming an earlier revision. Neither fact proves that the

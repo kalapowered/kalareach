@@ -3,21 +3,27 @@
 //! A host opts into an organisation's policy by pinning the chain of keys that signs it, on an
 //! owner's confirmation of exactly that chain (`organisation.enrol`). A member's device then
 //! presents the lease the organisation signed for it (`membership.present`), and the host answers
-//! for that device while the lease lasts. `organisation.list` reports what the host holds for each
-//! organisation, whether it is exclusively organisation-managed and every time that was turned
-//! off.
+//! for that device while the lease lasts. The owner applies the organisation's signed policy
+//! (`organisation.policy.apply`), and the adapters the policy allows are the only ones the host
+//! admits. `organisation.list` reports what the host holds for each organisation, whether it is
+//! exclusively organisation-managed and every time that was turned off.
 //!
 //! What the host holds for an organisation is a key chain it verified when it enrolled and the
 //! rotations it has followed since, each through a link the anchor's own key signed. A lease is
-//! checked against those keys and against the device that presented it before it is kept.
+//! checked against those keys and against the device that presented it before it is kept, and a
+//! policy against the key the chain ends with.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::account::MembershipLease;
+use crate::account::OrganisationPolicy;
 use crate::account::PolicyAuthority;
 use crate::action::RevocationBarrier;
-use crate::ids::{AccountId, AuthorityRevision, DeviceId, OrganisationId, PolicyKeyRevision};
+use crate::ids::{
+    AccountId, AuthorityRevision, DeviceId, OrganisationId, OrganisationPolicyRevision, PluginId,
+    PolicyKeyRevision,
+};
 use crate::pairing::ConfirmationChannel;
 use crate::scalars::{CanonicalSet, KeyId, Nullable, TimestampMs, U64};
 
@@ -45,6 +51,46 @@ pub struct OrganisationEnrolResult {
     /// The identifier of the organisation's first key, which is its identity: what an
     /// administrator can read out to the person enrolling.
     pub root_key_id: KeyId,
+}
+
+/// The parameters of `organisation.policy.apply`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OrganisationPolicyApplyParams {
+    /// The policy the organisation signed, as a member exported it. The host applies it only when
+    /// it is signed by the key the host's chain ends with, names a revision above the one it
+    /// holds, and states a structure this contract admits.
+    pub policy: OrganisationPolicy,
+    /// The organisation's chain, when it has moved since the host last accepted one. The key that
+    /// signs a policy is the one the chain ends with, so a policy under a newer key needs the chain
+    /// beside it. A chain that is not newer changes nothing. A newer chain that does not verify,
+    /// or that shows an installed lease was signed after its key was succeeded, refuses the whole
+    /// request and keeps nothing: a lease that has to be dropped is fenced when the chain is
+    /// presented with `membership.present`.
+    pub authority: Nullable<PolicyAuthority>,
+}
+
+/// The result of `organisation.policy.apply`, and what a repeat of the action is answered with.
+///
+/// The host verifies the whole policy and keeps its revision and its adapter allowlist. It neither
+/// keeps nor applies the other settings the policy states: the least client version, the longest
+/// grant, what members' clients may reach outside KalaReach, the backup requirements and the audit
+/// retention.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OrganisationPolicyApplyResult {
+    /// The organisation whose policy the host holds now.
+    pub organisation_id: OrganisationId,
+    /// The revision of that policy. The host refuses a policy at or below it, except the same
+    /// revision with the same allowlist, which changes nothing and puts the host's list in force
+    /// again.
+    pub organisation_policy_revision: OrganisationPolicyRevision,
+    /// The adapters this organisation allows, or null for every adapter the host qualifies.
+    pub adapter_allowlist: Nullable<CanonicalSet<PluginId>>,
+    /// The adapters the host admits as the answer was made: the adapters every enrolled
+    /// organisation that states a list allows, or null while none does. A repeat of the action is
+    /// given this list, not the one in force now; `organisation.list` reports the list in force.
+    pub effective_adapter_allowlist: Nullable<CanonicalSet<PluginId>>,
 }
 
 /// The parameters of `organisation.exclusive.set`.
@@ -129,6 +175,12 @@ pub struct OrganisationEnrolmentView {
     pub accepted_head: PolicyKeyRevision,
     /// The authority revision in force when the host enrolled.
     pub enrolment_revision: AuthorityRevision,
+    /// The revision of the policy the host applied for this organisation, or null while it has
+    /// applied none. It is not the enrolment revision a grant that requires the organisation names.
+    pub organisation_policy_revision: Nullable<OrganisationPolicyRevision>,
+    /// The adapters that policy allows, or null when it allows every adapter the host qualifies or
+    /// the host has applied none.
+    pub adapter_allowlist: Nullable<CanonicalSet<PluginId>>,
     /// The devices bound to member accounts, by device identity.
     pub members: Vec<OrganisationMemberView>,
 }
@@ -155,6 +207,10 @@ pub struct ExclusiveManagementEvent {
 pub struct OrganisationListResult {
     /// The organisations this host is enrolled in, by organisation identity.
     pub enrolments: Vec<OrganisationEnrolmentView>,
+    /// The adapters the host admits: the adapters every enrolled organisation that states a list
+    /// allows, or null while none does. Two organisations whose lists share nothing leave an empty
+    /// set, which admits no adapter.
+    pub effective_adapter_allowlist: Nullable<CanonicalSet<PluginId>>,
     /// Whether this host is exclusively organisation-managed.
     pub exclusive: bool,
     /// Whether this host trusts its own clock. While it does not, it installs no lease and

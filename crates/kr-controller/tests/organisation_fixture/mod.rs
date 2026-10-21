@@ -98,8 +98,16 @@ impl Fixture {
     /// The owner enrols the host in the organisation from the chain it publishes now, on the
     /// confirmation of an owner device, and the fixture holds the revision the enrolment took.
     pub async fn enrol(&mut self) -> OrganisationEnrolResult {
+        let enrolled = self.enrol_in(&self.organisation).await;
+        self.revision = enrolled.enrolment_revision;
+        enrolled
+    }
+
+    /// The owner enrols the host in `organisation` from the chain it publishes now, on the
+    /// confirmation of an owner device.
+    pub async fn enrol_in(&self, organisation: &Organisation) -> OrganisationEnrolResult {
         let params = OrganisationEnrolParams {
-            authority: self.organisation.authority(self.now() - 1_000),
+            authority: organisation.authority(self.now() - 1_000),
         };
         let mut client = self.host.client().await;
         calls::confirm_subject(
@@ -120,7 +128,6 @@ impl Fixture {
         .await
         .expect("the host enrols");
         assert!(OrganisationEnrolPlan::of_authority(&params.authority).is_some());
-        self.revision = enrolled.enrolment_revision;
         enrolled
     }
 

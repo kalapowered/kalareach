@@ -318,8 +318,9 @@ What a binding may do follows its installation. A grant the owner withdraws reac
 binding of the package, on every release it holds, and the next action that needs it is refused. A
 grant the owner confirms reaches only bindings on the installed release: a release the installation
 left is held to what it could do when it was left, and never gains. A package disabled or removed,
-or one the organisation's adapter allowlist no longer names, ends its bindings at the next
-snapshot, each once no request it admitted is still open, and a
+or one the organisation's adapter allowlist no longer names ([Applying a
+policy](../host/README.md#applying-a-policy) says how the list reaches a host), ends its bindings
+at the next snapshot, each once no request it admitted is still open, and a
 binding is reported as ending until it has closed. A binding closes only at a snapshot, so while a
 worker reports one as ending, the host sends that worker a snapshot every 30 seconds: the binding
 closes within about 30 seconds of its last request finishing, with no other change.
@@ -441,7 +442,7 @@ A release whose manifest carries a native bridge recipe changes files in the app
 directory, which the host does not own. A registration there is the package running in that
 application's name, so the daemon applies the recipe only while the installation stands: it holds
 `native_bridge.install`, the package is enabled, its repository has not revoked the release, and the
-organisation's adapter allowlist, where there is one, names it. It takes the recipe out as soon as
+organisation's adapter allowlist, where an applied policy states one, names it. It takes the recipe out as soon as
 any of those stops holding (a disable, a revocation that reaches the host in a synchronisation, a
 list that no longer names the package, a withdrawn grant, a removal), whatever the disable policy
 says about live bindings, and puts it back when they hold again. The installation stays. Where the

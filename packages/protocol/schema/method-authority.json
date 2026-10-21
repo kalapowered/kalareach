@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 184,
+  "method_count": 185,
   "methods": [
     {
       "capability": "none",
@@ -845,6 +845,35 @@
         "host"
       ],
       "summary": "The organisations this host is enrolled in, the key each is pinned to, the devices bound to member accounts and the lease each holds, whether exclusive management is on, and every time it was turned off, with how the owner confirmed it.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "organisation.policy.apply",
+      "name": "organisation.policy.apply",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "host"
+      ],
+      "summary": "Apply an organisation's signed policy to this host: the adapters it allows are the only ones the host admits, with every other organisation's list intersected. The policy is verified under the key the organisation's chain ends with, which the request can carry when it has moved, and is refused at or below the revision the host holds. The owner confirmed the organisation's keys when enrolling, and a policy never enlarges what the host allows without one, so it needs no new confirmation.",
       "version": 1
     },
     {

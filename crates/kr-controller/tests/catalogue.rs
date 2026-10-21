@@ -34,6 +34,21 @@ fn fixture() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/plugins/catalogue/development")
 }
 
+/// Puts the adapters an organisation's policy allows in force on the module, as the daemon does
+/// when a policy moves, and says whether that changed what was in force.
+async fn put_allowed(
+    module: &CatalogueModule,
+    allowed: Option<std::collections::BTreeSet<PluginId>>,
+) -> bool {
+    module
+        .put_allowed_adapters(
+            || allowed,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect("put")
+}
+
 struct Host {
     _temp: kr_ipc::testing::TempHost,
     module: CatalogueModule,
@@ -4547,7 +4562,7 @@ mod native_bridges {
                 PluginId::new(name).expect("a plugin identifier")
             ]))
         };
-        let put = |set| async { host.module.put_allowed_adapters(set).await.expect("put") };
+        let put = |set| put_allowed(&host.module, set);
 
         assert!(put(naming("kalareach/claude-code")).await);
         assert_eq!(site.tree(), placed, "a list that names it leaves it");
@@ -4626,12 +4641,7 @@ mod native_bridges {
         // A change that follows the bridge while the index cannot be read: nothing says the
         // release is not revoked, so the registration is not kept on its account.
         std::fs::write(&index, b"not an index").expect("damaged");
-        assert!(
-            host.module
-                .put_allowed_adapters(name("kalareach/claude-code"))
-                .await
-                .expect("put")
-        );
+        assert!(put_allowed(&host.module, name("kalareach/claude-code")).await);
         assert_eq!(
             site.tree(),
             before,
@@ -4640,17 +4650,12 @@ mod native_bridges {
 
         // Control: repaired, the next change that follows bridges puts it back.
         std::fs::write(&index, &intact).expect("repaired");
-        assert!(host.module.put_allowed_adapters(None).await.expect("put"));
+        assert!(put_allowed(&host.module, None).await);
         assert_eq!(site.tree(), placed, "the repaired index restores it");
 
         // A package the list excludes loses its registration whatever state the index is in.
         std::fs::write(&index, b"not an index").expect("damaged");
-        assert!(
-            host.module
-                .put_allowed_adapters(name("kalareach/codex"))
-                .await
-                .expect("put")
-        );
+        assert!(put_allowed(&host.module, name("kalareach/codex")).await);
         assert_eq!(
             site.tree(),
             before,
@@ -4740,12 +4745,7 @@ mod native_bridges {
         let index = index_file(&host).await;
         let intact = std::fs::read(&index).expect("the index");
         std::fs::write(&index, b"not an index").expect("damaged");
-        assert!(
-            host.module
-                .put_allowed_adapters(name("kalareach/claude-code"))
-                .await
-                .expect("put")
-        );
+        assert!(put_allowed(&host.module, name("kalareach/claude-code")).await);
         assert_eq!(
             site.tree(),
             before,
@@ -4756,7 +4756,7 @@ mod native_bridges {
         // found, which is out; restoring the package puts it back.
         std::fs::write(&index, &intact).expect("repaired");
         std::fs::write(&payload, &kept).expect("restored");
-        assert!(host.module.put_allowed_adapters(None).await.expect("put"));
+        assert!(put_allowed(&host.module, None).await);
         assert_eq!(site.tree(), placed, "the package restored, it is back");
 
         // A release its repository revokes keeps no registration with the package damaged.
@@ -4857,12 +4857,7 @@ mod native_bridges {
             "kalareach/codex",
         )
         .expect("a plugin identifier")]));
-        assert!(
-            host.module
-                .put_allowed_adapters(list.clone())
-                .await
-                .expect("put")
-        );
+        assert!(put_allowed(&host.module, list.clone()).await);
         assert_eq!(site.tree(), before, "excluded");
 
         let environment = host._temp.environment();

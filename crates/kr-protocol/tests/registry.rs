@@ -841,6 +841,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
     let organisation = [
         ("organisation.enrol", EffectClass::Write),
         ("organisation.list", EffectClass::Read),
+        ("organisation.policy.apply", EffectClass::Write),
         ("organisation.exclusive.set", EffectClass::Write),
         ("organisation.withdraw", EffectClass::Write),
     ];
@@ -862,7 +863,9 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             "{name} asks for host management and nothing else"
         );
         // Withdrawing restricts what the host answers to, and a list changes nothing. Turning
-        // exclusive management on or off is the owner's, whichever way it goes.
+        // exclusive management on or off is the owner's, whichever way it goes. Applying an
+        // organisation's policy is the organisation's own statement, under the keys the owner
+        // confirmed when enrolling, and it never enlarges what the host allows without one.
         let expected_confirmation =
             if matches!(name, "organisation.enrol" | "organisation.exclusive.set") {
                 ConfirmationRequirement::Always
@@ -1442,6 +1445,7 @@ fn host_management_methods_require_the_host_manage_right() {
         "machine.split",
         "organisation.enrol",
         "organisation.list",
+        "organisation.policy.apply",
         "organisation.exclusive.set",
         "organisation.withdraw",
     ] {

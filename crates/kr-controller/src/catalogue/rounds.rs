@@ -118,6 +118,11 @@ impl Controller {
             .admission_notes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The same reason again, as a pass that fails the same way each time gives it, says
+        // nothing new and must not push the other notes out.
+        if notes.last() == Some(&why) {
+            return;
+        }
         notes.push(why);
         let excess = notes.len().saturating_sub(16);
         notes.drain(..excess);
@@ -303,6 +308,15 @@ impl Controller {
         // The kernel first: letting go of an ended member waits for nothing else.
         self.check_unconfirmed_members();
         let deadline = tokio::time::Instant::now() + WORKER_EXCHANGE;
+        // The adapters in force are derived from the policy on disk, so a put that failed is made
+        // again here, ahead of the rounds that carry its revision. A list that has not landed is
+        // for the doctor to say.
+        if let Err(error) = self.put_the_adapter_allowlist_by(deadline).await {
+            self.note_admissions(format!(
+                "the adapters the organisations allow are not in force: {}",
+                error.message
+            ));
+        }
         let Ok((revision, installed)) = self.catalogue.installed_within(deadline).await else {
             return;
         };

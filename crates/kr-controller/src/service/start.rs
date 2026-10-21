@@ -416,22 +416,6 @@ impl Controller {
                 qualification.detail()
             );
         }
-        // The catalogue fetches through the proxy this daemon started with, the endpoint's own,
-        // and asks this generation's member set what the workers hold before it makes room.
-        let plugin_bridge = Arc::new(crate::catalogue::bridge::WorkerBridge::new(generation));
-        // The budgets in force from the start, so the limits they set hold every package from
-        // the catalogue's first check on, and the disable policy this reading decides, so the
-        // first round a worker that outlived the last daemon receives carries it: the cadence that
-        // sends it starts below, before the document is accepted.
-        let catalogue = Arc::new(crate::catalogue::CatalogueModule::open(
-            &setup.paths,
-            &Self::outbound_of(&started)?,
-            Arc::clone(&plugin_bridge) as Arc<dyn kr_plugin_catalogue::BrokerBridge>,
-            startup_budgets.or(accepted_budgets).unwrap_or_default(),
-            startup_policy.or(accepted_policy),
-            // No organisation policy reaches this host yet, so every adapter is allowed.
-            None,
-        )?);
         // The change-set service reads every repository through the project service's own opened
         // handles and restricted execution profile, so it takes that service rather than opening
         // a second one.
@@ -528,6 +512,24 @@ impl Controller {
                 utc_floor.could_not_write();
             }
         }
+        // The catalogue fetches through the proxy this daemon started with, the endpoint's own,
+        // and asks this generation's member set what the workers hold before it makes room. It is
+        // opened once the policy is restored, because the adapters the organisations' policies
+        // allow are in force from its first admission: a catalogue opened before them would admit
+        // every adapter until something put the list in force.
+        let plugin_bridge = Arc::new(crate::catalogue::bridge::WorkerBridge::new(generation));
+        // The budgets in force from the start, so the limits they set hold every package from
+        // the catalogue's first check on, and the disable policy this reading decides, so the
+        // first round a worker that outlived the last daemon receives carries it: the cadence that
+        // sends it starts below, before the document is accepted.
+        let catalogue = Arc::new(crate::catalogue::CatalogueModule::open(
+            &setup.paths,
+            &Self::outbound_of(&started)?,
+            Arc::clone(&plugin_bridge) as Arc<dyn kr_plugin_catalogue::BrokerBridge>,
+            startup_budgets.or(accepted_budgets).unwrap_or_default(),
+            startup_policy.or(accepted_policy),
+            policy.adapter_allowlist(),
+        )?);
         let policy = Arc::new(std::sync::Mutex::new(policy));
         let mut feed = match sharing.grants().stored_feed()? {
             Some(stored) => {

@@ -883,15 +883,20 @@ impl Controller {
             }
             // An organisation's policy is this host's, not a session's. A request that named a
             // session here would be asking for a policy scoped to something it does not have.
-            Method::OrganisationEnrol => {
+            Method::OrganisationEnrol | Method::OrganisationPolicyApply => {
                 if mutation.target.session_id.as_ref().is_some() {
                     return Err(ControllerError::InvalidArgument(
                         "an organisation's policy belongs to this host, not to one session"
                             .to_owned(),
                     ));
                 }
-                let _: kr_protocol::organisation::OrganisationEnrolParams =
-                    parse(&mutation.params)?;
+                if method == Method::OrganisationEnrol {
+                    let _: kr_protocol::organisation::OrganisationEnrolParams =
+                        parse(&mutation.params)?;
+                } else {
+                    let _: kr_protocol::organisation::OrganisationPolicyApplyParams =
+                        parse(&mutation.params)?;
+                }
             }
             Method::MembershipPresent => {
                 if mutation.target.session_id.as_ref().is_some() {
