@@ -463,8 +463,9 @@ impl Hold {
         state.holds.contains_key(&self.id)
     }
 
-    /// Extends what this hold covers by `more`, if no writer is at work and no session is alive
-    /// where the whole of it now reaches. A hold is granted over what its holder knows first, and
+    /// Extends what this hold covers by `more`, and the directories whose removal it turns away by
+    /// `more_ancestors`, if no writer is at work and no session is alive where the whole of it now
+    /// reaches. A hold is granted over what its holder knows first, and
     /// the rest of what it must cover is read from the host's records while the hold already keeps
     /// the writers that make those records off; this is where the two meet.
     ///
@@ -473,7 +474,11 @@ impl Hold {
     /// Returns the [`Refusal`] when something is in the way of the larger reach, and
     /// [`Refusal::Lapsed`] when the hold has ended. The hold stays as it was, and its holder drops
     /// it.
-    pub fn widen(&self, more: Identities) -> std::result::Result<(), Refusal> {
+    pub fn widen(
+        &self,
+        more: Identities,
+        more_ancestors: Identities,
+    ) -> std::result::Result<(), Refusal> {
         let now = (self.holds.moment)();
         let mut state = self.holds.state();
         state.expire(now);
@@ -482,6 +487,7 @@ impl Hold {
         };
         let mut reach = granted.reach.clone();
         reach.covers.extend(more);
+        reach.ancestors.extend(more_ancestors);
         if let Some(refusal) = state.in_the_way_of(&reach) {
             return Err(refusal);
         }
@@ -570,6 +576,15 @@ fn footprint_of_chain(chain: Option<Vec<ObjectIdentity>>) -> Footprint {
 struct KnownTree {
     tree: Option<ObjectIdentity>,
     repository: Option<ObjectIdentity>,
+    /// The directories above the tree, which removing one of them removes the tree with.
+    parents: Vec<ObjectIdentity>,
+}
+
+/// The identities of the directories above the working tree a record names at `path`, nearest
+/// first, or none when it cannot be opened.
+fn parents_of(environment_id: kr_protocol::ids::EnvironmentId, path: &str) -> Vec<ObjectIdentity> {
+    identity_chain(environment_id, Path::new(path))
+        .map_or_else(Vec::new, |chain| chain.into_iter().skip(1).collect())
 }
 
 impl ProjectService {
@@ -673,6 +688,7 @@ impl ProjectService {
             .map(|project| KnownTree {
                 tree: Some(project.identity.work_tree.object),
                 repository: Some(project.identity.git_dir.object),
+                parents: parents_of(self.environment_id, &project.display_path),
             })
             .collect();
         for row in workspaces
@@ -687,6 +703,7 @@ impl ProjectService {
                     }
                     _ => project_git_dir(row.project_repository_id),
                 },
+                parents: parents_of(self.environment_id, &row.display_path),
             });
         }
         Ok(known)
@@ -769,15 +786,18 @@ impl ProjectService {
         if let Err(refusal) = self.workspace_is_holdable(workspace_id, work_tree, git_dir)? {
             return Ok(Err(refusal));
         }
+        // The directories above every tree of the repository are protected from removal too, so a
+        // cleanup that removes a directory holding the project's checkout, and with it the Git
+        // directory the held worktree depends on, is turned away.
         let mut more = Identities::new();
+        let mut more_ancestors = Identities::new();
         for known in self.known_trees()? {
-            if known.repository == Some(git_dir)
-                && let Some(tree) = known.tree
-            {
-                more.insert(tree);
+            if known.repository == Some(git_dir) {
+                more.extend(known.tree);
+                more_ancestors.extend(known.parents);
             }
         }
-        Ok(hold.widen(more).map(|()| hold))
+        Ok(hold.widen(more, more_ancestors).map(|()| hold))
     }
 
     /// Whether the records and the disk agree that `workspace_id` is a ready, host-made workspace
@@ -1052,13 +1072,19 @@ mod tests {
                 .is_ok(),
             "the tree about to be added is not held yet"
         );
-        hold.widen(identities(&[4]))
+        hold.widen(identities(&[4]), identities(&[30]))
             .expect("nothing is in the added tree");
         assert!(
             holds
                 .begin_write("a test writer", Footprint::inside(&[identity(4)]))
                 .is_err(),
             "and the added tree is held"
+        );
+        assert!(
+            holds
+                .begin_write("a removal", Footprint::default().removing(identity(30)))
+                .is_err(),
+            "and a removal of a directory above the added tree is turned away"
         );
         drop(hold);
 
@@ -1067,7 +1093,7 @@ mod tests {
             .begin_write("a test writer", Footprint::inside(&[identity(3)]))
             .expect("the tree is not held yet");
         assert_eq!(
-            hold.widen(identities(&[3])),
+            hold.widen(identities(&[3]), Identities::new()),
             Err(Refusal::WriterAtWork("a test writer")),
             "a writer came to the tree between the grant and the widening"
         );
@@ -1082,12 +1108,12 @@ mod tests {
             .begin_session(session(1), SessionPlace::Chain(identities(&[3, 20])))
             .expect("the tree is not held yet");
         assert_eq!(
-            hold.widen(identities(&[3])),
+            hold.widen(identities(&[3]), Identities::new()),
             Err(Refusal::SessionsBound(1)),
             "a session began in the tree between the grant and the widening"
         );
         drop(session_there);
-        hold.widen(identities(&[3]))
+        hold.widen(identities(&[3]), Identities::new())
             .expect("nothing is there any more");
         drop(hold);
 
@@ -1099,7 +1125,10 @@ mod tests {
         })));
         let hold = holds.try_hold(first).expect("nothing is at work");
         offset.store(HOLD_BOUND.as_secs(), Ordering::SeqCst);
-        assert_eq!(hold.widen(identities(&[3])), Err(Refusal::Lapsed));
+        assert_eq!(
+            hold.widen(identities(&[3]), Identities::new()),
+            Err(Refusal::Lapsed)
+        );
     }
 
     /// KR-REQ-14.32: a writer whose place nobody can say is in the way of every hold, and every

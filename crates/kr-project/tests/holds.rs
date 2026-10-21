@@ -437,6 +437,45 @@ fn a_hold_on_a_tree_inside_a_staging_directory_turns_away_its_cleanup() {
     support::assert_absent(&leftover, "the staging directory the cleanup took away");
 }
 
+/// KR-REQ-14.32: the cleanup removes a staging directory with everything in it, so it is turned
+/// away when the project's own checkout, which holds the Git directory a held worktree depends on,
+/// is inside the directory, though the worktree itself is elsewhere; the directory is removed once
+/// the hold has ended.
+#[test]
+fn a_hold_turns_away_the_cleanup_of_a_directory_that_holds_the_repositorys_checkout() {
+    let fixture = Fixture::create();
+    let service = fixture.service();
+    let (reconcile, leftover, _) = leave_staging_in(&fixture, fixture.work(), 3);
+    ordinary_repository(&leftover, "source");
+    let project = service
+        .project_adopt(
+            &actor(),
+            &ProjectAdoptParams {
+                destination: destination(fixture.environment_id(), &leftover, "source"),
+                label: "source".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+            Some(&action("project.adopt", 5)),
+        )
+        .expect("a checkout inside the staging directory is adopted")
+        .project
+        .project_repository_id;
+    let outside = worktree(&fixture, project, "outside", 6);
+
+    let held = hold(service, outside).expect("the worktree outside the directory is held");
+    let refused = service
+        .project_operation_cancel(&actor(), &reconcile, Performed::default())
+        .expect_err("the cleanup would remove the Git directory the held worktree depends on");
+    assert_eq!(refused.code(), ErrorCode::ResourceUnavailable);
+    assert!(leftover.join("source/.git").is_dir(), "nothing was removed");
+    drop(held);
+
+    service
+        .project_operation_cancel(&actor(), &reconcile, Performed::default())
+        .expect("the same request goes ahead once nothing holds the repository");
+    support::assert_absent(&leftover, "the staging directory the cleanup took away");
+}
+
 /// KR-REQ-14.32: a live session blocks a hold on a tree of its repository wherever in the
 /// repository it started, including in the user's own checkout when that is only a project and
 /// no workspace has been selected on it, and a session that started where no tree is recorded
