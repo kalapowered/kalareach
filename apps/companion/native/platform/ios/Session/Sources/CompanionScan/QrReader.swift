@@ -42,6 +42,12 @@ public enum QrReader {
   private static func read(_ handler: VNImageRequestHandler) -> String? {
     let request = VNDetectBarcodesRequest()
     request.symbologies = [.qr]
+    #if targetEnvironment(simulator)
+      // The simulator has no accelerator for the detector's model-based revisions to run on: they cannot
+      // create their context there, and the first revision (the constant for it is deprecated, the
+      // revision is not) reads a QR code without one.
+      request.revision = 1
+    #endif
     do {
       try handler.perform([request])
     } catch {
