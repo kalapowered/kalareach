@@ -785,9 +785,9 @@ async fn a_side_effect_with_no_lease_holder_is_a_host_event_and_reaches_no_termi
     // like everything else a launched process touches.
     let gate = std::env::temp_dir().join(format!("kalareach-gate-{}", kr_ipc::new_uuid()));
     let host = host(&format!(
-        "stty -echo -echonl || exit 1; while [ ! -e '{}' ]; do sleep 0.1; done; \
+        "stty -echo -echonl || exit 1; while [ ! -e {} ]; do sleep 0.1; done; \
          printf '\\a\\033]52;c;c2VjcmV0\\033\\134kr-rang.\\n'; sleep 120",
-        gate.display()
+        kr_worker::testing::shell_quoted(&gate)
     ))
     .await;
     let (mut first, _, _) = attached(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;
@@ -850,10 +850,10 @@ async fn a_reply_waits_for_an_open_paste_and_takes_no_lease() {
     let (ask, read) = (gates.join("ask"), gates.join("read"));
     let host = host(&format!(
         "stty raw -echo || exit 1; printf '\\033[?2004hkr-ready.'; \
-         while [ ! -e '{}' ]; do sleep 0.1; done; printf '\\033[c'; \
-         while [ ! -e '{}' ]; do sleep 0.1; done; exec cat -v",
-        ask.display(),
-        read.display()
+         while [ ! -e {} ]; do sleep 0.1; done; printf '\\033[c'; \
+         while [ ! -e {} ]; do sleep 0.1; done; exec cat -v",
+        kr_worker::testing::shell_quoted(&ask),
+        kr_worker::testing::shell_quoted(&read)
     ))
     .await;
     let (_client, _, mut keys) =
@@ -905,10 +905,10 @@ async fn losing_the_paste_holder_closes_the_paste_before_a_held_reply() {
     let (ask, read) = (gates.join("ask"), gates.join("read"));
     let host = host(&format!(
         "stty raw -echo || exit 1; printf '\\033[?2004hkr-ready.'; \
-         while [ ! -e '{}' ]; do sleep 0.1; done; printf '\\033[c'; \
-         while [ ! -e '{}' ]; do sleep 0.1; done; exec cat -v",
-        ask.display(),
-        read.display()
+         while [ ! -e {} ]; do sleep 0.1; done; printf '\\033[c'; \
+         while [ ! -e {} ]; do sleep 0.1; done; exec cat -v",
+        kr_worker::testing::shell_quoted(&ask),
+        kr_worker::testing::shell_quoted(&read)
     ))
     .await;
     let (_client, _, mut keys) =
@@ -1191,8 +1191,8 @@ async fn a_reconnecting_terminal_is_replayed_neither_the_question_nor_the_answer
     let ask = gates.join("ask");
     let host = host(&format!(
         "stty raw -echo || exit 1; printf 'kr-ready.'; \
-         while [ ! -e '{}' ]; do sleep 0.1; done; printf '\\033[c'; exec cat -v",
-        ask.display()
+         while [ ! -e {} ]; do sleep 0.1; done; printf '\\033[c'; exec cat -v",
+        kr_worker::testing::shell_quoted(&ask)
     ))
     .await;
     let (mut first, _, _) = attached(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;

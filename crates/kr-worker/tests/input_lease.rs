@@ -2550,8 +2550,8 @@ async fn a_lone_escape_is_forwarded_at_its_deadline_while_the_session_s_processe
 /// which a case that stops the output ingest cannot use.
 fn bracketed_recording(received: &std::path::Path) -> String {
     format!(
-        "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec tee '{}'",
-        received.display()
+        "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec tee {}",
+        kr_worker::testing::shell_quoted(received)
     )
 }
 
@@ -3150,9 +3150,9 @@ fn triggered_recording(
 ) -> String {
     format!(
         "stty raw -echo; printf '\\033[?2004hkr-ready.'; \
-         ( while cat '{}' >/dev/null; do printf '{output}'; done ) & exec tee '{}'",
-        trigger.display(),
-        received.display()
+         ( while cat {} >/dev/null; do printf '{output}'; done ) & exec tee {}",
+        kr_worker::testing::shell_quoted(trigger),
+        kr_worker::testing::shell_quoted(received)
     )
 }
 
@@ -3184,10 +3184,10 @@ impl Rig {
     async fn start_late() -> Self {
         Self::from_script(|received, trigger| {
             format!(
-                "stty raw -echo; printf '\\033[?2004hkr-ready.'; cat '{}' >/dev/null; \
-                 exec tee '{}'",
-                trigger.display(),
-                received.display()
+                "stty raw -echo; printf '\\033[?2004hkr-ready.'; cat {} >/dev/null; \
+                 exec tee {}",
+                kr_worker::testing::shell_quoted(trigger),
+                kr_worker::testing::shell_quoted(received)
             )
         })
         .await
@@ -4320,11 +4320,11 @@ async fn replies_one_drain_of_the_lane_did_not_take_follow_the_keystrokes_that_c
     let mut rig = Rig::from_script(|received, trigger| {
         format!(
             "stty raw -echo; printf '\\033[?2004hkr-ready.'; \
-             ( while cat '{}' >/dev/null; do i=0; \
+             ( while cat {} >/dev/null; do i=0; \
                while [ $i -lt {ENTRIES} ]; do printf '\\033]4;%d;?\\033\\\\' $i; i=$((i+1)); done; \
-               printf 'kr-asked.'; done ) & exec cat > '{}'",
-            trigger.display(),
-            received.display()
+               printf 'kr-asked.'; done ) & exec cat > {}",
+            kr_worker::testing::shell_quoted(trigger),
+            kr_worker::testing::shell_quoted(received)
         )
     })
     .await;
@@ -4905,8 +4905,8 @@ impl Proxied {
         let kept = tempfile::tempdir().expect("a directory for what the application keeps");
         let received = kept.path().join("received");
         let wired = wired(&format!(
-            "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec tee '{}'",
-            received.display()
+            "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec tee {}",
+            kr_worker::testing::shell_quoted(&received)
         ))
         .await;
         retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;

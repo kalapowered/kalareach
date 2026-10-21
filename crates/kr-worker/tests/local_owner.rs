@@ -2934,9 +2934,9 @@ impl LateReader {
             .expect("mkfifo runs");
         assert!(made.success(), "the trigger is made");
         let script = format!(
-            "stty raw -echo; cat '{}' >/dev/null; exec tee '{}'",
-            trigger.display(),
-            received.display()
+            "stty raw -echo; cat {} >/dev/null; exec tee {}",
+            kr_worker::testing::shell_quoted(&trigger),
+            kr_worker::testing::shell_quoted(&received)
         );
         let typing = Typing::start_with(&script).await;
         Self {
@@ -3254,8 +3254,8 @@ async fn a_revision_that_takes_a_lease_with_a_paste_open_has_the_paste_closed_at
     let kept = tempfile::tempdir().expect("a directory for what the application keeps");
     let received = kept.path().join("received");
     let script = format!(
-        "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec tee '{}'",
-        received.display()
+        "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec tee {}",
+        kr_worker::testing::shell_quoted(&received)
     );
     let mut typing = Typing::start_with(&script).await;
     the_application_printed(&typing.wired.runtime, b"kr-ready.").await;

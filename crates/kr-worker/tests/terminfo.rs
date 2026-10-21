@@ -381,7 +381,7 @@ async fn two_builds_with_other_data_each_keep_their_own_database() {
     // while both are there.
     let older_script = format!(
         "while [ ! -f {go} ]; do sleep 0.1; done\necho \"cup=$({asks})\"",
-        go = work.0.join("go").display()
+        go = kr_worker::testing::shell_quoted(&work.0.join("go"))
     );
     let (older_ran, newer_ran) = tokio::join!(run(&older_script, &older_environment), async {
         let newer_directory =
@@ -499,8 +499,8 @@ async fn tmux_inside_a_managed_session_reads_the_private_database() {
              echo \"inner_colors=$(tput colors)\"; \
              echo \"client_term=$({tmux} display-message -p '#{{client_termname}}')\"; }} \
              > {work}/inner.txt\n{tmux} info > {work}/info.txt\n",
-            tmux = tmux.display(),
-            work = work.0.display()
+            tmux = kr_worker::testing::shell_quoted(&tmux),
+            work = kr_worker::testing::shell_quoted(&work.0)
         ),
     )
     .expect("the script that runs inside tmux");
@@ -511,8 +511,8 @@ async fn tmux_inside_a_managed_session_reads_the_private_database() {
          echo \"outer_term=$TERM\" >> {work}/outer.txt\n\
          echo \"outer_terminfo=$TERMINFO\" >> {work}/outer.txt\n\
          touch {work}/finished",
-        tmux = tmux.display(),
-        work = work.0.display()
+        tmux = kr_worker::testing::shell_quoted(&tmux),
+        work = kr_worker::testing::shell_quoted(&work.0)
     );
     let ran = run_observed(&script, &environment, Some(&work.0.join("finished"))).await;
 
@@ -789,7 +789,7 @@ impl Sshd {
             "ssh -tt -F /dev/null -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
              -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -p {port} \
              127.0.0.1 '{command}'",
-            key = self.client_key.display(),
+            key = kr_worker::testing::shell_quoted(&self.client_key),
             port = self.port
         )
     }
@@ -814,7 +814,7 @@ async fn a_remote_shell_over_ssh_keeps_the_stock_database() {
          {ssh} >> {work}/seen.txt\n\
          touch {work}/finished",
         ssh = server.command(remote),
-        work = work.0.display()
+        work = kr_worker::testing::shell_quoted(&work.0)
     );
     run_observed(&script, &environment, Some(&work.0.join("finished"))).await;
 
@@ -861,9 +861,9 @@ async fn tic_inside_a_managed_session_writes_where_terminfo_points() {
          echo \"private=$(ls {private}/*/kr-mine 2>/dev/null | wc -l | tr -d ' ')\"\n\
          {tic} -x -o {own}/elsewhere mine.src 2>&1\n\
          echo \"elsewhere=$(ls {own}/elsewhere/*/kr-mine 2>/dev/null | wc -l | tr -d ' ')\"",
-        own = own.0.display(),
-        tic = tic.display(),
-        private = directory.display()
+        own = kr_worker::testing::shell_quoted(&own.0),
+        tic = kr_worker::testing::shell_quoted(&tic),
+        private = kr_worker::testing::shell_quoted(&directory)
     );
     let shown = run(&script, &environment).await;
     assert_eq!(

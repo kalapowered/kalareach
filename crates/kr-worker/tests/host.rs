@@ -1212,8 +1212,14 @@ async fn the_creating_terminals_size_is_the_shells_from_the_start() {
     // so the size this file records is the one the shell was started at.
     let startup = host.temp.root().join("kr-measure-at-start.sh");
     let measured = host.temp.root().join("kr-size-at-start");
-    std::fs::write(&startup, format!("stty size > '{}'\n", measured.display()))
-        .expect("writes the shell's startup file");
+    std::fs::write(
+        &startup,
+        format!(
+            "stty size > {}\n",
+            kr_worker::testing::shell_quoted(&measured)
+        ),
+    )
+    .expect("writes the shell's startup file");
     params
         .environment_snapshot
         .push(kr_protocol::session::EnvironmentVariable {
@@ -2737,14 +2743,14 @@ async fn a_process_that_outlasts_the_cleanup_is_named_and_cannot_act_as_the_sess
     std::fs::write(
         &script,
         format!(
-            "export KR_SURVIVOR_DIR='{root}' KR_SURVIVOR_ENVIRONMENT='{environment}'\n\
+            "export KR_SURVIVOR_DIR={root} KR_SURVIVOR_ENVIRONMENT='{environment}'\n\
              sleep 600 &\n\
              echo $! > plain.pid\n\
              sh -c 'trap \"\" HUP TERM; echo $$ > survivor.pid; exec \"$0\" --ignored --exact \
-             a_survivor_of_a_crashed_session_tries_to_act_as_it --nocapture' '{half}' &\n",
-            root = host.temp.root().display(),
+             a_survivor_of_a_crashed_session_tries_to_act_as_it --nocapture' {half} &\n",
+            root = kr_worker::testing::shell_quoted(host.temp.root()),
             environment = host.environment_id,
-            half = half.display(),
+            half = kr_worker::testing::shell_quoted(&half),
         ),
     )
     .expect("writes the startup file");

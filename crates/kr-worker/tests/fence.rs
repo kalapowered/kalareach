@@ -2902,8 +2902,8 @@ impl RealProbes {
                  while [ ! -e {release} ]; do sleep 0.05; done\n\
                  fi\n\
                  printf '%s%s\\n' 'probe-' 'ran'\n",
-                record = shell_quoted(&root.join("record")),
-                release = shell_quoted(&root.join("release")),
+                record = kr_worker::testing::shell_quoted(&root.join("record")),
+                release = kr_worker::testing::shell_quoted(&root.join("release")),
             ),
         )
         .expect("the program's text");
@@ -3000,38 +3000,6 @@ impl RealProbes {
     }
 }
 
-/// A path as one word of a POSIX shell line, whatever characters it holds.
-///
-/// Inside single quotes every character stands for itself except the quote, which ends them, so a
-/// quote in the path is closed over, given as an escaped quote of its own, and reopened. The line
-/// is text, as the session's environment and the keys typed into it are, so a path that is not
-/// UTF-8 is refused here rather than quoted as some other path that its lossy spelling would name.
-#[cfg(unix)]
-fn shell_quoted(path: &std::path::Path) -> String {
-    let text = path.to_str().unwrap_or_else(|| {
-        panic!(
-            "{} is not UTF-8, and a shell line, the keys typed into a session and its \
-             environment are all text, so this case cannot put it in one",
-            path.display()
-        )
-    });
-    format!("'{}'", text.replace('\'', r"'\''"))
-}
-
-/// A path that is not UTF-8 is refused, rather than quoted as the other path its lossy spelling
-/// would name. The path is only a value here: no file system is asked to hold it.
-#[cfg(unix)]
-#[test]
-#[should_panic(expected = "is not UTF-8")]
-fn a_probe_path_that_is_not_text_is_refused_rather_than_quoted() {
-    use std::os::unix::ffi::OsStringExt as _;
-
-    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(
-        b"/tmp/kr-probes-\xff/bin/kr-probe".to_vec(),
-    ));
-    let _ = shell_quoted(&path);
-}
-
 /// The recording program works where its directory's name holds an apostrophe: a held start
 /// records its words and variables, waits for its release and then answers, and a script sourced
 /// by its quoted path runs it.
@@ -3078,7 +3046,10 @@ fn the_recording_program_works_where_its_directory_holds_an_apostrophe() {
 
     let sourced = std::process::Command::new("/bin/sh")
         .arg("-c")
-        .arg(format!(". {}", shell_quoted(&probes.script())))
+        .arg(format!(
+            ". {}",
+            kr_worker::testing::shell_quoted(&probes.script())
+        ))
         .envs(probes.variables())
         .stdin(std::process::Stdio::null())
         .output()
@@ -3220,7 +3191,10 @@ async fn asks_the_real_worker_before_each_command(
         } else {
             "."
         };
-        let sourced = format!("{source} {}", shell_quoted(&probes.script()));
+        let sourced = format!(
+            "{source} {}",
+            kr_worker::testing::shell_quoted(&probes.script())
+        );
         keys.type_line(&shell, &sourced);
         printed += 1;
         shell.produced(b"probe-ran", printed).await;
@@ -3757,7 +3731,10 @@ async fn a_real_shell_that_ran_cd_is_described_by_its_new_directory_at_the_next_
         shell
             .directory_described_as(&home_name, "the command that ran where the shell began")
             .await;
-        keys.type_line(&shell, &format!("cd {}", shell_quoted(&target)));
+        keys.type_line(
+            &shell,
+            &format!("cd {}", kr_worker::testing::shell_quoted(&target)),
+        );
         shell
             .directory_described_as("kr-moved-here", "the prompt after `cd`, with nothing typed")
             .await;
@@ -5579,8 +5556,8 @@ async fn a_keystroke_that_expires_a_hold_reaches_the_terminal_in_order_while_the
     let kept = tempfile::tempdir().expect("a directory for what the application keeps");
     let received = kept.path().join("received");
     let wired = unpumped_running(&format!(
-        "stty raw -echo; exec tee '{}'",
-        received.display()
+        "stty raw -echo; exec tee {}",
+        kr_worker::testing::shell_quoted(&received)
     ))
     .await;
     let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
