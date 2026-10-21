@@ -6483,22 +6483,24 @@ written under the broker's lock, because they and the fence coming down are one 
 take the store's lock without waiting for it: a store another connection is writing refuses them at
 once, is not counted as failed, and leaves the finish to a later pass.
 
-A connection that stayed open through the whole gap has carried every frame of it in both
-directions, so what its upstream still holds is what the host holds for it, unresolved; the host
-reconciles it with that once none of its answers is still in flight. A connection that closed at
-any point since the fence went up settled what it left at its end, as a connection that closes in
-normal operation does, so a recovery waits for none that has closed. If the store refused that
-settlement, the recovery's pass makes it: a connection that is not open is reconciled as an
-upstream that holds nothing, its entry goes from what the recovery owes only once what it left is
-settled, and the pass stops at the first write the store refuses. Every transition of a settlement
-made inside a gap is marked volatile, including the ones planned before the store first refused a
-write.
+A connection that is open has carried every frame of its life in both directions, and the host
+recorded a connection that began inside the gap from its first request, so what its upstream still
+holds is what the host holds for it, unresolved; the host reconciles it with that once none of its
+answers is still in flight. A connection that closed at any point since the fence went up settled
+what it left at its end, as a connection that closes in normal operation does, so a recovery waits
+for none that has closed. A store fault under that settlement keeps it in memory as a transition of
+the gap, and the recovery commits it with the gap. A settlement that failed for another reason, and
+the connections of a process that is gone, are made by the recovery's pass: a connection that is
+not open is reconciled as an upstream that holds nothing, its entry goes from what the recovery
+owes only once what it left is settled, and the pass stops at the first write the store refuses.
+Every transition of a settlement made inside a gap is marked volatile, including the ones planned
+before the store first refused a write.
 
-A worker that dies between the commit and the reconciliation comes back recovering, with every
-connection it owed gone with the process that held them, so its first pass settles what they left
-and finishes the recovery. Volatile operations are never replayed to manufacture durable history: a
-resource that lived through a gap says so for the rest of its life, and its later transitions are
-written down like anything else.
+A broker opened on a ledger that holds an unfinished recovery comes back recovering, and every
+connection it owes belonged to the process before it and is not open, so its first pass settles
+what they left and finishes the recovery. Volatile operations are never replayed to manufacture
+durable history: a resource that lived through a gap says so for the rest of its life, and its
+later transitions are written down like anything else.
 
 ## The local listener
 
