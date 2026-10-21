@@ -8,7 +8,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.07 | a backend with a table the gateway reads is accepted and round-trips; a table it cannot read (its transport named as the table writes it, ordered correlation without ending the rest of the check), a missing `messages`, colliding member names, an empty table, a wire name it cannot hold, a declaration with no table, and a table with more methods than the gateway interprets are each named; every stored package that is not an invalid fixture reads and writes back as it was |
+//! | KR-REQ-12.07 | a backend with a table the gateway reads is accepted and round-trips; a table it cannot read (its transport named as the table writes it, ordered correlation without ending the rest of the check), a missing `messages`, colliding member names, an empty table, a wire name it cannot hold, a declaration with no table, and a table with more methods than the gateway interprets are each named; every stored package that is not an invalid fixture reads and writes back as it was, and declares no backend unless it is the released Codex package 0.3.0 |
 
 use std::path::Path;
 
@@ -140,8 +140,9 @@ fn kr_req_12_07_a_backend_with_a_table_the_gateway_reads_is_accepted() {
 
 /// KR-REQ-12.07: a package written before the backend existed reads and writes as it did. Every
 /// committed manifest and connector table (the bundled and released packages, the examples and the
-/// catalogue fixtures) reads into the typed document and comes back with no `backend` and no
-/// `messages` member, so no package's bytes or hash depend on the new members.
+/// catalogue fixtures) reads into the typed document and comes back as it was, and comes back with
+/// no `backend` and no `messages` member unless it is the Codex package 0.3.0, which declares a
+/// gateway on purpose, so no other package's bytes or hash depend on the new members.
 #[test]
 fn kr_req_12_07_a_package_written_before_the_backend_reads_and_writes_as_before() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -181,6 +182,10 @@ fn kr_req_12_07_a_package_written_before_the_backend_reads_and_writes_as_before(
                 "{} is written back as read",
                 path.display()
             );
+            // The one package that declares a gateway: the released Codex package 0.3.0.
+            if path.starts_with(root.join("fixtures/plugins/released/kalareach/codex/0.3.0")) {
+                continue;
+            }
             let text = original.to_string();
             assert!(
                 !text.contains("\"backend\"")
