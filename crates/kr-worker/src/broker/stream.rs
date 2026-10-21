@@ -17,8 +17,7 @@
 //! * the outcome of such a request is unknown (its reply was unreadable, it was given up at the
 //!   deadline or its connection ended, or its bytes went in part), or the conversation it selected
 //!   belongs to another live execution;
-//! * no reply has named a conversation yet ([`THREAD_NOT_READ`](crate::broker::THREAD_NOT_READ),
-//!   set at launch).
+//! * no reply has named a conversation yet ([`THREAD_NOT_READ`], set at launch).
 //!
 //! Replies can come in any order, so what a success reply names is not applied when it arrives. It
 //! is kept until no request that selects or leaves a conversation is in flight, and the replies
