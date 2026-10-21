@@ -195,6 +195,11 @@ jobs:
           export https_proxy="$HTTPS_PROXY" http_proxy="$HTTP_PROXY" all_proxy="$ALL_PROXY"
           bash scripts/build-shells.sh --fish --no-upstream-tests
 
+      # What the tool says a shell package is made of is held to the packages built above: an
+      # ordinary test run has none, so these cases run here.
+      - name: Test the release tool against the packages built here
+        run: cargo test --locked -p kr-release --test release_tree -- --include-ignored
+
       # Every Mach-O or ELF file the release carries is held to the baseline its target runs on:
       # the host's programs, the shells' programs and the modules a shell loads.
       - name: Read each floor back
