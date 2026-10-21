@@ -19,6 +19,12 @@ name = "checkpoint"
 required-features = ["legs"]
 
 [[test]]
+# A command typed in a managed root shell reaches a gateway, with a real daemon, worker and
+# launcher, a stand-in for the application and a paired device reading what the session holds.
+name = "gateway"
+required-features = ["legs"]
+
+[[test]]
 # Sharing a session with a guest, checked with the processes a person runs and a paired device that
 # is this repository's client library, over loopback: no deployment is involved.
 name = "sharing"
