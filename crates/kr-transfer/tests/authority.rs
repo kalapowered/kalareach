@@ -2597,6 +2597,157 @@ fn removal_mount() {
     .expect("the mount comes off");
 }
 
+/// How long [`a_removal_does_not_wait_on_a_mount_that_never_answers`] waits for the removal before
+/// it calls it blocked. It only ends a removal that is stuck: a removal that is not stuck answers
+/// at once, and the case does not wait for this.
+#[cfg(target_os = "linux")]
+const HUNG_REMOVAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A filesystem in user space that is mounted and never served: every request made of it, a look
+/// at its root included, waits for an answer that does not come.
+///
+/// It is what a network mount whose server has gone is to a caller. The server end is held here,
+/// and letting it go aborts the connection, which ends every call waiting on the mount.
+#[cfg(target_os = "linux")]
+struct HungMount {
+    server: Option<std::os::fd::OwnedFd>,
+    at: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl HungMount {
+    /// Mounts it at `at`, an empty directory this account owns, through the setuid helper a
+    /// user-space filesystem is mounted with by an unprivileged account.
+    ///
+    /// The helper opens the control device, mounts it, and passes the descriptor back over the
+    /// socket it is told of, which is how a server is given its end.
+    ///
+    /// # Errors
+    ///
+    /// Returns what this host lacks when it cannot place the mount.
+    fn attach(at: &Path) -> Result<Self, String> {
+        use std::io::IoSliceMut;
+        use std::mem::MaybeUninit;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::net::UnixStream;
+
+        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
+
+        if !Path::new("/dev/fuse").exists() {
+            return Err("this host has no /dev/fuse".to_owned());
+        }
+        let (ours, theirs) = UnixStream::pair().map_err(|error| error.to_string())?;
+        // Held open across the helper's start, which a descriptor is not by default.
+        rustix::io::fcntl_setfd(&theirs, rustix::io::FdFlags::empty())
+            .map_err(|error| error.to_string())?;
+        let helper = std::process::Command::new("fusermount3")
+            .args(["-o", "rw,nosuid,nodev,fsname=kr-hung", "--"])
+            .arg(at)
+            .env("_FUSE_COMMFD", theirs.as_raw_fd().to_string())
+            .output()
+            .map_err(|error| format!("fusermount3 could not be run: {error}"))?;
+        drop(theirs);
+        if !helper.status.success() {
+            return Err(format!(
+                "fusermount3 would not place the mount: {}",
+                String::from_utf8_lossy(&helper.stderr).trim()
+            ));
+        }
+        let mut data = [0_u8; 1];
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut control = RecvAncillaryBuffer::new(&mut space);
+        recvmsg(
+            &ours,
+            &mut [IoSliceMut::new(&mut data)],
+            &mut control,
+            RecvFlags::empty(),
+        )
+        .map_err(|error| format!("the descriptor did not arrive: {error}"))?;
+        let server = control.drain().find_map(|message| match message {
+            RecvAncillaryMessage::ScmRights(mut descriptors) => descriptors.next(),
+            _ => None,
+        });
+        Ok(Self {
+            server: Some(server.ok_or("fusermount3 passed no descriptor")?),
+            at: at.to_owned(),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for HungMount {
+    fn drop(&mut self) {
+        // The connection is aborted first, so that nothing is left waiting on the mount while it
+        // comes off.
+        drop(self.server.take());
+        let _ = std::process::Command::new("fusermount3")
+            .args(["-u", "-z"])
+            .arg(&self.at)
+            .status();
+    }
+}
+
+/// KR-REQ-14.05: a recursive removal does not wait on a mount that never answers. It stops at the
+/// mount as at any other, and names it, without a single request reaching the mounted filesystem:
+/// a look at the root of a mount whose server has gone does not return.
+///
+/// The mount is a user-space filesystem that is attached and never served, which this account can
+/// place with the helper its distribution installs. A host without `/dev/fuse` or the helper
+/// leaves the case out and says why, unless `KR_REQUIRE_FUSE` is set, which a run that has to
+/// show the case ran sets.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_removal_does_not_wait_on_a_mount_that_never_answers() {
+    let root = kr_ipc::testing::PrivateTempDir::create();
+    let mount_point = root.path().join("tree/branch/mount");
+    std::fs::create_dir_all(&mount_point).expect("the tree");
+    std::fs::write(root.path().join("tree/staged"), b"staged\n").expect("the tree's file");
+    let hung = match HungMount::attach(&mount_point) {
+        Ok(hung) => hung,
+        Err(why) => {
+            assert!(
+                std::env::var_os("KR_REQUIRE_FUSE").is_none(),
+                "this host cannot place the mount this check needs: {why}"
+            );
+            eprintln!("skipped: {why}");
+            return;
+        }
+    };
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+    let name = RelativeName::parse("tree").expect("a name");
+    let opened = authority.subdirectory(&name).expect("the tree opens");
+
+    // On another thread, so that a removal that waits on the mount is a failure of this case and
+    // not a case that never ends.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let removal = std::thread::spawn(move || {
+        let _ = sender.send(authority.remove_tree(&name, opened));
+    });
+    let outcome = receiver.recv_timeout(HUNG_REMOVAL_DEADLINE);
+    // Letting the mount go ends a call that is still waiting on it, so the thread can be joined
+    // whatever the outcome was.
+    drop(hung);
+    removal.join().expect("the removal's thread ends");
+    let refusal = outcome
+        .expect("the removal waits on a mount that never answers")
+        .expect_err("a mount in the tree stops the removal");
+    let Escape::RemovalStopped {
+        stopped_at, reason, ..
+    } = &refusal
+    else {
+        panic!("the refusal is a stopped removal: {refusal}");
+    };
+    assert_eq!(
+        stopped_at, "tree/branch/mount",
+        "it stops at the directory mounted there"
+    );
+    assert!(
+        matches!(**reason, Escape::CrossedMount { .. }),
+        "because it is on another mount: {reason}"
+    );
+}
+
 /// KR-REQ-14.05: the same on macOS, where this account can attach a disk image inside the tree.
 ///
 /// A mount this account places itself is the graft a removal has to refuse: the image's volume is
