@@ -18,10 +18,12 @@
 #   * an attach from the command line to a session of the second release shows its screen, with the
 #     output of the `git` and `cargo` its shell ran, so the host runs a person's development tools
 #     unsandboxed.
-# With `--identity developer-id`, it holds as well that every permission record the second release
-# reports is the one the first reported. An ad hoc signature gives each build an identity of its
-# own, so a record taken against the executable's identity is stale after an update by design, and
-# an ad hoc run says that the records were not compared and does not claim them.
+# With `--identity developer-id`, it holds as well that both releases' programs are signed by one
+# Developer ID team, and that every permission record the second release reports, whole, is the one
+# the first reported; the time an answer was taken and the revision an action binds to are the two
+# members that may differ. An ad hoc signature gives each build an identity of its own, so a record
+# taken against the executable's identity is stale after an update by design, and an ad hoc run says
+# that the records were not compared and does not claim them.
 #
 # The demonstrations need a person's graphical login session, so this runs on a Mac at its console.
 # Every path it uses is on the internal disk.
@@ -56,6 +58,7 @@ if [ "$(uname -s)" != Darwin ]; then
   exit 2
 fi
 
+started="$(date '+%Y-%m-%d %H:%M:%S')"
 work="$(mktemp -d "${TMPDIR:-/tmp}/kr-e2e-update.XXXXXX")"
 # An installed release is read-only, so its directories are opened to removal first.
 cleanup() {
@@ -105,6 +108,8 @@ demonstrate() {
   KR_E2E_PROGRAMS="$programs" KR_E2E_STATE="$work/state-permissions" KR_TEST_ARTIFACTS_DIR="$work/artifacts" \
     bash "$root/scripts/e2e-permissions.sh" "$work/logs/permissions-$label.log" > /dev/null 2>&1 \
     || fail "the permission demonstration did not pass on the $label release; see $work/logs/permissions-$label.log"
+  cp "$work/artifacts/permissions/doctor.json" "$work/logs/doctor-$label.json" 2> /dev/null \
+    || fail "the permission demonstration left no capability records on the $label release"
   grep -q 'every demonstration passed' "$work/logs/desktop-$label.log" 2> /dev/null || fail "the desktop demonstration did not end in a pass on the $label release"
   echo "demonstrations on the $label release: done"
 }
@@ -124,12 +129,14 @@ attach first
 echo "updating to the second release"
 env -i HOME="$work/home" PATH=/usr/bin:/bin "$work/store/current/bin/kr" host update --archive "$second" > "$work/logs/update.log" 2>&1 \
   || { cat "$work/logs/update.log"; fail "the update did not complete"; }
+second_release="$(basename "$second" | sed -E 's/^.*-([0-9]+\.[0-9]+\.[0-9]+\+[0-9a-f]{12})\.tar\.gz$/\1/')"
 host_kr --json host versions > "$work/versions.json"
-python3 - "$work/versions.json" <<'PY' || failed=1
+python3 - "$work/versions.json" "$second_release" <<'PY' || failed=1
 import json, sys
 releases = json.load(open(sys.argv[1]))["releases"]
 current = [r["release"] for r in releases if r["current"]]
 assert len(releases) == 2 and len(current) == 1, f"the store holds {releases}"
+assert current == [sys.argv[2]], f"the current release is {current}, and the update was to {sys.argv[2]}"
 print("current after the update:", current[0], "; kept:", sorted(r["release"] for r in releases))
 PY
 
@@ -146,22 +153,54 @@ else
   echo "ok: the desktop identity is the same after the update: $before"
 fi
 
-records_of() { grep -E '^  ok: [a-z_.]+ is [a-z_]+, from ' "$1" | sort; }
+# The team a Developer ID signature names; nothing for an ad hoc signature or none.
+team_of() {
+  local details
+  details="$(/usr/bin/codesign -dv --verbose=2 "$1" 2>&1)" || return 0
+  case "$details" in
+    *"Authority=Developer ID Application:"*) printf '%s\n' "$details" | sed -n 's/^TeamIdentifier=//p' | head -1 ;;
+  esac
+}
+
+# What the host published about each capability, whole: every member of every record but the time
+# the answer was taken and the revision an action binds to.
+capability_records() {
+  /usr/bin/python3 - "$1" <<'PY'
+import json, sys
+
+def without_when(value):
+    if isinstance(value, dict):
+        return {k: without_when(v) for k, v in value.items() if k not in ("observed_at_ms", "revision")}
+    if isinstance(value, list):
+        return [without_when(v) for v in value]
+    return value
+
+records = json.load(open(sys.argv[1]))["environment"]["desktop"]["capabilities"]
+assert records, "the host published no capability record"
+print(json.dumps(without_when(records), sort_keys=True, indent=1))
+PY
+}
+
 if [ "$identity" = developer-id ]; then
-  if [ -z "$(records_of "$work/logs/permissions-first.log")" ]; then
-    fail "the first release's permission records could not be read"
-  elif [ "$(records_of "$work/logs/permissions-first.log")" != "$(records_of "$work/logs/permissions-second.log")" ]; then
-    fail "the permission records changed across the update"
+  first_team="$(team_of "$first_tree/bin/kr")"
+  second_team="$(team_of "$work/store/current/bin/kr")"
+  if [ -z "$first_team" ] || [ "$first_team" != "${second_team}" ]; then
+    fail "--identity developer-id needs both releases signed by one Developer ID team; the first is '${first_team:-not Developer ID}' and the second '${second_team:-not Developer ID}'"
+  elif ! capability_records "$work/logs/doctor-first.json" > "$work/logs/records-first.json" \
+    || ! capability_records "$work/logs/doctor-second.json" > "$work/logs/records-second.json"; then
+    fail "the capability records could not be read"
+  elif ! cmp -s "$work/logs/records-first.json" "$work/logs/records-second.json"; then
+    fail "the permission records changed across the update; compare $work/logs/records-first.json and records-second.json"
   else
-    echo "ok: every permission record is the same after the update"
+    echo "ok: every permission record is the same after the update, signed by team $first_team"
   fi
 else
   echo "not compared: the permission records of an ad hoc release are stale after an update by design, so only a Developer ID run can say they are the same"
 fi
 
 # The Dialogs check: a dialog the run raised is a finding, whoever answers it.
-if /usr/bin/log show --last 15m --predicate 'process == "SecurityAgent"' 2> /dev/null | grep -q 'SecurityAgent'; then
-  echo "NOTE: SecurityAgent logged in the last fifteen minutes; read it before taking this run as dialog-free"
+if /usr/bin/log show --start "$started" --predicate 'process == "SecurityAgent"' 2> /dev/null | grep -q 'SecurityAgent'; then
+  echo "NOTE: SecurityAgent logged since this run began; read it before taking this run as dialog-free"
 fi
 
 [ "$failed" -eq 0 ] || exit 1
