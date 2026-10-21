@@ -1368,9 +1368,10 @@ impl AuthorisedDirectory {
     /// established is true of the tree that goes.
     ///
     /// * **The name has to hold `opened` when the removal starts**, or nothing is removed. A mount
-    ///   put on the name since the caller opened the tree is refused by the same look as any other
-    ///   replacement, and the look goes into a mount only where the caller handed over the root of
-    ///   one: the opened directory is on another mount than the one that holds the name.
+    ///   put on the name since the caller opened the tree is refused as any other replacement is,
+    ///   and the look at the name goes into a mount only where the caller handed over the root of
+    ///   one (the opened directory is on another mount than the one that holds the name). Where
+    ///   the next bullet says the look cannot be kept out of a mount, this one cannot either.
     /// * **Each directory beneath is entered the way a descent enters one**: opened without
     ///   following a link, as a directory, against the handle above it, and kept open until
     ///   everything in it is gone. The removal stays on the mount `opened` is on, whether or not
