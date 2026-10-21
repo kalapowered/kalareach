@@ -949,8 +949,8 @@ the user's own tools write. It is granted only when no writer of this host is at
 repository and no live session this host started is in a tree it records for it. The reservation
 is first granted over the working tree and its Git directory, and the other trees the host records
 for the repository are read and added once it stands, so a worktree being made at that moment
-either turns the reservation away as a writer at work or is counted. A tree adopted after the grant is not covered. It
-never waits: a workspace it cannot hold at that moment is captured as the per-file class, or the
+either turns the reservation away as a writer at work or is counted. A tree adopted after the
+grant is not covered. It never waits: a workspace it cannot hold at that moment is captured as the per-file class, or the
 capture is refused when it required the quiesced one, and the refusal says which of these applies.
 A reservation ends at its bound, five minutes, whatever its holder does.
 
@@ -981,22 +981,28 @@ directory above it, matched at the moment a reservation is asked for against eve
 records, a project's own checkout included whether or not a workspace was ever selected on it, so
 a terminal opened before the host knew its repository still counts. A session with no directory
 starts at the root and counts nowhere; one whose directory is not an absolute path, or whose
-request the daemon could not read after a restart, counts against every reservation. A session
-counts until its closure is recorded. A create that did not come to a session counts until the
-kernel says the worker's process has ended, and then as follows. A launch no worker claimed, or
-whose claim the host refused, started no session, so it stops counting. A worker that was claimed (it reported it could not start, or
-did not report in time) stops counting only if its own journal holds a closure that lists nothing
-it left running; no journal, a journal with no closure in it, and a closure that lists a survivor
-all keep it, because a worker starts its shell even when it cannot open a journal. A claimed
-launch that reports late and runs is a session like any other, and its closure ends it. The host
-asks for sixty seconds, and a worker still running after that counts until the daemon restarts. A
-launch whose process the host could not identify counts until the daemon restarts too. A closure
-that could not confirm its worker ended counts until, within those sixty seconds, the kernel says
-the process has ended and the worker's own journal shows a closure with nothing left running; a closure the journal kept
-after its process ended is not looked at again until the daemon restarts, and is not registered
-again then. A closure that records a process the session left running counts until the daemon
-restarts, and after a restart nothing follows that process. A closure that accounts for its worker releases the session even where its
-account of the session's own processes is incomplete.
+request the daemon could not read after a restart, counts against every reservation.
+
+A session counts until its closure is recorded, with these exceptions, each of which waits for the
+kernel to say that the worker's process has ended. The host asks for sixty seconds; a worker still
+running after that counts until the daemon restarts.
+
+* A create that did not come to a session. A launch no worker claimed, or whose claim the host
+  refused, started no session, so it stops counting when its worker's process ends. A worker that
+  was claimed (it reported that it could not start, or it did not report in time) stops counting
+  only if its own journal holds a closure that lists nothing it left running. No journal, a
+  journal with no closure in it, and a closure that lists a survivor all keep it, because a worker
+  starts its shell even when it cannot open a journal. A claimed launch that reports late and
+  runs is a session like any other, and its closure ends it. A launch whose process the host could
+  not identify counts until the daemon restarts.
+* A closure the host wrote over a death it could not confirm. It stops counting under the same
+  rule as a claimed worker. One the journal kept after its process ended is not looked at again
+  until the daemon restarts, and is not registered again then.
+* A closure that records a process the session left running. It counts until the daemon restarts,
+  and after a restart nothing follows that process.
+
+A closure that accounts for its worker releases the session even where its account of the
+session's own processes is incomplete.
 
 What a reservation does not see: a session in a tree this host does not record (a linked worktree
 the user added by hand), a shell that changes into a tree after it started elsewhere, a parent
