@@ -4,9 +4,11 @@
 //! optional opaque diagnostic identifier. The codes below are the complete required set. A code is
 //! a stable wire string: renaming one is a protocol change, not a refactor.
 //!
-//! Typed resource states such as `permission_required`, `restart_required`, pending revocation and
-//! voice `creation_unknown` are **not** error codes. They belong to their own result schemas and
-//! must not appear as alternative spellings here.
+//! Typed resource states such as `permission_required`, pending revocation and voice
+//! `creation_unknown` are **not** error codes. They belong to their own result schemas and must
+//! not appear as alternative spellings here. `restart_required` is not a host result at all: it is
+//! the setup assistant's state, worked out from two readings of a capability, and is no error code
+//! either.
 
 use core::fmt;
 use core::str::FromStr;
