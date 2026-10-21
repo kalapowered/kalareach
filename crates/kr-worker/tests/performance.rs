@@ -974,17 +974,95 @@ async fn attach_to_a_usable_screen() {
     let measured = attach(&host, &mut owned).await;
     let closed = close_all(&host, &owned).await;
 
-    let worst = measured.unwrap_or_else(|failure| panic!("the measurement: {failure}"));
+    let measured = measured.unwrap_or_else(|failure| panic!("the measurement: {failure}"));
     closed.unwrap_or_else(|failure| panic!("the sessions this measurement created: {failure}"));
-    assert!(
-        worst < ATTACH_BOUND,
-        "the slowest attach reached a usable screen within {ATTACH_BOUND:?}: {worst:?}"
-    );
+    measured
+        .check()
+        .unwrap_or_else(|failure| panic!("{failure}"));
     let _ = host.controller;
 }
 
+/// What the attach measurement established, and whether its host's disk let the target be asserted.
+struct Attached {
+    slowest: Duration,
+    /// What the disk's durable writes fell short of the reference host by, where they did. An attach
+    /// is answered after the worker has made three journal records durable, so its time includes
+    /// the disk's time for three writes: on a disk slower than the reference host's the figure is
+    /// recorded and the target is not asserted. Any other shortfall leaves the target asserted, as
+    /// it always has been.
+    slow_disk: Option<String>,
+}
+
+impl Attached {
+    fn new(slowest: Duration, conditions: &record::Conditions) -> Self {
+        Self {
+            slowest,
+            slow_disk: conditions.slow_disk(),
+        }
+    }
+
+    /// Holds the slowest attach to the bound, unless the disk was slower than the target allows for.
+    fn check(&self) -> Result<(), String> {
+        if self.slow_disk.is_none() && self.slowest >= ATTACH_BOUND {
+            return Err(format!(
+                "the slowest attach reached a usable screen within {ATTACH_BOUND:?}: {:?}",
+                self.slowest
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// KR-PERF-004: an attach waits for the disk to make three journal records durable, so a host whose
+/// disk takes longer than a reference host's for a durable write records the figure and names the
+/// disk rather than failing on it.
+#[test]
+fn a_host_with_a_slow_disk_records_the_attach_figure_without_asserting_it() {
+    let slow = record::Conditions::supplied(4, 8 * 1024, Some(0.0)).with_durable_writes(2, 170);
+    let attached = Attached::new(Duration::from_millis(520), &slow);
+    assert!(
+        attached
+            .slow_disk
+            .as_deref()
+            .is_some_and(|disk| disk.contains("170.0 ms")),
+        "the record names how long the disk took: {:?}",
+        attached.slow_disk
+    );
+    assert_eq!(
+        attached.check(),
+        Ok(()),
+        "a host whose disk is slower than a reference host's is not failed on the attach figure"
+    );
+}
+
+/// KR-PERF-004: where the disk is as fast as a reference host's, or was not read, the bound is
+/// asserted, and so it is on a host short in any other way.
+#[test]
+fn a_host_with_a_fast_disk_fails_an_attach_over_the_bound() {
+    let over = Duration::from_millis(520);
+    for conditions in [
+        record::Conditions::supplied(4, 8 * 1024, Some(0.0)).with_durable_writes(2, 3),
+        record::Conditions::supplied(4, 8 * 1024, Some(0.0)),
+        record::Conditions::supplied(3, 7 * 1024, None).with_durable_writes(2, 3),
+    ] {
+        let attached = Attached::new(over, &conditions);
+        assert!(
+            attached
+                .check()
+                .is_err_and(|failure| failure.contains("usable screen")),
+            "the figure over the bound fails: {:?}",
+            attached.check()
+        );
+    }
+    let under = Attached::new(
+        Duration::from_millis(40),
+        &record::Conditions::supplied(4, 8 * 1024, Some(0.0)).with_durable_writes(2, 3),
+    );
+    assert_eq!(under.check(), Ok(()), "a figure under the bound passes");
+}
+
 /// Times the attachments and returns the slowest, reporting a failure rather than ending on one.
-async fn attach(host: &Host, owned: &mut Owned) -> Result<Duration, String> {
+async fn attach(host: &Host, owned: &mut Owned) -> Result<Attached, String> {
     create(host, owned).await?;
     let created = owned
         .sessions
@@ -994,7 +1072,7 @@ async fn attach(host: &Host, owned: &mut Owned) -> Result<Duration, String> {
     // Both presentations are measured. A terminal of the session's own size is handed the stream
     // directly; one of any other size is drawn a rendering of the canonical grid, and a person
     // waits for the screen either way.
-    let window = record::Window::open();
+    let window = record::Window::open_with_disk(host.temp.root());
     let direct = attach_samples(host, created, Dimensions::new(120, 40)).await;
     let projected = attach_samples(host, created, Dimensions::new(80, 24)).await;
     let conditions = window.close();
@@ -1031,6 +1109,7 @@ async fn attach(host: &Host, owned: &mut Owned) -> Result<Duration, String> {
         ),
         ATTACH_BOUND.as_secs_f64() * 1000.0
     ));
+    let slow_disk = conditions.slow_disk();
     lines.push(format!(
         "  verdict           {}",
         match slowest {
@@ -1039,9 +1118,16 @@ async fn attach(host: &Host, owned: &mut Owned) -> Result<Duration, String> {
                  target is neither met nor missed here"
             }
             Some(slowest) if slowest < ATTACH_BOUND => "the target is met on this host",
+            Some(_) if slow_disk.is_some() => {
+                "the target is recorded and not asserted here, because this host's disk took \
+                 longer to make a write durable than the reference host's does"
+            }
             _ => "the target is not met on this host",
         }
     ));
+    if let Some(disk) = &slow_disk {
+        lines.push(format!("  condition missing {disk}"));
+    }
     // Before anything is asserted, so a run whose target failed keeps the figure.
     record::report(
         RECORD,
@@ -1054,7 +1140,9 @@ async fn attach(host: &Host, owned: &mut Owned) -> Result<Duration, String> {
     if projected.len() != 5 {
         return Err("every projected attachment reached a screen".to_owned());
     }
-    slowest.ok_or_else(|| "samples".to_owned())
+    slowest
+        .map(|slowest| Attached::new(slowest, &conditions))
+        .ok_or_else(|| "samples".to_owned())
 }
 
 /// Closes every session this measurement created and waits for the daemon to record each closure.

@@ -38,6 +38,26 @@ const SPEED_STEPS: u64 = 20_000_000;
 /// How many times that work is run at each edge of a measurement.
 const SPEED_READINGS: usize = 3;
 
+/// The slowest a durable write may be, in the 90th percentile of a reading, before this harness
+/// stops asserting a target that waits on one.
+///
+/// A mutation the host journals is answered once its record is on disk, so a target that includes
+/// one includes the disk's time for it, and an attach commits three records. A reference host's
+/// disk takes well under a millisecond for one; at 25 ms the three are a fifth of the 500 ms a usable
+/// screen is given. Section 27 states no figure for the disk, so, like the stolen share's, this is
+/// the harness's own exclusion rule: a host above it recorded the figure and named what the disk
+/// took.
+const MAX_DURABLE_WRITE: Duration = Duration::from_millis(25);
+
+/// How many durable writes a reading takes, at most.
+const DURABLE_WRITES: usize = 40;
+
+/// How many it takes at the least, when the disk is slow enough that the time below runs out.
+const DURABLE_WRITES_LEAST: usize = 10;
+
+/// How long a reading may run, once it has taken the least.
+const DURABLE_WRITES_TIME: Duration = Duration::from_secs(2);
+
 /// How long a host takes to run a fixed piece of single-threaded work.
 ///
 /// A figure that is a share of one processor, or a time, is only as good as the processor it was
@@ -74,6 +94,80 @@ impl Speed {
     }
 }
 
+/// How long the disk a host keeps its state on takes to make a write durable.
+///
+/// A host that journals what it does answers after the record is on disk, and a disk shared with
+/// other work is not always as fast as it was a minute ago: a figure that includes a durable write
+/// is only as good as the disk it was taken on. This is read at both edges of what a measurement
+/// times, in the directory the measured host keeps its state in, by appending a block and syncing
+/// it, as the host's own journal does. Only Linux is read: the call the journal's database makes
+/// is the one made here, and the other platforms' calls differ (macOS's `sync_all` flushes the
+/// drive's cache, which the journal does not ask for), so a platform that is not read leaves the
+/// condition unverified rather than counting a difference of call against the host.
+#[derive(Clone, Copy, Debug)]
+pub struct DurableWrites {
+    slowest_tenth: Duration,
+}
+
+impl DurableWrites {
+    /// Appends blocks to a file in `directory`, syncing after each, and keeps the time the
+    /// slowest tenth of them took at the least.
+    ///
+    /// `None` where the platform is not read, or the file cannot be written.
+    #[must_use]
+    pub fn read(directory: &Path) -> Option<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let path = directory.join(format!("durable-write-reading-{}", std::process::id()));
+            let reading = Self::append_and_sync(&path);
+            let _ = std::fs::remove_file(&path);
+            reading
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = directory;
+            None
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn append_and_sync(path: &Path) -> Option<Self> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .ok()?;
+        let block = [0x6b_u8; 4096];
+        let began = Instant::now();
+        let mut times = Vec::with_capacity(DURABLE_WRITES);
+        while times.len() < DURABLE_WRITES
+            && (times.len() < DURABLE_WRITES_LEAST || began.elapsed() < DURABLE_WRITES_TIME)
+        {
+            file.write_all(&block).ok()?;
+            let write = Instant::now();
+            file.sync_all().ok()?;
+            times.push(write.elapsed());
+        }
+        times.sort_unstable();
+        let rank = (times.len() * 9 / 10).min(times.len().checked_sub(1)?);
+        Some(Self {
+            slowest_tenth: times[rank],
+        })
+    }
+
+    /// The time the slowest tenth of the writes took at the least, in milliseconds.
+    #[must_use]
+    pub fn milliseconds(self) -> f64 {
+        self.slowest_tenth.as_secs_f64() * 1000.0
+    }
+
+    /// Whether the disk is above what this harness admits.
+    fn is_slow(self) -> bool {
+        self.slowest_tenth > MAX_DURABLE_WRITE
+    }
+}
+
 /// A chain of integer steps in which each one needs the result of the one before it, so that the
 /// time it takes is the time of the processor's own arithmetic and nothing a compiler or a core
 /// can do ahead of it.
@@ -91,6 +185,8 @@ fn steps(count: u64) -> u64 {
 pub struct Window {
     entering: Option<String>,
     speed: Option<Speed>,
+    /// The directory the disk is read in, and what it read as the window opened.
+    storage: Option<(PathBuf, Option<DurableWrites>)>,
     stolen: StolenTime,
     beside: Option<Beside>,
 }
@@ -116,6 +212,27 @@ impl Window {
         Self {
             entering,
             speed,
+            storage: None,
+            stolen: StolenTime::start(),
+            beside: None,
+        }
+    }
+
+    /// Reads the host as a measurement begins, and the disk in `directory` as well.
+    ///
+    /// For a figure that waits on a durable write, as one for a mutation the host journals does:
+    /// `directory` is where the measured host keeps its state, so the disk read is the one its
+    /// journal writes to. The disk is read after the speed and before the span the hypervisor's
+    /// share is read over begins, so the writes are in neither.
+    #[must_use]
+    pub fn open_with_disk(directory: &Path) -> Self {
+        let entering = load_average();
+        let speed = Some(Speed::read());
+        let storage = Some((directory.to_owned(), DurableWrites::read(directory)));
+        Self {
+            entering,
+            speed,
+            storage,
             stolen: StolenTime::start(),
             beside: None,
         }
@@ -142,6 +259,7 @@ impl Window {
         Self {
             entering: load_average(),
             speed: None,
+            storage: None,
             stolen: StolenTime::start(),
             beside: None,
         }
@@ -157,6 +275,10 @@ impl Window {
             entering: self.entering,
             leaving,
             speed: self.speed.map(|entering| (entering, Speed::read())),
+            disk: self.storage.map(|(directory, entering)| {
+                let leaving = DurableWrites::read(&directory);
+                entering.zip(leaving)
+            }),
             stolen,
             beside: self
                 .beside
@@ -173,6 +295,9 @@ pub struct Conditions {
     leaving: Option<String>,
     /// The host's speed at the two edges, where it was read.
     speed: Option<(Speed, Speed)>,
+    /// The disk's durable writes at the two edges: `None` where the window was not asked to read
+    /// the disk, and `Some(None)` where it was and a reading was not taken at both.
+    disk: Option<Option<(DurableWrites, DurableWrites)>>,
     stolen: Option<f64>,
     /// What ran beside the measurement, and how many of it were completed.
     beside: Option<(&'static str, u64)>,
@@ -186,7 +311,33 @@ impl Conditions {
     /// otherwise names one condition for the record to carry beside the figure.
     #[must_use]
     pub fn shortfalls(&self) -> Vec<String> {
-        self.host.shortfalls(self.stolen)
+        let mut missing = self.host.shortfalls(self.stolen);
+        missing.extend(self.slow_disk());
+        missing
+    }
+
+    /// What the disk's durable writes fell short of the reference host by, where they did.
+    ///
+    /// For a target that waits on one: it stays asserted on a host short in any other way, and is
+    /// recorded without being asserted on one whose disk took longer than this harness admits at
+    /// either edge. A disk that was not read, or read at one edge only, is unverified and is not a
+    /// shortfall.
+    #[must_use]
+    pub fn slow_disk(&self) -> Option<String> {
+        let (entering, leaving) = self.disk??;
+        let (edge, slowest) = if entering.milliseconds() >= leaving.milliseconds() {
+            ("entering", entering)
+        } else {
+            ("leaving", leaving)
+        };
+        (entering.is_slow() || leaving.is_slow()).then(|| {
+            format!(
+                "durable writes on the host's disk took {:.1} ms in the slowest tenth {edge}, \
+                 above the {} ms this harness admits",
+                slowest.milliseconds(),
+                MAX_DURABLE_WRITE.as_millis()
+            )
+        })
     }
 
     /// The lines that record the host, in the order every record gives them.
@@ -257,6 +408,27 @@ impl Conditions {
                 format!("  reference host    short: {}", shortfalls.join("; "))
             },
         ];
+        if let Some(disk) = self.disk {
+            // Before the reference host's own line, which sums up every condition above it.
+            let at = lines.len() - 1;
+            lines.insert(
+                at,
+                format!(
+                    "  durable writes    {}",
+                    disk.map_or_else(
+                        || "not read here, so unverified".to_owned(),
+                        |(entering, leaving)| format!(
+                            "the slowest tenth of up to {DURABLE_WRITES} synced 4 KiB appends took \
+                             {:.1} ms entering and {:.1} ms leaving, against the {} ms this harness \
+                             admits",
+                            entering.milliseconds(),
+                            leaving.milliseconds(),
+                            MAX_DURABLE_WRITE.as_millis()
+                        )
+                    )
+                ),
+            );
+        }
         if let Some((what, done)) = self.beside {
             lines.push(format!(
                 "  work beside       {done} {what} completed while the measurement ran"
@@ -288,9 +460,21 @@ impl Conditions {
             entering: None,
             leaving: None,
             speed: None,
+            disk: None,
             stolen,
             beside: None,
         }
+    }
+
+    /// The same host with the disk's durable writes read as the two times name, in milliseconds
+    /// for the slowest tenth of the writes at each edge.
+    #[must_use]
+    pub fn with_durable_writes(mut self, entering_ms: u64, leaving_ms: u64) -> Self {
+        let reading = |milliseconds| DurableWrites {
+            slowest_tenth: Duration::from_millis(milliseconds),
+        };
+        self.disk = Some(Some((reading(entering_ms), reading(leaving_ms))));
+        self
     }
 }
 
