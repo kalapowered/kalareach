@@ -78,11 +78,6 @@ impl Home {
         let said = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
         (output, said)
     }
-
-    fn record(&self) -> Value {
-        serde_json::from_slice(&std::fs::read(self.store.record()).expect("the store's record"))
-            .expect("JSON")
-    }
 }
 
 impl Drop for Home {
@@ -135,7 +130,12 @@ fn the_first_command_of_a_package_managers_kr_admits_its_release() {
         home.store.current().expect("reads"),
         Some(one.name().clone())
     );
-    assert_eq!(home.record()["installer"], "homebrew");
+    assert_eq!(
+        kr_cli::update::installer(&home.store)
+            .expect("reads")
+            .as_deref(),
+        Some("homebrew")
+    );
     // `host versions` answers only for a kr of a store, so the command ran as the store's copy.
     assert_eq!(listed["releases"][0]["release"], one.name().as_str());
     assert_eq!(listed["releases"][0]["current"], true);
@@ -207,7 +207,12 @@ fn an_upgrade_by_a_package_manager_leaves_the_release_before_it_in_the_store() {
         .filter_map(|kept| kept["release"].as_str())
         .collect();
     assert!(names.contains(&one.name().as_str()) && names.contains(&two.name().as_str()));
-    assert_eq!(home.record()["installer"], "homebrew");
+    assert_eq!(
+        kr_cli::update::installer(&home.store)
+            .expect("reads")
+            .as_deref(),
+        Some("homebrew")
+    );
 }
 
 /// KR-REQ-26.03: an update that waits leaves the release that is current in place and does not stop
@@ -264,4 +269,133 @@ fn two_first_commands_at_once_admit_one_release() {
         Some(one.name().clone())
     );
     assert_eq!(home.store.releases().expect("reads").len(), 1);
+}
+
+/// KR-REQ-26.03: a release that carries no update channel root is refused, and the command does not
+/// run: nothing could check what the package manager's release says it is. The first test is the
+/// control, a release with its root.
+#[test]
+fn a_release_with_no_channel_root_is_not_admitted_and_the_command_does_not_run() {
+    let home = Home::new();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let tree = home.prefix("Cellar", &one);
+    // A release whose manifest lists no root and whose files are all there: nothing but the root's
+    // absence is wrong with it, and a first installation by hand takes it without a signature check.
+    std::fs::remove_file(tree.join(kr_cli::update::release::CHANNEL_ROOT)).expect("removed");
+    let path = tree.join("release.json");
+    let mut document: Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("the manifest")).expect("JSON");
+    let files = document["signed"]["files"].as_array_mut().expect("files");
+    files.retain(|file| file["path"] != kr_cli::update::release::CHANNEL_ROOT);
+    std::fs::write(&path, document.to_string()).expect("written");
+
+    let (refused, listed) = home.versions(&kr(&tree));
+    assert!(!refused.status.success(), "{}", said(&refused));
+    assert!(
+        said(&refused).contains("update channel root"),
+        "{}",
+        said(&refused)
+    );
+    assert!(listed.get("releases").is_none(), "the command did not run");
+    assert!(!home.store.is_store(), "nothing was admitted");
+}
+
+/// KR-REQ-26.03: a package manager's prefix that has lost its manifest is refused, and is never
+/// taken for a build of this checkout that runs from where it is.
+#[test]
+fn a_package_managers_release_without_its_manifest_is_refused() {
+    let home = Home::new();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let tree = home.prefix("Cellar", &one);
+    std::fs::remove_file(tree.join("release.json")).expect("removed");
+
+    let (refused, listed) = home.versions(&kr(&tree));
+    assert!(!refused.status.success());
+    assert!(said(&refused).contains("no manifest"), "{}", said(&refused));
+    assert_eq!(listed["ok"], false, "{listed}");
+    assert!(listed.get("releases").is_none(), "the command did not run");
+    assert!(!home.store.is_store(), "nothing was admitted");
+}
+
+/// KR-REQ-26.03: a release older than the one the host runs is not put in the store, and the
+/// command runs as the release that is current.
+#[test]
+fn a_package_managers_older_release_leaves_the_current_one_running() {
+    let home = Home::new();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    let newer = home.prefix("Cellar", &two);
+    assert!(home.versions(&kr(&newer)).0.status.success());
+
+    let older = home.prefix("Cellar", &one);
+    let (ran, listed) = home.versions(&kr(&older));
+    assert!(ran.status.success(), "{}", said(&ran));
+    assert!(said(&ran).contains("no newer"), "{}", said(&ran));
+    assert_eq!(listed["releases"][0]["release"], two.name().as_str());
+    assert_eq!(
+        home.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
+    assert!(
+        !home.store.release_directory(one.name()).exists(),
+        "the older release was not put in the store"
+    );
+}
+
+/// KR-REQ-26.03: a release a rollback left in the store is not switched back to by running the
+/// package manager's `kr` for it.
+#[test]
+fn a_release_kept_after_a_rollback_is_not_switched_back_to() {
+    let home = Home::new();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    let first = home.prefix("Cellar", &one);
+    assert!(home.versions(&kr(&first)).0.status.success());
+    let second = home.prefix("Cellar", &two);
+    assert!(home.versions(&kr(&second)).0.status.success());
+    let store_kr = home.store.stable(Program::Kr);
+    let rolled = home.run(&store_kr, &["host", "rollback"]);
+    assert!(rolled.status.success(), "{}", said(&rolled));
+    assert_eq!(
+        home.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+
+    let (ran, _) = home.versions(&kr(&second));
+    assert!(ran.status.success(), "{}", said(&ran));
+    assert_eq!(
+        home.store.current().expect("reads"),
+        Some(one.name().clone()),
+        "the rollback stands"
+    );
+}
+
+/// KR-REQ-26.03: a package manager's copy of the release already current takes ownership of the
+/// store, since the store's copy is that release byte for byte; a copy that only has its name does
+/// not, and is refused.
+#[test]
+fn a_package_manager_takes_over_the_release_that_is_current_only_by_its_manifest() {
+    let home = Home::new();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let by_hand = home.prefix("unpacked", &one);
+    let installed = home.run(&kr(&by_hand), &["host", "install"]);
+    assert!(installed.status.success(), "{}", said(&installed));
+    assert_eq!(kr_cli::update::installer(&home.store).expect("reads"), None);
+
+    let tree = home.prefix("Cellar", &one);
+    let (ran, _) = home.versions(&kr(&tree));
+    assert!(ran.status.success(), "{}", said(&ran));
+    assert_eq!(
+        kr_cli::update::installer(&home.store)
+            .expect("reads")
+            .as_deref(),
+        Some("homebrew")
+    );
+
+    // The control: a tree of the same name that is another release's manifest is not that release.
+    let other = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 7);
+    let forged = home.prefix("Caskroom", &other);
+    let (refused, listed) = home.versions(&kr(&forged));
+    assert!(!refused.status.success(), "{}", said(&refused));
+    assert!(listed.get("releases").is_none(), "the command did not run");
 }

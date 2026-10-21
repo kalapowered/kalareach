@@ -110,14 +110,15 @@ pub fn said(error: &InstallError) -> Shown {
 
 /// The store record's format this build writes, and the newest it reads.
 ///
-/// Format 3 records which package manager put the host's releases there, if one did. A record of
-/// format 2 holds none; it reads as it is and is written as format 3 the next time it is written.
-pub const RECORD_FORMAT: u32 = 3;
+/// Format 2 records the update channel root this host trusts, and the root an update under way
+/// settles on. A record of format 1 holds neither; it reads as it is and is written as format 2
+/// the next time it is written.
+pub const RECORD_FORMAT: u32 = 2;
 
 /// The oldest store record format this build reads. Raise it, and remove the step in
 /// [`Record::read`] that brings an earlier record forward, once no supported upgrade starts from
 /// one.
-pub const OLDEST_RECORD_FORMAT: u32 = 2;
+pub const OLDEST_RECORD_FORMAT: u32 = 1;
 
 /// The longest store record this build reads: it holds the channel roots of the host and of an
 /// update under way, of which a release may carry one up to 1 MiB each, written out in the
@@ -152,10 +153,6 @@ pub struct Record {
     /// Absent until the first switch settles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_root: Option<tough::schema::Signed<tough::schema::Root>>,
-    /// The package manager that put this host's releases here, when one did: it owns which
-    /// release is current, and this host's own update channel stays off for it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub installer: Option<String>,
 }
 
 kr_client::debug_as_name!(Record);
@@ -418,16 +415,8 @@ impl Record {
                 RECORD_FORMAT
             )));
         }
-        if record.format < OLDEST_RECORD_FORMAT {
-            return Err(CliError::Other(shown!(
-                "the store's record {} is of format {}, and this kr reads format {} at the oldest",
-                Shown::root(&path),
-                record.format,
-                OLDEST_RECORD_FORMAT
-            )));
-        }
-        // The step from an earlier format: what a record of format 2 holds is all that format 3
-        // holds before it records an installer, so it reads as format 3 and the next write says so.
+        // The step from an earlier format: what a record of format 1 holds is all that format 2
+        // holds before it records a root, so it reads as format 2 and the next write says so.
         Ok(Self {
             format: RECORD_FORMAT,
             ..record
@@ -455,6 +444,41 @@ impl Record {
         kr_ipc::paths::write_owner_only_file(&store.record(), &bytes)?;
         Ok(())
     }
+}
+
+/// The file in the store that names the package manager that put its releases there.
+const INSTALLER_FILE: &str = "installer";
+
+/// The package manager that put this store's releases there, when one did: it owns which release is
+/// current. It is a file of its own and not a member of the store's record, so a release before
+/// this one, which reads that record, finds it as it wrote it.
+///
+/// # Errors
+///
+/// Returns the failure to read it.
+#[cfg(unix)]
+pub fn installer(store: &Store) -> Result<Option<String>> {
+    match std::fs::read_to_string(store.root().join(INSTALLER_FILE)) {
+        Ok(text) => Ok(Some(text.trim().to_owned()).filter(|name| !name.is_empty())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(CliError::Other(shown!(
+            "the store's installer could not be read: {}",
+            Shown::io(&error)
+        ))),
+    }
+}
+
+/// Names `installer` as the package manager that owns this store's releases.
+#[cfg(unix)]
+fn write_installer(store: &Store, installer: &str) -> Result<()> {
+    if self::installer(store)?.as_deref() == Some(installer) {
+        return Ok(());
+    }
+    kr_ipc::paths::write_owner_only_file(
+        &store.root().join(INSTALLER_FILE),
+        format!("{installer}\n").as_bytes(),
+    )?;
+    Ok(())
 }
 
 /// What a release in the store is to this host.
@@ -870,7 +894,6 @@ pub async fn install(
     // `versions/` holds the release it is of.
     Record {
         format: RECORD_FORMAT,
-        installer: installer.map(str::to_owned),
         ..Record::default()
     }
     .write(&store)?;
@@ -878,6 +901,9 @@ pub async fn install(
     let staged = stage_tree(&store, &tree, &staging, &update_lock).await;
     let _ = remove_staging(&staging);
     let (release, has_root) = staged?;
+    if let Some(installer) = installer {
+        write_installer(&store, installer)?;
+    }
     Ok(Installed {
         store,
         release,
@@ -1107,10 +1133,8 @@ pub async fn update(
     // which release is current from here, whether this run switches to it or waits.
     if let Some(installer) = installer
         && !check
-        && record.installer.as_deref() != Some(installer)
     {
-        record.installer = Some(installer.to_owned());
-        record.write(&store)?;
+        write_installer(&store, installer)?;
     }
     if target.release == source {
         // The release that is current is not an update to go on past a failed one with: the daemons

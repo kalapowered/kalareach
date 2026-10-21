@@ -7,15 +7,22 @@
 //! store's own copy.
 //!
 //! * With no release in the store, the release is installed as `kr host install` installs one.
-//! * With another release current, the release is handed to the current release's `kr` as an
-//!   update (`kr host update --archive <tree>`), which checks it against the update channel's root,
-//!   hands the daemons over and switches, or waits for a live worker as any update does. A wait is
-//!   not a failure: the command goes on with the release still current.
+//! * With another release current, and this one newer and not kept yet, the release is handed to
+//!   the current release's `kr` as an update (`kr host update --archive <tree>`), which checks it
+//!   against the update channel's root, hands the daemons over and switches, or waits for a live
+//!   worker as any update does. A wait is not a failure: the command goes on with the release still
+//!   current.
+//! * A release that is the current one, one the store already keeps, and one no newer than the
+//!   current is not put in the store again, and the command goes on with the release that is
+//!   current. A release kept after a rollback is not switched back to by running its `kr`.
 //!
-//! Either way the record of the store names the package manager, which owns which release is
-//! current from then on. A release that cannot be checked is refused, with the reason, and the
-//! command does not run. Two first commands at once serialise on the store's own locks: the one
-//! that does not take them goes on with the release that is current.
+//! A release that carries no update channel root is refused, so that a package manager's release is
+//! always checked against the keys it names: the first installation by hand is the one that takes a
+//! release with none. A release that cannot be checked is refused, with the reason, and the command
+//! does not run. Two first commands at once serialise on the store's own locks: the one that does
+//! not take them goes on with the release that is current.
+//!
+//! The store names the package manager in a file of its own, which owns which release is current.
 //!
 //! A `kr` of a store, a build outside any package manager's prefix and the commands that read
 //! nothing of the host (`--help`, `--version`, a mistake in the arguments) do none of this.
@@ -38,27 +45,29 @@ const INSTALL_WAIT: Duration = Duration::from_secs(60);
 
 /// The release this `kr` is part of when it is a package manager's, and which manager.
 ///
-/// `None` for a `kr` of a store, for one outside a store that no package manager put there, and
-/// for one with no release beside it.
+/// `None` for a `kr` of a store and for one outside a store that no package manager put there. A
+/// `kr` in a package manager's prefix is one whether or not its release is whole: a prefix that has
+/// lost its manifest is refused by [`admit`], and is never taken for a build of this checkout.
 #[must_use]
 pub fn unadmitted() -> Option<(PathBuf, &'static str)> {
     let Ok(Running::Loose { directory }) = kr_ipc::install::this_process() else {
         return None;
     };
     let tree = directory.parent()?;
-    if !tree.join(kr_protocol::update::MANIFEST_FILE).is_file() {
-        return None;
-    }
     Some((tree.to_path_buf(), installer_of(tree)?))
 }
 
-/// The package manager whose prefix `tree` is in, from the directories each keeps releases in.
+/// The package manager whose prefix `tree` is in: the release's directory under the package's own
+/// name in the directory that manager keeps releases in.
 fn installer_of(tree: &Path) -> Option<&'static str> {
-    tree.components()
-        .find_map(|part| match part.as_os_str().to_str() {
-            Some("Cellar" | "Caskroom") => Some("homebrew"),
-            _ => None,
-        })
+    let parts: Vec<_> = tree
+        .components()
+        .map(|part| part.as_os_str().to_str())
+        .collect();
+    parts.windows(2).find_map(|pair| match pair {
+        [Some("Cellar" | "Caskroom"), Some("kalareach")] => Some("homebrew"),
+        _ => None,
+    })
 }
 
 /// Admits the release in `tree`, and then runs this command again as the store's `kr`.
@@ -75,7 +84,15 @@ pub async fn admit(tree: &Path, installer: &str) -> Result<Infallible> {
         ))
     })?;
     let store = Store::at(root);
-    let release = release::read_manifest(&release::manifest_document(tree)?)?.release;
+    let document = release::manifest_document(tree)?;
+    let manifest = release::read_manifest(&document)?;
+    if release::ChannelRoot::read(tree)?.is_none() {
+        return Err(CliError::Other(shown!(
+            "the release at {} carries no update channel root, so it cannot be checked, and this \
+             command did not run",
+            Shown::root(tree)
+        )));
+    }
 
     let deadline = Instant::now() + INSTALL_WAIT;
     loop {
@@ -83,9 +100,27 @@ pub async fn admit(tree: &Path, installer: &str) -> Result<Infallible> {
             .current()
             .map_err(|error| CliError::Other(said(&error)))?;
         match current {
-            Some(current) if current == release => break,
-            Some(_) => {
-                hand_to_current(&store, tree, installer)?;
+            Some(current) if current == manifest.release => {
+                // The store's own copy runs, so what the prefix holds changes nothing, but the
+                // manager takes ownership only of the release it put there: the same manifest,
+                // byte for byte.
+                let kept = release::manifest_document(&store.release_directory(&current))?;
+                if kept != document {
+                    return Err(CliError::Other(shown!(
+                        "the release at {} has the name of the one in this host's store and is not \
+                         it, and this command did not run",
+                        Shown::root(tree)
+                    )));
+                }
+                super::write_installer(&store, installer)?;
+                break;
+            }
+            Some(current) => {
+                if let Some(why) = not_to_admit(&store, &current, &manifest) {
+                    eprintln!("kr: {why}; this command runs as the release that is current");
+                    break;
+                }
+                hand_to_current(&store, tree, &manifest.release, installer)?;
                 break;
             }
             None => match install(Some(tree), None, Some(installer)).await {
@@ -111,15 +146,49 @@ pub async fn admit(tree: &Path, installer: &str) -> Result<Infallible> {
     )))
 }
 
+/// Why `release` is not offered to the current release as an update, when it is not: the store
+/// keeps it already, or it is no newer than the current release.
+fn not_to_admit(
+    store: &Store,
+    current: &kr_protocol::update::ReleaseName,
+    release: &kr_protocol::update::ReleaseManifest,
+) -> Option<String> {
+    if store.release_directory(&release.release).exists() {
+        return Some(format!(
+            "release {} is in this host's store already",
+            release.release
+        ));
+    }
+    let newer = release::manifest_document(&store.release_directory(current))
+        .and_then(|document| release::read_manifest(&document))
+        .map(|held| release.sequence.get() > held.sequence.get());
+    match newer {
+        Ok(true) => None,
+        Ok(false) => Some(format!(
+            "release {} is no newer than release {current}, which this host runs",
+            release.release
+        )),
+        // A current release whose manifest cannot be read is for the update to refuse by name.
+        Err(_) => None,
+    }
+}
+
 /// Offers `tree` to the current release's `kr` as an update.
 ///
 /// An update that waits (exit 9) leaves the current release in place and is not a failure. The
 /// current `kr` says why on standard error; what it prints to standard output is its report of the
-/// update, which the command that follows must not be preceded by.
-fn hand_to_current(store: &Store, tree: &Path, installer: &str) -> Result<()> {
+/// update, which the command that follows must not be preceded by. It reads nothing from standard
+/// input, which belongs to the command that follows.
+fn hand_to_current(
+    store: &Store,
+    tree: &Path,
+    release: &kr_protocol::update::ReleaseName,
+    installer: &str,
+) -> Result<()> {
     let status = std::process::Command::new(store.stable(Program::Kr))
         .args(["host", "update", "--installer", installer, "--archive"])
         .arg(tree)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .status()
         .map_err(|error| {
@@ -131,6 +200,9 @@ fn hand_to_current(store: &Store, tree: &Path, installer: &str) -> Result<()> {
         })?;
     match status.code() {
         Some(0 | 9) => Ok(()),
+        // Another command's update may have switched to this release between the look and the
+        // lock, which the current release's own refusal then reads as no update to make.
+        _ if store.current().ok().flatten().as_ref() == Some(release) => Ok(()),
         _ => Err(CliError::Other(shown!(
             "the release at {} was not admitted to this host's store, and this command did not \
              run",
