@@ -6,17 +6,34 @@ import UniformTypeIdentifiers
 
 /// What reading a code came to: the text of the code, that the person closed the scanner or the
 /// picker, that a picture showed no code, or that the camera is not allowed.
-enum ScanOutcome {
+///
+/// The text of a code holds an invitation's secret, so printing an outcome never shows it.
+enum ScanOutcome: CustomStringConvertible, CustomDebugStringConvertible {
   case text(String)
   case cancelled
   case noCode
   case cameraDenied
+
+  var description: String {
+    switch self {
+    case .text: return "text(..)"
+    case .cancelled: return "cancelled"
+    case .noCode: return "noCode"
+    case .cameraDenied: return "cameraDenied"
+    }
+  }
+
+  var debugDescription: String { description }
 }
 
-/// The one answer a request to read a code gets, in the words the plugin's Rust half reads.
-struct ScanAnswer: Encodable {
+/// The one answer a request to read a code gets, in the words the plugin's Rust half reads. Printing
+/// one never shows the text it carries.
+struct ScanAnswer: Encodable, CustomStringConvertible, CustomDebugStringConvertible {
   let outcome: String
   var text: String? = nil
+
+  var description: String { text == nil ? "ScanAnswer(\(outcome))" : "ScanAnswer(\(outcome), ..)" }
+  var debugDescription: String { description }
 
   init(_ outcome: ScanOutcome) {
     switch outcome {

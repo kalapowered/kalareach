@@ -19,7 +19,7 @@ use zeroize::Zeroizing;
 use crate::PlatformError;
 
 /// What reading a code came to.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum Scan {
     /// The text of the code. It clears itself when it is dropped.
     Text(Zeroizing<String>),
@@ -29,6 +29,19 @@ pub enum Scan {
     NoCode,
     /// The camera is not allowed to this application.
     CameraDenied,
+}
+
+/// What a reading says of itself when something prints it: which of the four it is, and never the
+/// text of a code, which holds an invitation's secret.
+impl std::fmt::Debug for Scan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Text(_) => "Text(..)",
+            Self::Cancelled => "Cancelled",
+            Self::NoCode => "NoCode",
+            Self::CameraDenied => "CameraDenied",
+        })
+    }
 }
 
 /// Which sources this device reads a code from.
@@ -190,5 +203,18 @@ mod tests {
         assert_eq!(read(r#"{"outcome":"camera_denied"}"#), Scan::CameraDenied);
         assert!(serde_json::from_str::<Answer>(r#"{"outcome":"text"}"#).is_err());
         assert!(serde_json::from_str::<Answer>(r#"{"outcome":"other"}"#).is_err());
+    }
+
+    /// The text of a code holds an invitation's secret, so no way of printing a reading shows it.
+    #[test]
+    fn a_reading_never_prints_the_text_it_holds() {
+        const SECRET: &str = "kr1.the-secret-in-a-code";
+        let reading = Scan::Text(Zeroizing::new(SECRET.to_owned()));
+        for printed in [format!("{reading:?}"), format!("{reading:#?}")] {
+            assert!(!printed.contains(SECRET), "{printed}");
+            assert!(printed.contains("Text"), "{printed}");
+        }
+        // The control: the other readings print, so the check is on what it was made to check.
+        assert_eq!(format!("{:?}", Scan::NoCode), "NoCode");
     }
 }
