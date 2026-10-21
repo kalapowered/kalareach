@@ -447,6 +447,7 @@ impl Record {
 }
 
 /// The file in the store that names the package manager that put its releases there.
+#[cfg(unix)]
 const INSTALLER_FILE: &str = "installer";
 
 /// The package manager that put this store's releases there, when one did: it owns which release is
