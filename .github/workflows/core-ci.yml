@@ -859,13 +859,18 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-automation --test definitions a_command_node_is_refused_where_no_command_can_be_run
 
-      # The engine's causal chain: the root, depth and parent a descendant keeps from the node that
-      # produced its trigger, no workflow retriggering on its own descendants unless its definition
-      # says so, and one budget for the whole chain across a restart. The engine runs on this
-      # platform; what it refuses is a repository operation and a command node, not a chain.
-      - name: Test the automation causal chain
+      # The engine's causal chain on this platform, through nodes that create sessions: the root,
+      # depth and parent a descendant keeps from the node that produced its trigger, and no
+      # workflow retriggering on its own descendants unless its definition says so. Only these two
+      # cases of the suite run here: the others install a node that runs a command, which the
+      # validation of a definition refuses on this platform, so they run on the others.
+      - name: Test that a descendant keeps its causal root, depth and parent
         if: ${{ !cancelled() && matrix.part == 'second' }}
-        run: cargo test --locked -p kr-automation --test causal_budget
+        run: cargo test --locked -p kr-automation --test causal_budget a_descendant_takes_its_ancestry_from_the_node_that_produced_its_trigger
+
+      - name: Test that a workflow does not retrigger on its own descendants by default
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-automation --test causal_budget self_retrigger_is_refused_without_explicit_recurrence
 
       # The contact skill installed and removed on this platform: the installer's own tests, the
       # crash accounting among them, and a configuration refused before anything is written where

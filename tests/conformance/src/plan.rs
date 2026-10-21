@@ -1251,9 +1251,8 @@ fn windows() -> Vec<Step> {
             ],
             "a_command_node_is_refused_where_no_command_can_be_run",
         ),
-        Step::cargo(
-            Group::Rust,
-            "the automation engine's causal chain",
+        qualified_only(
+            "a descendant keeps its causal root, depth and parent",
             &[
                 "test",
                 "--locked",
@@ -1261,7 +1260,22 @@ fn windows() -> Vec<Step> {
                 "kr-automation",
                 "--test",
                 "causal_budget",
+                "a_descendant_takes_its_ancestry_from_the_node_that_produced_its_trigger",
             ],
+            "a_descendant_takes_its_ancestry_from_the_node_that_produced_its_trigger",
+        ),
+        qualified_only(
+            "a workflow does not retrigger on its own descendants by default",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-automation",
+                "--test",
+                "causal_budget",
+                "self_retrigger_is_refused_without_explicit_recurrence",
+            ],
+            "self_retrigger_is_refused_without_explicit_recurrence",
         ),
         qualified_only(
             "the contact skill's installer",
