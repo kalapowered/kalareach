@@ -20,6 +20,7 @@
 		1AABAD0361650C489DA8812E /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 66F54D2F258FCD3383A592D3 /* Metal.framework */; };
 		1B1725B261E3503461B41CFD /* LaunchPlan.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F7673A3BC9A13535E7488A9 /* LaunchPlan.swift */; };
 		207DF065C5106CCE33A4F1F6 /* SecureKeys.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC81452583E1A11378351821 /* SecureKeys.swift */; };
+		617910ED7C3A599DF7479B64 /* PairingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5ECEFEDFCA7F6D3E300A17B2 /* PairingTests.swift */; };
 		2165CA32150D6D8C62BB4271 /* PickerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3032551E6A9CDCC1EFDC5487 /* PickerTests.swift */; };
 		23591009DB33BA0A6E6DF7A4 /* PushRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 529A8B9ADD788615F4718EB0 /* PushRegistration.swift */; };
 		243B06B450728E7814F317FC /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 21EFF08FF9DFE8027EAA8B8F /* Security.framework */; };
@@ -151,6 +152,7 @@
 		2C4D68F5B5A1CA28AA156354 /* LaunchHook.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = LaunchHook.m; sourceTree = "<group>"; };
 		2F00C93CA5C2053EBDAFC692 /* AudioSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioSession.swift; sourceTree = "<group>"; };
 		2F98D29B580DC36783990AB6 /* carrier.rs */ = {isa = PBXFileReference; path = carrier.rs; sourceTree = "<group>"; };
+		5ECEFEDFCA7F6D3E300A17B2 /* PairingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingTests.swift; sourceTree = "<group>"; };
 		3032551E6A9CDCC1EFDC5487 /* PickerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PickerTests.swift; sourceTree = "<group>"; };
 		3121E24E1630B06FCF24ECAF /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		343C7C2C560F586215BF9C3F /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
@@ -318,6 +320,7 @@
 				89A2D4B3AE9AD80CEDCEC961 /* KeychainTests.swift */,
 				8A7556962086670CA11B4113 /* LayoutTests.swift */,
 				C3579CCF6F90E0C62DBEB619 /* LifecycleTests.swift */,
+				5ECEFEDFCA7F6D3E300A17B2 /* PairingTests.swift */,
 				3032551E6A9CDCC1EFDC5487 /* PickerTests.swift */,
 				090833DCE614DBBC5B713F32 /* ProofTests.swift */,
 				B31F2B12399A396AD7474822 /* PushTests.swift */,
@@ -775,6 +778,7 @@
 				3BB00F33B3279B6F42690897 /* KeychainTests.swift in Sources */,
 				F81D0C2E43E5082B417A3C2B /* LayoutTests.swift in Sources */,
 				C182F409D322D9E066D5D76F /* LifecycleTests.swift in Sources */,
+				617910ED7C3A599DF7479B64 /* PairingTests.swift in Sources */,
 				2165CA32150D6D8C62BB4271 /* PickerTests.swift in Sources */,
 				A4D50746AA44675D26153C18 /* ProofTests.swift in Sources */,
 				FB45DC4A1CC59CE45D7E1CC6 /* PushTests.swift in Sources */,
