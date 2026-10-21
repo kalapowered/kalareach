@@ -22,10 +22,10 @@ use super::{Controller, LaunchPhase, UNACCOUNTED_WORKER, WORKER_EXCHANGE};
 /// every member whose end is not confirmed.
 pub(crate) const ADMISSIONS_CADENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// What the doctor's note starts with when the adapters the organisations allow could not be put in
-/// force.
+/// What the doctor's note starts with when the host could not confirm that the adapters the
+/// organisations allow are in force.
 const ADAPTERS_NOT_PUT: &str =
-    "the host could not put the adapters its organisations allow in force: ";
+    "the host could not confirm that the adapters its organisations allow are in force: ";
 
 /// How many rounds one member is sent in a row while each answer discovers a release the round
 /// before did not cover.

@@ -381,16 +381,16 @@ impl Controller {
     /// `organisation.policy.apply`: applies the policy an organisation signed, and puts the
     /// adapters it allows in force.
     ///
-    /// The registry's guard is taken first, and held until the policy is written. The policy is
-    /// kept in the store of applied policies, written before the registry row, which changes only
-    /// when the request followed a chain: a stop between the two leaves the policy applied at the
-    /// next start and the request, made again, completes what was not recorded. If the registry's
-    /// write is refused the file is put back as it was. The admission is asked again inside the
-    /// registry's transaction, once the store's lock is held. Only that the owner asked decides
-    /// it: the organisation's own statement binds this host through the keys the owner confirmed
-    /// when enrolling, and it never enlarges what this host allows without one, so it asks for no
-    /// new confirmation and owes no fence. A narrower list ends the bindings of the packages it
-    /// leaves out through the admission round every restriction on a package uses.
+    /// The registry's guard is taken first, and held until the policy is written. The registry's
+    /// row is written first, in a transaction that asks the admission again once the store's lock
+    /// is held, and then the policy is kept in the store of applied policies: a request that is
+    /// refused, or whose policy the store could not hold, writes nothing there, and a stop between
+    /// the two writes leaves the policy the host last answered for in force, with the chain the
+    /// request followed recorded. Only that the owner asked decides the admission: the
+    /// organisation's own statement binds this host through the keys the owner confirmed when
+    /// enrolling, and it never enlarges what this host allows without one, so it asks for no new
+    /// confirmation and owes no fence. A narrower list ends the bindings of the packages it leaves
+    /// out through the admission round every restriction on a package uses.
     ///
     /// No answer is kept for the request, and none is needed: the same policy again is accepted as
     /// a repeat, changes nothing the host keeps and puts the list in force again, and the answer is
@@ -422,9 +422,8 @@ impl Controller {
                 None => None,
             };
             let followed_head = std::cell::Cell::new(None);
-            let (answer, _, _) = self.commit_policy(
+            let (answer, _) = self.commit_policy(
                 |policy| {
-                    let before = policy.applied_policies();
                     let advanced = policy
                         .apply_organisation_policy(
                             &params.policy,
@@ -459,12 +458,13 @@ impl Controller {
                             policy.adapter_allowlist().as_ref(),
                         ),
                     };
-                    Ok((answer, before, policy.applied_policies()))
+                    // Encoded here, before anything is written, so a policy the store cannot hold
+                    // is refused with nothing changed.
+                    let record = crate::grants::applied::encode(&policy.applied_policies())?;
+                    Ok((answer, record))
                 },
-                |grants, snapshot, (_, before, after)| {
-                    let state_dir = self.paths.state_dir();
-                    crate::grants::applied::write(state_dir, after)?;
-                    let stored = grants.store_presentation(snapshot, None, || {
+                |grants, snapshot, (_, record)| {
+                    grants.store_presentation(snapshot, None, || {
                         self.check_admission(&registry, &carried)?;
                         // A chain the policy followed was judged at a reading taken before the
                         // waits for the locks, and its head is a bound that can pass while they
@@ -477,16 +477,8 @@ impl Controller {
                             ),
                             None => Ok(()),
                         }
-                    });
-                    if stored.is_err()
-                        && let Err(error) = crate::grants::applied::write(state_dir, before)
-                    {
-                        eprintln!(
-                            "kr-controller: could not put the organisation policies back as they \
-                             were after a policy was refused: {error}"
-                        );
-                    }
-                    stored
+                    })?;
+                    crate::grants::applied::publish(self.paths.state_dir(), record)
                 },
             )?;
             answer
@@ -553,7 +545,7 @@ impl Controller {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .adapter_allowlist()
         };
-        if read() == self.catalogue.adapters_in_force() {
+        if self.catalogue.adapters_settled_at(&read()) {
             return Ok(false);
         }
         let unavailable =
@@ -562,11 +554,13 @@ impl Controller {
             return Err(unavailable("this daemon is stopping"));
         };
         let task = tokio::spawn(async move {
+            let before = controller.catalogue.adapters_in_force();
             let moved = controller
                 .catalogue
                 .put_allowed_adapters(read, deadline)
                 .await;
-            if matches!(moved, Ok(true)) {
+            // A refusal after a list was put in force still left the admissions changed.
+            if matches!(moved, Ok(true)) || controller.catalogue.adapters_in_force() != before {
                 controller.admissions_due();
             }
             moved

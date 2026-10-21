@@ -1063,7 +1063,7 @@ pub fn table() -> Vec<Store> {
                 "organisation-policy.json",
                 member("version", 0),
                 kr_controller::grants::applied::RECORD_VERSION,
-                0,
+                kr_controller::grants::applied::RECORD_VERSION,
             ),
             owned: Vec::new(),
             kept: vec![Kept::Source(

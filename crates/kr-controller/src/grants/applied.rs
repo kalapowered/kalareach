@@ -17,10 +17,11 @@
 //! because the host stopped between the registry's write and this file's, never applies to a later
 //! enrolment: a new enrolment holds no policy.
 //!
-//! The file is written before the registry row of the request that applied the policy. A stop
-//! between the two leaves the file holding a policy the registry has not recorded the chain advance
-//! for, if the request carried one. The policy applies at the next start, as the request verified
-//! it, and the same request made again completes the advance.
+//! The file is written after the registry row of the change that made the policy, so a policy
+//! reaches it only once the registry has accepted the change: a request the registry refuses
+//! writes nothing here. A stop between the two writes leaves the policy the host last answered
+//! for in force at the next start, with the registry's part of the change, which is the chain a
+//! request followed, recorded. The same policy applied again then writes the file.
 
 use std::path::{Path, PathBuf};
 
@@ -110,27 +111,55 @@ pub fn read(state_dir: &Path) -> Result<Vec<StoredAppliedPolicy>> {
     Ok(record.policies)
 }
 
-/// Writes the applied policies in one write, or removes the file when there are none.
+/// Encodes the applied policies as the file holds them, refusing a record a start would not read.
 ///
 /// # Errors
 ///
-/// Returns an error when the file cannot be written or removed. What was there is then as it was.
-pub fn write(state_dir: &Path, policies: &[StoredAppliedPolicy]) -> Result<()> {
-    let path = file_in(state_dir);
-    if policies.is_empty() {
-        // A removal is refused, as a rename is, while another program holds the file.
-        return match kr_flush::retry_while_held(|| std::fs::remove_file(&path)) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(
-                ControllerError::registry(format!("could not remove {}: {error}", path.display())),
-            ),
-            _ => Ok(()),
-        };
-    }
+/// Returns an error when the policies are more than the file may hold.
+pub fn encode(policies: &[StoredAppliedPolicy]) -> Result<Vec<u8>> {
     let bytes = serde_json::to_vec_pretty(&Record {
         version: RECORD_VERSION,
         policies: policies.to_vec(),
     })
     .map_err(ControllerError::registry)?;
-    kr_ipc::paths::write_owner_only_file(&path, &bytes)
+    if bytes.len() as u64 > MAX_RECORD_LEN {
+        return Err(ControllerError::registry(format!(
+            "the applied organisation policies take {} bytes, and a start reads at most {MAX_RECORD_LEN}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Writes the record `encode` made in one write, owner only.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be written. What was there is then as it was, or, when the
+/// failure came after the file was renamed into place, the new record.
+pub fn publish(state_dir: &Path, record: &[u8]) -> Result<()> {
+    kr_ipc::paths::write_owner_only_file(&file_in(state_dir), record)
         .map_err(|error| ControllerError::registry(error.to_string()))
+}
+
+/// Writes the applied policies in one write, or removes the file when there are none.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be written or removed.
+pub fn write(state_dir: &Path, policies: &[StoredAppliedPolicy]) -> Result<()> {
+    if !policies.is_empty() {
+        return publish(state_dir, &encode(policies)?);
+    }
+    let path = file_in(state_dir);
+    let refused = |error: std::io::Error| {
+        ControllerError::registry(format!("could not remove {}: {error}", path.display()))
+    };
+    // A removal is refused, as a rename is, while another program holds the file, and is flushed
+    // as a rename is, so a stop that follows it does not bring the file back.
+    match kr_flush::retry_while_held(|| std::fs::remove_file(&path)) {
+        Ok(()) => kr_flush::flush_directory(state_dir, kr_flush::NameKind::File).map_err(refused),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(refused(error)),
+    }
 }

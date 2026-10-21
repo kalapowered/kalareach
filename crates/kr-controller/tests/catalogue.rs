@@ -4670,6 +4670,116 @@ mod native_bridges {
         assert_eq!(site.tree(), placed);
     }
 
+    /// KR-REQ-18.06: a list the catalogue could not be moved to after it had been moved once stays
+    /// as it was left, and the bridges follow it: the refusal is told, the package the list leaves
+    /// out loses its registration, and the next put brings the catalogue to the list the policy
+    /// states.
+    ///
+    /// Windows applies no native bridge (`refused_on_windows`), so this runs on the other
+    /// platforms.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kr_req_18_06_a_refusal_after_the_list_moved_leaves_the_bridges_following_it() {
+        let site = Site::new();
+        let host = host(&site);
+        let digest = synchronised(&host).await;
+        let before = site.tree();
+        let _: wire::PluginInstallResult = installed_and_enabled(&host, &digest).await;
+        let placed = applied(&before, &host.working);
+        let naming = |name: &str| {
+            Some(std::collections::BTreeSet::from([
+                PluginId::new(name).expect("a plugin identifier")
+            ]))
+        };
+
+        // The policy states a list that leaves the package out when the put reads it, and no list
+        // when the put reads it again; the revision cannot be raised for that second list.
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let refused = host
+            .module
+            .put_allowed_adapters(
+                || match reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 | 1 => naming("kalareach/codex"),
+                    3 => {
+                        host.module.fail_next_revision_raise();
+                        None
+                    }
+                    _ => None,
+                },
+                tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect_err("the second list could not be put in force");
+        assert_eq!(refused.code, ErrorCode::StorageUnavailable, "{refused:?}");
+        assert_eq!(
+            host.module.adapters_in_force(),
+            naming("kalareach/codex"),
+            "the list that was put in force is the one in force"
+        );
+        assert_eq!(
+            site.tree(),
+            before,
+            "and the bridges follow it: the package it leaves out has no registration"
+        );
+
+        assert!(
+            put_allowed(&host.module, None).await,
+            "the next put brings the catalogue to the list the policy states"
+        );
+        assert_eq!(site.tree(), placed);
+    }
+
+    /// KR-REQ-18.06: a change that is made while another holds the catalogue to set a list is not
+    /// answered from the list in force, which that other change may replace: it waits for the
+    /// catalogue.
+    #[tokio::test]
+    async fn kr_req_18_06_a_list_in_force_is_not_answered_from_while_another_change_sets_one() {
+        let site = Site::new();
+        let host = host(&site);
+        let naming = |name: &str| {
+            Some(std::collections::BTreeSet::from([
+                PluginId::new(name).expect("a plugin identifier")
+            ]))
+        };
+        let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+
+        // A change reads a list once it holds the catalogue, and a newer change, which restores
+        // the list in force, is made then.
+        let asked_while_setting = std::cell::RefCell::new(None);
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let moved = host
+            .module
+            .put_allowed_adapters(
+                || match reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 | 1 => {
+                        if reads.load(std::sync::atomic::Ordering::SeqCst) == 2 {
+                            // The older change holds the catalogue now.
+                            let mut newer =
+                                std::pin::pin!(host.module.put_allowed_adapters(|| None, far));
+                            let mut context =
+                                std::task::Context::from_waker(std::task::Waker::noop());
+                            *asked_while_setting.borrow_mut() =
+                                Some(std::future::Future::poll(newer.as_mut(), &mut context));
+                        }
+                        naming("kalareach/codex")
+                    }
+                    _ => None,
+                },
+                tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("put");
+        assert!(moved);
+        assert_eq!(host.module.adapters_in_force(), None);
+        let answered = asked_while_setting
+            .into_inner()
+            .expect("the newer change was made while the older one held the catalogue");
+        assert!(
+            answered.is_pending(),
+            "the newer change was answered from the list in force: {answered:?}"
+        );
+    }
+
     /// KR-REQ-11.42: the index that says whether a release is revoked is read once, after what
     /// needs no index and before the package. Where it cannot be read nothing is known to stand
     /// and the registration is not kept on its account, and a package the organisation's list

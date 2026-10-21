@@ -387,7 +387,7 @@
           "absent": 0
         },
         "version": 1,
-        "migrates_from": 0
+        "migrates_from": 1
       },
       "digest": "80e32abcf598c80aabf2fe0ee3af26d707c44f9c4e1f4d62937d8a71c7ca8ae9",
       "kept": [

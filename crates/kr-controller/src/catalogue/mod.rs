@@ -226,6 +226,9 @@ pub struct CatalogueModule {
     /// can tell that nothing has to change without waiting for a synchronisation that holds the
     /// catalogue.
     adapters_in_force: std::sync::Mutex<Option<std::collections::BTreeSet<PluginId>>>,
+    /// Whether a change of the adapters in force holds the catalogue to set them: while one does,
+    /// the list in force can still change, so no other change is answered from it.
+    setting_adapters: std::sync::atomic::AtomicBool,
     /// The enrolment budgets this host's configuration puts in force: set at the daemon's start
     /// and at every acceptance of the configuration after it, by the rule every value in force
     /// follows (`config::catalogue::budgets_in_force`), and read by each enrolment and each
@@ -246,6 +249,23 @@ pub struct CatalogueModule {
     /// computed, for this host's own tests. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     policies_carried: Arc<std::sync::Mutex<Vec<kr_protocol::admission::RevocationPolicy>>>,
+}
+
+/// Marks that a change of the adapters in force holds the catalogue to set them, until it is let
+/// go.
+struct SettingAdapters<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> SettingAdapters<'a> {
+    fn begin(flag: &'a std::sync::atomic::AtomicBool) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(flag)
+    }
+}
+
+impl Drop for SettingAdapters<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Why the adapters the organisations allow were not confirmed in force: the catalogue was held for
@@ -378,6 +398,7 @@ impl CatalogueModule {
             environment_id,
             bridges,
             adapters_in_force: std::sync::Mutex::new(allowed),
+            setting_adapters: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
             transport,
             snapshots: Arc::new(std::sync::Mutex::new(None)),
@@ -659,12 +680,26 @@ impl CatalogueModule {
             .clone()
     }
 
+    /// Whether `wanted` is in force and no change holds the catalogue to set another list, so
+    /// nothing has to change and nothing can replace it.
+    #[must_use]
+    pub fn adapters_settled_at(
+        &self,
+        wanted: &Option<std::collections::BTreeSet<PluginId>>,
+    ) -> bool {
+        self.adapters_in_force() == *wanted
+            && !self
+                .setting_adapters
+                .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Puts the adapters the organisations' policies allow in force for the admissions that
     /// follow, or every adapter with `None`, and returns true when that changed what was in force,
     /// so the caller sends every worker a round.
     ///
     /// `allowed` is read once before anything is waited for: a list that is already in force
-    /// changes nothing and waits for nothing. Otherwise it is read again once this call holds the
+    /// changes nothing and waits for nothing, unless another change holds the catalogue to set a
+    /// list, which may still replace it. Otherwise it is read again once this call holds the
     /// catalogue, which is what the host's policy says at that moment, so two changes cannot leave
     /// the list of the older one in force. The wait for the catalogue, which a synchronisation
     /// holds across its network work, ends at `deadline`.
@@ -672,29 +707,47 @@ impl CatalogueModule {
     /// # Errors
     ///
     /// Returns `RESOURCE_UNAVAILABLE` when the catalogue is still busy at `deadline`, and the
-    /// refusal the catalogue gave when the revision could not be raised. The list in force is the
-    /// one before then, and the same call again tries again.
+    /// refusal the catalogue gave when the revision could not be raised. A list that was put in
+    /// force before the refusal stays in force, and the bridges follow it; the list in force is
+    /// otherwise the one before. The same call again tries again.
     pub async fn put_allowed_adapters(
         &self,
         allowed: impl Fn() -> Option<std::collections::BTreeSet<PluginId>>,
         deadline: tokio::time::Instant,
     ) -> Answer<bool> {
-        if allowed() == self.adapters_in_force() {
+        if self.adapters_settled_at(&allowed()) {
             return Ok(false);
         }
         let mut catalogue = tokio::time::timeout_at(deadline, self.catalogue.lock())
             .await
             .map_err(|_| ProtocolError::new(ErrorCode::ResourceUnavailable, BUSY_FOR_ADAPTERS))?;
+        let _setting = SettingAdapters::begin(&self.setting_adapters);
         // The list is read again once it is in force: a change that was made while this one held
-        // the catalogue found the older list in force, took the fast path above and was answered,
-        // so the list it left is put in force here, and the loop ends only on a list that the
+        // the catalogue is not answered from the list in force (see above), and one that is
+        // made after this read is found by this check, so the loop ends only on a list that the
         // policy still states.
         let mut moved = false;
+        let mut refused = None;
         loop {
             let wanted = allowed();
-            moved |= catalogue
-                .set_allowed_adapters(wanted.clone(), &Owner::acting())
-                .map_err(ProtocolError::from)?;
+            #[cfg(feature = "testing")]
+            if self
+                .raise_fault
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                refused = Some(ProtocolError::new(
+                    ErrorCode::StorageUnavailable,
+                    "the admission revision could not be written",
+                ));
+                break;
+            }
+            match catalogue.set_allowed_adapters(wanted.clone(), &Owner::acting()) {
+                Ok(changed) => moved |= changed,
+                Err(error) => {
+                    refused = Some(ProtocolError::from(error));
+                    break;
+                }
+            }
             *self
                 .adapters_in_force
                 .lock()
@@ -706,12 +759,16 @@ impl CatalogueModule {
         if moved {
             // The list changed which packages may run in an application's name, so each bridge
             // follows what its installation now wants, under the same lock and after the change's
-            // commit, as a plugin change's bridge does.
+            // commit, as a plugin change's bridge does. A list put in force before a refusal is
+            // followed too: the packages it leaves out do not keep a registration.
             let subjects = bridge_subjects(&catalogue, &self.bridges, self.environment_id);
             let wanted = self.wanted_bridges(&catalogue, subjects);
             self.follow_bridges(wanted).await;
         }
-        Ok(moved)
+        match refused {
+            Some(error) => Err(error),
+            None => Ok(moved),
+        }
     }
 
     /// What each of `subjects`' installations wants of its native bridge, read from the catalogue

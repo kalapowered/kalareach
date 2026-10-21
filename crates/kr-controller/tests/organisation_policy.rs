@@ -219,15 +219,13 @@ fn refused_as(
 }
 
 /// Whether the doctor's catalogue evidence says that the adapters the organisations allow could not
-/// be put in force.
+/// be confirmed in force.
 async fn the_doctor_says_the_list_is_not_in_force(
     controller: &kr_controller::service::Controller,
 ) -> bool {
-    controller
-        .catalogue_warnings()
-        .await
-        .iter()
-        .any(|warning| warning.contains("could not put the adapters its organisations allow"))
+    controller.catalogue_warnings().await.iter().any(|warning| {
+        warning.contains("could not confirm that the adapters its organisations allow are in force")
+    })
 }
 
 /// The state directory of the fixture's daemon, where the store of applied policies is.
@@ -255,18 +253,6 @@ async fn restart_over(fixture: Fixture, change: impl FnOnce(&Path)) -> Fixture {
         host: stopped.start(settings).await,
         ..fixture
     }
-}
-
-/// The row of the registry that holds the host's policy.
-fn policy_row(fixture: &Fixture) -> Vec<u8> {
-    rusqlite::Connection::open(fixture.host.registry_database())
-        .expect("opens the registry")
-        .query_row(
-            "SELECT value FROM host_authority WHERE key = 'policy'",
-            [],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .expect("the host's policy row")
 }
 
 /// KR-REQ-18.06: a policy the organisation signed under the key the host pinned decides which
@@ -896,83 +882,58 @@ async fn a_policy_kept_for_an_enrolment_that_ended_applies_to_no_later_enrolment
     fixture.host.stop().await;
 }
 
-/// The policy is written to its store before the registry row of the request, so a stop between
-/// the two leaves the policy applied at the next start, with the chain advance the request made
-/// not recorded; the same request made again completes it.
+/// The policy is written to its store after the registry row of the request, so a stop between the
+/// two leaves the policy the host last answered for in force, with the chain the request followed
+/// recorded; the same policy applied again, with no chain beside it any more, writes the store.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_stop_between_the_two_writes_leaves_the_policy_applied_and_the_request_again_completes_it()
- {
+async fn a_stop_between_the_two_writes_leaves_the_earlier_policy_and_the_policy_again_completes_it()
+{
     let mut fixture = Fixture::start().await;
     let _repository = install_the_example(&fixture).await;
-    let before = policy_row(&fixture);
     let now = fixture.now();
     fixture.organisation.rotate(now - 1_000);
     let policy = fixture.organisation.policy(3, 1, Some(&[CODEX]), now);
     let chain = fixture.organisation.authority(now);
-    apply(&fixture, policy.clone(), Some(chain.clone()))
+    apply(&fixture, policy.clone(), Some(chain))
         .await
         .expect("the host applies the policy under the new key, with the chain beside it");
-    assert_eq!(fixture.listed().await.enrolments[0].accepted_head.get(), 3);
+    assert!(is_left_out_by_the_allowlist(&admission(&fixture).await));
 
-    // The registry row is as it was before the request: the host stopped before it was written.
+    // The store is as it was before the request: the host stopped after the registry row.
     let fixture = restart_over(fixture, |directory| {
-        rusqlite::Connection::open(directory.join("registry.sqlite"))
-            .expect("opens the registry")
-            .execute(
-                "UPDATE host_authority SET value = ?1 WHERE key = 'policy'",
-                [&before],
-            )
-            .expect("the policy row is put back");
+        applied::write(directory, &[]).expect("the store is put back");
     })
     .await;
     assert!(
-        is_left_out_by_the_allowlist(&admission(&fixture).await),
-        "the policy in the store applies"
+        is_admitted(&admission(&fixture).await),
+        "no policy the host did not write down is in force"
     );
     let listed = fixture.listed().await;
-    assert_eq!(listed.enrolments[0].accepted_head.get(), 2);
+    assert_eq!(
+        listed.enrolments[0].accepted_head.get(),
+        3,
+        "the chain the request followed is recorded"
+    );
     assert_eq!(
         listed.enrolments[0].organisation_policy_revision,
-        Nullable::some(OrganisationPolicyRevision::new(1))
+        Nullable::null()
     );
 
-    apply(&fixture, policy, Some(chain))
+    apply(&fixture, policy, None)
         .await
-        .expect("the same request again is the same policy again");
-    let listed = fixture.listed().await;
-    assert_eq!(listed.enrolments[0].accepted_head.get(), 3);
-    assert_eq!(
-        listed.enrolments[0].organisation_policy_revision,
-        Nullable::some(OrganisationPolicyRevision::new(1))
-    );
+        .expect("the same policy again applies, the chain being held");
+    assert_eq!(applied_policies(&fixture).len(), 1);
     assert!(is_left_out_by_the_allowlist(&admission(&fixture).await));
     fixture.host.stop().await;
 }
 
-/// A request the registry refuses after the policy was written to its store puts the store back as
-/// it was: the time the request was admitted for runs out while it waits for the registry's lock,
-/// so the refusal the owner reads is not a policy that applies at the next start.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_policy_the_registry_refuses_leaves_the_store_of_applied_policies_as_it_was() {
-    let fixture = Fixture::start().await;
-    let _repository = install_the_example(&fixture).await;
-    apply(
-        &fixture,
-        fixture
-            .organisation
-            .policy(2, 1, Some(&[CODEX]), fixture.now()),
-        None,
-    )
-    .await
-    .expect("the first policy");
-    let kept = applied_policies(&fixture);
-
-    let params = OrganisationPolicyApplyParams {
-        policy: fixture
-            .organisation
-            .policy(2, 2, Some(&[CODEX, EXAMPLE]), fixture.now()),
-        authority: Nullable::null(),
-    };
+/// Asks the host to apply `params`, lets the request reach the registry, passes `by` on both
+/// clocks while it waits for the registry's lock, and returns the refusal it ends with.
+async fn applied_while_time_passes(
+    fixture: &Fixture,
+    params: OrganisationPolicyApplyParams,
+    by: Duration,
+) -> ProtocolError {
     let (arrived, go) = fixture
         .host
         .controller()
@@ -996,25 +957,150 @@ async fn a_policy_the_registry_refuses_leaves_the_store_of_applied_policies_as_i
         .await
         .expect("the wait ends")
         .expect("the request reaches the registry");
-    let waiting = applied_policies(&fixture);
     assert_eq!(
-        waiting[0].organisation_policy_revision,
-        OrganisationPolicyRevision::new(2),
-        "the store is written before the registry"
+        applied_policies(fixture)
+            .first()
+            .map(|kept| kept.organisation_policy_revision),
+        Some(OrganisationPolicyRevision::new(1)),
+        "nothing is written to the store of applied policies before the registry accepts the request"
     );
-
-    fixture.pass(Duration::from_secs(16 * 60));
+    fixture.pass(by);
     go.send(()).expect("the request waits");
     let (client, answer) = asking.await.expect("the request ends");
     drop(client);
-    let refused = answer.expect_err("the time the request was admitted for ran out");
+    answer.expect_err("the registry refuses the request")
+}
+
+/// A request the registry refuses writes nothing to the store of applied policies: the time the
+/// request was admitted for runs out while it waits for the registry's lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_policy_the_registry_refuses_leaves_the_store_of_applied_policies_as_it_was() {
+    let fixture = Fixture::start().await;
+    let _repository = install_the_example(&fixture).await;
+    apply(
+        &fixture,
+        fixture
+            .organisation
+            .policy(2, 1, Some(&[CODEX]), fixture.now()),
+        None,
+    )
+    .await
+    .expect("the first policy");
+    let kept = applied_policies(&fixture);
+
+    let refused = applied_while_time_passes(
+        &fixture,
+        OrganisationPolicyApplyParams {
+            policy: fixture
+                .organisation
+                .policy(2, 2, Some(&[CODEX, EXAMPLE]), fixture.now()),
+            authority: Nullable::null(),
+        },
+        Duration::from_secs(16 * 60),
+    )
+    .await;
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     assert_eq!(applied_policies(&fixture), kept, "the store is as it was");
-    assert_eq!(
-        fixture.listed().await.enrolments[0].organisation_policy_revision,
-        Nullable::some(OrganisationPolicyRevision::new(1))
-    );
+    assert!(is_left_out_by_the_allowlist(&admission(&fixture).await));
     fixture.host.stop().await;
+}
+
+/// An entry that names no enrolment the host holds is dropped when the host starts, and a host that
+/// cannot drop it stops, naming the file: an entry that stays could meet an enrolment made later
+/// that takes its revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_cannot_drop_an_entry_that_names_no_enrolment_stops() {
+    let fixture = Fixture::start_unenrolled().await;
+    let stopped = fixture.host.shut_down().await;
+    let state_dir = stopped.tree().environment().state_dir().to_path_buf();
+    applied::write(
+        &state_dir,
+        &[applied::StoredAppliedPolicy {
+            organisation_id: fixture.organisation.organisation_id,
+            enrolment_revision: AuthorityRevision::new(1),
+            organisation_policy_revision: OrganisationPolicyRevision::new(1),
+            adapter_allowlist: allowed(&[CODEX]),
+        }],
+    )
+    .expect("the entry is written");
+    let settings = stopped.settings().clone();
+    let refused = {
+        let _flushes = kr_flush::testing::refuse_flushes_of(state_dir.clone());
+        let start = stopped.start(settings);
+        match tokio::task::LocalSet::new()
+            .run_until(async move { tokio::task::spawn_local(start).await })
+            .await
+        {
+            Err(stopped) => stopped,
+            Ok(_) => panic!("the daemon started with an entry it could not drop"),
+        }
+    };
+    let said = match refused.into_panic().downcast::<String>() {
+        Ok(text) => *text,
+        Err(other) => other
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .unwrap_or_default(),
+    };
+    assert!(
+        said.contains("organisation-policy.json"),
+        "the refusal names the file: {said}"
+    );
+}
+
+/// The store of applied policies is never written larger than a start reads: a record the host
+/// cannot read back is refused before anything is written.
+#[test]
+fn a_store_of_applied_policies_is_never_written_larger_than_a_start_reads() {
+    let entry = |byte: u16| applied::StoredAppliedPolicy {
+        organisation_id: OrganisationId::new(Uuid::from_bytes([byte as u8; 16])),
+        enrolment_revision: AuthorityRevision::new(u64::from(byte)),
+        organisation_policy_revision: OrganisationPolicyRevision::new(1),
+        adapter_allowlist: Nullable::some(
+            (0..64)
+                .map(|index| {
+                    PluginId::new(&format!("kalareach/an-adapter-with-a-long-name-{index:03}"))
+                        .expect("a plugin identifier")
+                })
+                .collect(),
+        ),
+    };
+    let directory = tempfile::tempdir().expect("a directory");
+    let few: Vec<_> = (0..4).map(entry).collect();
+    applied::write(directory.path(), &few).expect("a record a start reads is written");
+    assert_eq!(applied::read(directory.path()).expect("reads back"), few);
+
+    let many: Vec<_> = (0..255)
+        .flat_map(|first| (0..2).map(move |second| (first, second)))
+        .map(|(first, second)| {
+            let mut one = entry(first);
+            one.organisation_id = OrganisationId::new(Uuid::from_bytes([
+                first as u8,
+                second as u8,
+                9,
+                9,
+                9,
+                9,
+                9,
+                9,
+                9,
+                9,
+                9,
+                9,
+                9,
+                9,
+                9,
+                9,
+            ]));
+            one
+        })
+        .collect();
+    applied::write(directory.path(), &many).expect_err("a record a start would refuse is refused");
+    assert_eq!(
+        applied::read(directory.path()).expect("the record is as it was"),
+        few,
+        "nothing was written"
+    );
 }
 
 /// What a start does with a store of applied policies it cannot read: it stops, naming the file.
@@ -1034,6 +1120,12 @@ async fn a_store_of_applied_policies_this_build_cannot_read_stops_the_start() {
         &b"not a record"[..],
         // Another format: what a later build wrote is not read back without what it adds.
         &br#"{"version": 2, "policies": []}"#[..],
+        // An organisation named twice: which of the two is in force is not known.
+        &br#"{"version": 1, "policies": [
+            {"organisation_id": "21212121-2121-2121-2121-212121212121", "enrolment_revision": "7",
+             "organisation_policy_revision": "1", "adapter_allowlist": null},
+            {"organisation_id": "21212121-2121-2121-2121-212121212121", "enrolment_revision": "8",
+             "organisation_policy_revision": "2", "adapter_allowlist": null}]}"#[..],
     ] {
         kr_ipc::paths::write_owner_only_file(&file, damaged).expect("the file is written");
         let secrets = environment.secrets_dir();
