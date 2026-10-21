@@ -499,12 +499,7 @@ impl Generation {
             index_version: INDEX_VERSION,
             generation: RepositoryGeneration::new(index_generation),
             produced_at: TimestampMs::new(1_760_000_000_000),
-            publishers: vec![PublisherRecord {
-                id: manifest.publisher_id.clone(),
-                display_name: Label::new("KalaReach").expect("a literal label"),
-                homepage: "https://reach.kala.to".to_owned(),
-                first_party: true,
-            }],
+            publishers: vec![publisher_of(&manifest)],
             entries: vec![entry],
         };
         let index_bytes = index.canonical_json().expect("serialisable").into_bytes();
@@ -550,6 +545,29 @@ impl Generation {
         std::fs::write(self.directory.join("root.json"), root_v2_bytes).expect("writable");
         std::fs::write(metadata.join("root.json"), root_v2_bytes).expect("writable");
         std::fs::write(metadata.join("2.root.json"), root_v2_bytes).expect("writable");
+    }
+}
+
+/// The record a generation's index holds of the publisher of `manifest`'s package: KalaReach's own
+/// first-party record for its packages, and the record of an outside vendor, which is no
+/// first-party one, for any other.
+fn publisher_of(manifest: &PluginManifest) -> PublisherRecord {
+    let first_party = manifest.publisher_id.as_str() == "kalareach";
+    PublisherRecord {
+        id: manifest.publisher_id.clone(),
+        display_name: Label::new(if first_party {
+            "KalaReach"
+        } else {
+            "Example Vendor"
+        })
+        .expect("a literal label"),
+        homepage: if first_party {
+            "https://reach.kala.to"
+        } else {
+            "https://vendor.example"
+        }
+        .to_owned(),
+        first_party,
     }
 }
 
@@ -668,12 +686,7 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
         index_version: INDEX_VERSION,
         generation: RepositoryGeneration::new(spec.generation),
         produced_at: TimestampMs::new(1_760_000_000_000),
-        publishers: vec![PublisherRecord {
-            id: manifest.publisher_id.clone(),
-            display_name: Label::new("KalaReach").expect("a literal label"),
-            homepage: "https://reach.kala.to".to_owned(),
-            first_party: true,
-        }],
+        publishers: vec![publisher_of(&manifest)],
         entries: std::iter::once(entry)
             .chain(spec.listed_only.iter().cloned())
             .collect(),
