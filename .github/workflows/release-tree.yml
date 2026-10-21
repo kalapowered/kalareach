@@ -1,0 +1,422 @@
+name: release-tree
+
+# Builds the release tree of each macOS and Linux target, with everything about it that can be proved
+# without the release's own keys, and then signs each tree for release behind the `release-signing`
+# environment.
+#
+# The `tree` job builds the host's programs and the shell packages natively on the platform they are
+# for, holds each Mach-O or ELF file to the baseline its target runs on, assembles the tree
+# (`scripts/build-release.sh`: `bin/`, `shells/`, `share/` and the manifest), refuses a key anywhere in
+# it, signs the manifest with keys and a channel root that this run made, and then does with the
+# archive what a host does: checks it (`scripts/check-release-archive.py`), unpacks it, verifies its
+# signature and every file against the manifest, installs it into a store of its own, and starts the
+# Zsh package from the unpacked tree. No environment and no secret is read. What the run signs is not
+# a release, because no host trusts a root it made: the archive it keeps says so in its name.
+#
+# On macOS the tree is signed ad hoc before its manifest is written, since a signature changes the
+# bytes a manifest covers, and each file is held to it. An ad hoc signature has no team, so it carries
+# no hardened runtime, which a Developer ID signature does.
+#
+# The `sign` job is the release. It runs for a release tag and for the default branch, and a run on
+# any other ref shows it skipped, so a run that proves the tree never reaches the environment. It
+# takes the tree the `tree` job built, signs each Mach-O file with the Developer ID, has the system
+# notarise the programs, holds the files to what a notarised release is, writes the manifest again
+# (the signature changed the files) and signs it with the channel's release keys. Each step that
+# needs a credential stops the job, naming it, when the credential is not there; nothing is guessed
+# and nothing is skipped. `docs/releases/manifest.md` says what each step produces.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: The commit, branch or tag to build. Defaults to the ref this run was started from.
+        required: false
+        default: ''
+        type: string
+  push:
+    tags:
+      - 'host/v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-tree-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Each build starts from nothing, so incremental artefacts would only take disk.
+  CARGO_INCREMENTAL: "0"
+  # The release's macOS floor, which the shells are built to as well. Nothing reads it elsewhere.
+  MACOSX_DEPLOYMENT_TARGET: "14.0"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  tree:
+    name: the tree of ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    strategy:
+      # One target's failure says nothing about another's, and each is worth seeing.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            floor: glibc=2.35
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            floor: glibc=2.35
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            floor: macos=14.0
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            floor: macos=14.0
+    env:
+      TARGET: ${{ matrix.target }}
+      FLOOR: ${{ matrix.floor }}
+    steps:
+      # The whole history: a release's place among releases is the number of commits behind it.
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+
+      # What this release is: its version, its commit, and its place among releases. A host tag names
+      # the commit and the version, and has to name this commit at this version.
+      - name: What this release is
+        run: |
+          commit="$(git rev-parse HEAD)"
+          short="${commit:0:12}"
+          version="$(cargo metadata --format-version 1 --no-deps --locked \
+            | python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "kr-cli"))')"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "${GITHUB_REF_NAME#host/v}" != "$GITHUB_REF_NAME" ]; then
+            if [ "$GITHUB_REF_NAME" != "host/v$version+$short" ]; then
+              echo "::error::$GITHUB_REF_NAME does not name this commit at this version; this commit at this version is host/v$version+$short"
+              exit 1
+            fi
+          fi
+          release="$version+$short"
+          {
+            echo "COMMIT=$commit"
+            echo "RELEASE=$release"
+            echo "SEQUENCE=$(git rev-list --count HEAD)"
+            echo "TOP=kalareach-$TARGET-$release"
+          } >> "$GITHUB_ENV"
+          echo "release $release at $commit for $TARGET"
+
+      # Each of these checks is put through what it must refuse before it is trusted with the tree.
+      - name: Test the checks this run makes
+        run: |
+          python3 scripts/release-programs.py self-test
+          python3 scripts/check-release-floors.py self-test
+          python3 scripts/check-release-secrets.py self-test
+          python3 scripts/check-release-archive.py self-test
+
+      - name: Name the executables
+        run: |
+          builds=$(python3 scripts/release-programs.py builds --target "$TARGET")
+          echo "EXECUTABLES=${builds//$'\n'/ }" >> "$GITHUB_ENV"
+
+      - name: What this runner is
+        run: |
+          uname -a
+          case "$RUNNER_OS" in
+            macOS) sw_vers ;;
+            Linux) cat /etc/os-release ;;
+          esac
+
+      # Some runner images carry no Rust at all. The installer is rustup's own, and it installs no
+      # toolchain: the next step installs the one this repository pins.
+      - name: Install rustup where the image has none
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 --silent --show-error --fail https://sh.rustup.rs |
+              sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add "$TARGET"
+          rustc --version
+          cargo --version
+
+      # What the shells need to configure and build from their own release tarballs: the fish package
+      # is a Rust shell built through CMake, whose build turns the message catalogues with gettext.
+      - name: Install the shells' build dependencies
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends --yes libncurses-dev cmake gettext
+          else
+            command -v cmake >/dev/null 2>&1 || brew install cmake
+            if ! command -v msgfmt >/dev/null 2>&1; then
+              brew install gettext
+              echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+            fi
+          fi
+
+      # Each executable is built by a command of its own, as the release-baselines run builds them,
+      # so each one's dependencies are resolved exactly as they are for the release.
+      - name: Build the host executables
+        run: |
+          for executable in $EXECUTABLES; do
+            cargo build --locked --release --target "$TARGET" -p "${executable%/*}" --bin "${executable#*/}"
+          done
+
+      - name: Build the release tool
+        run: cargo build --locked --release -p kr-release
+
+      # What the shells are built from is pinned: the upstream sources are placed by digest, and the
+      # fish package then builds offline, with proxy variables that point at a port nothing listens
+      # on so that a client which obeys them and still tries a server fails here at once.
+      - name: Place the upstream sources
+        run: |
+          echo "KR_SHELL_PREFIX=$RUNNER_TEMP/shells" >> "$GITHUB_ENV"
+          KR_SHELL_PREFIX="$RUNNER_TEMP/shells" bash scripts/place-shell-sources.sh --all
+
+      - name: Build the shell packages
+        run: bash scripts/build-shells.sh --zsh --bash --no-upstream-tests
+
+      - name: Build the fish package
+        env:
+          HTTPS_PROXY: http://127.0.0.1:9
+          HTTP_PROXY: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+        run: |
+          # Some clients read only the lower-case names, and a workflow's names are not case-sensitive.
+          export https_proxy="$HTTPS_PROXY" http_proxy="$HTTP_PROXY" all_proxy="$ALL_PROXY"
+          bash scripts/build-shells.sh --fish --no-upstream-tests
+
+      # Every Mach-O or ELF file the release carries is held to the baseline its target runs on:
+      # the host's programs, the shells' programs and the modules a shell loads.
+      - name: Read each floor back
+        run: |
+          files=()
+          for executable in $EXECUTABLES; do
+            files+=("target/$TARGET/release/${executable#*/}")
+          done
+          while IFS= read -r -d '' file; do
+            if file -b "$file" | grep -q -E 'Mach-O|ELF'; then
+              files+=("$file")
+            fi
+          done < <(find "$RUNNER_TEMP/shells" -type f \( -path '*/bin/*' -o -name '*.so' -o -name '*.dylib' \) -print0)
+          {
+            echo "### $TARGET: ${#files[@]} files"
+            echo '```'
+            python3 scripts/check-release-floors.py check --target "$TARGET" "${files[@]}"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The plugins repository at the commit the bundled catalogue was taken from, to read the
+      # records the release cites from it.
+      - name: Name the plugins commit the bundled catalogue was taken from
+        id: plugins
+        run: echo "commit=$(python3 -c 'import json; print(json.load(open("bundled-plugins.lock"))["source"]["commit"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the plugins repository at that commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: kalapowered/kalareach-plugins
+          ref: ${{ steps.plugins.outputs.commit }}
+          path: plugins-source
+
+      # The channel's root and the keys that sign for it are this run's own, and stay outside the
+      # tree: no host trusts them.
+      - name: Make this run's keys and channel root
+        run: target/release/kr-release dev-keys --out "$RUNNER_TEMP/keys"
+
+      - name: Assemble the tree
+        run: |
+          identity=()
+          if [ "$RUNNER_OS" = macOS ]; then
+            identity=(--macos-identity -)
+          fi
+          bash scripts/build-release.sh \
+            --target "$TARGET" --release "$RELEASE" --sequence "$SEQUENCE" --commit "$COMMIT" --floor "$FLOOR" \
+            --programs "target/$TARGET/release" --shells "$RUNNER_TEMP/shells" \
+            --root "$RUNNER_TEMP/keys/root.json" --out "$RUNNER_TEMP/tree/$TOP" \
+            --kr-release target/release/kr-release --plugins plugins-source "${identity[@]}"
+
+      - name: Hold each Mach-O file to its signature
+        if: runner.os == 'macOS'
+        run: bash scripts/check-macos-signatures.sh "$RUNNER_TEMP/tree/$TOP" ad-hoc
+
+      - name: Refuse a private key in the tree
+        run: python3 scripts/check-release-secrets.py scan "$RUNNER_TEMP/tree/$TOP"
+
+      # The tree the `sign` job takes, before this run's signature is on it.
+      - name: Keep the tree for signing
+        if: github.ref_type == 'tag' || github.ref_name == github.event.repository.default_branch
+        run: |
+          mkdir -p "$RUNNER_TEMP/unsigned"
+          tar -C "$RUNNER_TEMP/tree" -cf "$RUNNER_TEMP/unsigned/$TOP.tar" "$TOP"
+
+      - name: Sign the manifest with this run's keys, and verify it
+        run: |
+          target/release/kr-release sign --tree "$RUNNER_TEMP/tree/$TOP" --checkout . \
+            --key "$RUNNER_TEMP/keys/targets-1.pk8" --key "$RUNNER_TEMP/keys/targets-2.pk8" \
+            --plugins plugins-source
+          target/release/kr-release verify --tree "$RUNNER_TEMP/tree/$TOP" --root "$RUNNER_TEMP/keys/root.json"
+
+      - name: Pack the archive
+        run: |
+          mkdir -p "$RUNNER_TEMP/archive"
+          # No extended attributes: macOS's tar writes a second entry for each, which a release
+          # archive does not hold.
+          COPYFILE_DISABLE=1 tar -C "$RUNNER_TEMP/tree" -czf "$RUNNER_TEMP/archive/$TOP.tar.gz" "$TOP"
+          (cd "$RUNNER_TEMP/archive" && { sha256sum "$TOP.tar.gz" 2>/dev/null || shasum -a 256 "$TOP.tar.gz"; } > SHA256SUMS)
+          cat "$RUNNER_TEMP/archive/SHA256SUMS"
+
+      - name: Check the archive as a host stages one
+        run: |
+          python3 scripts/check-release-archive.py check --archive "$RUNNER_TEMP/archive/$TOP.tar.gz" \
+            --sums "$RUNNER_TEMP/archive/SHA256SUMS"
+          python3 scripts/check-release-secrets.py scan "$RUNNER_TEMP/archive/$TOP.tar.gz"
+
+      # What a host does with it: unpack, verify the signature and every file, install it into a store
+      # of its own, and start the Zsh package from the unpacked tree and from the store, which is a
+      # package moved from where it was built.
+      - name: Unpack, verify, install and start it
+        run: |
+          mkdir -p "$RUNNER_TEMP/unpacked"
+          tar -C "$RUNNER_TEMP/unpacked" -xzf "$RUNNER_TEMP/archive/$TOP.tar.gz"
+          unpacked="$RUNNER_TEMP/unpacked/$TOP"
+          target/release/kr-release verify --tree "$unpacked" --root "$RUNNER_TEMP/keys/root.json"
+          store="$RUNNER_TEMP/store"
+          "$unpacked/bin/kr" host install --store "$store"
+          "$store/current/bin/kr" --version
+          for root in "$unpacked" "$store/versions/$RELEASE"; do
+            identity="$(cat "$root/shells/zsh/current")"
+            "$root/shells/zsh/$identity/bin/zsh" -f -c 'zmodload zsh/zle && print -r -- "zle loaded from $module_path[1]"'
+          done
+
+      - name: Keep the archive this run proved
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.TOP }}-signed-with-this-runs-keys-not-a-release
+          path: ${{ runner.temp }}/archive
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Keep the tree for the signing job
+        if: github.ref_type == 'tag' || github.ref_name == github.event.repository.default_branch
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-${{ env.TOP }}
+          path: ${{ runner.temp }}/unsigned
+          retention-days: 1
+          if-no-files-found: error
+
+  sign:
+    name: sign the tree of ${{ matrix.target }}
+    needs: tree
+    # A release tag and the default branch only: a run on any other ref skips this job and never
+    # reaches the environment.
+    if: github.ref_type == 'tag' || github.ref_name == github.event.repository.default_branch
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    # The environment carries the deployment policy and the reviewer, which puts a person in front
+    # of every signature.
+    environment: release-signing
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Take the tree the tree job built
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: unsigned-kalareach-${{ matrix.target }}-*
+          path: ${{ runner.temp }}/unsigned
+          merge-multiple: true
+
+      - name: Build the release tool
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cargo build --locked --release -p kr-release
+
+      # The Developer ID signature on every Mach-O file of a macOS tree, with the hardened runtime
+      # and no entitlement, then each file held to it. Each credential is named where it is missing.
+      - name: Sign each Mach-O file with the Developer ID
+        if: runner.os == 'macOS'
+        env:
+          IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          CERTIFICATE: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12 }}
+          PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+        run: |
+          for need in IDENTITY CERTIFICATE PASSWORD; do
+            if [ -z "${!need}" ]; then
+              echo "::error::the Developer ID is not set up: $need is empty. Signing for release needs the identity and its certificate, and nothing here signs without them."
+              exit 1
+            fi
+          done
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          security create-keychain -p "$PASSWORD" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$PASSWORD" "$keychain"
+          printf '%s' "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/identity.p12"
+          security import "$RUNNER_TEMP/identity.p12" -k "$keychain" -P "$PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$PASSWORD" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" login.keychain
+          rm -f "$RUNNER_TEMP/identity.p12"
+          tar -C "$RUNNER_TEMP/unsigned" -xf "$RUNNER_TEMP"/unsigned/*.tar
+          tree="$(ls -d "$RUNNER_TEMP"/unsigned/kalareach-*/)"
+          bash scripts/sign-macos-tree.sh "${tree%/}" "$IDENTITY"
+          bash scripts/check-macos-signatures.sh "${tree%/}" developer-id
+          echo "TREE=${tree%/}" >> "$GITHUB_ENV"
+
+      # The system's notary service looks at the programs, and the release is held to what it says:
+      # accepted, and each file assessed as a Notarized Developer ID. A command-line release has no
+      # ticket to staple, so the check asks the service.
+      - name: Notarise the programs, and hold each file to the result
+        if: runner.os == 'macOS'
+        env:
+          KEY: ${{ secrets.APPLE_NOTARY_API_KEY_P8 }}
+          KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          ISSUER: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          for need in KEY KEY_ID ISSUER; do
+            if [ -z "${!need}" ]; then
+              echo "::error::notarisation is not set up: $need is empty. A release for macOS is notarised, and nothing here publishes one that is not."
+              exit 1
+            fi
+          done
+          printf '%s' "$KEY" > "$RUNNER_TEMP/notary-key.p8"
+          ditto -c -k --keepParent "$TREE" "$RUNNER_TEMP/notarise.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarise.zip" --key "$RUNNER_TEMP/notary-key.p8" \
+            --key-id "$KEY_ID" --issuer "$ISSUER" --wait | tee "$RUNNER_TEMP/notary.txt"
+          rm -f "$RUNNER_TEMP/notary-key.p8"
+          grep -q 'status: Accepted' "$RUNNER_TEMP/notary.txt"
+          bash scripts/check-macos-signatures.sh "$TREE" notarized
+
+      # The manifest is written again, since signing changed the files, and signed by a threshold of
+      # the channel's release keys. Those keys are held in hardware and on offline media, and no
+      # mechanism of this repository gives a run one, so this is where the job stops until the
+      # channel's signing service is set up.
+      - name: Write the manifest again and sign it with the channel's release keys
+        run: |
+          echo "::error::the channel's release keys are not set up: they are held in hardware and on offline media, and this job has no signing service to ask for a signature. The tree is signed and checked up to this step, and the release is not signed."
+          exit 1
