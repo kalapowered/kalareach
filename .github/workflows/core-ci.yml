@@ -554,25 +554,62 @@ jobs:
           path: ${{ steps.libsodium.outputs.path }}
           key: ${{ steps.libsodium.outputs.key }}
 
-      # What has been qualified on this platform, and only that: the terminal engine, the
-      # repository boundary, the attach client, the contact tools against a session's job, the
-      # worker's own library, the suite that drives a real pseudo-console, a real PowerShell and a
-      # real job object and hosts a worker on its own pipe, where a launched agent's helper is
-      # placed, what a question's caller token reaches, a controller's and the local command
-      # line's authority at a worker's pipe, the local endpoint, descriptors and process identity
-      # the host rests on (the descriptor reader checks both the directory's and the file's
-      # access-control lists here), every local store's directory flush, the persistence suite, the
-      # decision a worker start makes about breaking away from the daemon's job, the environment's
-      # scheduled task and the starter it runs, the real-worker host tests under cargo through that
-      # task and from the built executable as the shipping daemon starts a worker, the first-owner
-      # pairing against a real control daemon on loopback, the contact skill's installation and
-      # removal with the access reader it compares a replacement with, the directory secret store
-      # and the libsodium boundary, the machine group record, and the plugin catalogue's package
-      # store with the daemon's catalogue and plugin groups over it. "The attach client" means the part of it that runs
-      # here - `crates/kr-cli/tests/attach.rs` is a Unix file, so what passes is that crate's library
-      # and its path tests rather than a real attachment. The contact tools run in
-      # `crates/kr-cli/tests/contact_windows.rs`, beside the Unix suite, with the tool server
-      # started by a root shell inside the session's job.
+      # What has been qualified on this platform, and only that: the suites below, which the steps
+      # that follow run in the order they are written. Both legs build the control daemon, the
+      # worker, the forwarder and the plugin host the suites start. The first leg also compiles and
+      # lints the whole workspace with its tests, since a test that only builds on Unix is a Windows
+      # failure, and runs:
+      #   - the terminal engine, the repository boundary, the attach client and the first-owner
+      #     pairing against a real control daemon on loopback: all of `kr-term`, `kr-project` and
+      #     `kr-cli`;
+      #   - the worker's library and the protocol's library;
+      #   - the worker's `binder`, `channels`, `connectors` and `attention_source` suites;
+      #   - the control daemon's library filters `config::`, `bridge::store::`,
+      #     `a_create_that_launches_nothing::`, `attention::`, `a_share_that_names_a_current_decision::`,
+      #     `service::a_read_that_meets_a_worker_on_its_way_out::` and `service::net::dispatch::tests::`,
+      #     and its `attention`, `barrier`, `configuration` and `network_host` suites;
+      #   - the forwarder: all of `kr-hook`.
+      # The second leg runs:
+      #   - the worker over its own pipe and the launch endpoint: `windows_endpoint`, `listener`,
+      #     `transport`, `broker`, `gateway`, `agent_service`, `windows_inheritance`, `connectors`,
+      #     `launch_probe`, `command_backends`, `windows` (a real pseudo-console, a real PowerShell
+      #     and a real job object), `question_bindings`, `questions_answer`, `authority`,
+      #     `persistence`, `snapshot`, `terminal`, `session`, `local_owner`, `input_lease`, `fence`,
+      #     `desktop` and `performance`, and `host` twice: under cargo through the environment's
+      #     scheduled task, and from the built executable as the shipping daemon starts a worker;
+      #   - the local endpoint, descriptors and process identity the host rests on: `kr-ipc`'s
+      #     `windows`, `stop` and `peer_gone` suites and its library, and all of `kr-flush`, the
+      #     directory flush of every local store;
+      #   - the control daemon over the environment's scheduled task and the starter it runs:
+      #     `supervision::windows`, the breakaway decision in `supervision::tests`, the
+      #     `task_supervisor` suite, the `plugin_runtime_service` suite over the plugin test
+      #     components built for it, and `kr-cli`'s `startup_windows`;
+      #   - the daemon's other Windows suites: the library filters `catalogue::integrations`,
+      #     `catalogue::launch_probes`, `agent_tools`, `machine`, `registry` and `singleton`, and
+      #     the `agent_tools`, `contact_skill`, `catalogue`, `voice_broker` (the sign-in cases),
+      #     `archive`, `project`, `network_project`, `shell`, `privacy` and `descriptions` suites;
+      #   - the stores' wait for the holder that is letting go of them, across `kr-controller`,
+      #     `kr-changeset`, `kr-delivery`, `kr-describe` and `kr-automation`;
+      #   - the automation engine: `kr-automation`'s refusal of a command node where no command can
+      #     be run (`definitions`), and its `causal_budget` cases, that a descendant keeps its causal
+      #     root, depth and parent and that a workflow does not retrigger on its own descendants by
+      #     default;
+      #   - the client and the shell integration: `kr-client`'s `sync`, `shown_rule` and library
+      #     suites and the collection key kept in the runner's credential store, `kr-plugin-sdk`'s
+      #     forwarder placeholder, and `kr-shell-integration`'s `host::command`, `pwsh_windows` and
+      #     `host::scripted::`;
+      #   - the plugin catalogue's package store, `kr-plugin-catalogue`, with the daemon's catalogue
+      #     and plugin groups over it;
+      #   - the directory secret store and the libsodium boundary (`kr-crypto`), the attention
+      #     store (`kr-attention`) and the loopback listener of a sign-in (`kr-loopback`);
+      #   - the repository boundary on its own, the change set's apply (`kr-changeset`'s `apply`)
+      #     and the filesystem authority (`kr-transfer`'s library and `authority`);
+      #   - the ARM64 compile of `kr-ipc`, `kr-worker`, `kr-controller`, `kr-cli`, `kr-term` and
+      #     `kr-project`, which runs nothing, and the documentation of this platform's own code.
+      # "The attach client" means the part of it that runs here - `crates/kr-cli/tests/attach.rs`
+      # is a Unix file, so what passes is that crate's library and its path tests rather than a real
+      # attachment. The contact tools run in `crates/kr-cli/tests/contact_windows.rs`, beside the
+      # Unix suite, with the tool server started by a root shell inside the session's job.
       #
       # The persistence suite runs with PowerShell 7 as each session's root shell rather than the
       # `/bin/sh` this platform has not got. The host tests that start a real worker run under
