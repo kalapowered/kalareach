@@ -748,17 +748,19 @@ impl Session {
         // Before the shell exists, so that whatever it leaves behind stays this worker's.
         crate::ownership::adopt_orphans();
         // A session a workflow started is held to what the daemon accepted it for at the last
-        // moment before its process exists, after everything this worker prepared first, so a
-        // delay in any of that cannot carry it past its moment.
-        if let Err(error) = self.start_terms.admits(
-            &command,
-            std::path::Path::is_dir,
-            kr_ipc::clock::boot_elapsed_ms,
-        ) {
-            self.record_closure(ClosureReason::RootLaunchFailed, None);
-            return Err(error);
-        }
-        match self.pty.launch(&command) {
+        // moment before its process exists. The terminal reads the directory first and asks the
+        // terms after, and reads nothing once they have admitted the start, so a delay in any of
+        // that cannot carry the session past its moment and a directory that goes after the
+        // terms have looked is not looked for again.
+        let terms = self.start_terms;
+        let admit = |directory_is_there: bool| {
+            terms.admits(
+                &command,
+                |_| directory_is_there,
+                kr_ipc::clock::boot_elapsed_ms,
+            )
+        };
+        match self.pty.launch(&command, admit) {
             Ok(shell) => {
                 // Ownership is established with the shell, not at closure: a process that started
                 // and ended while the session ran is still one this session owned, and a boundary
@@ -1482,6 +1484,14 @@ impl Session {
     #[must_use]
     pub fn root_identity(&self) -> Option<kr_protocol::identity::ProcessStartIdentity> {
         self.shell.as_ref().map(|shell| shell.identity().clone())
+    }
+
+    /// Returns whether a process was created for this session's terminal, for this host's own
+    /// tests: false for a session whose start was refused before any process existed.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn process_was_created(&self) -> bool {
+        self.pty.shell_started()
     }
 
     /// Returns a reader for the terminal's output.

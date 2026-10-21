@@ -142,19 +142,33 @@ impl Pty {
         self.dimensions
     }
 
-    /// Starts the root shell inside the terminal.
+    /// Starts the root shell inside the terminal, if `admit` allows it.
+    ///
+    /// Everything the start reads from the file system is read before `admit` is asked, and
+    /// nothing is read between its answer and the process: it is the last look at whether the
+    /// start may go ahead, such as a look at the clock for a start that is held to a moment.
+    /// `admit` is given whether the directory the command names was there. A start it refuses
+    /// leaves the terminal unused, and the shell can be started in it later.
     ///
     /// The environment is replaced outright rather than inherited: the worker's own environment is
     /// not the session's, and section 7 decides what the session gets.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::Pty`] when the shell cannot be started, or when a shell has already
-    /// been started in this terminal.
-    pub fn launch(&mut self, command: &ShellCommand) -> Result<RootShell> {
-        let slave = self.slave.take().ok_or_else(|| {
-            WorkerError::pty("start the root shell", "a shell is already running")
-        })?;
+    /// Returns what `admit` returns when it refuses, and [`WorkerError::Pty`] when the shell
+    /// cannot be started, or when a shell has already been started in this terminal.
+    pub fn launch(
+        &mut self,
+        command: &ShellCommand,
+        admit: impl FnOnce(bool) -> Result<()>,
+    ) -> Result<RootShell> {
+        let running = || WorkerError::pty("start the root shell", "a shell is already running");
+        if self.slave.is_none() {
+            return Err(running());
+        }
+        let named_is_there = std::path::Path::new(&command.cwd).is_dir();
+        admit(named_is_there)?;
+        let slave = self.slave.take().ok_or_else(running)?;
         let mut builder = CommandBuilder::new(&command.program);
         for argument in &command.arguments {
             builder.arg(argument);
@@ -189,6 +203,14 @@ impl Pty {
             #[cfg(windows)]
             console_input: std::sync::Arc::clone(&self.console_input),
         })
+    }
+
+    /// Returns whether the terminal has been given to a root shell, which is whether a process was
+    /// created for it, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn shell_started(&self) -> bool {
+        self.slave.is_none()
     }
 
     /// Returns a reader for everything the terminal produces.
@@ -708,7 +730,7 @@ mod tests {
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let mut reader = pty.reader().expect("a reader");
         let mut shell = pty
-            .launch(&crate::testing::posix_script("printf hello"))
+            .launch(&crate::testing::posix_script("printf hello"), |_| Ok(()))
             .expect("launches");
         assert!(shell.identity().pid.get() > 0);
         let seen = read_until(&pty, &mut reader, b"hello");
@@ -738,9 +760,10 @@ mod tests {
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let mut reader = pty.reader().expect("a reader");
         let mut shell = pty
-            .launch(&crate::testing::posix_script(&format!(
-                "printf %s \"[${{{inherited}:-absent}}]\""
-            )))
+            .launch(
+                &crate::testing::posix_script(&format!("printf %s \"[${{{inherited}:-absent}}]\"")),
+                |_| Ok(()),
+            )
             .expect("launches");
         let seen = read_until(&pty, &mut reader, b"[absent]");
         shell.wait().expect("waits");
@@ -754,13 +777,131 @@ mod tests {
     fn a_second_shell_cannot_be_started_in_the_same_terminal() {
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let mut first = pty
-            .launch(&crate::testing::posix_script("exit 0"))
+            .launch(&crate::testing::posix_script("exit 0"), |_| Ok(()))
             .expect("launches");
         first.wait().expect("waits");
         assert!(matches!(
-            pty.launch(&crate::testing::posix_script("exit 0")),
+            pty.launch(&crate::testing::posix_script("exit 0"), |_| Ok(())),
             Err(WorkerError::Pty { .. })
         ));
+    }
+
+    /// KR-REQ-19.04 and KR-REQ-25.14: a start the admission refuses has created no process and
+    /// has not used the terminal: the shell is started in it afterwards.
+    #[test]
+    fn a_start_the_admission_refuses_leaves_the_terminal_unused() {
+        let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
+        let refused = pty.launch(&crate::testing::posix_script("exit 0"), |_| {
+            Err(WorkerError::PermissionDenied {
+                detail: "the moment has passed".to_owned(),
+            })
+        });
+        assert!(matches!(refused, Err(WorkerError::PermissionDenied { .. })));
+        let mut shell = pty
+            .launch(&crate::testing::posix_script("exit 0"), |_| Ok(()))
+            .expect("the terminal was not used by the refused start");
+        assert_eq!(shell.wait().expect("waits").code, 0);
+    }
+
+    /// KR-REQ-19.04 and KR-REQ-25.14: once the admission has allowed the start, the directory is
+    /// not read again. The directory is moved away inside the admission, as a mount or an owner
+    /// could take it, and the shell still starts in the directory that was opened before: reading
+    /// the name again would find nothing there and start the shell in the home directory instead.
+    #[cfg(unix)]
+    #[test]
+    fn the_directory_is_not_read_again_once_the_start_is_admitted() {
+        let host = kr_ipc::testing::TempHost::create();
+        let (work, moved, home) = (
+            host.root().join("work"),
+            host.root().join("moved"),
+            host.root().join("home"),
+        );
+        std::fs::create_dir(&work).expect("the directory the shell is to start in");
+        std::fs::create_dir(&home).expect("the home directory");
+        let mut command = crate::testing::posix_script(": > ran-here");
+        command.cwd = work.display().to_string();
+        command
+            .environment
+            .push(("HOME".to_owned(), home.display().to_string()));
+        let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
+        let mut shell = pty
+            .launch(&command, |named_is_there| {
+                assert!(named_is_there, "the directory is there when it is asked");
+                std::fs::rename(&work, &moved).expect("the directory goes");
+                Ok(())
+            })
+            .expect("launches");
+        shell.wait().expect("the shell ends");
+        assert!(
+            moved.join("ran-here").exists(),
+            "the shell started in the directory that was opened; the home directory holds {:?}",
+            std::fs::read_dir(&home).map(|entries| entries
+                .flatten()
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>())
+        );
+    }
+
+    /// A directory that is not there is told to the admission, and the start goes ahead in the
+    /// account's home directory when the admission allows it.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_is_not_there_is_told_to_the_admission_and_the_home_directory_is_used() {
+        let host = kr_ipc::testing::TempHost::create();
+        let home = host.root().join("home");
+        std::fs::create_dir(&home).expect("the home directory");
+        let mut command = crate::testing::posix_script(": > ran-here");
+        command.cwd = host.root().join("not-there").display().to_string();
+        command
+            .environment
+            .push(("HOME".to_owned(), home.display().to_string()));
+        let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
+        let told = std::cell::Cell::new(None);
+        let mut shell = pty
+            .launch(&command, |named_is_there| {
+                told.set(Some(named_is_there));
+                Ok(())
+            })
+            .expect("launches");
+        shell.wait().expect("the shell ends");
+        assert_eq!(told.get(), Some(false));
+        assert!(
+            home.join("ran-here").exists(),
+            "the shell ran in the home directory"
+        );
+    }
+
+    /// The shell has the terminal and nothing else of the worker's descriptors: one the worker
+    /// holds open, with nothing to close it on exec, is not open in the shell. The control is the
+    /// terminal itself, which is.
+    #[cfg(unix)]
+    #[test]
+    fn the_shell_inherits_no_descriptor_of_the_workers() {
+        use std::os::fd::AsRawFd as _;
+
+        let held = std::fs::File::open("/").expect("a descriptor of the worker's");
+        rustix::io::fcntl_setfd(&held, rustix::io::FdFlags::empty()).expect("left open on exec");
+        let number = held.as_raw_fd();
+        let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
+        let mut reader = pty.reader().expect("a reader");
+        let script = format!(
+            "[ -e /dev/fd/1 ] && printf '[terminal]'; [ -e /dev/fd/{number} ] && printf '[leaked]'; \
+             printf '[done]'"
+        );
+        let mut shell = pty
+            .launch(&crate::testing::posix_script(&script), |_| Ok(()))
+            .expect("launches");
+        let seen = read_until(&pty, &mut reader, b"[done]");
+        shell.wait().expect("waits");
+        let seen = String::from_utf8_lossy(&seen);
+        assert!(
+            seen.contains("[terminal]"),
+            "the shell has the terminal: {seen:?}"
+        );
+        assert!(
+            !seen.contains("[leaked]"),
+            "a descriptor of the worker's is open in the shell: {seen:?}"
+        );
     }
 
     #[test]
@@ -780,7 +921,7 @@ mod tests {
     fn a_stop_request_reaches_the_shell_and_its_group() {
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let mut shell = pty
-            .launch(&crate::testing::posix_script("sleep 30"))
+            .launch(&crate::testing::posix_script("sleep 30"), |_| Ok(()))
             .expect("launches");
         shell.request_stop().expect("asks");
         let exit = shell.wait().expect("waits");
@@ -792,9 +933,10 @@ mod tests {
     fn a_shell_that_ignores_the_request_is_ended_by_force() {
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let mut shell = pty
-            .launch(&crate::testing::posix_script(
-                "trap '' TERM; while :; do sleep 1; done",
-            ))
+            .launch(
+                &crate::testing::posix_script("trap '' TERM; while :; do sleep 1; done"),
+                |_| Ok(()),
+            )
             .expect("launches");
         shell.force_stop().expect("forces");
         let exit = shell.wait().expect("waits");
@@ -806,7 +948,7 @@ mod tests {
     fn signalling_a_shell_that_has_already_ended_succeeds() {
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let mut shell = pty
-            .launch(&crate::testing::posix_script("exit 3"))
+            .launch(&crate::testing::posix_script("exit 3"), |_| Ok(()))
             .expect("launches");
         let exit = shell.wait().expect("waits");
         assert_eq!(exit.code, 3);
