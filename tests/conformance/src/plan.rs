@@ -1754,6 +1754,15 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         },
     },
     IgnoredRun {
+        package: "kr-release",
+        target: "--test release_tree",
+        cases: &[],
+        runs: Runs::Command {
+            file: ".github/workflows/release-tree.yml",
+            line: "cargo test --locked -p kr-release --test release_tree -- --include-ignored",
+        },
+    },
+    IgnoredRun {
         package: "kr-shell-integration",
         target: "--test pwsh_windows",
         cases: &[],
