@@ -1367,7 +1367,10 @@ impl AuthorisedDirectory {
     /// handle and through handles it opens itself, never through a path, so what the check
     /// established is true of the tree that goes.
     ///
-    /// * **The name has to hold `opened` when the removal starts**, or nothing is removed.
+    /// * **The name has to hold `opened` when the removal starts**, or nothing is removed. A mount
+    ///   put on the name since the caller opened the tree is refused by the same look as any other
+    ///   replacement, and the look goes into a mount only where the caller handed over the root of
+    ///   one: the opened directory is on another mount than the one that holds the name.
     /// * **Each directory beneath is entered the way a descent enters one**: opened without
     ///   following a link, as a directory, against the handle above it, and kept open until
     ///   everything in it is gone. The removal stays on the mount `opened` is on, whether or not
@@ -1439,9 +1442,6 @@ impl AuthorisedDirectory {
         check_component(name.as_str())?;
         opened.check_environment(self.environment_id)?;
         let entry = OsStr::new(name.as_str());
-        // The object the caller checked, or nothing: a different object at the name is not what
-        // the caller asked to take away.
-        same_object_at(&self.directory, entry, opened.identity, name.as_str(), true)?;
         // The mount rule travels with the removal whoever asked for it. An authority that carries
         // it already compares `opened` with its own mount; one that does not starts the removal on
         // the mount `opened` itself is on.
@@ -1454,12 +1454,23 @@ impl AuthorisedDirectory {
         // A name that holds the root of a mount, which a caller can hand over where this authority
         // has no mount rule of its own, is followed into at its end: the directory the caller
         // checked is on the mount, and the name leads there. A name on the mount that holds it is
-        // not, so a mount put on it afterwards is refused without a look into it.
+        // not, so a mount put on it afterwards is refused without a look into it. This is decided
+        // from the handles alone, before the name is looked at, because the look is the first
+        // request this removal makes of whatever is at the name.
         let held_on = match self.mount {
             Some(mount) => mount,
             None => mount_of(&self.directory, &self.display.display().to_string())?,
         };
         let name_leads_into_a_mount = opened.mount != Some(held_on);
+        // The object the caller checked, or nothing: a different object at the name is not what
+        // the caller asked to take away.
+        same_object_at(
+            &self.directory,
+            entry,
+            opened.identity,
+            name.as_str(),
+            name_leads_into_a_mount,
+        )?;
         let mut removal = Removal {
             name: name.as_str().to_owned(),
             removed: 0,
