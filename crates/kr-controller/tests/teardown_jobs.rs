@@ -295,9 +295,10 @@ fn systemctl_after(before: &str) -> (tempfile::TempDir, PathBuf) {
 
 /// A question to the manager that fails once, and then is answered late, as a manager busy with
 /// every unit a machine's tests have started answers one, is no sign that a unit is left: it is
-/// asked again and given the time to answer, and the tree's unit goes. The first question about
-/// the units' properties here fails, and the next takes longer than a question to a manager that
-/// answers is given.
+/// asked again and waited for, and the tree's unit goes. The first question about the units'
+/// properties here fails, and every one after it takes longer than the bound a question to a
+/// manager that answers is given (`TOOL_BOUND`), so a teardown that ended a question at that bound
+/// would never be answered.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI \
@@ -311,7 +312,7 @@ fn a_question_the_manager_fails_or_answers_late_is_asked_again_and_leaves_no_uni
     let (_directory, tool) = systemctl_after(
         "case \"$*\" in *--property=Id,WorkingDirectory*) \
          if [ ! -e \"$here/failed\" ]; then : > \"$here/failed\"; exit 1; fi; \
-         if [ ! -e \"$here/late\" ]; then : > \"$here/late\"; sleep 15; fi;; esac",
+         sleep 15;; esac",
     );
     let left = teardown::remove_units_through(&tree, &tool, std::time::Duration::from_secs(60));
     assert!(

@@ -880,8 +880,8 @@ fn asked_again_until_answered(
 /// to remove, and that is read from where every user manager listens, its private socket in the
 /// runtime directory, rather than from a question that fails: a manager that is there and does not
 /// answer for `give_up_after` leaves every unit it may hold not established as gone. A question
-/// the manager answers late, or fails once, is asked again, and a unit that is still loaded when
-/// `give_up_after` has passed is left.
+/// the manager answers late is waited for, one it fails is asked again, and a unit that is still
+/// loaded when `give_up_after` has passed is left.
 #[cfg(target_os = "linux")]
 pub fn remove_units_through(
     tree: &TempHost,
@@ -989,8 +989,11 @@ pub fn remove_units_through(
     left
 }
 
-/// Whether the user manager `manager` asks no longer has `unit`, given until `give_up_after` has
-/// passed to collect it, or why that could not be established.
+/// Whether the user manager `manager` asks no longer has `unit`, given `give_up_after` to collect it,
+/// or why that could not be established.
+///
+/// A question that starts just before the time is up is still given [`TOOL_BOUND`], and an answer
+/// that the unit is not there counts whenever it comes.
 #[cfg(target_os = "linux")]
 fn unit_gone(
     manager: &dyn Fn() -> Command,

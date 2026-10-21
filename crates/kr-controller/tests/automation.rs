@@ -220,8 +220,9 @@ impl WorkerSupervisor for AtTheDoor {
     }
 }
 
-/// How long a launch waits for a user manager that answers late before the test is called hung. It
-/// ends a manager that never answers, and nothing else.
+/// How long a launch is looked after, whatever the user manager answers, before the test is called
+/// hung. It ends a manager that never answers, one that refuses every start and a unit that stays
+/// loaded with no main process, and nothing else.
 const MANAGER_HUNG_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The platform's supervisor, for a manager that answers a launch after the daemon has stopped
@@ -234,9 +235,9 @@ const MANAGER_HUNG_AFTER: std::time::Duration = std::time::Duration::from_secs(1
 /// the manager answers late whenever enough of them do. Whatever the reason a systemd launch comes
 /// back with no process to name (the manager did not answer in time, refused the request, or did
 /// not report a main process), this asks the manager what became of the unit and goes on from its
-/// answer: a unit that is there has its main process named, and one the manager has never had is
-/// started again. A unit that was there when it was looked at and is gone since ended, and the
-/// launch is returned as it was. Anything else the launch came to is returned as it was, and so is
+/// answer: a unit that is there has its main process named, and one the first look does not find is
+/// started again. A unit that a look found and a later look did not has ended, and the launch is
+/// returned as it was. Anything else the launch came to is returned as it was, and so is
 /// a launch through any other supervisor than systemd's.
 ///
 /// What it cannot give a worker is more time than the daemon gives it: a worker that connects
@@ -287,9 +288,9 @@ fn asks_a_user_manager(_supervisor: &dyn WorkerSupervisor) -> bool {
 }
 
 /// What the user manager says of the unit `label`: nothing when it did not answer by `deadline`, or
-/// when the unit was there and is gone; otherwise the process the unit runs, or none when the
-/// manager has never had the unit. A unit that is there and runs no process yet is asked about
-/// again.
+/// when a look found the unit and a later one did not; otherwise the process the unit runs, or none
+/// when the first look does not find the unit. A unit that is there and runs no process yet is
+/// asked about again.
 #[cfg(target_os = "linux")]
 fn unit_main_process(label: &str, deadline: std::time::Instant) -> Option<Option<u32>> {
     let unit = format!("{label}.service");
