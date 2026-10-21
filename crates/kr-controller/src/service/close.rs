@@ -1221,16 +1221,28 @@ impl Controller {
     /// says its worker's process has ended, looking until [`CLOSURE_WATCH_TIMEOUT`] has passed.
     ///
     /// Such a worker closes whatever it started before it ends and keeps its own record of how it
-    /// ended, so when it ended the record is read, and a registration is ended only if that record
-    /// shows nothing the session left running. A worker still running after the bound keeps the
-    /// registration until its closure or until the daemon restarts, and so does one that left a
-    /// process behind.
+    /// ended, so when it ended the record is read, and a registration is ended only if the worker
+    /// kept no journal (it never started a session) or its journal shows a closure with nothing
+    /// left running. A worker still running after the bound keeps the registration until its
+    /// closure or until the daemon restarts, and so does one that left a process behind or whose
+    /// record shows nothing.
     pub(super) fn end_session_when_ended(
         self: &Arc<Self>,
         session_id: SessionId,
         identity: kr_protocol::identity::ProcessStartIdentity,
     ) {
         drop(self.watch_for_a_worker_to_end(session_id, identity));
+    }
+
+    /// Whether a worker that has ended shows that its session left nothing running: it kept no
+    /// journal, so it never started a session, or its journal holds a closure that lists no
+    /// survivor. A journal with no closure in it, or one that cannot be read, shows nothing.
+    fn worker_left_nothing(&self, session_id: SessionId) -> bool {
+        if !self.paths.journal_database(session_id).exists() {
+            return true;
+        }
+        self.recovered_closure(session_id)
+            .is_some_and(|closure| closure.surviving.is_empty())
     }
 
     /// The watch [`Self::end_session_when_ended`] starts, which finishes when it has ended the
@@ -1249,14 +1261,11 @@ impl Controller {
                     kr_ipc::identity::ProcessState::Ended
                 ) {
                     let reader = Arc::clone(&controller);
-                    let left_something = tokio::task::spawn_blocking(move || {
-                        reader
-                            .recovered_closure(session_id)
-                            .is_some_and(|closure| !closure.surviving.is_empty())
-                    })
-                    .await
-                    .unwrap_or(true);
-                    if !left_something {
+                    let left_nothing =
+                        tokio::task::spawn_blocking(move || reader.worker_left_nothing(session_id))
+                            .await
+                            .unwrap_or(false);
+                    if left_nothing {
                         controller
                             .project()
                             .service()

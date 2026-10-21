@@ -3251,6 +3251,39 @@ async fn a_failed_creates_registration_ends_when_its_worker_ends() {
     );
 }
 
+/// KR-REQ-14.32: a worker that ended with a journal and no closure in it shows nothing about what
+/// its session left running, so the registration stays, and one whose closure lists nothing left
+/// running lets it go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_creates_registration_follows_what_the_workers_journal_shows() {
+    for (closure, ends) in [(false, false), (true, true)] {
+        let (temp, controller, _started) = daemon().await;
+        let (session_id, mut worker, identity) = a_session_with_a_worker_running(&controller);
+        let holds = Arc::clone(controller.project().service().holds());
+        let path = temp.environment().journal_database(session_id);
+        std::fs::create_dir_all(path.parent().expect("a directory")).expect("the directory");
+        let mut journal =
+            kr_worker::journal::Journal::open(&path).expect("the worker's journal opens");
+        if closure {
+            journal
+                .record_closure(&a_workers_own_closure(session_id, Vec::new()))
+                .expect("the closure is recorded");
+        }
+        drop(journal);
+
+        let watching = controller.watch_for_a_worker_to_end(session_id, identity);
+        drop(worker.stdin.take());
+        worker.wait().expect("the worker ends");
+        watching.await.expect("the watch finishes");
+        assert_eq!(
+            !holds.has_session(session_id),
+            ends,
+            "a journal with{} a closure in it",
+            if closure { "" } else { "out" }
+        );
+    }
+}
+
 /// KR-REQ-14.32: the same registration stays when the worker's own record of its session shows
 /// something it left running, which is what a hold must keep waiting for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
