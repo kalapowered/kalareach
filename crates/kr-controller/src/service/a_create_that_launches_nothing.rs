@@ -3353,3 +3353,119 @@ async fn the_registration_of_a_claimed_failed_create_follows_what_the_workers_jo
         );
     }
 }
+
+/// A supervisor that says it started a worker, which is a process the test keeps and ends itself.
+#[cfg(unix)]
+#[derive(Debug)]
+struct StartsAWorkerTheTestEnds {
+    worker: Arc<Mutex<Option<std::process::Child>>>,
+}
+
+#[cfg(unix)]
+impl WorkerSupervisor for StartsAWorkerTheTestEnds {
+    fn start(&self, _launch: &WorkerLaunch) -> LaunchOutcome {
+        let child = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("a process that waits for its input");
+        let identity = kr_ipc::identity::process_start_identity(child.id())
+            .expect("the process has an identity");
+        *self.worker.lock().expect("the record is not poisoned") = Some(child);
+        LaunchOutcome::Started(identity)
+    }
+
+    fn describe(&self) -> &'static str {
+        "a supervisor whose worker is a process the test ends"
+    }
+}
+
+/// KR-REQ-14.32: a worker whose claim the host refused is told no launch specification and starts
+/// no session, so the registration of the create that waited for it ends with the worker's
+/// process, though the create is told it failed and no journal was ever written.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_claim_leaves_no_registration_once_its_worker_has_ended() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let worker = Arc::new(Mutex::new(None));
+    let controller = daemon_supervised(
+        &temp,
+        temp.root().join("kr-worker"),
+        None,
+        Box::new(StartsAWorkerTheTestEnds {
+            worker: Arc::clone(&worker),
+        }),
+    )
+    .await;
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let create = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let order = a_nodes_create(
+            temp.environment_id(),
+            ActionId::new(kr_ipc::new_uuid()),
+            &asked,
+            || Ok(None),
+        );
+        async move { controller.workflow_session_create(order).await }
+    });
+
+    // The create has started its worker and waits for it to report.
+    let (reservation_id, session_id) = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let waiting = {
+                let registry = controller.registry.lock().await;
+                registry
+                    .reservations_in(LaunchPhase::Spawned)
+                    .expect("reads the reservations")
+                    .into_iter()
+                    .find(|reservation| reservation.launcher_identity.is_some())
+            };
+            if let Some(reservation) = waiting {
+                return (reservation.reservation_id, reservation.session_id);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the create started a worker within the bound");
+    let holds = Arc::clone(controller.project().service().holds());
+    assert!(
+        holds.has_session(session_id),
+        "a process may be running, so the session counts"
+    );
+
+    // The host refuses the worker's claim, which resolves the create with the refusal.
+    let pending = controller
+        .pending
+        .lock()
+        .await
+        .remove(&reservation_id)
+        .expect("the create is waiting for its worker");
+    pending
+        .ready
+        .send(Err(kr_protocol::error::ProtocolError::new(
+            ErrorCode::PermissionDenied,
+            "the node's grant has gone",
+        )))
+        .expect("the create is still waiting");
+    create
+        .await
+        .expect("the create finishes")
+        .expect_err("a refused claim is a failed create");
+
+    // The worker ends, and the session stops counting without any journal to read.
+    let mut ended = worker
+        .lock()
+        .expect("the record is not poisoned")
+        .take()
+        .expect("the supervisor started the worker");
+    drop(ended.stdin.take());
+    ended.wait().expect("the worker ends");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while holds.has_session(session_id) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the registration ended once the worker had");
+}
