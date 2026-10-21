@@ -421,14 +421,17 @@ fn a_directory_whose_device_cannot_be_read_is_not_reported_as_another_object() {
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o400))
         .expect("takes the search right away");
     let enforced = std::fs::metadata(directory.join("README.md")).is_err();
+    if !enforced {
+        // Nothing stops the read, so the release below would remove the directory: leave before it.
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+            .expect("gives it back");
+        eprintln!("skipped: a mode stops nothing for this account");
+        return;
+    }
     let reread = materialise::reread(fixture.service(), made.materialisation_id);
     let released = materialise::release(fixture.service(), made.materialisation_id);
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
         .expect("gives it back");
-    if !enforced {
-        eprintln!("skipped: a mode stops nothing for this account");
-        return;
-    }
 
     let (_, state, _) = reread.expect("the materialisation reads");
     assert!(
