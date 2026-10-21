@@ -663,14 +663,12 @@ async fn kr_req_11_27_a_clients_own_answer_travels_the_transport_and_a_second_on
         PendingState::Resolved
     );
 
-    // A second answer to the same request is refused, and nothing more reaches the upstream. What
-    // the upstream was sent is read once the writers have finished, so a write still on its way
-    // would be in it.
-    assert!(
-        owner
-            .from_client(answer, TimestampMs::new(4))
-            .await
-            .is_err(),
+    // A second answer to the same request is not forwarded and does not end the connection:
+    // nothing more reaches the upstream. What the upstream was sent is read once the writers have
+    // finished, so a write still on its way would be in it.
+    assert_eq!(
+        late(owner.from_client(answer, TimestampMs::new(4)).await),
+        PendingState::Resolved,
         "one resource takes one answer"
     );
     let sent = everything_sent_upstream(owner, drained, upstream_reader).await;
@@ -1209,9 +1207,21 @@ fn refused_by_the_hosts_admission<T: std::fmt::Debug>(outcome: kr_worker::broker
     }
 }
 
+/// Asserts that the terminal's own answer came late: another answer had taken the request or it
+/// had ended, so the answer was not forwarded, the connection goes on, and the resource stands as
+/// the first answer left it. Returns where it stands.
+fn late(outcome: kr_worker::broker::Result<Carried>) -> PendingState {
+    match outcome {
+        Ok(Carried::ClientAnswerLate { state, .. }) => state,
+        other => {
+            panic!("a late answer is not forwarded and does not end the connection: {other:?}")
+        }
+    }
+}
+
 /// KR-REQ-11.33 and KR-REQ-11.27: while this host is performing a reverse request, the native
-/// client's answer and a rich answer to it are both refused, and the upstream receives exactly one
-/// answer.
+/// client's answer is not forwarded and a rich answer to it is refused, and the upstream receives
+/// exactly one answer.
 ///
 /// The host's admission is taken with the request's record, under one lock, so there is no moment
 /// at which another writer could take it first. Both contenders are qualified: the same caller and
@@ -1280,10 +1290,14 @@ async fn kr_req_11_33_native_and_rich_answers_lose_to_the_hosts_own_answer() {
     .await;
     arrived_at(arrived).await;
     assert!(!directory.join("held.txt").exists(), "nothing has run yet");
-    refused_by_the_hosts_admission(
-        owner
-            .from_client(br#"{"id":71,"result":{}}"#, TimestampMs::new(3))
-            .await,
+    assert_eq!(
+        late(
+            owner
+                .from_client(br#"{"id":71,"result":{}}"#, TimestampMs::new(3))
+                .await
+        ),
+        PendingState::Claimed,
+        "the host's own answer holds the admission, and the terminal's is not forwarded"
     );
     refused_by_the_hosts_admission(broker.interpret(
         binding(),
@@ -1341,7 +1355,7 @@ async fn kr_req_11_33_native_and_rich_answers_lose_to_the_hosts_own_answer() {
                         {
                             tokio::task::yield_now().await;
                         }
-                        outcome => return outcome.map(|_| ()),
+                        outcome => return outcome,
                     }
                 }
             })
@@ -1398,7 +1412,11 @@ async fn kr_req_11_33_native_and_rich_answers_lose_to_the_hosts_own_answer() {
         let Carried::Reverse { resource_id, .. } = carried else {
             panic!("a reverse request is what this was");
         };
-        refused_by_the_hosts_admission(native_side.await.expect("joined"));
+        let native_state = late(native_side.await.expect("joined"));
+        assert!(
+            matches!(native_state, PendingState::Claimed | PendingState::Resolved),
+            "the host's admission leaves the resource claimed or resolved, not {native_state:?}"
+        );
         let (interpreted, answered) = rich_side.await.expect("joined");
         refused_by_the_hosts_admission(interpreted);
         refused_by_the_hosts_admission(answered);
@@ -8144,15 +8162,17 @@ async fn kr_req_11_35_a_journal_fault_under_live_traffic_keeps_native_progress_a
 
     // What was answered before the fault, or through it, is not answered again by anyone.
     for answered in [3, 1] {
-        assert!(
+        let state = late(
             owner
                 .from_client(
                     format!(r#"{{"id":{answered},"result":{{"behavior":"allow"}}}}"#).as_bytes(),
                     TimestampMs::new(7),
                 )
-                .await
-                .is_err(),
-            "{answered} is answered once"
+                .await,
+        );
+        assert!(
+            matches!(state, PendingState::Resolved | PendingState::Uncertain),
+            "{answered} is answered once, and stands as that answer left it: {state:?}"
         );
     }
 
@@ -8255,14 +8275,16 @@ async fn kr_req_11_35_a_ledger_refusing_a_marker_under_live_traffic_raises_the_o
         settled_within(&broker, eleven, LIVENESS_DEADLINE).await,
         Some(PendingState::Resolved)
     );
-    assert!(
-        owner
-            .from_client(
-                br#"{"id":11,"result":{"behavior":"deny"}}"#,
-                TimestampMs::new(4),
-            )
-            .await
-            .is_err(),
+    assert_eq!(
+        late(
+            owner
+                .from_client(
+                    br#"{"id":11,"result":{"behavior":"deny"}}"#,
+                    TimestampMs::new(4),
+                )
+                .await
+        ),
+        PendingState::Resolved,
         "and it is answered once"
     );
 
