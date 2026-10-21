@@ -862,8 +862,8 @@ jobs:
       # The engine's causal chain on this platform, through nodes that create sessions: the root,
       # depth and parent a descendant keeps from the node that produced its trigger, and no
       # workflow retriggering on its own descendants unless its definition says so. Only these two
-      # cases of the suite run here: the others install a node that runs a command, which the
-      # validation of a definition refuses on this platform, so they run on the others.
+      # cases of the suite run here, the two that show those clauses: most of the others install a
+      # node that runs a command, which the validation of a definition refuses on this platform.
       - name: Test that a descendant keeps its causal root, depth and parent
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-automation --test causal_budget a_descendant_takes_its_ancestry_from_the_node_that_produced_its_trigger
