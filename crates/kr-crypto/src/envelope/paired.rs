@@ -8,10 +8,9 @@
 //! against.
 //!
 //! [`super::open_envelope`] stays public beneath it, for a caller that already knows which key it
-//! means: the vector generator opens a published envelope, and a host that has selected a sender
-//! some other way opens with it directly. That caller takes on the two duties this entry point
-//! discharges, selecting the sender from what it has paired with and recording the replay
-//! identifier.
+//! means, as the suites that seal an envelope and open it again do. That caller takes on the two
+//! duties this entry point discharges, selecting the sender from what it has paired with and
+//! recording the replay identifier.
 //!
 //! The order is the contract:
 //!
@@ -97,29 +96,23 @@ impl PairedSenders {
 /// only one that takes a [`ReplayLedger`]: an item that is accepted is recorded, because a caller
 /// that could open without recording could be given the same item twice.
 ///
-/// `verify_payload` carries the issuer's own verification for an authority-bearing payload, exactly
-/// as [`super::open_envelope`] requires. [`super::verify_authority_payload`] is what a host passes.
-/// It verifies and applies nothing: a refused item can be delivered again, so anything the callback
-/// did would be done again with it.
+/// A payload that bears authority is refused, as [`super::open_envelope`] refuses it, and its
+/// identifier is not recorded: nothing in a mailbox is authority.
 ///
 /// # Errors
 ///
 /// Returns [`CryptoError::BindingMismatch`] when the item's shape is not one this contract admits,
 /// when its routing record names a sender this device has not paired with, when a field inside the
 /// envelope does not match the one outside it, when the expiry has passed or when the replay
-/// identifier has been seen; [`CryptoError::Authentication`] when the box or the payload's own
-/// signature does not verify.
-pub fn open_delivered_envelope<F>(
+/// identifier has been seen; [`CryptoError::Authentication`] when the box does not verify; and
+/// [`CryptoError::AuthorityNotAccepted`] when the payload bears authority.
+pub fn open_delivered_envelope(
     recipient: &StoredEnvelopeKeyPair,
     senders: &PairedSenders,
     ledger: &mut ReplayLedger,
     sealed_envelope: &SealedEnvelope,
     now_ms: u64,
-    verify_payload: F,
-) -> Result<EnvelopePlaintext>
-where
-    F: FnOnce(&EnvelopePlaintext) -> Result<()>,
-{
+) -> Result<EnvelopePlaintext> {
     // Everything a reader can settle without a key, first. The declared bucket, the ciphertext's
     // length, the lifetime and the coalescing rule are the service's own admission rules, and a
     // recipient that did not apply them would accept an item the service should never have stored.
@@ -130,10 +123,10 @@ where
         })?;
 
     // A redelivery of something already accepted is refused here, on the identifier the record
-    // claims, so a service that offers one back does not cost a decryption and a signature check
-    // every time. The claim is untrusted and this is only an early exit: what settles acceptance
-    // is the admission at the end, on the identifier the box authenticated. A record that claimed
-    // a spent identifier falsely is refused, which is a service suppressing its own item.
+    // claims, so a service that offers one back does not cost a decryption every time. The claim
+    // is untrusted and this is only an early exit: what settles acceptance is the admission at the
+    // end, on the identifier the box authenticated. A record that claimed a spent identifier
+    // falsely is refused, which is a service suppressing its own item.
     if ledger.contains(sealed_envelope.routing.envelope_id) {
         return Err(CryptoError::BindingMismatch {
             what: "a replayed envelope identifier",
@@ -150,11 +143,10 @@ where
                 what: "the sender of a delivered envelope, which this device has not paired with",
             })?;
 
-    let plaintext = open_envelope(recipient, sender, sealed_envelope, now_ms, verify_payload)?;
+    let plaintext = open_envelope(recipient, sender, sealed_envelope, now_ms)?;
 
-    // Last, because an envelope refused for a reason that may pass, such as an issuer key this
-    // host has not learnt yet, must still be openable when it does. An envelope that was accepted
-    // is one that will never be accepted again.
+    // Last, so that only an envelope that was accepted is recorded: it will never be accepted
+    // again.
     ledger.admit(&plaintext, now_ms)?;
     Ok(plaintext)
 }

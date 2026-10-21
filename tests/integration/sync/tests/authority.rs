@@ -1081,8 +1081,7 @@ async fn kr_req_10_46_an_announcement_is_only_an_announcement() {
             &senders,
             &mut ReplayLedger::new(),
             &waiting.items[0].envelope,
-            now_ms(),
-            |_| Ok(()),
+            now_ms()
         )
         .expect("the announcement opens for the device it was sealed to");
         assert_eq!(opened.payload_type, MailboxPayloadType::AuthorityFeedChange);

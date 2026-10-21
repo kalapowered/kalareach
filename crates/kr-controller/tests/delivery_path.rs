@@ -5178,7 +5178,6 @@ async fn a_detail_that_does_not_fit_is_in_the_devices_mailbox_before_the_push_th
         &environment.host_mailbox_key(),
         &held[0],
         now(),
-        |_| Ok(()),
     )
     .expect("the device opens the object with its own key");
     let detail: kr_delivery::preview::PreviewBody =

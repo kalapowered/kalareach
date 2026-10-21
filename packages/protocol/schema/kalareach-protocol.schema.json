@@ -17167,7 +17167,7 @@
       "type": "object"
     },
     "ForwardedAuthority": {
-      "description": "What the payload of a `signed_authority_object` envelope decodes as.\n\nSection 20 signs an authorisation-bearing payload **before** encryption, so pairwise message\nauthentication can never substitute for an issuer's grant signature. The set is closed, and it\nis closed on one property: every member carries its issuer's key identifier and a signature\nover a domain-separated transcript of its own fields. A payload outside it carries no authority\na reader could check, so the mailbox does not forward it as authority.\n\nNothing here is authority by arriving. [`Self::issuer_key_id`] names the key the signature must\nverify under, and a reader resolves that name through the authority it already holds: section\n19 makes content data, and the envelope supplies no key of its own.",
+      "description": "What the payload of a `signed_authority_object` envelope decodes as.\n\nSection 20 signs an authorisation-bearing payload **before** encryption, so pairwise message\nauthentication can never substitute for an issuer's grant signature. The set is closed, and it\nis closed on one property: every member carries its issuer's key identifier and a signature\nover a domain-separated transcript of its own fields.\n\nNothing here is authority by arriving. A reader of a mailbox refuses an item of this kind, and\nthe objects take effect only through the authority feed and the host's own records.",
       "oneOf": [
         {
           "additionalProperties": false,
@@ -21320,7 +21320,7 @@
         },
         {
           "const": "signed_authority_object",
-          "description": "A signed authority object forwarded to a device: a grant, a revocation request or a host\nauthority revision record.\n\nThe payload is the signed object's canonical bytes. The issuer's signature is what\nauthorises it; the envelope only delivers it.",
+          "description": "A signed authority object: a revocation request or a host authority revision record.\n\nThe payload is the signed object's canonical bytes. No reader of a mailbox takes authority\nfrom one: a host and a device take theirs from their own records and the authority feed, so\nan item of this kind is refused whoever sealed it.",
           "type": "string"
         },
         {

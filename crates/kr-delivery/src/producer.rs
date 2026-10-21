@@ -2695,7 +2695,6 @@ mod tests {
             &host_mailbox_public,
             &sealed,
             1_500,
-            |_| Ok(()),
         )
         .expect("the encrypted object opens");
         let detail: PreviewBody =

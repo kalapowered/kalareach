@@ -8902,14 +8902,9 @@ fn a_detail_that_does_not_fit_is_in_the_devices_mailbox_before_the_push_that_ref
     let held = service.held();
     assert_eq!(held.len(), 1);
     assert_eq!(held[0].routing.envelope_id, object);
-    let opened = kr_crypto::envelope::open_envelope(
-        &service.device,
-        &host_public,
-        &held[0],
-        now + 1,
-        |_| Ok(()),
-    )
-    .expect("the device opens the object");
+    let opened =
+        kr_crypto::envelope::open_envelope(&service.device, &host_public, &held[0], now + 1)
+            .expect("the device opens the object");
     let body: kr_delivery::preview::PreviewBody =
         kr_cbor::from_canonical_slice(opened.payload.as_slice(), &kr_cbor::Limits::DEFAULT)
             .expect("the whole body");

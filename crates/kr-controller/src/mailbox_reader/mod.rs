@@ -489,14 +489,6 @@ async fn pass(
                 &mut ledger,
                 &item.envelope,
                 controller.wall_now_ms(),
-                // Authority comes to this host from its feed and its own records. An item that
-                // claims some in its payload is refused whoever sealed it.
-                |_| {
-                    Err(kr_crypto::CryptoError::BindingMismatch {
-                        what: "a payload that bears authority, which this host does not take from \
-                               its mailbox",
-                    })
-                },
             );
             match opened {
                 Ok(plaintext) => {

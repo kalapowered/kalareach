@@ -8,9 +8,13 @@
 //! 2. the key identifiers inside the authenticated plaintext name those two keys;
 //! 3. the untrusted routing record matches the authenticated fields.
 //!
-//! A payload that carries authority of its own is signed before encryption, and
-//! [`open_envelope`] refuses to return one whose signature the caller has not verified: the
-//! signature check is a required argument rather than a later step a caller can forget.
+//! A payload that bears authority is never returned. Section 20 has such a payload signed before
+//! encryption, so that pairwise message authentication cannot stand in for an issuer's signature,
+//! and no reader of a mailbox in this product takes authority from one: a host and a device take
+//! theirs from their own records and the authority feed. [`open_envelope`] therefore refuses it
+//! with [`CryptoError::AuthorityNotAccepted`] once the box, the bindings and the expiry have
+//! passed, so an unsigned object inside an otherwise valid envelope is refused by the same path
+//! as a signed one.
 //!
 //! # Padding
 //!
@@ -23,7 +27,6 @@
 //!
 //! This reduces precision. It does not hide traffic patterns, and section 20 says so.
 
-mod authority;
 mod collection;
 mod paired;
 mod sync;
@@ -44,7 +47,6 @@ use crate::keys::{StoredEnvelopeKeyPair, key_id};
 use crate::sealed;
 use crate::sodium;
 
-pub use authority::{AuthorityDirectory, verify_authority_payload};
 pub use collection::{
     CollectionMembers, CollectionRecipient, CollectionRecordDraft, check_genesis, check_successor,
     issue_collection_key_record, open_collection_key, verify_collection_key_record,
@@ -225,26 +227,21 @@ pub fn unpad_notification_preview(padded: &[u8]) -> Result<&[u8]> {
 
 /// Opens one envelope against a previously paired sender key.
 ///
-/// `verify_payload` is called for any payload type that carries authority. It returns the issuer's
-/// own verification result, so an authorisation-bearing payload can never be accepted on the
-/// strength of the pairwise box alone.
+/// A payload that bears authority is refused after everything else has been checked: the pairwise
+/// box proves that a paired device sealed the item and proves nothing about authority.
 ///
 /// # Errors
 ///
-/// Returns [`CryptoError::Authentication`] when the box does not authenticate, when the padding is
-/// malformed or when `verify_payload` rejects the payload, and [`CryptoError::BindingMismatch`]
-/// when a key identifier, a routing field, the declared bucket or the expiry does not match the
-/// authenticated plaintext.
-pub fn open_envelope<F>(
+/// Returns [`CryptoError::Authentication`] when the box does not authenticate or the padding is
+/// malformed, [`CryptoError::BindingMismatch`] when a key identifier, a routing field, the declared
+/// bucket or the expiry does not match the authenticated plaintext, and
+/// [`CryptoError::AuthorityNotAccepted`] when the payload bears authority.
+pub fn open_envelope(
     recipient: &StoredEnvelopeKeyPair,
     sender: &StoredEnvelopeKey,
     sealed_envelope: &SealedEnvelope,
     now_ms: u64,
-    verify_payload: F,
-) -> Result<EnvelopePlaintext>
-where
-    F: FnOnce(&EnvelopePlaintext) -> Result<()>,
-{
+) -> Result<EnvelopePlaintext> {
     let opened = sealed::open_stored_envelope(
         recipient,
         sender,
@@ -297,7 +294,7 @@ where
         });
     }
     if plaintext.payload_type.bears_authority() {
-        verify_payload(&plaintext)?;
+        return Err(CryptoError::AuthorityNotAccepted);
     }
     Ok(plaintext)
 }
@@ -348,9 +345,9 @@ impl ReplayLedger {
 
     /// Returns the retained identifiers and the instant each may be forgotten.
     ///
-    /// The durable store belongs to the controller, which owns the host's databases. This ledger
-    /// is the rule; the controller persists what it returns and restores it at startup, so a
-    /// restart does not reopen the replay window.
+    /// The durable store belongs to the reader that owns the ledger, which writes each accepted
+    /// identifier down and restores the ledger from what it wrote, so a restart does not reopen
+    /// the replay window. This ledger is the rule.
     pub fn entries(&self) -> impl Iterator<Item = (EnvelopeId, u64)> + '_ {
         self.retained.iter().map(|(id, until)| (*id, *until))
     }
@@ -434,10 +431,8 @@ mod tests {
             1024 + crate::sealed::MAC_LEN as u64
         );
 
-        let opened = open_envelope(&recipient, sender.public(), &sealed_envelope, 2_000, |_| {
-            unreachable!("a sync change carries no authority")
-        })
-        .expect("the plaintext");
+        let opened = open_envelope(&recipient, sender.public(), &sealed_envelope, 2_000)
+            .expect("the plaintext");
         assert_eq!(opened, plaintext);
     }
 
@@ -467,13 +462,7 @@ mod tests {
             seal_envelope(&sender, recipient.public(), &plaintext).expect("a sealed envelope");
         sealed_envelope.routing.size_bucket_bytes = U64::new(2048);
         assert!(matches!(
-            open_envelope(
-                &recipient,
-                sender.public(),
-                &sealed_envelope,
-                2_000,
-                |_| Ok(())
-            ),
+            open_envelope(&recipient, sender.public(), &sealed_envelope, 2_000),
             Err(CryptoError::BindingMismatch {
                 what: "the declared size bucket outside the envelope"
             })
@@ -489,13 +478,7 @@ mod tests {
             seal_envelope(&sender, recipient.public(), &plaintext).expect("a sealed envelope");
         sealed_envelope.routing.expires_at_ms = TimestampMs::new(999_999);
         assert!(matches!(
-            open_envelope(
-                &recipient,
-                sender.public(),
-                &sealed_envelope,
-                2_000,
-                |_| Ok(())
-            ),
+            open_envelope(&recipient, sender.public(), &sealed_envelope, 2_000),
             Err(CryptoError::BindingMismatch {
                 what: "the routing record outside the envelope"
             })
@@ -510,48 +493,11 @@ mod tests {
         let sealed_envelope =
             seal_envelope(&sender, recipient.public(), &plaintext).expect("a sealed envelope");
         assert!(matches!(
-            open_envelope(
-                &recipient,
-                sender.public(),
-                &sealed_envelope,
-                61_000,
-                |_| Ok(())
-            ),
+            open_envelope(&recipient, sender.public(), &sealed_envelope, 61_000),
             Err(CryptoError::BindingMismatch {
                 what: "the expiry of an envelope, which has passed"
             })
         ));
-    }
-
-    #[test]
-    fn an_authority_bearing_payload_must_pass_its_own_signature_check() {
-        let sender = StoredEnvelopeKeyPair::generate().expect("a keypair");
-        let recipient = StoredEnvelopeKeyPair::generate().expect("a keypair");
-        let plaintext = plaintext(
-            &sender,
-            &recipient,
-            MailboxPayloadType::SignedAuthorityObject,
-        );
-        let sealed_envelope =
-            seal_envelope(&sender, recipient.public(), &plaintext).expect("a sealed envelope");
-        assert!(matches!(
-            open_envelope(&recipient, sender.public(), &sealed_envelope, 2_000, |_| {
-                Err(CryptoError::Authentication {
-                    what: "the forwarded object's signature",
-                })
-            }),
-            Err(CryptoError::Authentication { .. })
-        ));
-        assert!(
-            open_envelope(
-                &recipient,
-                sender.public(),
-                &sealed_envelope,
-                2_000,
-                |_| Ok(())
-            )
-            .is_ok()
-        );
     }
 
     #[test]
@@ -574,16 +520,7 @@ mod tests {
         let plaintext = plaintext(&sender, &recipient, MailboxPayloadType::SyncChange);
         let sealed_envelope =
             seal_envelope(&sender, recipient.public(), &plaintext).expect("a sealed envelope");
-        assert!(
-            open_envelope(
-                &recipient,
-                impostor.public(),
-                &sealed_envelope,
-                2_000,
-                |_| Ok(())
-            )
-            .is_err()
-        );
+        assert!(open_envelope(&recipient, impostor.public(), &sealed_envelope, 2_000).is_err());
     }
 
     #[test]
@@ -672,7 +609,7 @@ mod tests {
             nonce,
             ciphertext: Bytes::new(ciphertext),
         };
-        let opened = open_envelope(&device, host.public(), &envelope, 1_500, |_| Ok(()))
+        let opened = open_envelope(&device, host.public(), &envelope, 1_500)
             .expect("libsodium unpads what this module padded");
         assert_eq!(opened.payload.as_slice(), b"a reference");
         assert_eq!(

@@ -392,8 +392,7 @@ async fn kr_req_20_04_an_envelope_is_delivered_read_opened_and_acknowledged() {
             &mailboxes.paired(),
             &mut ledger,
             &item.envelope,
-            now_ms(),
-            |_| Ok(()),
+            now_ms()
         )
         .expect("the item opens against the paired sender");
         assert_eq!(opened, plaintext);
@@ -459,8 +458,7 @@ async fn kr_req_20_04_a_routing_record_that_disagrees_with_the_box_is_refused() 
             &mailboxes.paired(),
             &mut ledger,
             &item.envelope,
-            now_ms(),
-            |_| Ok(()),
+            now_ms()
         )
         .expect_err("the record disagrees with the box");
         assert!(
@@ -509,8 +507,7 @@ async fn kr_req_20_05_an_unpaired_sender_is_refused_before_anything_is_decrypted
             &elsewhere,
             &mut ledger,
             &item.envelope,
-            now_ms(),
-            |_| Ok(()),
+            now_ms()
         )
         .expect_err("that sender is not one this device has paired with");
         assert!(
@@ -526,8 +523,7 @@ async fn kr_req_20_05_an_unpaired_sender_is_refused_before_anything_is_decrypted
                 &mailboxes.paired(),
                 &mut ledger,
                 &item.envelope,
-                now_ms(),
-                |_| Ok(()),
+                now_ms()
             )
             .is_ok(),
             "the same item opens once the sender is a paired one"
@@ -575,8 +571,7 @@ async fn kr_req_20_05_a_replayed_envelope_identifier_is_refused_by_the_reader() 
             &mailboxes.paired(),
             &mut ledger,
             &item.envelope,
-            now_ms(),
-            |_| Ok(()),
+            now_ms()
         )
         .expect("the item opens the first time");
         assert_eq!(opened.envelope_id, plaintext.envelope_id);
@@ -590,8 +585,7 @@ async fn kr_req_20_05_a_replayed_envelope_identifier_is_refused_by_the_reader() 
             &mailboxes.paired(),
             &mut ledger,
             &item.envelope,
-            now_ms(),
-            |_| Ok(()),
+            now_ms()
         )
         .expect_err("that identifier has been accepted already");
         assert!(

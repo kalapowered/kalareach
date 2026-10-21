@@ -15,14 +15,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use kr_cbor::CborError;
-
-use crate::ids::{
-    DeviceId, EnvelopeId, EnvironmentId, GrantId, MailboxThreadId, SessionEpoch, SessionId,
-};
+use crate::ids::{EnvelopeId, EnvironmentId, GrantId, MailboxThreadId, SessionEpoch, SessionId};
 use crate::pairing::{AuthorityRevisionRecord, RevocationRequest};
 use crate::scalars::{
-    Bytes, Digest256, KeyId, Nonce192, Nullable, Signature64, StoredEnvelopeKey, TimestampMs, U64,
+    Bytes, Digest256, KeyId, Nonce192, Nullable, StoredEnvelopeKey, TimestampMs, U64,
 };
 
 /// The envelope format this build writes and reads.
@@ -63,11 +59,11 @@ pub enum MailboxPayloadType {
     /// A reference and not the state: what it names is read under current authority from the host
     /// that holds it. It is the repeated kind, so it is the one coalescing is mostly about.
     StateReference,
-    /// A signed authority object forwarded to a device: a grant, a revocation request or a host
-    /// authority revision record.
+    /// A signed authority object: a revocation request or a host authority revision record.
     ///
-    /// The payload is the signed object's canonical bytes. The issuer's signature is what
-    /// authorises it; the envelope only delivers it.
+    /// The payload is the signed object's canonical bytes. No reader of a mailbox takes authority
+    /// from one: a host and a device take theirs from their own records and the authority feed, so
+    /// an item of this kind is refused whoever sealed it.
     SignedAuthorityObject,
     /// An encrypted notification preview.
     NotificationPreview,
@@ -99,12 +95,12 @@ impl MailboxPayloadType {
         }
     }
 
-    /// Returns true when a payload of this type carries authority of its own.
+    /// Returns true when a payload of this type bears authority.
     ///
     /// Section 20 requires an authorisation-bearing payload to be signed before encryption, so
-    /// pairwise message authentication never substitutes for an issuer's grant signature. A reader
-    /// that accepts such a payload without verifying the payload's own signature has accepted the
-    /// sender's word for authority the sender may not hold.
+    /// pairwise message authentication never substitutes for an issuer's grant signature. No
+    /// reader of a mailbox here accepts one, so a reader refuses an item of such a type after the
+    /// box, the bindings and the expiry have passed.
     #[must_use]
     pub const fn bears_authority(self) -> bool {
         match self {
@@ -123,12 +119,10 @@ impl MailboxPayloadType {
 /// Section 20 signs an authorisation-bearing payload **before** encryption, so pairwise message
 /// authentication can never substitute for an issuer's grant signature. The set is closed, and it
 /// is closed on one property: every member carries its issuer's key identifier and a signature
-/// over a domain-separated transcript of its own fields. A payload outside it carries no authority
-/// a reader could check, so the mailbox does not forward it as authority.
+/// over a domain-separated transcript of its own fields.
 ///
-/// Nothing here is authority by arriving. [`Self::issuer_key_id`] names the key the signature must
-/// verify under, and a reader resolves that name through the authority it already holds: section
-/// 19 makes content data, and the envelope supplies no key of its own.
+/// Nothing here is authority by arriving. A reader of a mailbox refuses an item of this kind, and
+/// the objects take effect only through the authority feed and the host's own records.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ForwardedAuthority {
@@ -136,106 +130,6 @@ pub enum ForwardedAuthority {
     RevocationRequest(RevocationRequest),
     /// One ordered authority revision a host issued.
     AuthorityRevision(AuthorityRevisionRecord),
-}
-
-/// Which kind of authority object a forwarded payload carries.
-///
-/// The two are issued by different devices in different roles: a paired owner publishes a
-/// revocation request, and only the target host issues an ordered authority revision. A reader
-/// resolves an issuer by device **and** by kind for that reason, so a key it records for one role
-/// cannot sign for the other.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ForwardedAuthorityKind {
-    /// A remote owner's signed revocation request.
-    RevocationRequest,
-    /// One ordered authority revision a host issued.
-    AuthorityRevision,
-}
-
-impl ForwardedAuthorityKind {
-    /// Every kind, in declaration order.
-    pub const ALL: [Self; 2] = [Self::RevocationRequest, Self::AuthorityRevision];
-
-    /// Returns the stable name this kind is reported under.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::RevocationRequest => "revocation_request",
-            Self::AuthorityRevision => "authority_revision",
-        }
-    }
-}
-
-impl core::fmt::Display for ForwardedAuthorityKind {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl ForwardedAuthority {
-    /// Returns which kind of authority object this is.
-    #[must_use]
-    pub const fn kind(&self) -> ForwardedAuthorityKind {
-        match self {
-            Self::RevocationRequest(_) => ForwardedAuthorityKind::RevocationRequest,
-            Self::AuthorityRevision(_) => ForwardedAuthorityKind::AuthorityRevision,
-        }
-    }
-
-    /// Returns the device the object says issued it.
-    ///
-    /// This is the name a reader resolves a key through. Naming a device does not establish that
-    /// it issued anything: the key the reader records for that device, in that role, is what the
-    /// signature has to verify under, and the identifier the object carries has to be that key's.
-    #[must_use]
-    pub const fn issuer_device_id(&self) -> DeviceId {
-        match self {
-            Self::RevocationRequest(request) => request.issuer_device_id,
-            Self::AuthorityRevision(record) => record.host_device_id,
-        }
-    }
-
-    /// Returns the key identifier of the issuer whose signature covers this object.
-    ///
-    /// It is a name, not a key. What it names is checked against the key the reader records for
-    /// [`Self::issuer_device_id`]; an object naming any other key is refused rather than trusted.
-    #[must_use]
-    pub const fn issuer_key_id(&self) -> KeyId {
-        match self {
-            Self::RevocationRequest(request) => request.issuer_key_id,
-            Self::AuthorityRevision(record) => record.host_key_id,
-        }
-    }
-
-    /// Returns the issuer's signature over [`Self::signing_input`].
-    #[must_use]
-    pub const fn signature(&self) -> Signature64 {
-        match self {
-            Self::RevocationRequest(request) => request.signature,
-            Self::AuthorityRevision(record) => record.signature,
-        }
-    }
-
-    /// Returns the domain the signature covers.
-    #[must_use]
-    pub const fn domain(&self) -> &'static str {
-        match self {
-            Self::RevocationRequest(_) => crate::pairing::REVOCATION_DOMAIN,
-            Self::AuthorityRevision(_) => crate::pairing::AUTHORITY_REVISION_DOMAIN,
-        }
-    }
-
-    /// Builds the canonical bytes this object's signature covers.
-    ///
-    /// # Errors
-    ///
-    /// Returns a CBOR error when the object cannot be represented in KR-CBOR-1.
-    pub fn signing_input(&self) -> Result<Vec<u8>, CborError> {
-        match self {
-            Self::RevocationRequest(request) => request.signing_input(),
-            Self::AuthorityRevision(record) => record.signing_input(),
-        }
-    }
 }
 
 /// The authenticated plaintext of one mailbox envelope.

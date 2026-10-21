@@ -276,7 +276,6 @@ fn the_envelope_vector_opens_and_its_declared_bucket_holds() {
         document["envelope"]["opened_at_ms"]
             .as_u64()
             .expect("an instant"),
-        |_| Ok(()),
     )
     .expect("the envelope opens");
 

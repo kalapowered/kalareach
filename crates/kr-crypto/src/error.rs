@@ -100,6 +100,14 @@ pub enum CryptoError {
         what: &'static str,
     },
 
+    /// An envelope carried a payload that bears authority, which no reader of a mailbox accepts.
+    ///
+    /// Authority reaches a host from its own records and its authority feed. A mailbox is a way
+    /// of telling a device that something is there to read, so what it carries is never taken as
+    /// a grant, a revocation or a revision, whoever sealed it.
+    #[error("an envelope carried a payload that bears authority, which a mailbox does not give")]
+    AuthorityNotAccepted,
+
     /// A value could not be represented in KR-CBOR-1.
     #[error(transparent)]
     Encoding(#[from] CborError),

@@ -276,10 +276,9 @@ device has no key for stops there, before anything is decrypted.
 The order is fixed. The keyless rules of the item's own shape run first, so a malformed item costs
 no key at all. An identifier the ledger already holds is refused next, on the record's own claim, so
 a redelivery costs no decryption; the claim is untrusted and that is only an early exit. Then the
-sender is selected, the box is opened and every binding is checked. The replay identifier is
-recorded **last**, after the payload's own verification has succeeded, because an item refused for a
-reason that may pass, such as an issuer key this host has not learnt yet, has to stay openable when
-it does. An item that was accepted is one that will never be accepted again.
+sender is selected, the box is opened, every binding is checked and a payload that bears authority
+is refused. The replay identifier is recorded **last**, so that only an item that was accepted is
+recorded, and an item that was accepted is one that will never be accepted again.
 
 `open_envelope` stays public beneath it, for a caller that already knows which key it means. That
 caller takes on the two duties the delivery path discharges: selecting the sender from what it has
@@ -347,32 +346,17 @@ A paired device is authenticated, not trusted. Section 19 makes content data rat
 and section 20 says what follows: an authorisation-bearing payload is signed by its issuer **before**
 encryption, so pairwise message authentication never substitutes for an issuer's grant signature.
 
-`open_envelope` will not return an authority-bearing payload unless the verification callback it is
-given returns `Ok`. The callback is a required argument rather than a later step a caller can
-forget, and a caller calls `verify_authority_payload` inside it. That function resolves the issuer
-through `AuthorityDirectory`, which the caller implements, and which answers two questions from the
-reader's own authority:
+No reader of a mailbox in this product takes authority from one. A host takes its authority from its
+own records and its authority feed, and a device from its paired hosts' records, so the mailbox is a
+way of telling a reader that something is there to read. `open_envelope` and
+`open_delivered_envelope` therefore refuse a payload that bears authority (`SignedAuthorityObject`)
+with `AuthorityNotAccepted`, after the box, the bindings and the expiry have passed: an object its
+issuer never signed, inside an envelope that is valid in every other way, is refused, and so is a
+signed one. The refusal does not record the replay identifier.
 
-| Question | What it establishes |
-| --- | --- |
-| Which authorisation key do you record for this device, as a producer of this kind of object? | The key is the reader's, not the envelope's. The role is part of the question because the two kinds have different issuers: any paired owner may publish a revocation request, and only the target host issues an ordered authority revision. |
-| Do you hold this grant under that device's authority? | A grant reference on an envelope names the authority the payload acts under. Naming a grant is not holding one. |
-
-The identifier the object carries must be that resolved key's own identifier, so an object signed by
-one recorded key cannot name another device or another role and be accepted. The signature is then
-verified over the object's own domain-separated transcript. The caller answers those two questions
-from its own records, a paired-device directory for the first and a grant directory for the second;
-the crate's tests answer them from a map; nothing answers them from an envelope.
-
-`ForwardedAuthority` is the closed set of objects this path carries: a signed revocation request and
-a host's ordered authority revision record. Those are the two objects the protocol gives a signature
-and an issuer key identifier. A grant is not among them, because `Grant` carries no signature and no
-signing transcript of its own: a grant reaches a device over its authenticated connection and
-through the authority feed, and forwarding one as a signed mailbox object would need a signed grant
-object the protocol does not define.
-
-Verification applies nothing. Whether a verified revocation or revision may be acted on is the
-reader's own decision, made against its current authority afterwards.
+`ForwardedAuthority` is the closed set of signed objects that kind names: a signed revocation
+request and a host's ordered authority revision record. Their signatures and the bytes they cover
+are published in `fixtures/crypto/envelopes.json`, and the TypeScript package reads the same bytes.
 
 ## Recovery
 
