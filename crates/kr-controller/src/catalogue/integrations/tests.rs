@@ -541,6 +541,45 @@ fn the_doctor_says_whether_an_integration_that_declares_a_backend_is_served_by_a
     assert_eq!(off.reason.0, None);
 }
 
+/// KR-REQ-11.35 and KR-REQ-07.45: the doctor says of an integration that declares a backend, and is
+/// on, that an invocation runs as typed when its connector declares no tested volatile forwarding
+/// mode, whether or not a signed record names the executable it finds.
+#[cfg(unix)]
+#[test]
+fn the_doctor_says_a_connector_without_a_tested_volatile_forwarding_mode_is_served_no_gateway() {
+    let store = Store::new("backend-untested");
+    let bin = store.0.join("bin");
+    let codex = executable(&bin, "codex");
+    let digest = crate::catalogue::native_bridge::read_executable(&codex).expect("a digest");
+    let reading = Integrations::new().read(&[store.admitted(
+        &fixture::Shape {
+            volatile_forwarding: false,
+            ..fixture::Shape::codex_backend()
+        },
+        |source| {
+            source.qualified = vec![kr_worker::broker::connectors::QualifiedExecutable {
+                digest,
+                version: fixture::GATEWAY_QUALIFIED_VERSION.to_owned(),
+            }];
+        },
+    )]);
+    let reported = report(Some(&reading), &[], &enabled(&["codex"]), &able(vec![bin]))
+        .reports
+        .remove(0);
+    assert_eq!(reported.state, CommandIntegrationState::On);
+    assert_eq!(
+        reported.mode,
+        IntegrationMode::NativeTerminal,
+        "a signed record for the executable does not make the gateway serve it"
+    );
+    let reason = reported.reason.0.as_deref().expect("a reason");
+    assert!(reason.contains("volatile forwarding"), "{reason}");
+    assert!(
+        reason.ends_with("so an invocation runs as typed"),
+        "{reason}"
+    );
+}
+
 /// KR-REQ-07.45: an integration that declares a backend is not reported as one a gateway serves
 /// when the executable the search path names was found and could not be read, since no digest
 /// can be shown to a signed record.
