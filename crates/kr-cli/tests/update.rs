@@ -6819,6 +6819,23 @@ async fn a_daemon_is_started_again_as_its_own_document_chose() {
 /// manager starts from this release is the daemon.
 #[cfg(target_os = "linux")]
 fn with_keys_in_files(release: Assembled) -> Assembled {
+    stating_with_keys_in_files(release, "")
+}
+
+/// [`with_keys_in_files`], and a daemon that states the later public major `LATER_MAJOR`, however
+/// the service manager starts it.
+#[cfg(target_os = "linux")]
+fn stating_the_later_major_with_keys_in_files(release: Assembled) -> Assembled {
+    stating_with_keys_in_files(
+        release,
+        &format!("/usr/bin/env {LATER_MAJOR_VARIABLE}={LATER_MAJOR} "),
+    )
+}
+
+/// A release whose daemon runs through `prefix`, a command that puts a variable in its
+/// environment, or through none.
+#[cfg(target_os = "linux")]
+fn stating_with_keys_in_files(release: Assembled, prefix: &str) -> Assembled {
     release
         .with_program(
             "kr-controller-real",
@@ -6826,10 +6843,13 @@ fn with_keys_in_files(release: Assembled) -> Assembled {
         )
         .with_program(
             "kr-controller",
-            b"#!/bin/sh\ncase \"$1\" in --version) echo kr-controller; exit 0;; esac\n\
-              real=\"$(dirname \"$0\")/kr-controller-real\"\n\
-              case \" $* \" in *\" --secret-store \"*) exec \"$real\" \"$@\";; esac\n\
-              exec \"$real\" --secret-store file \"$@\"\n",
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --version) echo kr-controller; exit 0;; esac\n\
+                 real=\"$(dirname \"$0\")/kr-controller-real\"\n\
+                 case \" $* \" in *\" --secret-store \"*) exec {prefix}\"$real\" \"$@\";; esac\n\
+                 exec {prefix}\"$real\" --secret-store file \"$@\"\n"
+            )
+            .as_bytes(),
         )
 }
 
@@ -6962,6 +6982,61 @@ async fn a_daemon_the_service_manager_started_is_started_again_by_it() {
         host.daemon_build().await,
         format!("kr-controller/{}", one.name())
     );
+    assert_eq!(
+        served_by(&host),
+        main_process_of(&manager, &unit),
+        "the manager started it"
+    );
+
+    // KR-REQ-26.07: across a public major the same holds. The manager starts the daemon of a release
+    // that states major 2 and lists only that major, which the updater of release one reaches by the
+    // majors the release's manifest lists, and it starts release one's again in the rollback that
+    // release two's `kr` makes.
+    let three = stating_the_later_major_with_keys_in_files(Assembled::at_this_level(
+        "0.3.0+cccccccccccc",
+        3,
+    ))
+    .listing_public_majors(&[LATER_MAJOR]);
+    let archive_three = host.scratch("archives").join("three.tar.gz");
+    three.archive(&archive_three);
+    let (output, said) = host.kr_json_with(
+        &manager_of_kr,
+        &[
+            "host",
+            "update",
+            "--archive",
+            &archive_three.display().to_string(),
+            "--json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "kr host update across a public major: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", three.name())
+    );
+    assert_eq!(host.daemon_states().await, LATER_MAJOR);
+    assert_eq!(
+        served_by(&host),
+        main_process_of(&manager, &unit),
+        "the manager started it"
+    );
+    let mut across = manager_of_kr.to_vec();
+    across.push((LATER_MAJOR_VARIABLE, std::ffi::OsStr::new("2")));
+    let (output, said) = host.kr_json_with(&across, &["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback across a public major: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name())
+    );
+    assert_eq!(host.daemon_states().await, 1);
     assert_eq!(
         served_by(&host),
         main_process_of(&manager, &unit),
