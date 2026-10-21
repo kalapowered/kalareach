@@ -65,7 +65,7 @@ pub struct Pty {
     slave: Option<std::os::fd::OwnedFd>,
     /// The end the root shell is given, until it is.
     #[cfg(windows)]
-    slave: Option<Box<dyn portable_pty::SlavePty + Send>>,
+    slave: Option<crate::windows::conpty::Slave>,
     /// The event a started read of this terminal's output is signalled on.
     ///
     /// Windows has no readiness to ask a pipe about: what says there is output is the read the
@@ -145,7 +145,7 @@ impl Pty {
         let console_input = master.input();
         Ok(Self {
             master: Box::new(master),
-            slave: Some(Box::new(slave)),
+            slave: Some(slave),
             output_event,
             console_input,
             dimensions,
@@ -163,9 +163,13 @@ impl Pty {
     /// On Unix everything the start reads from the file system is read before `admit` is asked,
     /// and nothing is read between its answer and the process: it is the last look at whether the
     /// start may go ahead, such as a look at the clock for a start that is held to a moment. On
-    /// Windows the terminal library still looks at the directory and for the program as it starts
-    /// the process. `admit` is given whether the directory the command names was there. A start it
-    /// refuses leaves the terminal unused, and the shell can be started in it later.
+    /// Windows the system looks at the directory and for the program as it creates the process,
+    /// and a read that waits there can carry the start past its moment, so `admit` is asked a
+    /// second time once the process exists and before it runs: a refusal then ends the process
+    /// without it having run, and the start fails with it. `admit` is given whether the directory
+    /// the command named was there, both times. A start it refuses before a process exists leaves
+    /// the terminal unused, and the shell can be started in it later; one it refuses afterwards
+    /// has handed the terminal to the process it ended.
     ///
     /// The environment is replaced outright rather than inherited: the worker's own environment is
     /// not the session's, and section 7 decides what the session gets.
@@ -177,7 +181,7 @@ impl Pty {
     pub fn launch(
         &mut self,
         command: &ShellCommand,
-        admit: impl FnOnce(bool) -> Result<()>,
+        mut admit: impl FnMut(bool) -> Result<()>,
     ) -> Result<RootShell> {
         let running = || WorkerError::pty("start the root shell", "a shell is already running");
         if self.slave.is_none() {
@@ -208,8 +212,13 @@ impl Pty {
             }
             builder.cwd(&command.cwd);
             slave
-                .spawn_command(builder)
-                .map_err(|error| WorkerError::pty("start the root shell", error))?
+                .start(&builder, || admit(named_is_there))
+                .map_err(|failure| match failure {
+                    crate::windows::conpty::StartFailure::Os(error) => {
+                        WorkerError::pty("start the root shell", error)
+                    }
+                    crate::windows::conpty::StartFailure::Refused(refusal) => refusal,
+                })?
         };
         // The slave descriptor is dropped here. Holding it open would keep the terminal alive
         // after the shell exits, so the read loop would never see end of file and the session

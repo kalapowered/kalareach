@@ -21,7 +21,7 @@ use std::io::{Read, Write};
 use std::os::windows::io::OwnedHandle;
 use std::sync::{Arc, Mutex};
 
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, SlavePty};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 
 /// The identifier of the process this thread last created in a console, for this host's own tests:
 /// a start can be refused at the moment its process exists, and that is how a case knows it does.
@@ -234,12 +234,41 @@ pub struct Slave {
     job: Arc<super::job::SessionJob>,
 }
 
-impl SlavePty for Slave {
-    fn spawn_command(
+/// Why a start did not go.
+#[derive(Debug)]
+pub enum StartFailure<E> {
+    /// The operating system could not make the process, put it where it belongs, run it, or end a
+    /// process that was made and then refused.
+    Os(std::io::Error),
+    /// The process was made and ended without having run, because the start was refused once it
+    /// existed.
+    Refused(E),
+}
+
+impl<E> From<std::io::Error> for StartFailure<E> {
+    fn from(failure: std::io::Error) -> Self {
+        Self::Os(failure)
+    }
+}
+
+impl Slave {
+    /// Starts the root shell inside the console, unless `before_it_runs` refuses.
+    ///
+    /// The system reads the directory the shell is to start in, and looks for its program, as it
+    /// creates the process, so what was looked at before the call is not what the system finds.
+    /// `before_it_runs` is asked once the process exists, inside the job and not yet running, and a
+    /// refusal ends the process without it having run an instruction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StartFailure::Refused`] with what `before_it_runs` refused with, and
+    /// [`StartFailure::Os`] when the process cannot be made, put in the job, resumed, or ended.
+    pub fn start<E: std::fmt::Display>(
         &self,
-        command: CommandBuilder,
-    ) -> Result<Box<dyn Child + Send + Sync>, anyhow::Error> {
-        let spawned = handle::spawn(&self.console, &self.job, &command)?;
+        command: &CommandBuilder,
+        before_it_runs: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Box<dyn Child + Send + Sync>, StartFailure<E>> {
+        let spawned = handle::spawn(&self.console, &self.job, command, before_it_runs)?;
         // The boundary is established from the root shell's identity, after this call and away
         // from the terminal that made it, so the job is recorded where that lookup can find it.
         super::job::record(spawned.identifier(), &self.job);
@@ -771,11 +800,58 @@ mod handle {
     /// not would make every ownership claim about the session wrong. A failure at either step ends
     /// the process rather than leaving one running that this host cannot account for, and a
     /// failure to end it is reported rather than swallowed.
-    pub(super) fn spawn(
+    ///
+    /// The create is where the system reads the directory the shell starts in and looks for its
+    /// program, so it is also where a start can be carried past its moment by a read that waits.
+    /// `before_it_runs` is asked after the process exists and before it runs, and a refusal ends
+    /// the process unstarted: the start fails at its moment, with the refusal, and nothing the
+    /// shell would have done is done. Where ending the process fails too, that failure is the one
+    /// reported, since a process may then be left.
+    pub(super) fn spawn<E: std::fmt::Display>(
         console: &PseudoConsole,
         job: &super::super::job::SessionJob,
         command: &CommandBuilder,
-    ) -> std::io::Result<Spawned> {
+        before_it_runs: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Spawned, super::StartFailure<E>> {
+        let created = create_in_job(console, job, command)?;
+        // The system has read the directory and looked for the program by now, and nothing of the
+        // shell has run: a start whose moment has passed is ended here, and says why.
+        if let Err(refusal) = before_it_runs() {
+            terminate_unstarted(&created.process, &refusal.to_string())?;
+            return Err(super::StartFailure::Refused(refusal));
+        }
+        // SAFETY: the thread is the one the creation made, suspended, and this handle is the only
+        // one for it. Resuming it is what starts the process running.
+        let resumed = unsafe { ResumeThread(created.thread.as_raw_handle().cast()) };
+        if resumed == u32::MAX {
+            let failure = std::io::Error::last_os_error();
+            terminate_unstarted(
+                &created.process,
+                &format!("its thread would not resume: {failure}"),
+            )?;
+            return Err(failure.into());
+        }
+        drop(created.thread);
+        Ok(Spawned {
+            process: Arc::new(created.process),
+            identifier: created.identifier,
+        })
+    }
+
+    /// A process made suspended inside the session's job, and not yet running.
+    struct Created {
+        process: OwnedHandle,
+        thread: OwnedHandle,
+        identifier: u32,
+    }
+
+    /// Makes the process suspended, inside the job and attached to the console, and asks the kernel
+    /// whether the job holds it. Nothing of it has run when this returns.
+    fn create_in_job(
+        console: &PseudoConsole,
+        job: &super::super::job::SessionJob,
+        command: &CommandBuilder,
+    ) -> std::io::Result<Created> {
         let mut line = command_line(command);
         let environment = environment(command);
         let directory: Option<Vec<u16>> = command.get_cwd().map(|cwd| {
@@ -911,17 +987,9 @@ mod handle {
                 return Err(failure);
             }
         }
-        // SAFETY: the thread is the one the call above created, suspended, and this handle is the
-        // only one for it. Resuming it is what starts the process running.
-        let resumed = unsafe { ResumeThread(thread.as_raw_handle().cast()) };
-        if resumed == u32::MAX {
-            let failure = std::io::Error::last_os_error();
-            terminate_unstarted(&process, &format!("its thread would not resume: {failure}"))?;
-            return Err(failure);
-        }
-        drop(thread);
-        Ok(Spawned {
-            process: Arc::new(process),
+        Ok(Created {
+            process,
+            thread,
             identifier: started.dwProcessId,
         })
     }
