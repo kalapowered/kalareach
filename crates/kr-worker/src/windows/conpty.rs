@@ -23,11 +23,13 @@ use std::sync::{Arc, Mutex};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 
-// The identifier of the process this thread last created in a console, for this host's own tests:
-// a start can be refused at the moment its process exists, and that is how a case knows it does.
+// The identifier of the process this thread last created in a console, and a handle to it, for
+// this host's own tests: a start can be refused at the moment its process exists, and that is how a
+// case knows it does, and waits for the process to end.
 #[cfg(test)]
 thread_local! {
-    pub(crate) static CREATED: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    pub(crate) static CREATED: std::cell::RefCell<Option<(u32, OwnedHandle)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// How much each pipe buffers before a write has to wait for the other end.
@@ -965,7 +967,12 @@ mod handle {
         // SAFETY: as above.
         let thread = unsafe { OwnedHandle::from_raw_handle(started.hThread.cast()) };
         #[cfg(test)]
-        super::CREATED.with(|created| created.set(Some(started.dwProcessId)));
+        super::CREATED.with(|created| {
+            *created.borrow_mut() = process
+                .try_clone()
+                .ok()
+                .map(|handle| (started.dwProcessId, handle));
+        });
 
         // Suspended, so nothing has run yet, and already inside the job because the create put it
         // there. The kernel is asked whether it really holds it, rather than the creation being

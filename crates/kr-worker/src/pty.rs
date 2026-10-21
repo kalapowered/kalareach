@@ -854,7 +854,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_start_whose_moment_passes_as_the_process_is_created_runs_nothing() {
-        use crate::windows::conpty::CREATED;
+        use crate::windows::conpty::{CREATED, OutputWaiter};
 
         let host = kr_ipc::testing::TempHost::create();
         let work = host.root().join("work");
@@ -862,15 +862,18 @@ mod tests {
         let mut command = crate::testing::posix_script(": > ran-here");
         command.cwd = work.display().to_string();
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
-        CREATED.with(|created| created.set(None));
-        let created = std::cell::RefCell::new(None);
-        let refused = pty.launch(&command, |_| match CREATED.with(std::cell::Cell::get) {
-            None => Ok(()),
-            Some(process) => {
-                *created.borrow_mut() = kr_ipc::identity::process_start_identity(process).ok();
-                Err(WorkerError::PermissionDenied {
-                    detail: "the moment has passed".to_owned(),
-                })
+        CREATED.with(|created| created.borrow_mut().take());
+        // Whether the process was there, to be described by the kernel, when the start was refused.
+        let existed = std::cell::Cell::new(false);
+        let refused = pty.launch(&command, |_| {
+            match CREATED.with(|created| created.borrow().as_ref().map(|(process, _)| *process)) {
+                None => Ok(()),
+                Some(process) => {
+                    existed.set(kr_ipc::identity::process_start_identity(process).is_ok());
+                    Err(WorkerError::PermissionDenied {
+                        detail: "the moment has passed".to_owned(),
+                    })
+                }
             }
         });
         let outcome = match &refused {
@@ -881,18 +884,21 @@ mod tests {
             matches!(refused, Err(WorkerError::PermissionDenied { .. })),
             "the start is refused with the admission's refusal: {outcome}"
         );
-        let process = created
-            .into_inner()
-            .expect("the process existed when the start was refused");
-        // The process goes: ended by the refused start, which waits for no run of its own.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while kr_ipc::identity::process_state(&process) != kr_ipc::identity::ProcessState::Ended {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the process a refused start created is still there"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        assert!(
+            existed.get(),
+            "the process existed when the start was refused"
+        );
+        // The process goes: ended by the refused start. A process handle is signalled when the
+        // process ends, so this waits on that and not on a clock; the minute only ends a case
+        // whose process is still there.
+        let (_, process) = CREATED
+            .with(|created| created.borrow_mut().take())
+            .expect("the start created a process");
+        assert_eq!(
+            OutputWaiter::over(process).wait(std::time::Duration::from_secs(60)),
+            Room::Ready,
+            "the process a refused start created is still there"
+        );
         assert!(
             !work.join("ran-here").exists(),
             "the shell ran, though its start was refused"
