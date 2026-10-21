@@ -2094,3 +2094,87 @@ async fn kr_req_11_35_a_committed_marker_followed_by_a_failed_transmission_leave
         PendingState::Uncertain
     );
 }
+
+/// KR-REQ-12.06: a prompt, a steer or a declared cancellation admitted before the terminal asked
+/// to change its conversation is stopped when its permit is taken: nothing is written, the refusal
+/// is proven, and the token a cancellation spent goes with it.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_06_a_mutation_and_an_action_admitted_before_a_selection_are_stopped_at_their_take()
+ {
+    let mut world = World::new(1 << 20);
+    let binding = binding_id();
+    let declaration = cancel_declaration();
+    world
+        .broker
+        .register_actions(binding, [&declaration])
+        .expect("the action is registered");
+    world.terminal_selects("thread-1").await;
+    world
+        .server_says(&turn_event("turn/started", "thread-1", "turn-7"))
+        .await;
+    let caller = World::owner_caller();
+
+    // A steer admitted, then the terminal asks to change its conversation: the take refuses it.
+    let steer = kr_protocol::agent::AgentSteerParams {
+        target: world.target(),
+        turn_id: World::turn_id("turn-7"),
+        text: kr_protocol::agent::PromptText::new("steer").expect("a steer"),
+    };
+    let admitted = world
+        .broker
+        .admit_steer(&caller, &steer, NOW)
+        .expect("the steer is admitted");
+    let _selecting = world.terminal_asks(RESUME).await;
+    assert_eq!(
+        world.server_reads().await["method"],
+        "thread/resume",
+        "the terminal's own request reached the server"
+    );
+    let Err(stopped) = world.broker.take_mutation(&admitted) else {
+        panic!("a permit admitted before a selection is stopped");
+    };
+    assert!(stopped.proven_unsent(), "{stopped:?}");
+    world.nothing_written().await;
+}
+
+/// KR-REQ-12.06 and KR-REQ-11.28: the same for the declared cancellation, whose token is retired
+/// when the take refuses it.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_28_a_declared_cancellation_admitted_before_a_leave_is_stopped_at_its_take() {
+    let mut world = World::new(1 << 20);
+    let binding = binding_id();
+    let declaration = cancel_declaration();
+    world
+        .broker
+        .register_actions(binding, [&declaration])
+        .expect("the action is registered");
+    world.terminal_selects("thread-1").await;
+    world
+        .server_says(&turn_event("turn/started", "thread-1", "turn-7"))
+        .await;
+    let invoke = kr_protocol::agent::PluginActionInvokeParams {
+        target: world.target(),
+        plugin_id: kr_protocol::ids::PluginId::new("kalareach.codex").expect("a plugin"),
+        action: kr_protocol::broker::ActionName::new("turn.cancel").expect("an action"),
+        draft_id: kr_protocol::scalars::Nullable::null(),
+        resource_id: kr_protocol::scalars::Nullable::null(),
+        parameters: kr_protocol::scalars::Bytes::new(b"{}".to_vec()),
+    };
+    let admitted = world
+        .broker
+        .admit_host_cancel(&World::owner_caller(), binding, &invoke, NOW)
+        .expect("the declared cancellation is admitted");
+    // The server ends the conversation the cancellation was admitted under.
+    world
+        .server_says(r#"{"method":"thread/closed","params":{"threadId":"thread-1"}}"#)
+        .await;
+    let Err(stopped) = world.broker.take_plugin_action(&admitted) else {
+        panic!("a permit admitted before a leave is stopped");
+    };
+    assert!(stopped.proven_unsent(), "{stopped:?}");
+    world.nothing_written().await;
+}
