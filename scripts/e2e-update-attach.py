@@ -37,8 +37,13 @@ def main(programs):
     for path in (runtime, state):
         os.makedirs(path, mode=0o700, exist_ok=True)
     shell = os.path.join(run, "marker-shell.sh")
+    # The tools a person's development work starts with, run by the session's own shell, so that
+    # what the attach shows is also what an unsandboxed host lets them do.
+    tools = {"git": "git version", "cargo": "cargo "}
+    found = {name: shutil.which(name) for name in tools}
+    lines = [f"printf '{MARKER}\\n'"] + [f"'{path}' --version" for path in found.values() if path]
     with open(shell, "w", encoding="utf-8") as handle:
-        handle.write(f"#!/bin/sh\nprintf '{MARKER}\\n'\nexec cat\n")
+        handle.write("#!/bin/sh\n" + "\n".join(lines) + "\nexec cat\n")
     os.chmod(shell, 0o755)
 
     environment = dict(os.environ, KR_RUNTIME_DIR=runtime, KR_STATE_DIR=state)
@@ -82,7 +87,8 @@ def main(programs):
         fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
         seen = b""
         end = time.monotonic() + 60
-        while MARKER.encode() not in seen and time.monotonic() < end:
+        wanted = [MARKER] + [tools[name] for name, path in found.items() if path]
+        while not all(text.encode() in seen for text in wanted) and time.monotonic() < end:
             ready, _, _ = select.select([terminal], [], [], 1.0)
             if ready:
                 try:
@@ -92,9 +98,13 @@ def main(programs):
                 if not block:
                     break
                 seen += block
-        if MARKER.encode() not in seen:
-            raise SystemExit(f"the attach never showed the session's screen; it showed {len(seen)} bytes")
-        print(f"ok: kr attach showed the session's screen ({len(seen)} bytes)")
+        missing = [text for text in wanted if text.encode() not in seen]
+        if missing:
+            raise SystemExit(f"the attach did not show {missing}; it showed {len(seen)} bytes")
+        print(f"ok: kr attach showed the session's screen and the tools it ran: {', '.join(name for name, path in found.items() if path)}")
+        for name, path in found.items():
+            if not path:
+                print(f"not run: {name} is not on this machine's search path")
         subprocess.run([kr, "close", display], env=environment, capture_output=True)
     finally:
         if attached is not None:
