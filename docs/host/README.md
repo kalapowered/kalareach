@@ -3132,17 +3132,21 @@ entry names the organisation and the authority revision the host took when it en
 written with every other entry in one write, owner only. A host that has applied no policy has no
 file. A start reads the file before the catalogue opens, so a restart restores the revision and
 the list. A start stops, naming the file, when the file is there and is not a record of the format
-this build reads: a host that came back without the restrictions it was left with would run every
-adapter. A release before this one reads the registry and does not name the file, so it leaves the
-file alone and a rollback to it is not refused for it. That release applies no organisation
-policy, so a host rolled back to it admits every adapter it qualifies. A host that is brought
-forward again applies the policy once more, as long as the enrolment it was applied for is still
-held.
+this build reads (also when another account owns it, or it is a link), and when an entry that
+names no enrolment the host holds cannot be removed from it: a host that came back without the
+restrictions it was left with would run every adapter. No list is in force until the owner has
+moved the file aside, started the daemon, and applied the policy again. A release before this one
+reads the registry and does not name the file, so it leaves the file alone and a rollback to it is
+not refused for it. That release applies no organisation policy, so a host rolled back to it
+admits every adapter it qualifies, a host that is exclusively organisation-managed included. A
+host that is brought forward again applies the policy once more, as long as the enrolment it was
+applied for is still held.
 
-The request writes the file before the registry row that records a chain it followed. A stop
-between the two leaves the policy applied at the next start, with the chain advance not recorded,
-and the same request made again completes it. A request that is refused after the file was written
-puts the file back as it was. An entry applies only to the enrolment it was applied for. A
+The request writes the registry row first and the file second, so a request the registry refuses
+writes nothing to the file, and a policy the file cannot hold is refused before anything is
+written. A stop between the two writes leaves the policy the host last answered for in force, with
+the chain the request followed recorded, and the same policy applied again, which needs no chain
+beside it any more, writes the file. An entry applies only to the enrolment it was applied for. A
 withdrawal writes the file again, without the entry of the organisation it left, or removes the
 file when no entry is left. A stop that leaves an entry of an enrolment that has ended behind
 names an enrolment the host no longer holds, so the next start drops it, and no later enrolment in
@@ -3174,7 +3178,7 @@ host puts the list in force in four places:
   is still busy then, or the revision cannot be raised, the policy is recorded and the request
   answers `RESOURCE_UNAVAILABLE` or `STORAGE_UNAVAILABLE`, saying the host puts the list in force at
   its next admissions pass; until it does, the list the policies state and the list in force differ.
-  The host keeps no answer for the request. The same request made again applies the same policy
+  The host keeps no answer for the request. The same policy sent again, as a new request, applies
   again, which changes nothing the host keeps, and puts the list in force.
 - After `organisation.withdraw`, which can only widen the list. A put that does not land waits for
   the next pass.
@@ -6079,10 +6083,10 @@ notice again. Setting a clock back will not make any numbers be lower than any p
 * **Revalidation after wake and reboot.** The policy, its restrictions, its enrolments and both
   floors are read back from the environment's authority store when the daemon starts, so a restart
   does not return an unrestricted host. The policies the owner applied are read back with their
-  revisions from the store of applied policies that lies beside it. Membership leases are not: a lease lasts at most fifteen
-  minutes, and a restarted host holds none until the service gives it one. A policy document naming
-  a revision at or below the floor is refused, and the floor only rises. A signature proves who
-  wrote a policy, not that the policy is the current one.
+  revisions from the store of applied policies that lies beside it. Membership leases are not: a
+  lease lasts at most fifteen minutes, and a restarted host holds none until the service gives it
+  one. A policy document naming a revision at or below the floor is refused, and the floor only
+  rises. A signature proves who wrote a policy, not that the policy is the current one.
 
   The floors live in the same store as the grants they protect, so restoring that store wholesale
   takes them back with it. That is a recovery event rather than a policy document, and the remedy is

@@ -70,8 +70,8 @@ pub struct OrganisationPolicyApplyParams {
     pub authority: Nullable<PolicyAuthority>,
 }
 
-/// The result of `organisation.policy.apply`. The host keeps no answer for the request: a request
-/// made again is a policy applied again, and is answered from what the host holds then.
+/// The result of `organisation.policy.apply`. The host keeps no answer for the request: the same
+/// policy sent again is a policy applied again, and is answered from what the host holds then.
 ///
 /// The host verifies the whole policy and keeps its revision and its adapter allowlist. It neither
 /// keeps nor applies the other settings the policy states: the least client version, the longest

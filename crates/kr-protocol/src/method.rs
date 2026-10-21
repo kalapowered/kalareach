@@ -610,10 +610,11 @@ methods! {
           ones the host admits, with every other organisation's list intersected. The policy is \
           verified under the key the organisation's chain ends with, which the request can carry \
           when it has moved, and is refused at or below the revision the host holds unless it \
-          is that policy again. That policy again changes nothing the host keeps and puts its \
-          adapters in force again, so a request that could not is made again and no answer is \
-          kept for it. The owner confirmed the organisation's keys when enrolling, and a policy \
-          never enlarges what the host allows without one, so it needs no new confirmation.";
+          is that policy again. That policy sent again changes nothing the host keeps and puts \
+          its adapters in force again, so a request that could not is sent again and no answer \
+          is kept for it. The owner confirmed the organisation's keys when enrolling, and a \
+          policy never enlarges what the host allows without one, so it needs no new \
+          confirmation.";
 
     OrganisationExclusiveSet = "organisation.exclusive.set", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host],
