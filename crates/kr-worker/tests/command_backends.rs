@@ -9,7 +9,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.07 | a backend's endpoint, credential and launch record exist before the answer; a bypass creates nothing; one line runs one integrated invocation; each session has a root of its own; a backend is established under the longest runtime directory a Mac has by default, and a backend retired by the end of its line leaves no directory; a declared package establishes with its flags, and its variables in the launch record rather than the answer; a session entry whose flags are not the package's, a run that splits the flags and an executable no match rule recognises establish nothing; a bypassed invocation exports nothing; an integration that declares a backend establishes nothing where it cannot be served, and says which launch it refuses |
+//! | KR-REQ-12.07 | a backend's endpoint, credential and launch record exist before the answer; a bypass creates nothing; one line runs one integrated invocation; each session has a root of its own; a backend is established under the longest runtime directory a Mac has by default, a runtime directory with no room for the socket a backend binds below it establishes nothing, and a backend retired by the end of its line leaves no directory; a declared package establishes with its flags, and its variables in the launch record rather than the answer; a session entry whose flags are not the package's, a run that splits the flags and an executable no match rule recognises establish nothing; a bypassed invocation exports nothing; an integration that declares a backend establishes nothing where it cannot be served, and says which launch it refuses |
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -58,6 +58,12 @@ impl Drop for Removed {
 /// A private directory as long as a Mac's default runtime directory, or longer where this machine's
 /// temporary directory already is.
 fn as_long_as_a_macs_default_runtime_directory() -> Removed {
+    a_private_directory_of(A_MACS_DEFAULT_RUNTIME_DIRECTORY_BYTES)
+}
+
+/// A private directory whose path is `bytes` long, or longer where this machine's temporary
+/// directory already is.
+fn a_private_directory_of(bytes: usize) -> Removed {
     let unique: String = kr_ipc::new_uuid()
         .to_string()
         .chars()
@@ -65,8 +71,7 @@ fn as_long_as_a_macs_default_runtime_directory() -> Removed {
         .take(8)
         .collect();
     let temporary = std::env::temp_dir();
-    let short = A_MACS_DEFAULT_RUNTIME_DIRECTORY_BYTES
-        .saturating_sub(temporary.join(&unique).as_os_str().len());
+    let short = bytes.saturating_sub(temporary.join(&unique).as_os_str().len());
     let directory = temporary.join(format!("{unique}{}", "k".repeat(short)));
     kr_ipc::paths::create_private_directory(&directory).expect("a private directory");
     Removed(directory)
@@ -405,6 +410,82 @@ async fn kr_req_12_07_a_backend_is_established_under_a_macs_default_runtime_dire
     assert!(
         endpoint_exists(endpoint),
         "the endpoint is bound: {endpoint}"
+    );
+}
+
+/// KR-REQ-12.07: a runtime directory with no room for the socket a backend binds below it is
+/// refused before anything is created, and the refusal names the directory. One with exactly the
+/// room establishes, so the refusal is made at the platform's own limit and not before it.
+///
+/// What a backend adds below its runtime directory is read from one that is established, as the
+/// difference between the endpoint it was given and the directory it was made under.
+#[cfg(unix)]
+#[tokio::test]
+async fn kr_req_12_07_a_runtime_directory_too_long_for_a_backends_socket_establishes_nothing() {
+    let establish = |runtime: &Removed| {
+        let setup = Setup::with(|config| CommandBackendsConfig {
+            runtime_dir: runtime.0.clone(),
+            ..config
+        });
+        let answer = setup.backends.establish(&request(
+            &setup,
+            &invocation(&["claude", "--resume"]),
+            &Setup::integration(),
+            1,
+        ));
+        (setup, answer)
+    };
+    let endpoint_of = |answer: &kr_protocol::root::CommandBackend| -> String {
+        let directory = PathBuf::from(&answer.environment[0].value)
+            .parent()
+            .expect("the backend's directory")
+            .to_path_buf();
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.join("launch")).expect("a launch record"),
+        )
+        .expect("the record is JSON");
+        record["endpoint"].as_str().expect("an endpoint").to_owned()
+    };
+
+    let probe = as_long_as_a_macs_default_runtime_directory();
+    let (_probed, answer) = establish(&probe);
+    let added =
+        endpoint_of(&answer.expect("a backend is established")).len() - probe.0.as_os_str().len();
+    let room = kr_ipc::paths::MAX_SOCKET_PATH_LEN - added;
+
+    let fits = a_private_directory_of(room);
+    assert_eq!(
+        fits.0.as_os_str().len(),
+        room,
+        "a directory of the length the room allows"
+    );
+    let (_fitted, answer) = establish(&fits);
+    let endpoint =
+        endpoint_of(&answer.expect("a runtime directory with just the room establishes"));
+    assert_eq!(
+        endpoint.len(),
+        kr_ipc::paths::MAX_SOCKET_PATH_LEN,
+        "and its socket is as long as a socket path may be"
+    );
+    assert!(endpoint_exists(&endpoint), "bound: {endpoint}");
+
+    let too_long = a_private_directory_of(room + 1);
+    let (setup, answer) = establish(&too_long);
+    let refusal = answer.expect_err("a runtime directory one byte too long for the socket");
+    assert!(
+        refusal.contains(&too_long.0.display().to_string()),
+        "the refusal names the runtime directory: {refusal}"
+    );
+    assert!(
+        setup.backends.root().is_none(),
+        "no directory was made for the session"
+    );
+    assert!(
+        std::fs::read_dir(&too_long.0)
+            .expect("the runtime directory")
+            .next()
+            .is_none(),
+        "nothing was made in the runtime directory"
     );
 }
 
