@@ -522,8 +522,11 @@ impl WorkflowEngine {
                                 Cancellation::Unsupported => (
                                     NodeStatus::Unknown,
                                     format!(
-                                        "{limit}: an action of this kind cannot be stopped once it \
-                                     has begun, so what it did is not established"
+                                        "{limit}: the runner could not stop this action (its kind \
+                                         offers no point to stop at once it has begun, it has \
+                                         passed the point where the runner can stop it, or its \
+                                         dispatch had already ended), so what it did is not \
+                                         established"
                                     ),
                                 ),
                             };
