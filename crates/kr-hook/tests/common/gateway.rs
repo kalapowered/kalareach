@@ -166,6 +166,21 @@ impl Gateway {
     }
 
     pub fn build(qualified: bool, runtime_name: &str, ledger: Ledger) -> Self {
+        Self::shaped(
+            qualified,
+            runtime_name,
+            ledger,
+            &fixture::Shape::codex_backend(),
+        )
+    }
+
+    /// The same, for a package of the shape given.
+    pub fn shaped(
+        qualified: bool,
+        runtime_name: &str,
+        ledger: Ledger,
+        shape: &fixture::Shape,
+    ) -> Self {
         let placed = Placed::new();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -184,8 +199,7 @@ impl Gateway {
         let store = placed.host.root().join("store");
         std::fs::create_dir_all(&store).expect("a store");
         let mut source =
-            fixture::package(&store, &placed.forwarder, &fixture::Shape::codex_backend())
-                .expect("the package is written");
+            fixture::package(&store, &placed.forwarder, shape).expect("the package is written");
         if qualified {
             source.qualified = vec![QualifiedExecutable {
                 digest,

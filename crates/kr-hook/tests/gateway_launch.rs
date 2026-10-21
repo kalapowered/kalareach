@@ -620,6 +620,45 @@ fn kr_req_12_07_a_launch_that_cannot_have_a_server_runs_the_program_as_typed() {
     }
 }
 
+/// KR-REQ-11.35: a connector whose table declares no tested volatile forwarding mode is served no
+/// gateway: the program runs as typed, no server is started, and nothing of the launch is left
+/// published. Control: the same package declaring the mode is served, as the cases around this one
+/// show.
+///
+/// Section 11: such a connector cannot be advertised as a resilient managed gateway, and its
+/// unchanged terminal integration remains the supported path. Not claimed: Windows, where no
+/// gateway runs.
+#[test]
+fn kr_req_11_35_a_connector_without_a_tested_volatile_forwarding_mode_runs_the_program_as_typed() {
+    let shell = Gateway::shaped(
+        true,
+        "",
+        common::gateway::Ledger::Memory,
+        &kr_worker::broker::connectors::fixture::Shape {
+            volatile_forwarding: false,
+            ..kr_worker::broker::connectors::fixture::Shape::codex_backend()
+        },
+    );
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let registration = PathBuf::from(&answer.environment[0].value);
+    let mut launched = shell.launch(&answer, "typed", &[]);
+    // Run as typed, the stand-in is started with no arguments and says what it serves.
+    let status = launched.ends();
+    assert_eq!(status.code(), Some(2), "{}", launched.said());
+    assert!(
+        launched.said().contains("serves `app-server"),
+        "it ran with the arguments it was typed with"
+    );
+    assert!(shell.servers().is_empty(), "no server was started");
+    assert!(!registration.exists(), "the registration was taken back");
+    assert!(
+        shell.broker.live_bindings().is_empty(),
+        "and so was the binding"
+    );
+}
+
 /// KR-REQ-12.07: a launcher whose environment a backend cannot be shown, because it holds more
 /// than a backend takes or a variable that is not text, runs the program as typed, and no server
 /// is started for it.
