@@ -975,6 +975,17 @@
           ],
           "description": "Where an answer to a pending approval goes, for a table that answers approvals.\n\nNull for a table that answers none. Without a destination nothing a package declares can\nanswer an approval on this connection, whatever trust it is granted."
         },
+        "decision_response": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionResponse"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How an application server reads the answer to an approval it asked, for a table of one.\n\nA table that does not leaves the member out, so a connector written before the member\nexisted reads and hashes exactly as it did. It is the other way a table answers\napprovals, and a table declares one way."
+        },
         "framing": {
           "$ref": "#/$defs/Framing",
           "description": "How messages are separated."
@@ -1006,6 +1017,17 @@
             "$ref": "#/$defs/MethodClassification"
           },
           "type": "array"
+        },
+        "observation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Observation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the host reads out of the backend's stream to know the terminal's conversation and\nturn, for a table of an application server a native terminal speaks to.\n\nA table that does not leaves the member out, and the host then reads no thread from the\nstream."
         },
         "plugin_id": {
           "$ref": "#/$defs/PluginId",
@@ -1184,6 +1206,36 @@
         "method",
         "request_id_path",
         "decision_path",
+        "decisions"
+      ],
+      "type": "object"
+    },
+    "DecisionResponse": {
+      "additionalProperties": false,
+      "description": "Where an answer goes when the application reads it as the response to the request it asked.\n\nAn application server that asks its client for a decision reads the answer as the response to\nthat very request: the response repeats the request's identifier, and one member of its result\ncarries the decision. This says which requests are decisions, which member of the result\ncarries the answer, and the value the application reads for each decision a person can make.\nThe identifier comes from the pending request and the value from this mapping, so an answer\ncarries nothing a caller typed. A table answers one way: through a [`DecisionDestination`] or\nthrough this, never both.",
+      "properties": {
+        "answers": {
+          "description": "The routed methods whose requests ask for a decision.\n\nThe application sends them; a message of one of these methods is a pending approval.",
+          "items": {
+            "$ref": "#/$defs/MethodName"
+          },
+          "type": "array"
+        },
+        "decisions": {
+          "description": "Every decision a person can make, and the value the application reads for it.",
+          "items": {
+            "$ref": "#/$defs/DecisionValue"
+          },
+          "type": "array"
+        },
+        "result_member": {
+          "description": "The member of the response's result that carries the decision.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "answers",
+        "result_member",
         "decisions"
       ],
       "type": "object"
@@ -2279,6 +2331,25 @@
       ],
       "type": "object"
     },
+    "LeaveRoute": {
+      "additionalProperties": false,
+      "description": "A message after which the terminal no longer has a thread selected.\n\nIt is a request the terminal sends or a notification the application sends; either way the\nmessage names the thread it ends.",
+      "properties": {
+        "method": {
+          "$ref": "#/$defs/MethodName",
+          "description": "The routed method."
+        },
+        "thread": {
+          "$ref": "#/$defs/FieldPath",
+          "description": "Where the message names the thread, from the root of the message."
+        }
+      },
+      "required": [
+        "method",
+        "thread"
+      ],
+      "type": "object"
+    },
     "MatchConfidence": {
       "description": "How certain a rule is about what it recognised.",
       "oneOf": [
@@ -2767,6 +2838,60 @@
       "minLength": 1,
       "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$",
       "type": "string"
+    },
+    "Observation": {
+      "additionalProperties": false,
+      "description": "What the host reads out of a backend's stream to know which conversation and turn the\nterminal is in.\n\nNothing here lets a package say what happened: each route names a method the table routes and\nthe place in its message that names a thread, a turn or a request, and the host reads those\nplaces itself. A conversation is never taken from matching prompt text and timestamps.",
+      "properties": {
+        "leaves": {
+          "description": "The messages after which the terminal has no thread selected.",
+          "items": {
+            "$ref": "#/$defs/LeaveRoute"
+          },
+          "type": "array"
+        },
+        "request_resolved": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResolvedRoute"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The notification that a request of the application's was answered or cleared."
+        },
+        "selections": {
+          "description": "The terminal's requests whose success reply names the thread it selected.",
+          "items": {
+            "$ref": "#/$defs/SelectionRoute"
+          },
+          "type": "array"
+        },
+        "turn_ended": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnRoute"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The notification that a turn ended."
+        },
+        "turn_started": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnRoute"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The notification that a turn started."
+        }
+      },
+      "type": "object"
     },
     "OperatingSystem": {
       "description": "An operating system a package supports.",
@@ -3862,6 +3987,25 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "ResolvedRoute": {
+      "additionalProperties": false,
+      "description": "A notification that says a request of the application's was answered or cleared.",
+      "properties": {
+        "method": {
+          "$ref": "#/$defs/MethodName",
+          "description": "The routed method, which travels from the application to the host."
+        },
+        "request_id": {
+          "$ref": "#/$defs/FieldPath",
+          "description": "Where the notification names the request it cleared, from the root of the message."
+        }
+      },
+      "required": [
+        "method",
+        "request_id"
+      ],
+      "type": "object"
+    },
     "ResponseCorrelation": {
       "description": "How a response is matched to its request.",
       "oneOf": [
@@ -3998,6 +4142,25 @@
       "maximum": 9007199254740991,
       "minimum": -9007199254740991,
       "type": "integer"
+    },
+    "SelectionRoute": {
+      "additionalProperties": false,
+      "description": "A request of the terminal whose success reply names the conversation it selected.",
+      "properties": {
+        "method": {
+          "$ref": "#/$defs/MethodName",
+          "description": "The routed method, which travels from the host to the application."
+        },
+        "thread": {
+          "$ref": "#/$defs/FieldPath",
+          "description": "Where the success reply names the thread, from the root of the reply."
+        }
+      },
+      "required": [
+        "method",
+        "thread"
+      ],
+      "type": "object"
     },
     "SemanticPriority": {
       "description": "How prominently a client presents a control.\n\nPriority is semantic, not visual: it says how important the action is, and each client decides\nwhat that looks like on its own platform.",
@@ -4257,6 +4420,30 @@
           "type": "string"
         }
       ]
+    },
+    "TurnRoute": {
+      "additionalProperties": false,
+      "description": "A notification that says a turn started or ended in one thread.",
+      "properties": {
+        "method": {
+          "$ref": "#/$defs/MethodName",
+          "description": "The routed method, which travels from the application to the host."
+        },
+        "thread": {
+          "$ref": "#/$defs/FieldPath",
+          "description": "Where the notification names the thread, from the root of the message."
+        },
+        "turn": {
+          "$ref": "#/$defs/FieldPath",
+          "description": "Where it names the turn, from the root of the message."
+        }
+      },
+      "required": [
+        "method",
+        "thread",
+        "turn"
+      ],
+      "type": "object"
     },
     "U64": {
       "description": "An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.",

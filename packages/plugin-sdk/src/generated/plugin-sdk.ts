@@ -142,6 +142,10 @@ export type FieldSegment =
       type: 'index'
     }
 /**
+ * A native protocol method name in the connector's classification table.
+ */
+export type MethodName = string
+/**
  * The package summary. One line, no control or bidirectional characters.
  */
 export type Summary = string
@@ -1315,6 +1319,14 @@ export interface ConnectorManifest {
    */
   decision_destination: DecisionDestination | null
   /**
+   * How an application server reads the answer to an approval it asked, for a table of one.
+   *
+   * A table that does not leaves the member out, so a connector written before the member
+   * existed reads and hashes exactly as it did. It is the other way a table answers
+   * approvals, and a table declares one way.
+   */
+  decision_response?: DecisionResponse | null
+  /**
    * How messages are separated.
    */
   framing:
@@ -1373,6 +1385,14 @@ export interface ConnectorManifest {
    */
   methods: MethodClassification[]
   /**
+   * What the host reads out of the backend's stream to know the terminal's conversation and
+   * turn, for a table of an application server a native terminal speaks to.
+   *
+   * A table that does not leaves the member out, and the host then reads no thread from the
+   * stream.
+   */
+  observation?: Observation | null
+  /**
    * A plugin identifier from its manifest.
    */
   plugin_id: string
@@ -1381,13 +1401,13 @@ export interface ConnectorManifest {
    * What the publisher says about the qualification behind this table.
    */
   qualification_note: Summary | null
-  request_id_path: FieldPath3
+  request_id_path: FieldPath8
   /**
    * How a response is matched to its request.
    */
   response_correlation:
     | {
-        id_path: FieldPath4
+        id_path: FieldPath9
         type: 'matching_id'
       }
     | {
@@ -1481,6 +1501,33 @@ export interface FieldPath1 {
   segments: FieldSegment[]
 }
 /**
+ * Where an answer goes when the application reads it as the response to the request it asked.
+ *
+ * An application server that asks its client for a decision reads the answer as the response to
+ * that very request: the response repeats the request's identifier, and one member of its result
+ * carries the decision. This says which requests are decisions, which member of the result
+ * carries the answer, and the value the application reads for each decision a person can make.
+ * The identifier comes from the pending request and the value from this mapping, so an answer
+ * carries nothing a caller typed. A table answers one way: through a [`DecisionDestination`] or
+ * through this, never both.
+ */
+export interface DecisionResponse {
+  /**
+   * The routed methods whose requests ask for a decision.
+   *
+   * The application sends them; a message of one of these methods is a pending approval.
+   */
+  answers: MethodName[]
+  /**
+   * Every decision a person can make, and the value the application reads for it.
+   */
+  decisions: DecisionValue[]
+  /**
+   * The member of the response's result that carries the decision.
+   */
+  result_member: string
+}
+/**
  * The top-level members a message is read by, beyond its identifier and its method.
  *
  * A table for the application server a native terminal speaks to names them here: the member a
@@ -1526,9 +1573,128 @@ export interface MethodClassification {
    */
   evidence: string
   /**
-   * The method.
+   * A native protocol method name in the connector's classification table.
    */
   method: string
+}
+/**
+ * What the host reads out of a backend's stream to know which conversation and turn the
+ * terminal is in.
+ *
+ * Nothing here lets a package say what happened: each route names a method the table routes and
+ * the place in its message that names a thread, a turn or a request, and the host reads those
+ * places itself. A conversation is never taken from matching prompt text and timestamps.
+ */
+export interface Observation {
+  /**
+   * The messages after which the terminal has no thread selected.
+   */
+  leaves?: LeaveRoute[]
+  /**
+   * The notification that a request of the application's was answered or cleared.
+   */
+  request_resolved?: ResolvedRoute | null
+  /**
+   * The terminal's requests whose success reply names the thread it selected.
+   */
+  selections?: SelectionRoute[]
+  /**
+   * The notification that a turn ended.
+   */
+  turn_ended?: TurnRoute | null
+  /**
+   * The notification that a turn started.
+   */
+  turn_started?: TurnRoute | null
+}
+/**
+ * A message after which the terminal no longer has a thread selected.
+ *
+ * It is a request the terminal sends or a notification the application sends; either way the
+ * message names the thread it ends.
+ */
+export interface LeaveRoute {
+  /**
+   * A native protocol method name in the connector's classification table.
+   */
+  method: string
+  thread: FieldPath3
+}
+/**
+ * Where the message names the thread, from the root of the message.
+ */
+export interface FieldPath3 {
+  /**
+   * The path segments, from the root of the message.
+   */
+  segments: FieldSegment[]
+}
+/**
+ * A notification that says a request of the application's was answered or cleared.
+ */
+export interface ResolvedRoute {
+  /**
+   * A native protocol method name in the connector's classification table.
+   */
+  method: string
+  request_id: FieldPath4
+}
+/**
+ * Where the notification names the request it cleared, from the root of the message.
+ */
+export interface FieldPath4 {
+  /**
+   * The path segments, from the root of the message.
+   */
+  segments: FieldSegment[]
+}
+/**
+ * A request of the terminal whose success reply names the conversation it selected.
+ */
+export interface SelectionRoute {
+  /**
+   * A native protocol method name in the connector's classification table.
+   */
+  method: string
+  thread: FieldPath5
+}
+/**
+ * Where the success reply names the thread, from the root of the reply.
+ */
+export interface FieldPath5 {
+  /**
+   * The path segments, from the root of the message.
+   */
+  segments: FieldSegment[]
+}
+/**
+ * A notification that says a turn started or ended in one thread.
+ */
+export interface TurnRoute {
+  /**
+   * A native protocol method name in the connector's classification table.
+   */
+  method: string
+  thread: FieldPath6
+  turn: FieldPath7
+}
+/**
+ * Where the notification names the thread, from the root of the message.
+ */
+export interface FieldPath6 {
+  /**
+   * The path segments, from the root of the message.
+   */
+  segments: FieldSegment[]
+}
+/**
+ * Where it names the turn, from the root of the message.
+ */
+export interface FieldPath7 {
+  /**
+   * The path segments, from the root of the message.
+   */
+  segments: FieldSegment[]
 }
 /**
  * The upstream protocol this table is qualified against.
@@ -1550,7 +1716,7 @@ export interface ProtocolPin {
 /**
  * Where a request carries its identifier.
  */
-export interface FieldPath3 {
+export interface FieldPath8 {
   /**
    * The path segments, from the root of the message.
    */
@@ -1559,7 +1725,7 @@ export interface FieldPath3 {
 /**
  * Where the identifier is in a response.
  */
-export interface FieldPath4 {
+export interface FieldPath9 {
   /**
    * The path segments, from the root of the message.
    */
@@ -1574,7 +1740,7 @@ export interface Route {
    */
   direction: 'upstream_to_host' | 'host_to_upstream' | 'bidirectional'
   /**
-   * The method as the table names it.
+   * A native protocol method name in the connector's classification table.
    */
   method: string
   /**
@@ -3297,7 +3463,7 @@ export interface ActionDeclaration {
  * One declared parameter bound to a field of an upstream request.
  */
 export interface ParameterBinding {
-  field: FieldPath5
+  field: FieldPath10
   /**
    * The declared parameter supplying the value.
    */
@@ -3306,7 +3472,7 @@ export interface ParameterBinding {
 /**
  * Where the value goes in the upstream request.
  */
-export interface FieldPath5 {
+export interface FieldPath10 {
   /**
    * The path segments, from the root of the message.
    */

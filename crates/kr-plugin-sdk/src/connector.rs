@@ -308,6 +308,116 @@ pub struct DecisionValue {
     pub value: String,
 }
 
+/// How many requests one decision response may answer.
+pub const MAX_RESPONSE_METHODS: usize = 8;
+
+/// How many routes of each kind one observation may name.
+pub const MAX_OBSERVED_ROUTES: usize = 8;
+
+/// Where an answer goes when the application reads it as the response to the request it asked.
+///
+/// An application server that asks its client for a decision reads the answer as the response to
+/// that very request: the response repeats the request's identifier, and one member of its result
+/// carries the decision. This says which requests are decisions, which member of the result
+/// carries the answer, and the value the application reads for each decision a person can make.
+/// The identifier comes from the pending request and the value from this mapping, so an answer
+/// carries nothing a caller typed. A table answers one way: through a [`DecisionDestination`] or
+/// through this, never both.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct DecisionResponse {
+    /// The routed methods whose requests ask for a decision.
+    ///
+    /// The application sends them; a message of one of these methods is a pending approval.
+    pub answers: Vec<MethodName>,
+    /// The member of the response's result that carries the decision.
+    pub result_member: String,
+    /// Every decision a person can make, and the value the application reads for it.
+    pub decisions: Vec<DecisionValue>,
+}
+
+impl DecisionResponse {
+    /// Returns the value the application reads for one decision, when the mapping lists it.
+    #[must_use]
+    pub fn value_for(&self, decision: &ParameterName) -> Option<&str> {
+        self.decisions
+            .iter()
+            .find(|entry| &entry.decision == decision)
+            .map(|entry| entry.value.as_str())
+    }
+}
+
+/// A request of the terminal whose success reply names the conversation it selected.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct SelectionRoute {
+    /// The routed method, which travels from the host to the application.
+    pub method: MethodName,
+    /// Where the success reply names the thread, from the root of the reply.
+    pub thread: FieldPath,
+}
+
+/// A message after which the terminal no longer has a thread selected.
+///
+/// It is a request the terminal sends or a notification the application sends; either way the
+/// message names the thread it ends.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct LeaveRoute {
+    /// The routed method.
+    pub method: MethodName,
+    /// Where the message names the thread, from the root of the message.
+    pub thread: FieldPath,
+}
+
+/// A notification that says a turn started or ended in one thread.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct TurnRoute {
+    /// The routed method, which travels from the application to the host.
+    pub method: MethodName,
+    /// Where the notification names the thread, from the root of the message.
+    pub thread: FieldPath,
+    /// Where it names the turn, from the root of the message.
+    pub turn: FieldPath,
+}
+
+/// A notification that says a request of the application's was answered or cleared.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ResolvedRoute {
+    /// The routed method, which travels from the application to the host.
+    pub method: MethodName,
+    /// Where the notification names the request it cleared, from the root of the message.
+    pub request_id: FieldPath,
+}
+
+/// What the host reads out of a backend's stream to know which conversation and turn the
+/// terminal is in.
+///
+/// Nothing here lets a package say what happened: each route names a method the table routes and
+/// the place in its message that names a thread, a turn or a request, and the host reads those
+/// places itself. A conversation is never taken from matching prompt text and timestamps.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct Observation {
+    /// The terminal's requests whose success reply names the thread it selected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selections: Vec<SelectionRoute>,
+    /// The messages after which the terminal has no thread selected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leaves: Vec<LeaveRoute>,
+    /// The notification that a turn started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_started: Option<TurnRoute>,
+    /// The notification that a turn ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_ended: Option<TurnRoute>,
+    /// The notification that a request of the application's was answered or cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_resolved: Option<ResolvedRoute>,
+}
+
 /// Why an answer could not be written.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AnswerError {
@@ -374,6 +484,20 @@ pub struct ConnectorManifest {
     /// Null for a table that answers none. Without a destination nothing a package declares can
     /// answer an approval on this connection, whatever trust it is granted.
     pub decision_destination: Nullable<DecisionDestination>,
+    /// How an application server reads the answer to an approval it asked, for a table of one.
+    ///
+    /// A table that does not leaves the member out, so a connector written before the member
+    /// existed reads and hashes exactly as it did. It is the other way a table answers
+    /// approvals, and a table declares one way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_response: Option<DecisionResponse>,
+    /// What the host reads out of the backend's stream to know the terminal's conversation and
+    /// turn, for a table of an application server a native terminal speaks to.
+    ///
+    /// A table that does not leaves the member out, and the host then reads no thread from the
+    /// stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<Observation>,
     /// Whether the connector has a tested volatile forwarding mode.
     ///
     /// Without one it is not a resilient managed gateway, so this host serves no gateway for it:
@@ -399,6 +523,36 @@ impl ConnectorManifest {
             .iter()
             .find(|entry| &entry.method == method)
             .map_or(MethodClass::UNCLASSIFIED, |entry| entry.class)
+    }
+
+    /// Returns true when the table answers approvals, in either of the two ways.
+    #[must_use]
+    pub fn answers_approvals(&self) -> bool {
+        self.decision_destination.is_present() || self.decision_response.is_some()
+    }
+
+    /// Returns the routed methods whose requests are approvals a person decides.
+    #[must_use]
+    pub fn approval_methods(&self) -> Vec<&MethodName> {
+        if let Some(destination) = self.decision_destination.as_ref() {
+            return vec![&destination.answers];
+        }
+        self.decision_response
+            .as_ref()
+            .map(|response| response.answers.iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Returns every decision the table maps to a value the application reads, in the table's
+    /// order, whichever way it answers.
+    #[must_use]
+    pub fn decisions(&self) -> &[DecisionValue] {
+        if let Some(destination) = self.decision_destination.as_ref() {
+            return &destination.decisions;
+        }
+        self.decision_response
+            .as_ref()
+            .map_or(&[], |response| response.decisions.as_slice())
     }
 
     /// Returns the route for a wire method name.
@@ -593,6 +747,8 @@ mod tests {
                 },
             ],
             decision_destination: Nullable(None),
+            decision_response: None,
+            observation: None,
             volatile_forwarding: false,
             qualification_note: Nullable(None),
         }

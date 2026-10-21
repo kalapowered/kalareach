@@ -21,9 +21,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::capability::PluginCapability;
 use crate::connector::{
-    BrokerTransport, ConnectorManifest, DecisionDestination, FieldPath, FieldSegment, Framing,
-    MAX_CLASSIFIED_METHODS, MAX_DECISION_VALUE_BYTES, MAX_FIELD_PATH_DEPTH, MethodClass,
-    ResponseCorrelation, RouteDirection,
+    BrokerTransport, ConnectorManifest, DecisionDestination, DecisionResponse, FieldPath,
+    FieldSegment, Framing, MAX_CLASSIFIED_METHODS, MAX_DECISION_VALUE_BYTES, MAX_FIELD_PATH_DEPTH,
+    MAX_OBSERVED_ROUTES, MAX_RESPONSE_METHODS, MethodClass, Observation, ResponseCorrelation,
+    RouteDirection,
 };
 use crate::digest::PayloadDigest;
 use crate::effect::{
@@ -1092,7 +1093,7 @@ fn check_manifest(
     // which decisions they offer, and it writes the answer. Interpreting a native request and
     // answering one are the two approval grants section 11 keeps apart, so a package whose table
     // does both asks for both, whether or not an action uses the destination yet.
-    if connector.is_some_and(|connector| connector.decision_destination.is_present()) {
+    if connector.is_some_and(ConnectorManifest::answers_approvals) {
         for needed in [
             PluginCapability::ApprovalDecode,
             PluginCapability::ApprovalRespond,
@@ -1102,7 +1103,7 @@ fn check_manifest(
                     FindingCode::EffectWithoutCapability,
                     MANIFEST_FILE,
                     format!(
-                        "the connector table interprets approval requests and answers them through its decision destination, and the package does not request {needed}"
+                        "the connector table interprets approval requests and answers them, and the package does not request {needed}"
                     ),
                 ));
             }
@@ -1393,7 +1394,7 @@ fn check_answer(
             detail,
         ));
     };
-    let destination = match connector {
+    let mapped = match connector {
         None => {
             unsatisfied(format!(
                 "the action {} answers through the connector table's decision destination and the package ships no connector table",
@@ -1402,14 +1403,13 @@ fn check_answer(
             None
         }
         Some(connector) => {
-            let destination = connector.decision_destination.as_ref();
-            if destination.is_none() {
+            if !connector.answers_approvals() {
                 unsatisfied(format!(
                     "the action {} answers through the connector table's decision destination and the table declares none",
                     action.id
                 ));
             }
-            destination
+            Some(connector)
         }
     };
     for parameter in &action.parameters.parameters {
@@ -1433,12 +1433,22 @@ fn check_answer(
             ));
             continue;
         };
-        if let Some(destination) = destination {
+        if let Some(connector) = mapped {
             for choice in choices {
-                if destination.value_for(&choice.id).is_none() {
+                if !connector
+                    .decisions()
+                    .iter()
+                    .any(|mapped| mapped.decision == choice.id)
+                {
                     unsatisfied(format!(
-                        "the action {} offers the decision {}, which the decision destination does not map",
-                        action.id, choice.id
+                        "the action {} offers the decision {}, which the {} does not map",
+                        action.id,
+                        choice.id,
+                        if connector.decision_response.is_some() {
+                            "decision response"
+                        } else {
+                            "decision destination"
+                        }
                     ));
                 }
             }
@@ -2521,6 +2531,357 @@ fn check_connector(connector: &ConnectorManifest, report: &mut Report) {
     }
     if let Some(destination) = connector.decision_destination.as_ref() {
         check_decision_destination(connector, destination, report);
+    }
+    if let Some(response) = connector.decision_response.as_ref() {
+        check_decision_response(connector, response, report);
+    }
+    if let Some(observation) = connector.observation.as_ref() {
+        check_observation(connector, observation, report);
+    }
+}
+
+/// Reports one thing wrong with the connector table.
+fn table_invalid(report: &mut Report, detail: String) {
+    report.push(Finding::at(
+        FindingCode::ConnectorTableInvalid,
+        CONNECTOR_FILE,
+        detail,
+    ));
+}
+
+/// Spells whether a path starts with the named top-level member.
+fn starts_with_member(path: &FieldPath, name: &str) -> bool {
+    matches!(
+        path.segments.first(),
+        Some(FieldSegment::Member { name: first }) if first == name
+    )
+}
+
+/// Checks how a table of an application server answers the approvals the server asks.
+///
+/// The answer is the response to the request itself, written by the host from this table alone:
+/// the requests it answers travel from the application to the host and are not unsupported; each
+/// decision maps to its own value; the result member is one name that meets nothing the table
+/// reads a message by; and the table reads responses by the identifier they repeat, which is how
+/// the answer says which request it is for.
+fn check_decision_response(
+    connector: &ConnectorManifest,
+    response: &DecisionResponse,
+    report: &mut Report,
+) {
+    let mut invalid = |detail: String| {
+        report.push(Finding::at(
+            FindingCode::ConnectorTableInvalid,
+            CONNECTOR_FILE,
+            detail,
+        ));
+    };
+    if connector.decision_destination.is_present() {
+        invalid(
+            "the table answers approvals through a decision destination and through a decision response; it answers one way"
+                .to_owned(),
+        );
+    }
+    let Some(messages) = connector.messages.as_ref() else {
+        invalid(
+            "a decision response answers in the member the table names for a result, and the table names no message members (messages)"
+                .to_owned(),
+        );
+        return;
+    };
+    if !matches!(
+        connector.response_correlation,
+        ResponseCorrelation::MatchingId { .. }
+    ) {
+        invalid(
+            "a decision response is the response to the request it answers, and the table matches responses by order rather than by the identifier they repeat"
+                .to_owned(),
+        );
+    }
+    if response.answers.is_empty() || response.answers.len() > MAX_RESPONSE_METHODS {
+        invalid(format!(
+            "the decision response answers {} methods; the range is 1 to {MAX_RESPONSE_METHODS}",
+            response.answers.len()
+        ));
+    }
+    let mut named = BTreeSet::new();
+    for method in &response.answers {
+        if !named.insert(method) {
+            invalid(format!(
+                "the decision response answers {method} more than once"
+            ));
+        }
+        match connector
+            .routes
+            .iter()
+            .find(|route| &route.method == method)
+        {
+            None => invalid(format!(
+                "the decision response answers {method}, which the table does not route"
+            )),
+            Some(route) if route.direction == RouteDirection::HostToUpstream => invalid(format!(
+                "the decision response answers {method}, which the table routes from the host to the application; the application never asks it"
+            )),
+            Some(_) => {}
+        }
+        if connector.classify(method) == MethodClass::Unsupported {
+            invalid(format!(
+                "the decision response answers {method}, which the table classifies as unsupported"
+            ));
+        }
+    }
+    let member = response.result_member.as_str();
+    if member.is_empty()
+        || member.len() > MAX_DECISION_VALUE_BYTES
+        || member.chars().any(char::is_control)
+    {
+        invalid(format!(
+            "the decision response's result_member is empty, over {MAX_DECISION_VALUE_BYTES} bytes or holds a control character"
+        ));
+    }
+    for (name, reserved) in [
+        ("params", messages.params.as_str()),
+        ("result", messages.result.as_str()),
+        ("error", messages.error.as_str()),
+    ] {
+        if member == reserved {
+            invalid(format!(
+                "the decision response writes its decision to {member}, which is the table's {name} member; it is a member inside the result"
+            ));
+        }
+    }
+    let decisions = &response.decisions;
+    if decisions.is_empty() || decisions.len() > MAX_PARAMETER_CHOICES {
+        invalid(format!(
+            "the decision response maps {} decisions; the range is 1 to {MAX_PARAMETER_CHOICES}",
+            decisions.len()
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    let mut values = BTreeSet::new();
+    for entry in decisions {
+        if !ids.insert(&entry.decision) {
+            invalid(format!(
+                "the decision response maps {} more than once",
+                entry.decision
+            ));
+        }
+        if !values.insert(entry.value.as_str()) {
+            invalid(format!(
+                "the decision response maps two decisions to {:?}, so the application cannot tell them apart",
+                entry.value
+            ));
+        }
+        if entry.value.is_empty()
+            || entry.value.len() > MAX_DECISION_VALUE_BYTES
+            || entry.value.chars().any(char::is_control)
+        {
+            invalid(format!(
+                "the decision response maps {} to a value that is empty, over {MAX_DECISION_VALUE_BYTES} bytes or holds a control character",
+                entry.decision
+            ));
+        }
+    }
+}
+
+/// Checks what a table says the host reads out of the stream.
+///
+/// Each route names a method the table routes in the direction the message travels, and the places
+/// it reads begin with the member the table names for that kind of message, so the host reads a
+/// request's parameters and a reply's result where the table says they are. A method has one
+/// role, so a message cannot both select a thread and end one.
+fn check_observation(
+    connector: &ConnectorManifest,
+    observation: &Observation,
+    report: &mut Report,
+) {
+    let Some(messages) = connector.messages.as_ref() else {
+        table_invalid(
+            report,
+            "an observation reads members of the stream's messages, and the table names no message members (messages)"
+                .to_owned(),
+        );
+        return;
+    };
+    if !matches!(
+        connector.response_correlation,
+        ResponseCorrelation::MatchingId { .. }
+    ) {
+        table_invalid(
+            report,
+            "an observation reads a reply by the identifier it repeats, and the table matches responses by order"
+                .to_owned(),
+        );
+    }
+    let direction = |method: &crate::ids::MethodName| {
+        connector
+            .routes
+            .iter()
+            .find(|route| &route.method == method)
+            .map(|route| route.direction)
+    };
+    /// What one route reads, and which way the message travels.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Role {
+        Selection,
+        Leave,
+        TurnStart,
+        TurnEnd,
+        Cleared,
+    }
+    impl Role {
+        const fn spelled(self) -> &'static str {
+            match self {
+                Self::Selection => "a selection",
+                Self::Leave => "a leave",
+                Self::TurnStart => "a turn start",
+                Self::TurnEnd => "a turn end",
+                Self::Cleared => "a cleared request",
+            }
+        }
+
+        /// Whether a message of this role may travel the way the table routes its method.
+        ///
+        /// A selection is the terminal's request, and a turn or a cleared request is the
+        /// application's notification; a leave is either end's message.
+        const fn fits(self, route: RouteDirection) -> bool {
+            matches!(
+                (self, route),
+                (_, RouteDirection::Bidirectional)
+                    | (Self::Leave, _)
+                    | (Self::Selection, RouteDirection::HostToUpstream)
+                    | (
+                        Self::TurnStart | Self::TurnEnd | Self::Cleared,
+                        RouteDirection::UpstreamToHost
+                    )
+            )
+        }
+    }
+    struct Reading<'a> {
+        method: &'a crate::ids::MethodName,
+        role: Role,
+        paths: Vec<(&'static str, &'a FieldPath, &'a str)>,
+    }
+    let mut roles: BTreeMap<&crate::ids::MethodName, Role> = BTreeMap::new();
+    let mut readings: Vec<Reading<'_>> = Vec::new();
+    for (name, count) in [
+        ("selections", observation.selections.len()),
+        ("leaves", observation.leaves.len()),
+    ] {
+        if count > MAX_OBSERVED_ROUTES {
+            table_invalid(
+                report,
+                format!("the observation names {count} {name}; the most is {MAX_OBSERVED_ROUTES}"),
+            );
+        }
+    }
+    for selection in &observation.selections {
+        readings.push(Reading {
+            method: &selection.method,
+            role: Role::Selection,
+            paths: vec![("thread", &selection.thread, messages.result.as_str())],
+        });
+    }
+    for leave in &observation.leaves {
+        readings.push(Reading {
+            method: &leave.method,
+            role: Role::Leave,
+            paths: vec![("thread", &leave.thread, messages.params.as_str())],
+        });
+    }
+    for (role, turn) in [
+        (Role::TurnStart, observation.turn_started.as_ref()),
+        (Role::TurnEnd, observation.turn_ended.as_ref()),
+    ] {
+        if let Some(turn) = turn {
+            readings.push(Reading {
+                method: &turn.method,
+                role,
+                paths: vec![
+                    ("thread", &turn.thread, messages.params.as_str()),
+                    ("turn", &turn.turn, messages.params.as_str()),
+                ],
+            });
+        }
+    }
+    if let Some(resolved) = observation.request_resolved.as_ref() {
+        readings.push(Reading {
+            method: &resolved.method,
+            role: Role::Cleared,
+            paths: vec![("request_id", &resolved.request_id, messages.params.as_str())],
+        });
+    }
+    for reading in &readings {
+        if let Some(earlier) = roles.insert(reading.method, reading.role) {
+            table_invalid(
+                report,
+                format!(
+                    "the observation names {} as {} and as {}; a method has one role",
+                    reading.method,
+                    earlier.spelled(),
+                    reading.role.spelled()
+                ),
+            );
+        }
+        match direction(reading.method) {
+            None => table_invalid(
+                report,
+                format!(
+                    "the observation reads {}, which the table does not route",
+                    reading.method
+                ),
+            ),
+            Some(route) if !reading.role.fits(route) => table_invalid(
+                report,
+                format!(
+                    "the observation reads {} as {}, and the table routes it the other way",
+                    reading.method,
+                    reading.role.spelled()
+                ),
+            ),
+            Some(_) => {}
+        }
+        for (name, path, member) in &reading.paths {
+            check_field_path(
+                path,
+                &format!("the observation's {name} of {}", reading.method),
+                report,
+            );
+            if !starts_with_member(path, member) {
+                table_invalid(
+                    report,
+                    format!(
+                        "the observation reads the {name} of {} at {}, which is not inside the table's {member} member",
+                        reading.method,
+                        dotted(path)
+                    ),
+                );
+            }
+        }
+        if let [("thread", thread, _), ("turn", turn, _)] = reading.paths.as_slice()
+            && paths_overlap(thread, turn)
+        {
+            table_invalid(
+                report,
+                format!(
+                    "the observation reads the thread and the turn of {} at overlapping places",
+                    reading.method
+                ),
+            );
+        }
+    }
+    if let (Some(started), Some(ended)) = (
+        observation.turn_started.as_ref(),
+        observation.turn_ended.as_ref(),
+    ) && started.method == ended.method
+    {
+        table_invalid(
+            report,
+            format!(
+                "the observation reads {} as both the start and the end of a turn",
+                started.method
+            ),
+        );
     }
 }
 

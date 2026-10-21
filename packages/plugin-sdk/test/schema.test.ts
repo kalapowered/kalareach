@@ -52,7 +52,7 @@ describe('the package contract', () => {
       'attachments',
       'document'
     ])
-    expect(sdkVersion).toBe('0.1.5')
+    expect(sdkVersion).toBe('0.1.6')
     expect(witVersion).toBe('0.1.0')
   })
 
