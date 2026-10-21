@@ -916,9 +916,10 @@ impl Controller {
     /// not necessarily gone, and one that is on its way out has not necessarily had its closure
     /// recorded: a command that ends at once takes its worker with it first. As a read of the
     /// session does, this asks for the closure of a worker that has ended, and answers from it.
-    /// Where none is established the failure stands, with its cause: a worker that does not answer
-    /// in time is [`ControllerError::Uncertain`], since its session exists and the same create asked
-    /// again is answered with it.
+    /// Where none is established the failure stands, with its cause. A failure of the supervision of
+    /// the exchange (the wait for the link or for the answer ran out, or the first exchange on a new
+    /// link failed) is [`ControllerError::Uncertain`], since the worker has reported itself, its session
+    /// exists, and the same create asked again is answered with it.
     ///
     /// # Errors
     ///
