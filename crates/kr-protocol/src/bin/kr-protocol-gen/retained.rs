@@ -429,30 +429,57 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
     let released = git(&["show", "-s", "--format=%cI", &full])?
         .trim()
         .to_owned();
-    // The document is prepared first: a document without the level's row stops the command
-    // before the record changes.
     let release = format!("{version}+{}", &full[..12]);
-    let (document, text) = document_with(level, &release, &released)?;
-    let path = retained_dir().join(level).join("RELEASE");
-    std::fs::write(
-        &path,
-        format!(
+    move_record(
+        &retained_dir(),
+        &repository().join("docs/releases/support-window.md"),
+        level,
+        &release,
+        &full,
+        &released,
+    )
+}
+
+/// Moves a level's record to `release`: the level's `RELEASE` file under `retained`, and the level's
+/// row in `document`, the document on the support window.
+///
+/// The document is prepared first: a document without the level's row stops the command before
+/// the record changes.
+fn move_record(
+    retained: &Path,
+    document: &Path,
+    level: &str,
+    release: &str,
+    full: &str,
+    released: &str,
+) -> Result<(), String> {
+    let text = document_with(document, level, release, released)?;
+    write_record(
+        &retained.join(level).join("RELEASE"),
+        &format!(
             "release={release}\ncommit={full}\nreleased={released}\nsource=the committer date of the commit\n",
         ),
-    )
-    .map_err(|error| format!("{}: {error}", path.display()))?;
+    )?;
+    write_record(document, &text)
+}
+
+/// Writes one file of the record.
+fn write_record(path: &Path, content: &str) -> Result<(), String> {
+    std::fs::write(path, content).map_err(|error| format!("{}: {error}", path.display()))?;
     println!("wrote {}", path.display());
-    std::fs::write(&document, text).map_err(|error| format!("{}: {error}", document.display()))?;
-    println!("wrote {}", document.display());
     Ok(())
 }
 
-/// The document on the support window with the row of `level` given its release and the day it was
-/// built, which the document's test holds equal to the records; and where it is.
-fn document_with(level: &str, release: &str, released: &str) -> Result<(PathBuf, String), String> {
-    let path = repository().join("docs/releases/support-window.md");
+/// The text of `document`, the document on the support window, with the row of `level` given its
+/// release and the day it was built, which the document's test holds equal to the records.
+fn document_with(
+    path: &Path,
+    level: &str,
+    release: &str,
+    released: &str,
+) -> Result<String, String> {
     let text =
-        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let begin = "<!-- retained-levels:begin -->\n";
     let end = "<!-- retained-levels:end -->";
     let (Some(from), Some(to)) = (text.find(begin), text.find(end)) else {
@@ -478,12 +505,110 @@ fn document_with(level: &str, release: &str, released: &str) -> Result<(PathBuf,
     if !changed {
         return Err(format!("{} has no row for level {level}", path.display()));
     }
-    Ok((path, format!("{}{block}{}", &text[..from], &text[to..])))
+    Ok(format!("{}{block}{}", &text[..from], &text[to..]))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::time::{Duration, SystemTime};
+
     use crate::public_majors::record_of;
+
+    use super::move_record;
+
+    const FULL: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn modified(path: &Path) -> SystemTime {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .expect("the file's time")
+    }
+
+    /// Gives a file a modification time in the past, which nothing that runs now can give it.
+    fn long_ago(path: &Path) -> SystemTime {
+        let then = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(then))
+            .expect("the time is set");
+        then
+    }
+
+    /// Moving a level's record to the release it already names writes nothing: the files keep the
+    /// times they have, so a build that was made from them is not taken for one made before a change
+    /// that was never made, and a change of content is written.
+    #[test]
+    fn a_record_that_names_the_same_release_is_not_written_again() {
+        let root =
+            std::env::temp_dir().join(format!("kr-protocol-gen-record-{}", std::process::id()));
+        let retained = root.join("retained");
+        std::fs::create_dir_all(retained.join("0.75")).expect("the level's directory");
+        let document = root.join("support-window.md");
+        std::fs::write(
+            &document,
+            "the window\n<!-- retained-levels:begin -->\n| 0.75 | 0.75.0+aaaaaaaaaaaa | 2026-01-01 |\n<!-- retained-levels:end -->\n",
+        )
+        .expect("the document");
+        let record = retained.join("0.75").join("RELEASE");
+
+        move_record(
+            &retained,
+            &document,
+            "0.75",
+            "0.75.0+bbbbbbbbbbbb",
+            FULL,
+            "2026-02-02",
+        )
+        .expect("the record moves");
+        let written = std::fs::read_to_string(&record).expect("the record");
+        assert!(written.contains("release=0.75.0+bbbbbbbbbbbb"), "{written}");
+        let row = std::fs::read_to_string(&document).expect("the document");
+        assert!(
+            row.contains("| 0.75 | 0.75.0+bbbbbbbbbbbb | 2026-02-02 |"),
+            "{row}"
+        );
+
+        let times = [long_ago(&record), long_ago(&document)];
+        move_record(
+            &retained,
+            &document,
+            "0.75",
+            "0.75.0+bbbbbbbbbbbb",
+            FULL,
+            "2026-02-02",
+        )
+        .expect("the same record is moved to again");
+        assert_eq!(
+            [modified(&record), modified(&document)],
+            times,
+            "the files are as they were, not written with what they already hold"
+        );
+
+        move_record(
+            &retained,
+            &document,
+            "0.75",
+            "0.75.0+cccccccccccc",
+            FULL,
+            "2026-03-03",
+        )
+        .expect("the record moves to another release");
+        assert!(
+            std::fs::read_to_string(&record)
+                .expect("the record")
+                .contains("release=0.75.0+cccccccccccc"),
+            "a change of content is written"
+        );
+        assert!(
+            std::fs::read_to_string(&document)
+                .expect("the document")
+                .contains("| 0.75 | 0.75.0+cccccccccccc | 2026-03-03 |"),
+            "and so is the document's"
+        );
+        std::fs::remove_dir_all(&root).expect("the directory goes");
+    }
 
     const TWO_ROWS: &str = r#"pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 0);
 pub const PUBLIC_MAJORS: &[PublicMajor] = &[
