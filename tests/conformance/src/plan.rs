@@ -1251,6 +1251,18 @@ fn windows() -> Vec<Step> {
             ],
             "a_command_node_is_refused_where_no_command_can_be_run",
         ),
+        Step::cargo(
+            Group::Rust,
+            "the automation engine's causal chain",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-automation",
+                "--test",
+                "causal_budget",
+            ],
+        ),
         qualified_only(
             "the contact skill's installer",
             &[

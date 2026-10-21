@@ -859,6 +859,14 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-automation --test definitions a_command_node_is_refused_where_no_command_can_be_run
 
+      # The engine's causal chain: the root, depth and parent a descendant keeps from the node that
+      # produced its trigger, no workflow retriggering on its own descendants unless its definition
+      # says so, and one budget for the whole chain across a restart. The engine runs on this
+      # platform; what it refuses is a repository operation and a command node, not a chain.
+      - name: Test the automation causal chain
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-automation --test causal_budget
+
       # The contact skill installed and removed on this platform: the installer's own tests, the
       # crash accounting among them, and a configuration refused before anything is written where
       # it carries an entry set on it or is encrypted, replaced with the same access where its
