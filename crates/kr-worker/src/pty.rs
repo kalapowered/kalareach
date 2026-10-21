@@ -873,7 +873,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_start_whose_moment_passes_as_the_process_is_created_runs_nothing() {
-        use crate::windows::conpty::{CREATED, OutputWaiter};
+        use crate::windows::conpty::{CREATED, OutputWaiter, RESUMED};
 
         let host = kr_ipc::testing::TempHost::create();
         let work = host.root().join("work");
@@ -882,13 +882,17 @@ mod tests {
         command.cwd = work.display().to_string();
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         CREATED.with(|created| created.borrow_mut().take());
-        // Whether the process was there, to be described by the kernel, when the start was refused.
+        RESUMED.with(|resumed| resumed.set(false));
+        // Whether the process was there, to be described by the kernel, and had not been resumed,
+        // when the start was refused.
         let existed = std::cell::Cell::new(false);
+        let not_yet_running = std::cell::Cell::new(false);
         let refused = pty.launch(&command, |_| {
             match CREATED.with(|created| created.borrow().as_ref().map(|(process, _)| *process)) {
                 None => Ok(()),
                 Some(process) => {
                     existed.set(kr_ipc::identity::process_start_identity(process).is_ok());
+                    not_yet_running.set(!RESUMED.with(std::cell::Cell::get));
                     Err(WorkerError::PermissionDenied {
                         detail: "the moment has passed".to_owned(),
                     })
@@ -906,6 +910,10 @@ mod tests {
         assert!(
             existed.get(),
             "the process existed when the start was refused"
+        );
+        assert!(
+            not_yet_running.get(),
+            "the process had not been resumed when the start was refused"
         );
         // The process goes: ended by the refused start. A process handle is signalled when the
         // process ends, so this waits on that and not on a clock; the minute only ends a case

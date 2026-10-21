@@ -30,6 +30,9 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 thread_local! {
     pub(crate) static CREATED: std::cell::RefCell<Option<(u32, OwnedHandle)>> =
         const { std::cell::RefCell::new(None) };
+    // Set where this thread resumes a process it created, so that a case can say a start was
+    // refused before the process ran.
+    pub(crate) static RESUMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// How much each pipe buffers before a write has to wait for the other end.
@@ -822,6 +825,8 @@ mod handle {
             terminate_unstarted(&created.process, &refusal.to_string())?;
             return Err(super::StartFailure::Refused(refusal));
         }
+        #[cfg(test)]
+        super::RESUMED.with(|resumed| resumed.set(true));
         // SAFETY: the thread is the one the creation made, suspended, and this handle is the only
         // one for it. Resuming it is what starts the process running.
         let resumed = unsafe { ResumeThread(created.thread.as_raw_handle().cast()) };
