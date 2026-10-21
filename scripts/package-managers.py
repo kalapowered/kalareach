@@ -38,7 +38,7 @@ ARCHIVE = re.compile(
 )
 
 HOMEPAGE = "https://github.com/kalapowered/kalareach"
-DESCRIPTION = "Managed terminal sessions for AI coding agents, with a host that keeps them running"
+DESCRIPTION = "Managed terminal sessions for AI coding agents"
 
 # What winget names the package and its publisher, which is the name its Authenticode signature
 # carries. A submission to winget's community repository is the owner's to make.
@@ -154,7 +154,8 @@ def formula(release, url_prefix, archives):
   end
 
   test do
-    assert_match version.to_s, shell_output("#{{bin}}/kr --version")
+    # `kr --version` states the crate's version; the release name adds the commit after a plus.
+    assert_match version.to_s.split("+").first, shell_output("#{{bin}}/kr --version")
   end
 end
 """
@@ -183,6 +184,10 @@ def winget(release, url_prefix, archives):
         + tail,
         f"{WINGET_PACKAGE}.installer.yaml": head
         + "InstallerType: zip\nNestedInstallerType: portable\nInstallModes:\n  - silent\n"
+        # The programs of a release find one another beside themselves, so `kr` is started from the
+        # release's own directory on the search path: a link to it in winget's links directory would
+        # make the host look for its programs beside the link.
+        + "ArchiveBinariesDependOnPath: true\n"
         + "Commands:\n  - kr\nInstallers:\n"
         + "\n".join(installers)
         + "\nManifestType: installer\n"
@@ -292,6 +297,10 @@ def self_test():
         report(
             "winget names each Windows archive's digest in upper case",
             all(digest(target).upper() in installer for target in FAMILIES["winget"]),
+        )
+        report(
+            "winget puts the tree's `bin` on the search path",
+            installer.count("ArchiveBinariesDependOnPath: true") == 1,
         )
         report(
             "winget starts `kr` from the tree's `bin`",
