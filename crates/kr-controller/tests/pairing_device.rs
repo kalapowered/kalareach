@@ -22,8 +22,10 @@
 //! | `device` | `go-device` | `device-value.txt`: the value of a second device the host asks the phone to confirm; `device-result.txt` once the phone's answer paired it |
 //!
 //! `KR_HARNESS_PEER` is the name the phone reaches this machine by: `127.0.0.1` for a simulator,
-//! which shares the machine's network, and `10.0.2.2` for an emulator. `KR_HARNESS_SECONDS` bounds
-//! the whole run. It is for the machines a simulator or an emulator runs on, which are Unix. No
+//! which shares the machine's network, and `10.0.2.2` for an emulator. `KR_HARNESS_SERVICE_PEER` is
+//! the name it reaches the other service of the `code` phase by, which is `KR_HARNESS_PEER` unless
+//! the script gives that port another way in (an emulator's own loopback interface, through a
+//! tunnel); `ready.json` says the port. `KR_HARNESS_SECONDS` bounds the whole run. It is for the machines a simulator or an emulator runs on, which are Unix. No
 //! test here calls a live service.
 
 #![cfg(unix)]
@@ -190,6 +192,8 @@ fn the_committed_qr_pictures_are_the_fixtures_drawn_the_way_the_host_draws_them(
 struct Run {
     directory: PathBuf,
     peer: String,
+    /// The name the phone reaches the other service of the `code` phase by.
+    service_peer: String,
     owner: DeviceKeys,
     host: Host,
     environment: EnvironmentId,
@@ -333,7 +337,7 @@ impl Run {
         let QrPayload::Code(fixed) = QrPayload::from_text(text).expect("the fixture reads") else {
             panic!("the fixture's code QR is a code payload");
         };
-        let origin = RendezvousOrigin::new(format!("https://{}:{port}", self.peer))
+        let origin = RendezvousOrigin::new(format!("https://{}:{port}", self.service_peer))
             .expect("an origin the phone is asked to use");
         let named = QrPayload::Code(CodeQrPayload {
             rendezvous_origin: origin,
@@ -486,6 +490,7 @@ impl Run {
 async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
     let directory = PathBuf::from(std::env::var("KR_HARNESS_DIR").expect("KR_HARNESS_DIR"));
     let peer = std::env::var("KR_HARNESS_PEER").unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let service_peer = std::env::var("KR_HARNESS_SERVICE_PEER").unwrap_or_else(|_| peer.clone());
     let seconds: u64 = std::env::var("KR_HARNESS_SECONDS")
         .ok()
         .and_then(|seconds| seconds.parse().ok())
@@ -512,11 +517,15 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
     let run = Run {
         directory: directory.clone(),
         peer,
+        service_peer,
         owner,
         host,
         environment,
     };
-    run.say("ready.json", "{\"ready\":true}\n");
+    run.say(
+        "ready.json",
+        &format!("{{\"ready\":true,\"service_port\":{port}}}\n"),
+    );
 
     // Each phase waits for its own `go-<phase>`, so one that the script never asks for, or that
     // stops where its cases failed, holds up no other.
