@@ -1758,6 +1758,34 @@ async fn a_run_names_the_revision_it_executed_and_a_revision_never_installed_is_
         );
     }
 
+    // The latest revision is the bar, not the set of numbers installed: with revision 4 in place,
+    // revision 3, which nobody installed, is below it and is refused as a conflict.
+    let fourth = WorkflowDefinition {
+        revision: U64::new(4),
+        name: "versioned, numbers skipped".to_owned(),
+        ..first.clone()
+    };
+    let installed = install(&mut control, &host, &fourth).await;
+    assert_eq!(installed.revision, fourth.revision);
+    let below = WorkflowDefinition {
+        revision: third,
+        name: "versioned, below the latest".to_owned(),
+        ..first.clone()
+    };
+    let refused = refused_mutation(
+        &mut control,
+        &host,
+        Method::WorkflowInstall,
+        &WorkflowInstallParams {
+            workflow_id: below.workflow_id,
+            revision: below.revision,
+            definition: below.clone(),
+            grant_reference: below.grant_reference,
+        },
+    )
+    .await;
+    assert_eq!(refused.code, ErrorCode::DraftConflict, "{refused:?}");
+
     host.clients.abort();
 }
 
