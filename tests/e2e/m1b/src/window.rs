@@ -28,14 +28,71 @@ pub const COLUMNS: u16 = 100;
 /// The rows every window has.
 pub const ROWS: u16 = 30;
 
+/// The writing end of a window's terminal, shared by whoever types into it.
+type Keys = Arc<Mutex<Box<dyn Write + Send>>>;
+
+/// What a window has been sent, and the replies it owes the questions its program asks.
+#[derive(Debug, Default)]
+struct Transcript {
+    bytes: Vec<u8>,
+    owed: Vec<Owed>,
+}
+
+impl Transcript {
+    /// Takes the replies whose question has arrived, leaving the rest owed.
+    fn take_due(&mut self) -> Vec<Owed> {
+        let (due, waiting) = std::mem::take(&mut self.owed)
+            .into_iter()
+            .partition(|owed| owed.is_due(&self.bytes));
+        self.owed = waiting;
+        due
+    }
+}
+
+/// A reply a terminal types the moment the question it answers has arrived.
+#[derive(Debug)]
+struct Owed {
+    mark: usize,
+    question: &'static [u8],
+    reply: &'static [u8],
+    typed: std::sync::mpsc::Sender<bool>,
+}
+
+impl Owed {
+    /// Whether the question is among the bytes sent since the mark.
+    fn is_due(&self, sent: &[u8]) -> bool {
+        sent.get(self.mark..)
+            .is_some_and(|since| contains(since, self.question))
+    }
+
+    /// Types the reply, and says whether the terminal took it.
+    fn type_into(self, keys: &Keys) {
+        let mut keys = keys.lock().unwrap_or_else(PoisonError::into_inner);
+        let typed = keys
+            .write_all(self.reply)
+            .and_then(|()| keys.flush())
+            .is_ok();
+        let _ = self.typed.send(typed);
+    }
+}
+
+/// A reply a window owes, which [`answered`] waits for.
+#[derive(Debug)]
+pub struct Answering(std::sync::mpsc::Receiver<bool>);
+
 /// Everything a terminal has been sent, collected by a thread of its own.
+///
+/// The same thread types the replies a window owes. A question with a deadline of its own, as the
+/// capability exchange has, is answered by the thread that finds it in the stream rather than by
+/// one that looks for it from time to time: a thread that sleeps between looks is woken late on a
+/// machine under load, and the question's time runs out while it sleeps.
 #[derive(Clone, Debug, Default)]
 pub struct Collected {
-    seen: Arc<Mutex<Vec<u8>>>,
+    seen: Arc<Mutex<Transcript>>,
 }
 
 impl Collected {
-    fn collect(mut reader: Box<dyn Read + Send>) -> Self {
+    fn collect(mut reader: Box<dyn Read + Send>, keys: Keys) -> Self {
         let collected = Self::default();
         let seen = Arc::clone(&collected.seen);
         std::thread::spawn(move || {
@@ -44,12 +101,48 @@ impl Collected {
                 if read == 0 {
                     break;
                 }
-                seen.lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .extend_from_slice(&buffer[..read]);
+                let due = {
+                    let mut transcript = seen.lock().unwrap_or_else(PoisonError::into_inner);
+                    transcript.bytes.extend_from_slice(&buffer[..read]);
+                    transcript.take_due()
+                };
+                for owed in due {
+                    owed.type_into(&keys);
+                }
             }
+            // A question that never came is not going to: whoever waits for its reply is told so.
+            seen.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .owed
+                .clear();
         });
         collected
+    }
+
+    /// Types `reply` the moment `question` is among the bytes sent since `mark`, or at once when
+    /// it already is.
+    fn reply_to(
+        &self,
+        mark: usize,
+        question: &'static [u8],
+        reply: &'static [u8],
+        keys: &Keys,
+    ) -> Answering {
+        let (typed, outcome) = std::sync::mpsc::channel();
+        let owed = Owed {
+            mark,
+            question,
+            reply,
+            typed,
+        };
+        let mut transcript = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if owed.is_due(&transcript.bytes) {
+            drop(transcript);
+            owed.type_into(keys);
+        } else {
+            transcript.owed.push(owed);
+        }
+        Answering(outcome)
     }
 
     /// How much has been sent so far. A later wait can start from here.
@@ -58,6 +151,7 @@ impl Collected {
         self.seen
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .bytes
             .len()
     }
 
@@ -67,6 +161,7 @@ impl Collected {
         self.seen
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .bytes
             .get(mark..)
             .map(<[u8]>::to_vec)
             .unwrap_or_default()
@@ -82,7 +177,7 @@ pub struct Window {
     pair: portable_pty::PtyPair,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     collected: Collected,
-    keys: Arc<Mutex<Box<dyn Write + Send>>>,
+    keys: Keys,
 }
 
 impl std::fmt::Debug for Window {
@@ -134,8 +229,11 @@ impl Window {
         if let Some(pid) = child.process_id() {
             run.record_child(pid, what);
         }
-        let collected = Collected::collect(pair.master.try_clone_reader().expect("a reader"));
-        let keys = Arc::new(Mutex::new(pair.master.take_writer().expect("a writer")));
+        let keys: Keys = Arc::new(Mutex::new(pair.master.take_writer().expect("a writer")));
+        let collected = Collected::collect(
+            pair.master.try_clone_reader().expect("a reader"),
+            Arc::clone(&keys),
+        );
         Self {
             what: what.to_owned(),
             withheld: false,
@@ -256,26 +354,13 @@ impl Window {
         }
     }
 
-    /// Answers the next capability exchange `kr` starts on this terminal after `mark`, from a
-    /// thread of its own: the exchange has one second in all.
+    /// Answers the next capability exchange `kr` starts on this terminal after `mark`: the
+    /// exchange has one second in all, so the answer is typed by the thread that collects what the
+    /// terminal is sent, the moment the question that ends the exchange arrives.
     #[must_use]
-    pub fn answer_capability_queries(&self, mark: usize) -> std::thread::JoinHandle<bool> {
-        let collected = self.collected.clone();
-        let keys = Arc::clone(&self.keys);
-        std::thread::spawn(move || {
-            let started = Instant::now();
-            while started.elapsed() < LIVENESS {
-                if contains(&collected.since(mark), b"\x1b[c") {
-                    let mut keys = keys.lock().unwrap_or_else(PoisonError::into_inner);
-                    return keys
-                        .write_all(PROBE_ANSWER)
-                        .and_then(|()| keys.flush())
-                        .is_ok();
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            false
-        })
+    pub fn answer_capability_queries(&self, mark: usize) -> Answering {
+        self.collected
+            .reply_to(mark, b"\x1b[c", PROBE_ANSWER, &self.keys)
     }
 
     /// Waits for the program to exit, and returns its status.
@@ -345,14 +430,15 @@ pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
-/// Waits for the thread answering a window's capability queries.
+/// Waits for the reply to a window's capability queries to be typed.
 ///
 /// # Panics
 ///
-/// Panics with what the window was sent when `kr` never asked or the answer could not be typed.
-pub fn answered(window: &Window, queries: std::thread::JoinHandle<bool>) {
+/// Panics with what the window was sent when `kr` never asked, the answer could not be typed, or
+/// the question did not come within [`LIVENESS`].
+pub fn answered(window: &Window, queries: Answering) {
     assert!(
-        queries.join().unwrap_or(false),
+        queries.0.recv_timeout(LIVENESS).unwrap_or(false),
         "{}: kr never asked this terminal what it is, or the answer could not be typed; the \
          terminal was sent: {}",
         window.what,
