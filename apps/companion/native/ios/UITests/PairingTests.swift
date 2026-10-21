@@ -40,7 +40,7 @@ final class PairingTests: DeviceTestCase {
     }
 
     /// Waits until the host has written `name`.
-    private func waitFor(_ name: String, timeout: TimeInterval = 180) {
+    private func waitFor(_ name: String, timeout: TimeInterval = 60) {
         eventually("the host to write \(name)", timeout: timeout) { FileManager.default.fileExists(atPath: path(name)) }
     }
 
@@ -56,7 +56,10 @@ final class PairingTests: DeviceTestCase {
             if condition() { return }
             Thread.sleep(forTimeInterval: 0.25)
         }
-        XCTFail("timed out waiting for: \(message)")
+        // What the screen showed when the wait ended, for whoever reads the failure.
+        let labels = app.staticTexts.allElementsBoundByIndex.prefix(40).map { $0.label }.joined(separator: " | ")
+        screenshot("timeout")
+        XCTFail("timed out waiting for: \(message); the screen shows: \(labels)")
     }
 
     // MARK: The page
@@ -98,13 +101,14 @@ final class PairingTests: DeviceTestCase {
     }
 
     /// Chooses the newest picture in the system's photo picker. The picker is the system's, drawn in
-    /// this application's window, and has no identifier for a picture but its position.
+    /// this application's window; its pictures are images that share one identifier, newest first.
     private func chooseTheNewestPicture() {
         press("Choose a photo")
-        let pictures = app.scrollViews.images
-        XCTAssertTrue(pictures.firstMatch.waitForExistence(timeout: 30), "the photo picker showed no picture")
-        // The library lists the newest picture last.
-        pictures.element(boundBy: pictures.count - 1).tap()
+        let newest = app.images.matching(identifier: "PXGGridLayout-Info").firstMatch
+        XCTAssertTrue(newest.waitForExistence(timeout: 30), "the photo picker showed no picture")
+        // The grid draws its pictures itself and reports none of them as hittable, so the tap goes to
+        // the middle of the picture's box.
+        newest.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
     }
 
     // MARK: The cases
