@@ -44,6 +44,8 @@ use kr_worker::broker::{
 use kr_worker::persistence::JournalHealth;
 use tokio::io::AsyncReadExt as _;
 
+mod common;
+
 const NOW: TimestampMs = TimestampMs::new(10);
 
 fn session() -> SessionId {
@@ -92,6 +94,16 @@ struct World {
 impl World {
     /// `upstream_capacity` bytes is what the pipe to the server holds before a write waits.
     fn new(upstream_capacity: usize) -> Self {
+        Self::opened(upstream_capacity, None)
+    }
+
+    /// A world whose broker keeps its ledger beside a session's receipt journal and reads that
+    /// journal's condition, as a worker's does.
+    fn with_store(shared: &common::SharedStore) -> Self {
+        Self::opened(1 << 20, Some(shared))
+    }
+
+    fn opened(upstream_capacity: usize, shared: Option<&common::SharedStore>) -> Self {
         let root = std::env::temp_dir().join(format!("kr-stream-{}", kr_ipc::new_uuid()));
         std::fs::create_dir_all(&root).expect("a store directory");
         let store = Store(root);
@@ -107,7 +119,11 @@ impl World {
         }];
         let connector = InstalledConnector::read(source.clone()).expect("the package is read");
         let broker = Arc::new(
-            Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"),
+            match shared {
+                Some(shared) => Broker::open(Some(&shared.path), session(), shared.health()),
+                None => Broker::open(None, session(), JournalHealth::shared()),
+            }
+            .expect("the broker opens"),
         );
         let admissions = Admissions::new();
         let sources = ConnectorSources::new();
@@ -1881,5 +1897,200 @@ async fn kr_req_12_06_a_held_permit_is_stopped_by_a_leave_an_unlisted_frame_and_
     assert_eq!(
         world.broker.pending(id).expect("held").state,
         PendingState::Pending
+    );
+}
+
+/// Waits until the resource is in `state`, within the liveness bound.
+async fn state_of(world: &World, id: kr_protocol::ids::PendingResourceId, state: PendingState) {
+    let started = std::time::Instant::now();
+    while world.broker.pending(id).expect("held").state != state {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "{id} did not become {state:?}: {:?}",
+            world.broker.pending(id)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// KR-REQ-11.33, KR-REQ-11.35 and KR-REQ-11.37: the receipt journal faults after a rich answer
+/// was admitted and before its dispatch marker is written. The marker that cannot be written is
+/// the rich answer's refusal, proven before any byte, so the terminal's answer is the one that
+/// goes and settles the request, volatile, and the gap commits that settlement when the store
+/// recovers. This is the order in which the rich answer loses to a journal fault, which a
+/// committed marker followed by a failed transmission is not.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_35_a_journal_fault_before_the_rich_marker_leaves_the_terminals_answer_the_one_that_goes()
+ {
+    let mut store = common::SharedStore::open();
+    let mut world = World::with_store(&store);
+    world.terminal_selects("thread-1").await;
+    world.server_says(ASK).await;
+    let id = world.broker.pending_resources()[0].resource_id;
+    let admitted = world
+        .broker
+        .admit_approval(&World::owner_caller(), &world.rich_answer("accept"), NOW)
+        .expect("the rich answer is admitted");
+
+    store.fault_acceptance();
+    let Err(fenced) = world.broker.mark_approval(&admitted, NOW) else {
+        panic!("the marker cannot be written under a fault");
+    };
+    assert!(fenced.proven_unsent(), "{fenced:?}");
+    assert_eq!(
+        world.broker.pending(id).expect("held").state,
+        PendingState::Pending,
+        "the claim was given back"
+    );
+
+    // The terminal's answer is carried through the fault and settles the request.
+    let carried = world
+        .owner
+        .from_client(TERMINAL_ANSWERS, NOW)
+        .await
+        .expect("the terminal's answer is carried");
+    assert!(
+        matches!(carried, Carried::ClientAnswer { .. }),
+        "{carried:?}"
+    );
+    state_of(&world, id, PendingState::Resolved).await;
+    let sent = world.server_reads().await;
+    assert_eq!(sent["id"], "approval-1");
+    assert_eq!(
+        sent["result"]["decision"], "decline",
+        "the one answer upstream is the terminal's"
+    );
+    assert_eq!(
+        world.broker.pending(id).expect("held").durability,
+        kr_protocol::session::Durability::Volatile,
+        "the settlement was made while the journal was faulted"
+    );
+
+    // Storage returns, and the gap commits what the settlement was.
+    store.recover_journal(20);
+    world
+        .broker
+        .recover(TimestampMs::new(20))
+        .expect("the broker commits its gap");
+    assert_eq!(
+        world.broker.pending(id).expect("held").state,
+        PendingState::Resolved
+    );
+}
+
+/// KR-REQ-11.33, KR-REQ-11.35 and KR-REQ-11.37: the receipt journal faults after the rich answer's
+/// dispatch marker is written. The rich bytes go, the terminal's later answer is not forwarded and
+/// does not end the connection, and the settlement is volatile and committed at recovery.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_35_a_journal_fault_after_the_rich_marker_leaves_the_rich_answer_the_one_that_goes()
+ {
+    let mut store = common::SharedStore::open();
+    let mut world = World::with_store(&store);
+    world.terminal_selects("thread-1").await;
+    world.server_says(ASK).await;
+    let id = world.broker.pending_resources()[0].resource_id;
+    let admitted = world
+        .broker
+        .admit_approval(&World::owner_caller(), &world.rich_answer("accept"), NOW)
+        .expect("the rich answer is admitted");
+    let marked = world
+        .broker
+        .mark_approval(&admitted, NOW)
+        .expect("the marker is committed");
+
+    store.fault_acceptance();
+    let (dispatch, request) = marked.transmission();
+    let pending = dispatch.submit(&request).expect("the bytes are queued");
+    let in_flight = marked.submitted(pending);
+    let settled = in_flight.settled(NOW).await.expect("the answer went");
+    assert_eq!(settled.state, PendingState::Resolved);
+    let sent = world.server_reads().await;
+    assert_eq!(sent["result"]["decision"], "accept");
+
+    // The terminal's answer comes late: it is not forwarded, and the connection goes on.
+    let late = world
+        .owner
+        .from_client(TERMINAL_ANSWERS, NOW)
+        .await
+        .expect("a late answer does not end the connection");
+    assert!(
+        matches!(
+            late,
+            Carried::ClientAnswerLate {
+                state: PendingState::Resolved,
+                ..
+            }
+        ),
+        "{late:?}"
+    );
+    assert_eq!(
+        world.broker.pending(id).expect("held").durability,
+        kr_protocol::session::Durability::Volatile
+    );
+    store.recover_journal(20);
+    world
+        .broker
+        .recover(TimestampMs::new(20))
+        .expect("the broker commits its gap");
+    assert_eq!(
+        world.broker.pending(id).expect("held").state,
+        PendingState::Resolved
+    );
+}
+
+/// KR-REQ-11.33 and KR-REQ-11.35: a committed marker followed by a transmission that fails is not
+/// a refusal. The answer's fate is unknown, the connection a failed write ends serves the terminal
+/// nothing more, the request stays uncertain, and nobody sends it again.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_35_a_committed_marker_followed_by_a_failed_transmission_leaves_the_request_uncertain()
+ {
+    let store = common::SharedStore::open();
+    let mut world = World::with_store(&store);
+    world.terminal_selects("thread-1").await;
+    world.server_says(ASK).await;
+    let id = world.broker.pending_resources()[0].resource_id;
+    let admitted = world
+        .broker
+        .admit_approval(&World::owner_caller(), &world.rich_answer("accept"), NOW)
+        .expect("the rich answer is admitted");
+    let marked = world
+        .broker
+        .mark_approval(&admitted, NOW)
+        .expect("the marker is committed");
+
+    // The server's end of the pipe is gone: the bytes cannot be written.
+    drop(std::mem::replace(
+        &mut world.upstream,
+        tokio::io::duplex(1).0,
+    ));
+    let (dispatch, request) = marked.transmission();
+    let failed = match dispatch.submit(&request) {
+        Ok(pending) => marked.submitted(pending).settled(NOW).await.err(),
+        Err(error) => Some(marked.refused(error)),
+    };
+    let failed = failed.expect("the answer could not be written");
+    assert!(
+        !failed.proven_unsent(),
+        "after the marker nobody can establish what happened: {failed:?}"
+    );
+    state_of(&world, id, PendingState::Uncertain).await;
+
+    // A write that failed ended the connection, so the terminal's answer comes to a connection
+    // that no longer serves, and nothing is written for it. The request stays uncertain: no
+    // writer answers it again.
+    world
+        .owner
+        .from_client(TERMINAL_ANSWERS, NOW)
+        .await
+        .expect_err("the connection ended with the failed write");
+    assert_eq!(
+        world.broker.pending(id).expect("held").state,
+        PendingState::Uncertain
     );
 }
