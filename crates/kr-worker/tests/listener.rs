@@ -1,22 +1,16 @@
-//! The local listener, bridge registration and the binary a live binding is pinned to.
+//! The local listener and bridge registration.
 
-use kr_protocol::broker::{BinaryIdentity, IntegrationMode};
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
-use kr_protocol::ids::{ApplicationInstanceId, LaunchProfileId, SessionId};
+use kr_protocol::ids::{ApplicationInstanceId, LaunchProfileId};
 use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
 use kr_worker::broker::{
-    BoundBinary, BoundEndpoint, BridgeHello, Broker, BrokerTransport, Credential, ListenerAddress,
-    ManagedProcess, PeerIdentity, Registration, TransportHandle, listener::BROWSER_HEADERS,
+    BoundEndpoint, BridgeHello, BrokerTransport, Credential, ListenerAddress, ManagedProcess,
+    PeerIdentity, Registration, TransportHandle, listener::BROWSER_HEADERS,
 };
-use kr_worker::persistence::JournalHealth;
 
 mod common;
 
 const CREDENTIAL: [u8; 32] = [9; 32];
-
-fn session() -> SessionId {
-    SessionId::new(Uuid::from_bytes([1; 16]))
-}
 
 fn instance() -> ApplicationInstanceId {
     ApplicationInstanceId::new(Uuid::from_bytes([2; 16]))
@@ -297,57 +291,4 @@ async fn kr_req_11_43_registration_needs_the_launch_binding_and_the_private_exch
     drop(connecting.await.expect("the connecting task finishes"));
     drop(endpoint);
     let _ = std::fs::remove_dir_all(&directory);
-}
-
-/// KR-REQ-12.15: an executable upgrade affects new launches; an existing binding keeps the binary
-/// identity it was bound to.
-#[test]
-fn kr_req_12_15_a_bound_binary_identity_is_the_one_a_running_binding_acts_under() {
-    let original = BinaryIdentity {
-        resolved_path: "/usr/local/bin/codex".to_owned(),
-        digest: Digest256::from_bytes([3; 32]),
-        version: "0.9.1".to_owned(),
-        distribution: "homebrew".to_owned(),
-    };
-    let upgraded = BinaryIdentity {
-        digest: Digest256::from_bytes([4; 32]),
-        version: "0.9.2".to_owned(),
-        ..original.clone()
-    };
-
-    let bound = BoundBinary::pin(original.clone(), process(41, 900));
-    assert_eq!(
-        bound.identity_for(&upgraded).version,
-        "0.9.1",
-        "a running binding acts under the identity it was bound to"
-    );
-    assert!(bound.differs_from_installed(&upgraded));
-    assert!(!bound.differs_from_installed(&original));
-    assert_eq!(bound.pinned.digest, Digest256::from_bytes([3; 32]));
-    assert_eq!(BoundBinary::for_new_launch(&upgraded).version, "0.9.2");
-
-    // And the live broker agrees: the connection the running process authenticated is still its
-    // own after the file on disk changed.
-    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
-    broker
-        .register_instance(
-            instance(),
-            IntegrationMode::Gateway,
-            Some(LaunchProfileId::new("lp-1").expect("valid")),
-            Some(managed(process(41, 900))),
-        )
-        .expect("the instance is registered");
-    broker.invalidate_capabilities(
-        kr_protocol::broker::InstanceInvalidation::BinaryChanged,
-        "the executable was upgraded",
-        TimestampMs::new(5),
-    );
-    assert_eq!(
-        broker
-            .binding_state(instance())
-            .expect("the instance is still bound")
-            .binding_revision,
-        kr_protocol::ids::AgentBindingRevision::new(1),
-        "an upgrade on disk does not move a running binding"
-    );
 }

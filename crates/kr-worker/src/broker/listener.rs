@@ -18,13 +18,7 @@
 //!   and neither does an argument vector: the secret travels in an owner-only file the launched
 //!   process opens, and the file's protection is read back from the opened file before it is
 //!   trusted.
-//!
-//! And one property that belongs to a binding rather than to the listener: an installed upgrade
-//! affects new launches. [`BoundBinary`] is pinned when a process starts, and
-//! [`BoundBinary::identity_for`] is what says a running binding keeps the identity it was bound
-//! to.
 
-use kr_protocol::broker::BinaryIdentity;
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{ApplicationInstanceId, LaunchProfileId};
 
@@ -446,57 +440,6 @@ impl Registration {
     }
 }
 
-/// The binary one live binding is bound to.
-///
-/// Section 12: "An agent executable upgrade affects new launches; existing bindings retain their
-/// original binary identity, schema and adapter version." The identity is pinned here when the
-/// process starts, and nothing that happens on disk afterwards changes it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BoundBinary {
-    /// The identity resolved when the process started.
-    pub pinned: BinaryIdentity,
-    /// The process it belongs to.
-    pub process: ProcessStartIdentity,
-}
-
-impl BoundBinary {
-    /// Pins one binding to the binary its process started from.
-    #[must_use]
-    pub const fn pin(pinned: BinaryIdentity, process: ProcessStartIdentity) -> Self {
-        Self { pinned, process }
-    }
-
-    /// Returns the identity this binding acts under, whatever is on disk now.
-    ///
-    /// The whole of section 12's rule is that this returns the pinned identity and not the
-    /// installed one. It takes the installed identity so that a caller cannot accidentally ask a
-    /// different question, and returns the pinned one so the answer is the rule.
-    #[must_use]
-    pub fn identity_for(&self, installed: &BinaryIdentity) -> &BinaryIdentity {
-        let _ = installed;
-        &self.pinned
-    }
-
-    /// Returns true when an installed upgrade has moved on from what this binding is bound to.
-    ///
-    /// It is a fact about the world rather than a permission: the binding keeps its identity
-    /// either way, and this is what a diagnostic shows a person so they know why a running
-    /// process reports an older version than the one on disk.
-    #[must_use]
-    pub fn differs_from_installed(&self, installed: &BinaryIdentity) -> bool {
-        &self.pinned != installed
-    }
-
-    /// Returns the identity a *new* launch resolves.
-    ///
-    /// This is the other half of the same rule: an upgrade affects new launches, and it is the new
-    /// launch that picks up what is on disk now.
-    #[must_use]
-    pub fn for_new_launch(installed: &BinaryIdentity) -> BinaryIdentity {
-        installed.clone()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,34 +769,6 @@ mod tests {
             "a runtime directory is an absolute path"
         );
         let _ = std::fs::remove_dir_all(&directory);
-    }
-
-    #[test]
-    fn an_installed_upgrade_leaves_a_running_binding_where_it_was() {
-        let original = BinaryIdentity {
-            resolved_path: "/usr/local/bin/codex".to_owned(),
-            digest: Digest256::from_bytes([3; 32]),
-            version: "0.9.1".to_owned(),
-            distribution: "homebrew".to_owned(),
-        };
-        let upgraded = BinaryIdentity {
-            digest: Digest256::from_bytes([4; 32]),
-            version: "0.9.2".to_owned(),
-            ..original.clone()
-        };
-        let bound = BoundBinary::pin(original.clone(), process(41, 900));
-        assert_eq!(
-            bound.identity_for(&upgraded),
-            &original,
-            "a running binding keeps the identity it was bound to"
-        );
-        assert!(bound.differs_from_installed(&upgraded));
-        assert!(!bound.differs_from_installed(&original));
-        assert_eq!(
-            BoundBinary::for_new_launch(&upgraded),
-            upgraded,
-            "and a new launch picks up what is on disk now"
-        );
     }
 
     /// The installation this process stands in for: its own executable, both surfaces.

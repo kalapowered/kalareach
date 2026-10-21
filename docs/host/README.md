@@ -6627,8 +6627,14 @@ all. A launch there is refused before any process starts, because a launched pro
 never be told its credential would only have to be stopped again.
 
 An executable upgrade affects new launches. An existing binding keeps the binary identity, schema
-and adapter version it was bound to, because the identity is pinned when the process starts and
-nothing that happens on disk afterwards reaches it.
+and adapter version it was bound to. The launch profile records the executable's path, digest and
+version before the program runs, and the binding's executable record is fixed when the binding is
+made: the path and digest the launch resolved, and the version the signed build record for that
+digest names. Nothing that happens on disk afterwards reaches it. The adapter version is the release
+the binding holds, and the schema is the table pinned for its instance. A program the host adopts
+rather than launches (a Unix host does this; a Windows host adopts nothing) is identified when it is
+adopted: on Linux from the running image, and on macOS from the file at the path the kernel reports,
+so a program replaced on disk before it was adopted has the new file's identity.
 
 ### Native bridges an application starts
 

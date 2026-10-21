@@ -385,17 +385,20 @@ fn kr_req_11_13_a_binding_is_made_only_from_the_admissions_held_at_their_frame()
     assert!(!live[0].ending);
 }
 
-/// KR-REQ-11.13: a live binding keeps the version its build's signed record named when it was
-/// bound. A later synchronisation that names another version for the same build changes the
-/// version a new binding takes, and not the live one's, in memory or in its row.
+/// KR-REQ-11.13 and KR-REQ-12.15: a live binding keeps the executable it was bound with, and an
+/// upgrade of the installed agent affects new bindings only. A later synchronisation that names
+/// another version for the same build changes the version a new binding takes, and a newer build
+/// at the same path changes the path's digest and version a new binding takes; the live binding's
+/// path, digest and version stay what they were, in memory and in its row.
 #[test]
-fn kr_req_11_13_a_binding_keeps_the_version_it_was_bound_with() {
+fn kr_req_11_13_a_binding_keeps_the_executable_it_was_bound_with() {
     let worker = Worker::open();
     let mut source = worker.claude_code();
     source.qualified = vec![build_named("2.1.278")];
     let first = worker.admit(1, vec![testing::admitted(&source)]);
     worker.register(2);
     worker.register(3);
+    worker.register(4);
     worker
         .bind(1, 2, source.package_digest, first)
         .expect("binds");
@@ -406,30 +409,68 @@ fn kr_req_11_13_a_binding_keeps_the_version_it_was_bound_with() {
         .bind(2, 3, source.package_digest, second)
         .expect("a new binding at the new frame");
 
-    let version = |number: u8| {
+    // The installed agent is upgraded: a newer build at the same path, which a signed record names.
+    let upgraded = MatchedExecutable {
+        path: program().path,
+        digest: Digest256::from_bytes([0x7b; 32]),
+    };
+    source.qualified = vec![
+        build_named("2.1.300"),
+        QualifiedExecutable {
+            digest: upgraded.digest,
+            version: "2.2.0".to_owned(),
+        },
+    ];
+    let third = worker.admit(3, vec![testing::admitted(&source)]);
+    worker
+        .broker
+        .bind(
+            binding(3),
+            instance(4),
+            source.package_digest,
+            third,
+            upgraded.clone(),
+            kr_ipc::now_ms(),
+        )
+        .expect("a binding for the upgraded executable");
+
+    let executable = |number: u8| {
         worker
             .broker
             .binding_record(binding(number))
             .and_then(|bound| bound.executable)
-            .and_then(|executable| executable.version)
+            .map(|executable| (executable.path, executable.digest, executable.version))
     };
+    let original = program();
     assert_eq!(
-        version(1).as_deref(),
-        Some("2.1.278"),
+        executable(1),
+        Some((
+            original.path.clone(),
+            original.digest,
+            Some("2.1.278".to_owned())
+        )),
         "the live binding's stays"
     );
     assert_eq!(
-        version(2).as_deref(),
-        Some("2.1.300"),
-        "a new binding takes the new"
+        executable(2),
+        Some((
+            original.path.clone(),
+            original.digest,
+            Some("2.1.300".to_owned())
+        )),
+        "a new binding takes the new version of the build it was launched from"
+    );
+    assert_eq!(
+        executable(3),
+        Some((upgraded.path, upgraded.digest, Some("2.2.0".to_owned()))),
+        "a binding for the upgraded executable takes the upgraded executable"
     );
     assert_eq!(
         worker
             .row(1)
             .and_then(|row| row.executable)
-            .and_then(|executable| executable.version)
-            .as_deref(),
-        Some("2.1.278"),
+            .map(|executable| (executable.path, executable.digest, executable.version)),
+        Some((original.path, original.digest, Some("2.1.278".to_owned()))),
         "and so does its row"
     );
 }

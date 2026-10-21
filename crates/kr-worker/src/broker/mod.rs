@@ -136,7 +136,7 @@ pub use crate::broker::ledger::{
     UnresolvedRecord,
 };
 pub use crate::broker::listener::{
-    BoundBinary, BridgeHello, ListenerAddress, Registration, reject_browser_origin,
+    BridgeHello, ListenerAddress, Registration, reject_browser_origin,
 };
 pub use crate::broker::methods::{
     ActionInFlight, AnswerInFlight, Caller, MarkedAnswer, MutationAdmission, MutationInFlight,
