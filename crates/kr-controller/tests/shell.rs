@@ -646,7 +646,9 @@ impl kr_controller::supervision::TerminalPresenter for RefusingTerminal {
 }
 
 /// KR-REQ-07.43, KR-REQ-07.31, KR-REQ-01.21: a terminal that cannot be opened is reported against
-/// the session that was created, and nothing creates a second one.
+/// the session that was created, and nothing creates a second one. The same create asked again, as
+/// by a caller that lost the answer, is answered from what the first came to: the same session
+/// and the same `TERMINAL_UNAVAILABLE`, with no second window asked for and no second session.
 /// KR-REQ-07.11: the failed presentation is attempted once and never retries the execution.
 /// KR-REQ-07.02: a create presented in a terminal asks for one terminal window running
 /// `kr attach` on the new session.
@@ -706,18 +708,23 @@ async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presenta
     let mut request = create(environment_id, ShellMode::NativeCompat, Some("/bin/sh"));
     request.presentation = Presentation::Terminal;
     request.cwd = Nullable::some(temp.root().display().to_string());
-    let created: kr_protocol::session::SessionCreateResult = client
-        .mutate(
+    let mutation = client
+        .compose(
             Method::SessionCreate,
             ActionId::new(kr_ipc::new_uuid()),
             target(environment_id),
             &request,
         )
         .await
+        .expect("composes the request");
+    let created: kr_protocol::session::SessionCreateResult = client
+        .repeat(&mutation)
+        .await
         .expect("reaches the daemon")
         .expect("the session is created whether or not a window opened")
         .to_typed()
         .expect("decodes");
+    assert!(!created.deduplicated, "the first ask makes the session");
 
     let refusal = created
         .presentation_error
@@ -752,6 +759,36 @@ async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presenta
         "a window opened on a display number would attach to whichever environment resolved it"
     );
 
+    // The create is asked again. It is the same action, so the daemon answers from what the first
+    // came to: it names the same session and says again that no window opened, and the presenter
+    // is not asked a second time.
+    let again: kr_protocol::session::SessionCreateResult = client
+        .repeat(&mutation)
+        .await
+        .expect("reaches the daemon")
+        .expect("the repeat is answered")
+        .to_typed()
+        .expect("decodes");
+    assert!(again.deduplicated, "the repeat is marked as one");
+    assert_eq!(
+        again.session.session_id, created.session.session_id,
+        "and it is the same session"
+    );
+    assert_eq!(
+        again.presentation_error.0.map(|error| error.code),
+        Some(ErrorCode::TerminalUnavailable),
+        "which still says no window opened"
+    );
+    assert_eq!(
+        presenter
+            .asked
+            .lock()
+            .expect("the record is not poisoned")
+            .len(),
+        1,
+        "a retry asks for no second window"
+    );
+
     let listed: kr_protocol::session::SessionListResult = client
         .request(
             Method::SessionList,
@@ -768,7 +805,7 @@ async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presenta
     assert_eq!(
         listed.sessions.len(),
         1,
-        "a failed presentation never produces a duplicate session"
+        "neither a failed presentation nor a retry of the create produces a duplicate session"
     );
 
     let _: kr_protocol::session::SessionCloseResult = client
