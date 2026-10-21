@@ -136,14 +136,25 @@ fn every_object_is_encrypted_under_its_own_random_key() {
     );
 }
 
+/// KR-REQ-20.06: an object is written in records of exactly one mebibyte, 1,048,576 bytes, and
+/// needs its final record. The size is asserted as the value the requirement states, on the
+/// product's constant and on the framing of an object written with it, so a changed record size
+/// fails here and not only where the framing is computed from the same constant.
 #[test]
 fn an_object_is_written_in_one_mebibyte_records_and_needs_its_final_record() {
+    const ONE_MEBIBYTE: usize = 1_048_576;
+    assert_eq!(
+        RECORD_LEN, ONE_MEBIBYTE,
+        "a secretstream record is one mebibyte"
+    );
+    assert_eq!(kr_crypto::stream::RECORD_LEN, ONE_MEBIBYTE);
+
     // Two full records and a remainder, so the framing rule is exercised rather than assumed.
-    let plaintext: Vec<u8> = (0..(2 * RECORD_LEN + 7))
+    let plaintext: Vec<u8> = (0..(2 * ONE_MEBIBYTE + 7))
         .map(|index| u8::try_from(index % 251).expect("a byte"))
         .collect();
     let staged = stage(3, "large.cbor", &plaintext);
-    let records = plaintext.len().div_ceil(RECORD_LEN);
+    let records = plaintext.len().div_ceil(ONE_MEBIBYTE);
     assert_eq!(records, 3, "two full records and a remainder");
     assert_eq!(
         staged.bytes().len(),
