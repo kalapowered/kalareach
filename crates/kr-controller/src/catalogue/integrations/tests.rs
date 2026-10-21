@@ -543,7 +543,8 @@ fn the_doctor_says_whether_an_integration_that_declares_a_backend_is_served_by_a
 
 /// KR-REQ-11.35 and KR-REQ-07.45: the doctor says of an integration that declares a backend, and is
 /// on, that an invocation runs as typed when its connector declares no tested volatile forwarding
-/// mode, whether or not a signed record names the executable it finds.
+/// mode, whether or not a signed record names the executable it finds, and whether or not it finds
+/// one.
 #[cfg(unix)]
 #[test]
 fn the_doctor_says_a_connector_without_a_tested_volatile_forwarding_mode_is_served_no_gateway() {
@@ -577,6 +578,28 @@ fn the_doctor_says_a_connector_without_a_tested_volatile_forwarding_mode_is_serv
     assert!(
         reason.ends_with("so an invocation runs as typed"),
         "{reason}"
+    );
+
+    // With no executable on the search path the worker refuses every launch of the connector all
+    // the same, so the doctor does not say that a gateway would serve one.
+    let nowhere = report(
+        Some(&reading),
+        &[],
+        &enabled(&["codex"]),
+        &able(vec![store.0.join("empty")]),
+    )
+    .reports
+    .remove(0);
+    assert_eq!(nowhere.state, CommandIntegrationState::On);
+    assert_eq!(nowhere.mode, IntegrationMode::NativeTerminal);
+    assert!(
+        nowhere
+            .reason
+            .0
+            .as_deref()
+            .is_some_and(|reason| reason.contains("volatile forwarding")),
+        "{:?}",
+        nowhere.reason
     );
 }
 

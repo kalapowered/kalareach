@@ -545,8 +545,9 @@ fn resolved(
     }
     // An integration that declares a backend is served by a gateway where this host can run the
     // server: on a Unix host, for an executable a signed qualification record names whose version
-    // the connector's table is qualified for. Where it cannot, every invocation runs as typed, and
-    // the owner who turned it on is told, beside the state.
+    // the connector's table is qualified for, when the connector declares a tested volatile
+    // forwarding mode. Where it cannot, every invocation runs as typed, and the owner who turned
+    // it on is told, beside the state.
     let declares_backend = connector
         .and_then(|connector| connector.manifest().command_integration.as_ref())
         .is_some_and(|declared| declared.backend.is_some());
@@ -559,22 +560,30 @@ fn resolved(
                     .to_owned(),
             );
         } else if let Some(connector) = connector {
-            // A digest no record qualifies, and an executable that was found and not read, are
-            // alike a launch the worker would run as typed.
-            match found.as_ref() {
-                Some(Ok(digest)) => {
-                    if let Err(refusal) = connector.native_tables(digest) {
-                        report.reason = Nullable::some(format!(
-                            "{}, so an invocation runs as typed",
-                            refusal.detail
-                        ));
+            if let Some(refusal) = connector.volatile_forwarding_refusal() {
+                // A connector the gateway serves none of, whatever executable is found.
+                report.reason = Nullable::some(format!(
+                    "{}, so an invocation runs as typed",
+                    refusal.detail
+                ));
+            } else {
+                // A digest no record qualifies, and an executable that was found and not read,
+                // are alike a launch the worker would run as typed.
+                match found.as_ref() {
+                    Some(Ok(digest)) => {
+                        if let Err(refusal) = connector.native_tables(digest) {
+                            report.reason = Nullable::some(format!(
+                                "{}, so an invocation runs as typed",
+                                refusal.detail
+                            ));
+                        }
                     }
+                    Some(Err(why)) => {
+                        report.reason =
+                            Nullable::some(format!("{why}, so an invocation runs as typed"));
+                    }
+                    None => {}
                 }
-                Some(Err(why)) => {
-                    report.reason =
-                        Nullable::some(format!("{why}, so an invocation runs as typed"));
-                }
-                None => {}
             }
         }
     }
