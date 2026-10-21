@@ -1843,7 +1843,8 @@ mod tests {
             }],
             modules: vec![ReleaseModule {
                 name: "zsh/zle".to_owned(),
-                search_path: ReleasePath::new("shells/zsh/0b26110c784907c9/lib/zsh/5.9").expect("a path"),
+                search_path: ReleasePath::new("shells/zsh/0b26110c784907c9/lib/zsh/5.9")
+                    .expect("a path"),
                 editor_abi: "zle-5.9".to_owned(),
             }],
             profile_order: vec![ProfileLaunch {
