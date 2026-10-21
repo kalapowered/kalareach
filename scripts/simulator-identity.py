@@ -10,6 +10,7 @@ Reads the listing on standard input.
     simulator-identity.py udid "iPhone 17 Pro"     # a booted one first, else any available one
     simulator-identity.py state <udid>             # Booted, Shutdown, ...
     simulator-identity.py describe <udid>          # "iPhone 17 Pro (iOS 26.5) <udid>"
+    simulator-identity.py template "iPhone 17 Pro" # its device type and runtime, to make another like it
 """
 
 import json
@@ -67,6 +68,15 @@ def main() -> int:
                     print(f"{device['name']} ({runtime_name(runtime)}) {argument}")
                     return 0
         print(f"unknown simulator {argument}")
+        return 0
+
+    if action == "template":
+        for runtime, listed in devices.items():
+            for device in listed:
+                if device.get("name") == argument and device.get("deviceTypeIdentifier"):
+                    print(device["deviceTypeIdentifier"], runtime)
+                    return 0
+        print("")
         return 0
 
     print(__doc__, file=sys.stderr)

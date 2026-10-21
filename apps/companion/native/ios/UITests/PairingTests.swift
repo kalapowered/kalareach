@@ -31,6 +31,13 @@ final class PairingTests: DeviceTestCase {
 
     private func path(_ name: String) -> String { directory + "/" + name }
 
+    /// The port of the host's other service, which `ready.json` names.
+    private func servicePort() -> Int {
+        let data = Data(read("ready.json").utf8)
+        let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        return object?["service_port"] as? Int ?? 0
+    }
+
     private func touch(_ name: String) {
         FileManager.default.createFile(atPath: path(name), contents: Data("1\n".utf8))
     }
@@ -162,8 +169,12 @@ final class PairingTests: DeviceTestCase {
         XCTAssertTrue(alert.waitForExistence(timeout: 30), "no alert named the other service")
         XCTAssertTrue(alert.label.contains("Use another pairing service"), "the alert is not the question: \(alert.label)")
         screenshot("origin-alert")
-        let named = alert.staticTexts.matching(NSPredicate(format: "label CONTAINS 'This code belongs to https://'")).firstMatch
-        XCTAssertTrue(named.exists, "the alert does not name the service")
+        // The alert names the service the code names: the host's other service, on the port it says.
+        let service = "https://127.0.0.1:\(servicePort())"
+        let named = alert.staticTexts.matching(
+            NSPredicate(format: "label CONTAINS %@", "This code belongs to \(service).")
+        ).firstMatch
+        XCTAssertTrue(named.exists, "the alert does not name \(service)")
         alert.buttons["Cancel"].tap()
         // Cancelling leaves nothing to pair with, and the host has seen no connection.
         eventually("the page to be back at its start") { !shows("Invitation") && !shows("Code for a host") }

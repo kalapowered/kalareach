@@ -18,6 +18,7 @@ Two commands:
 It uses the Python standard library alone.
 """
 
+import json
 import re
 import struct
 import subprocess
@@ -157,9 +158,29 @@ class Phone:
         picture = self.run("exec-out", "screencap", "-p", timeout=60).stdout
         (self.shots / f"android-{name}.png").write_bytes(picture)
 
-    def is_blank(self) -> bool:
-        """Whether a screenshot shows nothing: the system blanks a window that is marked secure."""
-        return len(self.run("exec-out", "screencap", "-p", timeout=60).stdout) < 30000
+    def colours_in_the_middle(self) -> int:
+        """How many different colours the middle of the screen shows in a screenshot of it.
+
+        The system blanks a window that is marked secure, so the middle of a screenshot of the
+        scanner is one colour, and the middle of any other screen of this application is many. The
+        frame is the raw one `screencap` writes (a header, then four bytes to a pixel), so a
+        screenshot that could not be taken is a failure of the run and never a blank screen.
+        """
+        answer = self.run("exec-out", "screencap", timeout=60)
+        raw = answer.stdout
+        if answer.returncode != 0 or len(raw) < 12:
+            self.give_up("the screen could not be captured")
+        width, height = struct.unpack("<II", raw[:8])
+        size = width * height * 4
+        if width == 0 or height == 0 or len(raw) < size:
+            self.give_up("the screenshot is not a frame of the size its header names")
+        pixels = raw[len(raw) - size :]
+        colours = set()
+        for row in range(height // 4, height * 3 // 4, 8):
+            for column in range(0, width, 4):
+                at = (row * width + column) * 4
+                colours.add(pixels[at : at + 3])
+        return len(colours)
 
 
 def touch(directory: Path, name: str) -> None:
@@ -231,11 +252,15 @@ def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> Non
     # Scan again opens the scanner, and Cancel closes it: the person is back at the start. The phone
     # is turned away from the picture first, since the scanner reads a code the moment it sees one.
     look(port, AWAY)
+    shown_before = phone.colours_in_the_middle()
     phone.press("Scan again")
     phone.wait(lambda each: each == "Point the camera at the code on your host", "the scanner")
-    # The scanner's window is secure: what the camera sees is kept out of screenshots.
-    if not phone.is_blank():
-        raise SystemExit("a screenshot shows what the scanner's camera sees")
+    # The scanner's window is secure: what the camera sees is kept out of screenshots. The control is
+    # the screen before it, which a screenshot does show.
+    if shown_before < 8:
+        phone.give_up("a screenshot of the pairing screen shows nothing, so a blank one proves nothing")
+    if phone.colours_in_the_middle() != 1:
+        phone.give_up("a screenshot shows what the scanner's camera sees")
     say("the scanner is kept out of screenshots")
     phone.press("Cancel")
     phone.wait(lambda each: each == "Pair with a host", "the pairing screen after the scanner closed")
@@ -266,9 +291,11 @@ def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> Non
     phone.wait(lambda each: each == "Pair with a host", "the pairing screen")
     asks = lambda each: each == "Use another pairing service?"
     scan(phone, directory, "code", port, asks, "the alert naming the other service")
-    named = phone.find(lambda each: each.startswith("This code belongs to https://"))
+    # The alert names the service the code names: the host's other service, on the port the host says.
+    service = f"https://127.0.0.1:{json.loads(read(directory, 'ready.json'))['service_port']}"
+    named = phone.find(lambda each: each.startswith(f"This code belongs to {service}."))
     if named is None:
-        raise SystemExit("the alert does not name the service")
+        phone.give_up(f"the alert does not name {service}")
     phone.shot("origin-alert")
     phone.press("Cancel")
     phone.wait(lambda each: each == "Pair with a host", "the pairing screen after Cancel")
