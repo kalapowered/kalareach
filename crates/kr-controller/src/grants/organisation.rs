@@ -47,7 +47,8 @@ use kr_protocol::ids::{
 use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Digest256, Nullable, Signature64};
 use kr_transport::clock::ContinuousInstant;
 
-use super::durable::{StoredAppliedPolicy, StoredBinding, StoredEnrolment, StoredLeaseRecord};
+use super::applied::StoredAppliedPolicy;
+use super::durable::{StoredBinding, StoredEnrolment, StoredLeaseRecord};
 use super::policy::{BoundCell, BoundIdentity, HeldBound};
 use crate::service::net::devices::ObservedUtc;
 
@@ -652,13 +653,7 @@ impl Enrolment {
             links: stored.links.clone(),
             accepted_head: stored.accepted_head,
             enrolment_revision: stored.enrolment_revision,
-            applied: stored.applied_policy.as_ref().map(|applied| AppliedPolicy {
-                revision: applied.organisation_policy_revision,
-                adapter_allowlist: applied
-                    .adapter_allowlist
-                    .as_ref()
-                    .map(|adapters| adapters.iter().cloned().collect()),
-            }),
+            applied: None,
             members: stored
                 .members
                 .iter()
@@ -686,15 +681,6 @@ impl Enrolment {
             links: self.links.clone(),
             accepted_head: self.accepted_head,
             enrolment_revision: self.enrolment_revision,
-            applied_policy: self.applied.as_ref().map(|applied| StoredAppliedPolicy {
-                organisation_policy_revision: applied.revision,
-                adapter_allowlist: Nullable(
-                    applied
-                        .adapter_allowlist
-                        .as_ref()
-                        .map(|adapters| adapters.iter().cloned().collect::<CanonicalSet<_>>()),
-                ),
-            }),
             members: self
                 .members
                 .iter()
@@ -786,6 +772,41 @@ impl Enrolment {
     #[must_use]
     pub const fn applied_policy(&self) -> Option<&AppliedPolicy> {
         self.applied.as_ref()
+    }
+
+    /// The policy applied for this enrolment, as it is written down in the store of applied
+    /// policies, or none while it has applied none.
+    #[must_use]
+    pub fn stored_applied_policy(
+        &self,
+        organisation_id: OrganisationId,
+    ) -> Option<StoredAppliedPolicy> {
+        self.applied.as_ref().map(|applied| StoredAppliedPolicy {
+            organisation_id,
+            enrolment_revision: self.enrolment_revision,
+            organisation_policy_revision: applied.revision,
+            adapter_allowlist: Nullable(
+                applied
+                    .adapter_allowlist
+                    .as_ref()
+                    .map(|adapters| adapters.iter().cloned().collect::<CanonicalSet<_>>()),
+            ),
+        })
+    }
+
+    /// Takes the policy a store of applied policies holds for this enrolment, when it was applied
+    /// for it: the entry names the revision this host enrolled at.
+    pub(crate) fn restore_applied_policy(&mut self, stored: &StoredAppliedPolicy) {
+        if stored.enrolment_revision != self.enrolment_revision {
+            return;
+        }
+        self.applied = Some(AppliedPolicy {
+            revision: stored.organisation_policy_revision,
+            adapter_allowlist: stored
+                .adapter_allowlist
+                .as_ref()
+                .map(|adapters| adapters.iter().cloned().collect()),
+        });
     }
 
     /// The highest head revision this host has accepted.

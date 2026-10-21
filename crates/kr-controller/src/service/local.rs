@@ -71,7 +71,7 @@ impl Default for LocalPace {
 /// name fails the lock's checks. A method only a paired device sends, such as
 /// `device.push.register`, is refused to a local caller before it can claim, so the lookup finds no
 /// record for it there.
-pub const RETAINED_AUTHORITY_ANSWERS: [Method; 24] = [
+pub const RETAINED_AUTHORITY_ANSWERS: [Method; 23] = [
     Method::GrantCreate,
     Method::GrantRedeem,
     Method::GrantRevoke,
@@ -83,7 +83,6 @@ pub const RETAINED_AUTHORITY_ANSWERS: [Method; 24] = [
     Method::DeliveryDestinationSecretSet,
     Method::DevicePushRegister,
     Method::OrganisationEnrol,
-    Method::OrganisationPolicyApply,
     Method::OrganisationExclusiveSet,
     Method::OrganisationWithdraw,
     Method::PrivacySet,

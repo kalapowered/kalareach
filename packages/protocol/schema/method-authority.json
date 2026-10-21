@@ -854,7 +854,11 @@
       "freshness": "action_window",
       "group": "host_and_environment",
       "history_filter": "not_applicable",
-      "idempotency": "action_deduplicated",
+      "idempotency": {
+        "keyed": {
+          "key": "organisation id + policy revision"
+        }
+      },
       "ingress": [
         "local_ipc"
       ],
@@ -873,7 +877,7 @@
       "resource_selectors": [
         "host"
       ],
-      "summary": "Apply an organisation's signed policy to this host: the adapters it allows are the only ones the host admits, with every other organisation's list intersected. The policy is verified under the key the organisation's chain ends with, which the request can carry when it has moved, and is refused at or below the revision the host holds unless it is that policy again. The owner confirmed the organisation's keys when enrolling, and a policy never enlarges what the host allows without one, so it needs no new confirmation.",
+      "summary": "Apply an organisation's signed policy to this host: the adapters it allows are the only ones the host admits, with every other organisation's list intersected. The policy is verified under the key the organisation's chain ends with, which the request can carry when it has moved, and is refused at or below the revision the host holds unless it is that policy again. That policy again changes nothing the host keeps and puts its adapters in force again, so a request that could not is made again and no answer is kept for it. The owner confirmed the organisation's keys when enrolling, and a policy never enlarges what the host allows without one, so it needs no new confirmation.",
       "version": 1
     },
     {

@@ -593,7 +593,11 @@ impl Controller {
     /// is written down. Mutating the live policy first would let a relaxation that failed to
     /// persist take effect anyway, and an error the caller sees would be an error about something
     /// that happened. A change that refuses leaves the policy, its epoch and the store as they were.
-    fn commit_policy<C>(
+    ///
+    /// `write` is the whole of what is written down for the change, and gets the snapshot to write
+    /// to the registry. A change that writes more than the registry does it there, in the order
+    /// that leaves nothing the caller was refused behind.
+    pub(super) fn commit_policy<C>(
         &self,
         change: impl FnOnce(&mut crate::grants::HostPolicy) -> Result<C>,
         write: impl FnOnce(

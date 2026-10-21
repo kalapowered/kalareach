@@ -16,8 +16,7 @@
 //!   back past a deadline therefore does not revive a grant this host has already refused.
 //! * **The host's restrictions.** The bounded offline-validity policy, whether this host is
 //!   exclusively organisation-managed, and which organisations it is enrolled in with the
-//!   policy-signing links it verified and the revision and adapter allowlist of the policy
-//!   applied for each.
+//!   policy-signing links it verified.
 //! * **The lease records.** For each member device, the newest lease this host installed and the
 //!   run that installed it, so a lease is installed at most once whatever either clock says.
 //! * **The feed's checkpoints.** The revision this host has accepted, its retained revocation
@@ -43,8 +42,7 @@ use serde::{Deserialize, Serialize};
 
 use kr_protocol::account::PolicyAuthorityLink;
 use kr_protocol::ids::{
-    AccountId, AuthorityRevision, ControllerGeneration, DeviceId, OrganisationId,
-    OrganisationPolicyRevision, PluginId, PolicyKeyRevision,
+    AccountId, AuthorityRevision, ControllerGeneration, DeviceId, OrganisationId, PolicyKeyRevision,
 };
 use kr_protocol::pairing::RevocationRequest;
 use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Digest256, Nullable, TimestampMs};
@@ -65,24 +63,9 @@ pub struct StoredEnrolment {
     /// The host authority revision in force when this host enrolled. An organisation grant's
     /// requirement names it.
     pub enrolment_revision: AuthorityRevision,
-    /// The organisation policy the owner applied, or none while none has been. It is absent from
-    /// the row, not null, so an enrolment that has applied none is written as it was before a policy
-    /// could be applied.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub applied_policy: Option<StoredAppliedPolicy>,
     /// The devices bound to member accounts in this organisation, each by its first verified
     /// lease.
     pub members: Vec<StoredBinding>,
-}
-
-/// What this host keeps of an organisation's policy once it has verified and applied it, as it is
-/// written down: the revision the floor is held at, and the adapters the policy allows.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredAppliedPolicy {
-    /// The revision of the policy. A policy at or below it is not applied again.
-    pub organisation_policy_revision: OrganisationPolicyRevision,
-    /// The adapters the policy allows, or null for every adapter this host qualifies.
-    pub adapter_allowlist: Nullable<CanonicalSet<PluginId>>,
 }
 
 /// One device bound to a member account, as it is written down.

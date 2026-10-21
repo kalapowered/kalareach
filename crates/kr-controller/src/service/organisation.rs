@@ -378,33 +378,37 @@ impl Controller {
         encode(&answer)
     }
 
-    /// `organisation.policy.apply`: applies the policy an organisation signed, under the claim of
-    /// the action that asked, and puts the adapters it allows in force.
+    /// `organisation.policy.apply`: applies the policy an organisation signed, and puts the
+    /// adapters it allows in force.
     ///
-    /// The registry's guard is taken first, and the policy and the action's answer are written in
-    /// one transaction, in which the admission is asked again once the store's lock is held. Only
-    /// that the owner asked decides it: the organisation's own statement binds this host through
-    /// the keys the owner confirmed when enrolling, and it never enlarges what this host allows
-    /// without one, so it asks for no new confirmation and owes no fence. A narrower list ends the
-    /// bindings of the packages it leaves out through the admission round every restriction on a
-    /// package uses.
+    /// The registry's guard is taken first, and held until the policy is written. The policy is
+    /// kept in the store of applied policies, written before the registry row, which changes only
+    /// when the request followed a chain: a stop between the two leaves the policy applied at the
+    /// next start and the request, made again, completes what was not recorded. If the registry's
+    /// write is refused the file is put back as it was. The admission is asked again inside the
+    /// registry's transaction, once the store's lock is held. Only that the owner asked decides
+    /// it: the organisation's own statement binds this host through the keys the owner confirmed
+    /// when enrolling, and it never enlarges what this host allows without one, so it asks for no
+    /// new confirmation and owes no fence. A narrower list ends the bindings of the packages it
+    /// leaves out through the admission round every restriction on a package uses.
+    ///
+    /// No answer is kept for the request, and none is needed: the same policy again is accepted as
+    /// a repeat, changes nothing the host keeps and puts the list in force again, and the answer is
+    /// made from what the host holds each time.
     ///
     /// The list is put in force once the guard is let go, because the catalogue may be held by a
     /// synchronisation: the wait is bounded, and a list that could not be put in force is told to
-    /// the caller after the policy is recorded. The recorded answer is given again to a repeat of
-    /// the action only once the list is in force ([`Self::recorded_authority_change`]), and a
-    /// repeat of the same policy by a new action completes it.
+    /// the caller after the policy is recorded.
     ///
     /// # Errors
     ///
-    /// Returns the rule that refuses the policy, what the admission, the clock or the store refuses
-    /// with, and `RESOURCE_UNAVAILABLE` or `STORAGE_UNAVAILABLE` when the policy is recorded and its
-    /// list is not yet in force.
+    /// Returns the rule that refuses the policy, what the admission, the clock or the stores refuse
+    /// with, and `RESOURCE_UNAVAILABLE` or `STORAGE_UNAVAILABLE` when the policy is recorded and
+    /// its list is not yet in force.
     pub(super) async fn organisation_policy_apply(
         &self,
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
-        hold: &crate::grants::ClaimHold,
     ) -> Result<ParamsValue> {
         let params: OrganisationPolicyApplyParams = parse(&mutation.params)?;
         let organisation_id = params.policy.payload.organisation_id;
@@ -418,9 +422,9 @@ impl Controller {
                 None => None,
             };
             let followed_head = std::cell::Cell::new(None);
-            self.update_policy_claimed(
-                hold,
+            let (answer, _, _) = self.commit_policy(
                 |policy| {
+                    let before = policy.applied_policies();
                     let advanced = policy
                         .apply_organisation_policy(
                             &params.policy,
@@ -455,26 +459,57 @@ impl Controller {
                             policy.adapter_allowlist().as_ref(),
                         ),
                     };
-                    let bytes = kr_cbor::encode(encode(&answer)?.as_value());
-                    Ok((answer, bytes))
+                    Ok((answer, before, policy.applied_policies()))
                 },
-                || {
-                    self.check_admission(&registry, &carried)?;
-                    // A chain the policy followed was judged at a reading taken before the waits
-                    // for the locks, and its head is a bound that can pass while they last.
-                    match followed_head.get() {
-                        Some(head_expires_at) => {
-                            self.head_holds_still(head_expires_at, reading.as_ref(), |refused| {
-                                policy_refusal(PolicyRefused::Chain(refused))
-                            })
+                |grants, snapshot, (_, before, after)| {
+                    let state_dir = self.paths.state_dir();
+                    crate::grants::applied::write(state_dir, after)?;
+                    let stored = grants.store_presentation(snapshot, None, || {
+                        self.check_admission(&registry, &carried)?;
+                        // A chain the policy followed was judged at a reading taken before the
+                        // waits for the locks, and its head is a bound that can pass while they
+                        // last.
+                        match followed_head.get() {
+                            Some(head_expires_at) => self.head_holds_still(
+                                head_expires_at,
+                                reading.as_ref(),
+                                |refused| policy_refusal(PolicyRefused::Chain(refused)),
+                            ),
+                            None => Ok(()),
                         }
-                        None => Ok(()),
+                    });
+                    if stored.is_err()
+                        && let Err(error) = crate::grants::applied::write(state_dir, before)
+                    {
+                        eprintln!(
+                            "kr-controller: could not put the organisation policies back as they \
+                             were after a policy was refused: {error}"
+                        );
                     }
+                    stored
                 },
-            )?
+            )?;
+            answer
         };
         self.put_the_adapters_the_policy_allows().await?;
         encode(&answer)
+    }
+
+    /// Writes the policies the owner applied down in the store of applied policies, as the policy
+    /// holds them now. A policy that holds none removes the file.
+    ///
+    /// The policy's lock is held across the write, as every write of the policy holds it, so two
+    /// writers cannot leave the older list on disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the file cannot be written or removed.
+    fn write_the_applied_policies(&self) -> Result<()> {
+        let held = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::grants::applied::write(self.paths.state_dir(), &held.applied_policies())
     }
 
     /// Puts the adapters the organisations' policies allow in force, within the time a request may
@@ -484,7 +519,7 @@ impl Controller {
     ///
     /// Returns why the list is not in force. The policy it follows is recorded, and the host puts
     /// the list in force at its next admissions pass.
-    pub(crate) async fn put_the_adapters_the_policy_allows(&self) -> Result<()> {
+    async fn put_the_adapters_the_policy_allows(&self) -> Result<()> {
         let deadline = tokio::time::Instant::now() + super::WORKER_EXCHANGE;
         match self.put_the_adapter_allowlist_by(deadline).await {
             Ok(_) => Ok(()),
@@ -600,6 +635,15 @@ impl Controller {
         };
         match written {
             Ok(()) => {
+                // The policy applied for the organisation goes with its enrolment. A file that is
+                // not written leaves an entry that names an enrolment this host no longer holds,
+                // which no later enrolment takes, and the next start drops it.
+                if let Err(error) = self.write_the_applied_policies() {
+                    eprintln!(
+                        "kr-controller: could not write the organisation policies this host holds \
+                         after a withdrawal: {error}"
+                    );
+                }
                 let completed = self
                     .complete_revocation(Audience::Host, None, CanonicalSet::new(), own)
                     .await?;

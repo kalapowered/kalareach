@@ -495,8 +495,24 @@ impl Controller {
         if continuity_lost {
             utc_floor.lose_continuity();
         }
-        let policy =
+        let mut policy =
             crate::grants::HostPolicy::restore(&stored, authority_revision, Arc::clone(&utc_floor));
+        // The policies the owner applied are in a store of their own, read before the catalogue
+        // opens so the adapters they allow are in force from its first admission. A file that
+        // cannot be read stops the start: a host that came back without the restrictions it was
+        // left with would run every adapter. An entry that names no enrolment this host holds is
+        // left out and written back so, so it is never applied to a later enrolment.
+        let applied = crate::grants::applied::read(setup.paths.state_dir())?;
+        policy.restore_applied_policies(&applied);
+        let applied_now = policy.applied_policies();
+        if applied_now != applied
+            && let Err(error) = crate::grants::applied::write(setup.paths.state_dir(), &applied_now)
+        {
+            eprintln!(
+                "kr-controller: could not write the organisation policies this host holds back \
+                 at start: {error}"
+            );
+        }
         // Written down again with the revision the registry reached. A start that cannot write it
         // still starts, with its floor owed its record: no decision that reads the clock is taken
         // until a write lands, and a personal grant that never expires is used as before. Stopping

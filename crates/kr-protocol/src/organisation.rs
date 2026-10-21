@@ -70,7 +70,8 @@ pub struct OrganisationPolicyApplyParams {
     pub authority: Nullable<PolicyAuthority>,
 }
 
-/// The result of `organisation.policy.apply`, and what a repeat of the action is answered with.
+/// The result of `organisation.policy.apply`. The host keeps no answer for the request: a request
+/// made again is a policy applied again, and is answered from what the host holds then.
 ///
 /// The host verifies the whole policy and keeps its revision and its adapter allowlist. It neither
 /// keeps nor applies the other settings the policy states: the least client version, the longest
@@ -89,8 +90,8 @@ pub struct OrganisationPolicyApplyResult {
     pub adapter_allowlist: Nullable<CanonicalSet<PluginId>>,
     /// The adapters the enrolled organisations' policies allow together as the answer was made: the
     /// adapters every organisation that states a list allows, or null while none does. The host puts
-    /// this list in force when it records the policy. A repeat of the action is given this list, not
-    /// the one the policies state now; `organisation.list` reports that.
+    /// this list in force when it records the policy; `organisation.list` reports the list the
+    /// policies state at any time.
     pub effective_adapter_allowlist: Nullable<CanonicalSet<PluginId>>,
 }
 

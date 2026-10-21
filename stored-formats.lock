@@ -378,6 +378,24 @@
     },
     {
       "entry": {
+        "store": "organisation-policy",
+        "scope": "environment",
+        "path": "organisation-policy.json",
+        "recording": {
+          "kind": "json_member",
+          "member": "version",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 0
+      },
+      "digest": "80e32abcf598c80aabf2fe0ee3af26d707c44f9c4e1f4d62937d8a71c7ca8ae9",
+      "kept": [
+        "Record, StoredAppliedPolicy (crates/kr-controller/src/grants/applied.rs)"
+      ]
+    },
+    {
+      "entry": {
         "store": "privacy",
         "scope": "environment",
         "path": "privacy.sqlite3",
@@ -429,10 +447,10 @@
           "kind": "sqlite_table",
           "table": "schema_version"
         },
-        "version": 16,
+        "version": 15,
         "migrates_from": 1
       },
-      "digest": "d7fb5c7a98e707750a3f224c397e32c77ac7cd584118e73482c2b0eb2d76ffff",
+      "digest": "f8de9f5850a777557cabce2cdf924857af45baeca98b6affcf1f23d78507cf9a",
       "kept": [
         "SessionCreateParams",
         "ClosureRecord",
@@ -452,7 +470,6 @@
         "VoiceStopResult",
         "OrganisationEnrolResult",
         "OrganisationExclusiveSetResult",
-        "OrganisationPolicyApplyResult",
         "OrganisationChangeMarker",
         "SessionRenameResult",
         "DescriptionSetup",
@@ -465,26 +482,8 @@
         "PairingSecurityEvent",
         "OwnerConfirmationRequest",
         "OwnerConfirmationProof",
-        "DevicePublicKeys",
-        "ErrorCode",
-        "ClientBundle",
-        "ProposedGrant",
-        "PolicyAuthorityLink",
-        "OfflineValidityPolicy",
-        "RevocationRequest",
-        "DevicePushRegisterResult",
-        "DeliveryDestinationConfigureResult",
-        "DeliveryDestinationRemoveResult",
-        "AccountSignInStarted",
-        "AccountSignedOut",
-        "PairingConsumedReason",
-        "ProcessStartSource",
-        "words of process start sources",
-        "words of invitation states",
-        "words of host owner kinds",
-        "InvitationState (crates/kr-pairing/src/platform.rs)",
-        "StoredPolicy, StoredFeed, StoredEnrolment, StoredAppliedPolicy, StoredBinding, StoredLeaseRecord, StoredRevocation, StoredRemoval (crates/kr-controller/src/grants/durable.rs)",
-        "StoredCommitment, HostOwner (crates/kr-controller/src/net/invitations.rs)",
+        "StoredPolicy, StoredFeed, StoredEnrolment, StoredBinding, StoredLeaseRecord, StoredRevocation, StoredRemoval (crates/kr-controller/src/grants/durable.rs)",
+        "StoredCommitment (crates/kr-controller/src/net/invitations.rs)",
         "KeyDeclaration (crates/kr-controller/src/net/devices.rs)",
         "words of methods a recorded pairing action names",
         "words of launch phases"

@@ -34,6 +34,7 @@
 //!   quietly serve a read instead, because "continued reads still require valid authority" and a
 //!   narrower grant is something the person has to choose.
 
+pub mod applied;
 pub mod durable;
 pub mod feed;
 pub mod organisation;

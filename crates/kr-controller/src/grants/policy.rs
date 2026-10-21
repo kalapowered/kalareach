@@ -41,6 +41,7 @@ use kr_protocol::scalars::{AuthorisationKey, CanonicalSet};
 use kr_protocol::sharing::{MembershipRefusal, OfflineValidityPolicy};
 use kr_transport::clock::ContinuousInstant;
 
+use super::applied::StoredAppliedPolicy;
 use super::durable::StoredPolicy;
 use super::organisation::{
     self, ChainOutcome, ChainRefused, Enrolment, LeaseHolder, LeaseInstalled, LeasePresentation,
@@ -902,6 +903,29 @@ impl HostPolicy {
         self.enrolments
             .iter()
             .map(|(organisation_id, enrolment)| (*organisation_id, enrolment))
+    }
+
+    /// The policies the owner applied, as they are written down in the store of applied policies,
+    /// one for each enrolment that has applied one.
+    #[must_use]
+    pub fn applied_policies(&self) -> Vec<StoredAppliedPolicy> {
+        self.enrolments
+            .iter()
+            .filter_map(|(organisation_id, enrolment)| {
+                enrolment.stored_applied_policy(*organisation_id)
+            })
+            .collect()
+    }
+
+    /// Takes the applied policies a store of them holds, each for the enrolment it was applied
+    /// for and for no other: an entry of an organisation this host left, or of an earlier
+    /// enrolment in one it joined again, matches nothing and is dropped.
+    pub fn restore_applied_policies(&mut self, stored: &[StoredAppliedPolicy]) {
+        for entry in stored {
+            if let Some(enrolment) = self.enrolments.get_mut(&entry.organisation_id) {
+                enrolment.restore_applied_policy(entry);
+            }
+        }
     }
 
     /// The adapters this host admits under the policies its organisations applied: the adapters

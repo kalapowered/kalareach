@@ -735,7 +735,6 @@ impl Controller {
             | Method::DeliveryDestinationRemove
             | Method::DeliveryDestinationSecretSet
             | Method::OrganisationEnrol
-            | Method::OrganisationPolicyApply
             | Method::OrganisationExclusiveSet
             | Method::OrganisationWithdraw => {
                 self.authority_change(
@@ -746,6 +745,12 @@ impl Controller {
                     carried,
                 )
                 .await
+            }
+            // The policy an organisation signed, applied under the registry's guard and kept in the
+            // store of applied policies: no action is claimed and no answer is kept, since the same
+            // policy again is accepted and puts its list in force again.
+            Method::OrganisationPolicyApply => {
+                self.organisation_policy_apply(mutation, carried).await
             }
             // The host presenting the lease its organisation signed for its own local owner, who
             // answers to a membership lease like a member while the host is exclusively

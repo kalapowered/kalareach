@@ -21926,7 +21926,7 @@
         },
         {
           "const": "organisation.policy.apply",
-          "description": "Apply an organisation's signed policy to this host: the adapters it allows are the only ones the host admits, with every other organisation's list intersected. The policy is verified under the key the organisation's chain ends with, which the request can carry when it has moved, and is refused at or below the revision the host holds unless it is that policy again. The owner confirmed the organisation's keys when enrolling, and a policy never enlarges what the host allows without one, so it needs no new confirmation.",
+          "description": "Apply an organisation's signed policy to this host: the adapters it allows are the only ones the host admits, with every other organisation's list intersected. The policy is verified under the key the organisation's chain ends with, which the request can carry when it has moved, and is refused at or below the revision the host holds unless it is that policy again. That policy again changes nothing the host keeps and puts its adapters in force again, so a request that could not is made again and no answer is kept for it. The owner confirmed the organisation's keys when enrolling, and a policy never enlarges what the host allows without one, so it needs no new confirmation.",
           "type": "string"
         },
         {
@@ -24402,7 +24402,7 @@
     },
     "OrganisationPolicyApplyResult": {
       "additionalProperties": false,
-      "description": "The result of `organisation.policy.apply`, and what a repeat of the action is answered with.\n\nThe host verifies the whole policy and keeps its revision and its adapter allowlist. It neither\nkeeps nor applies the other settings the policy states: the least client version, the longest\ngrant, what members' clients may reach outside KalaReach, the backup requirements and the audit\nretention.",
+      "description": "The result of `organisation.policy.apply`. The host keeps no answer for the request: a request\nmade again is a policy applied again, and is answered from what the host holds then.\n\nThe host verifies the whole policy and keeps its revision and its adapter allowlist. It neither\nkeeps nor applies the other settings the policy states: the least client version, the longest\ngrant, what members' clients may reach outside KalaReach, the backup requirements and the audit\nretention.",
       "properties": {
         "adapter_allowlist": {
           "anyOf": [
@@ -24434,7 +24434,7 @@
               "type": "null"
             }
           ],
-          "description": "The adapters the enrolled organisations' policies allow together as the answer was made: the\nadapters every organisation that states a list allows, or null while none does. The host puts\nthis list in force when it records the policy. A repeat of the action is given this list, not\nthe one the policies state now; `organisation.list` reports that."
+          "description": "The adapters the enrolled organisations' policies allow together as the answer was made: the\nadapters every organisation that states a list allows, or null while none does. The host puts\nthis list in force when it records the policy; `organisation.list` reports the list the\npolicies state at any time."
         },
         "organisation_id": {
           "$ref": "#/$defs/OrganisationId",
