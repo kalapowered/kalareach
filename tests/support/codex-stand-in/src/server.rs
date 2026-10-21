@@ -271,6 +271,14 @@ impl Server {
                     if self.variants.die_first {
                         std::process::exit(0);
                     }
+                    // It says the request was answered, to every client it has, the one that
+                    // answered it included.
+                    let request: Value = serde_json::from_str(&id).expect("an identifier");
+                    self.send(json!({
+                        "method": "serverRequest/resolved",
+                        "params": { "threadId": "thread-1", "requestId": request }
+                    }))
+                    .await;
                     if self.variants.two_approvals && !self.second_asked {
                         self.second_asked = true;
                         self.sent.insert(

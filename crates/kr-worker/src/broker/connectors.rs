@@ -54,6 +54,7 @@ use crate::broker::PackageIdentity;
 use crate::broker::bridge::{BridgeSurface, InstalledBridge};
 use crate::broker::framing::Framing;
 use crate::broker::gateway::native_class;
+use crate::broker::reading::Reading;
 
 /// The command an integration resolves, the flags it adds to an invocation of it and the variables
 /// it sets for that invocation, as the verified manifest declares them.
@@ -136,6 +137,9 @@ pub struct NativeTables {
     /// The closed table of rich methods, which lists none for a connector that declares no rich
     /// method of its own.
     pub rich: RichMethodTable,
+    /// What the core reads out of the stream and how it answers an approval, compiled from the
+    /// same table.
+    pub reading: Arc<Reading>,
     /// The upstream protocol version both tables are pinned to: the version a signed
     /// qualification record names for the executable.
     pub protocol_version: String,
@@ -487,12 +491,19 @@ impl InstalledConnector {
                     route.wire_name, route.method
                 ))
             })?;
+            // The member of an answer's result that carries the decision, for a request the table
+            // answers as a response; no other method is one the core writes an answer for.
+            let answer_member = table
+                .decision_response
+                .as_ref()
+                .filter(|response| response.answers.contains(&classified.method))
+                .map(|response| response.result_member.clone());
             entries.push(DeclarativeEntry {
                 method,
                 class: native_class(classified.class),
                 expects_response: true,
                 reverse: Nullable::null(),
-                approval_option_field: Nullable::null(),
+                approval_option_field: Nullable::from(answer_member),
             });
         }
         entries.sort_by(|first, second| first.method.cmp(&second.method));
@@ -533,6 +544,7 @@ impl InstalledConnector {
         Ok(NativeTables {
             table: compiled,
             rich,
+            reading: Arc::new(Reading::compile(table, self.offered_decisions())),
             protocol_version: version.to_owned(),
             framing: Framing::within(
                 NativeFraming::JsonLines,
@@ -642,14 +654,16 @@ impl InstalledConnector {
             || (lookup_name(file) == lookup_name(command) && self.matches_executable(&executable))
     }
 
-    /// Returns the decisions a declarative interpretation offers: the ones the table's decision
-    /// destination maps, in the table's order, each labelled as the package's answer action labels
-    /// that choice, or with its own name where the action names none.
+    /// Returns the decisions a declarative interpretation offers: the ones the table's decisions
+    /// map (through its decision destination or its decision response), in the table's order, each
+    /// labelled as the package's answer action labels that choice, or with its own name where the
+    /// action names none.
     #[must_use]
     pub fn offered_decisions(&self) -> Vec<OfferedDecision> {
-        let Some(destination) = self.table.decision_destination.as_ref() else {
+        let decisions = self.table.decisions();
+        if decisions.is_empty() {
             return Vec::new();
-        };
+        }
         let choices =
             self.manifest
                 .actions
@@ -666,8 +680,7 @@ impl InstalledConnector {
                         }),
                     _ => None,
                 });
-        destination
-            .decisions
+        decisions
             .iter()
             .map(|mapped| {
                 let label = choices
@@ -710,26 +723,31 @@ pub fn component_schema() -> String {
 /// The trust is derived from what the installation was granted and from the installed package's
 /// own connector table, and never from anything a component reports: none unless `approval.decode`
 /// is granted; the package, publisher and installed hash are the installed package's; the methods
-/// are the wire names of the routes that carry, towards this host, what the table's decision
-/// destination answers; the schemas are [`DECISION_SCHEMA`], and [`component_schema`] as well when
-/// the package ships a component; at most as many decisions as the destination maps; and it may
-/// encode an answer exactly when `approval.respond` is granted.
+/// are the wire names of the routes that carry, towards this host, what the table answers (the
+/// request a decision destination answers, or each request a decision response answers); the
+/// schemas are [`DECISION_SCHEMA`], and [`component_schema`] as well when the package ships a
+/// component; at most as many decisions as the table maps; and it may encode an answer exactly
+/// when `approval.respond` is granted.
 ///
-/// The decision destination is the one statement of which routed request asks for a decision, so a
-/// package whose table has none, or whose answers are responses to the request rather than a
-/// request of their own, is given no trust here.
+/// The table's decisions are the one statement of which routed request asks for a decision, so a
+/// package whose table answers none is given no trust here.
 #[must_use]
 pub fn decoding_trust(connector: &InstalledConnector, now: TimestampMs) -> Option<DecodingTrust> {
     if !connector.granted(PluginCapability::ApprovalDecode) {
         return None;
     }
     let table = connector.table();
-    let destination = table.decision_destination.as_ref()?;
+    // The requests the table's answers resolve: the one a decision destination answers, or each one
+    // a decision response answers.
+    let answered = table.approval_methods();
+    if answered.is_empty() {
+        return None;
+    }
     let methods: CanonicalSet<UpstreamMethod> = table
         .routes
         .iter()
         .filter(|route| {
-            route.method == destination.answers && route.direction != RouteDirection::HostToUpstream
+            answered.contains(&&route.method) && route.direction != RouteDirection::HostToUpstream
         })
         .filter_map(|route| UpstreamMethod::new(route.wire_name.clone()).ok())
         .collect();
@@ -748,7 +766,7 @@ pub fn decoding_trust(connector: &InstalledConnector, now: TimestampMs) -> Optio
         package_digest: package.package_digest,
         methods,
         schema_versions,
-        max_decisions: U64::new(u64::try_from(destination.decisions.len()).unwrap_or(u64::MAX)),
+        max_decisions: U64::new(u64::try_from(table.decisions().len()).unwrap_or(u64::MAX)),
         may_encode_response: connector.granted(PluginCapability::ApprovalRespond),
         granted_at: now,
     })
@@ -1088,6 +1106,10 @@ pub mod fixture {
         /// Whether that table declares a tested volatile forwarding mode, which the worker's
         /// gateway needs of a connector before it serves one.
         pub volatile_forwarding: bool,
+        /// Whether the gateway table answers the approvals its application asks as a response to
+        /// the request and says where its stream names the conversation and the turn, and the
+        /// package asks for the approval grants and declares the action that answers.
+        pub answers: bool,
     }
 
     impl Shape {
@@ -1106,6 +1128,7 @@ pub mod fixture {
                 component: false,
                 gateway: false,
                 volatile_forwarding: false,
+                answers: false,
             }
         }
 
@@ -1127,6 +1150,7 @@ pub mod fixture {
                 component: false,
                 gateway: false,
                 volatile_forwarding: false,
+                answers: false,
             }
         }
 
@@ -1155,6 +1179,17 @@ pub mod fixture {
                 component: false,
                 gateway: true,
                 volatile_forwarding: true,
+                answers: false,
+            }
+        }
+
+        /// The same Codex-shaped package, whose table answers an approval as the response to the
+        /// request it asks and reads the thread and turn out of the application's stream.
+        #[must_use]
+        pub fn codex_backend_answering() -> Self {
+            Self {
+                answers: true,
+                ..Self::codex_backend()
             }
         }
 
@@ -1173,6 +1208,7 @@ pub mod fixture {
                 component: false,
                 gateway: false,
                 volatile_forwarding: false,
+                answers: false,
             }
         }
     }
@@ -1193,6 +1229,7 @@ pub mod fixture {
             component: false,
             gateway: false,
             volatile_forwarding: false,
+            answers: false,
         }
     }
 
@@ -1345,6 +1382,150 @@ pub mod fixture {
         serde_json::to_string_pretty(&table).expect("a literal table encodes")
     }
 
+    /// The Codex-shaped table that also answers its approvals as a response and reads the stream:
+    /// the routes and classifications of the methods an application server of that shape sends in
+    /// a session, a decision response for the two approvals it asks, and an observation naming
+    /// where its messages name a thread, a turn and a cleared request.
+    #[must_use]
+    pub fn gateway_connector_json_answering(plugin_id: &str, volatile_forwarding: bool) -> String {
+        let mut table: serde_json::Value =
+            serde_json::from_str(&gateway_connector_json_for(plugin_id, volatile_forwarding))
+                .expect("the fixture table reads");
+        let path = |names: &[&str]| {
+            serde_json::json!({
+                "segments": names
+                    .iter()
+                    .map(|name| serde_json::json!({ "type": "member", "name": name }))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let routed = [
+            (
+                "thread.start",
+                "thread/start",
+                "host_to_upstream",
+                "mutation",
+                "Starts a thread",
+            ),
+            (
+                "thread.resume",
+                "thread/resume",
+                "host_to_upstream",
+                "mutation",
+                "Loads a stored thread",
+            ),
+            (
+                "thread.unsubscribe",
+                "thread/unsubscribe",
+                "host_to_upstream",
+                "mutation",
+                "Drops the connection's subscription",
+            ),
+            (
+                "thread.started",
+                "thread/started",
+                "upstream_to_host",
+                "observation",
+                "Reports a thread began",
+            ),
+            (
+                "thread.closed",
+                "thread/closed",
+                "upstream_to_host",
+                "observation",
+                "Reports a thread was unloaded",
+            ),
+            (
+                "turn.started",
+                "turn/started",
+                "upstream_to_host",
+                "observation",
+                "Reports a turn began",
+            ),
+            (
+                "turn.completed",
+                "turn/completed",
+                "upstream_to_host",
+                "observation",
+                "Reports a turn ended",
+            ),
+            (
+                "item.agent-message.delta",
+                "item/agentMessage/delta",
+                "upstream_to_host",
+                "observation",
+                "Streams the agent's words",
+            ),
+            (
+                "server-request.resolved",
+                "serverRequest/resolved",
+                "upstream_to_host",
+                "observation",
+                "Reports a request was answered or cleared",
+            ),
+            (
+                "item.command-execution.request-approval",
+                "item/commandExecution/requestApproval",
+                "upstream_to_host",
+                "mutation",
+                "Asks whether a command may run",
+            ),
+            (
+                "item.file-change.request-approval",
+                "item/fileChange/requestApproval",
+                "upstream_to_host",
+                "mutation",
+                "Asks whether a file change may apply",
+            ),
+        ];
+        for (method, wire, direction, class, evidence) in routed {
+            table["routes"].as_array_mut().expect("routes").push(
+                serde_json::json!({ "method": method, "wire_name": wire, "direction": direction }),
+            );
+            table["methods"].as_array_mut().expect("methods").push(
+                serde_json::json!({ "method": method, "class": class, "evidence": evidence }),
+            );
+        }
+        table["decision_response"] = serde_json::json!({
+            "answers": [
+                "item.command-execution.request-approval",
+                "item.file-change.request-approval"
+            ],
+            "result_member": "decision",
+            "decisions": [
+                { "decision": "accept", "value": "accept" },
+                { "decision": "accept-for-session", "value": "acceptForSession" },
+                { "decision": "decline", "value": "decline" },
+                { "decision": "decline-and-stop", "value": "cancel" }
+            ]
+        });
+        table["observation"] = serde_json::json!({
+            "selections": [
+                { "method": "thread.start", "thread": path(&["result", "thread", "id"]) },
+                { "method": "thread.resume", "thread": path(&["result", "thread", "id"]) }
+            ],
+            "leaves": [
+                { "method": "thread.unsubscribe", "thread": path(&["params", "threadId"]) },
+                { "method": "thread.closed", "thread": path(&["params", "threadId"]) }
+            ],
+            "turn_started": {
+                "method": "turn.started",
+                "thread": path(&["params", "threadId"]),
+                "turn": path(&["params", "turn", "id"])
+            },
+            "turn_ended": {
+                "method": "turn.completed",
+                "thread": path(&["params", "threadId"]),
+                "turn": path(&["params", "turn", "id"])
+            },
+            "request_resolved": {
+                "method": "server-request.resolved",
+                "request_id": path(&["params", "requestId"])
+            }
+        });
+        serde_json::to_string_pretty(&table).expect("a literal table encodes")
+    }
+
     /// The package's presentation: a document that names no action.
     #[must_use]
     pub fn presentation_json() -> String {
@@ -1406,7 +1587,7 @@ pub mod fixture {
         if shape.native_bridge {
             capabilities.push(serde_json::json!({ "capability": "native_bridge.install", "reason": "Register the forwarder Claude Code starts" }));
         }
-        if !shape.gateway {
+        if !shape.gateway || shape.answers {
             capabilities.push(serde_json::json!({ "capability": "approval.decode", "reason": "Recognise a relayed tool approval" }));
             capabilities.push(serde_json::json!({ "capability": "approval.respond", "reason": "Answer a relayed tool approval" }));
         }
@@ -1416,7 +1597,29 @@ pub mod fixture {
         if shape.launch_probe.is_some() {
             capabilities.push(serde_json::json!({ "capability": "launch.probe", "reason": "Read which sandbox the application will use before a launch" }));
         }
-        let actions = if shape.gateway {
+        let actions = if shape.gateway && shape.answers {
+            serde_json::json!([{
+                "id": "approval.answer",
+                "label": "Answer",
+                "effect": "approval.respond",
+                "implementation": { "type": "decision_destination", "decision": "decision" },
+                "parameters": {
+                    "parameters": [{
+                        "name": "decision",
+                        "kind": { "type": "choice", "choices": [
+                            { "id": "accept", "label": "Allow once" },
+                            { "id": "accept-for-session", "label": "Allow for the session" },
+                            { "id": "decline", "label": "Decline" },
+                            { "id": "decline-and-stop", "label": "Decline and stop" }
+                        ] },
+                        "label": "Decision",
+                        "required": true
+                    }]
+                },
+                "description": "Answer the approval the application is waiting on",
+                "confirmation_required": false
+            }])
+        } else if shape.gateway {
             serde_json::json!([])
         } else {
             serde_json::json!([
@@ -1521,6 +1724,9 @@ pub mod fixture {
         if shape.gateway {
             manifest["sdk_range"] = serde_json::json!(">=0.1.5, <0.2.0");
         }
+        if shape.answers {
+            manifest["sdk_range"] = serde_json::json!(">=0.1.6, <0.2.0");
+        }
         serde_json::to_string_pretty(&manifest).expect("a literal manifest encodes")
     }
 
@@ -1581,7 +1787,9 @@ pub mod fixture {
         shape: &Shape,
     ) -> std::io::Result<ConnectorSource> {
         let plugin_id = format!("kalareach/{}", shape.plugin_name);
-        let connector = if shape.gateway {
+        let connector = if shape.gateway && shape.answers {
+            gateway_connector_json_answering(&plugin_id, shape.volatile_forwarding)
+        } else if shape.gateway {
             gateway_connector_json_for(&plugin_id, shape.volatile_forwarding)
         } else {
             connector_json_for(&plugin_id)
@@ -1646,12 +1854,10 @@ pub mod fixture {
         .into_iter()
         .collect();
         if shape.gateway {
-            for capability in [
-                PluginCapability::UpstreamAction,
-                PluginCapability::ApprovalDecode,
-                PluginCapability::ApprovalRespond,
-            ] {
-                granted.remove(&capability);
+            granted.remove(&PluginCapability::UpstreamAction);
+            if !shape.answers {
+                granted.remove(&PluginCapability::ApprovalDecode);
+                granted.remove(&PluginCapability::ApprovalRespond);
             }
         }
         if shape.native_bridge {

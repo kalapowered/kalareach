@@ -557,12 +557,19 @@ impl BrokerState {
         let kept = kept_within(binding, target);
         if binding.grants != kept.grants || !same_trust(binding.trust.as_ref(), kept.trust.as_ref())
         {
+            let mut instance = None;
             if let Some(binding) = self.bindings.get_mut(&binding_id) {
                 binding.grants = kept.grants;
                 binding.trust = kept.trust;
                 binding.frame = Some(frame);
+                instance = Some(binding.application_instance_id);
             }
             self.owed_rows.insert(binding_id);
+            // What a gateway connection's capability evidence says of approvals follows the trust
+            // the binding holds.
+            if let Some(instance) = instance {
+                self.renew_gateway_evidence(instance, now);
+            }
         }
         let Some(binding) = self.bindings.get(&binding_id) else {
             return Err(BrokerError::unknown(format!("no binding {binding_id}")));
@@ -582,6 +589,7 @@ impl BrokerState {
         }
         self.owed_rows.remove(&binding_id);
         self.settle_owed_rows(now);
+        self.renew_gateway_evidence(changed.application_instance_id, now);
         Ok(())
     }
 

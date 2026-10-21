@@ -1409,6 +1409,13 @@ impl Broker {
         let claim = permit
             .settlement
             .ok_or_else(|| BrokerError::invalid("this admission holds no claim"))?;
+        // What the admission was made against is read again now, with the permit taken: a
+        // selection, a leave, an unlisted frame or a fence that came after the admission stops
+        // this answer here, before any marker, and gives the claim back.
+        if let Err(error) = self.recheck_permit(admitted) {
+            crate::broker::settled(self.release_claim(&claim, now));
+            return Err(error);
+        }
         // The marker goes in immediately before the bytes. Everything that could refuse this
         // answer has already refused it, so what remains after this point is the transport's own
         // failure, which is what uncertainty is for. A marker this host could not write has sent
@@ -1631,6 +1638,11 @@ impl Broker {
             .token
             .clone()
             .ok_or_else(|| BrokerError::invalid("this admission carries no action token"))?;
+        if let Err(error) = self.recheck_permit(admitted) {
+            // Nothing will carry the action, so the token it spent goes with it.
+            self.state().tokens.retire(&token.token_id);
+            return Err(error);
+        }
         Ok(TakenAction {
             turn_id: permit.request.turn_id.clone(),
             dispatch: permit.dispatch,
@@ -2074,6 +2086,47 @@ impl Broker {
         Ok(taken.submitted(dispatch.submit(&request)?))
     }
 
+    /// Checks again, under the broker's lock, what a permit was admitted against, as the permit
+    /// is taken.
+    ///
+    /// The admission checked the instance's binding, its suspension and the fence at one moment,
+    /// and the bytes follow later. A conversation the terminal selected or left meanwhile, a frame
+    /// of a method the table does not classify and a journal fault each change one of those, and
+    /// each stops a permit admitted before it. What nothing can order is the interval between the
+    /// permit's taking and its bytes reaching the transport's queue: every frame the host writes
+    /// names its thread, so one past this point reaches the thread the binding named at the
+    /// admission, never another.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PreconditionFailed`] while rich work is fenced or suspended,
+    /// [`BrokerError::StaleBinding`] when the binding moved, and [`BrokerError::UnknownSubject`]
+    /// for an instance this broker no longer holds.
+    fn recheck_permit(&self, admitted: &MutationAdmission) -> Result<()> {
+        let state = self.state();
+        state.volatile.require_rich_work()?;
+        let application_instance_id = admitted.application_instance_id();
+        let instance = state
+            .instances
+            .get(&application_instance_id)
+            .ok_or_else(|| crate::broker::unknown_instance(application_instance_id))?;
+        if let Some(reason) = instance.suspension_reason() {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!("rich mutations are suspended: {reason}"),
+            });
+        }
+        if instance.binding_revision != admitted.binding_revision() {
+            return Err(BrokerError::StaleBinding {
+                detail: format!(
+                    "this was admitted at binding revision {} and the binding is at {}",
+                    admitted.binding_revision(),
+                    instance.binding_revision
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Takes one admitted mutation's permit without handing it to the transport, so the caller
     /// can make the transport's own call wherever it chooses.
     ///
@@ -2092,6 +2145,7 @@ impl Broker {
             ));
         }
         let permit = admitted.take()?;
+        self.recheck_permit(admitted)?;
         Ok(TakenMutation {
             turn_id: permit.request.turn_id.clone(),
             dispatch: permit.dispatch,

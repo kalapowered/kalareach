@@ -100,6 +100,9 @@ pub struct Connection {
     pub table: DeclarativeTable,
     /// The closed rich method table for this connection's upstream version.
     pub rich: RichMethodTable,
+    /// What the core reads out of this connection's stream and how it answers an approval, where
+    /// its connector's table says either.
+    pub reading: Option<std::sync::Arc<crate::broker::reading::Reading>>,
 }
 
 /// What the core made of one native frame.
@@ -273,9 +276,32 @@ impl Gateway {
                 process: Some(process),
                 table,
                 rich,
+                reading: None,
             },
         );
         Ok(())
+    }
+
+    /// Returns the native connection open for one instance, where one is.
+    #[must_use]
+    pub fn native_connection_of(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Option<&Connection> {
+        self.connections
+            .values()
+            .find(|held| held.application_instance_id == application_instance_id)
+    }
+
+    /// Gives one open connection the reading of its connector's table.
+    pub fn read_with(
+        &mut self,
+        connection: GatewayConnectionId,
+        reading: std::sync::Arc<crate::broker::reading::Reading>,
+    ) {
+        if let Some(held) = self.connections.get_mut(&connection) {
+            held.reading = Some(reading);
+        }
     }
 
     /// Opens a connection for a rich client or a component.
@@ -311,6 +337,7 @@ impl Gateway {
                 process: None,
                 table,
                 rich,
+                reading: None,
             },
         );
         Ok(())
@@ -555,7 +582,7 @@ impl Gateway {
     /// The decision is written into the member the qualified table names for that method. A
     /// protocol that reads `behavior` does not read `option_id`, and writing the wrong member
     /// would send an answer the upstream cannot act on while this host recorded the resource
-    /// resolved.
+    /// resolved. The value written is the one the table maps the decision to, where it maps.
     ///
     /// # Errors
     ///
@@ -600,11 +627,29 @@ impl Gateway {
                 ),
             }
         })?;
+        // The value the application reads for the decision: the table's own mapping where it
+        // states one, and the decision's identifier as it is where it does not.
+        let value = match held
+            .reading
+            .as_ref()
+            .and_then(|reading| reading.answers.as_ref())
+        {
+            Some(answers) => answers
+                .values
+                .get(option_id)
+                .map(String::as_str)
+                .ok_or_else(|| BrokerError::PreconditionFailed {
+                    detail: format!(
+                        "{option_id} is not a decision this connector's table maps to a value"
+                    ),
+                })?,
+            None => option_id,
+        };
         let mut frame = serde_json::Map::new();
         frame.insert(held.table.response_id_field.clone(), identifier);
         frame.insert(
             held.table.result_field.clone(),
-            serde_json::json!({ option_field: option_id }),
+            serde_json::json!({ option_field: value }),
         );
         let frame = serde_json::to_vec(&serde_json::Value::Object(frame)).map_err(|error| {
             BrokerError::invalid(format!("this answer will not encode: {error}"))
@@ -777,7 +822,7 @@ fn read_identifier(
 
 /// Carries one JSON member as an upstream request identifier, in its JSON form; see
 /// [`read_identifier`].
-fn identifier_of(member: &serde_json::Value, field: &str) -> Result<UpstreamRequestId> {
+pub(crate) fn identifier_of(member: &serde_json::Value, field: &str) -> Result<UpstreamRequestId> {
     let text = match member {
         serde_json::Value::String(value) if value.len() > MAX_OPAQUE_ID_LEN => {
             return Err(BrokerError::invalid(format!(
@@ -938,7 +983,10 @@ fn read_channel_frame(bytes: &[u8]) -> Result<serde_json::Value> {
 }
 
 /// Follows one table path into a frame.
-fn member_at<'a>(value: &'a serde_json::Value, path: &FieldPath) -> Option<&'a serde_json::Value> {
+pub(crate) fn member_at<'a>(
+    value: &'a serde_json::Value,
+    path: &FieldPath,
+) -> Option<&'a serde_json::Value> {
     path.segments
         .iter()
         .try_fold(value, |current, segment| match segment {

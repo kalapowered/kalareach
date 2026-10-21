@@ -76,10 +76,12 @@ pub mod prepare;
 pub mod probe;
 pub mod process;
 pub mod profiles;
+pub mod reading;
 pub mod semantic;
 #[cfg(unix)]
 pub mod server;
 mod splice;
+pub mod stream;
 pub mod tokens;
 pub mod volatile;
 pub mod websocket;
@@ -312,9 +314,9 @@ impl Binding {
 /// Why rich mutations are suspended while nothing reads which conversation a gateway-served
 /// terminal has selected.
 ///
-/// A terminal behind the gateway can start, resume and fork conversations, and the gateway
-/// carries its frames without reading the thread out of them, so the binding names no thread and
-/// nothing vouches for one.
+/// A terminal behind the gateway can start, resume, fork and leave conversations. The gateway
+/// reads the thread out of the frames the connector's table names (see [`stream`]), and until a
+/// reply from the server has named one, the binding names no thread and nothing vouches for one.
 pub const THREAD_NOT_READ: &str = "the terminal's conversation is not read from its stream, so \
                                    which thread it has selected is unknown";
 
@@ -351,13 +353,17 @@ pub struct Instance {
     pub profile_id: Option<LaunchProfileId>,
     /// Why rich mutations are suspended, while they are.
     pub rich_suspension: Option<String>,
-    /// Set for the life of a gateway-served instance: nothing reads which conversation the terminal
-    /// behind its gateway has selected.
+    /// Set from the launch of a gateway-served instance until a reply from the server names the
+    /// conversation the terminal selected: nothing else reads which conversation the terminal
+    /// behind its gateway is in.
     ///
     /// It is a reason of its own: the unclassified-method suspension above is overwritten by the
     /// next unclassified method and lifted by [`Broker::resume_rich_mutations`], and this one is
-    /// lifted by neither.
+    /// lifted by neither. A conversation the terminal leaves brings it back.
     pub thread_unread: Option<&'static str>,
+    /// What this instance's stream says about the terminal's conversation: the selecting requests
+    /// in flight, what became of the last one, and the unlisted frames still unaccounted for.
+    pub stream: stream::StreamState,
     /// What carries a prepared operation to this instance's upstream, where anything does.
     dispatch: Option<std::sync::Arc<dyn crate::broker::methods::UpstreamDispatch>>,
     /// What this instance has been observed doing, and the cursor an adapter replays from.
@@ -447,17 +453,19 @@ impl Instance {
     }
 
     /// Why rich mutations are suspended, while they are: the reason one was placed with, or else
-    /// this instance's native bridge not being able to vouch for its thread, or else nothing
-    /// reading the thread a gateway-served terminal has selected. One reason is named, the first of
-    /// those that holds.
+    /// this instance's native bridge not being able to vouch for its thread, or else the stream of
+    /// a gateway-served terminal not saying which conversation it is in (a selection in flight or
+    /// of unknown outcome), or else nothing reading the thread it has selected. One reason is
+    /// named, the first of those that holds.
     ///
-    /// The bridge's reason and the unread thread are each their own. Lifting a suspension placed
-    /// here lifts neither, and neither settling lifts one placed here.
+    /// The bridge's reason, the stream's and the unread thread are each their own. Lifting a
+    /// suspension placed here lifts none of them, and none settling lifts one placed here.
     #[must_use]
     pub fn suspension_reason(&self) -> Option<&str> {
         self.rich_suspension
             .as_deref()
             .or_else(|| self.bridge.suspension())
+            .or_else(|| self.stream.reason())
             .or(self.thread_unread)
     }
 
@@ -597,6 +605,9 @@ pub struct ClientRequest {
     pub source: SourceEventHandle,
     /// True when admitting it suspended this instance's rich mutations.
     pub suspends_rich_mutations: bool,
+    /// The identifier it stays open under, while the broker waits for its reply because the reply
+    /// says something about the terminal's conversation.
+    open: Option<UpstreamRequestId>,
 }
 
 /// One draft as it stood when an invocation was admitted against it.
@@ -821,6 +832,9 @@ pub struct PinnedTable {
     /// A request a connection records with these tables is that package's request, and only that
     /// package's decoder gives it a meaning.
     pub package: PackageIdentity,
+    /// What the core reads out of the stream these tables frame and how it answers an approval,
+    /// where the installed connector's table says either.
+    pub reading: Option<Arc<reading::Reading>>,
 }
 
 /// The trusted broker.
@@ -1240,17 +1254,14 @@ impl Broker {
     /// Suspends an instance's rich mutations because nothing reads which conversation its
     /// gateway-served terminal has selected ([`THREAD_NOT_READ`]).
     ///
-    /// The terminal stays available. [`Broker::resume_rich_mutations`] does not lift this, and
-    /// nothing else does: the reason holds for the instance's life.
+    /// The terminal stays available. [`Broker::resume_rich_mutations`] does not lift this: a reply
+    /// from the server that names the conversation does, and so is the only thing that does.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance.
     #[cfg(unix)]
-    pub(crate) fn withhold_thread(
-        &self,
-        application_instance_id: ApplicationInstanceId,
-    ) -> Result<()> {
+    pub fn withhold_thread(&self, application_instance_id: ApplicationInstanceId) -> Result<()> {
         let mut state = self.state();
         let instance = state
             .instances
@@ -1264,7 +1275,8 @@ impl Broker {
     ///
     /// A native bridge's own suspension, while it cannot vouch for the application's thread, is not
     /// this one: it is lifted only by the bridge's next report the host can order. Nor is the
-    /// unread thread of a gateway-served terminal.
+    /// unread thread of a gateway-served terminal, nor a wait on a selection the terminal asked
+    /// for.
     ///
     /// # Errors
     ///
@@ -2057,6 +2069,14 @@ impl Broker {
         // did.
         state.volatile.note_native_request();
         let suspends_rich_mutations = classification.suspends_rich_mutations();
+        let open = state.stream_admit(
+            connection,
+            application_instance_id,
+            &method,
+            frame,
+            upstream_request_id,
+            suspends_rich_mutations,
+        );
         let recorder = state.connection_package(connection);
         if let Some(instance) = state.instances.get_mut(&application_instance_id) {
             if suspends_rich_mutations {
@@ -2078,6 +2098,7 @@ impl Broker {
             classification,
             source,
             suspends_rich_mutations,
+            open,
         })
     }
 
@@ -2101,6 +2122,20 @@ impl Broker {
         outcome: crate::broker::ledger::ClientRequestOutcome,
     ) -> Result<()> {
         let mut state = self.state();
+        // A request whose bytes never went was never seen by the server and leaves nothing behind;
+        // one that went in part may have been read, and what became of it is unknown.
+        if let Some(open) = request.open.as_ref()
+            && let Some(instance) = state.instances.get_mut(&request.application_instance_id)
+        {
+            let given_up = match outcome {
+                crate::broker::ledger::ClientRequestOutcome::Unsent => Some(false),
+                crate::broker::ledger::ClientRequestOutcome::Uncertain => Some(true),
+                _ => None,
+            };
+            if let Some(unknown) = given_up {
+                instance.stream.give_up(open, unknown);
+            }
+        }
         if !request.recorded || !state.volatile.writes_are_durable() {
             return Ok(());
         }
@@ -2996,6 +3031,7 @@ impl Broker {
                 table,
                 rich,
                 package,
+                reading: None,
             },
         );
         Ok(())
@@ -3031,6 +3067,13 @@ impl Broker {
             compiled.table.clone(),
             compiled.rich.clone(),
         )?;
+        if let Some(pinned) = self
+            .state()
+            .pinned_tables
+            .get_mut(&(application_instance_id, connector.plugin_id()))
+        {
+            pinned.reading = Some(Arc::clone(&compiled.reading));
+        }
         Ok(compiled)
     }
 
@@ -3156,7 +3199,11 @@ impl Broker {
             pinned.rich,
             installed_protocol_version,
         )?;
+        if let Some(reading) = pinned.reading {
+            state.gateway.read_with(connection, reading);
+        }
         state.connection_packages.insert(connection, pinned.package);
+        state.renew_gateway_evidence(application_instance_id, kr_ipc::now_ms());
         Ok(connection)
     }
 
@@ -3274,6 +3321,10 @@ impl Broker {
         let (_, settled) = state.settle_ended(scope, kr_ipc::now_ms());
         state.gateway.close(connection);
         state.connection_dispatch.remove(&connection);
+        // What the connection's evidence said ends with it.
+        if held.reading.is_some() || held.origin.may_forward_natively() {
+            state.withdraw_gateway_evidence(held.application_instance_id, kr_ipc::now_ms());
+        }
         // What it settled, here or before, is final now that nothing can name it on a connection
         // that has gone.
         state.forget_resolved();
@@ -3713,6 +3764,9 @@ impl BrokerState {
             "the upstream owner or selected thread changed",
             now,
         );
+        // What a gateway connection's tables let a client do is true of the new binding as it was
+        // of the old, so its evidence is written again at once.
+        self.renew_gateway_evidence(application_instance_id, now);
         Ok(revision)
     }
 
@@ -4149,6 +4203,7 @@ impl BrokerState {
                 profile_id,
                 rich_suspension: None,
                 thread_unread: None,
+                stream: stream::StreamState::default(),
                 dispatch: None,
                 semantic,
                 commands: Vec::new(),
@@ -4246,6 +4301,7 @@ impl BrokerState {
                 "{} is not classified by this connector's table, so what it changed is unknown",
                 forwarded.method
             ));
+            instance.stream.note_unlisted();
         }
 
         let Some(request) = forwarded.request.clone() else {

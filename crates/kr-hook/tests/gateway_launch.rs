@@ -874,6 +874,179 @@ fn kr_req_12_13_an_approval_is_a_pending_resource_before_the_terminal_answers_an
     }
 }
 
+/// A session whose package answers an approval as a response and reads the stream.
+fn answering() -> Gateway {
+    Gateway::shaped(
+        true,
+        "",
+        common::gateway::Ledger::Memory,
+        &kr_worker::broker::connectors::fixture::Shape::codex_backend_answering(),
+    )
+}
+
+/// KR-REQ-12.06: the terminal behind a gateway starts a thread and a turn, and the instance's
+/// binding is what the server's own messages say: the thread its reply named, the turn it started,
+/// and no turn once the turn ended. Rich mutations are not suspended for an unread thread.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_12_06_the_binding_of_a_gateway_served_terminal_is_what_the_servers_messages_say() {
+    let shell = answering();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let release = shell.placed.host.root().join("answer");
+    let mut launched = shell.launch(
+        &answer,
+        "binding",
+        &[
+            ("KR_STAND_IN", "stay,answer-when-released"),
+            ("KR_STAND_IN_COMMAND", COMMAND),
+            (
+                "KR_STAND_IN_RELEASE",
+                release.to_str().expect("a text path"),
+            ),
+        ],
+    );
+    launched.prints("TUI: the server asks for item/commandExecution/requestApproval");
+    let instance = shell.announcement().instance.application_instance_id;
+    // The terminal started a thread and a turn, and has not answered: the binding names both, from
+    // the replies and notifications the gateway carried, and nothing waits.
+    eventually("the binding names the turn", || {
+        shell
+            .broker
+            .binding_state(instance)
+            .is_ok_and(|state| state.turn_id.0.is_some())
+    });
+    let state = shell.broker.binding_state(instance).expect("the instance");
+    assert_eq!(
+        state.thread_id.0.map(|thread| thread.to_string()),
+        Some("thread-1".to_owned())
+    );
+    assert_eq!(
+        state.turn_id.0.map(|turn| turn.to_string()),
+        Some("turn-1".to_owned())
+    );
+    assert!(
+        !state.rich_mutations_suspended,
+        "{:?}",
+        state.suspension_reason
+    );
+
+    // The terminal answers; the turn ends, and the binding keeps its thread and names no turn.
+    std::fs::write(&release, b"answer").expect("the terminal is released");
+    launched.prints("TUI: turn/completed");
+    eventually("the turn ended", || {
+        shell
+            .broker
+            .binding_state(instance)
+            .is_ok_and(|state| state.turn_id.0.is_none())
+    });
+    let state = shell.broker.binding_state(instance).expect("the instance");
+    assert!(state.thread_id.0.is_some());
+    assert!(!state.rich_mutations_suspended);
+}
+
+/// KR-REQ-11.33: an approval the server asks a gateway-served terminal is interpreted under the
+/// package's trust, and a rich answer to it, with the terminal not answering, reaches the server
+/// once, in the shape the pinned release reads, with the value the table maps the decision to.
+/// The server's word that the request was answered reaches the terminal, and the resource is
+/// resolved.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_11_33_a_rich_answer_to_an_approval_a_gateway_served_terminal_was_asked_reaches_the_server_once()
+ {
+    use kr_protocol::agent::{AgentApprovalRespondParams, AgentMutationTarget};
+    use kr_protocol::gateway::PendingState;
+    use kr_protocol::ids::ActorId;
+
+    let shell = answering();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let received = shell.placed.host.root().join("rich-received");
+    let mut launched = shell.launch(
+        &answer,
+        "rich",
+        &[
+            ("KR_STAND_IN", "stay,leave-unanswered"),
+            ("KR_STAND_IN_COMMAND", COMMAND),
+            (
+                "KR_STAND_IN_RECEIVED",
+                received.to_str().expect("a text path"),
+            ),
+        ],
+    );
+    launched.prints("TUI: the server asks for item/commandExecution/requestApproval");
+    let instance = shell.announcement().instance.application_instance_id;
+    eventually("the request is interpreted", || {
+        shell
+            .broker
+            .pending_resources()
+            .first()
+            .is_some_and(|resource| resource.interpretation_verified)
+    });
+    let resource = shell.broker.pending_resources()[0].clone();
+    assert_eq!(resource.state, PendingState::Pending);
+    let offered = shell
+        .broker
+        .decoding(resource.resource_id)
+        .expect("the ledger reads")
+        .expect("the interpretation is recorded");
+    assert_eq!(
+        offered
+            .projection
+            .decisions
+            .iter()
+            .map(|decision| decision.option_id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "accept",
+            "accept-for-session",
+            "decline",
+            "decline-and-stop"
+        ]
+    );
+
+    let binding = shell.broker.binding_state(instance).expect("the instance");
+    let responded = shell
+        .runtime
+        .block_on(shell.broker.agent_approval_respond(
+            &kr_worker::broker::Caller {
+                actor_id: ActorId::new("owner").expect("an actor"),
+                grant_id: None,
+            },
+            &AgentApprovalRespondParams {
+                target: AgentMutationTarget {
+                    subject: kr_worker::broker::subject(common::session::session(), instance),
+                    binding_revision: binding.binding_revision,
+                },
+                resource_id: resource.resource_id,
+                option_id: "accept-for-session".to_owned(),
+            },
+            kr_ipc::now_ms(),
+        ))
+        .expect("the answer reaches the server");
+    drop(responded);
+    // The server read one response, for the request it asked, in a shape the pinned release's
+    // schema accepts (the stand-in checks every frame), and told the terminal it was answered.
+    launched.prints("TUI: serverRequest/resolved");
+    launched.prints("TUI: turn/completed");
+    eventually("the resource is resolved", || {
+        shell
+            .broker
+            .pending(resource.resource_id)
+            .is_some_and(|held| held.state == PendingState::Resolved)
+    });
+    let answers = std::fs::read_to_string(&received)
+        .expect("the server noted what it read")
+        .lines()
+        .filter(|line| line.starts_with("response "))
+        .count();
+    assert_eq!(answers, 1, "one response reached the server");
+}
+
 /// KR-REQ-11.32: a message at the connector's limit, which the host lowers from the package's
 /// larger statement to its own 1 MiB, is carried both ways through the gateway: the terminal's
 /// request to start a turn, and the server's notification of what the agent said.

@@ -1750,6 +1750,9 @@ impl Duplex {
     /// Returns true when the terminal was told. A refusal that cannot be handed over is a person
     /// left waiting on a reply that is not coming, so its caller ends the connection instead.
     fn give_up(&self, id: &UpstreamRequestId, client: &ClientId, why: &str) -> bool {
+        // The server may have read it, and nothing will say what it did.
+        self.broker
+            .client_request_given_up(self.connection, id, true);
         refusal_frame(&self.broker, self.connection, id, client, why)
             .is_some_and(|encoded| self.ends.client.queue(&encoded).is_ok())
     }
@@ -1896,9 +1899,18 @@ impl Duplex {
         // and everything the upstream said behind this frame, behind one end that is not
         // draining. What the write turns out to be is the owner's to act on.
         self.ends.client.queue(frame)?;
+        let resource_id = resource.map(|resource| resource.resource_id);
+        // Interpreted after it was recorded and forwarded, never before: the terminal's own
+        // answer does not wait for a meaning. A request the connector's table does not answer, or
+        // one nothing may decode, stays opaque and the terminal answers it.
+        if let Some(resource_id) = resource_id {
+            let _ = self.broker.interpret_native(resource_id, now);
+        }
+        self.broker
+            .read_upstream_frame(self.connection, &forwarded.method, frame, now);
         Ok(Carried::UpstreamRequest {
             method: forwarded.method,
-            resource_id: resource.map(|resource| resource.resource_id),
+            resource_id,
         })
     }
 
@@ -1913,6 +1925,10 @@ impl Duplex {
             // identifier the client used. It is never an answer to a request of this host's, and
             // it never reaches the arbitration.
             if let Some(client_identifier) = self.outstanding.client_identifier(&request.upstream) {
+                // What the reply says about the terminal's conversation is read before the
+                // terminal is given it.
+                self.broker
+                    .client_replied(self.connection, &request.upstream, frame, now);
                 let returned = self.return_to_client(frame, &client_identifier);
                 if returned.is_err() {
                     // The mapping has been taken and the reply cannot be handed over, so this

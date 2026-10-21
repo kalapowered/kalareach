@@ -128,6 +128,10 @@ async fn the_server_runs_a_turn_and_ends_its_commands_with_its_input() {
         &json!({"id":asked["id"],"result":{"decision":"accept"}}),
     )
     .await;
+    // The server says the request was answered before it ends the turn.
+    let resolved = next(&mut lines).await;
+    assert_eq!(resolved["method"], "serverRequest/resolved");
+    assert_eq!(resolved["params"]["requestId"], asked["id"]);
     assert_eq!(next(&mut lines).await["method"], "turn/completed");
 
     // The command leads a group of its own, with a process of its own in it; both are gone when
