@@ -790,9 +790,11 @@ mod tests {
             assert!(!floor.is_owed(), "and nothing is left owed");
 
             // The host restarts, with its wall clock wound back to where the bound was chosen. Its
-            // floor is what it had written down and nothing else: the policy is rebuilt from the
-            // stored one. A bound that lapsed in UTC is still lapsed, because the floor it was
-            // found at was written; the control, a bound that had not lapsed, still admits.
+            // floor is what it had written down and nothing else: for a lapse found in UTC the
+            // policy is rebuilt from the stored one, which carries that floor, and for the control
+            // from the policy as it stood. A bound that lapsed in UTC is still lapsed, because the
+            // floor it was found at was written; the control, a bound that had not lapsed, still
+            // admits.
             let stored = match lapsed {
                 Some("in UTC") => Some(
                     sharing
