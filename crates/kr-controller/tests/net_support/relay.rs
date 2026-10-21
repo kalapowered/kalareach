@@ -84,6 +84,8 @@ pub struct LocalRelay {
     tls: rustls::ServerConfig,
     port: u16,
     refusal: Refusal,
+    /// What holds the relay's port for as long as the relay lives, whether its server runs or not.
+    _port_kept: PortKept,
 }
 
 impl LocalRelay {
@@ -91,7 +93,8 @@ impl LocalRelay {
         let (certs, tls) = iroh_relay::server::testing::self_signed_tls_certs_and_config();
         let ca_roots = certs.into_iter().map(|cert| cert.to_vec()).collect();
         let refusal = Refusal::default();
-        let (server, port) = Self::serve(&tls, 0, &refusal)
+        let (port_kept, requested) = keep_a_port().await;
+        let (server, port) = Self::serve(&tls, requested, &refusal)
             .await
             .expect("a relay server");
         let url: iroh::RelayUrl = format!("https://127.0.0.1:{port}")
@@ -104,6 +107,7 @@ impl LocalRelay {
             tls,
             port,
             refusal,
+            _port_kept: port_kept,
         }
     }
 
@@ -154,7 +158,8 @@ impl LocalRelay {
     /// endpoint stays connected to a relay that has stopped. So no session is let in from the moment
     /// the stop begins, the ones the relay holds are ended before the server is told to stop, and
     /// the sweep goes on until every session the relay let in has ended. The relay counts those from
-    /// its admission, which the server's own counts do not.
+    /// its admission, which the server's own counts do not. It returns once a connection to the
+    /// relay's port is turned away, which is when the server's listener is gone.
     pub async fn stop(&mut self) {
         let Some(server) = self.server.take() else {
             return;
@@ -165,6 +170,7 @@ impl LocalRelay {
             .cloned()
             .expect("the relay serves relayed sessions");
         let refusal = self.refusal.clone();
+        let port = self.port;
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
             service.clients().shutdown().await;
             server.shutdown().await.expect("the relay stops");
@@ -172,42 +178,122 @@ impl LocalRelay {
                 {
                     let state = refusal.state();
                     if state.admitted == state.ended {
-                        return;
+                        break;
                     }
                 }
                 service.clients().shutdown().await;
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
+            // The server's listener goes with the task that held it, which the runtime ends some
+            // time after the server's shutdown has returned: until it has, a connection is
+            // accepted.
+            loop {
+                let dialled = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await;
+                if dialled
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
         })
         .await
-        .expect("every session the relay let in has ended");
+        .expect("every session the relay let in has ended and nothing answers at its port");
     }
 
     /// Starts the relay again at the address it had, with the certificate it had.
     ///
-    /// The port a stopped relay had is free for any other program on the machine to take, and on a
-    /// machine that runs many tests at once, another relay that binds an address of its own is
-    /// given it. The relay takes its port back as soon as whatever has it lets it go, and a test
-    /// that went wrong is stopped rather than left to wait.
+    /// The port is the relay's all the while it is stopped (see [`keep_a_port`]), so no other
+    /// program has taken it. What can still hold it is the listener of the server that was stopped,
+    /// which the runtime drops some time after the server's shutdown has returned, so the relay
+    /// tries again while the address is in use. A listener that is never dropped is a test that went
+    /// wrong, and it is stopped rather than left to wait.
     pub async fn start_again(&mut self) {
         assert!(self.server.is_none(), "the relay is running");
         self.refusal = self.refusal.for_a_server_started_again();
-        let (server, port) = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let mut refused = None;
+        let served = tokio::time::timeout(std::time::Duration::from_secs(120), async {
             loop {
                 match Self::serve(&self.tls, self.port, &self.refusal).await {
                     Ok(served) => return served,
                     Err(error) if is_address_in_use(&error) => {
+                        refused = Some(error);
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
-                    Err(error) => panic!("a relay server: {error}"),
+                    Err(error) => panic!("a relay server: {error:?}"),
                 }
             }
         })
-        .await
-        .expect("the port the relay had is free again");
+        .await;
+        let Ok((server, port)) = served else {
+            panic!(
+                "the port {} the relay had is not free again: {refused:?}",
+                self.port
+            );
+        };
         assert_eq!(port, self.port, "the relay came back at its address");
         self.server = Some(server);
     }
+}
+
+/// What holds a relay's port: on Unix, the local end of a connection to a listener of the
+/// fixture's own.
+#[cfg(unix)]
+struct PortKept {
+    _local_end: tokio::net::TcpStream,
+    _far_end: tokio::net::TcpListener,
+}
+
+#[cfg(not(unix))]
+struct PortKept;
+
+/// Holds a port on the loopback interface for a relay, from before the relay binds it until the
+/// relay is dropped, and returns it. A relay that stops frees its port, and on a machine that runs
+/// many tests at once any program that binds a port of its own, or opens a connection, can be given
+/// it, to keep it for as long as it likes; so the relay does not free it. A socket with the
+/// address-reuse option the relay's own listener has binds the port and connects to a listener of
+/// the fixture's own, and that connection holds the port:
+///
+/// - no bind of port 0 and no connection that is given a local port is handed a port that is
+///   bound, connected or not;
+/// - a program that names the port is turned away unless it too has the address-reuse option;
+/// - the relay's listener binds the port beside the connection, as any server does that restarts
+///   while its connections are still open, and while the relay is stopped a connection to the port
+///   is turned away as it is by a port that has no listener: the held connection is not one that
+///   answers, so a stopped relay answers nothing.
+///
+/// Elsewhere than on Unix the option means something else, and the relay is given a port when it
+/// binds.
+#[cfg(unix)]
+async fn keep_a_port() -> (PortKept, u16) {
+    let far_end = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("a listener");
+    let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+    socket
+        .set_reuseaddr(true)
+        .expect("the socket can be reused");
+    socket
+        .bind((Ipv4Addr::LOCALHOST, 0).into())
+        .expect("a port for the relay");
+    let port = socket.local_addr().expect("its address").port();
+    let local_end = socket
+        .connect(far_end.local_addr().expect("its address"))
+        .await
+        .expect("the connection that holds the port");
+    (
+        PortKept {
+            _local_end: local_end,
+            _far_end: far_end,
+        },
+        port,
+    )
+}
+
+#[cfg(not(unix))]
+async fn keep_a_port() -> (PortKept, u16) {
+    (PortKept, 0)
 }
 
 /// Whether `error`, or a cause it names, is an address that something else holds.
