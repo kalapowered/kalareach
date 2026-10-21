@@ -15,7 +15,9 @@
 # What it holds after the update:
 #   * both demonstrations pass on the second release, as on the first;
 #   * the desktop identity a session is bound to is the one it was before the update;
-#   * an attach to a session of the second release shows the session's screen.
+#   * an attach from the command line to a session of the second release shows its screen, with the
+#     output of the `git` and `cargo` its shell ran, so the host runs a person's development tools
+#     unsandboxed.
 # With `--identity developer-id`, it holds as well that every permission record the second release
 # reports is the one the first reported. An ad hoc signature gives each build an identity of its
 # own, so a record taken against the executable's identity is stale after an update by design, and
