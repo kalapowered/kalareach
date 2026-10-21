@@ -1226,7 +1226,11 @@ fn a_command_sessions_marker_is_kept_apart_from_the_summary_an_earlier_release_r
         kr_cbor::to_canonical_vec(&without_marker).expect("encodes the summary"),
         "the summary row is byte for byte the summary of a session whose root is a shell"
     );
-    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+    // The database stays open until the connection is closed, and a directory that holds an open
+    // database cannot be removed on Windows, so the removal comes after it and says if it fails.
+    connection.close().expect("closes the journal");
+    std::fs::remove_dir_all(path.parent().expect("a parent"))
+        .expect("removes the journal's directory");
 }
 
 /// Makes a current journal into the one a worker of the build before wrote: no record of what the
