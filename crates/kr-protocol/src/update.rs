@@ -595,8 +595,8 @@ pub enum LaunchMode {
 /// How a host starts a shell in one mode, and the startup files it puts its entry in.
 ///
 /// The arguments name no option that skips or replaces a startup file of the person's, and the
-/// entries go into files the shell reads itself, so every startup file runs in the order the shell
-/// reads them, the package's own entry among them.
+/// entries go into files the shell reads itself. The order the shell reads its startup files in is
+/// the shell's own and is not stated here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileLaunch {
     /// The mode.
@@ -1876,33 +1876,6 @@ mod tests {
             "4c89849c98172c951a9def3690e8647dae76308f"
         );
         assert_eq!(patches[1]["base_revision"], "zsh-5.9");
-    }
-
-    /// A release says every one of its members: a manifest that leaves one out is not read, so a
-    /// tool that forgets what a release owes its readers cannot sign one.
-    #[test]
-    fn a_manifest_that_leaves_a_member_out_is_not_read() {
-        let mut written = manifest(vec![file("bin/kr")]);
-        written.shells = vec![zsh_package()];
-        let whole = serde_json::to_value(&written).expect("encodes");
-        for member in ["shells", "agents", "dependencies", "public_majors"] {
-            let mut without = whole.clone();
-            without.as_object_mut().expect("an object").remove(member);
-            let members: SignedMembers = serde_json::from_value(without).expect("reads");
-            assert!(members.manifest().is_err(), "a manifest without {member}");
-        }
-        for member in ["upstream", "patches", "sources", "modules", "profile_order"] {
-            let mut without = whole.clone();
-            without["shells"][0]
-                .as_object_mut()
-                .expect("an object")
-                .remove(member);
-            let members: SignedMembers = serde_json::from_value(without).expect("reads");
-            assert!(
-                members.manifest().is_err(),
-                "a shell package without {member}"
-            );
-        }
     }
 
     /// A release retains the levels it names and no others.

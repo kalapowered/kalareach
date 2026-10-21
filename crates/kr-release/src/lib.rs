@@ -19,7 +19,7 @@
 mod agents;
 pub mod assemble;
 pub mod dev;
-mod pins;
+pub mod pins;
 mod profile;
 pub mod record;
 mod refusal;
