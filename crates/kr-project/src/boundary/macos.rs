@@ -21,6 +21,14 @@
 //! a document to rewrite between the writing and the launcher reading it. An argument vector this
 //! process built is reachable by nothing.
 //!
+//! ## Descriptors
+//!
+//! Every descriptor the child holds from the fourth on is marked to close when it executes the
+//! launcher, in the child before it executes, as the Linux boundary marks them
+//! ([`kr_ipc::inheritance`]). The profile is judged when a file is opened, and a descriptor the
+//! host opened before the profile is already open: without the mark the launcher, and Git after
+//! it, would read through it whatever the profile says.
+//!
 //! The library call `sandbox_init` would apply the same text without the extra program, and it
 //! works on this platform. It is not used, and the reason is where it would have to be called:
 //! after `fork` and before `exec`, in a child of a process that has other threads. Compiling a
@@ -59,10 +67,13 @@ const DEVICES: &[&str] = &[
     "/dev/dtracehelper",
 ];
 
-/// The profile this invocation runs under.
+/// The profile this invocation runs under, and what the child needs to pass on nothing else.
 #[derive(Debug)]
 pub struct Prepared {
     profile: String,
+    /// The room the child finds its descriptors in, made before the fork because the child may not
+    /// allocate.
+    room: kr_ipc::inheritance::TableRoom,
 }
 
 impl Prepared {
@@ -81,14 +92,19 @@ impl Prepared {
 
     /// Applies whatever the boundary still needs applying in the child.
     ///
-    /// Nothing: the launcher this invocation executes applies the profile itself, before Git
-    /// exists. The child's own hook does no work beyond moving into the directory handle.
+    /// The profile is not among it: the launcher this invocation executes applies that itself,
+    /// before Git exists. What is left is the descriptors the host holds. The profile judges a
+    /// file when it is opened, so a descriptor that is already open is read through whatever the
+    /// profile says, and the launcher would hand it to Git. Every descriptor above the standard
+    /// three is marked to close when the launcher executes, as the Linux boundary marks them, and
+    /// a system that cannot list them fails the start rather than run Git holding one.
     ///
     /// # Errors
     ///
-    /// Never.
+    /// Returns the system's error when a descriptor cannot be marked or the system will not list
+    /// them all.
     pub fn apply(&mut self) -> std::io::Result<()> {
-        Ok(())
+        kr_ipc::inheritance::mark_close_on_exec(&mut self.room)
     }
 }
 
@@ -142,7 +158,10 @@ pub fn prepare(confinement: &Confinement) -> Result<Prepared> {
             text.push_str(")\n");
         }
     }
-    Ok(Prepared { profile: text })
+    Ok(Prepared {
+        profile: text,
+        room: kr_ipc::inheritance::TableRoom::make(),
+    })
 }
 
 /// Returns one path as a profile's literal filter.

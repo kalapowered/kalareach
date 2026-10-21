@@ -122,8 +122,8 @@ pub fn start(invocation: &Invocation<'_>, confinement: &Confinement) -> Result<S
         // SAFETY: the hook runs in the forked child before `exec`. It moves into an already-open
         // directory and applies whatever the platform left for it, and each platform's `apply` is
         // written for that state: no allocation of its own, no lock this process holds, no call
-        // back into this crate. On macOS it does nothing at all, because the launcher the child
-        // executes applies the boundary itself.
+        // back into this crate. On macOS the launcher the child executes applies the profile
+        // itself, and what is left is marking the descriptors, with the room made before the fork.
         unsafe {
             command.pre_exec(move || {
                 rustix::process::fchdir(&directory)?;
