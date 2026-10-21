@@ -223,11 +223,13 @@ server leaves behind stays in the process table, ended, until the worker exits. 
 closed, this happens after the acceptance of the close has been delivered, because the command that
 asked for the close may be one the server started.
 
-The host does not read which conversation the terminal has selected out of the frames it carries,
-so the binding of a terminal served this way names no thread. Its rich mutations are suspended
-before the launch commits and for the instance's life, whatever the table lists: the unread thread
-alone keeps them suspended, even when the table classifies every method the terminal sends. The
-terminal is unaffected, and a package's table cannot lift the suspension.
+The host reads which conversation the terminal has selected out of the frames it carries only
+where the package's table says where they name it (the table's observation member, below). Until a
+reply names the conversation, the binding of a terminal served this way names no thread, and its
+rich mutations are suspended, from before the launch commits: the unread thread alone keeps them
+suspended, even when the table classifies every method the terminal sends. A table with no
+observation member never lifts the suspension, so rich mutations stay suspended for the instance's
+life. The terminal is unaffected either way.
 
 ### The forwarder's placeholder
 

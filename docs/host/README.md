@@ -6069,10 +6069,12 @@ destination answers; a projection offers at most the decisions the destination m
 versions are `kalareach.decision/1`, and `kalareach.plugin.decoded-request/<WIT version>` as well
 for a package that ships a component; and the record encodes an answer only with `approval.respond`.
 A request whose method the record does not cover stays recorded and opaque, and the native client
-answers it. A table with no decision destination gives no trust at all. That includes a protocol
-whose answer is a response to the request itself, such as the Agent Client Protocol's permission
-request, which a decision destination cannot name: its requests are recorded, forwarded and
-answered by the native client alone.
+answers it. A table with neither a decision destination nor a decision response gives no trust at
+all. A protocol whose answer is a response to the request itself, such as the Agent Client
+Protocol's permission request, which a decision destination cannot name, is trusted only where its
+table declares a decision response (see [What the gateway reads from the
+stream](#what-the-gateway-reads-from-the-stream)); otherwise its requests are recorded, forwarded
+and answered by the native client alone.
 
 A request belongs to the package whose table recorded it, and that package is kept with the
 request's source. A connection identifier keeps the package it recorded requests under for good,
@@ -6295,9 +6297,13 @@ qualify. A prompt, a steer and a cancellation name the thread the binding holds,
 cancellation name the turn that is running. They are refused before the dispatch marker, and
 nothing is written, when the binding names no thread, when no turn is known to run, when the turn
 named is not the running one, when a prompt names a draft (the template writes text, and the
-draft's content would be left out), and when a prompt is submitted over a running turn (whether the
-application takes that as a queue is not something this host has qualified). The reply's turn is
-read at the place the table names, so the receipt names the turn a prompt started.
+draft's content would be left out), and when a prompt is submitted while a turn is known to run
+(whether the application takes that as a queue is not something this host has qualified). A turn is
+known from the server's own notification that it started: a reply names the turn an operation
+started, and the receipt carries it, but the instance's running turn is not set from a reply, so a
+prompt sent before that notification arrives, or into a thread resumed while it runs, is not known
+to be over one. The reply's turn is read at the place the table names, so the receipt names the
+turn a prompt started.
 
 An upstream reverse request for a filesystem or terminal operation is one this host performs
 itself, in the agent's own host environment and as the user the agent runs as. Where it runs comes
@@ -6370,12 +6376,22 @@ request is in flight, and the replies are then applied in the order their reques
 the last selection decides the conversation, and a leave ends the conversation it names when that
 is the one bound by then. An older reply never restores a conversation a later request has left,
 and a reply older than a request whose outcome is unknown says nothing about where the terminal is:
-the instance waits until a later selection has named the conversation.
+the instance waits until a later selection has named the conversation. The server's notifications
+come in the server's own order, which a kept reply no longer has. One that closes the conversation a
+kept reply selected, or reports a turn in a conversation the terminal is not bound to that such a
+reply selected, drops that reply, and the instance waits for the next selection that is answered; a
+notification about a conversation no kept reply named changes nothing.
 
 An operation admitted before any of that, and not yet taken, is checked again when its permit is
-taken: the binding revision, every reason rich mutations wait, the journal's fence, and that the
-connection the admission chose still takes frames. A refusal there is a refusal before any marker,
-and nothing was sent. What nothing orders is the interval between the take and the bytes reaching
+taken: the binding revision, every reason rich mutations wait, the journal's fence, that the
+connection the admission chose still takes frames, and what the operation needs of the turn (a
+prompt is not submitted over a turn that began since, and a steer or a cancellation is not sent for
+a turn that ended or was replaced, since a turn starts and ends without moving the revision). An
+answer is also checked against its decoder's authority, which an owner or a narrower installation
+withdraws without moving the revision, and against what the connection carries; a revocation or a
+component fault disables the binding's rich capabilities and lets what it already admitted finish.
+A refusal there is proven: nothing was sent, the broker wrote no dispatch marker, and the receipt
+is refused, not uncertain. What nothing orders is the interval between the take and the bytes reaching
 the transport's queue. A frame the host writes names its thread (an approval's answer names its
 request), so a frame past the take reaches the thread the binding named when it was admitted and
 never another, though that can be one the terminal has just left, as a frame the terminal itself
