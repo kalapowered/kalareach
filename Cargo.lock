@@ -4662,9 +4662,11 @@ dependencies = [
 name = "kr-e2e-m1b"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "base64 0.23.1",
  "futures-util",
  "iroh",
+ "jiff",
  "kr-cbor",
  "kr-client",
  "kr-controller",
@@ -4683,9 +4685,11 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-websockets",
+ "tough",
  "url",
 ]
 

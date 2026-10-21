@@ -24,8 +24,8 @@ pub const SPEAK_VARIABLE: &str = "KR_STAND_IN_SPEAK";
 pub const KEY_VARIABLE: &str = "KR_STAND_IN_API_KEY";
 
 /// The file a terminal under `answer-when-released` waits for before it answers the approval, one
-/// under `wait-to-connect` waits for before it connects, and one under `request-when-released`
-/// waits for before it asks its question.
+/// under `wait-to-connect` waits for before it connects, and one under `request-when-released` or
+/// `ping-when-released` waits for before it asks its question.
 pub const RELEASE_VARIABLE: &str = "KR_STAND_IN_RELEASE";
 
 /// The file the server appends one line to when it starts (`server started`) and one for each
@@ -74,9 +74,17 @@ pub struct Variants {
     pub idle: bool,
     /// The terminal stops reading once its turn is running, as a terminal that is stopped does.
     pub stop_reading: bool,
+    /// The terminal writes the line `TUI: tick N` once the file `KR_STAND_IN_RELEASE` names, with
+    /// `.tickN` added, exists, for N from 1 on and in order, so that a test decides when its
+    /// output happens.
+    pub tick: bool,
     /// The terminal, once its turn is complete, waits for the file `KR_STAND_IN_RELEASE` names and
     /// then asks the server who the account is.
     pub request_when_released: bool,
+    /// The terminal, once its turn is complete, asks the server who the account is again and says
+    /// when the answer arrives (`TUI: the server answered after the turn`), taking nothing else
+    /// from it, so that a test knows the server has read everything the terminal sent before.
+    pub ping_when_released: bool,
     /// The server, once the file `KR_STAND_IN_SPEAK` names exists, writes a notification, whoever
     /// is reading, and says whether the write failed. A server whose write fails ends its commands.
     pub write_when_released: bool,
@@ -127,7 +135,9 @@ impl Variants {
                 "retry-plain" => variants.retry_plain = true,
                 "idle" => variants.idle = true,
                 "stop-reading" => variants.stop_reading = true,
+                "tick" => variants.tick = true,
                 "request-when-released" => variants.request_when_released = true,
+                "ping-when-released" => variants.ping_when_released = true,
                 "write-when-released" => variants.write_when_released = true,
                 "answer-when-released" => variants.answer_when_released = true,
                 "wait-to-connect" => variants.wait_to_connect = true,

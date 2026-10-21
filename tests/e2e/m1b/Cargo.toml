@@ -104,10 +104,22 @@ rustix = { workspace = true, features = ["fs", "process", "termios"], optional =
 libproc = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The keys and expiry a test signs a catalogue generation of its own with, through the catalogue's
+# own generation builder.
+aws-lc-rs.workspace = true
+jiff.workspace = true
 # A program a test starts is placed by a process of its own, so that no child another test starts
 # holds it open for writing. Only the tests build it: the checker the scripts build and run
 # without the legs does not.
 kr-ipc = { workspace = true, features = ["testing"] }
+# The catalogue's own generation builder, which the tests that publish a package use, seeds from
+# bundles of files of its own.
+kr-plugin-catalogue = { workspace = true, features = ["testing"] }
+# The connector packages a test publishes and installs are the worker's own test packages, so the
+# integration a session is given is read from the package a worker reads.
+kr-worker = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+tough.workspace = true
 
 [lints]
 workspace = true

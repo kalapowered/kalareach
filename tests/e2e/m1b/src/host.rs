@@ -195,6 +195,16 @@ pub struct HostOptions {
     pub shell_packages: Option<PathBuf>,
 }
 
+/// What a leg that prepares its host before the daemon opens it asks for beyond [`HostOptions`].
+#[derive(Clone, Debug, Default)]
+pub struct Preparation {
+    /// The plugins whose command integrations the configuration document turns on.
+    pub command_integrations: Vec<String>,
+    /// Whether the host keeps the loopback address a device dials across a restart of its daemon,
+    /// by binding a port chosen once instead of one the system chooses at each start.
+    pub stable_address: bool,
+}
+
 /// A running host.
 #[derive(Debug)]
 pub struct Host<'r> {
@@ -220,6 +230,23 @@ impl<'r> Host<'r> {
     /// what the daemon wrote.
     #[must_use]
     pub fn start(run: &'r Run, options: &HostOptions) -> Self {
+        Self::start_prepared(run, options, &Preparation::default(), |_| {})
+    }
+
+    /// Makes the host tree, writes its configuration document, lets `seed` put state in the tree
+    /// before any daemon has opened it, and starts the daemon.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the tree cannot be made or the daemon does not answer within [`LIVENESS`], with
+    /// what the daemon wrote.
+    #[must_use]
+    pub fn start_prepared(
+        run: &'r Run,
+        options: &HostOptions,
+        preparation: &Preparation,
+        seed: impl FnOnce(&EnvironmentPaths),
+    ) -> Self {
         let paths = HostPaths::new(run.root().join("r"), run.root().join("s"))
             .expect("absolute host roots");
         // The same identity the daemon opens when it starts: it reads the one that is there.
@@ -228,7 +255,19 @@ impl<'r> Host<'r> {
             .expect("the environment's identity");
         let environment = paths.environment(environment_id);
         environment.create().expect("the environment's directories");
-        write_configuration(&environment);
+        let port = if preparation.stable_address {
+            // A port nothing holds now; the daemon binds it at each start, and the address a
+            // paired device holds stays the address the host answers on.
+            std::net::UdpSocket::bind("127.0.0.1:0")
+                .expect("a free loopback port")
+                .local_addr()
+                .expect("its address")
+                .port()
+        } else {
+            0
+        };
+        write_configuration(&environment, &preparation.command_integrations, port);
+        seed(&environment);
         let host = Self {
             run,
             paths,
@@ -240,7 +279,12 @@ impl<'r> Host<'r> {
         host
     }
 
-    fn start_daemon(&self) {
+    /// Starts the daemon over the host tree.
+    ///
+    /// # Panics
+    ///
+    /// Panics when it does not answer within [`LIVENESS`].
+    pub fn start_daemon(&self) {
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -352,6 +396,37 @@ impl<'r> Host<'r> {
         let lines: Vec<&str> = text.lines().collect();
         let start = lines.len().saturating_sub(40);
         lines[start..].join("\n")
+    }
+
+    /// The identity of the worker process that serves `session_id`: the process running this run's
+    /// copy of `kr-worker` for that session, recorded with the run once its start holds the number
+    /// the process table gave.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no such process is in the process table within [`LIVENESS`].
+    #[must_use]
+    pub fn worker_of(&self, session_id: &str) -> ProcessStartIdentity {
+        let started = Instant::now();
+        let session = format!("--session {session_id}");
+        loop {
+            if let Some(identity) = crate::run::processes_under(self.run.root())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(_, command)| command.contains("kr-worker") && command.contains(&session))
+                .find_map(|(pid, _)| {
+                    self.run
+                        .record_named(pid, "the session's worker", &["kr-worker", &session])
+                })
+            {
+                return identity;
+            }
+            assert!(
+                started.elapsed() < LIVENESS,
+                "no worker for session {session_id} is in the process table"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     /// Records every worker this host's registry names, with everything that runs beneath it, by
@@ -584,6 +659,27 @@ impl<'r> Host<'r> {
             .ok_or_else(|| "kr list answered something that is not a list of sessions".to_owned())
     }
 
+    /// Kills the daemon with nothing said to it, as a crash does, and waits until it has gone.
+    /// The sessions it started go on; [`Self::start_daemon`] starts a daemon over the same tree.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the daemon is not running or does not end within twenty seconds.
+    pub fn kill_daemon(&self) {
+        let mut daemon = self
+            .daemon
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .expect("a running daemon to kill");
+        signal(&daemon.identity, rustix::process::Signal::KILL);
+        assert!(
+            ended_within(&daemon.identity, DAEMON_STOP),
+            "the control daemon did not end within {DAEMON_STOP:?} of being killed"
+        );
+        let _ = daemon.child.wait();
+    }
+
     fn stop_daemon(&self) -> Result<(), String> {
         let Some(mut daemon) = self
             .daemon
@@ -635,18 +731,22 @@ impl Drop for Host<'_> {
 
 /// Writes the environment's configuration document: this host joins the network on loopback, with
 /// no relay and no discovery service.
-fn write_configuration(environment: &EnvironmentPaths) {
+fn write_configuration(environment: &EnvironmentPaths, command_integrations: &[String], port: u16) {
     let path = kr_worker::config::document_path(environment);
-    let document = serde_json::json!({
+    let mut document = serde_json::json!({
         "version": 1,
         "revision": 1,
         "network": {
             "enabled": true,
-            "bind_address": "127.0.0.1:0",
+            "bind_address": format!("127.0.0.1:{port}"),
             "local_discovery": false,
             "mainline_dht": false,
         },
     });
+    if !command_integrations.is_empty() {
+        document["preferences"] =
+            serde_json::json!({ "command_integrations": command_integrations });
+    }
     kr_ipc::paths::write_owner_only_file(
         &path,
         serde_json::to_vec_pretty(&document)

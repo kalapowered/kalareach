@@ -26,6 +26,19 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
         // A terminal that was started and never connects, as one that ran as typed does not.
         std::future::pending::<()>().await;
     }
+    if variants.tick
+        && let Ok(release) = std::env::var(RELEASE_VARIABLE)
+    {
+        tokio::spawn(async move {
+            for number in 1_u64.. {
+                let released = format!("{release}.tick{number}");
+                while !std::path::Path::new(&released).exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                println!("TUI: tick {number}");
+            }
+        });
+    }
     if variants.wait_to_connect
         && let Ok(release) = std::env::var(RELEASE_VARIABLE)
     {
@@ -123,6 +136,8 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
     // The thread and the turn the server has said it started.
     let mut thread = String::new();
     let mut turn = String::new();
+    // Whether the next answer to `account/read` is the one `ping-when-released` asked for.
+    let mut pinged = false;
     loop {
         let message = match connection.next().await {
             Some(Ok(message)) => message,
@@ -170,6 +185,10 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
                     "initialize" => {
                         send!(json!({ "method": "initialized" }));
                         send!(json!({ "id": ACCOUNT, "method": "account/read", "params": {} }));
+                    }
+                    "account/read" if pinged => {
+                        pinged = false;
+                        println!("TUI: the server answered after the turn");
                     }
                     "account/read" => {
                         println!("TUI: signed out; the stand-in goes on");
@@ -264,6 +283,16 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
                     while !std::path::Path::new(&release).exists() {
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
+                    send!(json!({ "id": ACCOUNT, "method": "account/read", "params": {} }));
+                }
+                if completed
+                    && variants.ping_when_released
+                    && let Ok(release) = std::env::var(RELEASE_VARIABLE)
+                {
+                    while !std::path::Path::new(&release).exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    pinged = true;
                     send!(json!({ "id": ACCOUNT, "method": "account/read", "params": {} }));
                 }
             }

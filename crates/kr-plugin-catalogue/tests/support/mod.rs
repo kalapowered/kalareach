@@ -221,6 +221,9 @@ pub struct GenerationSpec {
     /// A change made to the package's index entry after it is derived from the manifest, before
     /// the index is signed: an index that says something the manifest does not.
     pub edit_entry: Option<fn(&mut IndexEntry)>,
+    /// The executable builds the index lists for the package, each with the digest of the
+    /// executable it qualifies.
+    pub builds: Vec<kr_plugin_sdk::catalogue::QualifiedBuild>,
     /// The platforms the example package's manifest lists, where not the example's own.
     pub platforms: Option<Vec<kr_plugin_sdk::matching::PlatformSupport>>,
     /// A change made to the index's document after it is rendered, before it is signed: an index
@@ -255,6 +258,7 @@ impl Default for GenerationSpec {
             metadata_version: None,
             extra_targets: Vec::new(),
             edit_entry: None,
+            builds: Vec::new(),
             platforms: None,
             edit_index_json: None,
         }
@@ -624,6 +628,7 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
     if let Some(edit) = spec.edit_entry {
         edit(&mut entry);
     }
+    entry.builds.extend(spec.builds.iter().cloned());
     // The names of the files that hold the presentation's bytes, and the length both signed
     // statements declare for them where it is understated.
     let presentation_digest = files

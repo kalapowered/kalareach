@@ -2,7 +2,9 @@
 //! terminal, each speaking the protocol that release speaks.
 //!
 //! * `codex app-server --listen stdio://` is the server, on standard input and output.
-//! * `codex --remote unix:///path [words]` is the terminal, connecting to a gateway's socket.
+//! * `codex --remote unix:///path [words]` and `codex words --remote unix:///path` are the
+//!   terminal, connecting to a gateway's socket: a host that integrates the command puts its flags
+//!   after the words that were typed.
 //! * `codex --exec-in-new-session PROGRAM [arguments]` is how the server starts a command in a
 //!   session of its own, as the pinned release's server does.
 //!
@@ -35,7 +37,9 @@ async fn main() {
     {
         ["--version"] => println!("codex-cli {}", contract::RELEASE),
         ["app-server", "--listen", "stdio://"] => server::run(variants).await,
-        ["--remote", remote, words @ ..] if remote.starts_with("unix://") => {
+        ["--remote", remote, words @ ..] | [words @ .., "--remote", remote]
+            if remote.starts_with("unix://") =>
+        {
             let socket = &remote["unix://".len()..];
             let prompt = words.join(" ");
             let status =

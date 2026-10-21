@@ -1298,8 +1298,10 @@ pub mod fixture {
     /// A table the worker's gateway reads: one JSON document per line over the backend's standard
     /// streams, the members it reads a message by at the top level, and the methods a
     /// Codex-shaped application's session sends that its classes tell apart: one of each class,
-    /// and a notification in each direction. It answers no approval.
-    fn gateway_connector_json_for(plugin_id: &str, volatile_forwarding: bool) -> String {
+    /// and a notification in each direction. It answers no approval. `volatile_forwarding` says
+    /// whether the table declares a tested volatile forwarding mode.
+    #[must_use]
+    pub fn gateway_connector_json_for(plugin_id: &str, volatile_forwarding: bool) -> String {
         let path =
             |name: &str| serde_json::json!({ "segments": [{ "type": "member", "name": name }] });
         let table = serde_json::json!({
@@ -1579,17 +1581,27 @@ pub mod fixture {
         shape: &Shape,
     ) -> std::io::Result<ConnectorSource> {
         let plugin_id = format!("kalareach/{}", shape.plugin_name);
+        let connector = if shape.gateway {
+            gateway_connector_json_for(&plugin_id, shape.volatile_forwarding)
+        } else {
+            connector_json_for(&plugin_id)
+        };
+        package_with_connector(root, forwarder, shape, connector)
+    }
+
+    /// Writes a package of `shape` as [`package`] does, with `connector` as its connector table.
+    ///
+    /// # Errors
+    ///
+    /// Returns what writing a file returned.
+    pub fn package_with_connector(
+        root: &Path,
+        forwarder: &Path,
+        shape: &Shape,
+        connector: String,
+    ) -> std::io::Result<ConnectorSource> {
         let mut files: Vec<(&str, &str, Vec<u8>)> = vec![
-            (
-                "connector",
-                "connector.json",
-                if shape.gateway {
-                    gateway_connector_json_for(&plugin_id, shape.volatile_forwarding)
-                } else {
-                    connector_json_for(&plugin_id)
-                }
-                .into_bytes(),
-            ),
+            ("connector", "connector.json", connector.into_bytes()),
             (
                 "presentation",
                 "presentation.json",

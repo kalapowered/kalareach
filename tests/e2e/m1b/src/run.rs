@@ -90,10 +90,17 @@ impl Run {
                 built.join(name).display()
             );
         }
-        // Short on purpose: a Unix socket address is 104 bytes on macOS, and the temporary
-        // directory there already spends about half of that.
+        // Short on purpose: a Unix socket address is 104 bytes on macOS, and the per-user
+        // temporary directory there is 58 of them. A socket a worker binds for a command it
+        // integrates lies 42 bytes below the run's directory, which would make it 111 bytes.
+        // `/tmp` is on the internal disk there as well.
         let suffix = kr_ipc::new_uuid().to_string();
-        let root = std::env::temp_dir().join(format!("krm-{}", &suffix[..8]));
+        let base = if cfg!(target_os = "macos") {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let root = base.join(format!("krm-{}", &suffix[..8]));
         kr_ipc::paths::create_private_tree(&root, &root)
             .expect("an owner-only directory for this run on the internal disk");
         let root = std::fs::canonicalize(&root).expect("the run's directory resolves");
@@ -138,6 +145,26 @@ impl Run {
     #[must_use]
     pub fn binary(&self, name: &str) -> PathBuf {
         self.root.join("b").join(name)
+    }
+
+    /// Places another program this build made at `destination`, for a leg that needs it beside the
+    /// run's own binaries or under another name, and starts it once with `arguments` where nothing
+    /// is timed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the program this build should have produced is missing, or cannot be placed or
+    /// started.
+    pub fn place_built(&self, name: &str, destination: &Path, arguments: &[&str]) {
+        let built = built_directory().join(name);
+        assert!(
+            built.is_file(),
+            "the {} leg needs {name} and there is none at {}; build it with `cargo build -p \
+             kr-hook -p kr-codex-stand-in`, as `cargo test --workspace` does",
+            self.leg,
+            built.display()
+        );
+        kr_ipc::testing::place_and_start_once(&built, destination, arguments);
     }
 
     /// The home directory every process this run starts is given, so none reads the person's own.
@@ -748,6 +775,48 @@ pub fn process_table() -> Result<Vec<Entry>, String> {
             })
         })
         .collect())
+}
+
+/// The process group a process leads or belongs to, and the one its controlling terminal has in
+/// the foreground.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Groups {
+    /// The process group the process belongs to.
+    pub group: i64,
+    /// The process group in the foreground of the process's controlling terminal, or a value that
+    /// is not a group (zero or negative) where it has none.
+    pub foreground: i64,
+}
+
+/// The groups of the process `identity` names, read while that start holds its number, or `None`
+/// once the kernel says it has ended.
+///
+/// # Errors
+///
+/// Returns why neither answer is established, as [`describe`] does.
+pub fn groups(identity: &ProcessStartIdentity) -> Result<Option<Groups>, String> {
+    let pid = identity.pid.get();
+    let mut ps = std::process::Command::new("/bin/ps");
+    ps.args(["-o", "pgid=,tpgid=", "-p", &pid.to_string()])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin");
+    let output = output_within(ps, SERVICE_MANAGER_BOUND)
+        .map_err(|why| format!("process {pid} could not be described: ps {why}"))?;
+    if !still_running(identity, &format!("process {pid}"))? {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "ps did not describe process {pid}, which runs: it ended with {}",
+            output.status
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut numbers = text.split_whitespace().map(str::parse::<i64>);
+    match (numbers.next(), numbers.next()) {
+        (Some(Ok(group)), Some(Ok(foreground))) => Ok(Some(Groups { group, foreground })),
+        _ => Err(format!("ps named no groups for process {pid}: {text:?}")),
+    }
 }
 
 /// What `ps` says about one process: its parent and its command line.
