@@ -1791,7 +1791,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: ".github/workflows/release-tree.yml",
-            line: "cargo test --locked -p kr-release --test release_tree -- --include-ignored",
+            line: "run: cargo test --locked -p kr-release --test release_tree -- --include-ignored",
         },
     },
     IgnoredRun {
