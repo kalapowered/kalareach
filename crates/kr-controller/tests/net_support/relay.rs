@@ -171,9 +171,12 @@ impl LocalRelay {
             .expect("the relay serves relayed sessions");
         let refusal = self.refusal.clone();
         let port = self.port;
-        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let mut waiting_for = "the server to stop";
+        let mut last_dial = None;
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             service.clients().shutdown().await;
             server.shutdown().await.expect("the relay stops");
+            waiting_for = "every session the relay let in to end";
             loop {
                 {
                     let state = refusal.state();
@@ -187,6 +190,7 @@ impl LocalRelay {
             // The server's listener goes with the task that held it, which the runtime ends some
             // time after the server's shutdown has returned: until it has, a connection is
             // accepted.
+            waiting_for = "a connection to the relay's port to be turned away";
             loop {
                 let dialled = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await;
                 if dialled
@@ -195,20 +199,33 @@ impl LocalRelay {
                 {
                     return;
                 }
+                last_dial = Some(dialled.map(|_| ()));
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("every session the relay let in has ended and nothing answers at its port");
+        .await;
+        if stopped.is_err() {
+            let (admitted, ended) = {
+                let state = refusal.state();
+                (state.admitted, state.ended)
+            };
+            panic!(
+                "the relay at port {port} did not stop in time; it was waiting for {waiting_for}; \
+                 sessions let in and ended: {admitted}, {ended}; the last connection to the port: \
+                 {last_dial:?}"
+            );
+        }
     }
 
     /// Starts the relay again at the address it had, with the certificate it had.
     ///
-    /// The port is the relay's all the while it is stopped (see [`keep_a_port`]), so no other
-    /// program has taken it. What can still hold it is the listener of the server that was stopped,
-    /// which the runtime drops some time after the server's shutdown has returned, so the relay
-    /// tries again while the address is in use. A listener that is never dropped is a test that went
-    /// wrong, and it is stopped rather than left to wait.
+    /// The port is the relay's all the while it is stopped (see [`keep_a_port`]), so no program
+    /// that takes a port without naming it has been given it, and the listener of the server that
+    /// was stopped is gone ([`Self::stop`] returns once a connection to the port is turned away).
+    /// The relay still tries again while the address is in use, for the instants in which a closed
+    /// socket is not yet released by the system, and for a program that names the port with the
+    /// address-reuse option and keeps it, which this does not keep out. Whatever holds the port past
+    /// the deadline is a test that went wrong, and it is stopped rather than left to wait.
     pub async fn start_again(&mut self) {
         assert!(self.server.is_none(), "the relay is running");
         self.refusal = self.refusal.for_a_server_started_again();
@@ -256,7 +273,8 @@ struct PortKept;
 /// the fixture's own, and that connection holds the port:
 ///
 /// - no bind of port 0 and no connection that is given a local port is handed a port that is
-///   bound, connected or not;
+///   bound, connected or not (on macOS a socket that listens on the wildcard address of both
+///   families can still be handed it, which no program of this workspace does);
 /// - a program that names the port is turned away unless it too has the address-reuse option;
 /// - the relay's listener binds the port beside the connection, as any server does that restarts
 ///   while its connections are still open, and while the relay is stopped a connection to the port
