@@ -5,7 +5,7 @@
 //! the configured command and asks for one approval, and finishes the turn when the approval is
 //! answered.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Stdio;
 
 use serde_json::{Value, json};
@@ -42,6 +42,13 @@ struct Started {
     leads_group: bool,
 }
 
+/// The turn that is running, and the approval it waits on.
+struct Running {
+    thread: String,
+    turn: String,
+    approval: Option<String>,
+}
+
 struct Server {
     contract: Contract,
     variants: Variants,
@@ -56,15 +63,24 @@ struct Server {
     commands: Vec<Started>,
     /// Whether the second approval has been asked, under `two-approvals`.
     second_asked: bool,
+    /// The threads the server has made, and whether its one client is subscribed to each.
+    threads: BTreeMap<String, bool>,
+    /// How many threads and how many turns the server has made, for the identifiers it gives them.
+    threads_made: u32,
+    turns_made: u32,
+    /// The turn that is running, until it completes.
+    running: Option<Running>,
+    /// The approvals the server cleared itself, whose late answers it takes and ignores.
+    cleared: BTreeSet<String>,
 }
 
-fn thread() -> Value {
+fn thread(id: &str) -> Value {
     json!({
         "cliVersion": RELEASE,
         "createdAt": 0,
         "cwd": "/",
         "ephemeral": false,
-        "id": "thread-1",
+        "id": id,
         "modelProvider": "stand-in",
         "preview": "",
         "projectId": null,
@@ -76,8 +92,21 @@ fn thread() -> Value {
     })
 }
 
-fn turn(status: &str) -> Value {
-    json!({ "id": "turn-1", "items": [], "status": status })
+fn turn(id: &str, status: &str) -> Value {
+    json!({ "id": id, "items": [], "status": status })
+}
+
+/// What a request that opens a thread answers with.
+fn opened(thread: Value) -> Value {
+    json!({
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "cwd": "/",
+        "model": "stand-in",
+        "modelProvider": "stand-in",
+        "sandbox": { "type": "dangerFullAccess" },
+        "thread": thread
+    })
 }
 
 impl Server {
@@ -241,7 +270,11 @@ impl Server {
             Err(why) => return self.violation(&why, &frame).await,
         };
         match &checked {
-            Frame::Request { id, method } => Self::note_received(&format!("request {id} {method}")),
+            Frame::Request { id, method } => {
+                Self::note_received(&format!("request {id} {method}"));
+                // What the request carried, for a case that wants to know it was written whole.
+                Self::note_received(&format!("params {method} {}", frame["params"]));
+            }
             Frame::Response { id, .. } | Frame::Failure { id, .. } => {
                 Self::note_received(&format!("response {id}"));
             }
@@ -266,6 +299,11 @@ impl Server {
             }
             Frame::Response { id, method } | Frame::Failure { id, method } => {
                 self.sent.remove(&id);
+                // An approval the server cleared itself is answered late by a terminal that had
+                // not read that yet: the answer is taken and means nothing.
+                if self.cleared.remove(&id) {
+                    return;
+                }
                 if method == "item/commandExecution/requestApproval" {
                     // The server dies with its command running, once the approval is answered.
                     if self.variants.die_first {
@@ -274,9 +312,13 @@ impl Server {
                     // It says the request was answered, to every client it has, the one that
                     // answered it included.
                     let request: Value = serde_json::from_str(&id).expect("an identifier");
+                    let (thread_id, turn_id) = self.running.as_ref().map_or_else(
+                        || ("thread-1".to_owned(), "turn-1".to_owned()),
+                        |running| (running.thread.clone(), running.turn.clone()),
+                    );
                     self.send(json!({
                         "method": "serverRequest/resolved",
-                        "params": { "threadId": "thread-1", "requestId": request }
+                        "params": { "threadId": thread_id, "requestId": request }
                     }))
                     .await;
                     if self.variants.two_approvals && !self.second_asked {
@@ -291,16 +333,17 @@ impl Server {
                             "params": {
                                 "itemId": "item-2",
                                 "startedAtMs": 0,
-                                "threadId": "thread-1",
-                                "turnId": "turn-1"
+                                "threadId": thread_id,
+                                "turnId": turn_id
                             }
                         }))
                         .await;
                         return;
                     }
+                    self.running = None;
                     self.send(json!({
                         "method": "turn/completed",
-                        "params": { "threadId": "thread-1", "turn": turn("completed") }
+                        "params": { "threadId": thread_id, "turn": turn(&turn_id, "completed") }
                     }))
                     .await;
                 }
@@ -344,24 +387,73 @@ impl Server {
                 }}))
                 .await;
             }
-            "thread/start" if self.thread.is_none() => {
-                self.thread = Some("thread-1".to_owned());
-                self.send(json!({ "id": id, "result": {
-                    "approvalPolicy": "on-request",
-                    "approvalsReviewer": "user",
-                    "cwd": "/",
-                    "model": "stand-in",
-                    "modelProvider": "stand-in",
-                    "sandbox": { "type": "dangerFullAccess" },
-                    "thread": thread()
-                }}))
-                .await;
+            "thread/start" => {
+                self.threads_made += 1;
+                let made = format!("thread-{}", self.threads_made);
+                self.threads.insert(made.clone(), true);
+                self.thread = Some(made.clone());
+                self.send(json!({ "id": id, "result": opened(thread(&made)) }))
+                    .await;
                 self.send(json!({
                     "method": "thread/started",
-                    "params": { "thread": thread() }
+                    "params": { "thread": thread(&made) }
                 }))
                 .await;
             }
+            "thread/resume" => {
+                let wanted = frame["params"]["threadId"].as_str().unwrap_or_default();
+                if !self.threads.contains_key(wanted) {
+                    return self.refuse(id, -32600, "thread not found").await;
+                }
+                let wanted = wanted.to_owned();
+                self.threads.insert(wanted.clone(), true);
+                self.thread = Some(wanted.clone());
+                self.send(json!({ "id": id, "result": opened(thread(&wanted)) }))
+                    .await;
+            }
+            "thread/fork" => {
+                let from = frame["params"]["threadId"].as_str().unwrap_or_default();
+                if !self.threads.contains_key(from) {
+                    return self.refuse(id, -32600, "thread not found").await;
+                }
+                self.threads_made += 1;
+                let made = format!("thread-{}", self.threads_made);
+                self.threads.insert(made.clone(), true);
+                self.thread = Some(made.clone());
+                self.send(json!({ "id": id, "result": opened(thread(&made)) }))
+                    .await;
+                self.send(json!({
+                    "method": "thread/started",
+                    "params": { "thread": thread(&made) }
+                }))
+                .await;
+            }
+            "thread/unsubscribe" => {
+                let wanted = frame["params"]["threadId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let status = match self.threads.get_mut(&wanted) {
+                    None => "notLoaded",
+                    Some(false) => "notSubscribed",
+                    Some(subscribed) => {
+                        *subscribed = false;
+                        "unsubscribed"
+                    }
+                };
+                self.send(json!({ "id": id, "result": { "status": status } }))
+                    .await;
+                // The last subscriber left, so the server unloads the thread and says so.
+                if status == "unsubscribed" {
+                    self.send(json!({
+                        "method": "thread/closed",
+                        "params": { "threadId": wanted }
+                    }))
+                    .await;
+                }
+            }
+            "turn/steer" => self.steer(id, frame).await,
+            "turn/interrupt" => self.interrupt(id, frame).await,
             "turn/start" => self.turn(id, frame).await,
             other => {
                 self.refuse(id, -32601, &format!("the stand-in does not serve {other}"))
@@ -370,9 +462,85 @@ impl Server {
         }
     }
 
+    /// Steers the turn that is running, which the request has to name.
+    async fn steer(&mut self, id: &Value, frame: &Value) {
+        let params = &frame["params"];
+        match &self.running {
+            Some(running)
+                if params["threadId"].as_str() == Some(running.thread.as_str())
+                    && params["expectedTurnId"].as_str() == Some(running.turn.as_str()) =>
+            {
+                let turn_id = running.turn.clone();
+                self.send(json!({ "id": id, "result": { "turnId": turn_id } }))
+                    .await;
+            }
+            _ => {
+                self.refuse(
+                    id,
+                    -32600,
+                    "the expected turn is not the one that is running",
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Stops the turn that is running, which the request has to name: the approval it waits on is
+    /// cleared, and the turn completes as interrupted.
+    async fn interrupt(&mut self, id: &Value, frame: &Value) {
+        let params = &frame["params"];
+        let matches = self.running.as_ref().is_some_and(|running| {
+            params["threadId"].as_str() == Some(running.thread.as_str())
+                && params["turnId"].as_str() == Some(running.turn.as_str())
+        });
+        if !matches {
+            return self.refuse(id, -32600, "no such turn is running").await;
+        }
+        let running = self.running.take().expect("a running turn");
+        self.send(json!({ "id": id, "result": {} })).await;
+        if let Some(approval) = running.approval {
+            // Still outstanding with the terminal, which may answer it late.
+            let request: Value = serde_json::from_str(&approval).expect("an identifier");
+            self.cleared.insert(approval);
+            self.send(json!({
+                "method": "serverRequest/resolved",
+                "params": { "threadId": running.thread, "requestId": request }
+            }))
+            .await;
+        }
+        self.send(json!({
+            "method": "turn/completed",
+            "params": { "threadId": running.thread, "turn": turn(&running.turn, "interrupted") }
+        }))
+        .await;
+    }
+
     async fn turn(&mut self, id: &Value, frame: &Value) {
-        if frame["params"]["threadId"].as_str() != self.thread.as_deref() {
+        let thread_id = frame["params"]["threadId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        if !self.threads.contains_key(&thread_id) {
             return self.refuse(id, -32600, "thread not found").await;
+        }
+        self.turns_made += 1;
+        let turn_id = format!("turn-{}", self.turns_made);
+        // A turn after the first is one somebody else started, and it runs to its end at once: it
+        // asks for nothing and starts nothing.
+        if self.turns_made > 1 {
+            self.send(json!({ "id": id, "result": { "turn": turn(&turn_id, "inProgress") }}))
+                .await;
+            self.send(json!({
+                "method": "turn/started",
+                "params": { "threadId": thread_id, "turn": turn(&turn_id, "inProgress") }
+            }))
+            .await;
+            self.send(json!({
+                "method": "turn/completed",
+                "params": { "threadId": thread_id, "turn": turn(&turn_id, "completed") }
+            }))
+            .await;
+            return;
         }
         eprintln!("stand-in: turn started");
         self.start_command();
@@ -386,15 +554,20 @@ impl Server {
             "params": {
                 "itemId": "item-1",
                 "startedAtMs": 0,
-                "threadId": "thread-1",
-                "turnId": "turn-1"
+                "threadId": thread_id,
+                "turnId": turn_id
             }
         });
         let asked = approval["id"].to_string();
-        let answer = json!({ "id": id, "result": { "turn": turn("inProgress") }});
+        self.running = Some(Running {
+            thread: thread_id.clone(),
+            turn: turn_id.clone(),
+            approval: Some(asked.clone()),
+        });
+        let answer = json!({ "id": id, "result": { "turn": turn(&turn_id, "inProgress") }});
         let started = json!({
             "method": "turn/started",
-            "params": { "threadId": "thread-1", "turn": turn("inProgress") }
+            "params": { "threadId": thread_id, "turn": turn(&turn_id, "inProgress") }
         });
         self.sent
             .insert(asked, "item/commandExecution/requestApproval".to_owned());
@@ -487,6 +660,11 @@ pub async fn run(variants: Variants) -> ! {
         sent: BTreeMap::new(),
         commands: Vec::new(),
         second_asked: false,
+        threads: BTreeMap::new(),
+        threads_made: 0,
+        turns_made: 0,
+        running: None,
+        cleared: BTreeSet::new(),
     };
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let speak = server

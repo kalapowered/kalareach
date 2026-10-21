@@ -101,6 +101,10 @@ pub struct Variants {
     pub leave_second_unanswered: bool,
     /// The server never answers the terminal's request to start a turn.
     pub no_turn_answer: bool,
+    /// A terminal under `answer-when-released` or `ping-when-released` goes on reading the
+    /// connection, and saying what it reads, while it waits for its file, as a terminal that is
+    /// waiting for a person does.
+    pub keep_reading: bool,
 }
 
 impl Variants {
@@ -144,6 +148,7 @@ impl Variants {
                 "two-approvals" => variants.two_approvals = true,
                 "leave-second-unanswered" => variants.leave_second_unanswered = true,
                 "no-turn-answer" => variants.no_turn_answer = true,
+                "keep-reading" => variants.keep_reading = true,
                 other => panic!("{VARIABLE} names a variant this program does not have: {other}"),
             }
         }

@@ -185,6 +185,134 @@ async fn the_server_runs_a_turn_and_ends_its_commands_with_its_input() {
     ending.0 = None;
 }
 
+/// The server steers and interrupts the turn it runs only when the request names it, clears the
+/// approval the turn waits on when it interrupts it, resumes, forks and unsubscribes from threads
+/// under identifiers of its own, and runs a later turn to its end at once. Every frame it writes is
+/// one the pinned release's schemas allow, which the server itself checks.
+#[tokio::test]
+async fn the_server_steers_interrupts_resumes_forks_and_unsubscribes() {
+    let mut child = server("", None);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+
+    write(&mut stdin, &initialize()).await;
+    assert_eq!(next(&mut lines).await["id"], "initialize");
+    assert_eq!(
+        next(&mut lines).await["method"],
+        "remoteControl/status/changed"
+    );
+    write(&mut stdin, &json!({"method":"initialized"})).await;
+    write(
+        &mut stdin,
+        &json!({"id":2,"method":"thread/start","params":{}}),
+    )
+    .await;
+    assert_eq!(next(&mut lines).await["result"]["thread"]["id"], "thread-1");
+    assert_eq!(next(&mut lines).await["method"], "thread/started");
+
+    // A turn that waits for an approval.
+    write(&mut stdin, &turn_request("thread-1")).await;
+    assert_eq!(next(&mut lines).await["result"]["turn"]["id"], "turn-1");
+    assert_eq!(next(&mut lines).await["method"], "turn/started");
+    let asked = next(&mut lines).await;
+    assert_eq!(asked["method"], "item/commandExecution/requestApproval");
+
+    // A steer that names another turn is refused, and one that names the running turn answers it.
+    write(
+        &mut stdin,
+        &json!({"id":"s1","method":"turn/steer","params":{
+            "threadId":"thread-1","expectedTurnId":"turn-9",
+            "input":[{"type":"text","text":"other","text_elements":[]}]}}),
+    )
+    .await;
+    assert!(next(&mut lines).await.get("error").is_some());
+    write(
+        &mut stdin,
+        &json!({"id":"s2","method":"turn/steer","params":{
+            "threadId":"thread-1","expectedTurnId":"turn-1",
+            "input":[{"type":"text","text":"the other file","text_elements":[]}]}}),
+    )
+    .await;
+    assert_eq!(next(&mut lines).await["result"]["turnId"], "turn-1");
+
+    // An interrupt that names the running turn clears the approval and completes the turn as
+    // interrupted; the terminal that answers the cleared approval late is not an error.
+    write(
+        &mut stdin,
+        &json!({"id":"i1","method":"turn/interrupt","params":{
+            "threadId":"thread-1","turnId":"turn-1"}}),
+    )
+    .await;
+    assert!(next(&mut lines).await["result"].is_object());
+    let resolved = next(&mut lines).await;
+    assert_eq!(resolved["method"], "serverRequest/resolved");
+    assert_eq!(resolved["params"]["requestId"], asked["id"]);
+    let completed = next(&mut lines).await;
+    assert_eq!(completed["method"], "turn/completed");
+    assert_eq!(completed["params"]["turn"]["status"], "interrupted");
+    write(
+        &mut stdin,
+        &json!({"id":asked["id"],"result":{"decision":"accept"}}),
+    )
+    .await;
+    // Nothing is running now, so a second interrupt is refused.
+    write(
+        &mut stdin,
+        &json!({"id":"i2","method":"turn/interrupt","params":{
+            "threadId":"thread-1","turnId":"turn-1"}}),
+    )
+    .await;
+    assert!(next(&mut lines).await.get("error").is_some());
+
+    // A later turn runs to its end at once, and asks for nothing.
+    write(
+        &mut stdin,
+        &json!({"id":"t2","method":"turn/start","params":{
+            "threadId":"thread-1","input":[{"type":"text","text":"again","text_elements":[]}]}}),
+    )
+    .await;
+    assert_eq!(next(&mut lines).await["result"]["turn"]["id"], "turn-2");
+    assert_eq!(next(&mut lines).await["method"], "turn/started");
+    assert_eq!(next(&mut lines).await["method"], "turn/completed");
+
+    // Forking makes a thread of its own; resuming one that is known answers with that thread;
+    // unsubscribing from it says the thread was unloaded.
+    write(
+        &mut stdin,
+        &json!({"id":"f1","method":"thread/fork","params":{"threadId":"thread-1"}}),
+    )
+    .await;
+    assert_eq!(next(&mut lines).await["result"]["thread"]["id"], "thread-2");
+    assert_eq!(next(&mut lines).await["method"], "thread/started");
+    write(
+        &mut stdin,
+        &json!({"id":"r1","method":"thread/resume","params":{"threadId":"thread-1"}}),
+    )
+    .await;
+    assert_eq!(next(&mut lines).await["result"]["thread"]["id"], "thread-1");
+    write(
+        &mut stdin,
+        &json!({"id":"u1","method":"thread/unsubscribe","params":{"threadId":"thread-1"}}),
+    )
+    .await;
+    assert_eq!(next(&mut lines).await["result"]["status"], "unsubscribed");
+    let closed = next(&mut lines).await;
+    assert_eq!(closed["method"], "thread/closed");
+    assert_eq!(closed["params"]["threadId"], "thread-1");
+    write(
+        &mut stdin,
+        &json!({"id":"r2","method":"thread/resume","params":{"threadId":"thread-7"}}),
+    )
+    .await;
+    assert!(next(&mut lines).await.get("error").is_some());
+    drop(stdin);
+    let status = tokio::time::timeout(WAIT, child.wait())
+        .await
+        .expect("the server ends with its input")
+        .expect("waited");
+    assert!(status.success());
+}
+
 /// Ends the process group a test names, when the test stops before it has been ended.
 struct EndsGroup(Option<String>);
 

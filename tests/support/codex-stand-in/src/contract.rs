@@ -72,6 +72,48 @@ impl Contract {
                     include_str!("../schemas/CommandExecutionRequestApprovalResponse.json"),
                 ),
             ),
+            (
+                "item/fileChange/requestApproval",
+                validator(
+                    "FileChangeRequestApprovalResponse",
+                    include_str!("../schemas/FileChangeRequestApprovalResponse.json"),
+                ),
+            ),
+            (
+                "thread/resume",
+                validator(
+                    "ThreadResumeResponse",
+                    include_str!("../schemas/ThreadResumeResponse.json"),
+                ),
+            ),
+            (
+                "thread/fork",
+                validator(
+                    "ThreadForkResponse",
+                    include_str!("../schemas/ThreadForkResponse.json"),
+                ),
+            ),
+            (
+                "thread/unsubscribe",
+                validator(
+                    "ThreadUnsubscribeResponse",
+                    include_str!("../schemas/ThreadUnsubscribeResponse.json"),
+                ),
+            ),
+            (
+                "turn/steer",
+                validator(
+                    "TurnSteerResponse",
+                    include_str!("../schemas/TurnSteerResponse.json"),
+                ),
+            ),
+            (
+                "turn/interrupt",
+                validator(
+                    "TurnInterruptResponse",
+                    include_str!("../schemas/TurnInterruptResponse.json"),
+                ),
+            ),
         ]
         .into_iter()
         .collect();

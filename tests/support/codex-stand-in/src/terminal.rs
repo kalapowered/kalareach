@@ -138,8 +138,30 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
     let mut turn = String::new();
     // Whether the next answer to `account/read` is the one `ping-when-released` asked for.
     let mut pinged = false;
+    // What a terminal under `keep-reading` has to say once the file it waits for exists, each with
+    // that file: it is sent in the order it was held, and the connection is read meanwhile.
+    let mut held: Vec<(String, Value)> = Vec::new();
     loop {
-        let message = match connection.next().await {
+        let next = if held.is_empty() {
+            connection.next().await
+        } else {
+            tokio::select! {
+                message = connection.next() => message,
+                () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                    let mut waiting = Vec::new();
+                    for (release, frame) in std::mem::take(&mut held) {
+                        if std::path::Path::new(&release).exists() {
+                            send!(frame);
+                        } else {
+                            waiting.push((release, frame));
+                        }
+                    }
+                    held = waiting;
+                    continue;
+                }
+            }
+        };
+        let message = match next {
             Some(Ok(message)) => message,
             Some(Err(error)) => {
                 println!("Error: remote app server transport failed: {error}");
@@ -248,23 +270,29 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
                 {
                     continue;
                 }
-                if variants.answer_when_released
-                    && let Ok(mut release) = std::env::var(RELEASE_VARIABLE)
-                {
-                    if requests_read > 1 {
-                        release.push_str(".second");
-                    }
-                    while !std::path::Path::new(&release).exists() {
-                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    }
-                }
                 let id_value: Value = serde_json::from_str(&id).expect("an identifier");
                 let decision = if variants.decline {
                     "decline"
                 } else {
                     "accept"
                 };
-                send!(json!({ "id": id_value, "result": { "decision": decision } }));
+                let answer = json!({ "id": id_value, "result": { "decision": decision } });
+                if variants.answer_when_released
+                    && let Ok(mut release) = std::env::var(RELEASE_VARIABLE)
+                {
+                    if requests_read > 1 {
+                        release.push_str(".second");
+                    }
+                    if variants.keep_reading {
+                        println!("TUI: holding the answer to {method}");
+                        held.push((release, answer));
+                        continue;
+                    }
+                    while !std::path::Path::new(&release).exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+                send!(answer);
             }
             Frame::Notification { method } => {
                 println!("TUI: {method}");
@@ -289,6 +317,14 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
                     && variants.ping_when_released
                     && let Ok(release) = std::env::var(RELEASE_VARIABLE)
                 {
+                    if variants.keep_reading {
+                        pinged = true;
+                        held.push((
+                            release,
+                            json!({ "id": ACCOUNT, "method": "account/read", "params": {} }),
+                        ));
+                        continue;
+                    }
                     while !std::path::Path::new(&release).exists() {
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
