@@ -254,6 +254,70 @@ mod tests {
         assert!(!profile.contains("network-bind"));
     }
 
+    /// A descriptor the host holds, with nothing to close it when a child executes, is not open in
+    /// the Git that is started inside the boundary: it would be read through whatever the profile
+    /// says, since the profile judges a file when it is opened and this one is open already. The
+    /// child lists its own descriptors, and the control is that it lists the standard three.
+    #[test]
+    fn a_descriptor_the_host_holds_is_not_open_in_the_git_it_is_started_as() {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+
+        let root = tempfile::TempDir::new().expect("a directory on the internal disk");
+        // The system's shell is the program that lists them, and on this platform it executes the
+        // shell it is a variant of, which the profile has to allow as well.
+        let mut confinement = confinement(root.path(), Reach::Nothing);
+        confinement.program = PathBuf::from("/bin/sh");
+        confinement.helpers = vec![PathBuf::from("/bin/bash")];
+
+        // Far above any the child's own listing opens, and left open on exec.
+        let held = std::fs::File::open("/").expect("a descriptor of the host's");
+        let leaked = rustix::io::fcntl_dupfd_cloexec(&held, 100).expect("one high in the table");
+        rustix::io::fcntl_setfd(&leaked, rustix::io::FdFlags::empty()).expect("left open on exec");
+        let number = leaked.as_raw_fd();
+
+        let arguments = [
+            OsString::from("-c"),
+            OsString::from("for d in /dev/fd/*; do echo \"${d#/dev/fd/}\"; done"),
+        ];
+        let environment = [(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))];
+        let invocation = Invocation {
+            program: Path::new("/bin/sh"),
+            arguments: &arguments,
+            environment: &environment,
+            described: "a listing of the descriptors the child holds",
+        };
+        let mut spawned =
+            crate::boundary::start(&invocation, &confinement).expect("the child starts");
+        let mut listing = String::new();
+        spawned
+            .stdout()
+            .expect("the child's output")
+            .read_to_string(&mut listing)
+            .expect("the child's listing");
+        while spawned
+            .try_wait()
+            .expect("the child is waited for")
+            .is_none()
+        {
+            std::thread::yield_now();
+        }
+        let open: Vec<i32> = listing
+            .split_whitespace()
+            .filter_map(|number| number.parse().ok())
+            .collect();
+        for standard in 0..=2 {
+            assert!(
+                open.contains(&standard),
+                "the child lists its own: {listing:?}"
+            );
+        }
+        assert!(
+            !open.contains(&number),
+            "descriptor {number} of the host's is open in the child: {listing:?}"
+        );
+    }
+
     #[test]
     fn a_path_a_profile_could_not_carry_refuses_the_invocation() {
         use std::ffi::OsString;
