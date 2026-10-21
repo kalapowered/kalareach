@@ -2552,6 +2552,15 @@ struct TemplateWalk {
     problems: Vec<String>,
 }
 
+/// Checks one literal of a template: a string, or the name of a member.
+fn walk_template_literal(text: &str, walk: &mut TemplateWalk) {
+    if text.len() > MAX_TEMPLATE_LITERAL_BYTES || text.chars().any(char::is_control) {
+        walk.problems.push(format!(
+            "a literal in the template is over {MAX_TEMPLATE_LITERAL_BYTES} bytes or holds a control character"
+        ));
+    }
+}
+
 /// Walks a template, counting what it holds and finding what it fills in.
 fn walk_template(value: &serde_json::Value, depth: usize, walk: &mut TemplateWalk) {
     walk.nodes += 1;
@@ -2576,7 +2585,9 @@ fn walk_template(value: &serde_json::Value, depth: usize, walk: &mut TemplateWal
                 }
                 return;
             }
-            for member in members.values() {
+            for (name, member) in members {
+                // A member's name is a literal of the frame like any text in it.
+                walk_template_literal(name, walk);
                 walk_template(member, depth + 1, walk);
             }
         }
@@ -2585,13 +2596,7 @@ fn walk_template(value: &serde_json::Value, depth: usize, walk: &mut TemplateWal
                 walk_template(item, depth + 1, walk);
             }
         }
-        serde_json::Value::String(text) => {
-            if text.len() > MAX_TEMPLATE_LITERAL_BYTES || text.chars().any(char::is_control) {
-                walk.problems.push(format!(
-                    "a literal in the template is over {MAX_TEMPLATE_LITERAL_BYTES} bytes or holds a control character"
-                ));
-            }
-        }
+        serde_json::Value::String(text) => walk_template_literal(text, walk),
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }

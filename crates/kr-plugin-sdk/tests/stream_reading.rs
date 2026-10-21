@@ -13,7 +13,7 @@
 //! | --- | --- |
 //! | KR-REQ-11.33 | a table that answers an approval as the response to its request, with each decision mapped to its own value, is accepted; each way it can say that wrongly (both ways at once, no message members, a request the application never asks, an unrouted or unsupported request, a duplicated value, a result member that is one the table reads a message by, responses matched by order, an answer action that offers a decision the table does not map, a package that does not ask for the approval grants) is named |
 //! | KR-REQ-12.06 | a table whose observation names the selection, leave, turn and cleared-request places the host reads is accepted; a route that is unrouted, travels the other way, reads outside the member the table names for that kind of message, gives one method two roles or reads a thread and a turn at overlapping places, and an observation with no message members, are each named |
-//! | KR-REQ-12.12 | a table that spells the core's operations, each as a routed host-to-application mutation with a bounded template that fills in exactly the thread, turn and text the operation has, is accepted; an unrouted method, one that travels the other way or is not a mutation, two operations on one method, a malformed or unknown hole, a missing or surplus hole, an oversized or control-character template, a reply turn outside the result member and operations with no message members are each named |
+//! | KR-REQ-12.12 | a table that spells the core's operations, each as a routed host-to-application mutation with a bounded template that fills in exactly the thread, turn and text the operation has, is accepted; an unrouted method, one that travels the other way or is not a mutation, two operations on one method, a malformed or unknown hole, a missing or surplus hole, an oversized or control-character template (in a text or in the name of a member), a reply turn outside the result member and operations with no message members are each named |
 
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::connector::{
@@ -573,6 +573,29 @@ fn kr_req_12_12_an_operation_is_a_routed_mutation_with_a_template_that_fits_it()
         "pad": "a\nb",
     });
     refused(&control, "holds a control character");
+    // The name of a member is a literal of the frame like any text in it.
+    let mut long_name = server_table();
+    operations(&mut long_name)
+        .turn_cancel
+        .as_mut()
+        .expect("a cancel")
+        .params = serde_json::json!({
+        "threadId": hole("thread_id"),
+        "turnId": hole("turn_id"),
+        "x".repeat(300): null,
+    });
+    refused(&long_name, "over 256 bytes");
+    let mut control_name = server_table();
+    operations(&mut control_name)
+        .turn_cancel
+        .as_mut()
+        .expect("a cancel")
+        .params = serde_json::json!({
+        "threadId": hole("thread_id"),
+        "turnId": hole("turn_id"),
+        "a\nb": null,
+    });
+    refused(&control_name, "holds a control character");
 
     // A reply names its turn inside the result member the table names.
     let mut reply_in_params = server_table();
