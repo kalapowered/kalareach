@@ -2908,10 +2908,10 @@ async fn the_daemon_renews_what_it_holds_with_the_phone_away_and_remembers_the_r
     );
 }
 
-/// KR-REQ-16.10: a device that registers a new authorisation for its installation leaves the
-/// earlier one behind. The earlier credential goes from the secret store, the gateway is asked to
-/// revoke the authorisation, a question is delivered under the new one, and the preview-key
-/// rotation the device made in between is kept.
+/// KR-REQ-16.10, KR-REQ-23.27: a device that registers a new authorisation for its installation
+/// leaves the earlier one behind. The earlier credential goes from the secret store, the gateway is
+/// asked to revoke the authorisation, a question is delivered under the new one, and the
+/// preview-key rotation the device made in between, over its own paired connection, is kept.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_new_authorisation_replaces_the_earlier_one_and_the_gateway_revokes_it() {
     let environment = Environment::start().await;
