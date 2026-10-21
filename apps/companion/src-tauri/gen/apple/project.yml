@@ -187,9 +187,13 @@ targets:
         CFBundleShortVersionString: 0.1.0
         CFBundleVersion: "0.1.0"
         # The interface offers the platform's camera and photo pickers, and iOS refuses to show
-        # either without the application saying in its own words what it wants them for.
+        # either without the application saying in its own words what it wants them for. The
+        # camera is also the scanner that reads a pairing code.
         NSCameraUsageDescription:
-          Take a photo to attach it to a session on one of your hosts.
+          Scan a pairing code, or take a photo to attach it to a session on one of your hosts.
+        # A host on the same network is reached directly, which iOS asks the person about once.
+        NSLocalNetworkUsageDescription:
+          Reach a host on your local network, to pair with it and to use it.
         NSPhotoLibraryUsageDescription:
           Choose a photo or a video to attach it to a session on one of your hosts.
         NSMicrophoneUsageDescription:

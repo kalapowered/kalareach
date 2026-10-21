@@ -1,3 +1,4 @@
+import AVFoundation
 import AuthenticationServices
 import CompanionCallLink
 import CompanionSession
@@ -221,6 +222,86 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
       }
       invoke.resolve(["done": true])
     }
+  }
+
+  // MARK: Reading a QR code
+
+  /// The scan that is open, when one is: one at a time, so a newer request ends the older one.
+  private var scanning: OpenScan?
+
+  /// One request to read a code, answered once: with its outcome, or with the cancel a newer
+  /// request or the scanner's own end gives.
+  private final class OpenScan {
+    private var invoke: Invoke?
+    /// Closes the scanner or the picker the request opened, answering it with a cancel.
+    var close: (() -> Void)?
+
+    init(_ invoke: Invoke) { self.invoke = invoke }
+
+    func answer(_ outcome: ScanOutcome) {
+      guard let waiting = invoke else { return }
+      invoke = nil
+      waiting.resolve(ScanAnswer(outcome))
+    }
+  }
+
+  /// Which sources this device reads a code from: its camera, when it has one, and the picker.
+  @objc public func scanSources(_ invoke: Invoke) {
+    invoke.resolve(["camera": AVCaptureDevice.default(for: .video) != nil, "photo": true])
+  }
+
+  /// Shows the scanner and answers when it closes.
+  @objc public func scanCamera(_ invoke: Invoke) {
+    beginScan(invoke) { presenter, scan in
+      let handle = CodeScannerViewController.scan(from: presenter) { outcome in scan.answer(outcome) }
+      scan.close = { handle.cancel() }
+    }
+  }
+
+  /// Shows the system's picker and answers with the code in the picture the person chose.
+  @objc public func scanPhoto(_ invoke: Invoke) {
+    beginScan(invoke) { presenter, scan in
+      let reader = PhotoReader()
+      scan.close = { reader.cancel() }
+      reader.pick(from: presenter) { outcome in
+        // The reader is held until its answer, by this closure.
+        withExtendedLifetime(reader) { scan.answer(outcome) }
+      }
+    }
+  }
+
+  /// Opens this application's own page in the system's settings, where the camera is allowed.
+  @objc public func openSettings(_ invoke: Invoke) {
+    DispatchQueue.main.async {
+      guard let url = URL(string: UIApplication.openSettingsURLString) else {
+        invoke.reject("the settings page could not be named")
+        return
+      }
+      UIApplication.shared.open(url) { _ in invoke.resolve(["done": true]) }
+    }
+  }
+
+  private func beginScan(_ invoke: Invoke, _ open: @escaping (UIViewController, OpenScan) -> Void) {
+    DispatchQueue.main.async {
+      // One at a time: a newer request ends the older one's wait with a cancel.
+      if let earlier = self.scanning {
+        earlier.close?()
+        earlier.answer(.cancelled)
+      }
+      guard let presenter = self.topViewController() else {
+        invoke.reject("there is no screen to show the scanner on")
+        return
+      }
+      let scan = OpenScan(invoke)
+      self.scanning = scan
+      open(presenter, scan)
+    }
+  }
+
+  private func topViewController() -> UIViewController? {
+    var top = manager.viewController
+    while let presented = top?.presentedViewController { top = presented }
+    return top
   }
 
   // MARK: The voice call

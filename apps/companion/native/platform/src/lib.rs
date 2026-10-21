@@ -1,6 +1,6 @@
 //! The companion's native platform services, shared by every feature that needs them.
 //!
-//! Six services, each a mechanism with no feature's policy in it:
+//! Seven services, each a mechanism with no feature's policy in it:
 //!
 //! * [`secrets`]: the one secure store the companion keeps secrets in. The Keychain on macOS and
 //!   iOS, the Credential Manager on Windows, the Secret Service on Linux, and on Android files
@@ -11,6 +11,8 @@
 //! * [`protection`]: whether the device's protected data can be read yet, and the system's word
 //!   when it can. iOS holds an application's files and keychain items back from a restart until the
 //!   first unlock.
+//! * [`scan`]: reading a QR code from the phone's camera or from a picture, in native code, so that an
+//!   invitation's secret goes no further than native code.
 //! * [`browser`]: the browser-backed session a sign-in hands its ceremony to on a phone: iOS's
 //!   authentication session, and Android's Auth Tab or a Custom Tab with a verified link.
 //! * [`call`]: the voice call that native code holds (capture, playback and the media connection),
@@ -30,6 +32,7 @@ pub mod backup;
 pub mod browser;
 pub mod call;
 pub mod protection;
+pub mod scan;
 pub mod secrets;
 #[cfg(target_os = "android")]
 mod tls;
