@@ -358,7 +358,7 @@ The resolve hook runs in front of an interactive invocation, before the command 
 session answers with the argument vector to run: the command name and the vector the person typed,
 plus the flags an enabled integration for that command adds. Several things bypass it, and each
 keeps the invocation exactly as typed, is given no backend at all, and is named in the answer's
-`bypass`: a command invoked by absolute path (`absolute_path`), a command no integration names
+`bypass`: a command named by a path, absolute or relative (`absolute_path`), a command no integration names
 (`not_integrated`), an integration the user has not enabled (`disabled`), a line of a script
 rather than an interactive invocation (`not_interactive`), a shell whose integration is not a
 managed KalaReach root shell yet (`unmanaged_shell`), a session that is closing
@@ -379,8 +379,9 @@ the program. Where the worker can establish no backend, the invocation is answer
 `backend_unavailable` and runs as typed: an agent started with the integration's flags and nothing
 behind them is worse off than one started without them. That covers a launch the route cannot serve:
 an option typed for the program, a word that is the name of another subcommand, a program that is a
-script, a runtime directory too long for the socket a backend binds, and, on Windows, where no gateway runs, a package that declares a server. The worker's
-diagnostics say which. A build no signed qualification record names, and a package whose table
+script, a runtime directory too long for the socket a backend binds, and, on Windows, where no
+gateway runs, a package that declares a server. Where the backends refuse the invocation, the
+worker's diagnostics say which; a session with no command backends records nothing. A build no signed qualification record names, and a package whose table
 declares no tested volatile forwarding mode, are refused later, when the launcher presents itself
 after an integrated answer, and the launcher then runs the command as typed.
 
