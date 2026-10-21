@@ -37,6 +37,8 @@ update_root=""
 out=""
 macos_identity=""
 kr_release="${KR_RELEASE:-$root/target/release/kr-release}"
+# Where a runner names its Python `python`, and not `python3`, this says which.
+python="${PYTHON:-python3}"
 record_options=()
 
 usage() {
@@ -65,12 +67,22 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-for name in target release sequence commit floor programs shells update_root out; do
+for name in target release sequence commit floor programs update_root out; do
     if [ -z "${!name}" ]; then
         echo "build-release: --${name//_/-} is needed" >&2
         usage
     fi
 done
+# A Windows release carries the PowerShell package from this checkout and builds no shell.
+case "$target" in
+    *windows*) ;;
+    *)
+        if [ -z "$shells" ]; then
+            echo "build-release: --shells is needed" >&2
+            usage
+        fi
+        ;;
+esac
 if [ ! -x "$kr_release" ]; then
     echo "build-release: $kr_release is not a program; build kr-release first or name it with --kr-release" >&2
     exit 1
@@ -95,12 +107,24 @@ while IFS= read -r name; do
     fi
     cp "$source_file" "$out/bin/$name$suffix"
     chmod 755 "$out/bin/$name$suffix"
-done < <(python3 "$root/scripts/release-programs.py" names --target "$target")
+done < <("$python" "$root/scripts/release-programs.py" names --target "$target")
 
-# The shell packages this target ships: each one's current build, every file as a file of its own,
-# no empty directory, the pointer to the build, the entry an installed host's startup files source
-# and the licence of the shell.
-python3 - "$shells" "$out/shells" "$root" <<'PYTHON'
+# The shell packages this target ships. A Windows release carries the PowerShell package, which is
+# files only: a host qualifies it against the editor it finds, so there is no build to state. The
+# others carry each shell's current build, every file as a file of its own, no empty directory, the
+# pointer to the build, the entry an installed host's startup files source and the licence of the
+# shell.
+case "$target" in
+*windows*)
+    mkdir -p "$out/shells/psreadline/module" "$out/shells/psreadline/startup"
+    for file in "$root"/shells/psreadline/module/*; do
+        cp "$file" "$out/shells/psreadline/module/"
+    done
+    cp "$root/shells/psreadline/startup/kr-profile.ps1" "$out/shells/psreadline/startup/"
+    cp "$root/shells/psreadline/manifest.json" "$root/shells/psreadline/LICENSE" "$out/shells/psreadline/"
+    ;;
+*)
+"$python" - "$shells" "$out/shells" "$root" <<'PYTHON'
 import json
 import os
 import shutil
@@ -139,6 +163,8 @@ for shell in ("zsh", "bash", "fish"):
     shutil.copyfile(os.path.join(home, entry), os.path.join(out, os.path.basename(entry)))
     shutil.copyfile(os.path.join(root, "shells", shell, "LICENSE"), os.path.join(out, "LICENSE"))
 PYTHON
+;;
+esac
 
 cp "$update_root" "$out/share/update-root.json"
 cp "$root/LICENSE" "$out/share/LICENSE"

@@ -41,6 +41,11 @@ pub fn packages(tree: &Path, checkout: &Path) -> Result<Vec<ReleaseShell>> {
         .collect();
     names.sort();
     for name in names {
+        // The PowerShell package is files only: a host qualifies it against the editor it finds, so
+        // there is no build to state, and its files are listed with the release's own.
+        if name == "psreadline" {
+            continue;
+        }
         if !BUILT.contains(&name.as_str()) {
             refuse!("shells/{name} is not a shell package this tool assembles");
         }
