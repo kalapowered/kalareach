@@ -463,8 +463,22 @@ fn move_record(
     write_record(document, &text)
 }
 
-/// Writes one file of the record.
+/// Writes one file of the record, unless it already holds `content`.
+///
+/// A file that is written with what it holds is a file that changed, as far as anything that
+/// compares times can tell: the upgrade suite takes a program built before such a write for one
+/// built from another tree, and a list that builds the programs first and runs this afterwards
+/// would fail every upgrade case with nothing wrong in the product.
 fn write_record(path: &Path, content: &str) -> Result<(), String> {
+    match std::fs::read_to_string(path) {
+        Ok(held) if held == content => {
+            println!("{} is unchanged", path.display());
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    }
     std::fs::write(path, content).map_err(|error| format!("{}: {error}", path.display()))?;
     println!("wrote {}", path.display());
     Ok(())
