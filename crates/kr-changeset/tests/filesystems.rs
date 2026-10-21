@@ -383,6 +383,89 @@ fn a_materialisation_under_another_device_number_is_still_the_version_it_was_wri
     );
 }
 
+/// KR-REQ-14.34: a directory this host cannot read the filesystem of is not said to be another
+/// object. A materialisation recorded under another device number is decided by the device of the
+/// directory above it, and where that cannot be read the re-read and the release say they could not
+/// read it, remove nothing and keep the record. The control is the same record with the directory
+/// readable, which is the version it was written from. Run as the superuser, a mode stops nothing,
+/// and the case then has nothing to show.
+#[cfg(unix)]
+#[test]
+fn a_directory_whose_device_cannot_be_read_is_not_reported_as_another_object() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "work");
+    write(&path, "README.md", "the version under test\n");
+    let workspace = fixture.workspace("work");
+    let record = fixture.capture(workspace, &include_everything());
+    let made = materialise::materialise(
+        fixture.service(),
+        reference(&record),
+        MaterialisationPurpose::Test,
+        "a copy",
+        None,
+    )
+    .expect("the version is materialised");
+    let directory = std::path::Path::new(&made.directory_path);
+    // The filesystem came back under another number, as the case above has it.
+    let journal = changeset_journal(&fixture);
+    journal
+        .execute(
+            "UPDATE materialisations SET identity_device = identity_device + 1",
+            [],
+        )
+        .expect("the record is rewritten");
+
+    // Readable, and not searchable: the device of the directory above is read through it.
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o400))
+        .expect("takes the search right away");
+    let enforced = std::fs::metadata(directory.join("README.md")).is_err();
+    let reread = materialise::reread(fixture.service(), made.materialisation_id);
+    let released = materialise::release(fixture.service(), made.materialisation_id);
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+        .expect("gives it back");
+    if !enforced {
+        eprintln!("skipped: a mode stops nothing for this account");
+        return;
+    }
+
+    let (_, state, _) = reread.expect("the materialisation reads");
+    assert!(
+        matches!(&state, Reread::Indeterminate(why) if why.contains("could not read")),
+        "the re-read says it could not read the directory: {state:?}"
+    );
+    let refusal = released.expect_err("a directory that cannot be read is not removed");
+    assert!(
+        refusal.to_string().contains("could not read"),
+        "the release says it could not read the directory: {refusal}"
+    );
+    for said in [format!("{state:?}"), refusal.to_string()] {
+        assert!(
+            !said.contains("not the object this host made"),
+            "a failed read is not another object: {said}"
+        );
+    }
+    assert!(directory.join("README.md").is_file(), "nothing was removed");
+    let device: i64 = journal
+        .query_row("SELECT identity_device FROM materialisations", [], |row| {
+            row.get(0)
+        })
+        .expect("reads the number");
+    let now = std::os::unix::fs::MetadataExt::dev(
+        &std::fs::metadata(directory).expect("the directory is there"),
+    ) as i64;
+    assert_eq!(
+        device,
+        now + 1,
+        "the record is as it was: nothing took its number"
+    );
+    // The control: with the directory readable, the same record is the version it was written from.
+    let (_, state, _) = materialise::reread(fixture.service(), made.materialisation_id)
+        .expect("the materialisation reads");
+    assert!(matches!(state, Reread::Unmodified), "{state:?}");
+}
+
 /// KR-REQ-14.34: a release that stops part way leaves the record naming the filesystem the
 /// directory was found on, so a later release cannot take another filesystem's directory at that
 /// path for it.
