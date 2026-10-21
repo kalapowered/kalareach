@@ -98,14 +98,15 @@ fn worker_record(
 /// `process` as the worker's process, and the directory lists a worker whose endpoint was never
 /// bound.
 ///
-/// No worker lives here, and none was ever listed. A worker that lived would go on serving a
-/// connection made before its endpoint path was taken away, and the daemon's own publisher opens a
-/// connection to a worker the directory lists as soon as it has a reason to, so a read could be
-/// answered over one. With none to reach, nothing the publisher or the create does can be.
+/// No worker lives here, and no live worker was ever listed. A worker that lived would go on
+/// serving a connection made before its endpoint path was taken away, and the daemon's own
+/// publisher opens a connection to a worker the directory lists as soon as it has a reason to, so a
+/// read could be answered over one. With no live worker to reach, no connection that the publisher
+/// or the create opens can carry a read.
 struct Gone {
     controller: Arc<Controller>,
     reservation: Reservation,
-    /// Declared last, so the tree is removed after the daemon's handles to it are gone.
+    /// Declared last, so the tree is removed after the fixture's own handles to it are gone.
     _temp: kr_ipc::testing::TempHost,
 }
 
