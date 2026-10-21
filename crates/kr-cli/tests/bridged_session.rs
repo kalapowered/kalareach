@@ -2892,7 +2892,8 @@ async fn an_enrolled_container_answers_a_bridge_and_a_session_made_through_it_li
     let refreshed = world.run(&["--json", "bridge", "refresh", "box"]);
     assert!(
         refreshed.status.success(),
-        "{}",
+        "{}; it said {}",
+        String::from_utf8_lossy(&refreshed.stdout),
         String::from_utf8_lossy(&refreshed.stderr)
     );
     let refreshed: Value = serde_json::from_slice(&refreshed.stdout).expect("kr printed JSON");
