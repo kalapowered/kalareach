@@ -2422,11 +2422,16 @@ impl ProjectService {
             return answer();
         }
         let reach = self.recorded_reach(location_id, &shown, "the staging directory")?;
-        // The staging directory is removed from beside the entries of a directory that may be
-        // inside a working tree a capture holds still.
-        let _writer = self.writer_in_directory(
+        // The staging directory is removed, with everything in it, from beside the entries of a
+        // directory that may be inside a working tree a capture holds still, and a tree a capture
+        // holds may be inside the staging directory.
+        let mut footprint = self.footprint_inside(Path::new(&row.parent_path));
+        if let Some(recorded) = row.staging_identity {
+            footprint = footprint.removing(recorded.object);
+        }
+        let _writer = self.holds.begin_write(
             "the cleanup of a project operation's staging directory",
-            Path::new(&row.parent_path),
+            footprint,
         )?;
         // The guard is released at the end of this statement: answering from the record below
         // takes the same lock.

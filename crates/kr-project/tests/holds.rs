@@ -308,32 +308,29 @@ fn a_hold_turns_away_a_new_repository_made_inside_its_tree() {
     init(&fixture.work().join("linked"), "inside", 5).expect("and inside, once nothing holds it");
 }
 
-/// KR-REQ-14.32: the cleanup of a staging directory that an ended operation left inside a held
-/// tree is turned away with `RESOURCE_UNAVAILABLE`, claims nothing and removes nothing, and the
-/// same request removes the directory once the hold has ended.
-#[test]
-fn a_hold_turns_away_the_cleanup_of_a_staging_directory_inside_its_tree() {
+/// An operation that has ended and left a staging directory in `parent` that its row proves it
+/// made, and the request that cleans it up through a location over `parent`.
+fn leave_staging_in(
+    fixture: &Fixture,
+    parent: &std::path::Path,
+    seed: u8,
+) -> (ProjectOperationCancelParams, std::path::PathBuf, String) {
     use std::os::unix::fs::MetadataExt as _;
 
-    let fixture = Fixture::create();
-    let project = adopt(&fixture, "source", 1);
-    let linked = worktree(&fixture, project, "linked", 2);
     let service = fixture.service();
-    let tree = fixture.work().join("linked");
     let made = service
         .project_init(
             &actor(),
             &ProjectInitParams {
-                destination: destination(fixture.environment_id(), &tree, "made"),
+                destination: destination(fixture.environment_id(), parent, "made"),
                 label: "made".to_owned(),
                 initial_branch: Nullable(Some("main".to_owned())),
             },
-            Some(&action("project.init", 3)),
+            Some(&action("project.init", seed)),
         )
-        .expect("a repository is made inside the worktree's tree");
-    // The operation has ended, and it left a staging directory its row proves it made.
+        .expect("a repository is made in the directory");
     let name = format!("{STAGING_PREFIX}left");
-    let leftover = tree.join(&name);
+    let leftover = parent.join(&name);
     support::staging_directory(&leftover);
     let metadata = std::fs::metadata(&leftover).expect("the staging directory has an identity");
     let journal = rusqlite::Connection::open(
@@ -355,12 +352,33 @@ fn a_hold_turns_away_the_cleanup_of_a_staging_directory_inside_its_tree() {
         .expect("the row names the staging directory it left");
     drop(journal);
     let owner = support::TestOwner::default();
-    let location =
-        support::authorise_location(service, &owner, &tree, LocationPurpose::Destination, 4);
-    let reconcile = ProjectOperationCancelParams {
-        operation_action_id: made.operation.action_id,
-        through_location_id: Nullable(Some(location)),
-    };
+    let location = support::authorise_location(
+        fixture.service(),
+        &owner,
+        parent,
+        LocationPurpose::Destination,
+        seed + 1,
+    );
+    (
+        ProjectOperationCancelParams {
+            operation_action_id: made.operation.action_id,
+            through_location_id: Nullable(Some(location)),
+        },
+        leftover,
+        name,
+    )
+}
+
+/// KR-REQ-14.32: the cleanup of a staging directory that an ended operation left inside a held
+/// tree is turned away with `RESOURCE_UNAVAILABLE`, claims nothing and removes nothing, and the
+/// same request removes the directory once the hold has ended.
+#[test]
+fn a_hold_turns_away_the_cleanup_of_a_staging_directory_inside_its_tree() {
+    let fixture = Fixture::create();
+    let project = adopt(&fixture, "source", 1);
+    let linked = worktree(&fixture, project, "linked", 2);
+    let service = fixture.service();
+    let (reconcile, leftover, name) = leave_staging_in(&fixture, &fixture.work().join("linked"), 3);
 
     let held = hold(service, linked).expect("the worktree is held");
     let refused = service
@@ -383,6 +401,82 @@ fn a_hold_turns_away_the_cleanup_of_a_staging_directory_inside_its_tree() {
         reconciled.operation.removed_staging_paths
     );
     support::assert_absent(&leftover, "the staging directory the cleanup took away");
+}
+
+/// KR-REQ-14.32: the cleanup removes a staging directory with everything in it, so a tree a
+/// capture holds inside the directory turns it away even though the directory is beside no held
+/// tree, and the directory is removed once the hold has ended.
+#[test]
+fn a_hold_on_a_tree_inside_a_staging_directory_turns_away_its_cleanup() {
+    let fixture = Fixture::create();
+    let project = adopt(&fixture, "source", 1);
+    let service = fixture.service();
+    let (reconcile, leftover, _) = leave_staging_in(&fixture, fixture.work(), 3);
+    let inside = create(
+        &fixture,
+        project,
+        WorkspaceKind::Isolated,
+        Some(IsolationMechanism::IndependentClone),
+        &leftover,
+        "held",
+        5,
+    )
+    .expect("a clone inside the staging directory");
+
+    let held = hold(service, inside).expect("the clone is held");
+    let refused = service
+        .project_operation_cancel(&actor(), &reconcile, Performed::default())
+        .expect_err("the cleanup would remove the held tree with the directory");
+    assert_eq!(refused.code(), ErrorCode::ResourceUnavailable);
+    assert!(leftover.join("held").is_dir(), "nothing was removed");
+    drop(held);
+
+    service
+        .project_operation_cancel(&actor(), &reconcile, Performed::default())
+        .expect("the same request goes ahead once nothing holds the tree");
+    support::assert_absent(&leftover, "the staging directory the cleanup took away");
+}
+
+/// KR-REQ-14.32: a writer whose directory the host cannot open might write anywhere, so a hold
+/// turns it away and it keeps every hold from being granted while it is at work.
+#[test]
+fn a_writer_whose_directory_cannot_be_opened_is_in_the_way_of_every_hold() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = Fixture::create();
+    let project = adopt(&fixture, "source", 1);
+    let linked = worktree(&fixture, project, "linked", 2);
+    let service = fixture.service();
+    // A directory its owner can enter and write but not read is one this host cannot open.
+    let closed = fixture.work().join("closed");
+    std::fs::create_dir(&closed).expect("a directory");
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o300))
+        .expect("the mode is set");
+    let restore = || {
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700))
+            .expect("the mode is put back");
+    };
+    if std::fs::read_dir(&closed).is_ok() {
+        // The account running this can read anything, so nothing is closed to it.
+        restore();
+        return;
+    }
+
+    let held = hold(service, linked).expect("the worktree is held");
+    let refused = service
+        .writer_in_directory("a test writer", &closed)
+        .expect_err("it might be writing in the held tree");
+    assert_eq!(refused.code(), ErrorCode::ResourceUnavailable);
+    drop(held);
+    let writer = service
+        .writer_in_directory("a test writer", &closed)
+        .expect("no hold stands");
+    assert_eq!(
+        hold(service, linked).expect_err("a writer that might write anywhere is at work"),
+        Refusal::WriterAtWork("a test writer")
+    );
+    drop(writer);
+    restore();
 }
 
 /// KR-REQ-14.32: a live session blocks a hold on a tree of its repository wherever in the

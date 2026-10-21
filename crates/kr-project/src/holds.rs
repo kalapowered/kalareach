@@ -59,6 +59,8 @@ pub struct Footprint {
     pub touch: Identities,
     /// The directories it may remove with everything beneath them.
     pub deletes: Identities,
+    /// Whether nobody can say where it writes: it is in the way of every hold.
+    pub anywhere: bool,
 }
 
 impl Footprint {
@@ -68,7 +70,7 @@ impl Footprint {
         let identity = repository.identity();
         Self {
             touch: Identities::from([identity.work_tree, identity.git_dir]),
-            deletes: Identities::new(),
+            ..Self::default()
         }
     }
 
@@ -77,7 +79,7 @@ impl Footprint {
     pub fn of_git_directory(git_dir: ObjectIdentity) -> Self {
         Self {
             touch: Identities::from([git_dir]),
-            deletes: Identities::new(),
+            ..Self::default()
         }
     }
 
@@ -86,7 +88,17 @@ impl Footprint {
     pub fn inside(chain: &[ObjectIdentity]) -> Self {
         Self {
             touch: chain.iter().copied().collect(),
-            deletes: Identities::new(),
+            ..Self::default()
+        }
+    }
+
+    /// A writer whose place nobody can say, which every hold turns away and which keeps every hold
+    /// from being granted while it is at work.
+    #[must_use]
+    pub fn everywhere() -> Self {
+        Self {
+            anywhere: true,
+            ..Self::default()
         }
     }
 
@@ -95,6 +107,7 @@ impl Footprint {
     pub fn and(mut self, other: Self) -> Self {
         self.touch.extend(other.touch);
         self.deletes.extend(other.deletes);
+        self.anywhere |= other.anywhere;
         self
     }
 
@@ -139,6 +152,8 @@ pub enum Refusal {
     WriterAtWork(&'static str),
     /// This many live sessions started in a tree of the repository.
     SessionsBound(usize),
+    /// The hold ran out before every tree of the repository was covered.
+    Lapsed,
 }
 
 impl std::fmt::Display for Refusal {
@@ -160,6 +175,8 @@ impl std::fmt::Display for Refusal {
                 "a live session started in a tree of its repository, and a session's shell \
                  writes where it runs",
             ),
+            Self::Lapsed => formatter
+                .write_str("the hold ran out before every tree of its repository was covered"),
             Self::SessionsBound(count) => write!(
                 formatter,
                 "{count} live sessions started in trees of its repository, and a session's \
@@ -192,11 +209,31 @@ impl State {
     fn expire(&mut self, now: Instant) {
         self.holds.retain(|_, granted| now < granted.bound);
     }
+
+    /// Why a hold over `reach` cannot stand now: a writer at work, or a session alive, where it
+    /// would reach.
+    fn in_the_way_of(&self, reach: &Reach) -> Option<Refusal> {
+        if let Some(what) = self
+            .writers
+            .values()
+            .find(|(_, footprint)| writer_meets(footprint, reach))
+            .map(|(what, _)| *what)
+        {
+            return Some(Refusal::WriterAtWork(what));
+        }
+        let sessions = self
+            .sessions
+            .values()
+            .filter(|place| session_meets(place, reach))
+            .count();
+        (sessions > 0).then_some(Refusal::SessionsBound(sessions))
+    }
 }
 
 /// Whether a writer's footprint meets a hold's reach.
 fn writer_meets(footprint: &Footprint, reach: &Reach) -> bool {
-    !footprint.touch.is_disjoint(&reach.covers)
+    footprint.anywhere
+        || !footprint.touch.is_disjoint(&reach.covers)
         || !footprint.deletes.is_disjoint(&reach.covers)
         || !footprint.deletes.is_disjoint(&reach.ancestors)
 }
@@ -259,8 +296,9 @@ impl WorkspaceHolds {
         what: &'static str,
         footprint: Footprint,
     ) -> Result<Writer> {
+        let now = (self.moment)();
         let mut state = self.state();
-        state.expire((self.moment)());
+        state.expire(now);
         if state
             .holds
             .values()
@@ -294,8 +332,9 @@ impl WorkspaceHolds {
         session: SessionId,
         place: SessionPlace,
     ) -> Result<SessionRegistration> {
+        let now = (self.moment)();
         let mut state = self.state();
-        state.expire((self.moment)());
+        state.expire(now);
         if state
             .holds
             .values()
@@ -337,27 +376,14 @@ impl WorkspaceHolds {
     ///
     /// # Errors
     ///
-    /// Returns the [`Refusal`] when a writer is at work, another hold stands or a session is
-    /// alive where the hold would reach.
+    /// Returns the [`Refusal`] when a writer is at work or a session is alive where the hold would
+    /// reach.
     pub fn try_hold(self: &Arc<Self>, reach: Reach) -> std::result::Result<Hold, Refusal> {
-        let mut state = self.state();
         let now = (self.moment)();
+        let mut state = self.state();
         state.expire(now);
-        if let Some(what) = state
-            .writers
-            .values()
-            .find(|(_, footprint)| writer_meets(footprint, &reach))
-            .map(|(what, _)| *what)
-        {
-            return Err(Refusal::WriterAtWork(what));
-        }
-        let sessions = state
-            .sessions
-            .values()
-            .filter(|place| session_meets(place, &reach))
-            .count();
-        if sessions > 0 {
-            return Err(Refusal::SessionsBound(sessions));
+        if let Some(refusal) = state.in_the_way_of(&reach) {
+            return Err(refusal);
         }
         let id = state.take_id();
         let bound = now + HOLD_BOUND;
@@ -431,9 +457,38 @@ impl Hold {
     /// Whether this hold has kept every writer off without interruption since it was granted.
     #[must_use]
     pub fn holding(&self) -> bool {
+        let now = (self.holds.moment)();
         let mut state = self.holds.state();
-        state.expire((self.holds.moment)());
+        state.expire(now);
         state.holds.contains_key(&self.id)
+    }
+
+    /// Extends what this hold covers by `more`, if no writer is at work and no session is alive
+    /// where the whole of it now reaches. A hold is granted over what its holder knows first, and
+    /// the rest of what it must cover is read from the host's records while the hold already keeps
+    /// the writers that make those records off; this is where the two meet.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Refusal`] when something is in the way of the larger reach, and
+    /// [`Refusal::Lapsed`] when the hold has ended. The hold stays as it was, and its holder drops
+    /// it.
+    pub fn widen(&self, more: Identities) -> std::result::Result<(), Refusal> {
+        let now = (self.holds.moment)();
+        let mut state = self.holds.state();
+        state.expire(now);
+        let Some(granted) = state.holds.get(&self.id) else {
+            return Err(Refusal::Lapsed);
+        };
+        let mut reach = granted.reach.clone();
+        reach.covers.extend(more);
+        if let Some(refusal) = state.in_the_way_of(&reach) {
+            return Err(refusal);
+        }
+        if let Some(granted) = state.holds.get_mut(&self.id) {
+            granted.reach = reach;
+        }
+        Ok(())
     }
 
     /// Gives the repository back. Releasing a hold that ended does nothing, and never touches a
@@ -481,8 +536,20 @@ fn identity_chain(
     let mut here = AuthorisedDirectory::open_root(environment_id, &real).ok()?;
     let mut chain = vec![here.identity()];
     for _ in 0..MAX_CLIMB {
-        let Ok(above) = here.parent() else {
-            break;
+        // A directory is opened from its own handle where the platform can do that, so a rename
+        // above it while this climbs changes nothing; where it cannot, each parent is opened by the
+        // name the canonical path gives it.
+        let above = match here.parent() {
+            Ok(above) => above,
+            Err(_) => {
+                let Some(parent) = real.ancestors().nth(chain.len()) else {
+                    break;
+                };
+                let Ok(above) = AuthorisedDirectory::open_root(environment_id, parent) else {
+                    break;
+                };
+                above
+            }
         };
         if above.identity() == here.identity() {
             break;
@@ -534,10 +601,16 @@ impl ProjectService {
     /// Returns [`ProjectError::Held`] when a capture is holding the repository the directory is
     /// in.
     pub fn writer_in_directory(&self, what: &'static str, path: &Path) -> Result<Writer> {
-        let footprint = self
-            .directory_chain(path)
-            .map_or_else(Footprint::default, |chain| Footprint::inside(&chain));
-        self.holds.begin_write(what, footprint)
+        self.holds.begin_write(what, self.footprint_inside(path))
+    }
+
+    /// What a writer of the directory a path names, or of the one it would be in, writes: the
+    /// directory and every parent above it. A directory that cannot be opened is a place nobody
+    /// can name, and what is written there may be anywhere.
+    #[must_use]
+    pub fn footprint_inside(&self, path: &Path) -> Footprint {
+        self.directory_chain(path)
+            .map_or_else(Footprint::everywhere, |chain| Footprint::inside(&chain))
     }
 
     /// Registers a writer of the repository `repository` is open on, and of the directory a path
@@ -553,10 +626,8 @@ impl ProjectService {
         also_in: Option<&Path>,
     ) -> Result<Writer> {
         let mut footprint = Footprint::of_repository(repository);
-        if let Some(path) = also_in
-            && let Some(chain) = self.directory_chain(path)
-        {
-            footprint = footprint.and(Footprint::inside(&chain));
+        if let Some(path) = also_in {
+            footprint = footprint.and(self.footprint_inside(path));
         }
         self.holds.begin_write(what, footprint)
     }
@@ -574,10 +645,8 @@ impl ProjectService {
         also_in: Option<&Path>,
     ) -> Result<Writer> {
         let mut footprint = Footprint::of_git_directory(git_dir);
-        if let Some(path) = also_in
-            && let Some(chain) = self.directory_chain(path)
-        {
-            footprint = footprint.and(Footprint::inside(&chain));
+        if let Some(path) = also_in {
+            footprint = footprint.and(self.footprint_inside(path));
         }
         self.holds.begin_write(what, footprint)
     }
@@ -656,8 +725,15 @@ impl ProjectService {
     ///
     /// Granted only for an isolated, ready workspace whose recorded tree and Git directory are the
     /// ones the capture opened, at the place the host recorded, and only when no writer of this
-    /// host is at work, no other capture holds the repository and no live session started in a
-    /// tree this host records for it.
+    /// host is at work and no live session started in a tree this host records for the
+    /// repository.
+    ///
+    /// The hold is granted over the tree and the Git directory first, and the other trees this host
+    /// records for the repository are read afterwards and added to it. The writers that publish a
+    /// tree of the repository write its Git directory, so from the first grant none of them can
+    /// finish unseen between the reading of the records and the end of this call; what the
+    /// records say once the hold stands is what it covers. A tree adopted afterwards is not
+    /// covered.
     ///
     /// # Errors
     ///
@@ -670,6 +746,44 @@ impl ProjectService {
         work_tree: ObjectIdentity,
         git_dir: ObjectIdentity,
     ) -> Result<std::result::Result<Hold, Refusal>> {
+        let chain = match self.workspace_is_holdable(workspace_id, work_tree, git_dir)? {
+            Ok(chain) => chain,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        let first = Reach {
+            covers: Identities::from([work_tree, git_dir]),
+            ancestors: chain.into_iter().skip(1).collect(),
+        };
+        let hold = match self.holds.try_hold(first) {
+            Ok(hold) => hold,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        // The records are read again now that the hold stands: a removal that finished since the
+        // first reading is seen here, and one that has not finished is a writer at work and was
+        // refused above.
+        if let Err(refusal) = self.workspace_is_holdable(workspace_id, work_tree, git_dir)? {
+            return Ok(Err(refusal));
+        }
+        let mut more = Identities::new();
+        for known in self.known_trees()? {
+            if known.repository == Some(git_dir)
+                && let Some(tree) = known.tree
+            {
+                more.insert(tree);
+            }
+        }
+        Ok(hold.widen(more).map(|()| hold))
+    }
+
+    /// Whether the records and the disk agree that `workspace_id` is a ready, host-made workspace
+    /// at `work_tree` in the repository `git_dir`, and the chain of identities of its tree and of
+    /// every parent above it when they do.
+    fn workspace_is_holdable(
+        &self,
+        workspace_id: WorkspaceId,
+        work_tree: ObjectIdentity,
+        git_dir: ObjectIdentity,
+    ) -> Result<std::result::Result<Vec<ObjectIdentity>, Refusal>> {
         let (row, project) = {
             let store = self.locked()?;
             let row =
@@ -701,19 +815,7 @@ impl ProjectService {
         if chain.first() != Some(&work_tree) {
             return Ok(Err(Refusal::TreeMoved));
         }
-        let mut covers = Identities::from([work_tree, git_dir]);
-        for known in self.known_trees()? {
-            if known.repository == Some(git_dir)
-                && let Some(tree) = known.tree
-            {
-                covers.insert(tree);
-            }
-        }
-        let reach = Reach {
-            covers,
-            ancestors: chain.into_iter().skip(1).collect(),
-        };
-        Ok(self.holds.try_hold(reach))
+        Ok(Ok(chain))
     }
 }
 
@@ -925,5 +1027,123 @@ mod tests {
             "releasing a hold that ended releases nothing of a later one"
         );
         assert!(!first.holding(), "and the one that ended holds no more");
+    }
+
+    /// KR-REQ-14.32: a hold is widened over the other trees of its repository only when nothing
+    /// writes them and no session is alive in them, and a widening that is turned away leaves the
+    /// hold as it was; a hold that ended cannot be widened.
+    #[test]
+    fn a_hold_is_widened_only_over_trees_nothing_writes() {
+        let holds = registry();
+        let first = Reach {
+            covers: identities(&[1, 2]),
+            ancestors: identities(&[10]),
+        };
+
+        let hold = holds.try_hold(first.clone()).expect("nothing is at work");
+        assert!(
+            holds
+                .begin_write("a test writer", Footprint::inside(&[identity(3)]))
+                .is_ok(),
+            "the tree about to be added is not held yet"
+        );
+        hold.widen(identities(&[4]))
+            .expect("nothing is in the added tree");
+        assert!(
+            holds
+                .begin_write("a test writer", Footprint::inside(&[identity(4)]))
+                .is_err(),
+            "and the added tree is held"
+        );
+        drop(hold);
+
+        let hold = holds.try_hold(first.clone()).expect("nothing is at work");
+        let writer = holds
+            .begin_write("a test writer", Footprint::inside(&[identity(3)]))
+            .expect("the tree is not held yet");
+        assert_eq!(
+            hold.widen(identities(&[3])),
+            Err(Refusal::WriterAtWork("a test writer")),
+            "a writer came to the tree between the grant and the widening"
+        );
+        assert!(
+            holds
+                .begin_write("a test writer", Footprint::inside(&[identity(1)]))
+                .is_err(),
+            "the hold stands as it was"
+        );
+        drop(writer);
+        let session_there = holds
+            .begin_session(session(1), SessionPlace::Chain(identities(&[3, 20])))
+            .expect("the tree is not held yet");
+        assert_eq!(
+            hold.widen(identities(&[3])),
+            Err(Refusal::SessionsBound(1)),
+            "a session began in the tree between the grant and the widening"
+        );
+        drop(session_there);
+        hold.widen(identities(&[3]))
+            .expect("nothing is there any more");
+        drop(hold);
+
+        let base = Instant::now();
+        let offset = Arc::new(AtomicU64::new(0));
+        let moved = Arc::clone(&offset);
+        let holds = Arc::new(WorkspaceHolds::on(Arc::new(move || {
+            base + Duration::from_secs(moved.load(Ordering::SeqCst))
+        })));
+        let hold = holds.try_hold(first).expect("nothing is at work");
+        offset.store(HOLD_BOUND.as_secs(), Ordering::SeqCst);
+        assert_eq!(hold.widen(identities(&[3])), Err(Refusal::Lapsed));
+    }
+
+    /// KR-REQ-14.32: a writer whose place nobody can say is in the way of every hold, and every
+    /// hold is in the way of it.
+    #[test]
+    fn a_writer_nobody_can_place_is_in_the_way_of_every_hold() {
+        let holds = registry();
+        let writer = holds
+            .begin_write("a test writer", Footprint::everywhere())
+            .expect("no hold stands");
+        assert_eq!(
+            holds
+                .try_hold(reach())
+                .expect_err("it may be writing there"),
+            Refusal::WriterAtWork("a test writer")
+        );
+        drop(writer);
+        let _hold = holds.try_hold(reach()).expect("nothing is at work");
+        assert!(
+            holds
+                .begin_write("a test writer", Footprint::everywhere())
+                .is_err()
+        );
+    }
+
+    /// KR-REQ-14.32: the chain of a directory holds its own identity and that of every directory
+    /// above it, on every platform, and a name that does not exist yet stands for the directory it
+    /// would be in.
+    #[test]
+    fn a_directorys_chain_holds_its_own_identity_and_every_parent_above_it() {
+        let temp = tempfile::TempDir::new().expect("a directory");
+        let real = std::fs::canonicalize(temp.path()).expect("it resolves");
+        let inner = real.join("a").join("b");
+        std::fs::create_dir_all(&inner).expect("two directories");
+        let environment = kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([9; 16]));
+        let identity_of = |path: &Path| {
+            AuthorisedDirectory::open_root(environment, path)
+                .expect("it opens")
+                .identity()
+        };
+
+        let chain = identity_chain(environment, &inner).expect("the directory opens");
+        assert_eq!(chain[0], identity_of(&inner));
+        assert!(chain.contains(&identity_of(&real.join("a"))));
+        assert!(chain.contains(&identity_of(&real)), "the directory above");
+        assert_eq!(
+            identity_chain(environment, &inner.join("missing")).expect("its parent opens")[0],
+            chain[0],
+            "a name that is not there yet stands for the directory it would be in"
+        );
     }
 }
