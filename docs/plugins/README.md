@@ -578,6 +578,18 @@ component fault disables rich meaning without stalling or discarding valid nativ
   [the host's account of the gateway](../host/README.md#what-the-gateway-reads-from-the-stream)
   describes. A table that leaves the member out has the host read no thread from the stream, and a
   package that declares it states `"sdk_range": ">=0.1.6, <0.2.0"`.
+- **Operations:** for a table of an application server, how its protocol spells the core's own
+  operations: `prompt_submit`, `prompt_queue`, `turn_steer` and `turn_cancel`, each a routed method
+  the host sends, a template for its parameters, and optionally where the reply names the turn it
+  started. A template holds the thread, the turn or the text as a whole value, `{"$": "thread_id"}`,
+  `{"$": "turn_id"}` or `{"$": "text"}`, and everything else in it is written as it stands. A
+  prompt needs the thread and the text, a steer the thread, the turn and the text, and a cancellation
+  the thread and the turn; a template that lacks one, or has one the operation has no value for, is
+  refused. A template is bounded (eight levels deep, sixty-four values, literals of at most 256
+  bytes with no control characters). Each method is routed from the host to the application,
+  classified as a mutation, and used by one operation only. A table that declares none leaves the
+  member out and has the host send no prompt, steer or cancellation of its own. A package that
+  declares it states `"sdk_range": ">=0.1.6, <0.2.0"`.
 - **Messages:** The `messages` member of an application server's table names the top-level members,
   other than the message identifier and method, that a message is read by: `params`, `result` and
   `error` each hold the name of one. A request names the method member, and a response names exactly

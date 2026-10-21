@@ -165,6 +165,48 @@ and a method has one role. A table lists at most eight selections and eight leav
 The package declares places and the host does the reading. A package cannot say that a conversation
 changed, and the host never takes one from prompt text or timestamps.
 
+## What the host writes for its own operations
+
+An `operations` member says how the application's protocol spells a prompt, a steer and a
+cancellation, so that the host can write them and a package cannot make it send anything it did not
+qualify:
+
+```json
+"operations": {
+  "prompt_submit": {
+    "method": "turn.start",
+    "params": {
+      "threadId": { "$": "thread_id" },
+      "input": [{ "type": "text", "text": { "$": "text" } }]
+    },
+    "reply_turn": { "segments": [
+      { "type": "member", "name": "result" },
+      { "type": "member", "name": "turn" },
+      { "type": "member", "name": "id" } ] }
+  },
+  "turn_steer": {
+    "method": "turn.steer",
+    "params": {
+      "threadId": { "$": "thread_id" },
+      "expectedTurnId": { "$": "turn_id" },
+      "input": [{ "type": "text", "text": { "$": "text" } }]
+    }
+  },
+  "turn_cancel": {
+    "method": "turn.interrupt",
+    "params": { "threadId": { "$": "thread_id" }, "turnId": { "$": "turn_id" } }
+  }
+}
+```
+
+A hole is a whole value, `{"$": "thread_id"}`, `{"$": "turn_id"}` or `{"$": "text"}`, and the host
+fills it with a JSON string. A prompt needs the thread and the text, a steer the thread, the turn and
+the text, and a cancellation the thread and the turn. Each method is one the table routes from the
+host to the application and classifies as a mutation, and no two operations share one. A template
+nests at most eight levels, holds at most sixty-four values, and its literals are at most 256 bytes
+without control characters. `reply_turn` is a path inside the table's result member. The table
+needs its `messages` member. An operation a table does not declare is one the host does not send.
+
 ## The action that answers
 
 An action answers through the destination with the `decision_destination` implementation:

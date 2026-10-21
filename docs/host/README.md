@@ -6279,10 +6279,25 @@ and refused against another.
 Each entry also says which of the core's own operations it is, and that is how an operation is
 encoded. Submitting a prompt, queueing one and steering a turn need one right between them, so the
 right cannot name the method; the table names one method per operation, and a table that names none
-for an operation, or two, sends nothing rather than sending the nearest thing. The operation
-travels with the turn it acts on. An approval's answer is written into the member the table names
-for that method, so an upstream that reads its decision from `behavior` is answered in `behavior`,
-and a method the table says nothing about answering is one this host will not answer at all.
+for an operation, or two, sends nothing rather than sending the nearest thing. An approval's answer
+is written into the member the table names for that method, so an upstream that reads its decision
+from `behavior` is answered in `behavior`, and a method the table says nothing about answering is
+one this host will not answer at all.
+
+A connector of an application server says how its protocol spells each operation, in the table's
+`operations` member: the routed method, a template for the request's parameters, and where the
+reply names the turn the operation started. The template has a hole where each value the core
+supplies goes (the thread, the turn, the text), and the core fills each with a JSON string and
+writes nothing else. The rich table is compiled from the declared operations, so it lists those and
+no others, and an operation the table does not declare is one this host does not send. Nothing a
+component says reaches a request: a package cannot make the host send something it did not
+qualify. A prompt, a steer and a cancellation name the thread the binding holds, and a steer and a
+cancellation name the turn that is running. They are refused before the dispatch marker, and
+nothing is written, when the binding names no thread, when no turn is known to run, when the turn
+named is not the running one, when a prompt names a draft (the template writes text, and the
+draft's content would be left out), and when a prompt is submitted over a running turn (whether the
+application takes that as a queue is not something this host has qualified). The reply's turn is
+read at the place the table names, so the receipt names the turn a prompt started.
 
 An upstream reverse request for a filesystem or terminal operation is one this host performs
 itself, in the agent's own host environment and as the user the agent runs as. Where it runs comes
@@ -6994,6 +7009,20 @@ the token was spent to invite the work and is not proof by the time the work com
 transmits is the plan that was validated: the operation it prepares travels in the frame, carried
 in the permit rather than attested by a flag beside it. The draft store itself (whose the draft is
 and what else it holds) is not this host's, and what it supplies here is the snapshot.
+
+A package's action reaches a connector that declares operations in two ways. An action declared as
+`upstream_cancel` that the package's component does not prepare is carried out by the host itself:
+the admission is made as for a component's, with the declaration as the plan, so the action token is
+issued and spent and the binding, the grant, the capability, the revision and the running turn are
+checked, and the cancellation template is written with the thread and the turn the admission read.
+An action whose component prepares a cancellation is written through the same template, once the
+plan has been compared with the token the host issued. What a connector's table has no place for is
+refused before the marker with the reason that it names no source for it: a component's prompt or
+steer (the template writes text the host was given, not text a component chose), an action that
+sends an upstream method of its own, and an attachment or terminal text. The host's own frame for a
+plugin action is written only for a connector that declares no operations; it is kept until a
+connector can declare an attachment template, and is never what a connector that declares
+operations falls back to.
 
 An action whose implementation is its connector's decision destination is an approval answer, and
 `plugin.action.invoke` admits it as one: every check an approval answer meets applies, in the
