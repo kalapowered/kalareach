@@ -53,7 +53,8 @@ use kr_worker::persistence::JournalHealth;
 /// means to make: `hook_loop` makes it again, and what it keeps is the last run's words. The two
 /// phrases it looks for are the ones the forwarder writes for that, which the launch gives it. The
 /// count of tries only ends a hook that never gets through. The program may be any shell the case
-/// names, so the loop is plain Bourne shell, and a nested process runs the same text.
+/// names, so the loop is plain Bourne shell, and a nested process or a program this one starts in
+/// its place runs the same text.
 const SCRIPT: &str = r#"report="$REPORT"
 await_file() {
   polls=0
@@ -92,7 +93,7 @@ if [ -n "$HOOK" ]; then
     echo done > "$report.hooked2"
   fi
   if [ -n "$THEN_EXEC" ]; then
-    exec "$THEN_EXEC" -c 'printf "%s" "$HOOK_EVENT_2" | "$HOOK" claude-code hook > "$REPORT.hook2" 2>&1; echo done > "$REPORT.hooked2"; sleep 1; exit 0'
+    exec "$THEN_EXEC" -c "$hook_loop"'; echo done > "$REPORT.hooked2"; sleep 1; exit 0' other "$HOOK_EVENT_2" "$REPORT.hook2"
   fi
 fi
 if [ -n "$HOLD_UNTIL" ]; then await_file "$HOLD_UNTIL"; fi
