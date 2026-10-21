@@ -120,8 +120,8 @@ PY
 }
 
 # Starts the host, which reaches the phone as `peer`, and waits until it is up.
-start_harness() { # <peer>
-    KR_HARNESS_DIR="$harness" KR_HARNESS_PEER="$1" KR_HARNESS_SECONDS=1500 \
+start_harness() { # <peer> [<peer of the other service>]
+    KR_HARNESS_DIR="$harness" KR_HARNESS_PEER="$1" KR_HARNESS_SERVICE_PEER="${2:-$1}" KR_HARNESS_SECONDS=1500 \
         "$harness_exe" --ignored --exact a_phone_scans_pairs_and_confirms_against_a_real_host --nocapture \
         >"$artefacts/harness.log" 2>&1 &
     harness_pid=$!
@@ -144,6 +144,14 @@ required_checks=(
     "cancelled: no connection"
     "accepted: one connection"
 )
+# What only the emulator's run shows: the scanner has a camera there, and the simulator has none.
+platform_checks=()
+if [ "$platform" = android ]; then
+    platform_checks=(
+        "the scanner is kept out of screenshots"
+        "the scanner closes on Cancel"
+    )
+fi
 
 # What the host wrote in one of its files, on one line, or nothing when it wrote none.
 host_file() { # <name>
@@ -153,7 +161,7 @@ host_file() { # <name>
 # Decides the run from the lines the driver reported and the files the host wrote.
 judge() { # <driver output>
     local bad=0 check
-    for check in "${required_checks[@]}"; do
+    for check in "${required_checks[@]}" ${platform_checks[@]+"${platform_checks[@]}"}; do
         if grep -q -F "PAIRING $check" "$1"; then
             say "check=$check ok=1"
         else
@@ -312,11 +320,10 @@ run_android() {
     # The emulator this script started is the one that answered: its process is still there.
     { [ "$booted" = 1 ] && kill -0 "$emulator_pid" 2>/dev/null; } || { say "the emulator did not come up"; return 3; }
 
-    # The camera looks at the wall's picture from two metres: a host's largest code gets about six
-    # pixels to a module there.
-    python3 "$here/scripts/lib/pairing-android.py" pose "$grpc_port" position -1.807 0.32 3.584 \
-        && python3 "$here/scripts/lib/pairing-android.py" pose "$grpc_port" rotation 0 210 0 \
-        || { say "the camera could not be placed"; return 2; }
+    # The camera starts at its first view of the wall's picture. The emulator's camera is a frame of
+    # 1280 by 960 pixels and a host's direct invitation is a dense code, so the driver moves the
+    # camera to another view when a view is not read, as a person moves a phone.
+    python3 "$here/scripts/lib/pairing-android.py" aim "$grpc_port" || { say "the camera could not be placed"; return 2; }
 
     "$adb" -s "$serial" uninstall "$app_id" >/dev/null 2>&1
     "$adb" -s "$serial" install -r "$apk" >/dev/null || { say "the package did not install"; return 2; }
@@ -325,16 +332,26 @@ run_android() {
     # scanner, and answered on its own screen.
     "$adb" -s "$serial" shell pm grant "$app_id" android.permission.POST_NOTIFICATIONS 2>/dev/null
 
-    # The emulator reaches this machine's loopback interface as 10.0.2.2.
-    start_harness 10.0.2.2 || return 2
+    # The emulator reaches this machine's loopback interface as 10.0.2.2, which carries the direct
+    # invitation's datagrams. The application's connections to the other service of the code case
+    # did not arrive at the host through that address (the host saw no connection at all), so that
+    # service is reached on the emulator's own loopback interface, which `adb reverse` ties to the
+    # host's listener.
+    start_harness 10.0.2.2 127.0.0.1 || return 2
+    local service_port
+    service_port="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["service_port"])' "$harness/ready.json")"
+    "$adb" -s "$serial" reverse "tcp:$service_port" "tcp:$service_port" >/dev/null \
+        || { say "the emulator's loopback interface could not be tied to the other service"; return 2; }
     feed_android "$adb" "$serial" &
     feeder_pid=$!
 
     say "driving the application"
     local out="$artefacts/driver.log" status=0
-    python3 "$here/scripts/lib/pairing-android.py" drive "$adb" "$serial" "$harness" "$shots" >"$out" 2>&1 || status=$?
+    python3 "$here/scripts/lib/pairing-android.py" drive "$adb" "$serial" "$harness" "$shots" "$grpc_port" >"$out" 2>&1 || status=$?
     sed 's/^/    /' "$out" | tee -a "$log"
-    "$adb" -s "$serial" logcat -d 2>/dev/null | tail -400 >"$artefacts/logcat.log"
+    # The crash buffer, and the main buffer without the compositor's and the screen reader's polling.
+    "$adb" -s "$serial" logcat -d -b crash >"$artefacts/crash.log" 2>&1
+    "$adb" -s "$serial" logcat -d 2>/dev/null | grep -v -E 'CompositionEngine|AccessibilityNodeInfoDumper' | tail -2000 >"$artefacts/logcat.log"
     judge "$out" || status=2
     [ "$status" = 0 ] || return 2
 }

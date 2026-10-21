@@ -4,12 +4,12 @@
 
 Two commands:
 
-  pose <grpc port> position|rotation <x> <y> <z>
-      Moves the emulator's virtual camera. The emulator's controller is a gRPC service, and its one
-      call this needs is `setPhysicalModel`, whose message is small enough to write by hand, so the
-      call is made with `curl` and no library.
+  aim <grpc port>
+      Moves the emulator's virtual camera to its first view of the wall's picture. The emulator's
+      controller is a gRPC service, and its one call this needs is `setPhysicalModel`, whose message
+      is small enough to write by hand, so the call is made with `curl` and no library.
 
-  drive <adb> <serial> <harness directory> <screenshot directory>
+  drive <adb> <serial> <harness directory> <screenshot directory> <grpc port>
       Runs the cases against the host the harness directory belongs to. The application is read
       through `uiautomator`, which names the page's own buttons and texts, and driven by taps at
       the centre of what it names. Every prompt of the system is answered by the button a person
@@ -30,6 +30,40 @@ APP = "to.kala.reach"
 
 
 # ---- The emulator's camera ---------------------------------------------------------------------
+
+
+# Where the camera stands (metres) and which way it looks (degrees) at each view of the wall's
+# picture, square on to it and with the picture whole. A person who cannot get a code to read moves
+# the phone, and so does this run: the emulator's camera is a frame of 1280 by 960 pixels, a host's
+# direct invitation is a code 109 modules wide, and whether one view reads it depends on the code,
+# which is new every run. The views keep the window frame, which stands before the picture's corner
+# from other places, off the code.
+VIEWS = [
+    ([-1.807, 0.32, 3.584], [0.0, 210.0, 0.0]),
+    ([-1.807, 0.32, 3.2], [0.0, 210.0, 0.0]),
+    ([-1.807, 0.32, 2.8], [0.0, 210.0, 0.0]),
+    ([-1.807, 0.8, 2.4], [0.0, 210.0, 0.0]),
+    ([-1.807, 0.6, 2.0], [0.0, 210.0, 0.0]),
+]
+
+# A view of the room with no picture in it.
+AWAY = ([-1.807, 0.32, 3.584], [0.0, 30.0, 0.0])
+
+# How long the scanner is given at a view before the phone is moved to the next one. The scanner
+# looks at a frame about eight times a second, so this is many frames.
+VIEW_SECONDS = 6
+
+
+def look(port: str, view) -> None:
+    """Puts the virtual camera at `view`."""
+    position, rotation = view
+    pose(port, "position", position)
+    pose(port, "rotation", rotation)
+
+
+def aim(port: str) -> None:
+    """Puts the virtual camera at its first view."""
+    look(port, VIEWS[0])
 
 
 def pose(port: str, kind: str, values: list[float]) -> None:
@@ -103,26 +137,29 @@ class Phone:
             if node is not None:
                 return node
             time.sleep(0.4)
-        raise SystemExit(f"timed out waiting for {what}")
+        self.give_up(f"timed out waiting for {what}")
+
+    def give_up(self, message: str) -> None:
+        """Ends the run, saying what the screen showed, for whoever reads the failure."""
+        labels = " | ".join(each["label"] for each in self.screen() if each["label"])
+        self.shot("timeout")
+        raise SystemExit(f"{message}; the screen shows: {labels}")
 
     def tap(self, node: dict) -> None:
         left, top, right, bottom = node["box"]
         self.run("shell", "input", "tap", str((left + right) // 2), str((top + bottom) // 2))
 
     def press(self, label: str, timeout: float = 30) -> None:
-        self.tap(self.wait(lambda each: each == label, f"the {label} button", timeout))
+        """Presses the button named `label`, however the system writes its capitals."""
+        self.tap(self.wait(lambda each: each.lower() == label.lower(), f"the {label} button", timeout))
 
     def shot(self, name: str) -> None:
         picture = self.run("exec-out", "screencap", "-p", timeout=60).stdout
         (self.shots / f"android-{name}.png").write_bytes(picture)
 
-    def answer_the_camera_prompt(self) -> bool:
-        """Presses the button a person presses to let the application use the camera, when it asks."""
-        node = self.find(lambda each: each in ("While using the app", "Only this time", "Allow"))
-        if node is None:
-            return False
-        self.tap(node)
-        return True
+    def is_blank(self) -> bool:
+        """Whether a screenshot shows nothing: the system blanks a window that is marked secure."""
+        return len(self.run("exec-out", "screencap", "-p", timeout=60).stdout) < 30000
 
 
 def touch(directory: Path, name: str) -> None:
@@ -149,21 +186,31 @@ def say(text: str) -> None:
     print(f"PAIRING {text}", flush=True)
 
 
-def scan(phone: Phone, directory: Path, picture: str) -> None:
-    """Has the camera see `picture`, and presses Scan code, answering the camera's question once."""
+def scan(phone: Phone, directory: Path, picture: str, port: str, wanted, what: str) -> None:
+    """Has the camera see `picture`, presses Scan code, and waits for what a scan of it opens.
+
+    The first scan asks to use the camera, and the answer a person gives is given. When a view of the
+    picture is not read in its time, the phone is moved to the next one.
+    """
     wait_for_file(directory, f"{picture}.png.added")
     phone.press("Scan code")
-    # The first scan asks to use the camera; later ones do not, so the question is looked for briefly.
-    asked = time.monotonic() + 8
-    while time.monotonic() < asked:
-        if phone.answer_the_camera_prompt():
-            break
-        if phone.find(lambda each: each.startswith("Invitation from a host") or each.startswith("Code for a host")):
-            break
-        time.sleep(0.4)
+    for view in VIEWS:
+        look(port, view)
+        end = time.monotonic() + VIEW_SECONDS
+        while time.monotonic() < end:
+            nodes = phone.screen()
+            asking = [node for node in nodes if node["label"] in ("While using the app", "Only this time", "Allow")]
+            if asking:
+                phone.tap(asking[0])
+                continue
+            for node in nodes:
+                if node["label"] and wanted(node["label"]):
+                    return
+            time.sleep(0.3)
+    phone.give_up(f"timed out waiting for {what}: the scanner read the picture at none of {len(VIEWS)} views")
 
 
-def drive(adb: str, serial: str, directory: Path, shots: Path) -> None:
+def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> None:
     phone = Phone(adb, serial, shots)
     shots.mkdir(parents=True, exist_ok=True)
     phone.run("shell", "am", "start", "-n", f"{APP}/.MainActivity")
@@ -173,8 +220,7 @@ def drive(adb: str, serial: str, directory: Path, shots: Path) -> None:
 
     # A QR code whose secret has one bit changed opens nothing.
     touch(directory, "go-control")
-    scan(phone, directory, "control")
-    phone.wait(lambda each: each.startswith("Invitation from a host"), "the scanned invitation")
+    scan(phone, directory, "control", port, lambda each: each.startswith("Invitation from a host"), "the scanned invitation")
     phone.press("Pair")
     phone.wait(lambda each: each.startswith("The invitation did not work"), "the refusal")
     touch(directory, "control-done")
@@ -182,18 +228,22 @@ def drive(adb: str, serial: str, directory: Path, shots: Path) -> None:
     if read(directory, "control-result.txt") != "candidate_locked=0":
         raise SystemExit("the host locked a candidate on a changed secret")
     say("a changed secret locked nothing")
-    # Scan again opens the scanner, and Cancel closes it: the person is back at the start.
+    # Scan again opens the scanner, and Cancel closes it: the person is back at the start. The phone
+    # is turned away from the picture first, since the scanner reads a code the moment it sees one.
+    look(port, AWAY)
     phone.press("Scan again")
     phone.wait(lambda each: each == "Point the camera at the code on your host", "the scanner")
-    phone.shot("scanner")
+    # The scanner's window is secure: what the camera sees is kept out of screenshots.
+    if not phone.is_blank():
+        raise SystemExit("a screenshot shows what the scanner's camera sees")
+    say("the scanner is kept out of screenshots")
     phone.press("Cancel")
     phone.wait(lambda each: each == "Pair with a host", "the pairing screen after the scanner closed")
     say("the scanner closes on Cancel")
 
     # The host's invitation: the phone shows the value the host shows, and is paired once approved.
     touch(directory, "go-direct")
-    scan(phone, directory, "direct")
-    phone.wait(lambda each: each.startswith("Invitation from a host"), "the scanned invitation")
+    scan(phone, directory, "direct", port, lambda each: each.startswith("Invitation from a host"), "the scanned invitation")
     phone.shot("scanned-summary")
     phone.press("Pair")
     phone.wait(lambda each: each == "Check this value on the host", "the value", 90)
@@ -212,10 +262,10 @@ def drive(adb: str, serial: str, directory: Path, shots: Path) -> None:
     # A code that names another service asks before anything is contacted.
     touch(directory, "go-code")
     wait_for_file(directory, "code.png.added")
-    phone.press("Hosts")
+    phone.press("Done")
     phone.wait(lambda each: each == "Pair with a host", "the pairing screen")
-    phone.press("Scan code")
-    alert = phone.wait(lambda each: each == "Use another pairing service?", "the alert naming the other service", 60)
+    asks = lambda each: each == "Use another pairing service?"
+    scan(phone, directory, "code", port, asks, "the alert naming the other service")
     named = phone.find(lambda each: each.startswith("This code belongs to https://"))
     if named is None:
         raise SystemExit("the alert does not name the service")
@@ -225,15 +275,17 @@ def drive(adb: str, serial: str, directory: Path, shots: Path) -> None:
     if read(directory, "connections.txt") != "0":
         raise SystemExit("a service was contacted before the person agreed")
     say("cancelled: no connection")
-    phone.press("Scan code")
-    phone.wait(lambda each: each == "Use another pairing service?", "the alert the second time", 60)
-    phone.tap(phone.wait(lambda each: each.startswith("Use "), "the button that accepts the service"))
+    scan(phone, directory, "code", port, asks, "the alert the second time")
+    # The button that accepts is "Use <the service>", and the alert's title is a question that starts
+    # with the same word.
+    accepts = lambda each: each.lower().startswith("use ") and not each.endswith("?")
+    phone.tap(phone.wait(accepts, "the button that accepts the service"))
     phone.wait(lambda each: each.startswith("Code for a host that uses"), "the held code")
     phone.press("Pair")
     end = time.monotonic() + 60
     while read(directory, "connections.txt") != "1":
         if time.monotonic() > end:
-            raise SystemExit("the other service was not contacted once the person agreed")
+            phone.give_up("the other service was not contacted once the person agreed")
         time.sleep(0.25)
     say("accepted: one connection")
     touch(directory, "code-done")
@@ -242,10 +294,10 @@ def drive(adb: str, serial: str, directory: Path, shots: Path) -> None:
 
 def main() -> None:
     arguments = sys.argv[1:]
-    if len(arguments) == 6 and arguments[0] == "pose":
-        pose(arguments[1], arguments[2], [float(each) for each in arguments[3:6]])
-    elif len(arguments) == 5 and arguments[0] == "drive":
-        drive(arguments[1], arguments[2], Path(arguments[3]), Path(arguments[4]))
+    if len(arguments) == 2 and arguments[0] == "aim":
+        aim(arguments[1])
+    elif len(arguments) == 6 and arguments[0] == "drive":
+        drive(arguments[1], arguments[2], Path(arguments[3]), Path(arguments[4]), arguments[5])
     else:
         raise SystemExit(__doc__)
 
