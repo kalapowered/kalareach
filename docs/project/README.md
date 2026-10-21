@@ -985,9 +985,10 @@ request the daemon could not read after a restart, counts against every reservat
 counts until its closure is recorded. A create that did not come to a session (a worker that
 reported it could not start, whether the create was still waiting or not, a launch no worker
 claimed, and a launch that did not report in time) counts until the kernel says the worker's
-process has ended and the worker's own record of the session shows nothing it left running; the
-host asks for sixty seconds, and a worker still running after that, or one that left a process
-behind, counts until the daemon restarts. A launch whose process the host could not identify
+process has ended and the worker's own journal shows nothing it left running (no journal, or one
+whose closure lists no survivor; a journal with no closure shows nothing); the host asks for sixty
+seconds, and a worker still running after that, or one that left a process behind, counts until
+the daemon restarts. A launch whose process the host could not identify
 counts until the daemon restarts too. A closure that could not confirm its worker ended counts
 until the kernel says the process has ended. A closure that records a process the session left
 running counts until the daemon restarts, and after a restart nothing follows that process. A
