@@ -18,6 +18,11 @@
 # first. A process a service manager launches is its own identity to the operating system, and one
 # that reaches a removable volume asks the person at the machine for permission.
 #
+# Two environment variables let a wrapper run this against a release instead of a build of this
+# checkout. KR_E2E_PROGRAMS names a directory that holds kr-controller, kr-worker and kr, which are
+# used as they are and not built. KR_E2E_STATE names the directory the daemon keeps its state in,
+# which then outlives the run, so that a later run finds what this one recorded.
+#
 # Nothing the person at this machine owns is touched: the graphical application is a new instance
 # started in the background, and this script ends only the processes it started itself.
 set -euo pipefail
@@ -67,38 +72,43 @@ echo "this shell's login context: $(/bin/launchctl managername)"
 echo
 
 echo "building the host"
-CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build -q -p kr-controller -p kr-worker -p kr-cli
+if [ -n "${KR_E2E_PROGRAMS:-}" ]; then
+  echo "using the programs in $KR_E2E_PROGRAMS"
+else
+  CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build -q -p kr-controller -p kr-worker -p kr-cli
+fi
 
 # The run's own root, on the internal disk, with the binaries beside it.
 run_root="$(mktemp -d "${TMPDIR:-/tmp}/kalareach-desktop.XXXXXX")"
-mkdir -p "$run_root/bin" "$run_root/r" "$run_root/s" "$run_root/evidence"
+state_dir="${KR_E2E_STATE:-$run_root/s}"
+mkdir -p "$run_root/bin" "$run_root/r" "$state_dir" "$run_root/evidence"
 # The host's own roots are owner-only and it checks them rather than assuming: /tmp is
 # world-writable by design and a directory this run created with anything looser would be refused.
-chmod 700 "$run_root/r" "$run_root/s"
+chmod 700 "$run_root/r" "$state_dir"
 # The build products, wherever this workspace's build cache is. They are copied to the internal
 # disk before anything is started, because a process a service manager launches asks the person at
 # the machine for permission the first time it reaches a removable volume.
-target_dir="${CARGO_TARGET_DIR:-$root/target}"
+programs="${KR_E2E_PROGRAMS:-${CARGO_TARGET_DIR:-$root/target}/debug}"
 for binary in kr-controller kr-worker kr; do
-  if [ ! -x "$target_dir/debug/$binary" ]; then
+  if [ ! -x "$programs/$binary" ]; then
     fail "the build did not produce $binary"
     exit 1
   fi
-  cp "$target_dir/debug/$binary" "$run_root/bin/$binary"
+  cp "$programs/$binary" "$run_root/bin/$binary"
   # Started once, here, where nothing is timed: the operating system checks a newly written
   # executable the first time it starts, and on a loaded machine that check alone can outlast a
   # create's rendezvous.
   "$run_root/bin/$binary" --version >/dev/null
 done
 export KR_RUNTIME_DIR="$run_root/r"
-export KR_STATE_DIR="$run_root/s"
+export KR_STATE_DIR="$state_dir"
 kr="$run_root/bin/kr"
 
 # The launchd jobs this run's daemon defined, by label. The daemon writes one definition per
 # worker's job into its environment's jobs directory and removes it once the job has gone.
 defined_jobs() {
   local definition
-  for definition in "$run_root"/s/environments/*/jobs/kr-worker-*.plist; do
+  for definition in "$state_dir"/environments/*/jobs/kr-worker-*.plist; do
     [ -e "$definition" ] || continue
     basename "$definition" .plist
   done
@@ -219,7 +229,7 @@ echo "starting the control daemon"
 # behind every other host on the machine for a key it throws away at the end.
 (cd "$run_root" && exec "$run_root/bin/kr-controller" \
   --runtime-dir "$run_root/r" \
-  --state-dir "$run_root/s" \
+  --state-dir "$state_dir" \
   --secret-store file \
   --worker "$run_root/bin/kr-worker") \
   >"$run_root/evidence/controller.log" 2>&1 &

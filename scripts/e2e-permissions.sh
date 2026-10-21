@@ -18,6 +18,11 @@
 # first. A process a service manager launches is its own identity to the operating system, and one
 # that reaches a removable volume asks the person at the machine for permission.
 #
+# Two environment variables let a wrapper run this against a release instead of a build of this
+# checkout. KR_E2E_PROGRAMS names a directory that holds kr-controller, kr-worker and kr, which are
+# used as they are and not built. KR_E2E_STATE names the directory the daemon keeps its state in,
+# which then outlives the run, so that a later run finds what this one recorded.
+#
 # Nothing the person at this machine owns is touched. No check sends input to an application, none
 # changes user data, and the one check that would do either is not run. Every process this script
 # ends is one it started, by the identifier it recorded.
@@ -76,7 +81,11 @@ echo "this shell's login context: $(/bin/launchctl managername)"
 echo
 
 echo "building the host and the disclosed checks"
-CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build -q -p kr-controller -p kr-worker -p kr-cli
+if [ -n "${KR_E2E_PROGRAMS:-}" ]; then
+  echo "using the programs in $KR_E2E_PROGRAMS"
+else
+  CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build -q -p kr-controller -p kr-worker -p kr-cli
+fi
 # The checks themselves are built as their own binary, so the session's shell can run them in the
 # execution context under test rather than in this script's.
 checks_binary="$(CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo test -q -p kr-worker --lib \
@@ -102,17 +111,18 @@ fi
 
 # The run's own root, on the internal disk, with the binaries beside it.
 run_root="$(mktemp -d "${TMPDIR:-/tmp}/kalareach-permissions.XXXXXX")"
-mkdir -p "$run_root/bin" "$run_root/r" "$run_root/s" "$run_root/evidence" "$run_root/scratch" \
+state_dir="${KR_E2E_STATE:-$run_root/s}"
+mkdir -p "$run_root/bin" "$run_root/r" "$state_dir" "$run_root/evidence" "$run_root/scratch" \
   "$run_root/authorised"
 # The host's own roots are owner-only and it checks them rather than assuming.
-chmod 700 "$run_root/r" "$run_root/s"
-target_dir="${CARGO_TARGET_DIR:-$root/target}"
+chmod 700 "$run_root/r" "$state_dir"
+programs="${KR_E2E_PROGRAMS:-${CARGO_TARGET_DIR:-$root/target}/debug}"
 for binary in kr-controller kr-worker kr; do
-  if [ ! -x "$target_dir/debug/$binary" ]; then
+  if [ ! -x "$programs/$binary" ]; then
     fail "the build did not produce $binary"
     exit 1
   fi
-  cp "$target_dir/debug/$binary" "$run_root/bin/$binary"
+  cp "$programs/$binary" "$run_root/bin/$binary"
   # Started once, here, where nothing is timed: the operating system checks a newly written
   # executable the first time it starts, and on a loaded machine that check alone can outlast a
   # create's rendezvous.
@@ -120,7 +130,7 @@ for binary in kr-controller kr-worker kr; do
 done
 cp "$checks_binary" "$run_root/bin/disclosed-checks"
 export KR_RUNTIME_DIR="$run_root/r"
-export KR_STATE_DIR="$run_root/s"
+export KR_STATE_DIR="$state_dir"
 kr="$run_root/bin/kr"
 
 # The file the person authorises this context to read. It is this run's own file, in this run's own
@@ -132,7 +142,7 @@ printf 'the person nominated this file for the authorised read check\n' >"$autho
 # worker's job into its environment's jobs directory and removes it once the job has gone.
 defined_jobs() {
   local definition
-  for definition in "$run_root"/s/environments/*/jobs/kr-worker-*.plist; do
+  for definition in "$state_dir"/environments/*/jobs/kr-worker-*.plist; do
     [ -e "$definition" ] || continue
     basename "$definition" .plist
   done
@@ -231,7 +241,7 @@ echo "starting the control daemon"
 # platform's own credential store.
 (cd "$run_root" && exec "$run_root/bin/kr-controller" \
   --runtime-dir "$run_root/r" \
-  --state-dir "$run_root/s" \
+  --state-dir "$state_dir" \
   --secret-store file \
   --worker "$run_root/bin/kr-worker") \
   >"$run_root/evidence/controller.log" 2>&1 &
@@ -558,7 +568,7 @@ echo
 echo "5. no account of any kind on this path"
 # Nothing on this path asks for, stores or reads an account. The run's own state is the whole of
 # what setup wrote, so this is checked by looking at it rather than by asserting it.
-account_files="$(find "$run_root/s" -type f \( -name '*account*' -o -name '*stripe*' \
+account_files="$(find "$state_dir" -type f \( -name '*account*' -o -name '*stripe*' \
   -o -name '*firebase*' -o -name '*cloudflare*' -o -name '*apple*' \) 2>/dev/null || true)"
 if [ -n "$account_files" ]; then
   fail "this path wrote something that reads as an account: $account_files"
