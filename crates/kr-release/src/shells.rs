@@ -18,7 +18,8 @@ use serde_json::Value;
 
 use crate::profile::profile_order;
 use crate::refusal::{
-    Refusal, Result, digest_file, digest_from_hex, hex, read_json, read_text, refuse, scalar,
+    Refusal, Result, digest, digest_file, digest_from_hex, hex, read, read_json, read_text, refuse,
+    scalar,
 };
 
 /// The shells whose packages a Unix release is built from, in the order the tree lists them.
@@ -63,8 +64,8 @@ pub fn packages(tree: &Path, checkout: &Path, target: &str) -> Result<Vec<Releas
         .collect()
 }
 
-/// Holds the PowerShell package of a tree to the checkout's: the same files, byte for byte, and no
-/// other.
+/// Holds the PowerShell package of a tree to the checkout's: the same files, and no other. A script
+/// may carry the signature Authenticode appended to it; its text is the checkout's.
 fn powershell_package(tree: &Path, checkout: &Path) -> Result<()> {
     let in_tree = files_under(&tree.join("shells/psreadline"))?;
     let in_checkout = files_under(&checkout.join("shells/psreadline"))?;
@@ -101,7 +102,8 @@ fn files_under(directory: &Path) -> Result<Vec<(String, [u8; 32])>> {
                     .map(|part| part.as_os_str().to_string_lossy().into_owned())
                     .collect::<Vec<_>>()
                     .join("/");
-                found.push((relative, digest_file(&path)?));
+                let digest = package_digest(&relative, &path)?;
+                found.push((relative, digest));
             }
         }
         Ok(())
@@ -110,6 +112,46 @@ fn files_under(directory: &Path) -> Result<Vec<(String, [u8; 32])>> {
     walk(directory, directory, &mut found)?;
     found.sort();
     Ok(found)
+}
+
+/// The first line of the block of comment lines Authenticode appends to a script it signs.
+const SIGNATURE_BEGINS: &[u8] = b"# SIG # Begin signature block";
+
+/// The digest of a file of the PowerShell package: of the file, or of a script's text as it was
+/// before it was signed.
+fn package_digest(relative: &str, path: &Path) -> Result<[u8; 32]> {
+    let bytes = read(path)?;
+    let script = [".ps1", ".psm1", ".psd1"]
+        .iter()
+        .any(|extension| relative.ends_with(extension));
+    Ok(digest(if script {
+        before_signing(&bytes)
+    } else {
+        &bytes
+    }))
+}
+
+/// A script's text without the signature Authenticode appended: from the line that begins the
+/// block to the end, which is all comment lines or the block is not one, then the line break before
+/// it, and the byte-order mark the signing may add. A line after the marker that is code keeps the
+/// whole file, so it differs from the checkout's.
+fn before_signing(bytes: &[u8]) -> &[u8] {
+    let text = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let block = text
+        .windows(SIGNATURE_BEGINS.len())
+        .enumerate()
+        .find(|(at, window)| *window == SIGNATURE_BEGINS && (*at == 0 || text[at - 1] == b'\n'))
+        .map(|(at, _)| at);
+    match block {
+        Some(at)
+            if text[at..]
+                .split(|byte| *byte == b'\n')
+                .all(|line| line.trim_ascii().is_empty() || line.starts_with(b"#")) =>
+        {
+            text[..at].trim_ascii_end()
+        }
+        _ => text.trim_ascii_end(),
+    }
 }
 
 /// One package, held to its pins.
@@ -255,6 +297,17 @@ fn package(tree: &Path, checkout: &Path, shell: &str) -> Result<ReleaseShell> {
                 recorded.display()
             )))
         })?;
+        let pinned = text(&pins["module_directory"])?;
+        if relative != Path::new(&pinned) {
+            refuse!(
+                "{}",
+                at(&format!(
+                    "module {} is searched for in {}, and the pins name {pinned}",
+                    text(&module["name"]).unwrap_or_default(),
+                    relative.display()
+                ))
+            );
+        }
         let directory = package_directory.join(relative);
         if !has_a_file(&directory) {
             refuse!(

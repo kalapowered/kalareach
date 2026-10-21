@@ -433,6 +433,21 @@ fn a_tree_that_disagrees_with_the_pins_is_refused_before_it_is_signed() {
         );
     }
 
+    // A module searched for in another directory of the package than the pins name, one that holds
+    // a file: the shell's module directory is still there, and it is not the one searched.
+    let release = tree_of();
+    edit_record(&release, &|record| {
+        let search = record["shell"]["modules"][0]["search_path"]
+            .as_str()
+            .expect("a path")
+            .to_owned();
+        let moved = search.replace("lib/zsh/5.9", "bin");
+        assert_ne!(moved, search, "the record names the pinned directory");
+        record["shell"]["modules"][0]["search_path"] = serde_json::json!(moved);
+    });
+    let refused = assemble(&inputs(&release.tree())).expect_err("another module directory");
+    assert!(refused.to_string().contains("the pins name"), "{refused}");
+
     // A file with a second name, and a link.
     let release = tree_of();
     std::fs::hard_link(
@@ -685,9 +700,46 @@ fn a_windows_tree_carries_the_powershell_package_as_files() {
         "{}",
         why(&refused)
     );
-    std::fs::write(&module, original).expect("put back");
+    std::fs::write(&module, &original).expect("put back");
     let again = run(&manifest_arguments_for(&tree, WINDOWS, "windows=10.0"));
     assert!(again.status.success(), "{}", why(&again));
+
+    // The same script as Authenticode leaves it: the checkout's text, then the block of comment
+    // lines the signing appends. The manifest of a signed tree is written again, so it takes it.
+    let block: &[u8] =
+        b"\r\n# SIG # Begin signature block\r\n# MIIabcdefgh\r\n# SIG # End signature block\r\n";
+    let with = |text: &[u8], tail: &[u8]| [text, tail].concat();
+    std::fs::write(&module, with(&original, block)).expect("signed");
+    let signed = run(&manifest_arguments_for(&tree, WINDOWS, "windows=10.0"));
+    assert!(
+        signed.status.success(),
+        "a signed script is the checkout's: {}",
+        why(&signed)
+    );
+    // A signed script whose text is not the checkout's, and a marker followed by code.
+    for (what, bytes) in [
+        (
+            "a signed script of another text",
+            with(&with(&original, b"\n# another\n"), block),
+        ),
+        (
+            "code after the marker",
+            with(
+                &original,
+                b"\r\n# SIG # Begin signature block\r\nWrite-Host smuggled\r\n",
+            ),
+        ),
+    ] {
+        std::fs::write(&module, bytes).expect("edited");
+        let refused = run(&manifest_arguments_for(&tree, WINDOWS, "windows=10.0"));
+        assert!(!refused.status.success(), "{what}");
+        assert!(
+            why(&refused).contains("shells/psreadline"),
+            "{what}: {}",
+            why(&refused)
+        );
+    }
+    std::fs::write(&module, &original).expect("put back");
 
     // Another directory under `shells/` is no shell package of a Windows release.
     std::fs::create_dir_all(tree.join("shells/another")).expect("a directory");

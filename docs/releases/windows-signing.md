@@ -62,7 +62,10 @@ and every file of the PowerShell package that runs: the five module scripts and
 with an all-signed execution policy, so they are signed together or not at all. The update channel's release
 keys sign `release.json`, which lists every other file with its length and digest, so the files that carry no
 Authenticode signature (the licences, the package manifest, the record and the channel's root) are held by
-that one. `scripts/stage-windows-signing.py` is what says which files are which.
+that one. `scripts/stage-windows-signing.py` is what says which files are which. When the release tool
+writes the manifest of a signed tree it holds each script to the checkout's text without the block of
+comment lines Authenticode appends; a script with anything but comment lines after the block's first
+line is not signed, and differs.
 
 The workflow reads all the programs that need to be included in the release from the
 `scripts/release-programs.json` file. There's only one list of programs to maintain, which is used
