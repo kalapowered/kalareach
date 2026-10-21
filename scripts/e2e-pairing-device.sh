@@ -60,12 +60,22 @@ feeder_pid=""
 emulator_pid=""
 emulator_serial=""
 emulator_adb=""
+# What the iOS run makes or changes outside this script's own directories: a simulator of its own,
+# whose photo library takes the pictures, and two files of the build that are put back as they were.
+simulator_made=""
+xcconfig="$companion/src-tauri/gen/apple/Local.xcconfig"
+xcconfig_saved=""
+xcconfig_made=""
+plist="$companion/src-tauri/gen/apple/companion-tauri_iOS/Info.plist"
+plist_saved=""
 
 say() { printf '== [pairing-device] %s\n' "$*" | tee -a "$log"; }
 
 # Ends what this script started and removes what it made. The host is asked to finish and ended by
 # the pid this script recorded only when it does not; so is the feeder; the emulator is asked to stop
-# through its serial and ended by its pid when it does not.
+# through its serial and ended by its pid when it does not, after the application and the tunnel it
+# was given are taken away; the simulator this script made is shut down and deleted, which takes its
+# photo library with it; and the two files of the iOS build are put back as they were.
 finish() {
     touch "$harness/finish" 2>/dev/null
     for pid in "$feeder_pid" "$harness_pid"; do
@@ -78,6 +88,8 @@ finish() {
         kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null
     done
     if [ -n "$emulator_pid" ] && kill -0 "$emulator_pid" 2>/dev/null; then
+        "$emulator_adb" -s "$emulator_serial" reverse --remove-all >/dev/null 2>&1
+        "$emulator_adb" -s "$emulator_serial" uninstall "$app_id" >/dev/null 2>&1
         "$emulator_adb" -s "$emulator_serial" emu kill >/dev/null 2>&1
         local stopped=0
         while kill -0 "$emulator_pid" 2>/dev/null && [ "$stopped" -lt 30 ]; do
@@ -86,6 +98,16 @@ finish() {
         done
         kill -0 "$emulator_pid" 2>/dev/null && kill "$emulator_pid" 2>/dev/null
     fi
+    if [ -n "$simulator_made" ]; then
+        xcrun simctl shutdown "$simulator_made" >/dev/null 2>&1
+        xcrun simctl delete "$simulator_made" >/dev/null 2>&1
+    fi
+    if [ -n "$xcconfig_saved" ]; then
+        cp "$xcconfig_saved" "$xcconfig" 2>/dev/null
+    elif [ -n "$xcconfig_made" ]; then
+        rm -f "${xcconfig:?}"
+    fi
+    [ -z "$plist_saved" ] || cp "$plist_saved" "$plist" 2>/dev/null
     rm -rf "${harness:?}"
 }
 trap finish EXIT
@@ -209,16 +231,29 @@ feed_ios() { # <udid>
 
 run_ios() {
     local device="${KR_IOS_DEVICE:-iPhone 17 Pro}" udid app="${KR_PAIRING_IOS_APP:-}"
-    udid="$(xcrun simctl list devices available -j | python3 "$here/scripts/simulator-identity.py" udid "$device")"
-    [ -n "$udid" ] || { say "no iOS simulator named $device"; return 3; }
+    # The simulator is one of this run's own, of the model and the runtime of the one named, so that
+    # nothing of an earlier run is in its photo library and nothing of this one is left in another's.
+    local template
+    template="$(xcrun simctl list devices available -j | python3 "$here/scripts/simulator-identity.py" template "$device")"
+    [ -n "$template" ] || { say "no iOS simulator named $device"; return 3; }
 
     if [ -z "$app" ]; then
         say "building the application for the simulator"
-        # No push: the build names no Firebase configuration.
-        printf 'KR_GOOGLE_SERVICE_INFO =\n' >"$companion/src-tauri/gen/apple/Local.xcconfig"
+        # No push: the build names no Firebase configuration. The file is a developer's own when it
+        # exists, and is put back as it was; the build also rewrites the end of one tracked file.
+        if [ -f "$xcconfig" ]; then
+            xcconfig_saved="$(mktemp "${TMPDIR:-/tmp}/kr-xcconfig.XXXXXX")"
+            cp "$xcconfig" "$xcconfig_saved"
+        else
+            xcconfig_made=1
+        fi
+        plist_saved="$(mktemp "${TMPDIR:-/tmp}/kr-info-plist.XXXXXX")"
+        cp "$plist" "$plist_saved"
+        printf 'KR_GOOGLE_SERVICE_INFO =\n' >"$xcconfig"
         rm -rf "${companion:?}/src-tauri/gen/apple/build"
         ( cd "$companion" && pnpm tauri ios build --debug --ci --target aarch64-sim ) >"$artefacts/build.log" 2>&1 \
             || { say "the build failed; see $artefacts/build.log"; return 2; }
+        cp "$plist_saved" "$plist"
         app="$companion/src-tauri/gen/apple/build/arm64-sim/KalaReach.app"
     fi
     [ -d "$app" ] || { say "there is no application at $app"; return 2; }
@@ -234,15 +269,13 @@ run_ios() {
     [ -f "$plan" ] || { say "the test build left no plan"; return 2; }
     build_harness || return 2
 
-    # A simulator that is already running is someone else's: it is neither used nor shut down.
-    if xcrun simctl list devices booted | grep -q "$udid"; then
-        say "the simulator $device is already running, which is left alone"
-        return 3
-    fi
-    say "starting the simulator $device"
+    say "making and starting a simulator like $device"
+    # shellcheck disable=SC2086
+    udid="$(xcrun simctl create "kr-pairing-device-$$" $template)" \
+        || { say "the simulator could not be made"; return 3; }
+    simulator_made="$udid"
     xcrun simctl boot "$udid" >/dev/null 2>&1
     xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1
-    xcrun simctl uninstall "$udid" "$app_id" >/dev/null 2>&1
     xcrun simctl install "$udid" "$app" || { say "the application did not install"; return 2; }
 
     # A simulator shares this machine's network: the host is where the invitation says.
