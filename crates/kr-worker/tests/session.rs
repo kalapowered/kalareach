@@ -2351,6 +2351,20 @@ fn quoted(path: &std::path::Path) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
+/// A start that was refused created no process, and so left no mark.
+///
+/// What decides it is whether a process was created for the session's terminal, which is settled
+/// by the time the refusal returns. The mark is what such a process would have left, and is not
+/// what decides: the file is read at that instant, a process created a moment before has almost
+/// never written it yet, and the look would pass whatever had happened.
+fn assert_no_process_was_created(session: &Session, marker: &std::path::Path) {
+    assert!(
+        !session.process_was_created(),
+        "a refused start created a process"
+    );
+    assert!(!marker.exists(), "and so left no mark");
+}
+
 /// What a directory holds, for the message of a mark that is not where the command was to leave it.
 fn names_in(directory: &std::path::Path) -> Vec<String> {
     std::fs::read_dir(directory)
@@ -2382,7 +2396,7 @@ fn command_session(
 }
 
 /// A command whose moment has passed by the time its process would be created does not start: the
-/// session closes with the record of a launch that failed, and the command leaves no mark.
+/// session closes with the record of a launch that failed, and no process is created for it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_does_not_start_after_the_moment_it_was_accepted_for() {
     let host = kr_ipc::testing::TempHost::create();
@@ -2399,7 +2413,7 @@ async fn a_command_does_not_start_after_the_moment_it_was_accepted_for() {
             .reason,
         ClosureReason::RootLaunchFailed
     );
-    assert!(!marker.exists(), "the command did not run");
+    assert_no_process_was_created(&session, &marker);
 }
 
 /// A shell a workflow named is held to the moment the daemon accepted its start for, as a command
@@ -2443,13 +2457,13 @@ async fn a_shell_a_workflow_named_does_not_start_after_the_moment_it_was_accepte
                     .reason,
                 ClosureReason::RootLaunchFailed
             );
-            assert!(!marker.exists(), "the shell did not run");
+            assert_no_process_was_created(&session, &marker);
         }
     }
 }
 
-/// A command whose directory is not there does not start: the terminal library would run it in the
-/// account's home directory instead, which nobody chose.
+/// A command whose directory is not there does not start: the shell would run it in the account's
+/// home directory instead, which nobody chose.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_does_not_start_in_a_directory_that_is_not_there() {
     let host = kr_ipc::testing::TempHost::create();
@@ -2460,7 +2474,7 @@ async fn a_command_does_not_start_in_a_directory_that_is_not_there() {
         session.closure().is_some(),
         "a refused start leaves its record"
     );
-    assert!(!marker.exists(), "the command did not run");
+    assert_no_process_was_created(&session, &marker);
 }
 
 /// The control of the two above: the same command, before its moment and in a directory that is
