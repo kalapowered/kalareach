@@ -1794,7 +1794,7 @@ async fn kr_req_12_08_the_approval_evidence_follows_the_bindings_grants_and_faul
         testing::Snapshot {
             policy: kr_protocol::admission::RevocationPolicy::DisableAtNextAdmission,
             releases: vec![revoked],
-            ..testing::Snapshot::admitting(2, Vec::new())
+            ..testing::Snapshot::admitting(2, vec![package.clone()])
         },
     );
     assert_eq!(
