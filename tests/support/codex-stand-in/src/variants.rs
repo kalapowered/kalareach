@@ -105,6 +105,13 @@ pub struct Variants {
     /// connection, and saying what it reads, while it waits for its file, as a terminal that is
     /// waiting for a person does.
     pub keep_reading: bool,
+    /// The server exits, with nothing said, when it reads a request to start a turn under an
+    /// identifier the host minted: a server killed under a prompt a device sent.
+    pub die_on_host_turn: bool,
+    /// The terminal, once the server has answered what it asked about the account, says so and
+    /// waits for the file `KR_STAND_IN_RELEASE` names with `.thread` added before it starts a
+    /// thread.
+    pub hold_before_thread: bool,
 }
 
 impl Variants {
@@ -149,6 +156,8 @@ impl Variants {
                 "leave-second-unanswered" => variants.leave_second_unanswered = true,
                 "no-turn-answer" => variants.no_turn_answer = true,
                 "keep-reading" => variants.keep_reading = true,
+                "die-on-host-turn" => variants.die_on_host_turn = true,
+                "hold-before-thread" => variants.hold_before_thread = true,
                 other => panic!("{VARIABLE} names a variant this program does not have: {other}"),
             }
         }

@@ -181,6 +181,17 @@ impl Gateway {
         ledger: Ledger,
         shape: &fixture::Shape,
     ) -> Self {
+        Self::shaped_with(qualified, runtime_name, ledger, shape, None)
+    }
+
+    /// The same, for a package of the shape given whose table is the one named, where one is.
+    pub fn shaped_with(
+        qualified: bool,
+        runtime_name: &str,
+        ledger: Ledger,
+        shape: &fixture::Shape,
+        table: Option<String>,
+    ) -> Self {
         let placed = Placed::new();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -198,8 +209,11 @@ impl Gateway {
         );
         let store = placed.host.root().join("store");
         std::fs::create_dir_all(&store).expect("a store");
-        let mut source =
-            fixture::package(&store, &placed.forwarder, shape).expect("the package is written");
+        let mut source = match table {
+            Some(table) => fixture::package_with_connector(&store, &placed.forwarder, shape, table),
+            None => fixture::package(&store, &placed.forwarder, shape),
+        }
+        .expect("the package is written");
         if qualified {
             source.qualified = vec![QualifiedExecutable {
                 digest,

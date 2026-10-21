@@ -222,6 +222,15 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
                                 "params": { "type": "apiKey", "apiKey": key }
                             }));
                         } else {
+                            if variants.hold_before_thread
+                                && let Ok(mut release) = std::env::var(RELEASE_VARIABLE)
+                            {
+                                release.push_str(".thread");
+                                println!("TUI: holding before the thread starts");
+                                while !std::path::Path::new(&release).exists() {
+                                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                }
+                            }
                             send!(json!({ "id": THREAD, "method": "thread/start", "params": {} }));
                         }
                     }

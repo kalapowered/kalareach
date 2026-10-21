@@ -947,6 +947,82 @@ fn kr_req_12_06_the_binding_of_a_gateway_served_terminal_is_what_the_servers_mes
     assert!(!state.rich_mutations_suspended);
 }
 
+/// KR-REQ-11.30: a method the terminal sends that the package's table does not list suspends rich
+/// mutations, and the suspension lifts when the terminal's next selection has named the thread, the
+/// binding naming it. The terminal's first request here, which asks the server who the account is,
+/// is the method the table leaves out.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_11_30_a_method_the_table_does_not_list_suspends_rich_mutations_until_a_selection_names_the_thread()
+ {
+    let shape = kr_worker::broker::connectors::fixture::Shape::codex_backend_answering();
+    let mut table: serde_json::Value = serde_json::from_str(
+        &kr_worker::broker::connectors::fixture::gateway_connector_json_answering(
+            "kalareach/codex",
+            true,
+        ),
+    )
+    .expect("the fixture's table is JSON");
+    for list in ["routes", "methods"] {
+        table[list]
+            .as_array_mut()
+            .expect("a list")
+            .retain(|entry| entry["method"] != "account.read");
+    }
+    let shell = Gateway::shaped_with(
+        true,
+        "",
+        common::gateway::Ledger::Memory,
+        &shape,
+        Some(serde_json::to_string_pretty(&table).expect("a table encodes")),
+    );
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let release = shell.placed.host.root().join("go");
+    let mut launched = shell.launch(
+        &answer,
+        "unlisted",
+        &[
+            ("KR_STAND_IN", "stay,hold-before-thread,leave-unanswered"),
+            ("KR_STAND_IN_COMMAND", COMMAND),
+            (
+                "KR_STAND_IN_RELEASE",
+                release.to_str().expect("a text path"),
+            ),
+        ],
+    );
+    launched.prints("TUI: holding before the thread starts");
+    let instance = shell.announcement().instance.application_instance_id;
+    // The server has answered what the terminal asked about the account, which the table does not
+    // list, and no thread is named: rich mutations wait, for the method the table does not list.
+    let state = shell.broker.binding_state(instance).expect("the instance");
+    assert!(state.rich_mutations_suspended);
+    assert!(
+        state
+            .suspension_reason
+            .0
+            .as_deref()
+            .is_some_and(|reason| reason.contains("not classified")),
+        "{:?}",
+        state.suspension_reason
+    );
+    assert!(state.thread_id.0.is_none());
+    // The terminal selects a thread, and the server's reply names it: both reasons end together,
+    // the binding naming the thread.
+    let mut thread_release = release.clone().into_os_string();
+    thread_release.push(".thread");
+    std::fs::write(&thread_release, b"go").expect("the terminal is released");
+    launched.prints("TUI: the server asks for item/commandExecution/requestApproval");
+    eventually("the binding names the thread and nothing waits", || {
+        shell
+            .broker
+            .binding_state(instance)
+            .is_ok_and(|state| state.thread_id.0.is_some() && !state.rich_mutations_suspended)
+    });
+}
+
 /// KR-REQ-11.33: an approval the server asks a gateway-served terminal is interpreted under the
 /// package's trust, and a rich answer to it, with the terminal not answering, reaches the server
 /// once, in the shape the pinned release reads, with the value the table maps the decision to.
