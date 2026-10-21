@@ -269,17 +269,24 @@ impl ShellPackage {
     ///
     /// The whole record, not only the editor ABI and the integration version: two builds of one
     /// shell agree on both of those and are still two different readers.
+    ///
+    /// It states the record as the build wrote it, paths included, because the bridge compiled
+    /// into the shell says the same paths from the same build whatever directory the package has
+    /// since been put in. The comparison of the hello with this checks the build's record: a
+    /// package that was moved is the build it was, and a record re-rooted to where the package now
+    /// sits would never agree with the shell inside it. The files the worker opens are another
+    /// matter, and [`Self::identity`] names them where the package is.
     #[must_use]
     pub fn declaration(&self) -> crate::contract::transport::PackageDeclaration {
-        let identity = self.identity();
+        let shell = &self.manifest.shell;
         crate::contract::transport::PackageDeclaration {
-            kind: identity.kind,
-            executable: identity.executable,
-            upstream_version: identity.upstream_version,
-            editor_abi: identity.editor_abi,
-            integration_version: identity.integration_version,
-            patches: identity.patches,
-            modules: identity.modules,
+            kind: shell.kind,
+            executable: shell.executable.display().to_string(),
+            upstream_version: shell.upstream_version.clone(),
+            editor_abi: shell.editor_abi.clone(),
+            integration_version: shell.integration_version.clone(),
+            patches: shell.patches.clone(),
+            modules: shell.modules.clone(),
         }
     }
 
