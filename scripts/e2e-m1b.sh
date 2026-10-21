@@ -72,12 +72,18 @@ legs=(
 # before anything else, so a mistyped word costs no build and no request.
 selected=()
 if [ "${KR_M1B_LEGS+set}" = set ]; then
-  chosen="${KR_M1B_LEGS//,/ }"
-  if [ -z "${chosen// /}" ]; then
+  # The words of the selection, split at commas and at every kind of white space, with nothing
+  # expanded: a tab or a newline is a separator as a space is, and a selection of separators alone
+  # names no leg.
+  chosen=()
+  while IFS= read -r want; do
+    [ -n "$want" ] && chosen+=("$want")
+  done < <(printf '%s\n' "$KR_M1B_LEGS" | tr -s ', \t\r\n' '\n')
+  if [ "${#chosen[@]}" = 0 ]; then
     echo "KR_M1B_LEGS names no leg" >&2
     exit 2
   fi
-  for want in $chosen; do
+  for want in "${chosen[@]}"; do
     known=0
     for leg in "${legs[@]}"; do
       [ "${leg%%:*}" = "$want" ] && known=1
