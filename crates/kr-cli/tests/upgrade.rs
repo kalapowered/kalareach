@@ -1193,7 +1193,10 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
     host.close(&updated.kr_now(), &display);
     host.worker_ended(&worker_now).await;
 
-    // With only the release before's session live the rollback goes on.
+    // With only the release before's session live the rollback goes on. A package manager has put
+    // these releases here: its name is in a file beside the record, which the release before does
+    // not know, and the record it reads is as it always was.
+    std::fs::write(host.store.root().join("installer"), "homebrew\n").expect("the installer file");
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -1209,6 +1212,10 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
         host.daemon_build().await,
         format!("kr-controller/{}", updated.one.name()),
         "the daemon is the release before's again"
+    );
+    assert!(
+        host.store.root().join("installer").is_file(),
+        "the package manager's name is where it was after the rollback"
     );
     // The release before's daemon says nothing of privacy mode in `host.info`, and reports it only
     // under `privacy.status`, which is what a device that manages the host asks of it.
