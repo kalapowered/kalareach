@@ -41,6 +41,9 @@ mod releases;
 mod door;
 #[path = "../../kr-controller/tests/net_support/pairing.rs"]
 mod pairing;
+// An organisation's keys, which sign the chain a host enrols from and the policy it applies.
+#[path = "../../kr-controller/tests/organisation_support/mod.rs"]
+mod organisation_support;
 // A person's terminal: a program run on a pseudo-terminal that a case types at.
 #[path = "upgrade/terminal.rs"]
 mod terminal;
@@ -1236,6 +1239,129 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
             .expect("this release reads the report");
         assert!(!report.enabled);
     }
+    updated.the_worker_is_as_it_was().await;
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+}
+
+/// KR-REQ-26.10, KR-REQ-26.08: the policy a host applied for an organisation is kept in
+/// a store the release before does not name, so a rollback to that release goes on while it is
+/// there. The release before reads the registry, which holds the enrolment as it always did, and
+/// the file beside it stays on disk, which that release ignores: it applies no organisation policy
+/// and shows none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_leaves_an_applied_organisation_policy_in_its_store_and_the_release_before_ignores_it()
+ {
+    use kr_protocol::confirmation::ConfirmationSubject;
+    use kr_protocol::organisation::{
+        OrganisationEnrolParams, OrganisationEnrolResult, OrganisationListParams,
+        OrganisationListResult, OrganisationPolicyApplyParams, OrganisationPolicyApplyResult,
+    };
+
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    let updated = Updated::on_the_network().await;
+    let host = &updated.host;
+    let endpoint = host
+        .tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let environment_id = host.tree.environment_id();
+    let door = door::Door::pair_the_first_owner(&endpoint, environment_id).await;
+
+    // The owner enrols the host in an organisation, on the confirmation of the owner's device, and
+    // applies the policy the organisation signed.
+    let now = kr_ipc::now_ms().get();
+    let mut organisation = organisation_support::Organisation::new(0x21, now - 2 * DAY_MS);
+    organisation.rotate(now - DAY_MS);
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("reaches the daemon");
+    let enrol = OrganisationEnrolParams {
+        authority: organisation.authority(now - 1_000),
+    };
+    pairing::confirm_subject(
+        environment_id,
+        &mut client,
+        ConfirmationSubject::EnrolOrganisation(Box::new(enrol.clone())),
+        &pairing::Signer::OwnerDevice(&door.keys),
+    )
+    .await
+    .expect("the owner's device confirms the chain");
+    let _: OrganisationEnrolResult = pairing::mutate_as(
+        environment_id,
+        &mut client,
+        kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+        Method::OrganisationEnrol,
+        &enrol,
+    )
+    .await
+    .expect("the host enrols");
+    let applied: OrganisationPolicyApplyResult = pairing::mutate_as(
+        environment_id,
+        &mut client,
+        kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+        Method::OrganisationPolicyApply,
+        &OrganisationPolicyApplyParams {
+            policy: organisation.policy(2, 1, Some(&["kalareach/codex"]), now),
+            authority: Nullable::null(),
+        },
+    )
+    .await
+    .expect("the host applies the organisation's policy");
+    assert_eq!(
+        applied.effective_adapter_allowlist.0.map(|list| list.len()),
+        Some(1)
+    );
+    let listed: OrganisationListResult = pairing::read(
+        &mut client,
+        Method::OrganisationList,
+        &OrganisationListParams::default(),
+    )
+    .await
+    .expect("the owner reads what the host holds");
+    assert_eq!(listed.enrolments.len(), 1);
+    let store = host
+        .tree
+        .environment()
+        .state_dir()
+        .join("organisation-policy.json");
+    assert!(store.is_file(), "the policy is kept in its store");
+    drop(client);
+    drop(door);
+
+    // The rollback goes on: the registry is at a version the release before reads, and the store
+    // is one it does not name.
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", updated.one.name()),
+        "the daemon is the release before's again"
+    );
+    assert!(store.is_file(), "the release before leaves the store alone");
+
+    // The release before's daemon holds the enrolment and applies no policy: its own `kr` shows the
+    // organisation with no applied policy.
+    let output = host.run(&updated.kr_before(), &["--json", "organisation", "list"]);
+    assert!(
+        output.status.success(),
+        "the release before's kr lists the organisations: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let said: Value = serde_json::from_slice(&output.stdout).expect("a document");
+    let enrolments = said["enrolments"].as_array().expect("a list of enrolments");
+    assert_eq!(enrolments.len(), 1, "{said}");
+    assert!(
+        enrolments[0].get("adapter_allowlist").is_none()
+            && said.get("effective_adapter_allowlist").is_none(),
+        "the release before shows no applied policy: {said}"
+    );
     updated.the_worker_is_as_it_was().await;
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
