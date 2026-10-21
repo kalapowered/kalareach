@@ -606,7 +606,14 @@ fn a_windows_tree_carries_the_powershell_package_as_files() {
     let built = Command::new("bash")
         .arg(checkout().join("scripts/build-release.sh"))
         .args(["--target", WINDOWS, "--release", "0.1.0+4254aa6e62e5"])
-        .args(["--sequence", "3", "--commit", COMMIT, "--floor", "windows=10.0"])
+        .args([
+            "--sequence",
+            "3",
+            "--commit",
+            COMMIT,
+            "--floor",
+            "windows=10.0",
+        ])
         .arg("--programs")
         .arg(&programs)
         .arg("--root")
@@ -621,7 +628,12 @@ fn a_windows_tree_carries_the_powershell_package_as_files() {
 
     let manifest = manifest_of(&tree);
     assert!(manifest.shells.is_empty(), "no shell build is stated");
-    let listed = |path: &str| manifest.files.iter().find(|file| file.path.as_str() == path);
+    let listed = |path: &str| {
+        manifest
+            .files
+            .iter()
+            .find(|file| file.path.as_str() == path)
+    };
     assert_eq!(
         listed("bin/kr.exe").map(|file| file.mode),
         Some(FileMode::Executable)
