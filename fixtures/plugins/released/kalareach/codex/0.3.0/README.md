@@ -91,8 +91,9 @@ limit Codex states. A response larger than it fails the connection rather than b
   could change: it writes `turn/interrupt` naming the thread and the running turn.
 - **Answer an approval.** `approval.answer` is a decision the host writes as the response to the
   request, for a binding that holds `approval.decode` and `approval.respond`. The terminal can answer
-  the same request, and Codex takes the first answer. When a person answers in the terminal after a
-  device has, the terminal's answer is not forwarded and the connection goes on.
+  the same request, and the host forwards one answer to Codex: the first to reach it. When a person
+  answers in the terminal after a device has, the terminal's answer is not forwarded and the
+  connection goes on.
 - **Prompt and steer.** The host's typed prompt and steer are written from the operations above. They
   are not package actions: no control of this package can name a thread or write text of its own.
 
@@ -101,19 +102,26 @@ No component, and therefore no decoder or encoder a package ships: the table is 
 Resuming a saved thread reads stored history. It does not establish that this process owns the live
 execution, and nothing in this package treats it as though it did. After a resume into a thread that
 is already running, a steer or a cancel is refused until Codex says a turn started, because a reply
-to a resume does not name the turn.
+to a resume does not name the turn. A prompt is not refused then: the host knows of no running turn,
+and it learns of one only from `turn/started`.
 
 ## What is not measured
 
-The frames below come from the stand-in this repository's host is tested with, not from a live
-Codex. Four things about a real 0.155.1 session are assumed and left for a run that has one:
+The host's cases for this package run against a stand-in for Codex's App Server in the core
+repository, not against a live Codex. Five things about a real 0.155.1 session are assumed and left
+for a run that has one:
 
 1. The terminal closes its approval prompt when Codex sends `serverRequest/resolved` for a request
    a device answered.
 2. The terminal shows a turn the host started.
 3. `thread/start`, `thread/resume` and `thread/fork` are the only ways the terminal selects a
-   thread.
-4. A prompt sent over a running turn is not a queue, which is why the host refuses it.
+   thread, and the thread a reply names is the one the terminal shows. A thread the terminal starts
+   for its own purposes on the same connection, an ephemeral one for instance, would be taken as the
+   conversation it is in.
+4. The 195 stable method names are every method a 0.155.1 session sends. A method outside the list
+   is read as a mutation.
+5. A prompt sent over a running turn is not a queue, which is why the host refuses one while it
+   knows a turn is running.
 
 Queueing a prompt is declared off for the same reason, and the matrix's case for queued prompts is
 open.

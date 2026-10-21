@@ -37,9 +37,9 @@ manifest, so a host can install it and the gateway's whole path runs on what the
 | | |
 | --- | --- |
 | Source | `kalareach-plugins`, `plugins/kalareach/codex/` |
-| Commit | `6029c7845a1a16f3c6ef27097818848ad9641960`, the revision the manifest's `source.revision` names |
+| Commit | `782f32d6a5d3f74f1f00c27f60c37b85e0928ce7`, the commit of the plugins repository these files are copied from; the manifest's `source.revision` names `cb39424b9bf23de38b91d6cbc787d4824439877d`, the commit that holds the package's other five files |
 | Files | `plugin.json`, `connector.json`, `presentation.json`, `README.md`, `fixtures/conformance.json`, `fixtures/frames.json` |
-| Package hash | `a37d8d7eaf63f8502ae2da2e57a39784a01a159426060aca53a48647d30b928f`, the SHA-256 digest of `plugin.json` |
+| Package hash | `5e252bd9f93856fd03c5ff4d3a2a4359dd1f4a1d663ab9d0b18479441dc0cd4b`, the SHA-256 digest of `plugin.json` |
 
 Each file is byte for byte what the plugins repository holds, and the manifest names every other
 file by digest, so the package check refuses a copy that differs. Where a checkout of the plugins

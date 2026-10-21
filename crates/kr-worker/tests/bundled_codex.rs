@@ -12,7 +12,7 @@
 //! | KR-REQ-11.30 | the released table compiles for the executable its build record names, and classifies every method of the pinned schema |
 //! | KR-REQ-11.33 | the released table answers the two approvals Codex asks as responses, offers the four decisions the package's action labels, and trusts a binding that holds the two approval grants |
 //! | KR-REQ-12.06 | the released table says where the thread, the turn and the cleared request are named |
-//! | KR-REQ-12.12 | the released table's rich table lists prompt, steer and cancel and no queue, each with a template the package check accepted |
+//! | KR-REQ-12.12 | the released table's rich table lists prompt, steer and cancel and no queue, each a mutation needing the right of its own and with a template the package check accepted |
 //!
 //! Not claimed: Windows, where no gateway runs.
 
@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::validate::validate_package_directory;
 use kr_protocol::gateway::RichOperation;
+use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Digest256;
 use kr_worker::broker::connectors::{
     ConnectorSource, InstalledConnector, QualifiedExecutable, fixture,
@@ -81,7 +82,7 @@ fn the_copy_is_the_package_the_plugins_repository_publishes() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     assert_eq!(
-        hash, "a37d8d7eaf63f8502ae2da2e57a39784a01a159426060aca53a48647d30b928f",
+        hash, "5e252bd9f93856fd03c5ff4d3a2a4359dd1f4a1d663ab9d0b18479441dc0cd4b",
         "the package hash an owner confirms at installation"
     );
     let checked = validate_package_directory(&package_dir());
@@ -104,7 +105,9 @@ fn the_copy_is_the_package_the_plugins_repository_publishes() {
         if !repository.join("plugin.json").is_file() {
             continue;
         }
-        // The checkout may be at another release; only a checkout of this one is compared.
+        // The checkout may be at another release; only a checkout of this one is compared. The
+        // manifest names every other file by digest, so a difference here means a checkout whose
+        // files do not match its own manifest.
         let same_release = std::fs::read(repository.join("plugin.json"))
             .is_ok_and(|bytes| bytes == std::fs::read(package_dir().join("plugin.json")).unwrap());
         if !same_release {
@@ -222,6 +225,22 @@ fn the_released_table_compiles_to_what_the_package_declares() {
         .filter_map(|entry| entry.operation.as_ref().copied())
         .collect();
     assert_eq!(operations.len(), 3, "{operations:?}");
+    // Each is a mutation, and needs the right of its own: a prompt or a steer the right to
+    // prompt, a cancellation the right to cancel.
+    for entry in &tables.rich.entries {
+        assert_eq!(
+            entry.class,
+            kr_protocol::gateway::NativeMethodClass::Mutation
+        );
+        let wanted = match entry.operation.as_ref().copied() {
+            Some(RichOperation::PromptSubmit | RichOperation::TurnSteer) => {
+                ActionRight::AgentPrompt
+            }
+            Some(RichOperation::TurnCancel) => ActionRight::AgentCancel,
+            other => panic!("the table declares {other:?}"),
+        };
+        assert_eq!(entry.required_right, wanted, "{}", entry.method);
+    }
     for wanted in [
         RichOperation::PromptSubmit,
         RichOperation::TurnSteer,
