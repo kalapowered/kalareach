@@ -47,6 +47,8 @@ kr-ipc.workspace = true
 # The owner-confirmation proof and the grants an invitation proposes.
 kr-pairing.workspace = true
 kr-protocol.workspace = true
+# One signer and one verifier of a release's manifest, which the tool that builds a release uses too.
+kr-release.workspace = true
 kr-shell-integration.workspace = true
 kr-term.workspace = true
 # The sign-in address, opened in the default browser.
@@ -66,9 +68,9 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util.workspace = true
 # A release is checked against the update channel's root: a threshold of the keys that root names
-# for its targets role signs each release's manifest. The root's format and its signature check
-# are The Update Framework's, the same code the plugin catalogue verifies with; the role types it
-# checks carry an expiry, which is why its time type is here too.
+# for its targets role signs each release's manifest. The root's format is The Update Framework's,
+# the same code the plugin catalogue verifies with, and the check itself is the release signer's.
+# A time is shown in a person's own zone.
 jiff.workspace = true
 tough.workspace = true
 # The recovery kit is read into a buffer that clears itself, and never through a copy that does not.
