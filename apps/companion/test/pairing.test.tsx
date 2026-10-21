@@ -320,7 +320,7 @@ describe('pairing with a host', () => {
 
   it('shows a pasted invitation as a summary, and pairs or cancels it', async () => {
     const { controls } = start()
-    controls.setPasteboard({
+    controls.setIntake('pasteboard', {
       invitation: {
         mode: 'direct',
         origin_host: null,
@@ -332,7 +332,8 @@ describe('pairing with a host', () => {
       },
       failure: null,
       cleared: true,
-      declined: false
+      declined: false,
+      cancelled: false
     })
     await userEvent.click(await screen.findByTestId('paste-invitation'))
     expect((await screen.findByTestId('invitation-summary')).textContent).toMatch(
@@ -351,6 +352,124 @@ describe('pairing with a host', () => {
     expect((await screen.findByTestId('paste-failure')).textContent).toBe(
       'The clipboard holds no invitation. Copy the invitation text from the host, then paste again.'
     )
+  })
+
+  // KR-REQ-10.38: a phone offers the scanner and the picker beside the pasteboard, and a desktop
+  // offers neither.
+  it('offers the scanner and the picker only where the device reads a code', async () => {
+    const { controls } = start()
+    await screen.findByLabelText('Pairing code')
+    expect(screen.queryByTestId('scan-code')).toBeNull()
+    expect(screen.queryByTestId('choose-photo')).toBeNull()
+    act(() => {
+      controls.setPairing({ sources: { camera: false, photo: true } })
+    })
+    expect(await screen.findByTestId('choose-photo')).toHaveTextContent('Choose a photo')
+    expect(screen.queryByTestId('scan-code')).toBeNull()
+    act(() => {
+      controls.setPairing({ sources: { camera: true, photo: true } })
+    })
+    expect(await screen.findByTestId('scan-code')).toHaveTextContent('Scan code')
+    expect(screen.getByText(/Scan the QR code your host shows/)).toBeInTheDocument()
+  })
+
+  it('takes an invitation in from the camera and from a picture, and names none of what it holds', async () => {
+    const { controls } = start()
+    act(() => {
+      controls.setPairing({ sources: { camera: true, photo: true } })
+    })
+    controls.setIntake('camera', {
+      invitation: {
+        mode: 'direct',
+        origin_host: null,
+        names_another_origin: false,
+        rights: ['session.view'],
+        authority: 'view sessions',
+        grant_expires_at_ms: null,
+        expires_at_ms: IN_FIVE_MINUTES
+      },
+      failure: null,
+      cleared: false,
+      declined: false,
+      cancelled: false
+    })
+    await userEvent.click(await screen.findByTestId('scan-code'))
+    expect((await screen.findByTestId('invitation-summary')).textContent).toMatch(
+      /^Invitation from a host on this network\./
+    )
+    // Nothing is said of a clipboard the scanner did not touch.
+    expect(screen.queryByText(/cleared from it/)).toBeNull()
+    await userEvent.keyboard('{Escape}')
+    await userEvent.click(await screen.findByTestId('choose-photo'))
+    await waitFor(() => {
+      expect(controls.intakes).toEqual(['camera', 'photo'])
+    })
+  })
+
+  it('says nothing when the person closes the scanner, and tells a denied camera from a picture with no code', async () => {
+    const { controls } = start()
+    act(() => {
+      controls.setPairing({ sources: { camera: true, photo: true } })
+    })
+    await userEvent.click(await screen.findByTestId('scan-code'))
+    await waitFor(() => {
+      expect(controls.intakes).toEqual(['camera'])
+    })
+    expect(screen.queryByTestId('paste-failure')).toBeNull()
+
+    controls.setIntake('camera', {
+      invitation: null,
+      failure: 'camera_denied',
+      cleared: false,
+      declined: false,
+      cancelled: false
+    })
+    await userEvent.click(screen.getByTestId('scan-code'))
+    expect((await screen.findByTestId('paste-failure')).textContent).toBe(
+      'KalaReach cannot use the camera. Allow it in Settings, or type the code.'
+    )
+    await userEvent.click(screen.getByTestId('open-settings'))
+    await waitFor(() => {
+      expect(controls.settingsOpened.count).toBe(1)
+    })
+
+    controls.setIntake('photo', {
+      invitation: null,
+      failure: 'no_code_found',
+      cleared: false,
+      declined: false,
+      cancelled: false
+    })
+    await userEvent.click(screen.getByTestId('choose-photo'))
+    await waitFor(() => {
+      expect(screen.getByTestId('paste-failure').textContent).toBe(
+        'No KalaReach invitation was found in that picture. Choose another picture, or scan the code.'
+      )
+    })
+    expect(screen.queryByTestId('open-settings')).toBeNull()
+  })
+
+  // KR-REQ-10.38: where a direct invitation is taken in with the scanner, trying it again is
+  // scanning it again, never pasting.
+  it('scans again after a direct invitation did not work, where the device has a scanner', async () => {
+    const { controls } = start()
+    act(() => {
+      controls.setPairing({ sources: { camera: true, photo: false } })
+    })
+    attempt(controls, {
+      state: 'ended',
+      failure: { kind: 'not_authenticated', tries_left: null },
+      mode: 'direct',
+      service: null
+    })
+    expect(await screen.findByTestId('failure-sentence')).toHaveTextContent(
+      'The invitation did not work. Ask the host for a new one.'
+    )
+    expect(screen.getByTestId('failure-action')).toHaveTextContent('Scan again')
+    await userEvent.click(screen.getByTestId('failure-action'))
+    await waitFor(() => {
+      expect(controls.intakes).toEqual(['camera'])
+    })
   })
 
   it('lists the paired hosts under the entry, and draws no list when there are none', async () => {

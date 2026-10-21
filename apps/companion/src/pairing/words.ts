@@ -6,7 +6,7 @@
  * code, the service or the host may be wrong, and saying which would be a guess.
  */
 
-import type { FailureKind, PairingFailure } from '../host/port'
+import type { FailureKind, PairingFailure, PairingSources } from '../host/port'
 
 /** What the person can do next, after an attempt ends. */
 export type NextAction =
@@ -15,12 +15,33 @@ export type NextAction =
   | 'try_again'
   | 'change_service'
   | 'start_again'
-  | 'paste_again'
+  | 'new_invitation'
+  | 'open_settings'
   | 'done'
 
 /** How an attempt was made. */
 export type AttemptMode = 'code' | 'direct'
 
+/** Where a person brings an invitation in from on this device, best first. */
+export type Reading = 'camera' | 'photo' | 'pasteboard'
+
+/** Where this device brings an invitation in from: the scanner when it has one, else the picker. */
+export function readingFrom(sources: PairingSources | undefined): Reading {
+  if (sources?.camera === true) return 'camera'
+  return sources?.photo === true ? 'photo' : 'pasteboard'
+}
+
+/** What a person does to bring the same invitation in again, as a clause that starts a sentence. */
+function bringItInAgain(reading: Reading): string {
+  switch (reading) {
+    case 'camera':
+      return 'Scan the invitation again'
+    case 'photo':
+      return 'Choose the picture again'
+    case 'pasteboard':
+      return 'Copy the invitation from the host again'
+  }
+}
 /**
  * The words and the next action for one failure kind of an attempt made in `mode`. `service` is
  * the host name of the service a code attempt went through.
@@ -28,33 +49,34 @@ export type AttemptMode = 'code' | 'direct'
 export function failureWords(
   kind: FailureKind,
   service: string,
-  mode: AttemptMode = 'code'
+  mode: AttemptMode = 'code',
+  reading: Reading = 'pasteboard'
 ): { readonly sentence: string; readonly action: NextAction } {
-  const words = codeWords(kind, service)
+  const words = codeWords(kind, service, reading)
   if (mode === 'code') return words
   // A direct invitation reaches no service and holds no code, and native code lets it go once the
-  // attempt ends: it is tried again only by copying it from the host and pasting it again.
+  // attempt ends: it is tried again only by bringing it in again.
   switch (kind) {
     case 'not_authenticated':
       return {
         sentence: 'The invitation did not work. Ask the host for a new one.',
-        action: 'paste_again'
+        action: 'new_invitation'
       }
     case 'did_not_finish':
       return {
-        sentence:
-          'Pairing did not finish. Copy the invitation from the host again, or ask it for a new one.',
-        action: 'paste_again'
+        sentence: `Pairing did not finish. ${bringItInAgain(reading)}, or ask it for a new one.`,
+        action: 'new_invitation'
       }
     default:
-      return words.action === 'done' ? words : { sentence: words.sentence, action: 'paste_again' }
+      return words.action === 'done' ? words : { sentence: words.sentence, action: 'new_invitation' }
   }
 }
 
 /** The words and the next action for one failure kind of a code attempt through `service`. */
 function codeWords(
   kind: FailureKind,
-  service: string
+  service: string,
+  reading: Reading
 ): { readonly sentence: string; readonly action: NextAction } {
   switch (kind) {
     case 'malformed':
@@ -138,14 +160,26 @@ function codeWords(
     case 'already_paired':
       return { sentence: 'This device is already paired with this host.', action: 'done' }
     case 'not_an_invitation':
-      return { sentence: 'That is not a KalaReach invitation.', action: 'paste_again' }
+      return { sentence: 'That is not a KalaReach invitation.', action: 'new_invitation' }
     case 'newer_invitation':
       return { sentence: 'This invitation needs a newer version of KalaReach.', action: 'done' }
     case 'nothing_to_paste':
       return {
         sentence:
           'The clipboard holds no invitation. Copy the invitation text from the host, then paste again.',
-        action: 'paste_again'
+        action: 'new_invitation'
+      }
+    case 'camera_denied':
+      return {
+        sentence: 'KalaReach cannot use the camera. Allow it in Settings, or type the code.',
+        action: 'open_settings'
+      }
+    case 'no_code_found':
+      return {
+        sentence: `No KalaReach invitation was found in that picture. ${
+          reading === 'photo' ? 'Choose another picture' : 'Choose another picture, or scan the code'
+        }.`,
+        action: 'new_invitation'
       }
     case 'store_failed':
       return {
@@ -173,9 +207,10 @@ function codeWords(
 export function failureSentence(
   failure: PairingFailure,
   service: string,
-  mode: AttemptMode = 'code'
+  mode: AttemptMode = 'code',
+  reading: Reading = 'pasteboard'
 ): string {
-  const { sentence } = failureWords(failure.kind, service, mode)
+  const { sentence } = failureWords(failure.kind, service, mode, reading)
   if (failure.tries_left === null) return sentence
   const tries = failure.tries_left === 1 ? '1 try' : `${failure.tries_left} tries`
   return `${sentence} ${tries} left on this device.`
@@ -191,7 +226,7 @@ export function triesTheCodeAgain(action: NextAction): boolean {
 }
 
 /** The label of the button that does a failure's next action. */
-export function actionLabel(action: NextAction): string {
+export function actionLabel(action: NextAction, reading: Reading = 'pasteboard'): string {
   switch (action) {
     case 'fix_code':
     case 'try_again':
@@ -202,8 +237,14 @@ export function actionLabel(action: NextAction): string {
       return 'Change service'
     case 'start_again':
       return 'Start again'
-    case 'paste_again':
-      return 'Paste again'
+    case 'new_invitation':
+      return reading === 'camera'
+        ? 'Scan again'
+        : reading === 'photo'
+          ? 'Choose another photo'
+          : 'Paste again'
+    case 'open_settings':
+      return 'Open Settings'
     case 'done':
       return 'Done'
   }
