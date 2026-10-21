@@ -1311,15 +1311,22 @@ impl CommandBackends {
     fn refuse_a_runtime_directory_with_no_room_for_a_socket(
         &self,
     ) -> std::result::Result<(), String> {
-        use crate::broker::listener::LAUNCH_SOCKET_NAME_BYTES;
-
-        // The separator before the session's root, its name, the separator before the backend's
-        // directory and its name, and then the longer socket's file name with its own separator.
-        let below_the_runtime_directory =
-            1 + SESSION_ROOT_PREFIX.len() + NAME_DIGITS + 1 + NAME_DIGITS;
-        let longest_socket = LAUNCH_SOCKET_NAME_BYTES.max(1 + GATEWAY_SOCKET.len());
+        // Built with the joins that make the real paths, so a runtime directory that ends in a
+        // separator is measured as the bind will see it.
+        let digits = "0".repeat(NAME_DIGITS);
+        let backend_directory = self
+            .runtime_dir
+            .join(format!("{SESSION_ROOT_PREFIX}{digits}"))
+            .join(&digits);
+        let longest = [
+            crate::broker::listener::longest_launch_socket_name(),
+            GATEWAY_SOCKET.to_owned(),
+        ]
+        .iter()
+        .map(|name| backend_directory.join(name).as_os_str().len())
+        .max()
+        .unwrap_or_default();
         let runtime = self.runtime_dir.as_os_str().len();
-        let longest = runtime + below_the_runtime_directory + longest_socket;
         let limit = kr_ipc::paths::MAX_SOCKET_PATH_LEN;
         if longest > limit {
             return Err(format!(

@@ -422,9 +422,9 @@ async fn kr_req_12_07_a_backend_is_established_under_a_macs_default_runtime_dire
 #[cfg(unix)]
 #[tokio::test]
 async fn kr_req_12_07_a_runtime_directory_too_long_for_a_backends_socket_establishes_nothing() {
-    let establish = |runtime: &Removed| {
+    let establish = |runtime: &std::path::Path| {
         let setup = Setup::with(|config| CommandBackendsConfig {
-            runtime_dir: runtime.0.clone(),
+            runtime_dir: runtime.to_path_buf(),
             ..config
         });
         let answer = setup.backends.establish(&request(
@@ -448,7 +448,7 @@ async fn kr_req_12_07_a_runtime_directory_too_long_for_a_backends_socket_establi
     };
 
     let probe = as_long_as_a_macs_default_runtime_directory();
-    let (_probed, answer) = establish(&probe);
+    let (_probed, answer) = establish(&probe.0);
     let added =
         endpoint_of(&answer.expect("a backend is established")).len() - probe.0.as_os_str().len();
     let room = kr_ipc::paths::MAX_SOCKET_PATH_LEN - added;
@@ -459,7 +459,7 @@ async fn kr_req_12_07_a_runtime_directory_too_long_for_a_backends_socket_establi
         room,
         "a directory of the length the room allows"
     );
-    let (_fitted, answer) = establish(&fits);
+    let (_fitted, answer) = establish(&fits.0);
     let endpoint =
         endpoint_of(&answer.expect("a runtime directory with just the room establishes"));
     assert_eq!(
@@ -469,8 +469,13 @@ async fn kr_req_12_07_a_runtime_directory_too_long_for_a_backends_socket_establi
     );
     assert!(endpoint_exists(&endpoint), "bound: {endpoint}");
 
+    // The same directory named with a separator at its end is the same place, and the same room.
+    let with_a_separator = PathBuf::from(format!("{}/", fits.0.display()));
+    let (_separated, answer) = establish(&with_a_separator);
+    answer.expect("a separator at the end of the runtime directory takes no room");
+
     let too_long = a_private_directory_of(room + 1);
-    let (setup, answer) = establish(&too_long);
+    let (setup, answer) = establish(&too_long.0);
     let refusal = answer.expect_err("a runtime directory one byte too long for the socket");
     assert!(
         refusal.contains(&too_long.0.display().to_string()),

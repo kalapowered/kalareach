@@ -55,9 +55,23 @@ pub const PIPE_PREFIX: &str = r"\\.\pipe\";
 /// The digits of a fresh identifier in the file name of a launch's private socket.
 const LAUNCH_SOCKET_DIGITS: usize = 12;
 
-/// How long the file name of a launch's private socket is, with the separator before it: `a-`, the
-/// digits and `.sock`.
-pub const LAUNCH_SOCKET_NAME_BYTES: usize = 1 + "a-".len() + LAUNCH_SOCKET_DIGITS + ".sock".len();
+/// The file name of a launch's private socket, for a fresh identifier's hexadecimal digits: `a-`,
+/// the first [`LAUNCH_SOCKET_DIGITS`] of them and `.sock`.
+///
+/// # Panics
+///
+/// Panics when there are fewer digits than the name takes.
+#[must_use]
+pub fn launch_socket_name(digits: &str) -> String {
+    format!("a-{}.sock", &digits[..LAUNCH_SOCKET_DIGITS])
+}
+
+/// The longest file name a launch's private socket has, which is every one of them: the digits
+/// make up a fixed length.
+#[must_use]
+pub fn longest_launch_socket_name() -> String {
+    launch_socket_name(&"0".repeat(LAUNCH_SOCKET_DIGITS))
+}
 
 /// Where the launched agent connects.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,9 +154,7 @@ impl ListenerAddress {
             // and a runtime directory a person chose can already be most of it, so the part this
             // host adds stays out of the way: enough of a fresh identifier not to collide, and no
             // more.
-            Self::PrivateSocket(
-                runtime_directory.join(format!("a-{}.sock", &fresh[..LAUNCH_SOCKET_DIGITS])),
-            )
+            Self::PrivateSocket(runtime_directory.join(launch_socket_name(&fresh)))
         } else {
             Self::NamedPipe(format!("kr-a-{fresh}"))
         };
