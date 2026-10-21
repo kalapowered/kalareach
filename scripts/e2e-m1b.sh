@@ -35,9 +35,17 @@
 #
 # Usage: scripts/e2e-m1b.sh https://example.invalid
 #        KR_M1B_ORIGIN=https://example.invalid scripts/e2e-m1b.sh
+#        KR_M1B_LEGS=pairing scripts/e2e-m1b.sh https://example.invalid
 #
-# It exits 0 when every leg passed, 1 when any leg failed or did not run, and 2 when it was given no
-# usable origin.
+# KR_M1B_LEGS names the legs to run, by the words above, separated by commas or spaces. It is for a
+# machine that cannot run them all: the terminal, catalogue and plugin legs need managed shell
+# packages and a published catalogue release, which the landing workflow's job does not build, so it
+# runs the pairing leg alone. Every leg is still checked against the tests of its group first, a leg
+# the selection leaves out is reported as omitted, and a selection that names no leg or an
+# unknown one is refused before anything is built or sent. The plugin leg runs in no landing step.
+#
+# It exits 0 when every selected leg passed, 1 when any of them failed or did not run, and 2 when it
+# was given no usable origin or an unusable selection.
 set -euo pipefail
 
 # This compares an address byte by byte and reads what the legs print. Both are ASCII, and a
@@ -59,6 +67,30 @@ legs=(
   "catalogue:the_host_installs_the_published_catalogue_release_byte_for_byte_the_bundled_copy"
   "plugin:the_installed_package_is_bound_into_the_session_and_acts_through_its_broker"
 )
+
+# The legs this run executes: all of them, unless the selection names some. A selection is checked
+# before anything else, so a mistyped word costs no build and no request.
+selected=()
+if [ "${KR_M1B_LEGS+set}" = set ]; then
+  chosen="${KR_M1B_LEGS//,/ }"
+  if [ -z "${chosen// /}" ]; then
+    echo "KR_M1B_LEGS names no leg" >&2
+    exit 2
+  fi
+  for want in $chosen; do
+    known=0
+    for leg in "${legs[@]}"; do
+      [ "${leg%%:*}" = "$want" ] && known=1
+    done
+    if [ "$known" = 0 ]; then
+      echo "$want is not a leg of this checkpoint" >&2
+      exit 2
+    fi
+    selected+=("$want")
+  done
+else
+  for leg in "${legs[@]}"; do selected+=("${leg%%:*}"); done
+fi
 
 origin="${1:-${KR_M1B_ORIGIN:-}}"
 if [ -z "$origin" ]; then
@@ -159,6 +191,7 @@ done <<<"$names"
 passed=0
 failed=0
 missed=0
+skipped=0
 unfinished=()
 left=()
 
@@ -227,12 +260,18 @@ run_leg() {
 }
 
 for leg in "${legs[@]}"; do
-  run_leg "${leg%%:*}" "${leg#*:}"
+  case " ${selected[*]} " in
+    *" ${leg%%:*} "*) run_leg "${leg%%:*}" "${leg#*:}" ;;
+    *)
+      skipped=$((skipped + 1))
+      printf '  %-7s %-10s %s\n' omitted "${leg%%:*}" "KR_M1B_LEGS leaves it out"
+      ;;
+  esac
 done
 
 echo
 total=$((passed + failed + missed))
-echo "$total legs against $origin: $passed passed, $failed failed, $missed did not run"
+echo "$total legs against $origin: $passed passed, $failed failed, $missed did not run, $skipped omitted"
 echo
 echo "what the run left on the deployment:"
 printf '  %s\n' "${left[@]}"
