@@ -573,14 +573,16 @@ impl Controller {
     }
 }
 
-/// Says, in this daemon's log, that a worker recovery reached runs at a compatibility level this
-/// daemon's release does not retain, by that level.
+/// Says, in this daemon's log, that a worker recovery reached is not adopted, and why: it runs at a
+/// compatibility level this daemon's release does not retain, or what it answered does not agree
+/// with its level.
 ///
 /// Such a worker is alive and is left so: it is not adopted, since this daemon could not read or
 /// write its frames, and it is not closed, since nothing about it has ended. Its session runs on,
 /// unreached by this daemon, until it closes or a daemon of a release that retains its level
-/// serves the environment again. An update of this host waits for such a worker rather than make
-/// one, so this is met only by a daemon started outside an update.
+/// serves the environment again. An update of this host waits for a worker at a level the target
+/// does not retain rather than make one, so that case is met only by a daemon started outside an
+/// update.
 fn report_unretained(
     display_number: kr_protocol::session::DisplayNumber,
     refused: &ControllerError,

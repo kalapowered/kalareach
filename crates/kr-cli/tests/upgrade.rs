@@ -2670,10 +2670,11 @@ async fn a_daemon_of_a_later_public_major_keeps_the_session_of_the_release_befor
 }
 
 /// KR-REQ-26.07, KR-REQ-26.10: a rollback goes back across a public major beside a live worker of
-/// the release before. The host's daemon states major 2 and has adopted the session's worker, which
-/// speaks major 1; release two's `kr`, which states major 2, looks at that worker with the offer of a
-/// build that retains its level, finds its level held by the release it goes back to, and goes
-/// ahead: the daemon is the release before's again, and the worker is the process it was.
+/// the release before. The host's daemon states major 2 beside the session's worker, which speaks
+/// major 1 (the case before shows the daemon adopting it); release two's `kr`, which states major 2,
+/// looks at that worker with the offer of a build that retains its level, finds its level held by
+/// the release it goes back to, and goes ahead: the daemon is the release before's again, and the
+/// worker is the process it was.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_from_a_daemon_of_a_later_public_major_goes_on_beside_the_session_of_the_release_before()
  {
@@ -2709,11 +2710,7 @@ async fn a_rollback_from_a_daemon_of_a_later_public_major_goes_on_beside_the_ses
         format!("kr-controller/{}", updated.one.name()),
         "the daemon is the release before's again"
     );
-    assert_eq!(
-        host.daemon_states().await,
-        1,
-        "and it states major 1, though the rollback ran with major 2 set"
-    );
+    assert_eq!(host.daemon_states().await, 1, "and it states major 1 again");
     updated.the_worker_is_as_it_was().await;
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
