@@ -154,6 +154,9 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("pairing_view", None),
     ("pairing_start_code", None),
     ("pairing_paste", None),
+    ("pairing_scan", None),
+    ("pairing_scan_photo", None),
+    ("pairing_open_settings", None),
     ("pairing_start_read", None),
     ("pairing_stop", None),
     // The owner's confirmations of this computer's hosts.
@@ -561,6 +564,9 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         pairing_view,
         pairing_start_code,
         pairing_paste,
+        pairing_scan,
+        pairing_scan_photo,
+        pairing_open_settings,
         pairing_start_read,
         pairing_stop,
         owner_confirmations,
@@ -2316,10 +2322,40 @@ pub fn pairing_start_code(state: State<'_, AppState>, code: String) -> Result<()
 /// Reads an invitation from the pasteboard in native code, and holds it for the person to use.
 /// The page is told what it is, never what it says.
 #[tauri::command]
-pub async fn pairing_paste(state: State<'_, AppState>) -> Result<crate::device::PasteView> {
+pub async fn pairing_paste(state: State<'_, AppState>) -> Result<crate::device::IntakeView> {
+    take_in(&state, pairing::Source::Pasteboard).await
+}
+
+/// Shows the phone's scanner, reads an invitation from the code it sees in native code, and holds it
+/// for the person to use. The page is told what it is, never what it says.
+#[tauri::command]
+pub async fn pairing_scan(state: State<'_, AppState>) -> Result<crate::device::IntakeView> {
+    take_in(&state, pairing::Source::Camera).await
+}
+
+/// Shows the system's picker, reads an invitation from the code in the picture the person chose in
+/// native code, and holds it for the person to use. The page is told what it is, never what it says.
+#[tauri::command]
+pub async fn pairing_scan_photo(state: State<'_, AppState>) -> Result<crate::device::IntakeView> {
+    take_in(&state, pairing::Source::Photo).await
+}
+
+/// Opens this application's page in the system's settings, where the camera is allowed. It opens
+/// nothing else.
+#[tauri::command]
+pub async fn pairing_open_settings<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<()> {
+    companion_platform::scan::open_settings(&app)
+        .await
+        .map_err(|error| CommandError::local_failure(error.to_string()))
+}
+
+async fn take_in(
+    state: &State<'_, AppState>,
+    source: pairing::Source,
+) -> Result<crate::device::IntakeView> {
     let device = state.device()?;
-    let platform = state.paste()?;
-    Ok(pairing::paste(&*platform, &device).await)
+    let platform = state.intake()?;
+    Ok(pairing::take_in(&*platform, &device, source).await)
 }
 
 /// Starts pairing with the invitation read from the pasteboard.
@@ -3393,6 +3429,9 @@ mod tests {
         "pairing_view",
         "pairing_start_code",
         "pairing_paste",
+        "pairing_scan",
+        "pairing_scan_photo",
+        "pairing_open_settings",
         "pairing_start_read",
         "pairing_stop",
         "owner_confirmations",
@@ -3534,6 +3573,9 @@ mod tests {
                 "pairing_view",
                 "pairing_start_code",
                 "pairing_paste",
+                "pairing_scan",
+                "pairing_scan_photo",
+                "pairing_open_settings",
                 "pairing_start_read",
                 "pairing_stop",
                 "owner_confirmations",

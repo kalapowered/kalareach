@@ -13,8 +13,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use companion_platform::PlatformError;
+use companion_platform::scan::{Scan, Sources};
 use companion_tauri::device::{Device, Parts};
 use companion_tauri::owner::{Owner, RequestView};
+use companion_tauri::pairing::Source;
 use kr_client::pairing::candidate::{AttemptState, CandidateRoom};
 use kr_client::pairing::clock::DeviceClock;
 use kr_client::pairing::paired::PairedHost;
@@ -343,17 +346,26 @@ pub async fn listed(owner: &Owner, matching: impl Fn(&RequestView) -> bool) -> R
     .expect("the owner device lists the request")
 }
 
-/// A pasteboard and an alert a test controls: the text the pasteboard holds, and the answer the
-/// person gives when an invitation names another service. It counts what it was asked.
+/// A pasteboard, a scanner and an alert a test controls: the text the pasteboard holds, the codes
+/// the scanner and the picker will read, and the answer the person gives when an invitation names
+/// another service. It counts what it was asked.
 #[derive(Debug, Default)]
-pub struct StubPaste {
+pub struct StubIntake {
     text: Mutex<Option<String>>,
     accepts: std::sync::atomic::AtomicBool,
+    /// What the scanner and the picker answer next, one for each time they are asked.
+    scans: Mutex<std::collections::VecDeque<std::result::Result<Scan, PlatformError>>>,
+    /// Which sources the device offers besides the pasteboard.
+    offered: Mutex<Sources>,
+    /// An alert held until the test answers it, instead of answered at once.
+    held_alert: Mutex<Option<tokio::sync::oneshot::Receiver<bool>>>,
     /// The services the person was asked about, each with the one this computer is set to use.
     pub asked: Mutex<Vec<(String, String)>>,
+    /// Each source a code was read from.
+    pub read_from: Mutex<Vec<Source>>,
 }
 
-impl StubPaste {
+impl StubIntake {
     /// A pasteboard holding `text`, whose person answers `accepts` when asked.
     pub fn holding(text: &str, accepts: bool) -> Arc<Self> {
         let stub = Self::default();
@@ -374,9 +386,42 @@ impl StubPaste {
         self.accepts
             .store(accepts, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// Offers the camera and the picker, as a phone does.
+    pub fn offering(&self, sources: Sources) {
+        *self.offered.lock().expect("the sources") = sources;
+    }
+
+    /// The scanner or the picker will read `text` the next time it is asked.
+    pub fn will_read(&self, text: &str) {
+        self.scans
+            .lock()
+            .expect("the scans")
+            .push_back(Ok(Scan::Text(zeroize::Zeroizing::new(text.to_owned()))));
+    }
+
+    /// The scanner or the picker will answer `scan` the next time it is asked.
+    pub fn will_answer(&self, scan: Scan) {
+        self.scans.lock().expect("the scans").push_back(Ok(scan));
+    }
+
+    /// The scanner or the picker will fail the next time it is asked.
+    pub fn will_fail(&self) {
+        self.scans
+            .lock()
+            .expect("the scans")
+            .push_back(Err(PlatformError("the scanner could not start".to_owned())));
+    }
+
+    /// The next alert waits until the returned sender answers it.
+    pub fn hold_the_alert(&self) -> tokio::sync::oneshot::Sender<bool> {
+        let (answer, held) = tokio::sync::oneshot::channel();
+        *self.held_alert.lock().expect("the alert") = Some(held);
+        answer
+    }
 }
 
-impl companion_tauri::pairing::PastePlatform for StubPaste {
+impl companion_tauri::pairing::IntakePlatform for StubIntake {
     fn text(&self) -> Option<String> {
         self.held()
     }
@@ -384,6 +429,25 @@ impl companion_tauri::pairing::PastePlatform for StubPaste {
     fn clear(&self) -> bool {
         *self.text.lock().expect("the pasteboard") = None;
         true
+    }
+
+    fn sources(&self) -> kr_client::pairing::BoxFuture<'_, Sources> {
+        let offered = *self.offered.lock().expect("the sources");
+        Box::pin(async move { offered })
+    }
+
+    fn read_code(
+        &self,
+        source: Source,
+    ) -> kr_client::pairing::BoxFuture<'_, std::result::Result<Scan, PlatformError>> {
+        self.read_from.lock().expect("the record").push(source);
+        let answer = self
+            .scans
+            .lock()
+            .expect("the scans")
+            .pop_front()
+            .unwrap_or(Ok(Scan::Cancelled));
+        Box::pin(async move { answer })
     }
 
     fn use_another_service<'a>(
@@ -396,7 +460,13 @@ impl companion_tauri::pairing::PastePlatform for StubPaste {
             .expect("the record")
             .push((named.as_str().to_owned(), configured.to_owned()));
         let accepts = self.accepts.load(std::sync::atomic::Ordering::SeqCst);
-        Box::pin(async move { accepts })
+        let held = self.held_alert.lock().expect("the alert").take();
+        Box::pin(async move {
+            match held {
+                Some(held) => held.await.unwrap_or(false),
+                None => accepts,
+            }
+        })
     }
 }
 
@@ -429,7 +499,7 @@ impl Companion {
         data: &std::path::Path,
         parts: Parts,
         ceremony: Arc<dyn kr_client::pairing::owner::Ceremony>,
-        paste: Arc<dyn companion_tauri::pairing::PastePlatform>,
+        paste: Arc<dyn companion_tauri::pairing::IntakePlatform>,
     ) -> Self {
         Self::start_with_voice(
             data,
@@ -449,7 +519,7 @@ impl Companion {
         data: &std::path::Path,
         parts: Parts,
         ceremony: Arc<dyn kr_client::pairing::owner::Ceremony>,
-        paste: Arc<dyn companion_tauri::pairing::PastePlatform>,
+        paste: Arc<dyn companion_tauri::pairing::IntakePlatform>,
         calls: companion_tauri::voice::Calls,
         account: companion_tauri::account::AccountSlot,
     ) -> Self {
@@ -486,6 +556,9 @@ impl Companion {
                 companion_tauri::commands::pairing_view,
                 companion_tauri::commands::pairing_start_code,
                 companion_tauri::commands::pairing_paste,
+                companion_tauri::commands::pairing_scan,
+                companion_tauri::commands::pairing_scan_photo,
+                companion_tauri::commands::pairing_open_settings,
                 companion_tauri::commands::pairing_start_read,
                 companion_tauri::commands::pairing_stop,
                 companion_tauri::commands::owner_confirmations,
@@ -770,7 +843,7 @@ impl Ceremony for NoOwner {
 /// secret store its keys live in and the directory its records live in.
 pub struct Phone {
     pub companion: Companion,
-    pub paste: Arc<StubPaste>,
+    pub paste: Arc<StubIntake>,
     pub secrets: Arc<dyn SecretStore>,
     pub room: Arc<dyn CandidateRoom>,
     pub data: tempfile::TempDir,
@@ -781,12 +854,12 @@ pub fn unpaired_phone(host: &Host) -> Phone {
     let data = tempfile::tempdir().expect("a directory");
     let secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
     let room: Arc<dyn CandidateRoom> = Arc::new(host.room.clone());
-    let paste = StubPaste::holding("", false);
+    let paste = StubIntake::holding("", false);
     let companion = Companion::start(
         data.path(),
         parts(Arc::clone(&secrets), Arc::clone(&room)),
         Arc::new(NoOwner),
-        Arc::clone(&paste) as Arc<dyn companion_tauri::pairing::PastePlatform>,
+        Arc::clone(&paste) as Arc<dyn companion_tauri::pairing::IntakePlatform>,
     );
     Phone {
         companion,
@@ -1058,7 +1131,7 @@ pub fn unpaired_phone_controlled(host: &Host, control: &Arc<LinkControl>) -> Pho
     let data = tempfile::tempdir().expect("a directory");
     let secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
     let room: Arc<dyn CandidateRoom> = Arc::new(host.room.clone());
-    let paste = StubPaste::holding("", false);
+    let paste = StubIntake::holding("", false);
     let mut governed = parts(Arc::clone(&secrets), Arc::clone(&room));
     let control = Arc::clone(control);
     governed.link = Some(Box::new(move |own| {
@@ -1068,7 +1141,7 @@ pub fn unpaired_phone_controlled(host: &Host, control: &Arc<LinkControl>) -> Pho
         data.path(),
         governed,
         Arc::new(NoOwner),
-        Arc::clone(&paste) as Arc<dyn companion_tauri::pairing::PastePlatform>,
+        Arc::clone(&paste) as Arc<dyn companion_tauri::pairing::IntakePlatform>,
     );
     Phone {
         companion,
