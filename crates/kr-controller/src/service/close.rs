@@ -1247,7 +1247,7 @@ impl Controller {
         never_claimed: bool,
     ) -> tokio::task::JoinHandle<()> {
         let holds = Arc::clone(self.project().service().holds());
-        let journal = self.paths.journal_database(session_id);
+        let archive = self.archive();
         tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + CLOSURE_WATCH_TIMEOUT;
             while tokio::time::Instant::now() < deadline {
@@ -1256,7 +1256,7 @@ impl Controller {
                     kr_ipc::identity::ProcessState::Ended
                 ) {
                     let left_nothing = tokio::task::spawn_blocking(move || {
-                        worker_left_nothing(&journal, session_id, never_claimed)
+                        worker_left_nothing(&archive, session_id, never_claimed)
                     })
                     .await
                     .unwrap_or(false);
@@ -1275,18 +1275,23 @@ impl Controller {
 /// launch, so it started no session, or its journal holds a closure that lists no survivor. A
 /// worker that was claimed and kept no journal (it starts its shell even when it cannot open
 /// one), a journal with no closure in it, and one that cannot be looked for or read show nothing.
+///
+/// A journal an earlier release wrote is brought forward first, which the archive does only once
+/// the kernel has said that the worker which owned it ended.
 fn worker_left_nothing(
-    journal: &std::path::Path,
+    archive: &crate::archive::ArchiveService,
     session_id: SessionId,
     never_claimed: bool,
 ) -> bool {
     if never_claimed {
         return true;
     }
+    archive.bring_forward(session_id);
+    let journal = archive.paths().journal_database(session_id);
     if !journal.try_exists().unwrap_or(false) {
         return false;
     }
-    kr_worker::journal::Journal::open_read_only(journal)
+    kr_worker::journal::Journal::open_read_only(&journal)
         .ok()
         .and_then(|journal| journal.read_closure(session_id).ok().flatten())
         .is_some_and(|closure| closure.surviving.is_empty())

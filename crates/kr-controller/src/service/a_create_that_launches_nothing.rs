@@ -3232,12 +3232,14 @@ fn a_session_with_a_worker_running(
 }
 
 /// Writes the journal a worker kept for a session: with a closure that lists `surviving`, with a
-/// closure that lists nothing, or with no closure in it.
+/// closure that lists nothing, or with no closure in it. `earlier` puts it back to the shape an
+/// earlier release wrote, which the daemon brings forward before it reads it.
 #[cfg(unix)]
 fn a_workers_journal(
     temp: &kr_ipc::testing::TempHost,
     session_id: kr_protocol::ids::SessionId,
     closure: Option<Vec<kr_protocol::session::SurvivingResource>>,
+    earlier: bool,
 ) {
     let path = temp.environment().journal_database(session_id);
     std::fs::create_dir_all(path.parent().expect("a directory")).expect("the directory");
@@ -3246,6 +3248,19 @@ fn a_workers_journal(
         journal
             .record_closure(&a_workers_own_closure(session_id, surviving))
             .expect("the closure is recorded");
+    }
+    drop(journal);
+    if earlier {
+        rusqlite::Connection::open(&path)
+            .expect("opens the store")
+            .execute_batch(
+                "DROP TABLE privacy;
+                 DROP TABLE outbox;
+                 DROP TABLE outbox_cursors;
+                 DROP TABLE journal_gaps;
+                 UPDATE schema_version SET version = 3;",
+            )
+            .expect("puts it back to the earlier shape");
     }
 }
 
@@ -3270,7 +3285,12 @@ async fn still_counted_after_the_worker_ends(
     );
     drop(worker.stdin.take());
     worker.wait().expect("the worker ends");
-    watching.await.expect("the watch finishes");
+    // The watch looks every 200 ms and gives up after a minute; one that has not seen the worker
+    // end long before that is not looking.
+    tokio::time::timeout(Duration::from_secs(30), watching)
+        .await
+        .expect("the watch saw the worker end")
+        .expect("the watch finishes");
     holds.has_session(session_id)
 }
 
@@ -3298,24 +3318,32 @@ async fn the_registration_of_a_claimed_failed_create_follows_what_the_workers_jo
         kind: "process".to_owned(),
         detail: "a process the shell's startup files started".to_owned(),
     }];
-    for (journal, counted, what) in [
-        (None, true, "no journal"),
-        (Some(None), true, "a journal with no closure in it"),
+    for (journal, earlier, counted, what) in [
+        (None, false, true, "no journal"),
+        (Some(None), false, true, "a journal with no closure in it"),
         (
             Some(Some(survivor)),
+            false,
             true,
             "a closure that lists a survivor",
         ),
         (
             Some(Some(Vec::new())),
             false,
+            false,
             "a closure that lists nothing",
+        ),
+        (
+            Some(Some(Vec::new())),
+            true,
+            false,
+            "a closure that lists nothing in a journal an earlier release wrote",
         ),
     ] {
         let (temp, controller, _started) = daemon().await;
         let (session_id, worker, identity) = a_session_with_a_worker_running(&controller);
         if let Some(closure) = journal {
-            a_workers_journal(&temp, session_id, closure);
+            a_workers_journal(&temp, session_id, closure, earlier);
         }
         assert_eq!(
             still_counted_after_the_worker_ends(&controller, session_id, worker, identity, false)

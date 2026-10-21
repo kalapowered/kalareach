@@ -784,7 +784,19 @@ impl Controller {
                 // alive, so the session stops being a writer when the kernel says the worker's
                 // process has ended and its own journal shows it left nothing running, and not
                 // before.
-                self.end_session_when_ended(reservation.session_id, identity.clone(), false);
+                // A claim the host refused sent the worker no launch specification, so it started
+                // no session; one that was admitted recorded its key, and then the worker did.
+                let never_claimed = self
+                    .registry
+                    .lock()
+                    .await
+                    .reservation(reservation.reservation_id)?
+                    .is_some_and(|recorded| recorded.claimed_key.is_none());
+                self.end_session_when_ended(
+                    reservation.session_id,
+                    identity.clone(),
+                    never_claimed,
+                );
                 self.retire_job_when_ended(reservation.reservation_id, Some(identity));
                 // A refusal of the authority the create stood on is that, and not a launch that
                 // failed: the caller pauses on the one and fails on the other.
