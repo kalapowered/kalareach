@@ -166,12 +166,15 @@ def winget(release, url_prefix, archives):
     tail = f"ManifestVersion: {WINGET_MANIFEST_VERSION}\n"
     installers = []
     for architecture, archive in (("x64", intel), ("arm64", arm)):
+        url = quoted(url_prefix + "/" + archive.name)
+        # The release's directory, then its program, with the separators a Windows path has.
+        nested = quoted("kalareach-" + archive.target + "-" + release + "\\bin\\kr.exe")
         installers.append(
             f"""  - Architecture: {architecture}
-    InstallerUrl: {quoted(url_prefix + "/" + archive.name)}
+    InstallerUrl: {url}
     InstallerSha256: {archive.sha256.upper()}
     NestedInstallerFiles:
-      - RelativeFilePath: {quoted("kalareach-" + archive.target + "-" + release + "\\bin\\kr.exe")}
+      - RelativeFilePath: {nested}
         PortableCommandAlias: kr"""
         )
     return {
