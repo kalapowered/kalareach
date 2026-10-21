@@ -16,14 +16,18 @@ use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::SigningTranscript;
 use kr_ipc::client::LocalClient;
 use kr_protocol::account::{
-    MembershipLeasePayload, POLICY_AUTHORITY_DOMAIN, POLICY_AUTHORITY_HEAD_DOMAIN, PolicyAuthority,
-    PolicyAuthorityHead, PolicyAuthorityHeadPayload, PolicyAuthorityLink,
-    PolicyAuthorityLinkPayload,
+    BackupPolicy, ExternalProviderPolicy, MembershipLeasePayload, ORGANISATION_POLICY_DOMAIN,
+    OrganisationPolicy, OrganisationPolicyPayload, POLICY_AUTHORITY_DOMAIN,
+    POLICY_AUTHORITY_HEAD_DOMAIN, PolicyAuthority, PolicyAuthorityHead, PolicyAuthorityHeadPayload,
+    PolicyAuthorityLink, PolicyAuthorityLinkPayload,
 };
 use kr_protocol::hostinfo::configuration::ConfigurationDocument;
-use kr_protocol::ids::{BuildId, OrganisationId, PolicyKeyRevision};
+use kr_protocol::ids::{
+    AuthorityRevision, BuildId, OrganisationId, OrganisationPolicyRevision, PluginId,
+    PolicyKeyRevision,
+};
 use kr_protocol::local::LocalClientKind;
-use kr_protocol::scalars::{Nullable, Signature64, TimestampMs, Uuid};
+use kr_protocol::scalars::{CanonicalSet, Nullable, Signature64, TimestampMs, U64, Uuid};
 use serde_json::Value;
 
 mod support;
@@ -62,6 +66,37 @@ impl Drop for Host {
 
 impl Host {
     async fn start() -> Self {
+        Self::start_with(|_| ()).await
+    }
+
+    /// Starts a host whose registry already records an enrolment in the organisation `authority`
+    /// names: what an owner device's confirmation and `organisation.enrol` leave, written before
+    /// the daemon starts, since the confirmation is the daemon suite's.
+    async fn start_enrolled(authority: &PolicyAuthority) -> Self {
+        Self::start_with(|temp| {
+            let database = temp.environment().registry_database();
+            std::fs::create_dir_all(database.parent().expect("a directory")).expect("created");
+            let grants = kr_controller::grants::GrantDirectory::open(&database)
+                .expect("the host's authority store");
+            let mut policy = kr_controller::grants::HostPolicy::personal(AuthorityRevision::new(0));
+            let reading = kr_controller::service::net::devices::ObservedUtc {
+                now: TimestampMs::new(kr_ipc::now_ms().get()),
+                behind_ms: 0,
+            };
+            let verified = policy
+                .verify_enrolment(authority, Some(&reading))
+                .expect("the published chain verifies");
+            policy
+                .enrol(verified, AuthorityRevision::new(0))
+                .expect("the host enrols");
+            grants
+                .store_policy(&policy.snapshot())
+                .expect("the host's policy is written");
+        })
+        .await
+    }
+
+    async fn start_with(seed: impl FnOnce(&kr_ipc::testing::TempHost)) -> Self {
         let controller = beside_this_test("kr-controller").unwrap_or_else(|| {
             panic!(
                 "the kr-controller executable is not built beside this test, so this check cannot \
@@ -81,6 +116,7 @@ impl Host {
             kr_protocol::hostinfo::configuration::contents(&document).as_bytes(),
         )
         .expect("the configuration document");
+        seed(&temp);
         let bin = temp.root().join("bin");
         std::fs::create_dir_all(&bin).expect("a directory for the executable");
         let destination = bin.join(controller.file_name().expect("the executable has a name"));
@@ -155,9 +191,64 @@ impl Host {
     }
 }
 
+/// An organisation that signs with real keys: its published chain, written as JSON where a member
+/// exported it, and the key of its second revision, which signs a policy.
+struct Exported {
+    authority: PolicyAuthority,
+    chain: PathBuf,
+    signing: AuthorisationKeyPair,
+}
+
 /// An organisation's chain of two keys and a head by the second, signed with real keys, as the
 /// organisation's service publishes it, written as JSON where a member exported it.
 fn export_chain(directory: &Path) -> PathBuf {
+    exported_organisation(directory).chain
+}
+
+/// A policy the organisation signs under the key of its second revision, written as JSON where a
+/// member exported it.
+fn export_policy(
+    directory: &Path,
+    organisation: &Exported,
+    name: &str,
+    policy_revision: u64,
+    adapters: Option<&[&str]>,
+) -> PathBuf {
+    let payload = OrganisationPolicyPayload {
+        organisation_id: organisation.authority.organisation_id,
+        policy_revision: OrganisationPolicyRevision::new(policy_revision),
+        adapter_allowlist: Nullable(adapters.map(|names| {
+            names
+                .iter()
+                .map(|name| PluginId::new(*name).expect("a plugin identifier"))
+                .collect::<CanonicalSet<PluginId>>()
+        })),
+        minimum_client_version: Nullable::null(),
+        maximum_grant_lifetime_ms: Nullable::null(),
+        external_providers: ExternalProviderPolicy::OrganisationOnly,
+        backup: BackupPolicy {
+            required: false,
+            recovery_recipient: Nullable::null(),
+        },
+        audit_retention_days: U64::new(365),
+        issued_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
+        key_revision: PolicyKeyRevision::new(2),
+    };
+    let transcript = SigningTranscript::from_canonical_bytes(
+        ORGANISATION_POLICY_DOMAIN,
+        payload.signing_input().expect("encodes"),
+    )
+    .expect("a transcript");
+    let policy = OrganisationPolicy {
+        signature: kr_crypto::sign::sign(&organisation.signing, &transcript).expect("a signature"),
+        payload,
+    };
+    let path = directory.join(name);
+    std::fs::write(&path, serde_json::to_vec(&policy).expect("encodes")).expect("writes");
+    path
+}
+
+fn exported_organisation(directory: &Path) -> Exported {
     let now = kr_ipc::now_ms().get();
     let sign = |key: &AuthorisationKeyPair, domain: &str, input: Vec<u8>| -> Signature64 {
         let transcript =
@@ -218,7 +309,11 @@ fn export_chain(directory: &Path) -> PathBuf {
     };
     let path = directory.join("chain.json");
     std::fs::write(&path, serde_json::to_vec(&authority).expect("encodes")).expect("writes");
-    path
+    Exported {
+        authority,
+        chain: path,
+        signing: second,
+    }
 }
 
 /// KR-REQ-17.53: a host enrolled in nothing says so, in words and in JSON, and the list is what the
@@ -458,4 +553,108 @@ async fn exclusive_management_is_refused_where_the_host_would_refuse_it() {
     );
     let listed = host.kr_json(&["organisation", "list", "--json"]);
     assert_eq!(listed["exclusive"], false, "{listed}");
+}
+
+/// KR-REQ-18.06: `kr organisation policy` applies the policy an organisation signed to a host
+/// enrolled in it, and the list shows the revision and the adapters it allows and the adapters the
+/// host admits. The same policy again is a repeat, and an older one is refused by its rule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_18_06_a_policy_is_applied_listed_and_not_applied_again_when_older() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let organisation = exported_organisation(directory.path());
+    let host = Host::start_enrolled(&organisation.authority).await;
+    let adapters = ["kalareach/claude-code", "kalareach/codex"];
+    let policy = export_policy(
+        directory.path(),
+        &organisation,
+        "policy-3.json",
+        3,
+        Some(&adapters),
+    );
+    let file = policy.to_str().expect("a path");
+
+    let applied = host.kr_json(&["organisation", "policy", file, "--json"]);
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(
+        applied["adapter_allowlist"],
+        serde_json::json!(adapters),
+        "{applied}"
+    );
+    assert_eq!(
+        applied["effective_adapter_allowlist"],
+        serde_json::json!(adapters),
+        "{applied}"
+    );
+
+    let listed = host.kr_json(&["organisation", "list", "--json"]);
+    assert_eq!(
+        listed["effective_adapter_allowlist"],
+        serde_json::json!(adapters),
+        "{listed}"
+    );
+    assert_eq!(
+        listed["enrolments"][0]["adapter_allowlist"],
+        serde_json::json!(adapters),
+        "{listed}"
+    );
+    assert_eq!(
+        listed["enrolments"][0]["organisation_policy_revision"],
+        applied["organisation_policy_revision"],
+        "{listed}"
+    );
+    let words = host.kr(&["organisation", "list"]);
+    let printed = String::from_utf8_lossy(&words.stdout);
+    assert!(printed.contains("kalareach/codex"), "{printed}");
+
+    let again = host.kr_json(&["organisation", "policy", file, "--json"]);
+    assert_eq!(again, applied, "the same policy again is a repeat");
+
+    let older = export_policy(directory.path(), &organisation, "policy-2.json", 2, None);
+    let output = host.kr(&["organisation", "policy", older.to_str().expect("a path")]);
+    assert!(!output.status.success(), "an older revision is refused");
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("(not_newer)"), "{said}\n{}", host.log());
+}
+
+/// KR-REQ-18.06: a policy file that is not a policy is the person's mistake and is said before the
+/// host is asked, and a policy for an organisation the host is not enrolled in is refused by the
+/// host, by its rule, with nothing applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_policy_that_is_not_one_or_is_for_another_organisation_is_refused() {
+    let host = Host::start().await;
+    let directory = host.temp.root().join("exports");
+    std::fs::create_dir_all(&directory).expect("a directory");
+
+    let not_a_policy = directory.join("not-a-policy.json");
+    std::fs::write(&not_a_policy, b"{\"hello\": 1}").expect("writes");
+    let output = host.kr(&[
+        "organisation",
+        "policy",
+        not_a_policy.to_str().expect("a path"),
+    ]);
+    assert!(!output.status.success());
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("not a policy"), "{said}");
+
+    let organisation = exported_organisation(&directory);
+    let policy = export_policy(
+        &directory,
+        &organisation,
+        "policy.json",
+        1,
+        Some(&["kalareach/codex"]),
+    );
+    let output = host.kr(&["organisation", "policy", policy.to_str().expect("a path")]);
+    assert!(
+        !output.status.success(),
+        "the host holds nothing of the organisation"
+    );
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("(not_enrolled)"), "{said}\n{}", host.log());
+    let listed = host.kr_json(&["organisation", "list", "--json"]);
+    assert_eq!(
+        listed["effective_adapter_allowlist"],
+        serde_json::Value::Null,
+        "{listed}"
+    );
 }

@@ -800,6 +800,16 @@ pub enum OrganisationCommand {
     /// a member: the sessions on this host refuse what the owner asks for once the lease ends.
     /// `kr organisation list` shows the identity a lease for this host is signed for.
     Present(OrganisationPresentArguments),
+    /// Apply the policy an organisation signed, so that the adapters it allows are the ones this
+    /// host admits.
+    ///
+    /// The policy is read from a file a member exported from the organisation's service. This host
+    /// verifies it under the key the organisation's chain ends with, refuses one at or below the
+    /// revision it holds, and applies the adapter allowlist the policy states: every enrolled
+    /// organisation that states a list narrows what this host admits to the adapters all the lists
+    /// name. When the organisation has rotated its key since this host last followed it, `--chain`
+    /// gives the chain beside the policy.
+    Policy(OrganisationPolicyArguments),
     /// Make this host exclusively organisation-managed, or end that.
     ///
     /// While it is on, a personal grant, the owner's own devices included, answers to a membership
@@ -833,6 +843,20 @@ pub enum OrganisationExclusiveCommand {
 pub struct OrganisationPresentArguments {
     /// The file holding the lease the organisation signed for this host, as JSON.
     pub lease: std::path::PathBuf,
+    /// A file holding the organisation's policy-signing chain, when it has moved since this host
+    /// last accepted one.
+    #[arg(long)]
+    pub chain: Option<std::path::PathBuf>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr organisation policy`.
+#[derive(Args)]
+pub struct OrganisationPolicyArguments {
+    /// The file holding the policy the organisation signed, as JSON.
+    pub policy: std::path::PathBuf,
     /// A file holding the organisation's policy-signing chain, when it has moved since this host
     /// last accepted one.
     #[arg(long)]

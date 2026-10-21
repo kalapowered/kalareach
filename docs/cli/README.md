@@ -46,7 +46,7 @@ worker directly for what a session owns.
 | `kr destination [list/configure/remove]` | — | The places this host sends notifications besides paired devices: a webhook, Slack, Discord, Telegram or email |
 | `kr account [sign-in/sign-out/show]` | — | Sign this host in to the managed account service, in a browser, sign it out, or show where the sign-in stands |
 | `kr host paths` | — | Show where this installation keeps its runtime files and its state |
-| `kr organisation [enrol/list/present/withdraw/exclusive]` | — | Enrol this host in an organisation's policy, show what it holds for each organisation, present the lease signed for the host's own key, leave one, or make the host exclusively organisation-managed or end that |
+| `kr organisation [enrol/list/present/policy/withdraw/exclusive]` | — | Enrol this host in an organisation's policy, show what it holds for each organisation, present the lease signed for the host's own key, apply the policy an organisation signed, leave one, or make the host exclusively organisation-managed or end that |
 
 `--help`, `--version` and `--json` work everywhere. A literal `--` ends option parsing. Neither
 shell commands nor paths are assembled by interpolating text.
@@ -1921,6 +1921,7 @@ host; this is about the owner's side of it.
 kr organisation enrol chain.json     # pin the keys that sign an organisation's policy
 kr organisation list                 # what this host holds for each organisation
 kr organisation present lease.json   # present the lease signed for this host's own key
+kr organisation policy policy.json   # apply the policy the organisation signed
 kr organisation withdraw <id>        # leave an organisation's policy
 kr organisation exclusive on         # make this host exclusively organisation-managed
 kr organisation exclusive off        # end that
@@ -1945,14 +1946,17 @@ first key.
 `kr organisation list` is read-only. The host serves the same report to a paired device that manages
 it. For each organisation the host is enrolled in, it shows the identifier of its first key, the key
 rotation is followed from, the highest key revision accepted and the enrolment revision that a grant
-requiring the organisation names. It shows the devices bound to member accounts of that
-organisation, and the lease last recorded for each. It also shows whether the host is exclusively
+requiring the organisation names. It shows the revision of the policy applied for the organisation
+and the adapters it allows, or that none is applied, and then the adapters the host admits. It shows
+the devices bound to member accounts of that organisation, and the lease last recorded for each. It also shows whether the host is exclusively
 organisation-managed, and whether it trusts its clock. It shows each time exclusive management was
 turned off. It prints the device identifier, authorisation key and key identifier that a lease for the host's
 own local owner is signed for, and names each session whose worker cannot be told what that owner may do. A
 member's account name is shown as the organisation signed it.
 
 `kr organisation present` reads a membership lease from a JSON file and presents it to the host as its local owner's. The organisation signs that lease for the host's own key, which `kr organisation list` prints beside the host's device identifier. `--chain` names a file that holds the organisation's policy-signing chain, for when it has moved since the host last accepted one. On a host that is exclusively organisation-managed, the lease serves the owner until it ends, at the daemon and at each session's worker; without one, the owner reaches only the session's own tooling and what recovers or ends access. A host that is not exclusively organisation-managed refuses the lease and says so. With `--json` it returns `ok`, `organisation_id`, `account_id`, `key_revision`, `expires_at_ms` and `exclusive`.
+
+`kr organisation policy` reads the policy an organisation signed from a JSON file that a member exported from the organisation's service, and applies it. The adapters its allowlist names are then the only ones this host admits, so `kr plugin list` says a package the list leaves out is "not among the adapters the organisation allows", and its bindings end. When more than one organisation states a list, the host admits the adapters every list names. An organisation that has rotated its key since this host last followed it needs `--chain`, which names a file that holds its policy-signing chain; without it, a policy signed under the new key is refused, and a policy signed under the old key is refused once the host has followed the new one. The command needs no confirmation, because the owner confirmed the organisation's keys when enrolling, and a policy never enlarges what the host allows without one. The host refuses a policy that is not signed under the key its chain ends with, one at or below the revision it holds, and one for an organisation it is not enrolled in; each refusal names its rule in parentheses, and the same policy again is a repeat that changes nothing and puts the list in force again. If the catalogue is busy and the list cannot be put in force, the command fails, the host keeps the policy, and the list is put in force at the host's next admissions pass; the same command completes it sooner. `docs/host/README.md` has what the host checks, keeps and does with the list. The command prints the organisation, the revision applied, the adapters that policy allows and the adapters the host admits. With `--json` it returns `ok`, `organisation_id`, `organisation_policy_revision`, `adapter_allowlist` and `effective_adapter_allowlist`; a list is an array of adapter identifiers, or null where the policy names no list.
 
 To withdraw a host from an organisation, use `kr organisation withdraw <id>`, where `<id>` is the identifier `kr organisation list` shows. This operation, being only a restriction, does not need any confirmation. The host refuses an organisation it is not enrolled in, and its last one while exclusive management is on. The command reports the authority revision the host is fenced at and how far each affected session's worker has got, and it fails with a pending result when a worker has not fenced it yet. With `--json` it returns the revocation result: `authority_revision`, `revoked_grants`, `revoked_grants_total` and the `barrier`.
 
@@ -2258,10 +2262,12 @@ A direct invitation has `"mode": "direct"` and no `code` or `rendezvous_origin`.
 
 `kr organisation enrol --json` returns `ok`, `organisation_id`, `enrolment_revision`,
 `accepted_head` and `root_key_id`, the identifier of the organisation's first key in hexadecimal.
-`kr organisation list --json` returns `ok`, `exclusive`, `clock_trusted`, `host_device` (with
+`kr organisation list --json` returns `ok`, `exclusive`, `clock_trusted`, `effective_adapter_allowlist` (the adapters the host
+admits, as an array of identifiers, or null while no organisation states a list), `host_device` (with
 `device_id`, `authorisation_key` and `authorisation_key_id`), `workers_without_local_enforcement`, `enrolments` and
 `exclusive_events`. Each enrolment has `organisation_id`, `root_key_id`, `anchor_revision`,
-`anchor_key_id`, `accepted_head`, `enrolment_revision` and `members`; a member has `device_id`,
+`anchor_key_id`, `accepted_head`, `enrolment_revision`, `organisation_policy_revision` (null while
+no policy is applied), `adapter_allowlist` (an array of adapter identifiers, or null) and `members`; a member has `device_id`,
 `account_id`, `device_key_id`, `bound_at_ms` and, when the host recorded one, `lease` with
 `issued_at_ms` and `expires_at_ms`. Each event has `sequence`, `at_ms`, `channel` and
 `organisation_ids`.

@@ -669,6 +669,7 @@ impl claim::Claimed for kr_protocol::ids::ChangeSetVersion {}
 impl claim::Claimed for kr_protocol::ids::EnvironmentId {}
 impl claim::Claimed for kr_protocol::ids::OrganisationId {}
 impl claim::Claimed for kr_protocol::ids::PolicyKeyRevision {}
+impl claim::Claimed for kr_protocol::ids::OrganisationPolicyRevision {}
 impl claim::Claimed for kr_protocol::ids::MaterialisationId {}
 impl claim::Claimed for kr_protocol::ids::ProjectRepositoryId {}
 impl claim::Claimed for kr_protocol::ids::RepositoryGeneration {}
@@ -1380,6 +1381,7 @@ mod tests {
         assert_closed::<kr_protocol::ids::MaterialisationId>();
         assert_closed::<kr_protocol::ids::OrganisationId>();
         assert_closed::<kr_protocol::ids::PolicyKeyRevision>();
+        assert_closed::<kr_protocol::ids::OrganisationPolicyRevision>();
         assert_closed::<kr_protocol::ids::ProjectRepositoryId>();
         assert_closed::<kr_protocol::ids::RepositoryGeneration>();
         assert_closed::<kr_protocol::ids::WorkflowRunId>();

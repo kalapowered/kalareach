@@ -9,21 +9,24 @@
 use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_ipc::paths::HostPaths;
-use kr_protocol::account::PolicyAuthority;
+use kr_protocol::account::{OrganisationPolicy, PolicyAuthority};
 use kr_protocol::confirmation::{ConfirmationDisplay, ConfirmationSubject};
-use kr_protocol::ids::OrganisationId;
+use kr_protocol::ids::{OrganisationId, PluginId};
 use kr_protocol::limits::MAX_CONTROL_FRAME_LEN;
 use kr_protocol::method::Method;
 use kr_protocol::organisation::{
     MembershipPresentParams, MembershipPresentResult, OrganisationEnrolParams,
     OrganisationEnrolResult, OrganisationExclusiveSetParams, OrganisationExclusiveSetResult,
-    OrganisationListParams, OrganisationListResult, OrganisationWithdrawParams,
+    OrganisationListParams, OrganisationListResult, OrganisationPolicyApplyParams,
+    OrganisationPolicyApplyResult, OrganisationWithdrawParams,
 };
+use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::sharing::RevocationResult;
 
 use crate::cli::{
     OrganisationCommand, OrganisationEnrolArguments, OrganisationExclusiveCommand,
-    OrganisationPresentArguments, OrganisationWithdrawArguments, PrivacyArguments,
+    OrganisationPolicyArguments, OrganisationPresentArguments, OrganisationWithdrawArguments,
+    PrivacyArguments,
 };
 use crate::daemon::{Daemon, identifier};
 use crate::error::{CliError, Result};
@@ -43,6 +46,7 @@ pub async fn run(paths: &HostPaths, command: OrganisationCommand, json: bool) ->
         OrganisationCommand::List(arguments) => list(paths, &arguments, json).await,
         OrganisationCommand::Withdraw(arguments) => withdraw(paths, &arguments, json).await,
         OrganisationCommand::Present(arguments) => present(paths, &arguments, json).await,
+        OrganisationCommand::Policy(arguments) => policy(paths, &arguments, json).await,
         OrganisationCommand::Exclusive(OrganisationExclusiveCommand::On(arguments)) => {
             exclusive_on(paths, &arguments, json).await
         }
@@ -102,6 +106,100 @@ async fn present(
             Asked::text(Request::Organisations, presented.account_id.as_str()),
             presented.key_revision,
             utc_moment(presented.expires_at_ms.get())
+        ));
+    }
+    Ok(())
+}
+
+/// The lines that say an adapter list: the adapters it names, one to a line, none at all, or
+/// `every` where the list names no adapter and so allows every one the host qualifies.
+fn adapter_lines(
+    list: &Nullable<CanonicalSet<PluginId>>,
+    every: &'static str,
+) -> Vec<output::Line> {
+    match list.as_ref() {
+        None => vec![stdout_line!("    {}.", Shown::said(every))],
+        Some(adapters) if adapters.is_empty() => vec![stdout_line!("    no adapter.")],
+        Some(adapters) => adapters
+            .iter()
+            .map(|adapter| {
+                stdout_line!(
+                    "    {}",
+                    Asked::text(Request::Plugins, &adapter.to_string())
+                )
+            })
+            .collect(),
+    }
+}
+
+/// An adapter list as a document holds it: the adapters, or null where it names none.
+fn adapters_held(list: &Nullable<CanonicalSet<PluginId>>) -> Option<Vec<Asked>> {
+    list.as_ref().map(|adapters| {
+        adapters
+            .iter()
+            .map(|adapter| Asked::text(Request::Plugins, &adapter.to_string()))
+            .collect()
+    })
+}
+
+/// `kr organisation policy`.
+async fn policy(
+    paths: &HostPaths,
+    arguments: &OrganisationPolicyArguments,
+    json: bool,
+) -> Result<()> {
+    let policy: OrganisationPolicy = read_json(
+        &arguments.policy,
+        ("the policy file", "policy"),
+        "the file is not a policy an organisation signed",
+    )?;
+    let authority = arguments
+        .chain
+        .as_ref()
+        .map(|path| read_chain(path))
+        .transpose()?;
+    let mut daemon = Daemon::open(paths, &arguments.selector).await?;
+    let applied: OrganisationPolicyApplyResult = daemon
+        .mutate(
+            Method::OrganisationPolicyApply,
+            &OrganisationPolicyApplyParams {
+                policy,
+                authority: Nullable(authority),
+            },
+        )
+        .await?;
+    if json {
+        output::document(
+            &Document::new()
+                .with("ok", true)
+                .with("organisation_id", closed(&applied.organisation_id))
+                .with(
+                    "organisation_policy_revision",
+                    closed(&applied.organisation_policy_revision),
+                )
+                .with(
+                    "adapter_allowlist",
+                    adapters_held(&applied.adapter_allowlist),
+                )
+                .with(
+                    "effective_adapter_allowlist",
+                    adapters_held(&applied.effective_adapter_allowlist),
+                ),
+        );
+    } else {
+        output::line(&stdout_line!(
+            "Organisation {}: policy revision {} is applied. It allows:",
+            applied.organisation_id,
+            output::closed_word(&applied.organisation_policy_revision)
+        ));
+        output::lines(&adapter_lines(
+            &applied.adapter_allowlist,
+            "every adapter this host qualifies",
+        ));
+        output::line(&stdout_line!("This host admits:"));
+        output::lines(&adapter_lines(
+            &applied.effective_adapter_allowlist,
+            "every adapter it qualifies",
         ));
     }
     Ok(())
@@ -401,6 +499,19 @@ async fn list(paths: &HostPaths, arguments: &PrivacyArguments, json: bool) -> Re
             enrolment.accepted_head,
             enrolment.enrolment_revision
         ));
+        match enrolment.organisation_policy_revision.as_ref() {
+            Some(revision) => {
+                output::line(&stdout_line!(
+                    "  policy revision {} allows:",
+                    output::closed_word(revision)
+                ));
+                output::lines(&adapter_lines(
+                    &enrolment.adapter_allowlist,
+                    "every adapter this host qualifies",
+                ));
+            }
+            None => output::line(&stdout_line!("  no policy is applied.")),
+        }
         for member in &enrolment.members {
             output::line(&stdout_line!(
                 "  device {} is bound to {}, since {}.",
@@ -417,6 +528,11 @@ async fn list(paths: &HostPaths, arguments: &PrivacyArguments, json: bool) -> Re
             }
         }
     }
+    output::line(&stdout_line!("This host admits:"));
+    output::lines(&adapter_lines(
+        &listed.effective_adapter_allowlist,
+        "every adapter it qualifies",
+    ));
     output::line(&stdout_line!(
         "A lease for this host's own local owner is signed for device {} and authorisation key {} \
          (key identifier {}).",
@@ -497,6 +613,14 @@ fn document(listed: &OrganisationListResult) -> Document {
                 )
                 .with("accepted_head", closed(&enrolment.accepted_head))
                 .with("enrolment_revision", closed(&enrolment.enrolment_revision))
+                .with(
+                    "organisation_policy_revision",
+                    enrolment.organisation_policy_revision.as_ref().map(closed),
+                )
+                .with(
+                    "adapter_allowlist",
+                    adapters_held(&enrolment.adapter_allowlist),
+                )
                 .with("members", members)
         })
         .collect();
@@ -515,6 +639,10 @@ fn document(listed: &OrganisationListResult) -> Document {
         .with("ok", true)
         .with("exclusive", listed.exclusive)
         .with("clock_trusted", listed.clock_trusted)
+        .with(
+            "effective_adapter_allowlist",
+            adapters_held(&listed.effective_adapter_allowlist),
+        )
         .with(
             "host_device",
             Document::new()
