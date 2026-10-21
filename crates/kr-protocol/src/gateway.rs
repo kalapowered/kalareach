@@ -831,7 +831,7 @@ impl fmt::Display for DownstreamRequestId {
 ///
 /// The state machine is small because the contract is small: a resource is offered once, claimed
 /// once, and reaches exactly one terminal state. There is no edge back out of a terminal state,
-/// so a reconnect cannot revive a resolved resource and answer it again.
+/// so nothing can revive a resolved resource and answer it again.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
@@ -843,14 +843,15 @@ pub enum PendingState {
     Claimed,
     /// The answer reached the upstream.
     Resolved,
-    /// The upstream withdrew or cancelled the request.
+    /// The upstream withdrew or cancelled the request, or the connection it was made on ended
+    /// with no answer sent for it.
     Cancelled,
     /// The deadline passed without an answer.
     Expired,
     /// An answer was dispatched and its outcome cannot be established.
     ///
-    /// Reconnect reconciles this; it never reissues. Section 11: it "does not reissue an uncertain
-    /// response".
+    /// A reconciliation settles it here, when the connection ends or a recovery runs; it never
+    /// reissues. Section 11: it "does not reissue an uncertain response".
     Uncertain,
 }
 

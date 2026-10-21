@@ -26215,7 +26215,7 @@
       "type": "string"
     },
     "PendingState": {
-      "description": "What a pending resource is doing.\n\nThe state machine is small because the contract is small: a resource is offered once, claimed\nonce, and reaches exactly one terminal state. There is no edge back out of a terminal state,\nso a reconnect cannot revive a resolved resource and answer it again.",
+      "description": "What a pending resource is doing.\n\nThe state machine is small because the contract is small: a resource is offered once, claimed\nonce, and reaches exactly one terminal state. There is no edge back out of a terminal state,\nso nothing can revive a resolved resource and answer it again.",
       "oneOf": [
         {
           "const": "pending",
@@ -26234,7 +26234,7 @@
         },
         {
           "const": "cancelled",
-          "description": "The upstream withdrew or cancelled the request.",
+          "description": "The upstream withdrew or cancelled the request, or the connection it was made on ended\nwith no answer sent for it.",
           "type": "string"
         },
         {
@@ -26244,7 +26244,7 @@
         },
         {
           "const": "uncertain",
-          "description": "An answer was dispatched and its outcome cannot be established.\n\nReconnect reconciles this; it never reissues. Section 11: it \"does not reissue an uncertain\nresponse\".",
+          "description": "An answer was dispatched and its outcome cannot be established.\n\nA reconciliation settles it here, when the connection ends or a recovery runs; it never\nreissues. Section 11: it \"does not reissue an uncertain response\".",
           "type": "string"
         }
       ]
