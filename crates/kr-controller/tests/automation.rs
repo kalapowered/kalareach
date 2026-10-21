@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use kr_controller::grants::GrantRecord;
 use kr_controller::service::{Clocks, Controller, ControllerSetup, WallClock};
-use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
+use kr_controller::supervision::{LaunchOutcome, ServiceLaunch, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
@@ -220,6 +220,154 @@ impl WorkerSupervisor for AtTheDoor {
     }
 }
 
+/// How long a launch waits for a user manager that answers late before the test is called hung. It
+/// ends a manager that never answers, and nothing else.
+const MANAGER_HUNG_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The platform's supervisor, for a manager that answers a launch after the daemon has stopped
+/// waiting for it.
+///
+/// The daemon gives the user manager a bound to answer one question, and a launch whose question
+/// ran past it comes back as one that may be running and has no process to name: the node's
+/// create fails, and the case, which is about the node and not about the manager, fails with it.
+/// Every list on this machine shares one user manager, and many cases start a worker at once, so
+/// the manager answers late whenever enough of them do. Whatever the reason a systemd launch comes
+/// back with no process to name (the manager did not answer in time, refused the request, or did
+/// not report a main process), this asks the manager what became of the unit and goes on from its
+/// answer: a unit that is there has its main process named, and one the manager has never had is
+/// started again. A unit that was there when it was looked at and is gone since ended, and the
+/// launch is returned as it was. Anything else the launch came to is returned as it was, and so is
+/// a launch through any other supervisor than systemd's.
+///
+/// What it cannot give a worker is more time than the daemon gives it: a worker that connects
+/// waits a bounded time for its launch to be recorded, and a launch recorded after that is refused.
+#[derive(Debug)]
+struct Patient {
+    inner: Box<dyn WorkerSupervisor>,
+}
+
+impl WorkerSupervisor for Patient {
+    fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
+        let deadline = std::time::Instant::now() + MANAGER_HUNG_AFTER;
+        loop {
+            let outcome = self.inner.start(launch);
+            let LaunchOutcome::Uncertain { pid: None, .. } = outcome else {
+                return outcome;
+            };
+            if !asks_a_user_manager(self.inner.as_ref()) || std::time::Instant::now() >= deadline {
+                return outcome;
+            }
+            match unit_main_process(&launch.label(), deadline) {
+                Some(Some(pid)) => return kr_controller::supervision::settle(pid),
+                Some(None) => std::thread::sleep(std::time::Duration::from_millis(250)),
+                None => return outcome,
+            }
+        }
+    }
+
+    fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
+        self.inner.start_service(launch)
+    }
+
+    fn describe(&self) -> &'static str {
+        self.inner.describe()
+    }
+}
+
+/// Whether `supervisor` is the one that starts a worker as a unit of the user manager.
+#[cfg(target_os = "linux")]
+fn asks_a_user_manager(supervisor: &dyn WorkerSupervisor) -> bool {
+    supervisor.describe() == kr_controller::supervision::SystemdSupervisor::new().describe()
+}
+
+/// No other platform's supervisor is asked about a launch again.
+#[cfg(not(target_os = "linux"))]
+fn asks_a_user_manager(_supervisor: &dyn WorkerSupervisor) -> bool {
+    false
+}
+
+/// What the user manager says of the unit `label`: nothing when it did not answer by `deadline`, or
+/// when the unit was there and is gone; otherwise the process the unit runs, or none when the
+/// manager has never had the unit. A unit that is there and runs no process yet is asked about
+/// again.
+#[cfg(target_os = "linux")]
+fn unit_main_process(label: &str, deadline: std::time::Instant) -> Option<Option<u32>> {
+    let unit = format!("{label}.service");
+    let mut seen = false;
+    loop {
+        let shown =
+            systemctl_user_until(&["show", "--property=LoadState,MainPID", &unit], deadline)?;
+        let property = |name: &str| {
+            shown
+                .lines()
+                .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
+        };
+        if property("LoadState") == Some("not-found") {
+            return if seen { None } else { Some(None) };
+        }
+        seen = true;
+        if let Some(pid) = property("MainPID")
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .filter(|pid| *pid != 0)
+        {
+            return Some(Some(pid));
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// What `systemctl --user <arguments>` prints: waited for until `deadline`, and asked again after a
+/// short pause when it fails, while time is left.
+#[cfg(target_os = "linux")]
+fn systemctl_user_until(arguments: &[&str], deadline: std::time::Instant) -> Option<String> {
+    loop {
+        let mut child = std::process::Command::new("systemctl")
+            .arg("--user")
+            .args(arguments)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let printed = child.stdout.take().map(|mut stdout| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+                text
+            })
+        });
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+            }
+        };
+        let text = printed.and_then(|reader| reader.join().ok());
+        match status {
+            Some(status) if status.success() => return text,
+            None => return None,
+            Some(_) if std::time::Instant::now() >= deadline => return None,
+            Some(_) => std::thread::sleep(std::time::Duration::from_millis(250)),
+        }
+    }
+}
+
+/// Where no user manager is asked, a launch is as the platform's supervisor made it.
+#[cfg(not(target_os = "linux"))]
+fn unit_main_process(_label: &str, _deadline: std::time::Instant) -> Option<Option<u32>> {
+    None
+}
+
 /// [`working_host`] with the supervisor wrapped by `wrap`, which sits between the daemon and the
 /// tree's own.
 async fn working_host_through(
@@ -239,7 +387,9 @@ async fn working_host_on(
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let worker = temp.root().join("kr-worker");
-    let supervisor = wrap(temp.supervisor(kr_controller::supervision::detect()));
+    let supervisor = wrap(Box::new(Patient {
+        inner: temp.supervisor(kr_controller::supervision::detect()),
+    }));
     let controller = start_daemon_with(
         &environment,
         environment_id,
@@ -290,7 +440,9 @@ async fn working_host_apart() -> (Host, Apart) {
     let environment_id = temp.environment_id();
     let worker = temp.root().join("kr-worker");
     kr_ipc::testing::place_and_start_once(&beside_this_test("kr-worker"), &worker, &["--version"]);
-    let supervisor = temp.supervisor(kr_controller::supervision::detect());
+    let supervisor = Box::new(Patient {
+        inner: temp.supervisor(kr_controller::supervision::detect()),
+    });
     let (ready_sender, ready) = std::sync::mpsc::channel();
     let (stop, stopped) = std::sync::mpsc::channel::<()>();
     let thread = std::thread::spawn({
