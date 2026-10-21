@@ -101,7 +101,7 @@ pub fn assemble(inputs: &Inputs) -> Result<ReleaseManifest> {
             .map(|row| row.major)
             .collect(),
         retained_levels: retained::levels(),
-        shells: shells::packages(&inputs.tree, &inputs.checkout)?,
+        shells: shells::packages(&inputs.tree, &inputs.checkout, &inputs.target)?,
         agents: agents::agents(&inputs.checkout, &inputs.target)?,
         dependencies: pins::dependencies(&inputs.checkout)?,
         stores: stores(&inputs.checkout)?,
