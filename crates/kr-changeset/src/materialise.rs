@@ -408,7 +408,8 @@ pub fn reread_with(
                     .settle_materialisation(row.materialisation_id, was, now)?;
             }
         }
-        Err(_) => {
+        // Another object at the name, which is said as that.
+        Err(kr_transfer::Escape::IdentityChanged { .. }) => {
             return Ok((
                 row,
                 Reread::Indeterminate(
@@ -416,6 +417,19 @@ pub fn reread_with(
                      made"
                         .to_owned(),
                 ),
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+        // A read that failed is not an answer about the directory: it may well be the one this host
+        // made, and the record is not read as another object.
+        Err(error) => {
+            return Ok((
+                row,
+                Reread::Indeterminate(format!(
+                    "this host could not read whether the directory at this materialisation's \
+                     name is the object it made: {error}"
+                )),
                 Vec::new(),
                 Vec::new(),
             ));
@@ -1442,12 +1456,24 @@ pub fn release(
                             .settle_materialisation(materialisation_id, was, now)?;
                     }
                 }
-                Err(_) => {
+                Err(kr_transfer::Escape::IdentityChanged { .. }) => {
                     return Err(ChangeSetError::StorageUnavailable {
                         detail: "the directory at this materialisation's name is not the object \
                                  this host made, so nothing was removed and nothing is recorded \
                                  as released"
                             .into(),
+                    });
+                }
+                // A read that failed says nothing about which object is there. Nothing is removed
+                // on it either, and the record stays as it was.
+                Err(error) => {
+                    return Err(ChangeSetError::StorageUnavailable {
+                        detail: format!(
+                            "this host could not read whether the directory at this \
+                             materialisation's name is the object it made ({error}), so nothing \
+                             was removed and nothing is recorded as released"
+                        )
+                        .into(),
                     });
                 }
             }
