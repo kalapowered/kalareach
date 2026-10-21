@@ -9,7 +9,7 @@ use kr_protocol::authority::EffectClass;
 use kr_protocol::envelope::{ControlEvent, ControlFrame, MutationRequest, Outcome, Response};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::frame::StreamKind;
-use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION, ReceiveLimits};
+use kr_protocol::hello::{ActionWindow, ProtocolVersion, ReceiveLimits};
 use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, RequestId};
 use kr_protocol::local::{LocalHelloAck, LocalPeer, LocalRole};
 use kr_protocol::method::Method;
@@ -430,12 +430,13 @@ impl Controller {
 
     pub(super) fn acknowledgement(
         &self,
+        selected_version: ProtocolVersion,
         role: LocalRole,
         action_window: ActionWindow,
         peer: &PeerIdentity,
     ) -> Box<LocalHelloAck> {
         Box::new(LocalHelloAck {
-            selected_version: PROTOCOL_VERSION,
+            selected_version,
             role,
             connection_id: action_window.connection_id,
             environment_id: self.paths.environment_id(),
@@ -559,10 +560,12 @@ impl Controller {
                         let _ = writer.write_message(&refusal).await;
                         break;
                     }
+                    // The protocol this daemon states, which a client of the same major offers.
+                    let stated = kr_protocol::retained::stated_protocol();
                     if hello
                         .offered_versions
                         .iter()
-                        .any(|offered| offered.major == PROTOCOL_VERSION.major)
+                        .any(|offered| offered.major == stated.major)
                     {
                         // Validating the caller's record and registering the connection in the
                         // authority store happen together, under the store's own lock, so a
@@ -589,6 +592,7 @@ impl Controller {
                             break;
                         };
                         ControlFrame::HelloAck(self.acknowledgement(
+                            stated,
                             LocalRole::Controller,
                             window,
                             peer,
@@ -597,7 +601,7 @@ impl Controller {
                         error_reply(
                             RequestId::new(0),
                             ErrorCode::UnsupportedSchema,
-                            format!("this host speaks protocol {PROTOCOL_VERSION}"),
+                            format!("this host speaks protocol {stated}"),
                         )
                     }
                 }

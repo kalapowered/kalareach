@@ -112,8 +112,16 @@ pub fn supported_versions_of(majors: &[PublicMajor]) -> Vec<ProtocolVersion> {
 }
 
 /// The versions this build lists and offers.
+///
+/// A build made to state a later major for a test (`KR_TEST_LOCAL_MAJOR`, builds with debug
+/// assertions only) lists that major's version alone: every major below it is retired, and a device
+/// of one is refused at the door.
 #[must_use]
 pub fn supported_versions() -> Vec<ProtocolVersion> {
+    #[cfg(debug_assertions)]
+    if let Some(stated) = crate::retained::switched_protocol() {
+        return vec![stated];
+    }
     supported_versions_of(PUBLIC_MAJORS)
 }
 

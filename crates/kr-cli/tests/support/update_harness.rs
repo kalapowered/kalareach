@@ -13,7 +13,7 @@ use aws_lc_rs::signature::Ed25519KeyPair;
 use kr_ipc::client::LocalClient;
 use kr_ipc::install::{Program, Store};
 use kr_protocol::envelope::ActionTarget;
-use kr_protocol::hello::{PACKAGE_VERSION, PackageVersion};
+use kr_protocol::hello::{PACKAGE_VERSION, PackageVersion, ProtocolVersion};
 use kr_protocol::ids::{ActionId, BuildId, SessionId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
@@ -27,6 +27,30 @@ use serde_json::Value;
 
 /// How long a wait for something to happen is given. It fails when the thing never happens.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
+
+/// The variable that makes a program of a build with debug assertions state a later public major of
+/// the protocol on its local links, and list only that major to a device: the way a test makes a
+/// release of a later major without one existing.
+const LATER_MAJOR_VARIABLE: &str = "KR_TEST_LOCAL_MAJOR";
+
+/// The later major the suites make a program state.
+const LATER_MAJOR: u16 = 2;
+
+/// Connects to the daemon at `endpoint` as a client of the release that runs it: of this build's
+/// own major, and where the daemon refuses that, of the later major a test made it state.
+async fn connect_to_daemon(endpoint: &kr_ipc::paths::Endpoint) -> kr_ipc::Result<LocalClient> {
+    match LocalClient::connect(endpoint, LocalClientKind::Cli, build()).await {
+        Ok(client) => Ok(client),
+        Err(refused) => LocalClient::connect_stating(
+            endpoint,
+            LocalClientKind::Cli,
+            build(),
+            ProtocolVersion::new(LATER_MAJOR, 0),
+        )
+        .await
+        .map_err(|_| refused),
+    }
+}
 
 /// One release this suite assembles.
 fn release(name: &str) -> ReleaseName {
@@ -616,6 +640,26 @@ impl Assembled {
             )
     }
 
+    /// This release as one whose control daemon states the public major `major` on its local links
+    /// and lists only that major to a device, wherever the daemon is started from; with `None`, as
+    /// one whose daemon states this build's own, even when the program that starts it states a
+    /// later major. The workspace's own daemon is kept beside as `kr-controller-real`.
+    fn whose_daemon_states(self, major: Option<u16>) -> Self {
+        let setting = match major {
+            Some(major) => format!("{LATER_MAJOR_VARIABLE}={major}"),
+            None => format!("-u {LATER_MAJOR_VARIABLE}"),
+        };
+        self.with_program("kr-controller-real", &Self::program_bytes("kr-controller"))
+            .with_program(
+                "kr-controller",
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in --version) echo kr-controller; exit 0;; esac\n\
+                     exec /usr/bin/env {setting} \"$(dirname \"$0\")/kr-controller-real\" \"$@\"\n"
+                )
+                .as_bytes(),
+            )
+    }
+
     /// This release with `name` listed as a file that is not a program: its bytes are in the tree
     /// and in the manifest, so every file check passes, and the manifest does not say it runs.
     fn with_data(mut self, name: &str) -> Self {
@@ -950,9 +994,7 @@ async fn answers_for(tree: &teardown::Tree) -> bool {
     let Ok(endpoint) = tree.environment().controller_endpoint() else {
         return false;
     };
-    LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-        .await
-        .is_ok()
+    connect_to_daemon(&endpoint).await.is_ok()
 }
 
 /// Hands over and stops whatever daemon serves `tree`'s environment, through its own door, and says
@@ -962,7 +1004,7 @@ async fn stop_daemon_of(tree: &teardown::Tree) -> bool {
     let Ok(endpoint) = environment.controller_endpoint() else {
         return true;
     };
-    if let Ok(mut client) = LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await {
+    if let Ok(mut client) = connect_to_daemon(&endpoint).await {
         let target = release("0.0.0+000000000000");
         let prepared = tokio::time::timeout(
             Duration::from_secs(60),
@@ -1240,10 +1282,7 @@ impl Second {
             .controller_endpoint()
             .expect("an endpoint");
         let started = Instant::now();
-        while LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-            .await
-            .is_err()
-        {
+        while connect_to_daemon(&endpoint).await.is_err() {
             assert!(
                 started.elapsed() < LIVENESS_DEADLINE,
                 "the daemon did not answer; its log says: {}",
@@ -1266,9 +1305,7 @@ impl Second {
             .environment()
             .controller_endpoint()
             .expect("an endpoint");
-        let client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-            .await
-            .expect("reaches the daemon");
+        let client = connect_to_daemon(&endpoint).await.expect("reaches the daemon");
         client
             .acknowledgement()
             .build
@@ -1477,7 +1514,7 @@ impl Host {
             .environment()
             .controller_endpoint()
             .expect("an endpoint");
-        let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        let mut client = connect_to_daemon(&endpoint)
             .await
             .expect("reaches the daemon");
         let target = release("0.0.0+000000000000");
@@ -1598,10 +1635,7 @@ impl Host {
             .controller_endpoint()
             .expect("an endpoint");
         let started = Instant::now();
-        while LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-            .await
-            .is_err()
-        {
+        while connect_to_daemon(&endpoint).await.is_err() {
             assert!(
                 started.elapsed() < LIVENESS_DEADLINE,
                 "the daemon did not answer; its log says: {}",
@@ -1791,15 +1825,28 @@ impl Host {
             .environment()
             .controller_endpoint()
             .expect("an endpoint");
-        let client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-            .await
-            .expect("reaches the daemon");
+        let client = connect_to_daemon(&endpoint).await.expect("reaches the daemon");
         client
             .acknowledgement()
             .build
             .as_ref()
             .map(|build| build.build_id.as_str().to_owned())
             .unwrap_or_default()
+    }
+
+    /// The public major this host's daemon states in its answer to a hello.
+    async fn daemon_states(&self) -> u16 {
+        let endpoint = self
+            .tree
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint");
+        connect_to_daemon(&endpoint)
+            .await
+            .expect("reaches the daemon")
+            .acknowledgement()
+            .selected_version
+            .major
     }
 
     /// The identity of the process this host's daemon runs as, which differs each time a daemon

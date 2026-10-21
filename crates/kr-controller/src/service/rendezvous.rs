@@ -94,6 +94,7 @@ impl Controller {
     ) -> Result<()> {
         writer
             .write_message(&ControlFrame::HelloAck(self.acknowledgement(
+                PROTOCOL_VERSION,
                 LocalRole::Rendezvous,
                 self.issue_window(connection_id)?,
                 peer,

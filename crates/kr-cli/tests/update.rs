@@ -621,11 +621,12 @@ async fn an_update_waits_for_a_session_its_release_does_not_retain() {
 /// lists. A release whose table lists major 2 and no longer major 1, the major the session's release
 /// listed, and whose daemon retains the session's level, is updated to with the session kept: the
 /// worker is the process it was, and the session closes at the end through release two's `kr`. A
-/// release whose table lists no major 1 either, and whose daemon does not retain the level, still
-/// waits for the session, exit 9, with nothing stopped. This build has one public major, so no public
-/// window ends in this case: it shows that an update reads the levels a release retains and never its
-/// table of public majors, so the local window is independent of the public table, and not that the
-/// local window outlasts a public window that ended.
+/// release whose table lists no major 1 either, and which does not retain the session's level, still
+/// waits for the session, exit 9, with nothing stopped, and goes ahead once the session has closed.
+/// This build has one public major, so no public window ends in this case: it shows that an update
+/// reads the levels a release retains and never its table of public majors, so the local window is
+/// independent of the public table. That the local window outlasts a public window that ended is
+/// shown against a daemon that states a later major, in the upgrade suite.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_keeps_or_waits_for_a_session_by_the_levels_it_retains_whatever_its_table_lists()
 {
@@ -681,17 +682,12 @@ async fn an_update_keeps_or_waits_for_a_session_by_the_levels_it_retains_whateve
         "and it answers, on the release it started from"
     );
 
-    // A release whose table does not list major 1 either, and whose daemon does not retain the
-    // session's level: the session still holds the update.
-    let another = if PACKAGE_VERSION.major == 0 {
-        PackageVersion::new(0, PACKAGE_VERSION.minor + 1, 0)
-    } else {
-        PackageVersion::new(PACKAGE_VERSION.major + 1, 0, 0)
-    };
+    // A release whose table does not list major 1 either, and which retains the level of the release
+    // before this one and not the session's: the session still holds the update.
     let three = Assembled::new(
         "0.3.0+cccccccccccc",
         3,
-        CompatibilityLevel::of(another),
+        kr_protocol::retained::RETAINED_WORKER_LEVELS[0],
         the_root(),
     )
     .listing_public_majors(&[2]);
@@ -732,9 +728,129 @@ async fn an_update_keeps_or_waits_for_a_session_by_the_levels_it_retains_whateve
         kr_ipc::identity::ProcessState::Running,
         "the session's worker runs on"
     );
-    // The session closes through release two's `kr`.
+    // The session closes through release two's `kr`, and the wait ends with the worker: the same
+    // update, run again, goes ahead.
     host.close(&host.store.stable(Program::Kr), &display);
     host.worker_ended(&worker).await;
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive_three.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "the update that waited goes ahead once the session has ended: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(three.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", three.name())
+    );
+}
+
+/// KR-REQ-26.07: a host goes from a release of public major 1 to a release whose daemon states major
+/// 2, and back, with no session live. The `kr` of the release before updates to it and sees that its
+/// daemon answers, though that daemon admits clients of major 2 alone, because the manifest of the
+/// release it makes current lists major 2; the `kr` of release two, which states major 2, rolls the
+/// host back and sees release one's daemon answer in the same way. Each daemon states the major its
+/// release names however it is started, and a client of the other major is refused by it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_goes_from_one_public_major_to_the_next_and_back() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).whose_daemon_states(None);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2)
+        .whose_daemon_states(Some(LATER_MAJOR))
+        .listing_public_majors(&[LATER_MAJOR]);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    assert_eq!(
+        host.daemon_states().await,
+        1,
+        "release one's daemon states major 1"
+    );
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "an update across a public major goes ahead: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name()),
+        "the daemon is the new release's"
+    );
+    assert_eq!(
+        host.daemon_states().await,
+        LATER_MAJOR,
+        "and it states major 2"
+    );
+    let endpoint = host
+        .tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    assert!(
+        LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+            .await
+            .is_err(),
+        "a client of major 1 is refused by a daemon that states major 2"
+    );
+
+    // Release two's `kr` states major 2, as a program of a release of that major does.
+    let (output, said) = host.kr_json_with(
+        &[(LATER_MAJOR_VARIABLE, std::ffi::OsStr::new("2"))],
+        &["host", "rollback", "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "a rollback across a public major goes ahead: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the daemon is release one's again"
+    );
+    assert_eq!(
+        host.daemon_states().await,
+        1,
+        "and it states major 1, though the rollback ran with major 2 set"
+    );
+    assert!(
+        LocalClient::connect_stating(
+            &endpoint,
+            LocalClientKind::Cli,
+            build(),
+            kr_protocol::hello::ProtocolVersion::new(LATER_MAJOR, 0),
+        )
+        .await
+        .is_err(),
+        "a client of major 2 is refused by a daemon that states major 1"
+    );
 }
 
 /// KR-REQ-26.09: an update an earlier run left after its switch is finished by the next run: the

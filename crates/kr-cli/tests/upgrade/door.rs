@@ -14,6 +14,8 @@ use kr_crypto::keys::DeviceKeys;
 use kr_ipc::client::LocalClient;
 use kr_ipc::paths::Endpoint as LocalEndpoint;
 use kr_pairing::direct::{CandidateIdentity, redeem_proof};
+use kr_protocol::error::ErrorCode;
+use kr_protocol::hello::ProtocolVersion;
 use kr_protocol::ids::{DeviceId, DeviceKeyRevision, EnvironmentId};
 use kr_protocol::invitation::InviteGrantKind;
 use kr_protocol::local::LocalClientKind;
@@ -21,6 +23,7 @@ use kr_protocol::method::Method;
 use kr_protocol::pairing::{DeviceName, DevicePlatform};
 use kr_protocol::preauth::{PairRedeemParams, PairRedeemResult};
 use kr_transport::config::EndpointConfig;
+use kr_transport::error::TransportError;
 use kr_transport::handshake::{self, LocalIdentity};
 
 use super::pairing::{self, Signer};
@@ -232,5 +235,49 @@ impl Door {
         .await;
         assert!(!first_owner, "a guest is not the first owner");
         paired.device_id
+    }
+}
+
+/// A device that offers this build's public major, as a phone built for major 1 does, comes to the
+/// door of a host whose daemon states `daemon`, and says why it is refused.
+///
+/// The owner's half is a client of the daemon's own major, which issues the invitation the device
+/// dials; the device's half is refused at its first stream, before any pairing step.
+pub async fn refused_at_the_door(
+    controller: &LocalEndpoint,
+    environment_id: EnvironmentId,
+    daemon: ProtocolVersion,
+) -> ErrorCode {
+    let build = super::build();
+    let keys = DeviceKeys::generate().expect("device keys");
+    let endpoint = kr_transport::endpoint::bind_dialer(&loopback(), &keys.transport)
+        .await
+        .expect("a dialling endpoint");
+    let unpaired = LocalIdentity::new(
+        DeviceId::new(kr_ipc::new_uuid()),
+        DeviceKeyRevision::new(1),
+        *keys.transport.public(),
+        keys.authorisation.clone(),
+        build.clone(),
+    );
+    let ceremony = DeviceKeys::generate().expect("a ceremony key");
+    let mut client = LocalClient::connect_stating(controller, LocalClientKind::Cli, build, daemon)
+        .await
+        .expect("reaches the daemon");
+    let invited = pairing::invite_direct(
+        environment_id,
+        &mut client,
+        InviteGrantKind::PersonalOwner,
+        &kr_pairing::grants::personal_owner_grant(),
+        &Signer::Bootstrap(&ceremony.authorisation),
+    )
+    .await
+    .expect("the host issues the invitation");
+    let payload = pairing::direct_payload(&invited);
+    let connection = pairing::dial_until_connected(&endpoint, pairing::host_addr(&payload)).await;
+    match handshake::connect_unpaired(&connection, &unpaired).await {
+        Err(TransportError::Refused(error)) => error.code,
+        Err(other) => panic!("the door refuses the device with a protocol error, not {other}"),
+        Ok(_) => panic!("a device of a retired major is not admitted"),
     }
 }

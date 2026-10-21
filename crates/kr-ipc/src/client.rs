@@ -21,11 +21,11 @@ use kr_protocol::envelope::{
 };
 use kr_protocol::error::ProtocolError;
 use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, FrameCodec, StreamKind};
-use kr_protocol::hello::{PROTOCOL_VERSION, ReceiveLimits};
+use kr_protocol::hello::{ProtocolVersion, ReceiveLimits};
 use kr_protocol::ids::{ActionId, BuildId, RequestId};
 use kr_protocol::local::{BridgeOrigin, LocalClientKind, LocalHello, LocalHelloAck};
 use kr_protocol::method::{Method, MethodVersion};
-use kr_protocol::retained::Level;
+use kr_protocol::retained::{Level, stated_protocol};
 use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable};
 use kr_protocol::wire::WireMessage;
 use kr_protocol::worker::{
@@ -140,6 +140,7 @@ impl LocalClient {
             build_id,
             ReceiveLimits::default(),
             Some(origin),
+            stated_protocol(),
         )
         .await
     }
@@ -160,7 +161,40 @@ impl LocalClient {
         build_id: BuildId,
         max_receive: ReceiveLimits,
     ) -> Result<Self> {
-        Self::connecting(endpoint, kind, build_id, max_receive, None).await
+        Self::connecting(
+            endpoint,
+            kind,
+            build_id,
+            max_receive,
+            None,
+            stated_protocol(),
+        )
+        .await
+    }
+
+    /// Connects as a client of a build that states `own` as its protocol, whatever this build
+    /// states, so that a test can talk to a daemon that states a later major as a client of that
+    /// major does.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`LocalClient::connect`] returns.
+    #[cfg(feature = "testing")]
+    pub async fn connect_stating(
+        endpoint: &Endpoint,
+        kind: LocalClientKind,
+        build_id: BuildId,
+        own: ProtocolVersion,
+    ) -> Result<Self> {
+        Self::connecting(
+            endpoint,
+            kind,
+            build_id,
+            ReceiveLimits::default(),
+            None,
+            own,
+        )
+        .await
     }
 
     #[cfg(not(feature = "testing"))]
@@ -170,7 +204,15 @@ impl LocalClient {
         build_id: BuildId,
         max_receive: ReceiveLimits,
     ) -> Result<Self> {
-        Self::connecting(endpoint, kind, build_id, max_receive, None).await
+        Self::connecting(
+            endpoint,
+            kind,
+            build_id,
+            max_receive,
+            None,
+            stated_protocol(),
+        )
+        .await
     }
 
     async fn connecting(
@@ -179,6 +221,7 @@ impl LocalClient {
         build_id: BuildId,
         max_receive: ReceiveLimits,
         origin: Option<BridgeOrigin>,
+        own: ProtocolVersion,
     ) -> Result<Self> {
         if kind == LocalClientKind::Controller {
             return Err(IpcError::UnexpectedMessage(
@@ -187,7 +230,7 @@ impl LocalClient {
             ));
         }
         let (reader, writer, acknowledgement) =
-            hello(endpoint, kind, build_id, max_receive, origin).await?;
+            hello(endpoint, kind, build_id, max_receive, origin, own).await?;
         Ok(Self {
             codec: ThisLevel,
             reader,
@@ -231,12 +274,13 @@ async fn hello(
     build_id: BuildId,
     max_receive: ReceiveLimits,
     origin: Option<BridgeOrigin>,
+    own: ProtocolVersion,
 ) -> Result<(FrameReader, FrameWriter, LocalHelloAck)> {
     let connection = Connection::connect(endpoint).await?;
     let (mut reader, mut writer) = split(connection, StreamKind::Control);
     writer
         .write_message(&ControlFrame::Hello(LocalHello {
-            offered_versions: vec![PROTOCOL_VERSION],
+            offered_versions: vec![own],
             build_id,
             client: kind,
             capabilities: CanonicalSet::new(),
@@ -263,9 +307,9 @@ async fn hello(
             ));
         }
     };
-    if acknowledgement.selected_version.major != PROTOCOL_VERSION.major {
+    if acknowledgement.selected_version.major != own.major {
         return Err(IpcError::VersionMismatch {
-            host: PROTOCOL_VERSION.to_string(),
+            host: own.to_string(),
             offered: acknowledgement.selected_version.to_string(),
         });
     }
@@ -331,6 +375,7 @@ impl BoundLink {
             build_id,
             max_receive,
             None,
+            stated_protocol(),
         )
         .await?;
         let level = match bound_to {

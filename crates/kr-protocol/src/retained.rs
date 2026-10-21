@@ -37,6 +37,7 @@ use kr_cbor::{CanonicalValue, Limits};
 use thiserror::Error;
 
 use crate::envelope::{ControlFrame, ParamsValue};
+use crate::hello::{PROTOCOL_VERSION, ProtocolVersion};
 use crate::local::LocalBuild;
 use crate::method::Method;
 use crate::update::{CompatibilityLevel, THIS_LEVEL};
@@ -488,6 +489,46 @@ pub fn levels() -> Vec<CompatibilityLevel> {
     std::iter::once(THIS_LEVEL)
         .chain(RETAINED_WORKER_LEVELS)
         .collect()
+}
+
+/// The protocol this build states as its own on a local link: what a client of a worker offers
+/// first, what the control daemon's client endpoint admits and answers, and what a worker of this
+/// build is expected to answer.
+///
+/// A build with debug assertions reads the variable `KR_TEST_LOCAL_MAJOR` and, where it names a
+/// major, states that major instead, which is how a test makes a process of a later major without
+/// a later major existing. A build without them has no such variable: this is a constant, and the
+/// name of the variable is not in the program.
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn stated_protocol() -> ProtocolVersion {
+    switched_protocol().unwrap_or(PROTOCOL_VERSION)
+}
+
+/// The protocol this build states as its own on a local link: what a client of a worker offers
+/// first, what the control daemon's client endpoint admits and answers, and what a worker of this
+/// build is expected to answer.
+///
+/// A build with debug assertions can be made to state another major for a test. This build has none
+/// of that, and this is a constant.
+#[cfg(not(debug_assertions))]
+#[must_use]
+pub const fn stated_protocol() -> ProtocolVersion {
+    PROTOCOL_VERSION
+}
+
+/// The protocol a test made this process state, where it did: `<major>.0` for the major
+/// `KR_TEST_LOCAL_MAJOR` names. Read once.
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn switched_protocol() -> Option<ProtocolVersion> {
+    static SWITCHED: OnceLock<Option<ProtocolVersion>> = OnceLock::new();
+    *SWITCHED.get_or_init(|| {
+        std::env::var("KR_TEST_LOCAL_MAJOR")
+            .ok()
+            .and_then(|text| text.parse::<u16>().ok())
+            .map(|major| ProtocolVersion::new(major, 0))
+    })
 }
 
 /* -------------------------------------------------------------------------------------------- */

@@ -2612,3 +2612,59 @@ async fn the_release_before_reads_the_journal_of_a_command_session_this_release_
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
 }
+
+/// KR-REQ-26.07: the local window outlasts the public one. A host whose daemon states public major 2
+/// lists only major 2 to a device, so a device of major 1 is refused at the door; and in the same
+/// run that daemon adopts the live worker of the release before, which speaks major 1 and is at a
+/// level the daemon retains, and the session is kept: the worker is the process it was, the `kr` of
+/// release two, which states major 2, closes it through the daemon, and a client of major 1 is
+/// refused by that daemon.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_of_a_later_public_major_keeps_the_session_of_the_release_before() {
+    let mut updated = Updated::on_the_network().await;
+    let host = &mut updated.host;
+    assert!(host.stop_the_daemon().await, "the daemon stops");
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon_with(
+        &controller,
+        &[(LATER_MAJOR_VARIABLE, std::ffi::OsStr::new("2"))],
+        &[],
+    )
+    .await;
+    let endpoint = host
+        .tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let later = kr_protocol::hello::ProtocolVersion::new(LATER_MAJOR, 0);
+    assert_eq!(host.daemon_states().await, LATER_MAJOR);
+
+    // Major 1 has left the device list: a device that offers it is refused at the door.
+    assert_eq!(
+        door::refused_at_the_door(&endpoint, host.tree.environment_id(), later).await,
+        kr_protocol::error::ErrorCode::UnsupportedSchema
+    );
+    // And the daemon admits clients of the major it states alone.
+    assert!(
+        LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+            .await
+            .is_err(),
+        "a client of major 1 is refused by a daemon that states major 2"
+    );
+
+    // The worker of the release before, which speaks major 1, is still reached through the daemon
+    // of major 2, and the session is kept.
+    updated.the_worker_is_as_it_was().await;
+    let host = &updated.host;
+    let (closed, said) = host.kr_json_with(
+        &[(LATER_MAJOR_VARIABLE, std::ffi::OsStr::new("2"))],
+        &["close", &updated.display, "--json"],
+    );
+    assert!(
+        closed.status.success(),
+        "release two's kr closes the session through the daemon of major 2: {said} {}",
+        String::from_utf8_lossy(&closed.stderr)
+    );
+    host.worker_ended(&updated.worker).await;
+    host.released(updated.one.name()).await;
+}
