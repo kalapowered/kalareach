@@ -757,3 +757,185 @@ async fn an_expiring_grant_is_decided_again_once_the_owner_establishes_the_clock
         "the grant is in force again once the owner has established the clock"
     );
 }
+
+/// KR-REQ-09.17, KR-REQ-09.19: a grant that ran out stays out in a new boot whatever the wall clock
+/// says, and the owner's establishment of the clock, the retrust this host performs, records a new
+/// checkpoint and keeps every expiry already on record.
+///
+/// Two expiring grants run out in one boot: a paired device's, and one in the grant store. The
+/// host is stopped and started again in another boot with its wall clock wound back to before both
+/// expiries, so that nothing in the new boot's own readings shows they ran out. The host
+/// distrusts the clock, and neither grant is in force: the device is not a paired peer and the
+/// stored grant's end is told from its record. An expiring grant this boot never anchored is not
+/// in force either, since an untrusted wall clock cannot reconstitute it. The owner establishes
+/// the clock: its checkpoint is the wound-back reading, a grant that has not run out is decided
+/// again, and the two ends that were on record are still there and still tell the grants out, with
+/// the wall clock reading before their expiry.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_grant_stays_out_in_a_new_boot_and_the_owners_establishment_keeps_it_out() {
+    use kr_protocol::grant::GrantExpiry;
+    use kr_protocol::identity::{BootIdentity, BootIdentitySource};
+    use kr_protocol::ids::GrantId;
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::{Bytes, TimestampMs, Uuid};
+    use kr_transport::handshake::PairedDirectory;
+
+    use crate::grants::GrantRecord;
+    use crate::service::net::lifetimes::GrantEnd;
+    use crate::service::net::tests::{setup, started};
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let (continuous, wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let start = wall.load(Ordering::SeqCst);
+    assert!(proven(&controller), "the clock is proven where it starts");
+    let ends_in_a_minute = GrantExpiry::At {
+        expires_at_ms: TimestampMs::new(start + 60_000),
+    };
+    let ends_tomorrow = GrantExpiry::At {
+        expires_at_ms: TimestampMs::new(start + 86_400_000),
+    };
+    let keys = |byte: u8| {
+        let device = kr_crypto::keys::DeviceKeys::generate().expect("keys");
+        paired(
+            &controller,
+            &device,
+            byte,
+            &[ActionRight::SessionView],
+            if byte == 0x31 {
+                ends_in_a_minute
+            } else {
+                ends_tomorrow
+            },
+        )
+    };
+    let runs_out = keys(0x31);
+    let lasts = keys(0x32);
+    let stored = {
+        let mut grant = runs_out.grant.clone();
+        grant.grant_id = GrantId::new(Uuid::from_bytes([0x41; 16]));
+        GrantRecord {
+            grant,
+            session_id: None,
+            issued_at_ms: 1,
+            activated_at_ms: Some(1),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        }
+    };
+    controller
+        .sharing()
+        .grants()
+        .issue(&stored, || Ok(()))
+        .expect("the stored grant is written");
+    assert!(decides(&controller, &runs_out) && decides(&controller, &lasts));
+    assert_eq!(
+        controller
+            .lifetimes()
+            .stored_end(controller.sharing().grants(), &stored)
+            .expect("decided"),
+        None,
+        "the stored grant is in force before it runs out"
+    );
+
+    // Both continuous and wall clocks pass the end. The ends are written down where the next boot
+    // reads them: on the device's record, and on the stored grant.
+    continuous.advance(Duration::from_secs(61));
+    wall.store(start + 61_000, Ordering::SeqCst);
+    assert!(!decides(&controller, &runs_out), "the grant has run out");
+    assert_eq!(
+        controller
+            .lifetimes()
+            .stored_end(controller.sharing().grants(), &stored)
+            .expect("decided"),
+        Some(GrantEnd::Expired)
+    );
+    let tombstone = controller
+        .devices()
+        .record_for_device(runs_out.device_id)
+        .expect("readable")
+        .expect("the device")
+        .expired_at_ms
+        .expect("the end is on the device's record");
+    // What the host owes its record is written, as its own task writes it, before it stops.
+    controller
+        .lifetimes()
+        .clock_trust()
+        .settle(controller.devices())
+        .expect("the clock record is written");
+    stopped(controller).await;
+
+    // Another boot, with the wall clock wound back to before both expiries.
+    let (_continuous, wall, clocks) = manual_clocks();
+    wall.store(start, Ordering::SeqCst);
+    let next_boot = BootIdentity {
+        source: BootIdentitySource::MacosBootSessionUuid,
+        value: Bytes::new(vec![0x5b; 16]),
+    };
+    let controller =
+        started(|| Controller::start_on_clocks(setup(&temp, next_boot.clone()), clocks.clone()))
+            .await;
+    assert!(
+        !proven(&controller),
+        "a wall clock behind what the host recorded is not proven"
+    );
+    let record_of = |device: &crate::service::net::devices::DeviceRecord| {
+        controller
+            .devices()
+            .record_for_device(device.device_id)
+            .expect("readable")
+            .expect("the device")
+    };
+    let held_out = |controller: &Controller| {
+        assert!(
+            controller
+                .devices()
+                .paired_peer(&runs_out.endpoint_id)
+                .is_none(),
+            "a device whose grant ran out is not a paired peer"
+        );
+        assert_eq!(record_of(&runs_out).expired_at_ms, Some(tombstone));
+        assert_eq!(
+            controller
+                .lifetimes()
+                .stored_end(controller.sharing().grants(), &stored)
+                .expect("an end on record is told before any clock"),
+            Some(GrantEnd::Expired)
+        );
+    };
+    held_out(&controller);
+    assert!(
+        matches!(
+            controller.lifetimes().paired(&record_of(&lasts)),
+            Err(crate::error::ControllerError::ClockUntrusted { .. })
+        ),
+        "a grant this boot never anchored is not reconstituted from a wall clock nobody trusts"
+    );
+    let before = controller.devices().clock_record().expect("readable");
+    assert!(
+        before.observed_ms.is_some_and(|mark| mark > start + 60_000),
+        "the checkpoint on record is the one from before the wall clock was wound back"
+    );
+
+    // The owner establishes the clock.
+    the_owner_establishes(&temp, &controller).await;
+    assert!(proven(&controller), "the owner's word ends the distrust");
+    let after = controller.devices().clock_record().expect("readable");
+    assert_eq!(
+        after.confirmed_at_ms,
+        Some(start),
+        "a new checkpoint: the reading the owner established the clock at"
+    );
+    assert_eq!(
+        after.observed_ms,
+        Some(start),
+        "and the mark moved to it, from the later one that was on record"
+    );
+    assert!(
+        decides(&controller, &record_of(&lasts)),
+        "a grant that has not run out is decided again"
+    );
+    held_out(&controller);
+    drop(controller);
+}
