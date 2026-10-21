@@ -3148,11 +3148,12 @@ test.describe('pairing', () => {
     await open(page)
     await page.getByRole('button', { name: 'Pair with a host' }).click()
     await page.evaluate(() => {
-      window.krTestHost?.setPasteboard({
+      window.krTestHost?.setIntake('pasteboard', {
         invitation: null,
         failure: 'not_an_invitation',
         cleared: false,
-        declined: false
+        declined: false,
+        cancelled: false
       })
     })
     await page.getByTestId('paste-invitation').click()
