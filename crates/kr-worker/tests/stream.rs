@@ -1870,11 +1870,9 @@ async fn kr_req_12_06_a_held_permit_is_stopped_by_a_leave_an_unlisted_frame_and_
         .admit_approval(&caller, &world.rich_answer("accept"), NOW)
         .expect("admitted");
     world.owner.shutdown();
-    let refused = world
-        .broker
-        .mark_approval(&admitted, NOW)
-        .err()
-        .expect("the transport is closed");
+    let Err(refused) = world.broker.mark_approval(&admitted, NOW) else {
+        panic!("the transport is closed, so nothing is marked");
+    };
     assert!(refused.proven_unsent(), "{refused:?}");
     assert_eq!(
         refused.code(),

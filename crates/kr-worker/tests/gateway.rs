@@ -1863,10 +1863,9 @@ async fn kr_req_11_27_one_exclusive_admission_carries_one_answer_whichever_write
         )
         .expect("a native answer takes a reservation that has no marker");
     assert!(forwarded.get(), "the native answer is the one that goes");
-    let overtaken = broker
-        .mark_approval(&reserved, TimestampMs::new(15))
-        .err()
-        .expect("the rich answer finds the resource taken at its marker");
+    let Err(overtaken) = broker.mark_approval(&reserved, TimestampMs::new(15)) else {
+        panic!("the rich answer finds the resource taken at its marker");
+    };
     assert_eq!(overtaken.code(), ErrorCode::QuestionResolved);
     assert!(
         overtaken.proven_unsent(),
