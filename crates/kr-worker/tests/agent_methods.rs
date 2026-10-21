@@ -486,9 +486,6 @@ fn kr_req_23_39_an_agent_read_names_the_instance_carries_its_evidence_and_report
 async fn kr_req_23_40_the_five_mutations_carry_the_registrys_rights_and_check_their_binding() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
-    broker
-        .set_turn(instance(), Some(AgentTurnId::new("turn-1").expect("valid")))
-        .expect("a turn is running");
 
     // Five methods, and the rights the registry requires of them are not one right repeated.
     let rights: Vec<ActionRight> = [
@@ -548,6 +545,10 @@ async fn kr_req_23_40_the_five_mutations_carry_the_registrys_rights_and_check_th
         Some("upstream-1"),
         "the answer names what the upstream called it"
     );
+    // A turn starts, which a prompt submitted now would not queue behind: the rest act on it.
+    broker
+        .set_turn(instance(), Some(AgentTurnId::new("turn-1").expect("valid")))
+        .expect("a turn is running");
     broker
         .agent_prompt(&caller(), &prompt, true, TimestampMs::new(21))
         .await
