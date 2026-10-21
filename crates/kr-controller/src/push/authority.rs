@@ -500,6 +500,7 @@ impl RecipientAuthority for GrantedRecipients {
 mod tests {
     use super::*;
     use crate::grants::GrantRecord;
+    use crate::grants::policy::UtcFloor;
     use kr_protocol::grant::{
         EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
     };
@@ -651,12 +652,12 @@ mod tests {
         }
     }
 
-    /// A grant whose expiry UTC has passed admits nothing, and the end is written down as every end
-    /// this host finds is: as the grant's tombstone, and as the floor it was found at. So a host
-    /// that holds no anchor for the grant and whose wall clock reads before the expiry, as after a
-    /// reboot with the clock wound back, finds it ended too. Alike when the question is the first
-    /// in this boot and when an earlier one anchored the grant. The control: with UTC short of the
-    /// expiry, the question admits its recipient and nothing is written.
+    /// KR-REQ-09.18: a grant whose expiry UTC has passed admits nothing, and the end is written
+    /// down as every end this host finds is: as the grant's tombstone, and as the floor it was
+    /// found at. So a host that holds no anchor for the grant and whose wall clock reads before
+    /// the expiry, as after a reboot with the clock wound back, finds it ended too. Alike when the
+    /// question is the first in this boot and when an earlier one anchored the grant. The control:
+    /// with UTC short of the expiry, the question admits its recipient and nothing is written.
     #[test]
     fn a_grant_run_out_in_utc_is_written_down_with_the_floor_it_was_found_at() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -724,8 +725,8 @@ mod tests {
         }
     }
 
-    /// A message under a personal grant whose offline bound has run out admits nothing: in UTC, and
-    /// then the floor it was found at is written down, so a clock wound back before a restart
+    /// KR-REQ-09.18: a message under a personal grant whose offline bound has run out admits
+    /// nothing: in UTC, and then the floor it was found at is written down, so a clock wound back before a restart
     /// cannot revive the bound; and on the continuous clock, whatever UTC says. The control: inside
     /// the bound it admits, and no floor is written.
     #[test]
@@ -787,6 +788,58 @@ mod tests {
                 "only a lapse found in UTC writes the floor down, at the reading it was found at"
             );
             assert!(!floor.is_owed(), "and nothing is left owed");
+
+            // The host restarts, with its wall clock wound back to where the bound was chosen. Its
+            // floor is what it had written down and nothing else: the policy is rebuilt from the
+            // stored one. A bound that lapsed in UTC is still lapsed, because the floor it was
+            // found at was written; the control, a bound that had not lapsed, still admits.
+            let stored = match lapsed {
+                Some("in UTC") => Some(
+                    sharing
+                        .grants()
+                        .stored_policy()
+                        .expect("readable")
+                        .expect("a lapse found in UTC wrote the policy down"),
+                ),
+                None => Some(policy.lock().expect("not poisoned").snapshot()),
+                Some(_) => None,
+            };
+            if let Some(stored) = stored {
+                let restored = Arc::new(Mutex::new(HostPolicy::restore(
+                    &stored,
+                    AuthorityRevision::new(1),
+                    Arc::new(UtcFloor::at(stored.utc_floor_ms.get())),
+                )));
+                // The bound's continuous end is read back from the device directory by a daemon
+                // and published again: a minute out on this boot's clock, as it was chosen.
+                let continuous_again = kr_transport::clock::ManualClock::new();
+                restored
+                    .lock()
+                    .expect("not poisoned")
+                    .offline_cell()
+                    .publish(
+                        crate::grants::policy::BoundIdentity::Offline {
+                            synchronised_at_ms: Some(NOW),
+                        },
+                        kr_transport::clock::ContinuousClock::now(&continuous_again)
+                            .checked_add(std::time::Duration::from_secs(60)),
+                        Some(NOW + 60_001),
+                        false,
+                        false,
+                    );
+                let restarted = GrantedRecipients::at(
+                    Arc::clone(&sharing),
+                    restored,
+                    environment(),
+                    Arc::new(continuous_again),
+                    || NOW,
+                );
+                assert_eq!(
+                    restarted.scope_for(&rule(Some(14))).is_some(),
+                    lapsed.is_none(),
+                    "after a restart with the clock wound back, lapsed {lapsed:?}"
+                );
+            }
         }
     }
 

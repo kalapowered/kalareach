@@ -1032,8 +1032,8 @@ fn host_settings() -> kr_controller::service::net::config::NetworkSettings {
     }
 }
 
-/// A feed that cannot be reached, or that is slow, is not a removal: nothing is refused, the status
-/// is stale, and the connection that waited for it is served after the bound.
+/// KR-REQ-10.46: a feed that cannot be reached, or that is slow, is not a removal: nothing is
+/// refused, the status is stale, and the connection that waited for it is served after the bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_feed_that_cannot_be_reached_refuses_nothing_and_shows_stale_status() {
     let rig = Rig::start().await;

@@ -954,7 +954,7 @@ mod tests {
         )
     }
 
-    /// Rule C's grant snapshots: a stored grant with an expiry is anchored once per boot, and a
+    /// KR-REQ-09.17: a stored grant with an expiry is anchored once per boot, and a
     /// daemon restarted in the same boot reads its anchor back rather than deriving it again. With
     /// UTC moved past its expiry and its continuous deadline still ahead it is out of force, and
     /// the end it was found at is written down, so a new boot refuses it whatever the wall clock
