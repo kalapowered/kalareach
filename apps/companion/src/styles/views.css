@@ -1496,6 +1496,20 @@
   padding-top: var(--gap-4);
 }
 
+/*
+ * The row that names the pairing service wraps like a host's row: at a larger text size the
+ * control drops beneath the name instead of running past the screen's edge, and a long name breaks.
+ */
+.pairing-settings .divided-row {
+  flex-wrap: wrap;
+}
+
+.pairing-settings .divided-row > p {
+  flex: 1 1 10rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .pairing-status {
   display: inline-flex;
   align-items: center;
