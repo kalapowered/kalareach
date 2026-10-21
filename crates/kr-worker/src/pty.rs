@@ -1097,7 +1097,7 @@ mod tests {
         let low =
             rustix::io::fcntl_dupfd_cloexec(&held, 100).expect("a descriptor low in the table");
         rustix::io::fcntl_setfd(&low, rustix::io::FdFlags::empty()).expect("left open on exec");
-        let far = spawn::tests::descriptor_far_up(&held);
+        let far = kr_ipc::testing::descriptor_far_up(&held);
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let mut reader = pty.reader().expect("a reader");
         let command = crate::testing::posix_script(

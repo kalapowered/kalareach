@@ -16,6 +16,33 @@ use crate::paths::{EnvironmentPaths, HostPaths};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod volumes;
 
+/// A descriptor of this process's as far up the table as the system lets one go, left open on
+/// exec, and the number it has.
+///
+/// Placed by asking for the first free number at or above a high one, which takes nothing
+/// another case holds, and tried lower until the system accepts one: the highest number it
+/// gives is below its own limit on descriptors, which is not always the soft limit.
+///
+/// # Panics
+///
+/// Panics when no number can be had at all.
+#[cfg(all(unix, not(any(target_os = "ios", target_os = "android"))))]
+#[must_use]
+pub fn descriptor_far_up(like: &std::fs::File) -> std::os::fd::OwnedFd {
+    let mut wanted = 70_000;
+    loop {
+        match rustix::io::fcntl_dupfd_cloexec(like, wanted) {
+            Ok(placed) => {
+                rustix::io::fcntl_setfd(&placed, rustix::io::FdFlags::empty())
+                    .expect("left open on exec");
+                return placed;
+            }
+            Err(_) if wanted > 64 => wanted /= 2,
+            Err(error) => panic!("no descriptor could be placed far up the table: {error}"),
+        }
+    }
+}
+
 /// A loopback address that nothing answers at, whatever else is running beside a test.
 ///
 /// A test that needs a connection refused cannot take the port it frees: another test in the same

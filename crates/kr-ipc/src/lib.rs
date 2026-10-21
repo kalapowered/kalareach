@@ -67,6 +67,8 @@ pub mod error;
 pub mod floor;
 pub mod framed;
 pub mod identity;
+#[cfg(all(unix, not(any(target_os = "ios", target_os = "android"))))]
+pub mod inheritance;
 pub mod install;
 pub mod paths;
 pub mod peer;
