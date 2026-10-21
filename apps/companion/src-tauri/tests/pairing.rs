@@ -15,8 +15,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use companion_platform::scan::Scan;
 use companion_tauri::device::Device;
 use companion_tauri::owner::Owner;
+use companion_tauri::pairing::Source;
 use kr_client::pairing::BoxFuture;
 use kr_client::pairing::candidate::{AttemptState, CandidateRoom};
 use kr_client::pairing::clock::DeviceClock;
@@ -30,6 +32,7 @@ use kr_protocol::ids::EnvironmentId;
 use kr_protocol::invitation::PairingApproval;
 use kr_protocol::invitation::{
     InviteEntry, InviteGrantKind, InviteMode, InviteModeKind, PairInviteParams, PairInviteResult,
+    default_rendezvous_origin,
 };
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{
@@ -39,7 +42,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nullable, to_base64url};
 use net_support::pairing::{self as calls, Signer};
 use net_support::{Host, proposal};
-use support::{Capture, Companion, StubPaste, WATCHDOG, device, owner_device, reached};
+use support::{Capture, Companion, StubIntake, WATCHDOG, device, owner_device, reached};
 
 fn awaiting(state: &AttemptState) -> bool {
     matches!(state, AttemptState::AwaitingApproval { .. })
@@ -225,9 +228,9 @@ fn key_bytes(store: &dyn SecretStore) -> Vec<String> {
 }
 
 /// KR-REQ-10.06, KR-REQ-10.36: everything the page is sent, through the commands it calls and the
-/// two events the application publishes, while this computer pairs by a typed code and by a direct
-/// invitation read from the pasteboard, and while it confirms one request as an owner and declines
-/// another, carries none of these: the invitations' text or secret, the code's secret characters,
+/// two events the application publishes, while this computer pairs by a typed code, by a direct
+/// invitation read from the pasteboard and by one the phone's scanner read, and while it confirms
+/// one request as an owner and declines another, carries none of these: the invitations' text or secret, the code's secret characters,
 /// a challenge's identifier, nonce or digest, the owner's proof, the transcript and bundle digests
 /// the owner approves, or any key of this computer, the owner or the host. The same scan finds a
 /// secret planted in one event, so it is shown to work on what the events carry. A confirming
@@ -251,7 +254,7 @@ async fn the_page_is_sent_no_secret_while_this_computer_pairs_and_confirms() {
         code_data.path(),
         support::parts(Arc::clone(&code_secrets), room()),
         StubCeremony::answering(CeremonyOutcome::Confirmed),
-        Arc::new(StubPaste::default()),
+        Arc::new(StubIntake::default()),
     );
     let invited = invite_code(environment, &mut client, &owner).await;
     let InviteEntry::Code { code, qr_text, .. } = &invited.entry else {
@@ -293,7 +296,7 @@ async fn the_page_is_sent_no_secret_while_this_computer_pairs_and_confirms() {
     };
     let direct_data = tempfile::tempdir().expect("a directory");
     let direct_secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
-    let pasteboard = StubPaste::holding(direct_text.as_str(), false);
+    let pasteboard = StubIntake::holding(direct_text.as_str(), false);
     let by_paste = Companion::start(
         direct_data.path(),
         support::parts(Arc::clone(&direct_secrets), room()),
@@ -318,6 +321,55 @@ async fn the_page_is_sent_no_secret_while_this_computer_pairs_and_confirms() {
         .expect("the owner approves");
     by_paste.reached(|state| state["state"] == "paired").await;
 
+    // By a direct invitation the phone's scanner read, on a third computer: the text goes from the
+    // scanner to native code and no further.
+    let scanned = calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await
+    .expect("a direct invitation");
+    let InviteEntry::Direct {
+        qr_text: scanned_text,
+    } = &scanned.entry
+    else {
+        panic!("a direct invitation");
+    };
+    let scan_data = tempfile::tempdir().expect("a directory");
+    let scan_secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
+    let scanner = StubIntake::holding("what the pasteboard holds", false);
+    scanner.will_read(scanned_text.as_str());
+    let by_scan = Companion::start(
+        scan_data.path(),
+        support::parts(Arc::clone(&scan_secrets), room()),
+        StubCeremony::answering(CeremonyOutcome::Confirmed),
+        scanner.clone(),
+    );
+    let seen = by_scan
+        .call("pairing_scan", json!({}))
+        .expect("the invitation is read");
+    assert_eq!(seen["invitation"]["mode"], "direct");
+    assert_eq!(seen["cleared"], false);
+    assert_eq!(
+        scanner.held().as_deref(),
+        Some("what the pasteboard holds"),
+        "a scan leaves the pasteboard alone"
+    );
+    by_scan
+        .call("pairing_start_read", json!({}))
+        .expect("started");
+    by_scan
+        .reached(|state| state["state"] == "awaiting_approval")
+        .await;
+    secrets.extend(approved(&mut client, scanned.invitation_id).await);
+    calls::confirm_candidate(environment, &mut client, scanned.invitation_id, &owner)
+        .await
+        .expect("the owner approves");
+    by_scan.reached(|state| state["state"] == "paired").await;
+
     // As the owner: one request confirmed, and then one declined.
     let owner_data = tempfile::tempdir().expect("a directory");
     let owner_secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
@@ -328,7 +380,7 @@ async fn the_page_is_sent_no_secret_while_this_computer_pairs_and_confirms() {
         owner_data.path(),
         support::parts(Arc::clone(&owner_secrets), room()),
         ceremony.clone(),
-        Arc::new(StubPaste::default()),
+        Arc::new(StubIntake::default()),
     );
     support::record_owned(&as_owner.device(), &host, "the test host");
     let challenge = calls::request(environment, &mut client, an_invitation())
@@ -396,6 +448,7 @@ async fn the_page_is_sent_no_secret_while_this_computer_pairs_and_confirms() {
 
     // Everything the page was sent, scanned for every secret it must not carry.
     let payload = calls::direct_payload(&direct);
+    let scanned_payload = calls::direct_payload(&scanned);
     let QrPayload::Code(code_payload) =
         QrPayload::from_text(qr_text.as_str()).expect("the code's payload")
     else {
@@ -411,6 +464,7 @@ async fn the_page_is_sent_no_secret_while_this_computer_pairs_and_confirms() {
     secrets.extend([
         qr_text.as_str().to_owned(),
         direct_text.as_str().to_owned(),
+        scanned_text.as_str().to_owned(),
         code.clone(),
         code_secret,
         challenge.confirmation_id.to_string(),
@@ -419,6 +473,7 @@ async fn the_page_is_sent_no_secret_while_this_computer_pairs_and_confirms() {
     let host_keys = host.network().pairing().identity().keys;
     for bytes in [
         payload.secret.expose().to_vec(),
+        scanned_payload.secret.expose().to_vec(),
         challenge.nonce.as_bytes().to_vec(),
         challenge.action_digest.as_bytes().to_vec(),
         declined.nonce.as_bytes().to_vec(),
@@ -429,10 +484,15 @@ async fn the_page_is_sent_no_secret_while_this_computer_pairs_and_confirms() {
     ] {
         secrets.extend(spellings(&bytes));
     }
-    for store in [&owner_secrets, &code_secrets, &direct_secrets] {
+    for store in [
+        &owner_secrets,
+        &code_secrets,
+        &direct_secrets,
+        &scan_secrets,
+    ] {
         secrets.extend(key_bytes(&**store));
     }
-    let companions = [&by_code, &by_paste, &as_owner];
+    let companions = [&by_code, &by_paste, &by_scan, &as_owner];
     for companion in companions {
         assert!(
             companion
@@ -537,7 +597,7 @@ async fn the_watcher_never_cuts_off_an_attempt_that_shares_its_relay() {
         panic!("a direct invitation");
     };
     let invitation = device.read(qr_text.as_str()).expect("an invitation");
-    let _ = device.hold(invitation);
+    let _ = device.hold_for(device.begin_intake(), invitation);
     device.start_held().expect("started");
     let state = reached(&device, awaiting).await;
     assert!(awaiting(&state), "{state:?}");
@@ -761,7 +821,7 @@ async fn a_code_for_another_service_contacts_nothing_until_the_person_accepts_it
     .expect("the invitation's text");
     let room = Arc::new(CountingRoom::default());
     let data = tempfile::tempdir().expect("a directory");
-    let pasteboard = StubPaste::holding(&text, false);
+    let pasteboard = StubIntake::holding(&text, false);
     let companion = Companion::start(
         data.path(),
         support::parts(Arc::new(MemoryStore::new()), room.clone()),
@@ -810,6 +870,242 @@ async fn a_code_for_another_service_contacts_nothing_until_the_person_accepts_it
         .map(|(origin, _)| origin.as_str().to_owned())
         .collect();
     assert_eq!(opened, vec!["https://pair.example.org".to_owned()]);
+}
+
+/// A code naming another service, as the camera or a picture would hand it to native code.
+fn another_services_code() -> String {
+    QrPayload::Code(CodeQrPayload {
+        rendezvous_origin: RendezvousOrigin::new("https://pair.example.org").expect("an origin"),
+        code: ShortCode::new("aB3x-Yz7-9Qw").expect("a code"),
+    })
+    .to_text()
+    .expect("the invitation's text")
+    .to_string()
+}
+
+/// A device on a room that opens nothing, for what a test does with what it takes in.
+fn quiet_device(data: &std::path::Path) -> (Arc<Device>, Arc<CountingRoom>) {
+    let room = Arc::new(CountingRoom::default());
+    let device = device(
+        data,
+        Arc::new(MemoryStore::new()),
+        room.clone(),
+        &Arc::new(Capture::default()),
+    );
+    (device, room)
+}
+
+/// KR-REQ-10.17, KR-REQ-10.38: a code the phone's camera or the picker reads is taken in the way a
+/// pasted invitation is. A QR that names another service waits for the person's answer in the
+/// platform's own alert, which names both services, and a declined one holds nothing and contacts
+/// nothing; the text of a read code never reaches the page; what is not an invitation, a picture
+/// with no code and a camera that is not allowed are three different words; and a scanner or a
+/// picker the person closes is no failure and leaves a held invitation as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_code_the_camera_or_the_picker_reads_is_taken_in_as_a_pasted_one_is() {
+    use companion_tauri::pairing::take_in;
+
+    let data = tempfile::tempdir().expect("a directory");
+    let (device, room) = quiet_device(data.path());
+    let intake = StubIntake::holding("what the pasteboard holds", false);
+    let text = another_services_code();
+
+    // Declined at the alert: nothing is held and no room is opened.
+    intake.will_read(&text);
+    let view = take_in(&*intake, &device, Source::Camera).await;
+    assert!(view.declined && view.invitation.is_none() && !view.cancelled);
+    assert_eq!(
+        *intake.asked.lock().expect("the record"),
+        vec![(
+            "https://pair.example.org".to_owned(),
+            "https://reach.kala.to".to_owned()
+        )],
+        "the alert named both services"
+    );
+    assert!(device.view().invitation.is_none());
+    assert!(
+        device.start_held().is_err(),
+        "nothing is waiting to be used"
+    );
+    assert_eq!(room.opened(), 0, "no room was opened");
+
+    // Accepted, from a picture this time: held, and the pasteboard untouched.
+    intake.copy("what the pasteboard holds", true);
+    intake.will_read(&text);
+    let view = take_in(&*intake, &device, Source::Photo).await;
+    assert_eq!(
+        view.invitation
+            .as_ref()
+            .and_then(|each| each.origin_host.as_deref()),
+        Some("pair.example.org")
+    );
+    assert!(!view.cleared, "a picture is no pasteboard");
+    assert_eq!(intake.held().as_deref(), Some("what the pasteboard holds"));
+    assert_eq!(
+        *intake.read_from.lock().expect("the record"),
+        vec![Source::Camera, Source::Photo]
+    );
+
+    // Closing the scanner is no failure, and the invitation already held stays.
+    intake.will_answer(Scan::Cancelled);
+    let view = take_in(&*intake, &device, Source::Camera).await;
+    assert!(view.cancelled && view.failure.is_none());
+    assert!(device.view().invitation.is_some(), "the held one stays");
+
+    // What is not a KalaReach invitation is refused whatever read it, and holds nothing new.
+    intake.will_read(r#"{"mode":"direct"}"#);
+    let view = take_in(&*intake, &device, Source::Camera).await;
+    assert_eq!(view.failure, Some(FailureKind::NotAnInvitation));
+
+    // Three words for three things.
+    intake.will_answer(Scan::NoCode);
+    let view = take_in(&*intake, &device, Source::Photo).await;
+    assert_eq!(view.failure, Some(FailureKind::NoCodeFound));
+    intake.will_answer(Scan::CameraDenied);
+    let view = take_in(&*intake, &device, Source::Camera).await;
+    assert_eq!(view.failure, Some(FailureKind::CameraDenied));
+    intake.will_fail();
+    let view = take_in(&*intake, &device, Source::Camera).await;
+    assert_eq!(view.failure, Some(FailureKind::CameraDenied));
+    intake.will_fail();
+    let view = take_in(&*intake, &device, Source::Photo).await;
+    assert_eq!(view.failure, Some(FailureKind::NoCodeFound));
+}
+
+/// An intake holds what it read only while it is the one under way. An answer to the alert that
+/// arrives after a stop, after a newer intake or after an attempt began holds nothing, whatever the
+/// answer: the person is told nothing happened, and what a newer intake held stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_intake_that_was_overtaken_holds_nothing() {
+    use companion_tauri::pairing::take_in;
+
+    let data = tempfile::tempdir().expect("a directory");
+    let (device, _room) = quiet_device(data.path());
+    let intake = StubIntake::holding("", true);
+    let text = another_services_code();
+
+    // The alert waits until the test answers it; the answer comes once the alert was asked.
+    let asked = |intake: &Arc<StubIntake>| {
+        let intake = Arc::clone(intake);
+        async move {
+            tokio::time::timeout(WATCHDOG, async {
+                while intake.asked.lock().expect("the record").is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the alert is raised");
+        }
+    };
+
+    // After a stop.
+    let answer = intake.hold_the_alert();
+    intake.will_read(&text);
+    let (view, ()) = tokio::join!(take_in(&*intake, &device, Source::Camera), async {
+        asked(&intake).await;
+        device.stop().await;
+        answer.send(true).expect("the intake waits");
+    });
+    assert!(view.cancelled && view.invitation.is_none());
+    assert!(device.view().invitation.is_none(), "nothing was restored");
+
+    // After a newer intake, which holds its own invitation.
+    intake.asked.lock().expect("the record").clear();
+    let answer = intake.hold_the_alert();
+    intake.will_read(&text);
+    let newer = QrPayload::Code(CodeQrPayload {
+        rendezvous_origin: default_rendezvous_origin(),
+        code: ShortCode::new("Zx9k-Ab3-Cd4").expect("a code"),
+    })
+    .to_text()
+    .expect("the invitation's text")
+    .to_string();
+    let (view, newer_view) = tokio::join!(take_in(&*intake, &device, Source::Camera), async {
+        asked(&intake).await;
+        intake.copy(&newer, true);
+        let newer_view = take_in(&*intake, &device, Source::Pasteboard).await;
+        answer.send(true).expect("the intake waits");
+        newer_view
+    });
+    assert!(view.cancelled && view.invitation.is_none());
+    assert_eq!(
+        newer_view
+            .invitation
+            .as_ref()
+            .and_then(|each| each.origin_host.as_deref()),
+        Some("reach.kala.to")
+    );
+    assert_eq!(
+        device.view().invitation.and_then(|each| each.origin_host),
+        Some("reach.kala.to".to_owned()),
+        "the newer intake's invitation is the one held"
+    );
+    device.stop().await;
+
+    // After an attempt began.
+    intake.asked.lock().expect("the record").clear();
+    let answer = intake.hold_the_alert();
+    intake.will_read(&text);
+    let (view, ()) = tokio::join!(take_in(&*intake, &device, Source::Camera), async {
+        asked(&intake).await;
+        device.start_code("Zx9k-Ab3-Cd4").expect("started");
+        answer.send(true).expect("the intake waits");
+    });
+    assert!(view.cancelled && view.invitation.is_none());
+    assert!(device.view().invitation.is_none(), "nothing was restored");
+    device.stop().await;
+}
+
+/// The page is told which sources this device reads a code from: a desktop none, a phone the camera
+/// and the picker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_page_is_told_where_this_device_reads_a_code_from() {
+    use companion_platform::scan::Sources;
+    use serde_json::json;
+
+    let data = tempfile::tempdir().expect("a directory");
+    let intake = StubIntake::holding("", false);
+    intake.offering(Sources {
+        camera: true,
+        photo: true,
+    });
+    let companion = Companion::start(
+        data.path(),
+        support::parts(
+            Arc::new(MemoryStore::new()),
+            Arc::new(CountingRoom::default()),
+        ),
+        StubCeremony::answering(CeremonyOutcome::Confirmed),
+        intake,
+    );
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let view = companion
+                .call("pairing_view", json!({}))
+                .expect("the pairing screen's state");
+            if view["sources"] == json!({ "camera": true, "photo": true }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the page is told what this device offers");
+
+    let desktop = tempfile::tempdir().expect("a directory");
+    let none = Companion::start(
+        desktop.path(),
+        support::parts(
+            Arc::new(MemoryStore::new()),
+            Arc::new(CountingRoom::default()),
+        ),
+        StubCeremony::answering(CeremonyOutcome::Confirmed),
+        Arc::new(StubIntake::default()),
+    );
+    assert_eq!(
+        none.call("pairing_view", json!({})).expect("the screen")["sources"],
+        json!({ "camera": false, "photo": false })
+    );
 }
 
 /// KR-REQ-10.32: this computer counts its tries with a code in its own data directory, under its
@@ -916,7 +1212,9 @@ async fn this_computer_counts_its_tries_in_its_own_budget() {
     .to_text()
     .expect("the invitation's text");
     let invitation = third.read(&text).expect("an invitation");
-    let summary = third.hold(invitation);
+    let summary = third
+        .hold_for(third.begin_intake(), invitation)
+        .expect("the intake is the one under way");
     assert_eq!(summary.origin_host.as_deref(), Some("reach.kala.to"));
     third.start_held().expect("started");
     let AttemptState::Ended { failure, .. } = reached(&third, |_| false).await else {

@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use companion_platform::scan::Sources;
 use kr_client::pairing::candidate::{AttemptState, Candidate, CandidateRoom, Pairing};
 use kr_client::pairing::clock::DeviceClock;
 use kr_client::pairing::failure::{FailureKind, PairingFailure};
@@ -88,15 +89,17 @@ pub struct PairingView {
     pub device_name: String,
     /// Where the attempt has got to.
     pub state: AttemptState,
-    /// What a person is shown of an invitation read from the pasteboard and not yet used.
+    /// What a person is shown of an invitation taken in and not yet used.
     pub invitation: Option<InvitationSummary>,
+    /// Where this device reads a code from, besides the pasteboard.
+    pub sources: Sources,
     /// The hosts this computer is paired with.
     pub hosts: Vec<HostRow>,
 }
 
-/// What reading the pasteboard found.
+/// What taking an invitation in found.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct PasteView {
+pub struct IntakeView {
     /// The invitation, when there was one and it is held for the person to use.
     pub invitation: Option<InvitationSummary>,
     /// Why nothing is held, when nothing is.
@@ -105,12 +108,45 @@ pub struct PasteView {
     pub cleared: bool,
     /// True when the invitation named another service and the person declined it.
     pub declined: bool,
+    /// True when nothing was taken in because the person closed the scanner or the picker, or
+    /// because a newer intake, a stop or an attempt came first. It is not a failure.
+    pub cancelled: bool,
 }
 
-/// An invitation read from the pasteboard, held until it is used, dropped or too old.
+impl IntakeView {
+    /// Nothing was taken in, and nothing is wrong.
+    #[must_use]
+    pub const fn cancelled() -> Self {
+        Self {
+            invitation: None,
+            failure: None,
+            cleared: false,
+            declined: false,
+            cancelled: true,
+        }
+    }
+}
+
+/// One intake of an invitation: it holds what it reads only while it is the one under way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Intake(u64);
+
+/// An invitation taken in, held until it is used, dropped or too old.
 struct Held {
     invitation: Invitation,
     read_at: Instant,
+    /// The wall clock at the reading, because a phone's monotonic clock stops while it sleeps.
+    read_wall: std::time::SystemTime,
+}
+
+impl Held {
+    fn is_stale(&self) -> bool {
+        self.read_at.elapsed() >= HELD_FOR
+            || self
+                .read_wall
+                .elapsed()
+                .is_ok_and(|elapsed| elapsed >= HELD_FOR)
+    }
 }
 
 /// This computer as a device that pairs with hosts.
@@ -120,6 +156,9 @@ pub struct Device {
     origin_file: PathBuf,
     origin: Mutex<RendezvousOrigin>,
     held: Mutex<Option<Held>>,
+    /// The intake under way, by number: a newer one, a stop and an attempt's start void it.
+    intake: Mutex<u64>,
+    sources: Mutex<Sources>,
     running: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     progress: watch::Sender<AttemptState>,
     contact: Mutex<BTreeMap<DeviceId, bool>>,
@@ -305,6 +344,8 @@ impl Device {
             origin_file,
             origin: Mutex::new(origin),
             held: Mutex::new(None),
+            intake: Mutex::new(0),
+            sources: Mutex::new(Sources::default()),
             running: Mutex::new(None),
             progress: watch::channel(AttemptState::Idle).0,
             contact: Mutex::new(BTreeMap::new()),
@@ -370,6 +411,7 @@ impl Device {
             device_name: self.identity.name.as_str().to_owned(),
             state: self.progress.borrow().clone(),
             invitation: self.held_summary(),
+            sources: *lock(&self.sources),
             hosts,
         }
     }
@@ -556,16 +598,67 @@ impl Device {
         read_invitation(text, &configured)
     }
 
-    /// Holds `invitation` until the person uses it, drops it, or [`HELD_FOR`] passes.
+    /// Begins taking an invitation in. Any intake still waiting is void from now on, and holds
+    /// nothing when its text arrives.
+    pub fn begin_intake(&self) -> Intake {
+        let mut number = lock(&self.intake);
+        *number += 1;
+        Intake(*number)
+    }
+
+    /// Voids the intake under way, when there is one.
+    pub fn void_intakes(&self) {
+        *lock(&self.intake) += 1;
+    }
+
+    /// Holds `invitation` for `intake`, when it is still the intake under way, and drops it when
+    /// [`HELD_FOR`] has passed. The answer is `None` when a newer intake, a stop or an attempt's
+    /// start voided it first.
     #[must_use]
-    pub fn hold(&self, invitation: Invitation) -> InvitationSummary {
+    pub fn hold_for(
+        self: &Arc<Self>,
+        intake: Intake,
+        invitation: Invitation,
+    ) -> Option<InvitationSummary> {
+        // The check and the holding are one step under the intake's lock, so a stop that voids the
+        // intake is either before both or after both.
+        let number = lock(&self.intake);
+        if *number != intake.0 {
+            return None;
+        }
         let summary = invitation.summary();
         *lock(&self.held) = Some(Held {
             invitation,
             read_at: Instant::now(),
+            read_wall: std::time::SystemTime::now(),
+        });
+        drop(number);
+        // The invitation leaves when its time is up, whether or not anything looks at it again.
+        let device = Arc::downgrade(self);
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(HELD_FOR).await;
+            if let Some(device) = device.upgrade() {
+                let dropped = {
+                    let mut held = lock(&device.held);
+                    let stale = held.as_ref().is_some_and(Held::is_stale);
+                    if stale {
+                        *held = None;
+                    }
+                    stale
+                };
+                if dropped {
+                    (device.changed)();
+                }
+            }
         });
         (self.changed)();
-        summary
+        Some(summary)
+    }
+
+    /// Records where this device reads a code from, and tells the page.
+    pub fn set_sources(&self, sources: Sources) {
+        *lock(&self.sources) = sources;
+        (self.changed)();
     }
 
     /// Starts pairing with the invitation held from the pasteboard.
@@ -579,7 +672,7 @@ impl Device {
         }
         let held = lock(&self.held)
             .take()
-            .filter(|held| held.read_at.elapsed() < HELD_FOR)
+            .filter(|held| !held.is_stale())
             .ok_or_else(|| CommandError::refused("no invitation is waiting to be used"))?;
         match held.invitation {
             Invitation::Code(code) => self.run(move |pairing, progress| async move {
@@ -596,6 +689,8 @@ impl Device {
     /// Ends the attempt on this computer, drops a held invitation, and returns the screen to its
     /// start. A host keeps its side of an attempt until it expires or its owner declines it.
     pub async fn stop(&self) {
+        // An intake still waiting must hold nothing once this has ended what is held.
+        self.void_intakes();
         let running = lock(&self.running).take();
         if let Some(running) = running {
             running.abort();
@@ -618,10 +713,7 @@ impl Device {
     /// What a person is shown of the held invitation, dropping it once it is too old.
     fn held_summary(&self) -> Option<InvitationSummary> {
         let mut held = lock(&self.held);
-        if held
-            .as_ref()
-            .is_some_and(|held| held.read_at.elapsed() >= HELD_FOR)
-        {
+        if held.as_ref().is_some_and(Held::is_stale) {
             *held = None;
         }
         held.as_ref().map(|held| held.invitation.summary())
@@ -640,6 +732,8 @@ impl Device {
         {
             return Err(CommandError::refused("an attempt is already running"));
         }
+        // What an intake still waiting would hold is no longer wanted: an attempt has begun.
+        self.void_intakes();
         let pairing = Arc::clone(&self.pairing);
         let progress = self.progress.clone();
         let device = Arc::downgrade(self);

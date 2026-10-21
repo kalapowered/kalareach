@@ -16,7 +16,7 @@ use crate::connection::{Connection, ConnectionState, Standing};
 use crate::device::Device;
 use crate::error::{CommandError, Result};
 use crate::owner::Owner;
-use crate::pairing::PastePlatform;
+use crate::pairing::IntakePlatform;
 use crate::recovery::Recovery;
 use crate::sync_service::SyncService;
 
@@ -43,7 +43,7 @@ pub struct AppState {
     opening_records: Mutex<()>,
     owner: OnceLock<Arc<Owner>>,
     revocations: OnceLock<Arc<crate::revocation::Revocations>>,
-    paste: OnceLock<Arc<dyn PastePlatform>>,
+    intake: OnceLock<Arc<dyn IntakePlatform>>,
     sync_service: OnceLock<Arc<SyncService>>,
     recovery: OnceLock<Arc<Recovery>>,
     mailbox: OnceLock<Arc<crate::mailbox::MailboxDesk>>,
@@ -85,7 +85,7 @@ impl AppState {
             opening_records: Mutex::new(()),
             owner: OnceLock::new(),
             revocations: OnceLock::new(),
-            paste: OnceLock::new(),
+            intake: OnceLock::new(),
             sync_service: OnceLock::new(),
             recovery: OnceLock::new(),
             mailbox: OnceLock::new(),
@@ -424,18 +424,18 @@ impl AppState {
         }
     }
 
-    /// Records this computer as a device that pairs, once it has been opened, and where it pastes
+    /// Records this computer as a device that pairs, once it has been opened, and where it takes invitations in from
     /// invitations from.
     pub fn opened(
         &self,
         device: Arc<Device>,
         owner: Arc<Owner>,
-        paste: Arc<dyn PastePlatform>,
+        intake: Arc<dyn IntakePlatform>,
         revocations: Arc<crate::revocation::Revocations>,
     ) {
         let _ = self.device.set(device);
         let _ = self.owner.set(owner);
-        let _ = self.paste.set(paste);
+        let _ = self.intake.set(intake);
         let _ = self.revocations.set(revocations);
         // Once they are open, so that nothing that asks in between hears of a failure that is over.
         *self
@@ -607,14 +607,14 @@ impl AppState {
         })
     }
 
-    /// Where this computer pastes invitations from.
+    /// Where this computer takes invitations in from.
     ///
     /// # Errors
     ///
     /// Returns a stated local failure, with its cause, when its keys or records could not be
     /// opened.
-    pub fn paste(&self) -> Result<Arc<dyn PastePlatform>> {
-        self.paste
+    pub fn intake(&self) -> Result<Arc<dyn IntakePlatform>> {
+        self.intake
             .get()
             .cloned()
             .ok_or_else(|| self.records_unavailable())
@@ -773,7 +773,7 @@ mod tests {
         for error in [
             state.device().expect_err("not open"),
             state.owner().expect_err("not open"),
-            state.paste().expect_err("not open"),
+            state.intake().expect_err("not open"),
         ] {
             assert_eq!(error.code, ErrorCode::ResourceUnavailable);
             assert_eq!(error.user_action, "nothing", "waiting does not open them");

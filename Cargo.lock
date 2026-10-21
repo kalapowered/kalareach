@@ -1316,6 +1316,7 @@ dependencies = [
  "ureq",
  "windows 0.61.3",
  "windows-future 0.2.1",
+ "zeroize",
 ]
 
 [[package]]

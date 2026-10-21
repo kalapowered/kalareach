@@ -252,7 +252,8 @@ async fn pair<R: Runtime>(app: &AppHandle<R>, invitation: &str, checks: &mut Che
             return false;
         }
     };
-    let _ = device.hold(read);
+    let intake = device.begin_intake();
+    let _ = device.hold_for(intake, read);
     if let Err(error) = device.start_held() {
         checks.push(Check::found("paired", false, format!("{error:?}")));
         return false;

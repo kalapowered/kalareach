@@ -533,7 +533,7 @@ fn open_the_records(app: &tauri::AppHandle) -> Result<()> {
         &data,
         parts,
         verify::platform_ceremony(app.get_webview_window("main")),
-        Arc::new(pairing::NativePaste::new(app.clone())),
+        Arc::new(pairing::NativeIntake::new(app.clone())),
     )
 }
 
@@ -812,7 +812,7 @@ pub fn start_mailbox<R: tauri::Runtime>(
 }
 
 /// Opens this computer as a device that pairs, made of `parts` with its records under `data`, and
-/// as an owner device whose confirmations `ceremony` answers, pasting invitations through `paste`;
+/// as an owner device whose confirmations `ceremony` answers, taking invitations in through `intake`;
 /// tells the page about both on [`pairing::PAIRING_EVENT`] and [`pairing::CONFIRMATIONS_EVENT`];
 /// and starts both.
 ///
@@ -824,7 +824,7 @@ pub fn start_pairing<R: tauri::Runtime>(
     data: &std::path::Path,
     parts: device::Parts,
     ceremony: std::sync::Arc<dyn kr_client::pairing::owner::Ceremony>,
-    paste: std::sync::Arc<dyn pairing::PastePlatform>,
+    intake: std::sync::Arc<dyn pairing::IntakePlatform>,
 ) -> Result<()> {
     use std::sync::Arc;
 
@@ -863,10 +863,17 @@ pub fn start_pairing<R: tauri::Runtime>(
             let _ = emitter.emit(pairing::CONFIRMATIONS_EVENT, owner.view());
         }
     });
+    let reading = Arc::clone(&intake);
     app.state::<AppState>()
-        .opened(Arc::clone(&device), Arc::clone(&owner), paste, revocations);
+        .opened(Arc::clone(&device), Arc::clone(&owner), intake, revocations);
     device.start();
     owner.start();
+    // Where this device reads a code from is asked of the platform without waiting for it, and the
+    // page is told when it is known.
+    let known = Arc::clone(&device);
+    tauri::async_runtime::spawn(async move {
+        known.set_sources(reading.sources().await);
+    });
     Ok(())
 }
 

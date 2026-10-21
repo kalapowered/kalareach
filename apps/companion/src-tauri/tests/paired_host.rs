@@ -37,7 +37,7 @@ use kr_protocol::sharing::{DeviceRevokeParams, RevocationResult};
 use net_support::pairing::{self as calls, Signer};
 use net_support::{Host, proposal};
 use serde_json::json;
-use support::{Companion, NoOwner, StubPaste, WATCHDOG, pair, phone_paired_with};
+use support::{Companion, NoOwner, StubIntake, WATCHDOG, pair, phone_paired_with};
 
 /// This computer paired with `host` as a device holding `rights`, and the data directory its
 /// records live in.
@@ -112,7 +112,7 @@ async fn a_paired_host_answers_the_commands_the_page_calls() {
         data.path(),
         support::parts(Arc::new(MemoryStore::new()), room),
         Arc::new(NoOwner),
-        StubPaste::holding(qr_text.as_str(), false),
+        StubIntake::holding(qr_text.as_str(), false),
     );
 
     let before = companion
@@ -358,7 +358,7 @@ async fn a_host_chosen_before_is_reached_again_when_the_application_starts() {
         phone.data.path(),
         support::parts(Arc::clone(&phone.secrets), Arc::clone(&phone.room)),
         Arc::new(NoOwner),
-        StubPaste::holding("", false),
+        StubIntake::holding("", false),
     );
     assert_eq!(
         restarted
@@ -605,7 +605,7 @@ async fn a_phone_its_host_revoked_can_forget_that_host() {
         phone.data.path(),
         support::parts(Arc::clone(&phone.secrets), Arc::clone(&phone.room)),
         Arc::new(NoOwner),
-        StubPaste::holding("", false),
+        StubIntake::holding("", false),
     );
     companion_tauri::hosts::resume(restarted.app.handle());
     assert_eq!(
@@ -734,7 +734,7 @@ async fn a_choice_made_from_a_listing_that_has_since_forgotten_the_host_is_refus
         phone.data.path(),
         support::parts(Arc::clone(&phone.secrets), Arc::clone(&phone.room)),
         Arc::new(NoOwner),
-        StubPaste::holding("", false),
+        StubIntake::holding("", false),
     );
     companion_tauri::hosts::resume(restarted.app.handle());
     assert_eq!(
