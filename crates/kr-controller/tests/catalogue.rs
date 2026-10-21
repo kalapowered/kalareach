@@ -36,6 +36,7 @@ fn fixture() -> std::path::PathBuf {
 
 /// Puts the adapters an organisation's policy allows in force on the module, as the daemon does
 /// when a policy moves, and says whether that changed what was in force.
+#[cfg(unix)]
 async fn put_allowed(
     module: &CatalogueModule,
     allowed: Option<std::collections::BTreeSet<PluginId>>,
