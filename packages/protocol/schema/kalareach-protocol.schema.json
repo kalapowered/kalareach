@@ -26244,7 +26244,7 @@
         },
         {
           "const": "uncertain",
-          "description": "An answer was dispatched and its outcome cannot be established.\n\nA reconciliation settles it here, when the connection ends or a recovery runs; it never\nreissues. Section 11: it \"does not reissue an uncertain response\".",
+          "description": "An answer was dispatched and its outcome cannot be established.\n\nThe writer that could not establish the outcome settles it here, and so does a\nreconciliation when the connection ends or a recovery runs; it never reissues. Section 11:\nit \"does not reissue an uncertain response\".",
           "type": "string"
         }
       ]

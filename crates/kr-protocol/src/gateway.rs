@@ -850,8 +850,9 @@ pub enum PendingState {
     Expired,
     /// An answer was dispatched and its outcome cannot be established.
     ///
-    /// A reconciliation settles it here, when the connection ends or a recovery runs; it never
-    /// reissues. Section 11: it "does not reissue an uncertain response".
+    /// The writer that could not establish the outcome settles it here, and so does a
+    /// reconciliation when the connection ends or a recovery runs; it never reissues. Section 11:
+    /// it "does not reissue an uncertain response".
     Uncertain,
 }
 
