@@ -4,7 +4,8 @@
 #
 #   scripts/build-release.sh --target <triple> --release <name> --sequence <n> --commit <sha> \
 #       --floor <system>=<version> --programs <dir> --shells <dir> --root <update-root.json> \
-#       --out <tree> [--kr-release <program>] [--plugins <dir>] [--web <dir>] [--development]
+#       --out <tree> [--kr-release <program>] [--plugins <dir>] [--web <dir>] [--development] \
+#       [--macos-identity <identity>]
 #
 # The tree is `bin/` with the host's programs, `shells/` with the shell packages, `share/` with the
 # update channel's root, the record and the licences, and `release.json`, which `kr-release sign`
@@ -15,11 +16,11 @@
 # Every file of a package is copied as a file of its own, because the build names one binary twice
 # and an archive writes the second name as a link. A directory the build left empty is left out,
 # since a release holds none. A step that changes a file, such as the platform's signature, runs
-# on the tree before the manifest is written, which is a later command (`kr-release manifest`
-# after it) and not this one; this script writes the manifest for the tree as it is.
+# on the tree before the manifest is written: `--macos-identity` signs each Mach-O file, and a
+# platform signature made by another step is made before `kr-release manifest` is run again.
 #
-# Nothing here signs, and no key is read. The programs are built, floors checked and platform
-# signatures made by the workflow that calls this.
+# No release key is read here: the manifest is signed by `kr-release sign`. The programs are built
+# and their floors checked by the workflow that calls this.
 
 set -euo pipefail
 
@@ -34,6 +35,7 @@ programs=""
 shells=""
 update_root=""
 out=""
+macos_identity=""
 kr_release="${KR_RELEASE:-$root/target/release/kr-release}"
 record_options=()
 
@@ -57,6 +59,7 @@ while [ $# -gt 0 ]; do
         --plugins) record_options+=(--plugins "${2:?--plugins needs a directory}"); shift 2 ;;
         --web) record_options+=(--web "${2:?--web needs a directory}"); shift 2 ;;
         --development) record_options+=(--development); shift ;;
+        --macos-identity) macos_identity="${2:?--macos-identity needs an identity}"; shift 2 ;;
         -h|--help) usage ;;
         *) echo "build-release: unknown argument $1" >&2; usage ;;
     esac
@@ -139,6 +142,12 @@ PYTHON
 
 cp "$update_root" "$out/share/update-root.json"
 cp "$root/LICENSE" "$out/share/LICENSE"
+
+# Every Mach-O file is signed before anything is digested: a signature changes the bytes the
+# manifest covers.
+if [ -n "$macos_identity" ]; then
+    bash "$root/scripts/sign-macos-tree.sh" "$out" "$macos_identity"
+fi
 
 "$kr_release" record --tree "$out" --checkout "$root" --target "$target" ${record_options[@]+"${record_options[@]}"}
 "$kr_release" manifest --tree "$out" --checkout "$root" --release "$release" --sequence "$sequence" \
