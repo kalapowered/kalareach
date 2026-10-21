@@ -37,7 +37,7 @@ use kr_protocol::sharing::{DeviceListResult, DeviceSummary};
 use kr_service_stand_in::{Moment, Served, serve};
 use net_support::{Device, Host, pair_with, proposal};
 use serde_json::{Value, json};
-use support::{Companion, StubPaste};
+use support::{Companion, StubIntake};
 use tauri::Manager as _;
 
 const AUTHORITY: &str = "/api/authority/sync";
@@ -297,7 +297,7 @@ impl Rig {
             data.path(),
             support::parts(Arc::clone(&secrets), Arc::new(host.room.clone())),
             Arc::clone(&ceremony) as Arc<dyn Ceremony>,
-            StubPaste::holding("", false),
+            StubIntake::holding("", false),
         );
         support::record_owned(&app.device(), &host, "the test host");
         companion_tauri::start_sync_service(app.app.handle(), data.path());
@@ -343,7 +343,7 @@ impl Rig {
             data.path(),
             support::parts(Arc::clone(&secrets), Arc::new(host.room.clone())),
             Arc::clone(&ceremony) as Arc<dyn Ceremony>,
-            StubPaste::holding("", false),
+            StubIntake::holding("", false),
         );
         companion_tauri::start_sync_service(app.app.handle(), data.path());
         companion_tauri::start_mailbox(app.app.handle(), data.path()).expect("the mailbox opens");

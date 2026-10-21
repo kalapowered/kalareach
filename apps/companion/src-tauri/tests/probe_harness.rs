@@ -35,7 +35,7 @@ use kr_protocol::scalars::Nullable;
 use net_support::pairing::{self as calls, Signer};
 use net_support::{Host, proposal};
 use support::call::ScriptedCalls;
-use support::{Companion, NoOwner, StubPaste, WATCHDOG, parts};
+use support::{Companion, NoOwner, StubIntake, WATCHDOG, parts};
 use voice_support::StandIn;
 
 /// The token the phone's account holds, which the stand-in's control accepts.
@@ -90,7 +90,7 @@ async fn scene() -> Scene {
         data.path(),
         parts(Arc::new(MemoryStore::new()), Arc::new(host.room.clone())),
         Arc::new(NoOwner),
-        StubPaste::holding("", false),
+        StubIntake::holding("", false),
         calls,
         harness.account(),
     );
