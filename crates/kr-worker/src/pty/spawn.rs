@@ -16,7 +16,7 @@
 //! The shell is to have the terminal and nothing else of the worker's descriptors. Every descriptor
 //! the child holds is marked to close when the shell is run, found in the child itself at the
 //! moment it is made, so that nothing the worker opened, whenever and above whatever limit, is
-//! missed.
+//! missed (on the systems this ships on; the one that is walked instead is named where it is).
 
 #![expect(
     unsafe_code,
@@ -37,9 +37,8 @@ pub(super) struct Reads {
     /// there, as the terminal library started a shell in one it could not find. A directory that
     /// is there and cannot be entered is not replaced: the start fails with the reason.
     opened: std::io::Result<OwnedFd>,
-    /// One past the highest number the system gives a descriptor, where the child has to count
-    /// them to find them.
-    table_end: libc::c_int,
+    /// What the child needs to find its descriptors, made here because the child cannot make it.
+    room: TableRoom,
 }
 
 impl Reads {
@@ -70,13 +69,64 @@ impl Reads {
         Self {
             named_is_there,
             opened,
-            table_end: table_end(),
+            room: TableRoom::make(),
         }
     }
 
     /// Whether the directory the command names was there.
     pub(super) const fn named_is_there(&self) -> bool {
         self.named_is_there
+    }
+}
+
+/// What the child needs to find its descriptors, made before the fork because the child may not
+/// allocate.
+#[derive(Debug)]
+pub(super) struct TableRoom {
+    /// Room for the kernel's list of the process's descriptors, with room above what is open now
+    /// for any opened before the fork.
+    #[cfg(target_vendor = "apple")]
+    list: Vec<libc::proc_fdinfo>,
+    /// One past the highest number the system gives a descriptor, which is walked as far as when
+    /// the list does not hold them all.
+    #[cfg(target_vendor = "apple")]
+    table_end: libc::c_int,
+}
+
+impl TableRoom {
+    #[cfg(target_vendor = "apple")]
+    fn make() -> Self {
+        /// Descriptors that can be opened between asking how many there are and the fork.
+        const OPENED_SINCE: usize = 512;
+
+        // SAFETY: a null buffer of no size asks only how much room the list needs.
+        let needed = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDLISTFDS,
+                0,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        let entries = usize::try_from(needed).unwrap_or(0)
+            / std::mem::size_of::<libc::proc_fdinfo>()
+            + OPENED_SINCE;
+        Self {
+            list: vec![
+                libc::proc_fdinfo {
+                    proc_fd: 0,
+                    proc_fdtype: 0,
+                };
+                entries
+            ],
+            table_end: table_end(),
+        }
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    const fn make() -> Self {
+        Self {}
     }
 }
 
@@ -110,14 +160,6 @@ fn table_end() -> libc::c_int {
 #[cfg(target_vendor = "apple")]
 const FALLBACK_TABLE_END: libc::c_int = 1 << 20;
 
-/// One past the highest number the system gives any descriptor of a process, where it is not
-/// asked: Linux lists the descriptors of the child instead, and the other systems are walked as far
-/// as the soft limit.
-#[cfg(not(target_vendor = "apple"))]
-const fn table_end() -> libc::c_int {
-    0
-}
-
 /// Opens a directory for the one thing the start does with it, which is to enter it.
 ///
 /// Entering a directory needs the right to search it and not the right to list it, so it is not
@@ -150,9 +192,14 @@ fn open_directory(path: &std::path::Path) -> std::io::Result<OwnedFd> {
 /// * Linux marks them all in one call from kernel 5.11, and where that call is not available lists
 ///   the child's own table (`/proc/self/fd`) and marks each. Where neither can be done the start
 ///   fails, rather than going ahead with descriptors it could not account for.
-/// * Apple systems give no descriptor a number at or above `kern.maxfilesperproc`, whatever the
-///   soft limit says, so every number below it is marked: about 7 ms at the default of 92,160, in
-///   the child, before the shell runs.
+/// * Apple systems list the process's descriptors in the room made for it before the fork, which
+///   is complete when the list leaves room over. When it does not (more descriptors than the room
+///   made for, or the list is refused), every number is marked up to the larger of what the list
+///   named and `kern.maxfilesperproc`, above which the system gives no descriptor a number: about
+///   7 ms at the default of 92,160, in the child, before the shell runs. A system that will not
+///   say that number is walked as far as 2^20, which is a guess. A descriptor opened above a limit
+///   that was lowered by an administrator after it was opened is in the list, and in the walk only
+///   if the walk reaches it.
 /// * Other Unix systems are walked as far as the soft limit, which does not cover a descriptor
 ///   above a limit lowered since it was opened.
 ///
@@ -160,10 +207,10 @@ fn open_directory(path: &std::path::Path) -> std::io::Result<OwnedFd> {
 /// is returned, so that a shell is not started with a descriptor that could not be marked.
 ///
 /// This allocates nothing and calls only system calls, as it has to between the fork and the run.
-fn mark_close_on_exec(table_end: libc::c_int) -> std::io::Result<()> {
+fn mark_close_on_exec(room: &mut TableRoom) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let _ = table_end;
+        let _ = room;
         // SAFETY: the call takes no pointer, and marks descriptors of this process only.
         let marked = unsafe {
             libc::syscall(
@@ -180,11 +227,11 @@ fn mark_close_on_exec(table_end: libc::c_int) -> std::io::Result<()> {
     }
     #[cfg(target_vendor = "apple")]
     {
-        mark_range_close_on_exec(3, table_end)
+        mark_by_the_kernels_list(room).map(|_| ())
     }
     #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
     {
-        let _ = table_end;
+        let _ = room;
         let mut limit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -198,6 +245,44 @@ fn mark_close_on_exec(table_end: libc::c_int) -> std::io::Result<()> {
         };
         mark_range_close_on_exec(3, end)
     }
+}
+
+/// Marks each descriptor the kernel lists for this process, and, when the list may not hold them
+/// all, every number up to where the system gives descriptors. Says whether the list was complete.
+#[cfg(target_vendor = "apple")]
+fn mark_by_the_kernels_list(room: &mut TableRoom) -> std::io::Result<bool> {
+    let entry = std::mem::size_of::<libc::proc_fdinfo>();
+    let capacity = room.list.len() * entry;
+    let Ok(capacity_bytes) = libc::c_int::try_from(capacity) else {
+        mark_range_close_on_exec(3, room.table_end)?;
+        return Ok(false);
+    };
+    // SAFETY: the buffer is the room made before the fork, `capacity` bytes of it, and nothing else
+    // holds it; the call is a thin wrapper of the system call and allocates nothing.
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDLISTFDS,
+            0,
+            room.list.as_mut_ptr().cast(),
+            capacity_bytes,
+        )
+    };
+    let filled = usize::try_from(bytes).unwrap_or(0).min(capacity) / entry;
+    // The kernel fills what fits and reports what it filled, so a list that leaves room over is
+    // the whole of them, and a full one may not be.
+    let complete = bytes > 0 && usize::try_from(bytes).is_ok_and(|bytes| bytes < capacity);
+    let mut end = 3;
+    for listed in &room.list[..filled] {
+        end = end.max(listed.proc_fd.saturating_add(1));
+        if listed.proc_fd > 2 {
+            mark_range_close_on_exec(listed.proc_fd, listed.proc_fd + 1)?;
+        }
+    }
+    if !complete {
+        mark_range_close_on_exec(3, end.max(room.table_end))?;
+    }
+    Ok(complete)
 }
 
 /// Marks each descriptor the child's own table lists to close when the shell is run, reading the
@@ -255,7 +340,7 @@ pub(super) fn start(
     command: &ShellCommand,
 ) -> std::io::Result<std::process::Child> {
     let directory = reads.opened?;
-    let table_end = reads.table_end;
+    let mut room = reads.room;
     let mut process = std::process::Command::new(&command.program);
     process
         .args(&command.arguments)
@@ -297,7 +382,7 @@ pub(super) fn start(
             rustix::process::ioctl_tiocsctty(standard_input)?;
             // The directory that was opened, not a path to it.
             rustix::process::fchdir(&directory)?;
-            mark_close_on_exec(table_end)
+            mark_close_on_exec(&mut room)
         });
     }
     process.spawn()
@@ -330,16 +415,25 @@ pub(super) mod tests {
         }
     }
 
-    /// Every descriptor the child holds is marked to close when the shell is run, in a process of
-    /// its own, since marking is done to the whole table: one low, one far up it, and, on Linux, by
-    /// listing the table as well as by the one call that marks it, which the other would hide.
+    /// Every descriptor the child holds is marked to close when the shell is run, whatever number
+    /// it has and whatever the soft limit on descriptors has been lowered to since it was opened.
+    ///
+    /// Run in a process of its own, since marking is done to the whole table and the limit is the
+    /// process's: the test binary runs this one case again with the variable set. In it, the room
+    /// the child needs is made, a descriptor low in the table and one far up it are placed
+    /// after (as the ones opened between the making and the fork are), the soft limit is lowered
+    /// below both, and every way of finding them is run on a pair of its own: the start's, and on
+    /// Linux the listing of the table as well as the one call that marks it, which the other would
+    /// hide; on Apple systems it is also said that the kernel's list was the whole of them.
     #[test]
     fn every_descriptor_the_child_holds_is_marked_to_close_when_the_shell_is_run() {
         const IN_CHILD: &str = "KR_MARK_DESCRIPTORS_IN_CHILD";
+        const THIS_CASE: &str = "pty::spawn::tests::every_descriptor_the_child_holds_is_marked_to_close_when_the_shell_is_run";
 
         if std::env::var_os(IN_CHILD).is_some() {
             let held = std::fs::File::open("/").expect("a descriptor to copy");
-            let placed = || {
+            let mut room = TableRoom::make();
+            let pair = || {
                 let low = rustix::io::fcntl_dupfd_cloexec(&held, 100).expect("one low");
                 rustix::io::fcntl_setfd(&low, rustix::io::FdFlags::empty()).expect("inheritable");
                 [low, descriptor_far_up(&held)]
@@ -349,39 +443,71 @@ pub(super) mod tests {
                     .expect("flags")
                     .contains(rustix::io::FdFlags::CLOEXEC)
             };
-            let first = placed();
+            // The soft limit as it was, to be lowered below the far descriptors and given back.
+            let was = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+            let set = |current| {
+                rustix::process::setrlimit(
+                    rustix::process::Resource::Nofile,
+                    rustix::process::Rlimit {
+                        current,
+                        maximum: was.maximum,
+                    },
+                )
+                .expect("the soft limit is set")
+            };
+
+            let first = pair();
             assert!(
                 !marked(&first[0]) && !marked(&first[1]),
                 "inheritable to begin with"
             );
-            mark_close_on_exec(table_end()).expect("marks");
+            set(Some(64));
+            #[cfg(target_os = "linux")]
+            mark_listed_close_on_exec().expect("marks by the listing");
+            #[cfg(target_vendor = "apple")]
+            assert!(
+                mark_by_the_kernels_list(&mut room).expect("marks by the list"),
+                "the kernel's list held all of the descriptors"
+            );
+            #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+            mark_close_on_exec(&mut room).expect("marks");
             assert!(
                 marked(&first[0]),
                 "the descriptor low in the table is marked"
             );
             assert!(marked(&first[1]), "and the one far up it");
-            #[cfg(target_os = "linux")]
-            {
-                let second = placed();
-                mark_listed_close_on_exec().expect("marks by the listing");
-                assert!(
-                    marked(&second[0]),
-                    "listed: the descriptor low in the table"
-                );
-                assert!(marked(&second[1]), "listed: and the one far up it");
-            }
+
+            // The call that marks the whole table at once, where there is one, on a pair of its own.
+            set(was.current);
+            let second = pair();
+            assert!(
+                !marked(&second[0]) && !marked(&second[1]),
+                "inheritable to begin with"
+            );
+            set(Some(64));
+            mark_close_on_exec(&mut room).expect("marks");
+            assert!(
+                marked(&second[0]),
+                "marked by the start's way: the descriptor low in the table"
+            );
+            assert!(
+                marked(&second[1]),
+                "marked by the start's way: and the one far up it"
+            );
             return;
         }
-        let status = std::process::Command::new(std::env::current_exe().expect("this binary"))
-            .args([
-                "--exact",
-                "pty::spawn::tests::every_descriptor_the_child_holds_is_marked_to_close_when_the_shell_is_run",
-                "--test-threads=1",
-            ])
+        let ran = std::process::Command::new(std::env::current_exe().expect("this binary"))
+            .args(["--exact", THIS_CASE, "--test-threads=1"])
             .env(IN_CHILD, "1")
-            .status()
+            .output()
             .expect("the case runs in a process of its own");
-        assert!(status.success(), "the marking did not hold: {status}");
+        let said = String::from_utf8_lossy(&ran.stdout);
+        assert!(
+            ran.status.success() && said.contains("test result: ok. 1 passed"),
+            "the marking did not hold, or the case did not run: {}\n{said}\n{}",
+            ran.status,
+            String::from_utf8_lossy(&ran.stderr)
+        );
     }
 
     /// A missing directory falls back to the home directory the environment names, and a directory
