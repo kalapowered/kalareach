@@ -936,7 +936,7 @@ beside the class. It does not promise that an editor or a program outside the im
 was kept off, and the version says that too. What stands between such a writer and a version
 recorded as quiesced is the capture's own comparison: after the last reading, with a reservation
 held, it opens every path it read from the working tree once more and compares each file's
-identity, length and instants (the instant the file's metadata last changed among them, so a change of mode or owner during the read counts) with what it saw, and a difference makes the capture the per-file
+identity, length and instants (on Linux and macOS the instant the file's metadata last changed is among them, so a change of mode or owner during the read counts) with what it saw, and a difference makes the capture the per-file
 class with the contradiction recorded. That comparison sees what Git's state and those instants
 show. An overwrite that leaves all of them as they were is not something it can see.
 
@@ -982,15 +982,17 @@ records, a project's own checkout included whether or not a workspace was ever s
 a terminal opened before the host knew its repository still counts. A session with no directory
 starts at the root and counts nowhere; one whose directory is not an absolute path, or whose
 request the daemon could not read after a restart, counts against every reservation. A session
-counts until its closure is recorded. A worker that reported it could not start, a launch that no
-worker claimed, and a closure that could not confirm its worker ended, count until the kernel says
-the worker's process has ended; the host asks for sixty seconds, and a worker still running after
-that counts until the daemon restarts. So does a closure that records a process the session left
-running, and after a restart nothing follows that process. A launch that a worker claimed and that
-did not report in time counts until its closure is recorded, and one that never reports counts
-until the daemon restarts; so does a launch whose process the host could not identify. A closure
-that accounts for its worker releases the session even where its account of the session's own
-processes is incomplete.
+counts until its closure is recorded. A create that did not come to a session (a worker that
+reported it could not start, whether the create was still waiting or not, a launch no worker
+claimed, and a launch that did not report in time) counts until the kernel says the worker's
+process has ended and the worker's own record of the session shows nothing it left running; the
+host asks for sixty seconds, and a worker still running after that, or one that left a process
+behind, counts until the daemon restarts. A launch whose process the host could not identify
+counts until the daemon restarts too. A closure that could not confirm its worker ended counts
+until the kernel says the process has ended. A closure that records a process the session left
+running counts until the daemon restarts, and after a restart nothing follows that process. A
+closure that accounts for its worker releases the session even where its account of the session's
+own processes is incomplete.
 
 What a reservation does not see: a session in a tree this host does not record (a linked worktree
 the user added by hand), a shell that changes into a tree after it started elsewhere, a parent
