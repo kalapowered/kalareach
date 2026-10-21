@@ -112,8 +112,9 @@ impl Pty {
         answer_rather_than_wait(pair.master.as_ref())?;
         // The shell is started by this host rather than by the terminal library, so that nothing
         // is read from the file system between the last admission of the start and the process
-        // ([`spawn`]), and the slave end it needs is opened here by the name the master reports,
-        // while the library's own is still open.
+        // ([`spawn`]). The slave end it needs is taken from the master, or opened by the name the
+        // master reports where it cannot be taken ([`open_slave`]), while the library's own is
+        // still open.
         let slave = open_slave(pair.master.as_ref())?;
         Ok(Self {
             master: pair.master,
@@ -183,16 +184,16 @@ impl Pty {
             return Err(running());
         }
         #[cfg(unix)]
-        let directory = spawn::Directory::open(command);
+        let reads = spawn::Reads::read(command);
         #[cfg(unix)]
-        let named_is_there = directory.named_is_there();
+        let named_is_there = reads.named_is_there();
         #[cfg(windows)]
         let named_is_there = std::path::Path::new(&command.cwd).is_dir();
         admit(named_is_there)?;
         let slave = self.slave.take().ok_or_else(running)?;
         #[cfg(unix)]
         let child: Box<dyn portable_pty::Child + Send + Sync> = Box::new(
-            spawn::start(&slave, directory, command)
+            spawn::start(&slave, reads, command)
                 .map_err(|error| WorkerError::pty("start the root shell", error))?,
         );
         #[cfg(windows)]
@@ -957,6 +958,45 @@ mod tests {
         assert!(work.join("ran-here").exists(), "the shell started in it");
     }
 
+    /// A directory that is there and cannot be entered is a start that fails, and the shell is not
+    /// started in the home directory instead. Run as the superuser, a mode stops nothing, and the
+    /// case then has nothing to show.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_is_there_and_cannot_be_entered_is_a_start_that_fails() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let host = kr_ipc::testing::TempHost::create();
+        let (work, home) = (host.root().join("work"), host.root().join("home"));
+        std::fs::create_dir(&work).expect("the directory the shell is to start in");
+        std::fs::create_dir(&home).expect("the home directory");
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o000))
+            .expect("that cannot be entered");
+        let enforced = std::fs::read_dir(&work).is_err();
+        let mut command = crate::testing::posix_script(": > ran-here");
+        command.cwd = work.display().to_string();
+        command
+            .environment
+            .push(("HOME".to_owned(), home.display().to_string()));
+        let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
+        let told = std::cell::Cell::new(None);
+        let outcome = pty.launch(&command, |named_is_there| {
+            told.set(Some(named_is_there));
+            Ok(())
+        });
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700))
+            .expect("it can be entered again");
+        if !enforced {
+            return;
+        }
+        assert_eq!(told.get(), Some(true), "the directory is there");
+        assert!(
+            matches!(outcome, Err(WorkerError::Pty { .. })),
+            "the start fails: {outcome:?}"
+        );
+        assert!(!home.join("ran-here").exists(), "and nothing ran at home");
+    }
+
     /// The shell has the terminal and nothing else of the worker's descriptors: one the worker
     /// holds open, with nothing to close it on exec, is not open in the shell. The control is the
     /// terminal itself, which is.
@@ -968,11 +1008,32 @@ mod tests {
         let held = std::fs::File::open("/").expect("a descriptor of the worker's");
         rustix::io::fcntl_setfd(&held, rustix::io::FdFlags::empty()).expect("left open on exec");
         let number = held.as_raw_fd();
+        // And one far up the table, past what a fixed number of descriptors would have covered
+        // where the limit lets the worker have one: the soft limit is raised toward the hard one
+        // for it.
+        let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        let wanted = 70_100_u64.min(limit.maximum.unwrap_or(u64::MAX));
+        if limit.current.is_some_and(|current| current < wanted) {
+            let _ = rustix::process::setrlimit(
+                rustix::process::Resource::Nofile,
+                rustix::process::Rlimit {
+                    current: Some(wanted),
+                    maximum: limit.maximum,
+                },
+            );
+        }
+        let room = rustix::process::getrlimit(rustix::process::Resource::Nofile)
+            .current
+            .unwrap_or(u64::MAX);
+        let far_number = i32::try_from(room.saturating_sub(8).min(70_000)).expect("a number");
+        let far = rustix::io::fcntl_dupfd_cloexec(&held, far_number).expect("a descriptor far up");
+        rustix::io::fcntl_setfd(&far, rustix::io::FdFlags::empty()).expect("left open on exec");
+        let far_number = far.as_raw_fd();
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let mut reader = pty.reader().expect("a reader");
         let script = format!(
             "[ -e /dev/fd/1 ] && printf '[terminal]'; [ -e /dev/fd/{number} ] && printf '[leaked]'; \
-             printf '[done]'"
+             [ -e /dev/fd/{far_number} ] && printf '[leaked-far]'; printf '[done]'"
         );
         let mut shell = pty
             .launch(&crate::testing::posix_script(&script), |_| Ok(()))
@@ -985,7 +1046,7 @@ mod tests {
             "the shell has the terminal: {seen:?}"
         );
         assert!(
-            !seen.contains("[leaked]"),
+            !seen.contains("[leaked"),
             "a descriptor of the worker's is open in the shell: {seen:?}"
         );
     }
@@ -1312,9 +1373,9 @@ impl InputWaiter {
 
 /// The place in this crate that borrows a descriptor the terminal library owns.
 ///
-/// The workspace forbids unsafe code; this crate denies it and relaxes the rule here and in the
-/// start of the root shell, because duplicating a descriptor the terminal owns has no safe form:
-/// the terminal library hands out a raw number and nothing else.
+/// The workspace forbids unsafe code; this crate denies it and relaxes the rule here, because
+/// duplicating a descriptor the terminal owns has no safe form: the terminal library hands out a
+/// raw number and nothing else.
 #[cfg(unix)]
 mod descriptor {
     #![expect(
@@ -1323,11 +1384,14 @@ mod descriptor {
     )]
 
     /// Duplicates a descriptor the caller keeps open for at least the length of this call.
+    ///
+    /// The duplicate is closed when a program is run, so that no program this worker starts holds
+    /// the terminal's master.
     pub fn duplicate(raw: std::os::fd::RawFd) -> Option<std::os::fd::OwnedFd> {
         // SAFETY: `raw` is the terminal's own master descriptor, which the `Pty` that produced it
         // holds open, and this borrow lives no longer than this call. The duplicate it makes is a
         // descriptor of its own, closed when it is dropped.
         let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
-        rustix::io::dup(borrowed).ok()
+        rustix::io::fcntl_dupfd_cloexec(borrowed, 0).ok()
     }
 }

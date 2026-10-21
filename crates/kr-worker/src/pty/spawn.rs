@@ -12,6 +12,10 @@
 //! The program is not looked at before the start: the operating system looks it up as it runs it,
 //! and a program that cannot be run is reported by the start, as an error of the process that
 //! would have run it.
+//!
+//! The shell is to have the terminal and nothing else of the worker's descriptors. Which ones the
+//! worker has open is read with the directory, before the start is admitted, and they are marked
+//! to close when the shell is run.
 
 #![expect(
     unsafe_code,
@@ -23,38 +27,48 @@ use std::os::unix::process::CommandExt as _;
 
 use super::ShellCommand;
 
-/// The directory a shell is to start in, opened before the start is admitted.
+/// What a start reads from the file system, read before the start is admitted.
 #[derive(Debug)]
-pub(super) struct Directory {
-    /// Whether the directory the command names was there to be entered.
+pub(super) struct Reads {
+    /// Whether the directory the command names was there.
     named_is_there: bool,
     /// The directory the shell starts in: the named one, or the account's home where that was not
-    /// there, as the terminal library started a shell in one it could not find.
+    /// there, as the terminal library started a shell in one it could not find. A directory that
+    /// is there and cannot be entered is not replaced: the start fails with the reason.
     opened: std::io::Result<OwnedFd>,
+    /// The highest descriptor the worker has open, where the system lists them.
+    highest_descriptor: Option<libc::c_int>,
 }
 
-impl Directory {
-    /// Opens the directory `command` names, or the account's home directory where it names one
-    /// that cannot be entered: the `HOME` of the environment the shell is given, else the home
-    /// directory the account database names, else the root.
-    pub(super) fn open(command: &ShellCommand) -> Self {
-        match open_directory(std::path::Path::new(&command.cwd)) {
-            Ok(opened) => Self {
-                named_is_there: true,
-                opened: Ok(opened),
-            },
+impl Reads {
+    /// Opens the directory `command` names, or the account's home directory where there is no
+    /// such directory: the `HOME` of the environment the shell is given, else the home directory
+    /// the account database names, else the root.
+    pub(super) fn read(command: &ShellCommand) -> Self {
+        let named = std::path::Path::new(&command.cwd);
+        let (named_is_there, opened) = match open_directory(named) {
+            Ok(opened) => (true, Ok(opened)),
+            // A directory that is there and cannot be entered is a start that fails, as it was
+            // when the terminal library found it with a look and failed to change into it.
+            Err(error) if named.is_dir() => (true, Err(error)),
             Err(_) => {
-                let home = command
+                let home: std::path::PathBuf = command
                     .environment
                     .iter()
                     .find_map(|(name, value)| (name == "HOME").then(|| value.into()))
-                    .or_else(account_home)
+                    .or_else(|| {
+                        kr_ipc::paths::passwd_entry()
+                            .and_then(|entry| entry.home)
+                            .map(Into::into)
+                    })
                     .unwrap_or_else(|| "/".into());
-                Self {
-                    named_is_there: false,
-                    opened: open_directory(&home),
-                }
+                (false, open_directory(&home))
             }
+        };
+        Self {
+            named_is_there,
+            opened,
+            highest_descriptor: highest_descriptor(),
         }
     }
 
@@ -62,6 +76,15 @@ impl Directory {
     pub(super) const fn named_is_there(&self) -> bool {
         self.named_is_there
     }
+}
+
+/// The highest descriptor this process has open, from the system's list of them.
+fn highest_descriptor() -> Option<libc::c_int> {
+    std::fs::read_dir("/dev/fd")
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+        .max()
 }
 
 /// Opens a directory for the one thing the start does with it, which is to enter it.
@@ -83,39 +106,6 @@ fn open_directory(path: &std::path::Path) -> std::io::Result<OwnedFd> {
     .map_err(Into::into)
 }
 
-/// The home directory the account database names for the user this process runs as.
-pub(super) fn account_home() -> Option<std::path::PathBuf> {
-    use std::os::unix::ffi::OsStringExt as _;
-
-    let mut buffer = vec![0_u8; 1024];
-    loop {
-        let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
-        let mut found: *mut libc::passwd = std::ptr::null_mut();
-        // SAFETY: the entry and the buffer are this function's own and outlive the call, the
-        // buffer's length is the one passed, and `found` is read only after the call has set it.
-        let status = unsafe {
-            libc::getpwuid_r(
-                libc::getuid(),
-                entry.as_mut_ptr(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &raw mut found,
-            )
-        };
-        if status == libc::ERANGE && buffer.len() < (1 << 20) {
-            buffer.resize(buffer.len() * 2, 0);
-            continue;
-        }
-        if status != 0 || found.is_null() {
-            return None;
-        }
-        // SAFETY: the call found an entry, so `pw_dir` points to a NUL-terminated string in the
-        // buffer, which is still alive.
-        let home = unsafe { std::ffi::CStr::from_ptr((*found).pw_dir) };
-        return Some(std::ffi::OsString::from_vec(home.to_bytes().to_vec()).into());
-    }
-}
-
 /// Marks every descriptor above the standard three to close when the shell is run, so that the
 /// shell has the terminal and nothing else of the worker's.
 ///
@@ -123,14 +113,15 @@ pub(super) fn account_home() -> Option<std::path::PathBuf> {
 /// failed run through is among them: it is already marked, and closed by a good run, and it has to
 /// be open for a failed one to be reported.
 ///
+/// Linux marks them all in one call from kernel 5.11. Where it cannot, and on the other systems,
+/// the descriptors up to the highest one the worker was found to have open, and a few above it for
+/// any opened since, are marked one by one; where the system lists none, those below the soft
+/// limit on descriptors, and never more than [`MOST_WALKED`] of them. A descriptor that is not
+/// open is refused by the call, which is the only way it can fail, and there is nothing to be done
+/// about that in the child.
+///
 /// This allocates nothing and calls only system calls, as it has to between the fork and the run.
-fn mark_close_on_exec() {
-    /// `CLOSE_RANGE_CLOEXEC`, which asks `close_range` to mark the descriptors instead.
-    #[cfg(target_os = "linux")]
-    const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
-    /// The most descriptors walked one by one, where there is no call for the range.
-    const MOST_WALKED: libc::rlim_t = 1 << 16;
-
+fn mark_close_on_exec(highest_open: Option<libc::c_int>) {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: the call takes no pointer, and marks descriptors of this process only.
@@ -139,28 +130,46 @@ fn mark_close_on_exec() {
                 libc::SYS_close_range,
                 3 as libc::c_uint,
                 libc::c_uint::MAX,
-                CLOSE_RANGE_CLOEXEC,
+                libc::CLOSE_RANGE_CLOEXEC,
             )
         };
         if marked == 0 {
             return;
         }
     }
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
+    let end = match highest_open {
+        Some(highest) => highest.saturating_add(OPENED_SINCE),
+        None => {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: `limit` is this function's own and outlives the call.
+            let known = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } == 0;
+            let walked = if known {
+                limit.rlim_cur.min(MOST_WALKED)
+            } else {
+                MOST_WALKED
+            };
+            libc::c_int::try_from(walked).unwrap_or(libc::c_int::MAX)
+        }
     };
-    // SAFETY: `limit` is this function's own and outlives the call.
-    let known = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } == 0;
-    let end = if known {
-        limit.rlim_cur.min(MOST_WALKED)
-    } else {
-        MOST_WALKED
-    };
-    for descriptor in 3..end {
+    mark_range_close_on_exec(3, end);
+}
+
+/// The most descriptors walked one by one where the system lists none.
+const MOST_WALKED: libc::rlim_t = 1 << 16;
+
+/// How many descriptors above the highest one found open are marked as well, for any opened
+/// between the finding and the fork.
+const OPENED_SINCE: libc::c_int = 64;
+
+/// Marks the descriptors from `from` up to, not including, `to` to close when the shell is run.
+fn mark_range_close_on_exec(from: libc::c_int, to: libc::c_int) {
+    for descriptor in from..to {
         // SAFETY: the call takes no pointer; a descriptor that is not open is refused.
         unsafe {
-            libc::fcntl(descriptor as libc::c_int, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC);
         }
     }
 }
@@ -174,10 +183,11 @@ fn mark_close_on_exec() {
 /// could not be started, a program that cannot be run included.
 pub(super) fn start(
     terminal: &OwnedFd,
-    directory: Directory,
+    reads: Reads,
     command: &ShellCommand,
 ) -> std::io::Result<std::process::Child> {
-    let directory = directory.opened?;
+    let directory = reads.opened?;
+    let highest_open = reads.highest_descriptor;
     let mut process = std::process::Command::new(&command.program);
     process
         .args(&command.arguments)
@@ -219,7 +229,7 @@ pub(super) fn start(
             rustix::process::ioctl_tiocsctty(standard_input)?;
             // The directory that was opened, not a path to it.
             rustix::process::fchdir(&directory)?;
-            mark_close_on_exec();
+            mark_close_on_exec(highest_open);
             Ok(())
         });
     }
@@ -230,9 +240,65 @@ pub(super) fn start(
 mod tests {
     use super::*;
 
+    /// The descriptors from the first to the last given are marked, and the ones past it are not,
+    /// whatever number they have: past what a fixed bound would have walked, where the limit
+    /// allows one.
     #[test]
-    fn the_account_database_names_a_home_directory_that_is_there() {
-        let home = account_home().expect("the user this runs as has an entry");
-        assert!(home.is_dir(), "{home:?}");
+    fn a_range_of_descriptors_is_marked_to_close_when_the_shell_is_run() {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+        let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        let room = limit
+            .current
+            .unwrap_or(1 << 20)
+            .min(limit.maximum.unwrap_or(1 << 20));
+        let first = libc::c_int::try_from((room.saturating_sub(8)).min(70_000)).expect("a number");
+        let held = std::fs::File::open("/").expect("a descriptor to place");
+        let placed: Vec<OwnedFd> = (first..first + 3)
+            .map(|number| {
+                // SAFETY: the number is one this case has chosen to use for a descriptor of its
+                // own, high enough that nothing else of this process holds it, and the descriptor
+                // it makes is owned from here on.
+                unsafe {
+                    assert_eq!(
+                        libc::dup2(held.as_raw_fd(), number),
+                        number,
+                        "a descriptor at {number}"
+                    );
+                    OwnedFd::from_raw_fd(number)
+                }
+            })
+            .collect();
+        for descriptor in &placed {
+            rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::empty())
+                .expect("left open on exec");
+        }
+        mark_range_close_on_exec(first, first + 2);
+        let marked = |index: usize| {
+            rustix::io::fcntl_getfd(&placed[index])
+                .expect("flags")
+                .contains(rustix::io::FdFlags::CLOEXEC)
+        };
+        assert!(marked(0) && marked(1), "the range is marked");
+        assert!(!marked(2), "and nothing past it");
+    }
+
+    /// The directory the shell is to start in is told apart from one that is there and cannot be
+    /// entered, and from one that is not there.
+    #[test]
+    fn a_missing_directory_falls_back_to_the_home_directory_and_one_that_is_there_does_not() {
+        let host = kr_ipc::testing::TempHost::create();
+        let home = host.root().join("home");
+        std::fs::create_dir(&home).expect("the home directory");
+        let mut command = crate::testing::posix_script("exit 0");
+        command
+            .environment
+            .push(("HOME".to_owned(), home.display().to_string()));
+        command.cwd = host.root().join("not-there").display().to_string();
+        let missing = Reads::read(&command);
+        assert!(!missing.named_is_there());
+        assert!(missing.opened.is_ok(), "the home directory opens");
+        command.cwd = host.root().display().to_string();
+        assert!(Reads::read(&command).named_is_there());
     }
 }
