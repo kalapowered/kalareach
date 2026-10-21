@@ -507,12 +507,18 @@ async fn tmux_inside_a_managed_session_reads_the_private_database() {
     let script = format!(
         "export TMUX_TMPDIR={work}\n\
          echo \"outer_file=$(infocmp -x xterm-256color | head -n 1)\" > {work}/outer.txt\n\
-         {tmux} -f /dev/null -L kr new-session -x 80 -y 24 \"sh {work}/inner.sh\"\n\
+         {tmux} -f /dev/null -L kr new-session -x 80 -y 24 {inner}\n\
          echo \"outer_term=$TERM\" >> {work}/outer.txt\n\
          echo \"outer_terminfo=$TERMINFO\" >> {work}/outer.txt\n\
          touch {work}/finished",
         tmux = kr_worker::testing::shell_quoted(&tmux),
-        work = kr_worker::testing::shell_quoted(&work.0)
+        work = kr_worker::testing::shell_quoted(&work.0),
+        // The command tmux runs in the pane is one word for this shell and a line for tmux's own,
+        // so a quote in the path is closed over once for each.
+        inner = kr_worker::testing::shell_word(&format!(
+            "sh {}/inner.sh",
+            kr_worker::testing::shell_quoted(&work.0)
+        ))
     );
     let ran = run_observed(&script, &environment, Some(&work.0.join("finished"))).await;
 
@@ -788,7 +794,8 @@ impl Sshd {
         format!(
             "ssh -tt -F /dev/null -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
              -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -p {port} \
-             127.0.0.1 '{command}'",
+             127.0.0.1 {command}",
+            command = kr_worker::testing::shell_word(command),
             key = kr_worker::testing::shell_quoted(&self.client_key),
             port = self.port
         )

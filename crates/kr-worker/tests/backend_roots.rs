@@ -96,9 +96,10 @@ impl Server {
         let written = directory.join(name);
         let command = format!(
             "perl -MPOSIX -e '$SIG{{HUP}} = q(DEFAULT); POSIX::setsid(); exec @ARGV' \
-             /bin/sh -c '{script}' & \
+             /bin/sh -c {script} & \
              echo $! > {file}.part && mv {file}.part {file}; \
              while :; do sleep 0.2; done",
+            script = kr_worker::testing::shell_word(script),
             file = kr_worker::testing::shell_quoted(&written)
         );
         let process = Reaped(start("/bin/sh", &["-c", &command]));
