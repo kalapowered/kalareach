@@ -21921,12 +21921,12 @@
         },
         {
           "const": "organisation.list",
-          "description": "The organisations this host is enrolled in, the key each is pinned to, the devices bound to member accounts and the lease each holds, whether exclusive management is on, and every time it was turned off, with how the owner confirmed it.",
+          "description": "The organisations this host is enrolled in, the key each is pinned to, the policy applied for each with the adapters it allows, the adapters the policies allow together, the devices bound to member accounts and the lease each holds, whether exclusive management is on, and every time it was turned off, with how the owner confirmed it.",
           "type": "string"
         },
         {
           "const": "organisation.policy.apply",
-          "description": "Apply an organisation's signed policy to this host: the adapters it allows are the only ones the host admits, with every other organisation's list intersected. The policy is verified under the key the organisation's chain ends with, which the request can carry when it has moved, and is refused at or below the revision the host holds. The owner confirmed the organisation's keys when enrolling, and a policy never enlarges what the host allows without one, so it needs no new confirmation.",
+          "description": "Apply an organisation's signed policy to this host: the adapters it allows are the only ones the host admits, with every other organisation's list intersected. The policy is verified under the key the organisation's chain ends with, which the request can carry when it has moved, and is refused at or below the revision the host holds unless it is that policy again. The owner confirmed the organisation's keys when enrolling, and a policy never enlarges what the host allows without one, so it needs no new confirmation.",
           "type": "string"
         },
         {
@@ -24271,7 +24271,7 @@
               "type": "null"
             }
           ],
-          "description": "The adapters the host admits: the adapters every enrolled organisation that states a list\nallows, or null while none does. Two organisations whose lists share nothing leave an empty\nset, which admits no adapter."
+          "description": "The adapters the enrolled organisations' policies allow together: the adapters every\norganisation that states a list allows, or null while none does. Two organisations whose\nlists share nothing leave an empty set, which allows no adapter. This is the list the host\nputs in force when a policy changes, and again at each admissions pass until it lands;\n`plugin.list` says which packages the admissions in force leave out."
         },
         "enrolments": {
           "description": "The organisations this host is enrolled in, by organisation identity.",
@@ -24391,7 +24391,7 @@
         },
         "policy": {
           "$ref": "#/$defs/OrganisationPolicy",
-          "description": "The policy the organisation signed, as a member exported it. The host applies it only when\nit is signed by the key the host's chain ends with, names a revision above the one it\nholds, and states a structure this contract admits."
+          "description": "The policy the organisation signed, as a member exported it. The host applies it only when\nit is signed by the key the host's chain ends with, names a revision above the one it holds\n(or is the policy it holds again), and states a structure this contract admits."
         }
       },
       "required": [
@@ -24434,7 +24434,7 @@
               "type": "null"
             }
           ],
-          "description": "The adapters the host admits as the answer was made: the adapters every enrolled\norganisation that states a list allows, or null while none does. A repeat of the action is\ngiven this list, not the one in force now; `organisation.list` reports the list in force."
+          "description": "The adapters the enrolled organisations' policies allow together as the answer was made: the\nadapters every organisation that states a list allows, or null while none does. The host puts\nthis list in force when it records the policy. A repeat of the action is given this list, not\nthe one the policies state now; `organisation.list` reports that."
         },
         "organisation_id": {
           "$ref": "#/$defs/OrganisationId",

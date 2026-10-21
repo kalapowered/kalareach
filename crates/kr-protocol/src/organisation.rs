@@ -58,8 +58,8 @@ pub struct OrganisationEnrolResult {
 #[serde(deny_unknown_fields)]
 pub struct OrganisationPolicyApplyParams {
     /// The policy the organisation signed, as a member exported it. The host applies it only when
-    /// it is signed by the key the host's chain ends with, names a revision above the one it
-    /// holds, and states a structure this contract admits.
+    /// it is signed by the key the host's chain ends with, names a revision above the one it holds
+    /// (or is the policy it holds again), and states a structure this contract admits.
     pub policy: OrganisationPolicy,
     /// The organisation's chain, when it has moved since the host last accepted one. The key that
     /// signs a policy is the one the chain ends with, so a policy under a newer key needs the chain
@@ -87,9 +87,10 @@ pub struct OrganisationPolicyApplyResult {
     pub organisation_policy_revision: OrganisationPolicyRevision,
     /// The adapters this organisation allows, or null for every adapter the host qualifies.
     pub adapter_allowlist: Nullable<CanonicalSet<PluginId>>,
-    /// The adapters the host admits as the answer was made: the adapters every enrolled
-    /// organisation that states a list allows, or null while none does. A repeat of the action is
-    /// given this list, not the one in force now; `organisation.list` reports the list in force.
+    /// The adapters the enrolled organisations' policies allow together as the answer was made: the
+    /// adapters every organisation that states a list allows, or null while none does. The host puts
+    /// this list in force when it records the policy. A repeat of the action is given this list, not
+    /// the one the policies state now; `organisation.list` reports that.
     pub effective_adapter_allowlist: Nullable<CanonicalSet<PluginId>>,
 }
 
@@ -207,9 +208,11 @@ pub struct ExclusiveManagementEvent {
 pub struct OrganisationListResult {
     /// The organisations this host is enrolled in, by organisation identity.
     pub enrolments: Vec<OrganisationEnrolmentView>,
-    /// The adapters the host admits: the adapters every enrolled organisation that states a list
-    /// allows, or null while none does. Two organisations whose lists share nothing leave an empty
-    /// set, which admits no adapter.
+    /// The adapters the enrolled organisations' policies allow together: the adapters every
+    /// organisation that states a list allows, or null while none does. Two organisations whose
+    /// lists share nothing leave an empty set, which allows no adapter. This is the list the host
+    /// puts in force when a policy changes, and again at each admissions pass until it lands;
+    /// `plugin.list` says which packages the admissions in force leave out.
     pub effective_adapter_allowlist: Nullable<CanonicalSet<PluginId>>,
     /// Whether this host is exclusively organisation-managed.
     pub exclusive: bool,

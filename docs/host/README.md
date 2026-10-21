@@ -1328,9 +1328,9 @@ root to verify a fetch against.
 An installed release whose manifest carries a native bridge recipe, installed with
 `native_bridge.install` granted, has the recipe applied in the application's own directory while the
 installation stands: the package is enabled, its repository has not revoked the release and the
-organisation's adapter allowlist, where an applied policy states one, names it. Disabling the package, a revocation,
-a list that no longer names it, a grant that withdraws that capability and removing the package each
-take the recipe out again, whatever the disable policy says about live bindings, and the
+organisation's adapter allowlist, where an applied policy states one, names it. Disabling the
+package, a revocation, a list that no longer names it, a grant that withdraws that capability and
+removing the package each take the recipe out again, whatever the disable policy says about live bindings, and the
 installation stays. After every plugin change, every synchronisation, pin and removal, every change
 of the allowlist, and each time the daemon starts, the package's bridge is brought to what its
 installation wants, so a recipe a stopped daemon left part way is finished or taken out before
@@ -3086,19 +3086,23 @@ and the owner can already end an organisation's list altogether by withdrawing. 
 exclusively organisation-managed the method is held to the local owner's lease, like every method
 outside the recovery list.
 
-The host checks the policy in this order, and each refusal is `INVALID_ARGUMENT` that names its rule
-in parentheses:
+The host checks the policy in this order. Each refusal is `INVALID_ARGUMENT` that names its rule in
+parentheses, except that a chain the host cannot judge for want of a trusted clock, or of a floor
+written to disk, is refused as every other decision of the clock is (`CLOCK_UNTRUSTED` or
+`STORAGE_UNAVAILABLE`).
 
 1. The host is enrolled in the policy's organisation (`not_enrolled`).
 2. The policy's structure holds: an allowlist that is stated names at least one adapter and at most
-   64, the audit retention and the grant lifetime are in range (`structure`).
+   64, and the audit retention and the grant lifetime are in range (`structure`).
 3. A chain, when the request carries one, is followed first, as it is when a lease carries one. A
-   chain that is not newer changes nothing. A newer chain is verified against the clock, which the
-   host must trust, and against the anchor the host holds; one that belongs to another organisation
+   chain that is not newer changes nothing. A newer chain is verified against the anchor the host
+   holds and against the clock, which the host must trust, and it is judged again inside the
+   transaction that writes the policy; a chain that belongs to another organisation
    (`foreign_chain`) or does not verify (`chain`) refuses the request. So does a chain that shows
-   that a lease the host holds was signed after its key was succeeded (`chain_drops_leases`):
-   dropping a lease owes a fence, which presenting the chain with a lease raises, and the lease
-   stays in force until then. A refused request keeps no chain.
+   that a lease the host holds, and that is still in force, was signed after its key was succeeded
+   (`chain_drops_leases`): dropping it owes a fence, which presenting the chain with a lease
+   raises. That refusal ends with the lease, which lasts at most fifteen minutes; a lease that has
+   ended is dropped with the chain. A refused request keeps no chain.
 4. The policy is signed under the highest key revision the host has accepted. A policy under a
    later revision is refused, and asks for the chain beside it (`later_revision`). A policy under an
    earlier revision is refused whether or not the host still holds that revision's link, because
@@ -3110,55 +3114,59 @@ in parentheses:
 6. The revision is above the one the host holds (`not_newer`). The same revision with the same
    allowlist is a repeat: it changes nothing and puts the host's list in force again.
 
-The host reads no clock for the policy itself. It has no lifetime, every time in these rules is one
-the organisation signed, and a host that distrusts its clock must still be able to narrow what it
-runs. The limit of the key chain stands: a host that never saw a rotation cannot tell a key the
-organisation retired from the one in force, so a policy signed by a retained key it never saw
-rotate is applied.
+The host reads no clock for a policy that comes without a chain. It has no lifetime, every time in
+these rules is one the organisation signed, and a host that distrusts its clock must still be able
+to narrow what it runs. The limit of the key chain stands: a host that never saw a rotation cannot
+tell a key the organisation retired from the one in force, so a policy signed by a retained key it
+never saw rotate is applied.
 
 After the organisation rotates its key, a host that has followed the new chain keeps the policy it
 holds and accepts the next one only under the new key. A policy the organisation signed under the
 old key is refused until the organisation signs it again. A host that has not followed the rotation
-needs the chain beside the policy: `kr organisation policy --chain <chain-file>`.
+needs the chain beside the policy: `kr organisation policy <policy-file> --chain <chain-file>`.
 
-The host keeps the policy's revision and its adapter allowlist, in the enrolment's row in the
-registry, so a restart restores both. The policy states other settings too: the least client
-version, the longest grant, what members' clients may reach outside KalaReach, the backup
-requirements and the audit retention. The host verifies them with the rest of the policy and
-neither stores nor applies them. The revision is a floor: a policy at or below it is refused, a
-restart does not lower it, and a captured older policy cannot bring back a list the organisation
-has since replaced. The floor lives with the enrolment, so a withdrawal removes it. Lease records
-are kept across a withdrawal, and the floor is not: a later enrolment, which needs the owner's
-confirmation again, starts with no policy. A host that is exclusively organisation-managed cannot
-leave its last organisation until that ends. Like every floor, the floor goes back when the whole
-store is restored.
+The host keeps the policy's revision and its adapter allowlist with the organisation's enrolment,
+in the policy row of the host's authority store, so a restart restores both. The policy states
+other settings too: the least client version, the longest grant, what members' clients may reach
+outside KalaReach, the backup requirements and the audit retention. The host verifies them with
+the rest of the policy and neither stores nor applies them. The revision is a floor: a policy at
+or below it is refused, a restart does not lower it, and a captured older policy cannot bring back
+a list the organisation has since replaced. The floor lives with the enrolment, so a withdrawal
+removes it. Lease records are kept across a withdrawal, and the floor is not: a later enrolment,
+which needs the owner's confirmation again, starts with no policy. A host that is exclusively
+organisation-managed cannot leave its last organisation until that ends. Like every floor, the
+floor goes back when the whole store is restored.
 
 The adapters the host admits are those that every enrolled organisation which states an allowlist
 allows: the intersection of the lists. An organisation with no list adds no constraint, a host with
 no list admits every adapter it qualifies, and lists that share nothing leave an empty set, which
-admits none. `organisation.list` reports each enrolment's revision and list and the list the host
-admits. The host puts the list in force in four places:
+admits none. `organisation.list` reports each enrolment's revision and list and the list the
+policies allow together; `plugin.list` says which packages the admissions in force leave out. The
+host puts the list in force in four places:
 
 - When the daemon starts, the policy is restored before the catalogue opens, and the catalogue
   opens with the list. Each start that has a list raises the admission revision once, because the
   catalogue begins without one. If that raise fails, the daemon does not start, as with the other
   records the catalogue needs to open.
 - After `organisation.policy.apply` commits. The request waits for the catalogue for up to five
-  seconds, because a synchronisation holds the catalogue across its network work. If the catalogue is still busy then, or the revision cannot be raised, the policy is
-  recorded and the request answers `RESOURCE_UNAVAILABLE` or `STORAGE_UNAVAILABLE`, saying the host
-  puts the list in force at its next admissions pass. The recorded answer is given to a repeat of
-  the same action only once the list is in force, and a repeat of the same policy by a new action
-  completes it.
+  seconds, because a synchronisation holds the catalogue across its network work. If the catalogue
+  is still busy then, or the revision cannot be raised, the policy is recorded and the request
+  answers `RESOURCE_UNAVAILABLE` or `STORAGE_UNAVAILABLE`, saying the host puts the list in force at
+  its next admissions pass; until it does, the list the policies state and the list in force differ.
+  The recorded answer is given to a repeat of the same action only once the list is in force, and a
+  repeat of the same policy by a new action completes it.
 - After `organisation.withdraw`, which can only widen the list. A put that does not land waits for
   the next pass.
 - At the head of every admissions pass, which runs every 30 seconds and whenever a change asks for
-  one. The list in force is derived from the policy on disk, so a put that failed is made again, and
-  `kr doctor` reports the failure through the catalogue check. While the raise keeps failing, a list
-  that should have narrowed stays wide.
+  one. The list in force is derived from the policy on disk, so a put that failed is made again. A
+  list that is already in force costs nothing and waits for nothing. While a put keeps failing,
+  `kr host doctor` reports it through the catalogue check, and a list that should have narrowed
+  stays wide.
 
 Each put reads the policy once it holds the catalogue, so two changes cannot leave the older list in
-force. `organisation.enrol` puts nothing: an enrolment cannot replace one that holds a policy, and a
-new enrolment holds none, so it adds no constraint.
+force. A put that waits past its time leaves the change to finish on a task of its own, so a native
+bridge is never cut part way. `organisation.enrol` puts nothing: an enrolment cannot replace one
+that holds a policy, and a new enrolment holds none, so it adds no constraint.
 
 A session whose adapter leaves the list keeps running: its shell and terminal are not the adapter's.
 The package's bindings end at the next snapshot, each once no request it admitted is still open, and

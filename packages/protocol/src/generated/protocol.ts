@@ -19447,9 +19447,11 @@ export interface OrganisationListResult {
    */
   clock_trusted: boolean
   /**
-   * The adapters the host admits: the adapters every enrolled organisation that states a list
-   * allows, or null while none does. Two organisations whose lists share nothing leave an empty
-   * set, which admits no adapter.
+   * The adapters the enrolled organisations' policies allow together: the adapters every
+   * organisation that states a list allows, or null while none does. Two organisations whose
+   * lists share nothing leave an empty set, which allows no adapter. This is the list the host
+   * puts in force when a policy changes, and again at each admissions pass until it lands;
+   * `plugin.list` says which packages the admissions in force leave out.
    */
   effective_adapter_allowlist: PluginId[] | null
   /**
@@ -19602,8 +19604,8 @@ export interface OrganisationPolicyApplyParams {
 }
 /**
  * The policy the organisation signed, as a member exported it. The host applies it only when
- * it is signed by the key the host's chain ends with, names a revision above the one it
- * holds, and states a structure this contract admits.
+ * it is signed by the key the host's chain ends with, names a revision above the one it holds
+ * (or is the policy it holds again), and states a structure this contract admits.
  */
 export interface OrganisationPolicy1 {
   payload: OrganisationPolicyPayload
@@ -19626,9 +19628,10 @@ export interface OrganisationPolicyApplyResult {
    */
   adapter_allowlist: PluginId[] | null
   /**
-   * The adapters the host admits as the answer was made: the adapters every enrolled
-   * organisation that states a list allows, or null while none does. A repeat of the action is
-   * given this list, not the one in force now; `organisation.list` reports the list in force.
+   * The adapters the enrolled organisations' policies allow together as the answer was made: the
+   * adapters every organisation that states a list allows, or null while none does. The host puts
+   * this list in force when it records the policy. A repeat of the action is given this list, not
+   * the one the policies state now; `organisation.list` reports that.
    */
   effective_adapter_allowlist: PluginId[] | null
   /**

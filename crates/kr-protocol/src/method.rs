@@ -597,9 +597,10 @@ methods! {
     effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)], selectors: [Host],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,
-    doc: "The organisations this host is enrolled in, the key each is pinned to, the devices \
-          bound to member accounts and the lease each holds, whether exclusive management is on, \
-          and every time it was turned off, with how the owner confirmed it.";
+    doc: "The organisations this host is enrolled in, the key each is pinned to, the policy \
+          applied for each with the adapters it allows, the adapters the policies allow together, \
+          the devices bound to member accounts and the lease each holds, whether exclusive \
+          management is on, and every time it was turned off, with how the owner confirmed it.";
 
     OrganisationPolicyApply = "organisation.policy.apply", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host],
@@ -608,9 +609,10 @@ methods! {
     doc: "Apply an organisation's signed policy to this host: the adapters it allows are the only \
           ones the host admits, with every other organisation's list intersected. The policy is \
           verified under the key the organisation's chain ends with, which the request can carry \
-          when it has moved, and is refused at or below the revision the host holds. The owner \
-          confirmed the organisation's keys when enrolling, and a policy never enlarges what the \
-          host allows without one, so it needs no new confirmation.";
+          when it has moved, and is refused at or below the revision the host holds unless it \
+          is that policy again. The owner confirmed the organisation's keys when enrolling, and \
+          a policy never enlarges what the host allows without one, so it needs no new \
+          confirmation.";
 
     OrganisationExclusiveSet = "organisation.exclusive.set", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host],

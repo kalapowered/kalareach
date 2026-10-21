@@ -196,10 +196,10 @@ async fn policy(
             &applied.adapter_allowlist,
             "every adapter this host qualifies",
         ));
-        output::line(&stdout_line!("This host admits:"));
+        output::line(&stdout_line!("The organisations' policies allow together:"));
         output::lines(&adapter_lines(
             &applied.effective_adapter_allowlist,
-            "every adapter it qualifies",
+            "every adapter this host qualifies",
         ));
     }
     Ok(())
@@ -528,10 +528,10 @@ async fn list(paths: &HostPaths, arguments: &PrivacyArguments, json: bool) -> Re
             }
         }
     }
-    output::line(&stdout_line!("This host admits:"));
+    output::line(&stdout_line!("The organisations' policies allow together:"));
     output::lines(&adapter_lines(
         &listed.effective_adapter_allowlist,
-        "every adapter it qualifies",
+        "every adapter this host qualifies",
     ));
     output::line(&stdout_line!(
         "A lease for this host's own local owner is signed for device {} and authorisation key {} \
