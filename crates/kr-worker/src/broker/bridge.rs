@@ -1265,6 +1265,8 @@ mod tests {
                 "public_majors": [1],
                 "retained_levels": ["0.48"],
                 "shells": [],
+                "agents": [],
+                "dependencies": { "lock_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "pinned": [], "vectors": [] },
                 "stores": [{
                     "store": "registry",
                     "scope": "environment",

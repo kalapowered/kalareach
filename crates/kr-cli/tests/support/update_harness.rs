@@ -515,7 +515,16 @@ impl Assembled {
                     .map(|row| row.major)
                     .collect(),
                 retained_levels: vec![retained],
+                // Older builds of the upgrade suite require the members a shell entry had before the
+                // manifest named its patches, so a release assembled here lists no shell package;
+                // its shell packages are the module tree the files list.
                 shells: Vec::new(),
+                agents: Vec::new(),
+                dependencies: kr_protocol::update::ReleaseDependencies {
+                    lock_sha256: Digest256::from_bytes([0; 32]),
+                    pinned: Vec::new(),
+                    vectors: Vec::new(),
+                },
                 stores: release_stores(),
                 files,
             },

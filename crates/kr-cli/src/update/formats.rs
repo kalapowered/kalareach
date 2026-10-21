@@ -752,6 +752,8 @@ mod tests {
                 "public_majors": [1],
                 "retained_levels": ["0.48"],
                 "shells": [],
+                "agents": [],
+                "dependencies": { "lock_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "pinned": [], "vectors": [] },
                 "stores": [
                     listed("shell-entries", "state_root", "shell-entries.json"),
                     listed("machine-group", "environment", "machine-group"),

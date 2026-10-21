@@ -2456,6 +2456,12 @@ fn small_release(signer: &Ed25519KeyPair) -> (ReleaseManifest, BTreeMapFiles, St
         public_majors: vec![1],
         retained_levels: vec![CompatibilityLevel::of(PACKAGE_VERSION)],
         shells: Vec::new(),
+        agents: Vec::new(),
+        dependencies: kr_protocol::update::ReleaseDependencies {
+            lock_sha256: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
+            pinned: Vec::new(),
+            vectors: Vec::new(),
+        },
         stores: release_stores(),
         files: files
             .iter()

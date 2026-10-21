@@ -504,6 +504,8 @@ fn kr_req_12_27_a_release_an_update_holds_cannot_hold_its_hook() {
                 "public_majors": [1],
                 "retained_levels": ["0.48"],
                 "shells": [],
+                "agents": [],
+                "dependencies": { "lock_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "pinned": [], "vectors": [] },
                 "stores": [{
                     "store": "registry",
                     "scope": "environment",
