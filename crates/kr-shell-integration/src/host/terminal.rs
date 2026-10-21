@@ -701,6 +701,8 @@ mod tests {
         ]
     }
 
+    /// KR-REQ-07.31: an explicit profile decides first, then the saved preference, then the first
+    /// terminal detected, each over the ones after it.
     #[test]
     fn the_order_is_profile_then_preference_then_detection() {
         let available = applications();
@@ -717,6 +719,8 @@ mod tests {
         assert_eq!(chosen.application.id, "iterm2");
     }
 
+    /// KR-REQ-07.31: a profile that names a terminal this host does not have is not replaced by the
+    /// preference or by a detected terminal: it is `TERMINAL_UNAVAILABLE`.
     #[test]
     fn a_profile_that_names_something_missing_is_an_error_rather_than_a_substitution() {
         let error = select(Some("kitty"), Some("iterm2"), &applications()).expect_err("refused");
@@ -724,6 +728,8 @@ mod tests {
         assert!(matches!(error, TerminalUnavailable::ProfileMissing { .. }));
     }
 
+    /// KR-REQ-07.31: a saved preference that names a terminal no longer installed is not an error:
+    /// the first detected terminal is chosen.
     #[test]
     fn a_stale_preference_falls_through_to_detection() {
         let chosen = select(None, Some("kitty"), &applications()).expect("chosen");
@@ -955,10 +961,89 @@ mod tests {
         assert!(hold_preference_within(other.path(), patience).is_err());
     }
 
+    /// KR-REQ-07.31: a host with no terminal to open answers `TERMINAL_UNAVAILABLE`, which the
+    /// create that asked for a window reports beside the session it made.
     #[test]
     fn a_host_with_no_terminal_says_so_once() {
         let error = select(None, None, &[]).expect_err("refused");
         assert_eq!(error, TerminalUnavailable::NoneAvailable);
         assert_eq!(error.code(), ErrorCode::TerminalUnavailable);
+    }
+
+    /// What a Windows host detects and opens a console with, run there and not read from the
+    /// code.
+    #[cfg(windows)]
+    mod native_windows {
+        use super::*;
+
+        /// Whether `wt.exe` is a name in a directory of `PATH`, which is where `detect` looks. It is
+        /// read here by the name's own entry, so an application execution alias, which is a
+        /// reparse point and not a file, counts.
+        fn windows_terminal_is_on_the_path() -> bool {
+            std::env::var_os("PATH").is_some_and(|path| {
+                std::env::split_paths(&path)
+                    .any(|directory| std::fs::symlink_metadata(directory.join("wt.exe")).is_ok())
+            })
+        }
+
+        /// KR-REQ-07.31: a Windows host detects Windows Terminal when it is on `PATH` and a console
+        /// window after it, always, so the list is never empty; with no profile or preference the
+        /// first detected is chosen, and a profile naming the console chooses it.
+        #[test]
+        fn detection_names_windows_terminal_when_it_is_on_the_path_and_the_console_after_it() {
+            let detected = detect();
+            let ids: Vec<&str> = detected
+                .iter()
+                .map(|application| application.id.as_str())
+                .collect();
+            println!("terminals detected on this host: {detected:?}");
+            if windows_terminal_is_on_the_path() {
+                assert_eq!(ids, ["windows-terminal", "windows-console"], "{detected:?}");
+            } else {
+                assert_eq!(ids, ["windows-console"], "{detected:?}");
+            }
+
+            let chosen = select(None, None, &detected).expect("a terminal is detected");
+            assert_eq!(chosen.source, Source::Detected);
+            assert_eq!(chosen.application, detected[0]);
+            let console = select(Some("windows-console"), None, &detected)
+                .expect("the console is always detected");
+            assert_eq!(console.source, Source::Profile);
+            assert_eq!(console.application.id, "windows-console");
+        }
+
+        /// KR-REQ-07.31: the console launcher runs the command it is given and reports success
+        /// once the launcher has accepted it. The command makes a directory, which is what shows
+        /// it ran; nothing has made it before the console is asked. The launcher is `cmd.exe /c
+        /// start`, which starts the command in a console of its own, so what is shown here is that
+        /// the command ran through it and not that a window was drawn: a hosted job has no desktop
+        /// to look at.
+        #[test]
+        fn the_console_launcher_runs_the_command_it_is_given() {
+            let directory = tempfile::tempdir().expect("a directory");
+            let made = directory.path().join("made-by-the-console");
+            assert!(!made.exists(), "nothing has run the command yet");
+
+            let selection = select(Some("windows-console"), None, &detect())
+                .expect("the console is always detected");
+            let command = vec![
+                "cmd.exe".to_owned(),
+                "/c".to_owned(),
+                "mkdir".to_owned(),
+                made.display().to_string(),
+            ];
+            open(&selection, &command).expect("the launcher accepted the command");
+
+            // The command runs in a process the launcher started and does not wait for, so what
+            // it makes is the signal. The deadline only ends a failure; passing it decides nothing.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            while !made.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the command the console was given never ran"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
     }
 }

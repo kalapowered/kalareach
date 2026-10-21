@@ -567,8 +567,10 @@ jobs:
       # task and from the built executable as the shipping daemon starts a worker, the first-owner
       # pairing against a real control daemon on loopback, the contact skill's installation and
       # removal with the access reader it compares a replacement with, the directory secret store
-      # and the libsodium boundary, the machine group record, and the plugin catalogue's package
-      # store with the daemon's catalogue and plugin groups over it. "The attach client" means the part of it that runs
+      # and the libsodium boundary, the machine group record, the terminal a session opens in
+      # (what is detected and what the console launcher runs), the platform time adapter's reading
+      # of this machine's time service, and the plugin catalogue's package store with the
+      # daemon's catalogue and plugin groups over it. "The attach client" means the part of it that runs
       # here - `crates/kr-cli/tests/attach.rs` is a Unix file, so what passes is that crate's library
       # and its path tests rather than a real attachment. The contact tools run in
       # `crates/kr-cli/tests/contact_windows.rs`, beside the Unix suite, with the tool server
@@ -612,6 +614,15 @@ jobs:
       - name: Test the worker's library
         if: ${{ !cancelled() && matrix.part == 'first' }}
         run: cargo test --locked -p kr-worker --lib
+
+      # The platform time adapter against this machine's own time service, the recorded readings
+      # every platform's classifier is held to, and the rule that retrust needs the host's time
+      # authority or its owner and never a paired peer. The first case prints the reading it took
+      # (the source, the status and the bound the service gave), so this log shows what `w32tm`
+      # answered here. Only these three cases of the suite are qualified on this platform.
+      - name: Test the platform time adapter
+        if: ${{ !cancelled() && matrix.part == 'first' }}
+        run: cargo test --locked -p kr-worker --test receipts -- --nocapture --exact the_platform_time_adapter_reads_this_machines_own_time_service every_recorded_platform_reading_classifies_the_way_the_fixture_states retrust_needs_the_host_time_authority_or_the_owner_and_never_a_paired_peer
 
       # The protocol crate's own tests. Among them the configuration document's validation, which
       # takes a certificate path only as this platform writes an absolute one, and the lock a
@@ -757,6 +768,16 @@ jobs:
       - name: Test the command a typed name is looked up by
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-shell-integration --lib host::command
+
+      # What a Windows host detects to open a session's terminal in, and the console launcher that
+      # runs the command it is given, both run here and not read from the code: Windows Terminal
+      # when it is on `PATH` and the console after it, and a command the console is asked to run
+      # that makes what it was told to make. The saved preference's files and locks, the rest of
+      # this module's units, have never run on this platform and are not claimed by this filter.
+      - name: Test the terminal a session opens in
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        # Quoted: a plain YAML scalar cannot end in a colon, and the filter does.
+        run: "cargo test --locked -p kr-shell-integration --lib host::terminal::tests::native_windows::"
 
       # What the doctor reads of this platform: the worker's own answer to whether its command
       # backends run, which is a fact apart from whether it can publish a credential file.
