@@ -309,6 +309,15 @@ impl Binding {
     }
 }
 
+/// Why rich mutations are suspended while nothing reads which conversation a gateway-served
+/// terminal has selected.
+///
+/// A terminal behind the gateway can start, resume and fork conversations, and the gateway
+/// carries its frames without reading the thread out of them, so the binding names no thread and
+/// nothing vouches for one.
+pub const THREAD_NOT_READ: &str = "the terminal's conversation is not read from its stream, so \
+                                   which thread it has selected is unknown";
+
 /// One managed application instance.
 #[derive(Debug)]
 pub struct Instance {
@@ -342,6 +351,13 @@ pub struct Instance {
     pub profile_id: Option<LaunchProfileId>,
     /// Why rich mutations are suspended, while they are.
     pub rich_suspension: Option<String>,
+    /// Set for the life of a gateway-served instance: nothing reads which conversation the terminal
+    /// behind its gateway has selected.
+    ///
+    /// It is a reason of its own: the unclassified-method suspension above is overwritten by the
+    /// next unclassified method and lifted by [`Broker::resume_rich_mutations`], and this one is
+    /// lifted by neither.
+    pub thread_unread: Option<&'static str>,
     /// What carries a prepared operation to this instance's upstream, where anything does.
     dispatch: Option<std::sync::Arc<dyn crate::broker::methods::UpstreamDispatch>>,
     /// What this instance has been observed doing, and the cursor an adapter replays from.
@@ -431,15 +447,18 @@ impl Instance {
     }
 
     /// Why rich mutations are suspended, while they are: the reason one was placed with, or else
-    /// this instance's native bridge not being able to vouch for its thread.
+    /// this instance's native bridge not being able to vouch for its thread, or else nothing
+    /// reading the thread a gateway-served terminal has selected. One reason is named, the first of
+    /// those that holds.
     ///
-    /// The bridge's reason is its own. Lifting a suspension placed here does not lift it, and the
-    /// bridge settling does not lift one placed here.
+    /// The bridge's reason and the unread thread are each their own. Lifting a suspension placed
+    /// here lifts neither, and neither settling lifts one placed here.
     #[must_use]
     pub fn suspension_reason(&self) -> Option<&str> {
         self.rich_suspension
             .as_deref()
             .or_else(|| self.bridge.suspension())
+            .or(self.thread_unread)
     }
 
     /// Holds one frame, with the package whose table recorded it, forgetting the oldest
@@ -1218,10 +1237,34 @@ impl Broker {
         Ok(())
     }
 
+    /// Suspends an instance's rich mutations because nothing reads which conversation its
+    /// gateway-served terminal has selected ([`THREAD_NOT_READ`]).
+    ///
+    /// The terminal stays available. [`Broker::resume_rich_mutations`] does not lift this, and
+    /// nothing else does: the reason holds for the instance's life.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance.
+    #[cfg(unix)]
+    pub(crate) fn withhold_thread(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Result<()> {
+        let mut state = self.state();
+        let instance = state
+            .instances
+            .get_mut(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        instance.thread_unread = Some(THREAD_NOT_READ);
+        Ok(())
+    }
+
     /// Lifts the suspension, because the binding has been verified.
     ///
     /// A native bridge's own suspension, while it cannot vouch for the application's thread, is not
-    /// this one: it is lifted only by the bridge's next report the host can order.
+    /// this one: it is lifted only by the bridge's next report the host can order. Nor is the
+    /// unread thread of a gateway-served terminal.
     ///
     /// # Errors
     ///
@@ -4105,6 +4148,7 @@ impl BrokerState {
                 mode,
                 profile_id,
                 rich_suspension: None,
+                thread_unread: None,
                 dispatch: None,
                 semantic,
                 commands: Vec::new(),

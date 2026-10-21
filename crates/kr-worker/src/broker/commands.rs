@@ -2916,6 +2916,10 @@ async fn admit_claimed<'a>(
         *run.tables
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tables);
+        // The gateway carries the terminal's frames and reads no thread out of them, so nothing
+        // vouches for the conversation it has selected. Section 12 has rich mutations suspended
+        // until the binding is verified, the terminal available meanwhile.
+        broker.withhold_thread(backend.application_instance_id)?;
     }
     // The directory the invocation was resolved in, for reading only and confined to its own
     // mount. The grant is the instance's, so it goes with the instance: a launch given back takes
