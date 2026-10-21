@@ -19,9 +19,9 @@ use kr_client::services::{
     SyncRecoveryId, SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use kr_crypto::backup::{
-    ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CheckpointSource,
-    CollectionKind, GenerationExpectation, ObjectSource, RestoreGeneration, open_archive,
-    seal_archive, stage_object,
+    ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CollectionKind,
+    GenerationExpectation, ObjectSource, RestoreGeneration, open_archive, seal_archive,
+    stage_object,
 };
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
@@ -2902,71 +2902,6 @@ async fn rotating_a_writers_key_replaces_it_in_one_commit() {
     );
 }
 
-#[tokio::test]
-async fn a_verified_generation_never_moves_backwards() {
-    let service = ScriptedService::shared();
-    let seed = RecoverySeed::generate().expect("a seed");
-    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
-    let mut bundle = BundleStore::empty(TimestampMs::new(1));
-    let newest = ArchiveCheckpoint {
-        archive_id: archive_id(),
-        backup_generation: BackupGeneration::new(9),
-        encrypted_manifest_hash: Digest256::from_bytes([0xab; 32]),
-        verified_at_ms: TimestampMs::new(2),
-    };
-    store
-        .record_checkpoint(&seed, &mut bundle, newest.clone(), TimestampMs::new(1_000))
-        .await
-        .expect("the checkpoint commits");
-
-    // A verification of an older generation arriving late is a late answer, not a newer fact.
-    // Writing it would give a service five generations it could replay unnoticed.
-    let late = ArchiveCheckpoint {
-        backup_generation: BackupGeneration::new(4),
-        ..newest.clone()
-    };
-    assert!(matches!(
-        store
-            .record_checkpoint(&seed, &mut bundle, late, TimestampMs::new(2_000))
-            .await,
-        Err(RecoveryError::CheckpointWentBackwards {
-            recorded: 9,
-            offered: 4
-        })
-    ));
-
-    // And the same generation with a different manifest is a substitution, not an update.
-    let substituted = ArchiveCheckpoint {
-        encrypted_manifest_hash: Digest256::from_bytes([0xcd; 32]),
-        ..newest.clone()
-    };
-    assert!(
-        store
-            .record_checkpoint(&seed, &mut bundle, substituted, TimestampMs::new(2_000))
-            .await
-            .is_err()
-    );
-
-    // Forward is fine.
-    let newer = ArchiveCheckpoint {
-        backup_generation: BackupGeneration::new(11),
-        ..newest
-    };
-    store
-        .record_checkpoint(&seed, &mut bundle, newer, TimestampMs::new(3_000))
-        .await
-        .expect("a later generation is recorded");
-    let read = store.fetch(&seed).await.expect("the bundle");
-    assert_eq!(
-        read.checkpoints
-            .iter()
-            .next()
-            .expect("a checkpoint")
-            .backup_generation,
-        BackupGeneration::new(11)
-    );
-}
-
 #[test]
 fn a_kit_value_whose_spacing_would_change_when_read_is_refused() {
     // Reading trims the line, so a locator that ends in a space would come back a different
@@ -3120,9 +3055,7 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
         archive_id: archive_id(),
         generation: material.checkpoint(archive_id()).map_or(
             GenerationExpectation::Unverified,
-            |checkpoint| {
-                GenerationExpectation::Checkpoint(CheckpointSource::RecoveryBundle, checkpoint)
-            },
+            GenerationExpectation::Checkpoint,
         ),
     };
     let opened = open_archive(
@@ -3158,11 +3091,10 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
     // it still cannot claim that no newer archive exists.
     let standing = RestoreGeneration::against(
         &descriptor,
-        material
-            .checkpoint(archive_id())
-            .map_or(GenerationExpectation::Unverified, |checkpoint| {
-                GenerationExpectation::Checkpoint(CheckpointSource::RecoveryBundle, checkpoint)
-            }),
+        material.checkpoint(archive_id()).map_or(
+            GenerationExpectation::Unverified,
+            GenerationExpectation::Checkpoint,
+        ),
     );
     assert!(standing.describe().contains("generation 4"));
     assert!(!standing.proves_no_newer_archive());

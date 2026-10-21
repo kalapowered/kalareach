@@ -34,8 +34,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_crypto::backup::{
-    ArchiveExpectation, ArchiveReader, CheckpointSource, GenerationExpectation, Material,
-    OpenArchive, RestoreGeneration, admit_for_restore, member_cap, member_material, open_archive,
+    ArchiveExpectation, ArchiveReader, GenerationExpectation, Material, OpenArchive,
+    RestoreGeneration, admit_for_restore, member_cap, member_material, open_archive,
 };
 use kr_crypto::kdf::{RecoveryRecipient, RecoverySeed};
 use kr_crypto::secret::SecretVec;
@@ -982,9 +982,7 @@ impl FilesRestore {
 
         // 4. The publication, before an object is read.
         let expectation = match &checkpoint {
-            Some(checkpoint) => {
-                GenerationExpectation::Checkpoint(CheckpointSource::RecoveryBundle, checkpoint)
-            }
+            Some(checkpoint) => GenerationExpectation::Checkpoint(checkpoint),
             None => GenerationExpectation::Unverified,
         };
         let verified = verify_publication(
@@ -1138,13 +1136,10 @@ async fn choose_archive(
                 let newest = match source.generation(*archive_id, checkpoint).await? {
                     None => CandidateState::Nothing,
                     Some(publication) => {
-                        let expectation =
-                            checkpoint.map_or(GenerationExpectation::Unverified, |checkpoint| {
-                                GenerationExpectation::Checkpoint(
-                                    CheckpointSource::RecoveryBundle,
-                                    checkpoint,
-                                )
-                            });
+                        let expectation = checkpoint.map_or(
+                            GenerationExpectation::Unverified,
+                            GenerationExpectation::Checkpoint,
+                        );
                         match verify_publication(
                             &publication,
                             *archive_id,

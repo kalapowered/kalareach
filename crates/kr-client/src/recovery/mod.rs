@@ -121,17 +121,6 @@ pub enum RecoveryError {
     /// nothing else: no writer key is taken from the archive to make up for it.
     #[error("the recovery bundle did not authenticate at that origin and locator")]
     BundleNotAuthentic,
-    /// A checkpoint would have moved backwards, which is a late answer rather than a newer fact.
-    #[error(
-        "this archive's verified generation is {recorded}; recording {offered} would move it \
-         backwards"
-    )]
-    CheckpointWentBackwards {
-        /// The generation the bundle already records.
-        recorded: u64,
-        /// The generation that was offered.
-        offered: u64,
-    },
     /// The kit names another bundle than the one this store holds.
     ///
     /// It is the caller's kit that is wrong, not the bytes a service served, which is why it is

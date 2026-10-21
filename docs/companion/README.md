@@ -667,8 +667,8 @@ https origin or an http one on this computer.
 
 Recovery keeps the owner's seed on this computer and an encrypted bundle at a stable locator on the
 sync service. `src-tauri/src/recovery.rs` does it with `kr-client`'s `BundleStore`, which owns the
-bundle's rules: writes that compare the revision they replace, a record of any write whose answer
-never came back, and a checkpoint that never moves back.
+bundle's rules: writes that compare the revision they replace, and a record of any write whose
+answer never came back.
 
 - Turning recovery on writes `recovery/recovery.json` first (the service, a locator drawn for the
   bundle, and whether the first write is known to have landed), flushed to disk before the first

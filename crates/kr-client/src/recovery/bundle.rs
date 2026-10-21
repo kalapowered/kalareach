@@ -62,8 +62,8 @@ use std::sync::Arc;
 
 use kr_crypto::kdf::RecoverySeed;
 use kr_protocol::archive::{
-    ArchiveCheckpoint, RECOVERY_BUNDLE_SCHEMA_VERSION, RecoveryBundle, RecoveryContext,
-    RecoveryKit, TrustedProducer, TrustedWriter,
+    RECOVERY_BUNDLE_SCHEMA_VERSION, RecoveryBundle, RecoveryContext, RecoveryKit, TrustedProducer,
+    TrustedWriter,
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::SyncConflictId;
@@ -875,50 +875,6 @@ impl BundleStore {
         let mut writers: Vec<TrustedWriter> = bundle.trusted_writers.iter().cloned().collect();
         writers.retain(|held| &held.writer_key_id != retiring);
         bundle.trusted_writers = writers.into_iter().collect();
-        self.commit(seed, bundle, now_ms).await
-    }
-
-    /// Records the latest generation the owner has verified for one archive.
-    ///
-    /// A checkpoint only ever moves forward. A verification of generation four arriving after one
-    /// of generation nine is a late answer, not a newer fact, and writing it would give a service
-    /// five generations of archives it could replay unnoticed. The compare-and-swap protects the
-    /// bundle's revision; this protects what the bundle says.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RecoveryError::CheckpointWentBackwards`] when the recorded generation is newer
-    /// than this one, and whatever [`Self::commit`] returns.
-    pub async fn record_checkpoint(
-        &mut self,
-        seed: &RecoverySeed,
-        bundle: &mut RecoveryBundle,
-        checkpoint: ArchiveCheckpoint,
-        now_ms: TimestampMs,
-    ) -> Result<SyncPosition> {
-        let mut checkpoints: Vec<ArchiveCheckpoint> = bundle.checkpoints.iter().cloned().collect();
-        if let Some(held) = checkpoints
-            .iter()
-            .find(|held| held.archive_id == checkpoint.archive_id)
-        {
-            if held.backup_generation.get() > checkpoint.backup_generation.get() {
-                return Err(RecoveryError::CheckpointWentBackwards {
-                    recorded: held.backup_generation.get(),
-                    offered: checkpoint.backup_generation.get(),
-                });
-            }
-            if held.backup_generation == checkpoint.backup_generation
-                && held.encrypted_manifest_hash != checkpoint.encrypted_manifest_hash
-            {
-                return Err(RecoveryError::CheckpointWentBackwards {
-                    recorded: held.backup_generation.get(),
-                    offered: checkpoint.backup_generation.get(),
-                });
-            }
-        }
-        checkpoints.retain(|held| held.archive_id != checkpoint.archive_id);
-        checkpoints.push(checkpoint);
-        bundle.checkpoints = checkpoints.into_iter().collect();
         self.commit(seed, bundle, now_ms).await
     }
 

@@ -217,8 +217,8 @@ says where the archive stands: at the checkpoint, ahead of it, replayed from bef
 its generation with another manifest, or for a different archive altogether.
 The last three are refused, and refused by `open_archive` itself
 rather than only reported, so a caller that never looked at the report still cannot restore a
-replay. Where the checkpoint came from travels with the answer, because a paired device's and a
-recovery bundle's mean different things to a person. `proves_no_newer_archive` is always false and is a method rather than a comment: a service
+replay. The checkpoint a restore compares against is the one the owner's recovery bundle holds.
+`proves_no_newer_archive` is always false and is a method rather than a comment: a service
 holding a newer archive back looks exactly like an owner who has not written one, and
 `RestoreGeneration::describe` says so in the sentence a restore displays, alongside the generation
 it is restoring.

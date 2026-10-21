@@ -5,8 +5,8 @@
 //! may trust, and it is committed before a writer is declared recovery-enabled. This module is
 //! that client on a companion: it makes the seed, puts the first bundle at the service, writes the
 //! kit the person keeps, and commits the bundle again when a writer is enabled. The rules about
-//! the bundle itself, the compare-and-swap, the record of a write whose answer never came back
-//! and the checkpoint that never moves back, are `kr_client::recovery::BundleStore`'s.
+//! the bundle itself, the compare-and-swap and the record of a write whose answer never came
+//! back, are `kr_client::recovery::BundleStore`'s.
 //!
 //! # What lives where
 //!

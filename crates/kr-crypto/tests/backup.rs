@@ -7,8 +7,8 @@
 use kr_crypto::CryptoError;
 use kr_crypto::archive::{self, EncryptedObject};
 use kr_crypto::backup::{
-    ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CheckpointSource,
-    CollectionKind, GenerationExpectation, GenerationStanding, KeyRotation, ObjectSource,
+    ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CollectionKind,
+    GenerationExpectation, GenerationStanding, KeyRotation, ObjectSource,
     RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT, RestoreGeneration, ResumeDecision, RetainedObjectKeys,
     SealedArchive, StagedObject, open_archive, recipient_key_id, resume_object, seal_archive,
     stage_object, still_readable_after_revocation,
@@ -1420,7 +1420,7 @@ fn checkpoint(generation: u64, hash: Digest256) -> ArchiveCheckpoint {
 }
 
 #[test]
-fn a_checkpoint_from_a_paired_device_catches_a_replayed_older_archive() {
+fn a_checkpoint_catches_a_replayed_older_archive() {
     let parties = Parties::generate();
     let objects = [stage(1, "a.cbor", b"one")];
     let old = seal(&parties, 3, &objects);
@@ -1429,7 +1429,7 @@ fn a_checkpoint_from_a_paired_device_catches_a_replayed_older_archive() {
     let verified = checkpoint(7, new.descriptor.encrypted_manifest.encrypted_object_hash);
     let replayed = RestoreGeneration::against(
         &old.descriptor,
-        GenerationExpectation::Checkpoint(CheckpointSource::Pairing, &verified),
+        GenerationExpectation::Checkpoint(&verified),
     );
     assert!(matches!(
         replayed.standing,
@@ -1443,7 +1443,7 @@ fn a_checkpoint_from_a_paired_device_catches_a_replayed_older_archive() {
     // manifest verifies.
     let against = ArchiveExpectation {
         archive_id: archive_id(),
-        generation: GenerationExpectation::Checkpoint(CheckpointSource::Pairing, &verified),
+        generation: GenerationExpectation::Checkpoint(&verified),
     };
     assert!(
         open_archive(
@@ -1460,12 +1460,9 @@ fn a_checkpoint_from_a_paired_device_catches_a_replayed_older_archive() {
 
     let current = RestoreGeneration::against(
         &new.descriptor,
-        GenerationExpectation::Checkpoint(CheckpointSource::Pairing, &verified),
+        GenerationExpectation::Checkpoint(&verified),
     );
-    assert!(matches!(
-        current.standing,
-        GenerationStanding::AtCheckpoint { .. }
-    ));
+    assert!(matches!(current.standing, GenerationStanding::AtCheckpoint));
     assert!(current.is_admissible());
     let opened = open_archive(
         &ArchiveReader::Device(&parties.device),
@@ -1478,7 +1475,7 @@ fn a_checkpoint_from_a_paired_device_catches_a_replayed_older_archive() {
     .expect("the generation the owner verified opens");
     assert!(matches!(
         opened.generation().standing,
-        GenerationStanding::AtCheckpoint { .. }
+        GenerationStanding::AtCheckpoint
     ));
 }
 
@@ -1515,7 +1512,7 @@ fn an_archive_of_another_collection_is_not_the_backup_that_was_asked_for() {
     };
     let standing = RestoreGeneration::against(
         &sealed.descriptor,
-        GenerationExpectation::Checkpoint(CheckpointSource::Pairing, &other),
+        GenerationExpectation::Checkpoint(&other),
     );
     assert!(matches!(
         standing.standing,
@@ -1529,7 +1526,7 @@ fn an_archive_of_another_collection_is_not_the_backup_that_was_asked_for() {
             &[trusted(&parties.writer)],
             &ArchiveExpectation {
                 archive_id: archive_id(),
-                generation: GenerationExpectation::Checkpoint(CheckpointSource::Pairing, &other),
+                generation: GenerationExpectation::Checkpoint(&other),
             },
             &sealed.descriptor_bytes,
             &sealed.encrypted_manifest,
@@ -1547,7 +1544,7 @@ fn an_archive_claiming_the_checkpoints_generation_with_another_manifest_is_refus
 
     let substituted = RestoreGeneration::against(
         &second.descriptor,
-        GenerationExpectation::Checkpoint(CheckpointSource::Pairing, &verified),
+        GenerationExpectation::Checkpoint(&verified),
     );
     assert!(matches!(
         substituted.standing,
@@ -1561,10 +1558,7 @@ fn an_archive_claiming_the_checkpoints_generation_with_another_manifest_is_refus
             &[trusted(&parties.writer)],
             &ArchiveExpectation {
                 archive_id: archive_id(),
-                generation: GenerationExpectation::Checkpoint(
-                    CheckpointSource::Pairing,
-                    &verified,
-                ),
+                generation: GenerationExpectation::Checkpoint(&verified),
             },
             &second.descriptor_bytes,
             &second.encrypted_manifest,
@@ -1601,10 +1595,7 @@ fn a_recovery_only_restore_states_its_generation_and_claims_nothing_more() {
         &[trusted(&parties.writer)],
         &ArchiveExpectation {
             archive_id: archive_id(),
-            generation: GenerationExpectation::Checkpoint(
-                CheckpointSource::RecoveryBundle,
-                &bundle_checkpoint,
-            ),
+            generation: GenerationExpectation::Checkpoint(&bundle_checkpoint),
         },
         &sealed.descriptor_bytes,
         &sealed.encrypted_manifest,
@@ -1628,7 +1619,7 @@ fn a_recovery_only_restore_states_its_generation_and_claims_nothing_more() {
     let verified = checkpoint(9, Digest256::from_bytes([0xab; 32]));
     let ahead = RestoreGeneration::against(
         &sealed.descriptor,
-        GenerationExpectation::Checkpoint(CheckpointSource::RecoveryBundle, &verified),
+        GenerationExpectation::Checkpoint(&verified),
     );
     assert!(matches!(ahead.standing, GenerationStanding::Ahead { .. }));
     assert!(ahead.is_admissible());
