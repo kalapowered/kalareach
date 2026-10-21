@@ -11,7 +11,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-12.07 | a plain `codex resume` typed in a managed root shell runs behind a gateway that exists before the terminal connects, with the name and vector typed and the integration's flags added; an absolute-path invocation runs as typed and a program found running is adopted and given none |
-//! | KR-REQ-12.06 | the binding of a gateway-served terminal whose thread selection nothing reads says so: no thread, rich mutations suspended for that reason from the start, a rich prompt refused for it, the terminal available throughout |
+//! | KR-REQ-12.06 | the binding of a gateway-served terminal whose thread selection nothing reads says so: no thread, rich mutations suspended for that reason before and after the terminal connects, a rich prompt refused for it, the terminal available throughout |
 //! | KR-REQ-12.10, KR-ACC-006, KR-REQ-11.27 | the daemon killed while the terminal writes leaves the worker, terminal and server and the terminal's output; a restarted daemon serves the same agent, binding and pending request to a reconnecting device, which is drawn what the local terminal shows, and the terminal's answer reaches the server once, without the request being asked again |
 //! | KR-REQ-07.61, KR-REQ-07.66 | the session's closure, requested or by a worker's crash, ends the server that ignores the end of its input and a terminate, and what it started, by the identities the worker recorded |
 //!
@@ -794,8 +794,8 @@ fn process_absent(run: &Run, needle: &str) -> bool {
 
 /// KR-REQ-12.06: the binding of a gateway-served terminal says that nothing reads which thread the
 /// terminal has selected: it names no thread, its rich mutations are suspended for that reason
-/// before the launch commits, before and after the terminal connects and completes a turn, and a
-/// rich prompt at the revision read is refused for it. The terminal runs its whole turn through
+/// before and after the terminal connects and completes a turn, and a rich prompt at the revision
+/// read is refused for it. The terminal runs its whole turn through
 /// the gateway meanwhile. The package's table lists every method the terminal sends, so no method
 /// the table does not list is the reason.
 ///
@@ -852,7 +852,8 @@ fn kr_req_12_06_a_gateway_served_terminals_unread_thread_suspends_rich_mutations
 /// was written while no daemon existed. The terminal's answer then reaches the server once, the
 /// request resolves once, and the terminal was asked once: a pending request is reconciled and
 /// never asked again. The terminal asks the server something after its answer, so the server has
-/// read everything the gateway sent it before the case counts what it received. The shell's half
+/// read everything the gateway sent it before that question when the case counts what it
+/// received. The shell's half
 /// (typing into the shell while no daemon exists) is `kr-worker`'s `controller_kill` suite's.
 ///
 /// Not claimed: Windows, where no gateway runs; the Windows leg of KR-ACC-006 is a native
@@ -1018,8 +1019,8 @@ fn kr_acc_006_a_daemon_killed_while_the_terminal_writes_leaves_its_agent_and_a_r
 
     // The terminal answers, and the answer reaches the server once. The terminal then asks the
     // server who the account is, which the gateway sends after the answer and the server reads
-    // after it: once that is answered, a second copy of the answer would have been read, and a
-    // server that reads one ends.
+    // after it: once that is answered, a second copy of the answer sent with the first would have
+    // been read, and a server that reads one ends.
     let mark = person.window.mark();
     std::fs::write(release_of(&ctx), b"go").expect("the release");
     let _ = person.sees("TUI: turn/completed", "the turn completes");
@@ -1162,9 +1163,10 @@ impl Stubborn {
     /// and a terminate, and no process survives.
     ///
     /// A host whose boundary is the terminal's process group, a Mac, cannot see a descendant that
-    /// left it, so its closure says what it could not establish and never claims the coverage
-    /// complete; that is the only thing such a closure may name as surviving. Where the coverage
-    /// is complete, nothing is named at all.
+    /// left it, so its closure never claims the coverage complete, and the closure a daemon writes
+    /// for a crashed worker, which has no control group to read there, names that limit among what
+    /// survived. That is the only thing a closure may name as surviving. Where the coverage is
+    /// complete, nothing is named at all.
     fn closed_as(&self, closure: &serde_json::Value, reason: &str) {
         assert_eq!(closure["reason"], reason, "{closure}");
         let ended = closure["terminated"]
@@ -1219,8 +1221,8 @@ fn closure_of(host: &Host<'_>, display: &str) -> serde_json::Value {
 /// the terminal, by the identities the worker recorded, and leaves nothing surviving. The server
 /// leads a group of its own, neither the terminal's nor the worker's, and the terminal is the
 /// foreground group of its tty. On a Mac the closure's coverage is incomplete, since the terminal's
-/// group is the boundary there and a descendant could leave it, and it names what it could not
-/// establish; nothing is claimed of the coverage elsewhere.
+/// group is the boundary there and a descendant could leave it; nothing is claimed of the coverage
+/// elsewhere.
 ///
 /// Not claimed: Windows, where no gateway runs.
 #[test]

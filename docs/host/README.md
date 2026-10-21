@@ -6223,11 +6223,11 @@ reading out of them which conversation the terminal has selected, so the binding
 and nothing vouches for one. Rich mutations are suspended for that reason whatever the table lists,
 and the binding reads `rich_mutations_suspended` with it. The binding names one reason at a time:
 one an unclassified request placed, else a native bridge's, else this. Once the instance has an
-upstream transport, a prompt submitted at the revision read is refused `DRAFT_CONFLICT`, naming
-this reason when no other is placed; until then the refusal is `UNSUPPORTED_CAPABILITY`, as for any
-instance with no transport. The terminal runs as it does without the suspension. The reasons are
-kept apart: the next unclassified request does not replace this one, and reconciling the binding
-does not lift it.
+upstream transport, and while rich work is not fenced (see *Volatile-native mode*), a prompt
+submitted at the revision read is refused `DRAFT_CONFLICT`, naming this reason when no other is
+placed; until then the refusal is `UNSUPPORTED_CAPABILITY`, as for any instance with no transport.
+The terminal runs as it does without the suspension. The reasons are kept apart: the next
+unclassified request does not replace this one, and reconciling the binding does not lift it.
 
 Downstream request identifiers are namespaced by connection, so two connections that both call
 their first request `1` are two different pending resources, and a restarted worker numbers its
@@ -6282,12 +6282,13 @@ with the integration's flags and a backend, and the shell runs the installation'
 of the program. The typed vector has no option and, if it has a first word, one the package lists,
 and the program is not a script; otherwise the worker answers with a bypass and the command runs as
 typed. When the launcher presents itself, a signed qualification record has to name the program's
-build and the package's table has to be qualified for its version, or the launch fails and the
-launcher runs the command as typed. The worker starts the server, which is its own
-child on pipes, in a process group of its own, in the directory the invocation runs in; it records
-the server among the processes the session owns, binds the gateway's socket in the backend's
-directory, and only then commits the launch. The launcher writes the socket's address where the
-flags have `{gateway}` and becomes the program, which connects.
+build, the package's table has to be qualified for its version, and the table has to declare a
+tested volatile forwarding mode, or the launch fails and the launcher runs the command as typed.
+The worker starts the server, which is its own child on pipes, in a process group of its own, in
+the directory the invocation runs in; it records the server among the processes the session owns,
+binds the gateway's socket in the backend's directory, and only then commits the launch. The
+launcher writes the socket's address where the flags have `{gateway}` and becomes the program,
+which connects.
 
 The worker accepts one connection on the socket, from the process the launch registered. The
 upgrade must arrive within five seconds, be at most 16 KiB and be a plain `GET`; a request with a
@@ -6580,10 +6581,10 @@ worker admits the launch only if its intent still holds against the foreground i
 against, and writes the registration file last, so a forwarder that reads it reads a complete one
 and the credential it names already exists. A launch that fails after the launcher has presented
 leaves nothing reserved: the registration file is removed, the broker gives back the instance and
-the conversation the launch took, a server the launch started is set to end (the ending runs on
-its own, after the launch has returned), and the launcher runs the command as typed. The backend
-stays for a retry of the same invocation unless its line has ended meanwhile, so a retry is not
-refused for a launch that never happened.
+the conversation the launch took, a server the launch started is set to end (the ending starts
+with the roll-back and can go on after the launch has returned), and the launcher runs the command
+as typed. The backend stays for a retry of the same invocation unless its line has ended
+meanwhile, so a retry is not refused for a launch that never happened.
 
 On Windows the spawned programs must be `.exe` or `.com`: a batch file, a PowerShell script or a
 script that a runtime runs is refused by name, because the process that would start is the

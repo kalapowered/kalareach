@@ -91,7 +91,7 @@ impl Run {
             );
         }
         // Short on purpose: a Unix socket address is 104 bytes on macOS, and the per-user
-        // temporary directory there is 58 of them. A socket a worker binds for a command it
+        // temporary directory there is 57 of them. A socket a worker binds for a command it
         // integrates lies 42 bytes below the run's directory, which would make it 111 bytes.
         // `/tmp` is on the internal disk there as well.
         let suffix = kr_ipc::new_uuid().to_string();
