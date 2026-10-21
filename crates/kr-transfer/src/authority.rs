@@ -1367,7 +1367,11 @@ impl AuthorisedDirectory {
     ///   everything in it is gone. The removal stays on the mount `opened` is on, whether or not
     ///   this authority was confined to one, so a directory mounted into the tree is refused before
     ///   anything in it is reached: a recursive removal that crossed into another filesystem would
-    ///   take away what no name inside the tree named.
+    ///   take away what no name inside the tree named. On Linux nothing is asked of the other
+    ///   filesystem either, not even a look at its root, so a mount whose server does not answer
+    ///   stops the removal as any other mount does instead of holding it. Elsewhere the mount is
+    ///   found by opening the entry and comparing its mount, and a mount that never answers holds
+    ///   the removal at that look.
     /// * **Nothing is followed.** On Unix an entry that is not a directory is unlinked by its name
     ///   in the handle of the directory it is in, which removes a link as a link and cannot remove a
     ///   directory, so an entry replaced by a directory in the meantime stops the removal rather
@@ -1455,12 +1459,11 @@ impl AuthorisedDirectory {
     /// parsed as a relative name: a tree holds names a relative name refuses, such as a Windows
     /// device name on a Unix host, and every one of them has to be removable. It is opened the way
     /// each step of a descent is: without following a link, as a directory, and on this
-    /// authority's mount where the authority is confined to one.
+    /// authority's mount where the authority is confined to one. On Linux the open itself refuses
+    /// to go into a mount, so a mount whose server does not answer is refused without being asked
+    /// anything.
     fn enter(&self, entry: &OsStr, reported: &str) -> Result<Self, Escape> {
-        let opened = self
-            .directory
-            .open_dir_nofollow(entry)
-            .map_err(|error| entry_failure(reported, &error))?;
+        let opened = open_in_place(&self.directory, entry, reported)?;
         refuse_reparse_point(&opened, reported)?;
         let mut display = self.display.clone();
         display.push(entry);
@@ -1592,21 +1595,30 @@ impl Removal {
             entry_names(&directory.directory, at).map_err(|reason| self.stopped(at, reason))?;
         for entry in entries {
             let here = format!("{at}/{}", entry.to_string_lossy());
-            // Asked of the name without following it. Only a directory is descended into, and
-            // whether it is one is settled by the open that enters it; everything else is removed
-            // by a call that cannot remove a directory, whatever this said.
-            let kind = match directory.directory.symlink_metadata(&entry) {
-                Ok(metadata) => metadata.file_type(),
+            // Asked of the name without following it, and without going into a mount where the
+            // platform can say so. Only a directory is descended into, and whether it is one is
+            // settled by the open that enters it; everything else is removed by a call that
+            // cannot remove a directory, whatever this said.
+            match held_by(&directory.directory, &entry) {
+                Ok(Held::Directory) => self.descend(directory, &entry, &here)?,
+                Ok(Held::Other) => {
+                    remove_non_directory(&directory.directory, &entry)
+                        .map_err(|error| self.stopped(&here, entry_failure(&here, &error)))?;
+                    self.removed += 1;
+                }
+                // A mount is not this tree's to take, and it is refused here as it is where a
+                // directory is entered, without a look at what is on the other side of it.
+                Ok(Held::Mount) => {
+                    return Err(self.stopped(
+                        &here,
+                        Escape::CrossedMount {
+                            component: here.clone(),
+                        },
+                    ));
+                }
                 // Gone since the listing, whoever took it: nothing of it is left to remove.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(self.stopped(&here, entry_failure(&here, &error))),
-            };
-            if kind.is_dir() {
-                self.descend(directory, &entry, &here)?;
-            } else {
-                remove_non_directory(&directory.directory, &entry)
-                    .map_err(|error| self.stopped(&here, entry_failure(&here, &error)))?;
-                self.removed += 1;
             }
         }
         Ok(())
@@ -1885,6 +1897,92 @@ fn entry_failure(reported: &str, error: &std::io::Error) -> Escape {
         component: reported.to_owned(),
         detail: error.to_string(),
     }
+}
+
+/// What a name in a directory holds, as far as a removal needs to know before it does anything to
+/// it.
+enum Held {
+    /// A directory, which is entered and emptied.
+    Directory,
+    /// Anything else, which a call that cannot remove a directory removes.
+    Other,
+    /// A mount: the name leads to another filesystem, which a removal does not go into.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            dead_code,
+            reason = "only Linux says a name is a mount without going into it"
+        )
+    )]
+    Mount,
+}
+
+/// Asks what `entry` is in `directory`, without following a link and, on Linux, without going into
+/// a mount.
+///
+/// On Linux the entry is opened as a path with the resolution barred from crossing a mount point,
+/// which the kernel refuses before it asks the filesystem on the other side anything. A look at the
+/// root of a mount whose server has gone does not return, and this one does. A kernel too old to
+/// have the call looks at the entry the way every other platform does, as does a platform that has
+/// no such call: there a mount that never answers holds the removal at the look, and the mount
+/// rule is applied to what the entry opens as.
+fn held_by(directory: &Dir, entry: &OsStr) -> std::io::Result<Held> {
+    #[cfg(target_os = "linux")]
+    match rustix::fs::openat2(
+        directory,
+        entry,
+        rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+        rustix::fs::ResolveFlags::NO_XDEV | rustix::fs::ResolveFlags::NO_MAGICLINKS,
+    ) {
+        Ok(found) => {
+            let kind = rustix::fs::FileType::from_raw_mode(rustix::fs::fstat(&found)?.st_mode);
+            return Ok(if kind == rustix::fs::FileType::Directory {
+                Held::Directory
+            } else {
+                Held::Other
+            });
+        }
+        Err(rustix::io::Errno::XDEV) => return Ok(Held::Mount),
+        Err(rustix::io::Errno::NOSYS) => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(if directory.symlink_metadata(entry)?.file_type().is_dir() {
+        Held::Directory
+    } else {
+        Held::Other
+    })
+}
+
+/// Opens the directory `entry` names in `directory`, without following a link and, on Linux,
+/// without going into a mount.
+///
+/// The refusal for a mount is [`Escape::CrossedMount`] at `reported`, the same one an authority
+/// confined to one mount gives for a directory it opened and found on another.
+fn open_in_place(directory: &Dir, entry: &OsStr, reported: &str) -> Result<Dir, Escape> {
+    #[cfg(target_os = "linux")]
+    match rustix::fs::openat2(
+        directory,
+        entry,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+        rustix::fs::ResolveFlags::NO_XDEV | rustix::fs::ResolveFlags::NO_MAGICLINKS,
+    ) {
+        Ok(opened) => return Ok(Dir::from_std_file(std::fs::File::from(opened))),
+        Err(rustix::io::Errno::XDEV) => {
+            return Err(Escape::CrossedMount {
+                component: reported.to_owned(),
+            });
+        }
+        Err(rustix::io::Errno::NOSYS) => {}
+        Err(error) => return Err(entry_failure(reported, &error.into())),
+    }
+    directory
+        .open_dir_nofollow(entry)
+        .map_err(|error| entry_failure(reported, &error))
 }
 
 /// Removes one entry that is not a directory, relative to the handle of the directory it is in.
