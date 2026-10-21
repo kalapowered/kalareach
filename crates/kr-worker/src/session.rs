@@ -131,9 +131,8 @@ impl StartTerms {
         directory_is_there: impl FnOnce(&std::path::Path) -> bool,
         now_boot_ms: impl FnOnce() -> u64,
     ) -> Result<()> {
-        // The terminal library starts a process in the account's home directory when the
-        // directory it was given is not there, which would run the command somewhere nobody
-        // chose.
+        // A shell started in a directory that is not there is started in the account's home
+        // directory instead, which would run the command somewhere nobody chose.
         if self.root_is_command && !directory_is_there(std::path::Path::new(&command.cwd)) {
             return Err(WorkerError::InvalidArgument(
                 "the directory this command runs in is not there".to_owned(),
@@ -749,8 +748,8 @@ impl Session {
         crate::ownership::adopt_orphans();
         // A session a workflow started is held to what the daemon accepted it for at the last
         // moment before its process exists. The terminal reads the directory first and asks the
-        // terms after, and reads nothing once they have admitted the start, so a delay in any of
-        // that cannot carry the session past its moment and a directory that goes after the
+        // terms after, and on Unix reads nothing once they have admitted the start, so a delay in
+        // any of that cannot carry the session past its moment and a directory that goes after the
         // terms have looked is not looked for again.
         let terms = self.start_terms;
         let admit = |directory_is_there: bool| {
@@ -1486,12 +1485,12 @@ impl Session {
         self.shell.as_ref().map(|shell| shell.identity().clone())
     }
 
-    /// Returns whether a process was created for this session's terminal, for this host's own
-    /// tests: false for a session whose start was refused before any process existed.
+    /// Returns whether this session's terminal has been handed to a start of its root shell, for
+    /// this host's own tests: false for a session whose start was refused before it began.
     #[cfg(feature = "testing")]
     #[must_use]
-    pub const fn process_was_created(&self) -> bool {
-        self.pty.shell_started()
+    pub const fn terminal_was_used(&self) -> bool {
+        self.pty.was_used()
     }
 
     /// Returns a reader for the terminal's output.

@@ -2353,14 +2353,14 @@ fn quoted(path: &std::path::Path) -> String {
 
 /// A start that was refused created no process, and so left no mark.
 ///
-/// What decides it is whether a process was created for the session's terminal, which is settled
-/// by the time the refusal returns. The mark is what such a process would have left, and is not
-/// what decides: the file is read at that instant, a process created a moment before has almost
-/// never written it yet, and the look would pass whatever had happened.
-fn assert_no_process_was_created(session: &Session, marker: &std::path::Path) {
+/// What decides it is whether the session's terminal was handed to a start, which is settled by
+/// the time the refusal returns. The mark is what a process would have left, and is not what
+/// decides: the file is read at that instant, a process created a moment before has almost never
+/// written it yet, and the look would pass whatever had happened.
+fn assert_the_terminal_was_not_used(session: &Session, marker: &std::path::Path) {
     assert!(
-        !session.process_was_created(),
-        "a refused start created a process"
+        !session.terminal_was_used(),
+        "a refused start was given the terminal"
     );
     assert!(!marker.exists(), "and so left no mark");
 }
@@ -2413,7 +2413,7 @@ async fn a_command_does_not_start_after_the_moment_it_was_accepted_for() {
             .reason,
         ClosureReason::RootLaunchFailed
     );
-    assert_no_process_was_created(&session, &marker);
+    assert_the_terminal_was_not_used(&session, &marker);
 }
 
 /// A shell a workflow named is held to the moment the daemon accepted its start for, as a command
@@ -2457,7 +2457,7 @@ async fn a_shell_a_workflow_named_does_not_start_after_the_moment_it_was_accepte
                     .reason,
                 ClosureReason::RootLaunchFailed
             );
-            assert_no_process_was_created(&session, &marker);
+            assert_the_terminal_was_not_used(&session, &marker);
         }
     }
 }
@@ -2474,7 +2474,7 @@ async fn a_command_does_not_start_in_a_directory_that_is_not_there() {
         session.closure().is_some(),
         "a refused start leaves its record"
     );
-    assert_no_process_was_created(&session, &marker);
+    assert_the_terminal_was_not_used(&session, &marker);
 }
 
 /// The control of the two above: the same command, before its moment and in a directory that is
@@ -2484,6 +2484,10 @@ async fn a_command_starts_in_time_in_a_directory_that_is_there() {
     let host = kr_ipc::testing::TempHost::create();
     let (mut session, marker) = command_session(&host, host.root(), u64::MAX);
     session.launch().expect("the command starts");
+    assert!(
+        session.terminal_was_used(),
+        "a start that goes ahead is given the terminal, which is what the refusals are told from"
+    );
     assert_eq!(
         session.summary().root,
         Some(kr_protocol::session::SessionRoot::Command)

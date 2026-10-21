@@ -42,7 +42,8 @@ libc.workspace = true
 portable-pty.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 # `fs` for whether this account may execute a file, which the kernel answers for its own reasons.
-rustix = { workspace = true, features = ["event", "fs", "param", "process", "termios", "time"] }
+# `pty` for the slave end of a terminal, which Linux hands over from the master without a name.
+rustix = { workspace = true, features = ["event", "fs", "param", "process", "pty", "termios", "time"] }
 serde.workspace = true
 # An executable an integrated invocation runs is hashed through the one descriptor its identity is
 # read from, a megabyte at a time, rather than read whole into memory first.

@@ -86,7 +86,7 @@ impl std::fmt::Debug for Pty {
         formatter
             .debug_struct("Pty")
             .field("dimensions", &self.dimensions)
-            .field("shell_started", &self.slave.is_none())
+            .field("used", &self.slave.is_none())
             .finish()
     }
 }
@@ -159,11 +159,12 @@ impl Pty {
 
     /// Starts the root shell inside the terminal, if `admit` allows it.
     ///
-    /// Everything the start reads from the file system is read before `admit` is asked, and
-    /// nothing is read between its answer and the process: it is the last look at whether the
-    /// start may go ahead, such as a look at the clock for a start that is held to a moment.
-    /// `admit` is given whether the directory the command names was there. A start it refuses
-    /// leaves the terminal unused, and the shell can be started in it later.
+    /// On Unix everything the start reads from the file system is read before `admit` is asked,
+    /// and nothing is read between its answer and the process: it is the last look at whether the
+    /// start may go ahead, such as a look at the clock for a start that is held to a moment. On
+    /// Windows the terminal library still looks at the directory and for the program as it starts
+    /// the process. `admit` is given whether the directory the command names was there. A start it
+    /// refuses leaves the terminal unused, and the shell can be started in it later.
     ///
     /// The environment is replaced outright rather than inherited: the worker's own environment is
     /// not the session's, and section 7 decides what the session gets.
@@ -233,11 +234,11 @@ impl Pty {
         })
     }
 
-    /// Returns whether the terminal has been given to a root shell, which is whether a process was
-    /// created for it, for this host's own tests.
+    /// Returns whether the terminal has been handed to a start of the root shell, whether or not
+    /// the start went on to create a process, for this host's own tests.
     #[cfg(feature = "testing")]
     #[must_use]
-    pub const fn shell_started(&self) -> bool {
+    pub const fn was_used(&self) -> bool {
         self.slave.is_none()
     }
 
@@ -899,6 +900,63 @@ mod tests {
         );
     }
 
+    /// A program that cannot be run is a start that failed: it is reported when the start is
+    /// asked for, and not as a shell that began and ended. One that is not there and one that is
+    /// there and may not be run are both refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_program_that_cannot_be_run_fails_the_start() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let host = kr_ipc::testing::TempHost::create();
+        let not_executable = host.root().join("not-executable");
+        std::fs::write(&not_executable, b"#!/bin/sh\nexit 0\n").expect("a file");
+        std::fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o600))
+            .expect("that may not be run");
+        for program in [host.root().join("not-there"), not_executable] {
+            let mut command = crate::testing::posix_script("exit 0");
+            command.program = program.display().to_string();
+            let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
+            let outcome = pty.launch(&command, |_| Ok(()));
+            assert!(
+                matches!(outcome, Err(WorkerError::Pty { .. })),
+                "{program:?} was started: {outcome:?}"
+            );
+        }
+    }
+
+    /// A directory that can be entered and not listed is one a shell starts in: entering it needs
+    /// the right to search it and not the right to read it.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_can_be_entered_and_not_listed_is_where_the_shell_starts() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let host = kr_ipc::testing::TempHost::create();
+        let (work, home) = (host.root().join("work"), host.root().join("home"));
+        std::fs::create_dir(&work).expect("the directory the shell is to start in");
+        std::fs::create_dir(&home).expect("the home directory");
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o300))
+            .expect("that can be entered and not listed");
+        let mut command = crate::testing::posix_script(": > ran-here");
+        command.cwd = work.display().to_string();
+        command
+            .environment
+            .push(("HOME".to_owned(), home.display().to_string()));
+        let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
+        let told = std::cell::Cell::new(None);
+        let started = pty.launch(&command, |named_is_there| {
+            told.set(Some(named_is_there));
+            Ok(())
+        });
+        let mut shell = started.expect("launches");
+        shell.wait().expect("the shell ends");
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700))
+            .expect("it can be read again");
+        assert_eq!(told.get(), Some(true), "the directory is there");
+        assert!(work.join("ran-here").exists(), "the shell started in it");
+    }
+
     /// The shell has the terminal and nothing else of the worker's descriptors: one the worker
     /// holds open, with nothing to close it on exec, is not open in the shell. The control is the
     /// terminal itself, which is.
@@ -1104,18 +1162,31 @@ fn deadline(timeout: std::time::Duration) -> rustix::event::Timespec {
     }
 }
 
-/// Opens the slave end of a terminal by the name its master reports.
+/// Opens the slave end of a terminal for the shell.
 ///
 /// The terminal library keeps the end it opened to itself, and a shell started by this host needs
-/// one of its own. It is not made the opening process's controlling terminal, which is the shell's
-/// to be.
+/// one of its own. Linux hands it over from the master, which does not depend on the terminal's
+/// name being visible where this runs; where the master will not, and on the other systems, it is
+/// opened by the name the master reports. It is not made the opening process's controlling
+/// terminal, which is the shell's to be.
 ///
 /// # Errors
 ///
-/// Returns [`WorkerError::Pty`] when the terminal reports no name or the name cannot be opened.
+/// Returns [`WorkerError::Pty`] when the terminal gives no end and reports no name that opens.
 #[cfg(unix)]
 fn open_slave(master: &dyn MasterPty) -> Result<std::os::fd::OwnedFd> {
     const OPERATION: &str = "open the slave end of the pseudo-terminal";
+    #[cfg(target_os = "linux")]
+    if let Some(master) = master.as_raw_fd().and_then(descriptor::duplicate)
+        && let Ok(slave) = rustix::pty::ioctl_tiocgptpeer(
+            &master,
+            rustix::pty::OpenptFlags::RDWR
+                | rustix::pty::OpenptFlags::NOCTTY
+                | rustix::pty::OpenptFlags::CLOEXEC,
+        )
+    {
+        return Ok(slave);
+    }
     let name = master
         .tty_name()
         .ok_or_else(|| WorkerError::pty(OPERATION, "the terminal reports no name"))?;
@@ -1239,11 +1310,11 @@ impl InputWaiter {
     }
 }
 
-/// The one place in this crate that borrows a descriptor the operating system owns.
+/// The place in this crate that borrows a descriptor the terminal library owns.
 ///
-/// The workspace forbids unsafe code; this crate denies it and relaxes the rule here alone, because
-/// duplicating a descriptor the terminal owns has no safe form: the terminal library hands out a
-/// raw number and nothing else.
+/// The workspace forbids unsafe code; this crate denies it and relaxes the rule here and in the
+/// start of the root shell, because duplicating a descriptor the terminal owns has no safe form:
+/// the terminal library hands out a raw number and nothing else.
 #[cfg(unix)]
 mod descriptor {
     #![expect(
