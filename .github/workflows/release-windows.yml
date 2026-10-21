@@ -340,8 +340,8 @@ jobs:
           ref: ${{ steps.plugins.outputs.commit }}
           path: plugins-source
 
-      # The channel's root and the keys that sign for it are this run's own, and stay outside the
-      # tree: no host trusts them.
+      # The channel's root and the keys that sign for it are this run's own: the keys stay outside
+      # the tree and the root goes in it, and no host trusts either.
       - name: Make this run's keys and channel root
         shell: bash
         run: target/release/kr-release.exe dev-keys --out "$(cygpath -m "$RUNNER_TEMP")/keys"
@@ -461,6 +461,12 @@ jobs:
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustc --version
+
+      # As in the build job: libsodium's prebuilt libraries come from files this places.
+      - name: Place libsodium's archives
+        uses: ./.github/actions/libsodium-archive
+        with:
+          restore: 'false'
 
       - name: Build the release tool
         shell: bash
@@ -586,7 +592,7 @@ jobs:
       # This is where the job stops, with the same words on every platform, until they do.
       - name: Write the manifest again and sign it with the channel's release keys
         run: |
-          Write-Host "::error::the channel's release keys do not exist yet, so this release cannot be signed. Publishing a release waits for the key ceremony, which is the project owner's to hold. The trees are signed and checked up to this step."
+          Write-Host "::error::the channel's release keys do not exist yet, so this release cannot be signed. Publishing a release waits for the key ceremony, which is the project owner's to hold. Every step before this one ran and passed."
           exit 1
 
       # Each tree is packed, and each archive is read as a host stages one: every member against the
@@ -671,9 +677,9 @@ jobs:
             echo
             echo 'Every executable and every PowerShell file in each archive is signed by'
             echo 'Kala Holdings Inc. and timestamped. The manifest, release.json, is signed by the'
-            echo 'update channel'"'"'s release keys. The licences are data and carry no signature, and'
-            echo 'share\signatures.txt inside each archive records the digest of every file either'
-            echo 'way. Check one signature for yourself after unpacking:'
+            echo 'update channel'"'"'s release keys. The licences are data and carry no signature.'
+            echo 'share\signatures.txt inside each archive records the signer of each file that'
+            echo 'carries one. Check one signature for yourself after unpacking:'
             echo
             echo '    Get-AuthenticodeSignature .\bin\kr.exe | Format-List'
             echo '    signtool verify /pa /v .\bin\kr.exe'

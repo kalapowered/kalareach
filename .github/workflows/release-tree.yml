@@ -236,8 +236,8 @@ jobs:
           ref: ${{ steps.plugins.outputs.commit }}
           path: plugins-source
 
-      # The channel's root and the keys that sign for it are this run's own, and stay outside the
-      # tree: no host trusts them.
+      # The channel's root and the keys that sign for it are this run's own: the keys stay outside
+      # the tree and the root goes in it, and no host trusts either.
       - name: Make this run's keys and channel root
         run: target/release/kr-release dev-keys --out "$RUNNER_TEMP/keys"
 
@@ -345,15 +345,23 @@ jobs:
           bash scripts/check-homebrew-install.sh --brew "$brew" --kind cask \
             --first "$RUNNER_TEMP/archive/$TOP.tar.gz" --second "$NEXT_ARCHIVE"
 
-      # The two releases the `formula` job installs and upgrades between.
-      - name: Keep the two releases for the formula
-        if: runner.os == 'Linux'
+      # The two releases the `formula` job installs and upgrades between, each as an artefact of its
+      # own: one artefact of two paths would keep the directories they are in.
+      - name: Keep the release for the formula
+        if: runner.os == 'Linux' && matrix.target == 'x86_64-unknown-linux-gnu'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: formula-input-${{ matrix.target }}
-          path: |
-            ${{ runner.temp }}/archive/${{ env.TOP }}.tar.gz
-            ${{ env.NEXT_ARCHIVE }}
+          name: formula-first-${{ matrix.target }}
+          path: ${{ runner.temp }}/archive/${{ env.TOP }}.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Keep the release after it for the formula
+        if: runner.os == 'Linux' && matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: formula-second-${{ matrix.target }}
+          path: ${{ env.NEXT_ARCHIVE }}
           retention-days: 1
           if-no-files-found: error
 
@@ -374,32 +382,32 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # A Homebrew formula installed with Homebrew itself on the two Linux targets: the release the tree
-  # job built, then the one after it, then the removal. No environment and no secret.
+  # A Homebrew formula installed with Homebrew itself: the release the tree job built for x86_64
+  # Linux, then the one after it, then the removal. It runs where Homebrew is: the hosted Arm Linux
+  # image carries none, so the formula for Arm Linux is rendered by the same code from the same
+  # archives and is installed by no run here. No environment and no secret.
   formula:
-    name: the formula on ${{ matrix.target }}
+    name: the formula on x86_64-unknown-linux-gnu
     needs: tree
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
     steps:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ inputs.ref || github.sha }}
 
-      - name: Take the two releases
+      - name: Take the release
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: formula-input-${{ matrix.target }}
-          path: ${{ runner.temp }}/releases
+          name: formula-first-x86_64-unknown-linux-gnu
+          path: ${{ runner.temp }}/first
+
+      - name: Take the release after it
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: formula-second-x86_64-unknown-linux-gnu
+          path: ${{ runner.temp }}/second
 
       - name: Install, upgrade and remove it with Homebrew
         run: |
@@ -411,14 +419,14 @@ jobs:
             echo "::error::this runner has no Homebrew, and the formula is installed with it"
             exit 1
           fi
-          # The release before the other sorts first, as its version is the lower.
-          mapfile -t archives < <(ls "$RUNNER_TEMP"/releases/kalareach-*.tar.gz | sort)
-          if [ "${#archives[@]}" -ne 2 ]; then
-            echo "::error::the formula job was given ${#archives[@]} releases, and installs two"
+          first=("$RUNNER_TEMP"/first/kalareach-*.tar.gz)
+          second=("$RUNNER_TEMP"/second/kalareach-*.tar.gz)
+          if [ "${#first[@]}" -ne 1 ] || [ ! -f "${first[0]}" ] || [ "${#second[@]}" -ne 1 ] || [ ! -f "${second[0]}" ]; then
+            echo "::error::the formula job needs one archive of each release"
             exit 1
           fi
           bash scripts/check-homebrew-install.sh --brew "$brew" --kind formula \
-            --first "${archives[0]}" --second "${archives[1]}"
+            --first "${first[0]}" --second "${second[0]}"
 
   sign:
     name: sign the tree of ${{ matrix.target }}
@@ -457,6 +465,15 @@ jobs:
           pattern: unsigned-kalareach-${{ matrix.target }}-*
           path: ${{ runner.temp }}/unsigned
           merge-multiple: true
+
+      # Some runner images carry no Rust at all, as in the tree job.
+      - name: Install rustup where the image has none
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 --silent --show-error --fail https://sh.rustup.rs |
+              sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
 
       - name: Build the release tool
         run: |
@@ -523,5 +540,5 @@ jobs:
       # This is where the job stops, with the same words on every platform, until they do.
       - name: Write the manifest again and sign it with the channel's release keys
         run: |
-          echo "::error::the channel's release keys do not exist yet, so this release cannot be signed. Publishing a release waits for the key ceremony, which is the project owner's to hold. The tree is signed and checked up to this step."
+          echo "::error::the channel's release keys do not exist yet, so this release cannot be signed. Publishing a release waits for the key ceremony, which is the project owner's to hold. Every step before this one ran and passed."
           exit 1

@@ -163,6 +163,9 @@ echo "ok   the first command of kr admits $first_release and Homebrew is the ins
 echo "== upgrade to $second_release"
 render "$second_release"
 "$brew" upgrade "$stanza" "$name"
+# A formula's upgrade keeps the keg it replaced until Homebrew cleans up, which the run's settings
+# leave off for everything else; a cask's upgrade removes the version it replaced by itself.
+"$brew" cleanup "$name"
 unpacked_before="$(find "$brew_prefix/Cellar" "$brew_prefix/Caskroom" -maxdepth 3 -name "*$first_release*" 2>/dev/null || true)"
 if [ -n "$unpacked_before" ]; then
   echo "check-homebrew-install: Homebrew kept the release it upgraded from: $unpacked_before" >&2
