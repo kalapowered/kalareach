@@ -618,8 +618,8 @@ includes a capture node that requires a quiesced capture, the node fails when th
 the workspace, and its reason names which applies: a shared existing checkout is written by the
 user's own tools, a live session is written by its shell, and a writer of this host that is at
 work cannot be waited for. While the capture reads, a session, `diff.apply`, a workspace
-operation or an agent-tool installation that would write the repository is turned away with
-`RESOURCE_UNAVAILABLE` and is not retried by the host; `docs/project/README.md` lists them and what
-a reservation does not see. A node that meets that refusal while it starts a session fails like
-any node whose session cannot start. An atomic snapshot, which reads the base commit's own Git
+operation or an agent-tool installation or removal that would write the repository is turned
+away with `RESOURCE_UNAVAILABLE` and is not retried by the host; `docs/project/README.md` lists
+them and what a reservation does not see. A node that meets that refusal while it starts a
+session fails like any node whose session cannot start. An atomic snapshot, which reads the base commit's own Git
 objects rather than the working tree, is a point-in-time capture and needs no reservation.

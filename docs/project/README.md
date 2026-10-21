@@ -946,13 +946,16 @@ This host's own reservation is the project service's. It is granted for an isola
 host made (a Git worktree or an independent clone) that is ready, whose recorded working tree
 and Git directory are the ones the capture opened, and never for the user's own checkout, which
 the user's own tools write. It is granted only when no writer of this host is at work in the
-repository and no live session this host started is in a tree it records for it. It never waits:
-a workspace it cannot hold at that moment is captured as the per-file class, or the capture is
-refused when it required the quiesced one, and the refusal says which of these applies. A
-reservation ends at its bound, five minutes, whatever its holder does.
+repository and no live session this host started is in a tree it records for it. The reservation
+is first granted over the working tree and its Git directory, and the other trees the host records
+for the repository are read and added once it stands, so a worktree being made at that moment
+either turns the reservation away as a writer at work or is counted. A tree adopted after the grant is not covered. It
+never waits: a workspace it cannot hold at that moment is captured as the per-file class, or the
+capture is refused when it required the quiesced one, and the refusal says which of these applies.
+A reservation ends at its bound, five minutes, whatever its holder does.
 
 While a reservation stands the host's own writers of that repository are turned away with
-`RESOURCE_UNAVAILABLE`, before they have written or recorded anything:
+`RESOURCE_UNAVAILABLE`, before they have written anything:
 
 * `diff.apply` and `diff.revert` into any working tree of the repository (a preflight writes
   nothing and is not turned away; a proposal and a reference compare-and-swap write no tree);
@@ -962,9 +965,14 @@ While a reservation stands the host's own writers of that repository are turned 
 * `workspace.remove`, which prunes the repository and removes the working tree with every tree
   recorded inside it, so a reservation on a clone inside the tree being removed turns the removal
   away;
-* the cleanup of a repository operation's staging directory inside such a tree;
-* an agent-tool installation at project scope into such a tree;
+* the cleanup of a repository operation's staging directory, which removes the directory with
+  everything in it: it is turned away when the directory is inside a covered tree, and when a
+  covered tree is inside the directory;
+* an agent-tool installation or removal at project scope into such a tree;
 * a session that would start in one of those trees: the daemon asks before the shell is started.
+
+A writer whose directory the host cannot open is taken to write anywhere. It is turned away by
+every reservation, and it keeps every reservation from being granted while it is at work.
 
 A session is a writer for as long as it lives. It is found by the directory it was asked to start
 in: the nearest existing directory at or above that path, after links, together with every
@@ -973,14 +981,16 @@ records, a project's own checkout included whether or not a workspace was ever s
 a terminal opened before the host knew its repository still counts. A session with no directory
 starts at the root and counts nowhere; one whose directory is not an absolute path, or whose
 request the daemon could not read after a restart, counts against every reservation. A session
-counts until its closure is recorded; a closure that could not confirm its worker ended counts
-until the kernel says the worker's process has ended, and a closure that records a process the
-session left running counts until the daemon restarts, after which nothing follows that process.
-A closure that accounts for its worker releases the session even where its account of the
-session's own processes is incomplete, as it always is on macOS.
+counts until its closure is recorded. A worker that failed to start or did not report in time, and
+a closure that could not confirm its worker ended, count until the kernel says the worker's
+process has ended; the host asks for sixty seconds, and a worker still running after that counts
+until the daemon restarts. So does a closure that records a process the session left running, and
+after a restart nothing follows that process. A closure that accounts for its worker releases the
+session even where its account of the session's own processes is incomplete.
+
 What a reservation does not see: a session in a tree this host does not record (a linked worktree
-the user added by hand), a shell that changes into a tree after it started elsewhere, a climb that
-stops at a mount, and the writers of other programs.
+the user added by hand), a shell that changes into a tree after it started elsewhere, a parent
+directory the daemon cannot open, which ends the climb above it, and the writers of other programs.
 
 A refused `workspace.create`, `workspace.remove`, `project.init`, `project.clone` or
 `session.create` is recorded under its action identifier, like any other outcome of those methods,
