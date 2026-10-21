@@ -22,8 +22,8 @@ use common::LIVENESS;
 use common::gateway::{COMMAND, Gateway, STUBBORN, directory_of, eventually};
 use kr_protocol::identity::ProcessStartIdentity;
 
-/// KR-REQ-12.07 and KR-REQ-07.67: a plain launch of a terminal whose package declares a server is
-/// served by a gateway: the server is started in a group of its own and recorded as a root of what
+/// KR-REQ-12.07, KR-REQ-07.67 and KR-REQ-11.44: a plain launch of a terminal whose package declares
+/// a server is served by a gateway: the server is started in a group of its own and recorded as a root of what
 /// the session owns before the program runs, the program connects to the socket the launch named
 /// and runs its whole session through it, the instance is a gateway's, and when the program ends
 /// the server and the instance end with it.
@@ -596,8 +596,8 @@ fn kr_req_11_36_a_server_that_ends_under_an_unanswered_turn_is_not_replaced_or_a
     );
 }
 
-/// KR-REQ-11.32 and KR-REQ-12.07: only the process the launch registered reaches the gateway, and
-/// an upgrade a browser could have sent does not use the admission: another process that speaks a
+/// KR-REQ-11.32, KR-REQ-12.07 and KR-REQ-11.44: only the process the launch registered reaches the
+/// gateway, and an upgrade a browser could have sent does not use the admission: another process that speaks a
 /// plain upgrade to the socket, while the program has become the terminal and not yet connected, is
 /// closed without a word, and the program whose first upgrade is refused for its `Origin` header
 /// connects again and runs its whole session. The gateway's socket is bound before the launcher is

@@ -3553,6 +3553,9 @@ mod native_bridges {
     struct Site {
         _temp: tempfile::TempDir,
         root: PathBuf,
+        /// The application's own directory under the site's home, and its name for the host.
+        application_directory: &'static str,
+        application_name: &'static str,
         /// The signed qualification record the release would carry for the stand-in executable,
         /// at a version inside the recipe's range.
         signed_records: Vec<QualifiedExecutable>,
@@ -3560,34 +3563,47 @@ mod native_bridges {
 
     impl Site {
         fn new() -> Self {
+            Self::of(".claude", "claude", "Claude Code")
+        }
+
+        /// A site for the application `application_name`, whose directory in the home is
+        /// `application_directory` and whose executable on the search path is `executable`.
+        fn of(
+            application_directory: &'static str,
+            executable: &str,
+            application_name: &'static str,
+        ) -> Self {
             let temp = tempfile::tempdir().expect("a temporary directory");
             let root = temp.path().to_path_buf();
             let site = Self {
                 _temp: temp,
                 root,
+                application_directory,
+                application_name,
                 signed_records: vec![QualifiedExecutable {
                     digest: Digest256::from_bytes(kr_cbor::sha256(EXECUTABLE)),
                     version: "2.1.278".to_owned(),
                 }],
             };
-            std::fs::create_dir_all(site.application()).expect("Claude Code's directory");
+            std::fs::create_dir_all(site.application()).expect("the application's directory");
             std::fs::write(site.application().join("settings.json"), SETTINGS).expect("settings");
             std::fs::create_dir_all(site.root.join("bin")).expect("a search path");
-            std::fs::write(site.root.join("bin/claude"), EXECUTABLE).expect("an executable");
+            std::fs::write(site.root.join("bin").join(executable), EXECUTABLE)
+                .expect("an executable");
             std::fs::write(site.root.join("bin/kr-hook"), b"a stand-in forwarder")
                 .expect("a forwarder");
             site
         }
 
         fn application(&self) -> PathBuf {
-            self.root.join("home/.claude")
+            self.root.join("home").join(self.application_directory)
         }
 
         fn bridges(&self, environment: &kr_ipc::paths::EnvironmentPaths) -> BridgeHost {
             BridgeHost {
                 journals: environment.state_dir().join("native-bridges"),
                 applications: vec![ApplicationDirectory {
-                    application: "Claude Code".to_owned(),
+                    application: self.application_name.to_owned(),
                     directory: self.application(),
                 }],
                 search_path: vec![self.root.join("bin")],
@@ -3666,6 +3682,22 @@ mod native_bridges {
 
     /// Enrols and synchronises the bridge generation, and returns release 0.3.0's hash.
     async fn synchronised(host: &Host) -> String {
+        enrolled_and_synchronised(host).await;
+        let catalogue = host.module.catalogue().lock().await;
+        catalogue
+            .index(&RepositoryId::new("development").expect("a valid identifier"))
+            .expect("an activated index")
+            .find(
+                &claude_code(),
+                &kr_plugin_sdk::version::PackageVersion::parse("0.3.0").expect("a version"),
+            )
+            .expect("release 0.3.0")
+            .manifest_digest
+            .to_string()
+    }
+
+    /// Enrols the repository the host's working copy holds and synchronises it.
+    async fn enrolled_and_synchronised(host: &Host) {
         let _: wire::CatalogueAddResult = ok(host
             .module
             .write_frame_admitted(
@@ -3689,17 +3721,6 @@ mod native_bridges {
                 Some(host.confirmations()),
             )
             .await);
-        let catalogue = host.module.catalogue().lock().await;
-        catalogue
-            .index(&RepositoryId::new("development").expect("a valid identifier"))
-            .expect("an activated index")
-            .find(
-                &claude_code(),
-                &kr_plugin_sdk::version::PackageVersion::parse("0.3.0").expect("a version"),
-            )
-            .expect("release 0.3.0")
-            .manifest_digest
-            .to_string()
     }
 
     /// The installation of release 0.3.0 with the grant it needs, carrying the owner's
@@ -3715,6 +3736,27 @@ mod native_bridges {
         digest: &str,
         confirmed: bool,
     ) -> ControlFrame {
+        install_release(
+            host,
+            catalogue_id,
+            &claude_code(),
+            &release_statement(),
+            digest,
+            confirmed,
+        )
+        .await
+    }
+
+    /// The installation of release 0.3.0 of `plugin` from the repository `catalogue_id`, with the
+    /// grant it needs and the statement its manifest makes of its bridge.
+    async fn install_release(
+        host: &Host,
+        catalogue_id: &str,
+        plugin: &PluginId,
+        statement: &str,
+        digest: &str,
+        confirmed: bool,
+    ) -> ControlFrame {
         let grant: Vec<String> = GRANT.iter().map(|name| (*name).to_owned()).collect();
         let owner_confirmation = if confirmed {
             let ceiling = listed_ceiling(host, catalogue_id).await;
@@ -3722,11 +3764,11 @@ mod native_bridges {
                 environment_id: host.environment_id,
                 catalogue_id: catalogue_id.to_owned(),
                 ceiling: ceiling.into_iter().collect(),
-                plugin_id: claude_code(),
+                plugin_id: plugin.clone(),
                 version: "0.3.0".to_owned(),
                 package_digest: digest.to_owned(),
                 grant: grant.iter().cloned().collect(),
-                grant_statement: Some(release_statement()),
+                grant_statement: Some(statement.to_owned()),
             };
             Nullable::some(host.ceremony.approve(
                 SensitiveAction::GrantExecutableCapability,
@@ -3738,7 +3780,7 @@ mod native_bridges {
         let params = wire::PluginInstallParams {
             environment_id: host.environment_id,
             catalogue_id: catalogue_id.to_owned(),
-            plugin_id: claude_code(),
+            plugin_id: plugin.clone(),
             version: "0.3.0".to_owned(),
             package_digest: digest.to_owned(),
             grant,
@@ -3763,14 +3805,19 @@ mod native_bridges {
 
     /// Serves one plugin mutation that needs no confirmation.
     async fn plugin_change(host: &Host, method: Method) -> ControlFrame {
+        plugin_change_of(host, &claude_code(), method).await
+    }
+
+    /// Serves one mutation of `plugin` that needs no confirmation.
+    async fn plugin_change_of(host: &Host, plugin: &PluginId, method: Method) -> ControlFrame {
         let params = match method {
             Method::PluginRemove => ParamsValue::from_typed(&wire::PluginRemoveParams {
                 environment_id: host.environment_id,
-                plugin_id: claude_code(),
+                plugin_id: plugin.clone(),
             }),
             _ => ParamsValue::from_typed(&wire::PluginEnableParams {
                 environment_id: host.environment_id,
-                plugin_id: claude_code(),
+                plugin_id: plugin.clone(),
             }),
         }
         .expect("serialisable");
@@ -5306,6 +5353,223 @@ mod native_bridges {
                 .expect("installed")
                 .enabled,
             "the owner's disable stays"
+        );
+    }
+
+    /// The Claude Code package of the bridge generation, written into `directory` as the package
+    /// of an outside vendor: another publisher, another name and application, a registration for
+    /// the vendor's own executable, and the vendor's own labels for the decisions it offers. Its
+    /// manifest names the digest and size of the connector table that changed.
+    #[cfg(unix)]
+    fn vendor_package(directory: &Path) {
+        copy_tree(
+            &generation().join("targets/packages/kalareach/claude-code/0.3.0"),
+            directory,
+        );
+        let write = |relative: &str, value: &serde_json::Value| -> Vec<u8> {
+            let mut text = serde_json::to_string_pretty(value).expect("serialisable");
+            text.push('\n');
+            std::fs::write(directory.join(relative), &text).expect("writable");
+            text.into_bytes()
+        };
+        let read = |relative: &str| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(directory.join(relative)).expect("a file"))
+                .expect("a document")
+        };
+
+        let mut table = read("connector.json");
+        table["plugin_id"] = serde_json::json!("example-vendor/amp-style");
+        let table_bytes = write("connector.json", &table);
+
+        let mut manifest = read("plugin.json");
+        manifest["publisher_id"] = serde_json::json!("example-vendor");
+        manifest["plugin_name"] = serde_json::json!("amp-style");
+        manifest["display_name"] = serde_json::json!("Amp");
+        manifest["description"] = serde_json::json!(
+            "Recognises Amp, carries a message into its session and declares how the tool \
+             approvals it relays are answered."
+        );
+        manifest["source"]["repository"] = serde_json::json!("https://vendor.example/amp-style");
+        manifest["match_rules"] = serde_json::json!([
+            {
+                "id": "amp-npm",
+                "executable": {"file_stem": "amp", "path_suffix": [], "version_range": null},
+                "distribution": {"registry": "npm", "package": "@example-vendor/amp"},
+                "confidence": "exact"
+            },
+            {
+                "id": "amp-executable",
+                "executable": {"file_stem": "amp", "path_suffix": [], "version_range": null},
+                "distribution": null,
+                "confidence": "inferred"
+            }
+        ]);
+        manifest["native_bridge"]["application"] = serde_json::json!("Amp");
+        let answer = manifest["actions"]
+            .as_array_mut()
+            .expect("the package declares actions")
+            .iter_mut()
+            .find(|action| action["id"] == "approval.answer")
+            .expect("the package answers a tool approval");
+        answer["parameters"]["parameters"][0]["kind"]["choices"] = serde_json::json!([
+            {"id": "allow", "label": "Approve in Amp"},
+            {"id": "deny", "label": "Decline in Amp"}
+        ]);
+        let payload = manifest["payloads"]
+            .as_array_mut()
+            .expect("the package names its payloads")
+            .iter_mut()
+            .find(|payload| payload["path"] == "connector.json")
+            .expect("the connector table is a payload");
+        payload["digest"] =
+            serde_json::json!(kr_plugin_sdk::digest::PayloadDigest::of(&table_bytes).to_string());
+        payload["size_bytes"] = serde_json::json!(table_bytes.len().to_string());
+        write("plugin.json", &manifest);
+    }
+
+    /// A package a vendor publishes in a repository of its own supplies its native bridge and its
+    /// protocol mappings, and the host uses them. The vendor is not the first-party publisher:
+    /// the repository's signed index says so. The package, signed as the vendor's, installs
+    /// through the daemon with the owner's confirmation; the daemon applies the package's own
+    /// bridge recipe in the application's directory, and hands the worker the installed package
+    /// with the bridge it put in place. What the worker then reads is the vendor's: its publisher,
+    /// its plugin, its bridge, and the decisions its protocol table offers under its own labels.
+    ///
+    /// Not shown here: the transport the application is given, which the core makes and a worker
+    /// serves and which no package supplies.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_package_of_another_publisher_supplies_its_bridge_and_mappings_and_the_host_uses_them()
+     {
+        let site = Site::of(".amp", "amp", "Amp");
+        let host = host(&site);
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let package = home.path().join("amp-style-0.3.0");
+        vendor_package(&package);
+        let published = generations::Generation::build(
+            &home.path().join("generation"),
+            generations::GenerationSpec {
+                package: Some(package.clone()),
+                ..generations::GenerationSpec::default()
+            },
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&host.working);
+        copy_tree(&published.directory(), &host.working);
+        enrolled_and_synchronised(&host).await;
+
+        // The repository's own index says the vendor is not the first-party publisher.
+        {
+            let catalogue = host.module.catalogue().lock().await;
+            let index = catalogue
+                .index(&RepositoryId::new("development").expect("a valid identifier"))
+                .expect("an activated index");
+            let vendor = index
+                .publishers
+                .iter()
+                .find(|publisher| publisher.id.as_str() == "example-vendor")
+                .expect("the vendor's record");
+            assert!(!vendor.first_party, "{vendor:?}");
+        }
+
+        let vendor_plugin = PluginId::new("example-vendor/amp-style").expect("a plugin identifier");
+        let statement = serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(package.join("plugin.json")).expect("a manifest"),
+        )
+        .expect("a readable manifest")["native_bridge"]["grant_statement"]
+            .as_str()
+            .expect("a statement")
+            .to_owned();
+        let before = site.tree();
+        let digest = published.manifest_digest().to_string();
+        let _: wire::PluginInstallResult = ok(install_release(
+            &host,
+            "development",
+            &vendor_plugin,
+            &statement,
+            &digest,
+            true,
+        )
+        .await);
+        let _: wire::PluginEnableResult =
+            ok(plugin_change_of(&host, &vendor_plugin, Method::PluginEnable).await);
+
+        // The daemon applied the vendor's own recipe: its three files, byte for byte, in the
+        // application's directory.
+        let after = site.tree();
+        for (placed, source) in [
+            (
+                "skills/kalareach-channels/.claude-plugin/plugin.json",
+                "bridge/plugin-manifest.json",
+            ),
+            (
+                "skills/kalareach-channels/.mcp.json",
+                "bridge/mcp-servers.json",
+            ),
+            (
+                "skills/kalareach-channels/hooks/hooks.json",
+                "bridge/hooks.json",
+            ),
+        ] {
+            assert!(
+                !before.contains_key(placed),
+                "{placed} was not there before"
+            );
+            assert_eq!(
+                after.get(placed),
+                Some(&Some(
+                    std::fs::read(package.join(source)).expect("a bridge file")
+                )),
+                "{placed} is the vendor's {source}"
+            );
+        }
+
+        // What the worker is handed is the vendor's installed package, with the bridge the host put
+        // in place, and what it reads of it is the vendor's.
+        let snapshot = host
+            .module
+            .snapshot_within(
+                &[],
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .await
+            .expect("computed");
+        let admitted = snapshot
+            .packages
+            .iter()
+            .find(|package| package.plugin_id == vendor_plugin)
+            .expect("the vendor's package is admitted");
+        assert_eq!(admitted.publisher_id.as_str(), "example-vendor");
+        assert_eq!(
+            admitted
+                .bridge
+                .0
+                .as_ref()
+                .map(|bridge| bridge.application.as_str()),
+            Some("Amp"),
+            "the host put the vendor's bridge in place and says so"
+        );
+        let connector = kr_worker::broker::connectors::InstalledConnector::read(
+            kr_worker::broker::catalogue::source_of(admitted),
+        )
+        .expect("the worker reads the installed package");
+        assert_eq!(connector.plugin_id(), vendor_plugin);
+        assert!(
+            connector.installed_bridge().is_some(),
+            "the worker has the vendor's bridge"
+        );
+        let offered: Vec<(String, String)> = connector
+            .offered_decisions()
+            .into_iter()
+            .map(|decision| (decision.option_id, decision.label))
+            .collect();
+        assert_eq!(
+            offered,
+            [
+                ("allow".to_owned(), "Approve in Amp".to_owned()),
+                ("deny".to_owned(), "Decline in Amp".to_owned()),
+            ],
+            "the decisions the table maps are offered under the vendor's labels"
         );
     }
 }
