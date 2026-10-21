@@ -55,38 +55,15 @@ the manifest states:
   shell with and the startup files that hold the package's marked entry, each with where in the
   file the entry goes and the lines that open and close it.
 
-The arguments name no option that skips or replaces a startup file of the person's (`-f`,
-`--norc`, `--noprofile`, `--rcfile`), so every startup file runs in the order the shell reads them
-and the entry runs among them. A person who moves a startup directory moves the entry with it, and
-the location says so in the shell's own words (`${ZDOTDIR:-$HOME}/.zshrc`). The member is made from
-the host's own tables of where it puts an entry, so a change to one is a change to the other.
-The qualification corpus drives each shell through its startup files and holds the order it records
-to the order they ran in.
-
-### What refuses a package
-
-`kr-release` refuses a tree, before a manifest is written and again before it is signed, when a
-package:
-
-- was built from another upstream archive than the pins name, with a patch of another revision or
-  another base revision, or with other patches than the pins list;
-- was built from other inputs than the checkout holds: the build script, the manifest, a patch, a
-  source or the startup entry, each compared with the digest the build recorded;
-- carries a startup entry that is not the checkout's;
-- lists a module whose directory is missing or empty, or built for another editor ABI;
-- names a directory outside the package for a module;
-- is not a package a worker can read, as the worker reads one.
-
-A `release.json` that is not what the tree and the repository make now is not signed. Editing a
-member after the manifest was written, or a file after the manifest listed it, is refused at that
-step, and a host refuses it again when it installs the tree.
-
-A package that has moved from where it was built is the package it was. The worker declares it as
-the build recorded it, and the shell says the same of itself, so a package under
-`versions/<release>/shells/` starts a managed session where it is; the files the worker opens are
-named where the package sits. The Zsh package finds its modules from where its executable is
-(`shells/zsh/patches/0005-module-paths-from-executable.patch`), through the search path the
-manifest names.
+The member states what the host does and no more: the arguments, which name no option that skips or
+replaces a startup file of the person's (`-f`, `--no-rcs`, `--norc`, `--noprofile`, `--rcfile`,
+`--no-config`, `-N`), and the files the host puts its entry in. The order the shell reads its own
+startup files in is the shell's, and a login Bash reaches `.bashrc` only where its login file
+sources it, which is why the host also puts an entry in the first login file. A person who moves a
+startup directory moves the entry with it, and the location says so in the shell's own words
+(`${ZDOTDIR:-$HOME}/.zshrc`). The member is made from the host's own tables of where it puts an
+entry, so a change to one is a change to the other. The qualification corpus drives each shell
+through its startup files and holds the order they ran in, which the member does not restate.
 
 ## Agents
 
@@ -123,7 +100,9 @@ stops it too.
 
 `share/release-record.json` lists what the release was qualified against, by digest, and the
 manifest lists the file, so its signature covers the record. `docs/releases/records.json` is where
-the classes are written down.
+the classes are written down. The vendor routes cite the plugins repository at the commit
+`bundled-plugins.lock` names, so synchronising the bundled catalogue to another commit moves the
+citation too, and the record is refused until `records.json` says the new commit and digest.
 
 | Class | Cited |
 | --- | --- |
@@ -197,9 +176,11 @@ admits its own release instead. Its first command checks the release against the
 daemon, the workers and the helpers never run from the package manager's directory. When another
 release is current, the first command hands the new one to the current release's `kr` as an update,
 which switches to it or waits for a live worker as any update does, and the command goes on with
-the release that is current. The store's record names the package manager as the installer, which owns
-which release is current, and the host's own update channel stays off for it. Removing the package
-removes the package manager's directory and never touches `versions/`.
+the release that is current. A release the store keeps already, or one no newer than the current
+release, is not offered again, so a rollback stands. The store names the package manager in a file of
+its own, `installer`, which owns which release is current; a release before this one does not know
+the file and treats the install as its own. Removing the package removes the package manager's
+directory and never touches `versions/`.
 
 `scripts/check-homebrew-install.sh` installs a release with Homebrew itself from a tap of the run's
 own, upgrades it to the next release and removes it, and holds each of those to what the store says.

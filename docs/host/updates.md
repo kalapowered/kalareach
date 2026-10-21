@@ -22,7 +22,8 @@ Each user has one store of releases:
 | `staging/` | A release being unpacked and checked before it is renamed into `versions/` |
 | `trash/` | A release being removed, moved out of `versions/` before anything of it is deleted |
 | `roots/` | The runtime and state roots each control daemon of the store has served, those a command of the store has worked in, and the configuration documents either has read or written |
-| `install.json` | The store's record: the release current before the last switch, a release staged for a later update, an update under way, and the package manager that put the releases there, if one did |
+| `install.json` | The store's record: the release current before the last switch, a release staged for a later update and an update under way |
+| `installer` | One line naming the package manager that put the releases there, when one did; a file of its own so that the record reads as it always has |
 | `update.lock`, `install.lock`, `writers.lock` | The locks an update, a starting control daemon and a command that writes a stored record take |
 
 A release is named by its version and the first twelve hexadecimal digits of its commit, as its tag
@@ -119,18 +120,24 @@ deletes the one before it. So the first command of such a `kr` admits its releas
 and the command then runs as the store's own copy of that release.
 
 With no release in the store, the release is installed as `kr host install` installs one. With
-another release current, the current release's `kr` is asked to take this one in as an update
-(`kr host update --archive <directory>`, which takes the directory a package manager keeps a
-release unpacked in as well as an archive), so the release is checked against the update channel's
-root, the daemons are handed over and `current` is switched under the same rules. An update that
-waits for a live worker, exit 9, is not a failure: its reason is said on standard error and the
-command goes on with the release that is still current. A release that cannot be checked is
-refused with the reason, and the command does not run. Two first commands at once take the
-store's locks in turn, and the one that does not get them goes on with the release that is
-current.
+another release current, and this one newer and not in the store yet, the current release's `kr` is
+asked to take this one in as an update (`kr host update --archive <directory>`, which takes the
+directory a package manager keeps a release unpacked in as well as an archive), so the release is
+checked against the update channel's root, the daemons are handed over and `current` is switched
+under the same rules. An update that waits for a live worker, exit 9, is not a failure: its reason
+is said on standard error and the command goes on with the release that is still current. A
+release that is already in the store, as one is after a rollback, or that is no newer than the
+current one is not offered again: the command goes on with the release that is current, and a
+rollback stands. A release that carries no update channel root, or cannot be checked, is refused
+with the reason, and the command does not run. Two first commands at once take the store's locks
+in turn, and the one that does not get them goes on with the release that is current.
 
-The store's record names the package manager, and the package manager owns which release is
-current from then on. Removing the prefix leaves `versions/` as it is. `kr --help`, `kr --version`
+The store names the package manager in its `installer` file, and the package manager owns which
+release is current from then on. The file is not part of the store's record, so a release before
+this one, which a rollback may bring back, reads the record as it always has. It does not know the
+file, so a host rolled back to it treats the install as its own: nothing then reads the file, and
+the package manager's next release is admitted again by the first command of its `kr`, by the same
+rules. Removing the prefix leaves `versions/` as it is. `kr --help`, `kr --version`
 and a mistake in the arguments read nothing of the host and admit nothing, and neither does a `kr`
 of the store, an unpacked release that no package manager keeps (which `kr host install` installs
 on request) or a build outside a release. The store keeps no release on Windows, so none of this
