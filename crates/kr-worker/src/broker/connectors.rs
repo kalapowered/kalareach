@@ -462,9 +462,9 @@ impl InstalledConnector {
                 table.methods.len()
             )));
         }
-        // The table's framing, message members and size are judged first, so a table the gateway
-        // cannot read is refused for that; the declaration comes before the per-method routes, and
-        // a table that reads is served only when it declares a tested volatile forwarding mode.
+        // Everything except the per-method routes is judged first, so a table the gateway cannot
+        // read is refused for that; a table that reads is served only when it declares a tested
+        // volatile forwarding mode. Either refusal runs the program as typed.
         if let Some(refusal) = self.volatile_forwarding_refusal() {
             return Err(refusal);
         }

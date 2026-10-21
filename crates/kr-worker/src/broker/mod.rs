@@ -2801,16 +2801,19 @@ impl Broker {
     /// A connection that is not open is one nobody can reopen, so its upstream holds nothing:
     /// what it left unresolved is settled as its end settles it (cancelled for a request no
     /// answer went for, uncertain for one an answer went for) and its entry goes from what the
-    /// recovery owes. Two cases reach this. A broker opened on a ledger that holds an unfinished
-    /// recovery owes the connections of the process before it, and none is open. And a
-    /// settlement at a connection's end that failed for a reason that is not a store fault left
-    /// its requests unresolved, and this pass makes it. A store fault at the end keeps the
-    /// settlement in memory as a transition of the gap instead, which the recovery commits. This
-    /// is the rule that no recovery waits for a connection that cannot come back.
+    /// recovery owes. Three cases reach this. A broker opened on a ledger that holds an
+    /// unfinished recovery owes the connections of the process before it, and none is open. A
+    /// broker opened on a ledger that holds unresolved requests and no recovery owes their
+    /// connections to the next recovery, and none is open. And a settlement at a connection's end
+    /// that failed for a reason that is not a store fault left its requests unresolved, and this
+    /// pass makes it. A store fault at the end keeps the settlement in memory as a transition of
+    /// the gap instead, which the recovery commits. This is the rule that no recovery waits for a
+    /// connection that cannot come back.
     ///
     /// Its writes take the store's lock without waiting for it, so a store another connection is
-    /// writing leaves this pass with nothing done and the next one tries again. A store that fails
-    /// again raises the fence, and the next call tries again once the journal has recovered.
+    /// writing leaves this pass with nothing done and the next one tries again. A store that
+    /// fails raises the fence, which drops what the recovery owed; the recovery that commits the
+    /// gap again owes it afresh, and the pass after that tries again.
     /// Returns the transition back to normal operation when this finished the recovery.
     pub fn reconcile_owed(&self, now: TimestampMs) -> Option<VolatileTransition> {
         let mut state = self.state();
@@ -3705,8 +3708,9 @@ impl BrokerState {
                 connection,
             };
             if !self.gateway.contains(connection) {
-                // Nobody can reopen it, so its upstream holds nothing. A store that is busy or
-                // refuses this leaves the entry owed, and a later pass starts again.
+                // Nobody can reopen it, so its upstream holds nothing. A store that is busy
+                // leaves the entry owed, and a later pass starts again; one that faults raises the
+                // fence, and the recovery that commits the gap again owes it afresh.
                 if self.reconcile_in(scope, &[], now).is_err() {
                     return None;
                 }
