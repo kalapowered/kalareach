@@ -1047,7 +1047,13 @@ impl AuthorisedDirectory {
         if let Err(refusal) = owner_only(&child.directory, component, privacy) {
             // Nothing this host staged is inside yet, but the directory was not what the caller
             // needs, so something else may be: only an empty directory goes.
-            let _ = remove_empty(&self.directory, OsStr::new(component), child, component);
+            let _ = remove_empty(
+                &self.directory,
+                OsStr::new(component),
+                child,
+                component,
+                false,
+            );
             return Err(refusal);
         }
         // The entry that names the new directory is durable before anything inside it is created.
@@ -1451,7 +1457,7 @@ impl AuthorisedDirectory {
             held: vec![opened.identity],
         };
         removal.empty(&opened, name.as_str())?;
-        removal.take_directory(self, entry, opened, name.as_str())
+        removal.take_directory(self, entry, opened, name.as_str(), true)
     }
 
     /// Opens one entry a listing of this directory returned, as a directory of its own.
@@ -1661,18 +1667,23 @@ impl Removal {
         self.held.push(child.identity);
         self.empty(&child, here)?;
         self.held.pop();
-        self.take_directory(directory, entry, child, here)
+        self.take_directory(directory, entry, child, here, false)
     }
 
     /// Takes away the name of a directory this removal has emptied.
+    ///
+    /// `across_mounts` is set for the directory the removal was asked to take away, which the
+    /// caller may have been handed as the root of a mount, and not for a directory beneath it: a
+    /// mount put on a name inside the tree is not something this removal looks into.
     fn take_directory(
         &mut self,
         holder: &AuthorisedDirectory,
         entry: &OsStr,
         emptied: AuthorisedDirectory,
         here: &str,
+        across_mounts: bool,
     ) -> Result<(), Escape> {
-        remove_empty(&holder.directory, entry, emptied, here)
+        remove_empty(&holder.directory, entry, emptied, here, across_mounts)
             .map_err(|reason| self.stopped(here, reason))?;
         self.removed += 1;
         Ok(())
@@ -1687,15 +1698,19 @@ impl Removal {
 /// directory goes by name, and it goes only as the directory that was checked. Where the handle
 /// can be held across the removal of the name, the directory is then asked whether it went with
 /// the name, and one that did not is refused rather than reported gone.
+///
+/// A name with a mount on it holds the mount's root and not the directory, and where the platform
+/// can say so without going into the mount the check refuses it, unless `across_mounts` is set.
 fn remove_empty(
     holder: &Dir,
     entry: &OsStr,
     emptied: AuthorisedDirectory,
     reported: &str,
+    across_mounts: bool,
 ) -> Result<(), Escape> {
     #[cfg(feature = "testing")]
     testing::reached(testing::RemovalStep::Emptied, reported);
-    same_object_at(holder, entry, emptied.identity, reported, false)?;
+    same_object_at(holder, entry, emptied.identity, reported, across_mounts)?;
     // Windows removes a directory only by its name and only once no handle on it is open, because
     // the handles this host resolves names through are opened so that nothing can rename or
     // delete a directory beneath them. Unix does not mind, so there the handle stays open across
@@ -3696,7 +3711,7 @@ mod tests {
         let authority =
             AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the root");
         let made = authority.subdirectory(&name("made")).expect("opens it");
-        let refusal = remove_empty(authority.handle(), OsStr::new("made"), made, "made")
+        let refusal = remove_empty(authority.handle(), OsStr::new("made"), made, "made", false)
             .expect_err("a directory with something in it is not empty");
         assert!(matches!(refusal, Escape::Unopenable { .. }), "{refusal}");
         assert_eq!(
@@ -3705,7 +3720,7 @@ mod tests {
         );
         std::fs::remove_file(root.path().join("made/theirs")).expect("emptied");
         let made = authority.subdirectory(&name("made")).expect("opens it");
-        remove_empty(authority.handle(), OsStr::new("made"), made, "made")
+        remove_empty(authority.handle(), OsStr::new("made"), made, "made", false)
             .expect("an empty directory goes");
         assert!(!root.path().join("made").exists());
     }

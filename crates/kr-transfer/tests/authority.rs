@@ -2784,7 +2784,15 @@ fn a_removal_does_not_wait_on_a_mount_put_on_a_directory_it_has_emptied() {
     let name = RelativeName::parse("tree").expect("a name");
     let opened = authority.subdirectory(&name).expect("the tree opens");
 
-    let mount: Arc<Mutex<Option<HungMount>>> = Arc::default();
+    /// Where the mount is: not yet placed, placed, or no longer to be placed because the case has
+    /// given up waiting. One state under one lock, so that a mount placed after the case gave up
+    /// is never left holding a removal that nothing will free.
+    enum Mount {
+        Waiting,
+        Placed { _held: HungMount },
+        Cancelled,
+    }
+    let mount = Arc::new(Mutex::new(Mount::Waiting));
     let (sender, receiver) = std::sync::mpsc::channel();
     let removal = {
         let (mount, inner) = (Arc::clone(&mount), inner.clone());
@@ -2792,8 +2800,12 @@ fn a_removal_does_not_wait_on_a_mount_put_on_a_directory_it_has_emptied() {
             // The hook belongs to the thread that removes, and the mount is placed by it.
             let _hook = at_removal_step(move |reached, directory| {
                 if reached == RemovalStep::Emptied && directory == "tree/branch/inner" {
-                    let placed = HungMount::attach(&inner).expect("the mount is placed");
-                    *mount.lock().expect("the mount's holder") = Some(placed);
+                    let mut state = mount.lock().expect("the mount's holder");
+                    if matches!(*state, Mount::Waiting) {
+                        *state = Mount::Placed {
+                            _held: HungMount::attach(&inner).expect("the mount is placed"),
+                        };
+                    }
                 }
             });
             let _ = sender.send(authority.remove_tree(&name, opened));
@@ -2801,8 +2813,8 @@ fn a_removal_does_not_wait_on_a_mount_put_on_a_directory_it_has_emptied() {
     };
     let outcome = receiver.recv_timeout(HUNG_REMOVAL_DEADLINE);
     // Letting the mount go ends a call that is still waiting on it, so the thread can be joined
-    // whatever the outcome was.
-    drop(mount.lock().expect("the mount's holder").take());
+    // whatever the outcome was, and a mount that has not been placed yet is not placed.
+    *mount.lock().expect("the mount's holder") = Mount::Cancelled;
     removal.join().expect("the removal's thread ends");
     let refusal = outcome
         .expect("the removal waits on a mount that never answers")
