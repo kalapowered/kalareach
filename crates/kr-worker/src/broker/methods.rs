@@ -1414,15 +1414,17 @@ impl Broker {
         // this answer here, before any marker, and gives the claim back.
         if let Err(error) = self.recheck_permit(admitted) {
             crate::broker::settled(self.release_claim(&claim, now));
-            return Err(error);
+            return Err(BrokerError::NotTransmitted(Box::new(error)));
         }
         // The marker goes in immediately before the bytes. Everything that could refuse this
         // answer has already refused it, so what remains after this point is the transport's own
         // failure, which is what uncertainty is for. A marker this host could not write has sent
         // nothing, so the reservation goes back and the resource stays answerable.
         if let Err(error) = self.commit_dispatch(&claim, now) {
+            // No byte of this answer has been queued: what refused the marker is why, and the
+            // resource is left to whoever now holds it, or answerable again if nobody does.
             crate::broker::settled(self.release_claim(&claim, now));
-            return Err(error);
+            return Err(BrokerError::NotTransmitted(Box::new(error)));
         }
         Ok(MarkedAnswer {
             broker: self,
@@ -1641,7 +1643,7 @@ impl Broker {
         if let Err(error) = self.recheck_permit(admitted) {
             // Nothing will carry the action, so the token it spent goes with it.
             self.state().tokens.retire(&token.token_id);
-            return Err(error);
+            return Err(BrokerError::NotTransmitted(Box::new(error)));
         }
         Ok(TakenAction {
             turn_id: permit.request.turn_id.clone(),
@@ -2145,7 +2147,8 @@ impl Broker {
             ));
         }
         let permit = admitted.take()?;
-        self.recheck_permit(admitted)?;
+        self.recheck_permit(admitted)
+            .map_err(|refusal| BrokerError::NotTransmitted(Box::new(refusal)))?;
         Ok(TakenMutation {
             turn_id: permit.request.turn_id.clone(),
             dispatch: permit.dispatch,

@@ -867,6 +867,10 @@ pub struct Broker {
     /// tests.
     #[cfg(feature = "testing")]
     channel_write_pause: Mutex<Option<channels::WritePause>>,
+    /// Where the next approval's answer stops before its dispatch marker is written, for this
+    /// host's own tests.
+    #[cfg(feature = "testing")]
+    marker_pause: Mutex<Option<channels::WritePause>>,
 }
 
 /// The two ends of one armed pause: what says the recovery arrived, and what lets it go on.
@@ -999,6 +1003,8 @@ impl Broker {
             recovery_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             channel_write_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            marker_pause: Mutex::new(None),
         })
     }
 
@@ -2200,6 +2206,64 @@ impl Broker {
             resource_id,
             frame: frame.to_vec(),
         })
+    }
+
+    /// Stops the next approval answer before its dispatch marker is written, for this host's own
+    /// tests: the reservation is held and nothing of the answer has gone.
+    ///
+    /// Returns the end that says the answer has arrived there and the end that lets it go on;
+    /// dropping that end lets it go on too. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_marker(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrived, watch) = tokio::sync::oneshot::channel();
+        let (release, go) = tokio::sync::oneshot::channel();
+        *self
+            .marker_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Waits at an armed pause before an answer's dispatch marker, for this host's own tests.
+    #[cfg(feature = "testing")]
+    pub(crate) async fn at_marker_pause(&self) {
+        let armed = self
+            .marker_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.await;
+        }
+    }
+
+    /// No pause is ever armed in a shipped build.
+    #[cfg(not(feature = "testing"))]
+    #[allow(clippy::unused_async)]
+    pub(crate) async fn at_marker_pause(&self) {}
+
+    /// Says whether a response the native client wrote answers a request that has already been
+    /// taken by another answer or has ended, and where that request stands.
+    ///
+    /// It is asked after [`Broker::admit_native_answer`] refused the response, to tell an answer
+    /// that came too late from a frame the connection cannot carry.
+    #[must_use]
+    pub fn answer_arrived_late(
+        &self,
+        connection: GatewayConnectionId,
+        frame: &[u8],
+    ) -> Option<(PendingResourceId, PendingState)> {
+        let state = self.state();
+        let request = state.gateway.correlate_response(connection, frame).ok()?;
+        let pending = state.arbitration.by_request(&request)?;
+        (pending.resource.state.is_terminal() || pending.transmitter.is_some())
+            .then_some((pending.resource.resource_id, pending.resource.state))
     }
 
     /// Records that an admitted native answer reached the upstream.

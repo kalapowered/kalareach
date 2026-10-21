@@ -424,6 +424,16 @@ impl Arbitration {
     /// requires, and [`BrokerError::Arbitration`] when this claim does not hold the resource's
     /// transmission admission.
     pub fn plan_dispatched(&self, claim: &Claim) -> Result<Transition> {
+        // A claim that has been discharged since the admission was overtaken: a native answer took
+        // the resource's transmission, or the server cleared the request. Nothing of this answer
+        // has gone, and the caller is told where the resource stands.
+        if let Some(pending) = self.by_id.get(&claim.resource_id)
+            && pending.claim.is_none()
+        {
+            return Err(BrokerError::AnswerOvertaken {
+                state: pending.resource.state,
+            });
+        }
         let pending = self.claimed_by(claim)?;
         if pending.transmitter != Some(Transmitter::Rich(claim.claim_id)) {
             return Err(BrokerError::Arbitration(ArbitrationError::AlreadyClaimed));
@@ -482,11 +492,20 @@ impl Arbitration {
             ));
         }
         if let Some(held) = pending.transmitter {
-            return Err(BrokerError::denied(format!(
-                "{} has already been admitted to transmit for {}",
-                held.as_str(),
-                pending.resource.resource_id
-            )));
+            // A native answer arriving while a rich answer is only reserved takes the transmission
+            // from it: the rich answer's marker is not written, so nothing of it has gone and its
+            // holder can still be told it lost. Once the marker is written an answer may already
+            // have gone, and a second one is refused here, before anything is forwarded.
+            let reserved_only = writer == Transmitter::Native
+                && matches!(held, Transmitter::Rich(_))
+                && !pending.dispatched;
+            if !reserved_only {
+                return Err(BrokerError::denied(format!(
+                    "{} has already been admitted to transmit for {}",
+                    held.as_str(),
+                    pending.resource.resource_id
+                )));
+            }
         }
         // The writer takes the resource's one claim, which is what the state machine already
         // means by `claimed`: one answer is on its way and no other may start. A rich claim this

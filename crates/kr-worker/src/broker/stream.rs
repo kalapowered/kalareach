@@ -351,8 +351,12 @@ impl BrokerState {
         let Some(connection) = self.gateway.native_connection_of(application_instance_id) else {
             return;
         };
+        // A connection pinned with no reading of its own says nothing about what a client can do
+        // here: its evidence is whatever else recorded it.
+        let Some(reading) = connection.reading.clone() else {
+            return;
+        };
         let rich = connection.rich.clone();
-        let reading = connection.reading.clone();
         let connection_id = connection.connection;
         let Some(package) = self.connection_packages.get(&connection_id).cloned() else {
             return;
@@ -385,7 +389,7 @@ impl BrokerState {
                 .map_err(|_| format!("this connector's table declares no way to {what}"))
         };
         let answers = match (&reading, binding) {
-            (Some(reading), Some(binding)) => reading.answers.as_ref().map_or_else(
+            (reading, Some(binding)) => reading.answers.as_ref().map_or_else(
                 || Err("this connector's table answers no approval".to_owned()),
                 |answers| {
                     if answers

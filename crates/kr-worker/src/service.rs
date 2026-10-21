@@ -5084,10 +5084,7 @@ impl WorkerService {
     /// second, because a transient code invites the retry that makes an agent do the work twice.
     fn upstream_answer(error: &WorkerError) -> ProtocolError {
         let answered = error.to_protocol_error();
-        if matches!(
-            error,
-            WorkerError::Broker(crate::broker::BrokerError::UpstreamRefused { .. })
-        ) {
+        if matches!(error, WorkerError::Broker(refusal) if refusal.proven_unsent()) {
             return answered;
         }
         ProtocolError::new(ErrorCode::OutcomeUnknown, answered.message)
@@ -5131,10 +5128,7 @@ impl WorkerService {
             Err(error) => journal.settle(
                 actor_id.clone(),
                 action_id,
-                if matches!(
-                    error,
-                    WorkerError::Broker(crate::broker::BrokerError::UpstreamRefused { .. })
-                ) {
+                if matches!(error, WorkerError::Broker(refusal) if refusal.proven_unsent()) {
                     kr_protocol::receipt::ReceiptState::Refused
                 } else {
                     kr_protocol::receipt::ReceiptState::Unknown
@@ -10539,7 +10533,7 @@ fn reported_outcome(
                 },
             }
         }
-        Err(error @ WorkerError::Broker(crate::broker::BrokerError::UpstreamRefused { .. })) => {
+        Err(error @ WorkerError::Broker(refusal)) if refusal.proven_unsent() => {
             ReportedOutcome::Failed {
                 detail: error.to_string(),
             }
@@ -10673,6 +10667,7 @@ async fn answer_within(
     now: kr_protocol::scalars::TimestampMs,
     deadline: tokio::time::Instant,
 ) -> Result<kr_protocol::agent::AgentApprovalRespondResult> {
+    broker.at_marker_pause().await;
     let marked = broker.mark_approval(admitted, now)?;
     // On a refusal or at the deadline `marked` is dropped here, which leaves the resource
     // uncertain before the caller is told anything.

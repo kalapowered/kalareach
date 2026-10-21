@@ -1437,6 +1437,93 @@ async fn kr_req_11_33_what_changes_inside_the_admission_interval_is_still_a_reje
     }
 }
 
+/// KR-REQ-11.33 and section 9: a native answer that takes the resource's transmission after a rich
+/// answer was admitted and its receipt marked, and before the broker's own marker, leaves the rich
+/// answer a refusal the caller can read as one: nothing of it went, so its receipt is `refused` and
+/// its error says the request was settled, not that its outcome is unknown. Asked again with the
+/// same action identity it is answered from the receipt, and nothing reaches the upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_33_a_rich_answer_a_native_answer_overtakes_before_its_marker_is_a_refusal() {
+    let host = host().await;
+    let upstream = Arc::new(CountingUpstream::default());
+    register(&host, None);
+    let resource_id = offer_approval(&host, Arc::clone(&upstream));
+    let mut client = cli(&host).await;
+    let mutation = approval_mutation(&client, &host, 19, resource_id);
+    let action_id = mutation.action_id;
+    let again = mutation.clone();
+
+    let (arrived, release) = host.service.broker().pause_before_marker();
+    let sending = tokio::spawn(async move {
+        let outcome = send(&mut client, mutation).await;
+        (outcome, client)
+    });
+    tokio::time::timeout(LIVENESS_DEADLINE, arrived)
+        .await
+        .expect("the answer reached the pause before its marker")
+        .expect("the pause is armed");
+    // The receipt is marked as about to be dispatched and the resource is reserved for the rich
+    // answer; the terminal's answer takes the transmission now.
+    let (state, events) = durable(&host, action_id);
+    assert_eq!(state.as_deref(), Some("dispatching"));
+    assert!(events.iter().any(|event| event == "dispatching"));
+    host.service
+        .broker()
+        .native_answer_through(
+            kr_protocol::ids::GatewayConnectionId::new(1),
+            br#"{"id":11,"result":{"option_id":"allow"}}"#,
+            TimestampMs::new(5),
+            |_| Ok(()),
+        )
+        .expect("the terminal's answer takes the reserved transmission");
+    release.send(()).expect("the answer is let go");
+
+    let (outcome, mut client) = sending.await.expect("the mutation is answered");
+    let Outcome::Error(error) = outcome else {
+        panic!("an answer that was overtaken did not apply: {outcome:?}");
+    };
+    assert_eq!(
+        error.code,
+        ErrorCode::QuestionResolved,
+        "nothing went, so the caller is told the request was settled and not that its outcome is unknown"
+    );
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the rich answer wrote no frame"
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Refused,
+        "a refusal established before any byte was queued"
+    );
+    assert_eq!(
+        host.service
+            .broker()
+            .pending(resource_id)
+            .expect("retained")
+            .state,
+        kr_protocol::gateway::PendingState::Resolved,
+        "the terminal's answer is the one that resolved it"
+    );
+
+    // The same action identity again: its receipt is what answers, and nothing goes upstream.
+    let outcome = send(&mut client, again).await;
+    assert!(
+        matches!(outcome, Outcome::Ok(_) | Outcome::Error(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "and nothing reached the upstream a second time"
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Refused
+    );
+}
+
 /// Section 9 and KR-REQ-11.27: an approval whose dispatch marker the receipt journal refused
 /// leaves its reservation back where it was.
 ///

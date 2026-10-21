@@ -53,6 +53,27 @@ pub enum BrokerError {
         /// What the upstream said.
         detail: String,
     },
+    /// The operation was refused after it was admitted and before any byte of it was queued for
+    /// the upstream.
+    ///
+    /// Nothing was sent, so this is established rather than uncertain, and a caller reads it as a
+    /// thing that did not happen. The refusal it wraps is what went wrong, and the code it is
+    /// reported under is that refusal's own.
+    #[error("{0}")]
+    NotTransmitted(Box<BrokerError>),
+    /// The resource was settled before this answer's marker was written: a native answer took its
+    /// one transmission, or the server said the request was cleared.
+    ///
+    /// Nothing of this answer went. The state is where the resource stands: `Claimed` while a
+    /// native answer is being written, and its end once it is known.
+    #[error(
+        "this request was settled before this answer's marker was written, and it is now \
+         {state}; this answer sent nothing"
+    )]
+    AnswerOvertaken {
+        /// Where the resource stands now.
+        state: kr_protocol::gateway::PendingState,
+    },
     /// A rich operation arrived while the journal was faulted.
     #[error("{detail}")]
     RichWorkFenced {
@@ -152,6 +173,16 @@ impl BrokerError {
         }
     }
 
+    /// Returns true when the failure establishes that the operation did not reach the upstream:
+    /// the upstream answered and refused it, or it was refused before any byte of it was queued.
+    ///
+    /// Section 9 keeps this apart from an outcome nobody can establish, because a caller reads a
+    /// refusal as a thing that did not happen and an unknown outcome as a thing that may have.
+    #[must_use]
+    pub const fn proven_unsent(&self) -> bool {
+        matches!(self, Self::UpstreamRefused { .. } | Self::NotTransmitted(_))
+    }
+
     /// Returns the stable protocol code this failure is reported under.
     #[must_use]
     pub fn code(&self) -> ErrorCode {
@@ -169,6 +200,8 @@ impl BrokerError {
             Self::Table(_) | Self::Rich(_) | Self::UnsupportedCapability { .. } => {
                 ErrorCode::UnsupportedCapability
             }
+            Self::NotTransmitted(refusal) => refusal.code(),
+            Self::AnswerOvertaken { .. } => ErrorCode::QuestionResolved,
             Self::Arbitration(error) => match error {
                 ArbitrationError::AlreadyResolved { .. } | ArbitrationError::AlreadyClaimed => {
                     ErrorCode::QuestionResolved

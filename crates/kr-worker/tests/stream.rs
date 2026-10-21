@@ -168,6 +168,12 @@ impl World {
             EnvironmentId::new(Uuid::from_bytes([4; 16])),
             "agent-user",
         );
+        // What carries an answer out on the connection, as the gateway's own attachment binds it.
+        let dispatch = owner.dispatch().expect("the connection has a dispatch");
+        broker.bind_connection_dispatch(connection, dispatch.clone());
+        broker
+            .bind_dispatch(instance(), dispatch)
+            .expect("the instance has a transport");
         Self {
             _store: store,
             broker,
@@ -210,6 +216,48 @@ impl World {
             .from_upstream(frame.as_bytes(), NOW)
             .await
             .expect("the frame is carried");
+    }
+
+    /// The terminal selects a thread, and the server answers, so the binding names it. What the
+    /// server was sent for it is read, so the next line it reads is the case's.
+    async fn terminal_selects(&mut self, thread: &str) {
+        let selecting = self.terminal_asks(START).await;
+        assert_eq!(self.server_reads().await["method"], "thread/start");
+        self.server_answers(&selecting, &named(thread)).await;
+    }
+
+    /// An answer a rich client prepares for the one pending request, admitted at the binding now.
+    fn rich_answer(&self, option: &str) -> kr_protocol::agent::AgentApprovalRespondParams {
+        let resource = self.broker.pending_resources()[0].resource_id;
+        kr_protocol::agent::AgentApprovalRespondParams {
+            target: kr_protocol::agent::AgentMutationTarget {
+                subject: kr_worker::broker::subject(session(), instance()),
+                binding_revision: self.state().binding_revision,
+            },
+            resource_id: resource,
+            option_id: option.to_owned(),
+        }
+    }
+
+    fn owner_caller() -> kr_worker::broker::Caller {
+        kr_worker::broker::Caller {
+            actor_id: kr_protocol::ids::ActorId::new("owner").expect("an actor"),
+            grant_id: None,
+        }
+    }
+
+    /// Reads the next line the owner wrote to the server.
+    async fn server_reads(&mut self) -> serde_json::Value {
+        let mut line = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            self.upstream.read_exact(&mut byte).await.expect("a byte");
+            if byte[0] == b'\n' {
+                break;
+            }
+            line.push(byte[0]);
+        }
+        serde_json::from_slice(&line).expect("a frame")
     }
 
     fn thread(&self) -> Option<String> {
@@ -686,7 +734,7 @@ async fn kr_req_11_33_the_server_clearing_a_request_never_settles_an_answer_that
         "the writer decides"
     );
     // The server reads the answer; the writer finishes; the resource is resolved.
-    let mut taken = vec![0_u8; 128];
+    let mut taken = [0_u8; 128];
     let mut got = 0;
     while !taken[..got].ends_with(b"\n") {
         got += world
@@ -703,4 +751,205 @@ async fn kr_req_11_33_the_server_clearing_a_request_never_settles_an_answer_that
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+}
+
+const TERMINAL_ANSWERS: &[u8] = br#"{"id":"approval-1","result":{"decision":"decline"}}"#;
+
+/// KR-REQ-11.33: a rich answer is written as the response to the request, in the shape the table
+/// names, with the value the table maps the decision to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_33_a_rich_answer_is_the_response_the_table_writes_with_the_decisions_mapped_value()
+ {
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    world.server_says(ASK).await;
+    let (result, _) = world
+        .broker
+        .agent_approval_respond(
+            &World::owner_caller(),
+            &world.rich_answer("decline-and-stop"),
+            NOW,
+        )
+        .await
+        .expect("the answer reaches the server");
+    let _ = result;
+    assert_eq!(
+        world.server_reads().await,
+        serde_json::json!({ "id": "approval-1", "result": { "decision": "cancel" } })
+    );
+    let id = world.broker.pending_resources()[0].resource_id;
+    assert_eq!(
+        world.broker.pending(id).expect("held").state,
+        PendingState::Resolved
+    );
+}
+
+/// KR-REQ-11.33: a native answer that arrives after a rich answer was admitted and before its
+/// marker takes the transmission, and the rich answer returns where the resource stands, sending
+/// nothing. One answer reaches the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_33_a_native_answer_during_encoding_wins_and_the_rich_answer_sends_nothing() {
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    world.server_says(ASK).await;
+    let id = world.broker.pending_resources()[0].resource_id;
+
+    // The rich answer is admitted: the resource is claimed and its one transmission reserved.
+    let admitted = world
+        .broker
+        .admit_approval(&World::owner_caller(), &world.rich_answer("accept"), NOW)
+        .expect("the rich answer is admitted");
+    assert_eq!(
+        world.broker.pending(id).expect("held").state,
+        PendingState::Claimed
+    );
+    // The terminal answers before the rich answer's marker: the connection carries it.
+    let carried = world
+        .owner
+        .from_client(TERMINAL_ANSWERS, NOW)
+        .await
+        .expect("the terminal's answer is not refused");
+    assert!(
+        matches!(carried, Carried::ClientAnswer { .. }),
+        "{carried:?}"
+    );
+    // The rich answer reaches its marker and finds the resource taken: it sends nothing, and the
+    // refusal says where the resource stands.
+    let refused = world
+        .broker
+        .record_approval(&admitted, NOW)
+        .expect_err("the marker is refused");
+    assert!(refused.proven_unsent(), "{refused:?}");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::QuestionResolved
+    );
+    assert!(
+        matches!(
+            &refused,
+            kr_worker::broker::BrokerError::NotTransmitted(cause)
+                if matches!(**cause, kr_worker::broker::BrokerError::AnswerOvertaken { .. })
+        ),
+        "{refused:?}"
+    );
+    // The native answer is the one that reaches the server, and settles the resource.
+    assert_eq!(
+        world.server_reads().await,
+        serde_json::json!({ "id": "approval-1", "result": { "decision": "decline" } })
+    );
+    let started = std::time::Instant::now();
+    while world.broker.pending(id).expect("held").state != PendingState::Resolved {
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// KR-REQ-11.33: a native answer that arrives after a rich answer's marker is not forwarded and
+/// does not end the connection, and the connection carries what follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_33_a_native_answer_after_a_rich_one_is_not_forwarded_and_the_connection_goes_on()
+{
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    world.server_says(ASK).await;
+    let id = world.broker.pending_resources()[0].resource_id;
+    world
+        .broker
+        .agent_approval_respond(&World::owner_caller(), &world.rich_answer("accept"), NOW)
+        .await
+        .expect("the answer reaches the server");
+
+    let carried = world
+        .owner
+        .from_client(TERMINAL_ANSWERS, NOW)
+        .await
+        .expect("a late answer is not a fault of the connection");
+    assert!(
+        matches!(
+            carried,
+            Carried::ClientAnswerLate { resource_id, state }
+                if resource_id == id && state == PendingState::Resolved
+        ),
+        "{carried:?}"
+    );
+    assert!(!world.owner.stopping());
+    // One answer reached the server, and what the terminal sends next is carried behind it.
+    assert_eq!(
+        world.server_reads().await,
+        serde_json::json!({ "id": "approval-1", "result": { "decision": "accept" } })
+    );
+    let next = world
+        .terminal_asks(r#"{"id":9,"method":"account/read","params":{}}"#)
+        .await;
+    let forwarded = world.server_reads().await;
+    assert_eq!(forwarded["method"], "account/read");
+    assert_eq!(
+        forwarded["id"].as_str(),
+        Some(next.as_str().trim_matches('"'))
+    );
+}
+
+/// KR-REQ-11.33: an answer to a request the server cleared is not forwarded either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_33_an_answer_to_a_request_the_server_cleared_is_not_forwarded() {
+    let world = World::new(1 << 20);
+    world.server_says(ASK).await;
+    world.server_says(RESOLVED).await;
+    let carried = world
+        .owner
+        .from_client(TERMINAL_ANSWERS, NOW)
+        .await
+        .expect("a late answer is not a fault of the connection");
+    assert!(
+        matches!(
+            carried,
+            Carried::ClientAnswerLate {
+                state: PendingState::Cancelled,
+                ..
+            }
+        ),
+        "{carried:?}"
+    );
+    assert!(!world.owner.stopping());
+}
+
+/// KR-REQ-12.06: a rich answer admitted before the terminal selected another conversation is
+/// stopped when its permit is taken, sends nothing, and gives the request back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_06_a_rich_answer_admitted_before_a_selection_is_stopped_at_its_take() {
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    world.server_says(ASK).await;
+    let id = world.broker.pending_resources()[0].resource_id;
+    let admitted = world
+        .broker
+        .admit_approval(&World::owner_caller(), &world.rich_answer("accept"), NOW)
+        .expect("the rich answer is admitted");
+
+    // The terminal asks to change its conversation, and the server answers.
+    let selecting = world.terminal_asks(RESUME).await;
+    let refused = world
+        .broker
+        .record_approval(&admitted, NOW)
+        .expect_err("the permit is stale");
+    assert!(refused.proven_unsent(), "{refused:?}");
+    assert_eq!(
+        world.broker.pending(id).expect("held").state,
+        PendingState::Pending,
+        "the claim was given back"
+    );
+    world.server_answers(&selecting, &named("thread-2")).await;
+
+    // The request was asked under the conversation the terminal left, and is not answerable at the
+    // new binding: it is refused as stale, and still pending.
+    let stale = world
+        .broker
+        .agent_approval_respond(&World::owner_caller(), &world.rich_answer("accept"), NOW)
+        .await
+        .expect_err("a request of the old conversation is stale");
+    assert_eq!(stale.code(), kr_protocol::error::ErrorCode::StaleSession);
+    assert_eq!(
+        world.broker.pending(id).expect("held").state,
+        PendingState::Pending
+    );
 }

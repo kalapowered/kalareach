@@ -1534,6 +1534,18 @@ pub enum Carried {
         /// True when the reply was queued for the client.
         returned: bool,
     },
+    /// The client's own answer to a request that another answer had taken or that had ended, which
+    /// was not forwarded.
+    ///
+    /// The connection goes on: the server's own word that the request was answered is what clears
+    /// the terminal's prompt. This is a report of what became of the frame and nothing is
+    /// recorded for it; the state is where the resource stands.
+    ClientAnswerLate {
+        /// The resource the answer was for.
+        resource_id: PendingResourceId,
+        /// Where it stands.
+        state: PendingState,
+    },
     /// The client's own answer, admitted and queued for the upstream.
     ///
     /// What the resource becomes is what the write turns out to be, which the owner settles: a
@@ -1979,12 +1991,22 @@ impl Duplex {
         // finishing means, and the write finishing is the owner's to report: an answer whose fate
         // nobody establishes is one the guard settles uncertain, whether the reader is cancelled,
         // the connection ends, or the frame goes out in part.
+        let answer = match self.broker.admit_native_answer(self.connection, frame, now) {
+            Ok(answer) => answer,
+            Err(error) => {
+                // An answer to a request another answer already took, or that has ended, is not a
+                // fault of the connection: it is not forwarded, and the connection goes on.
+                if let Some((resource_id, state)) =
+                    self.broker.answer_arrived_late(self.connection, frame)
+                {
+                    return Ok(Carried::ClientAnswerLate { resource_id, state });
+                }
+                return Err(error);
+            }
+        };
         let admitted = AdmittedAnswer {
             broker: Arc::clone(&self.broker),
-            answer: Some(
-                self.broker
-                    .admit_native_answer(self.connection, frame, now)?,
-            ),
+            answer: Some(answer),
         };
         let resource_id = admitted.resource_id();
         let body = admitted.frame().to_vec();
