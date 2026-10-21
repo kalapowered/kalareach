@@ -991,8 +991,8 @@ all keep it, because a worker starts its shell even when it cannot open a journa
 launch that reports late and runs is a session like any other, and its closure ends it. The host
 asks for sixty seconds, and a worker still running after that counts until the daemon restarts. A
 launch whose process the host could not identify counts until the daemon restarts too. A closure
-that could not confirm its worker ended counts until the kernel says the process has ended and
-the worker's own journal shows a closure with nothing left running; a closure the journal kept
+that could not confirm its worker ended counts until, within those sixty seconds, the kernel says
+the process has ended and the worker's own journal shows a closure with nothing left running; a closure the journal kept
 after its process ended is not looked at again until the daemon restarts, and is not registered
 again then. A closure that records a process the session left running counts until the daemon
 restarts, and after a restart nothing follows that process. A closure that accounts for its worker releases the session even where its

@@ -785,13 +785,16 @@ impl Controller {
                 // process has ended and its own journal shows it left nothing running, and not
                 // before.
                 // A claim the host refused sent the worker no launch specification, so it started
-                // no session; one that was admitted recorded its key, and then the worker did.
-                let never_claimed = self
-                    .registry
-                    .lock()
-                    .await
-                    .reservation(reservation.reservation_id)?
-                    .is_some_and(|recorded| recorded.claimed_key.is_none());
+                // no session; one that was admitted recorded its key, and then the worker did. A
+                // reservation that cannot be read counts as claimed, and the failure reported
+                // below is still the one the worker or the host gave.
+                let never_claimed = matches!(
+                    self.registry
+                        .lock()
+                        .await
+                        .reservation(reservation.reservation_id),
+                    Ok(Some(recorded)) if recorded.claimed_key.is_none()
+                );
                 self.end_session_when_ended(
                     reservation.session_id,
                     identity.clone(),
