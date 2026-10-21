@@ -1006,7 +1006,11 @@ fn default_entry_path(kind: ShellKind) -> &'static str {
     }
 }
 
-/// What the installed record says the package is, as a worker that launched it would read it.
+/// What the installed package says it is, as the worker that launched it states it.
+///
+/// A shell this tree builds is read the way the worker reads it, from the directory it sits in, so
+/// a package that was moved is declared from where it is now. The PowerShell package builds no
+/// shell of its own and is declared from its record.
 fn declared_package(
     package: &Package,
 ) -> kr_shell_integration::contract::transport::PackageDeclaration {
@@ -1014,6 +1018,18 @@ fn declared_package(
         ModuleEntry, PackageDeclaration, PatchRevision,
     };
 
+    if package.kind != ShellKind::PowerShell
+        && let Some(directory) = package.startup_entry.parent().and_then(Path::parent)
+    {
+        return kr_shell_integration::host::package::ShellPackage::read(directory)
+            .unwrap_or_else(|fault| {
+                panic!(
+                    "{} is not a package a worker reads: {fault}",
+                    directory.display()
+                )
+            })
+            .declaration();
+    }
     let shell = &package.record["shell"];
     let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_owned();
     PackageDeclaration {
