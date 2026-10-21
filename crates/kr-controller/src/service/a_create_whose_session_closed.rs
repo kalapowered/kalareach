@@ -7,15 +7,21 @@
 //! daemon has recorded one, as the worker of a command that ends at once does, and the closure of
 //! a worker that ends while the create waits for it.
 
+use std::sync::Arc;
+
 use kr_protocol::identity::{DesktopBinding, ProcessStartIdentity, WorkerProfile};
 use kr_protocol::ids::{AuthorityRevision, SessionId};
-use kr_protocol::session::{DisplayNumber, SessionCreateResult, SessionState};
+use kr_protocol::session::{SessionCreateResult, SessionState};
+use kr_protocol::worker::WorkerDescriptor;
 
-use super::a_create_that_launches_nothing::create_params;
+use super::a_close_a_worker_never_answers as world;
+use super::a_create_that_launches_nothing::{create_params, seed_claim_as};
 use super::a_link_that_is_not_given_back::Served;
 use super::a_read_that_meets_a_worker_on_its_way_out::closure_of;
+use crate::directory::KnownWorker;
 use crate::error::ControllerError;
 use crate::registry::{Reservation, WorkerRecord};
+use crate::service::Controller;
 
 /// A daemon, a real worker that has reported itself, and the create it reported for.
 async fn reported() -> (Served, Reservation) {
@@ -39,32 +45,40 @@ async fn reported() -> (Served, Reservation) {
 
 /// What a create is answered with, for the worker `world` serves.
 async fn answered(world: &Served, reservation: &Reservation) -> SessionCreateResult {
-    answer(world, reservation)
-        .await
-        .expect("the create is answered")
-        .to_typed()
-        .expect("a create result")
-}
-
-/// The create's answer or its failure, for the worker `world` serves.
-async fn answer(
-    world: &Served,
-    reservation: &Reservation,
-) -> crate::error::Result<kr_protocol::envelope::ParamsValue> {
-    world
-        .controller
-        .answer_a_created_session(
-            &create_params(world.controller.paths().environment_id()),
+    to_a_result(
+        answer(
+            &world.controller,
             reservation,
             world.worker.endpoint.as_text(),
         )
         .await
+        .expect("the create is answered"),
+    )
 }
 
-/// The registry's row for the worker of `session_id`, naming `process` as the worker's process.
+fn to_a_result(answer: kr_protocol::envelope::ParamsValue) -> SessionCreateResult {
+    answer.to_typed().expect("a create result")
+}
+
+/// The create's answer or its failure, for the worker the daemon lists for `reservation`.
+async fn answer(
+    controller: &Arc<Controller>,
+    reservation: &Reservation,
+    endpoint: String,
+) -> crate::error::Result<kr_protocol::envelope::ParamsValue> {
+    controller
+        .answer_a_created_session(
+            &create_params(controller.paths().environment_id()),
+            reservation,
+            endpoint,
+        )
+        .await
+}
+
+/// The registry's row for the worker of `reservation`, naming `process` as the worker's process.
 fn worker_record(
     reservation: &Reservation,
-    worker: &crate::directory::KnownWorker,
+    worker: &KnownWorker,
     process: ProcessStartIdentity,
 ) -> WorkerRecord {
     WorkerRecord {
@@ -79,46 +93,107 @@ fn worker_record(
     }
 }
 
-/// A daemon and the create its worker reported for, with the worker as the daemon holds it once its
+/// A daemon and the create a worker reported for, with the worker as the daemon holds it once its
 /// endpoint is gone, as the worker of a command that ended at once leaves it: the registry names
-/// `process` as the worker's process, and nothing listens at the endpoint the directory names.
+/// `process` as the worker's process, and the directory lists a worker whose endpoint was never
+/// bound.
 ///
-/// The endpoint was never bound, and the daemon's connection to the worker that lives is let go
-/// before the worker the directory lists is added. The daemon's own publisher opens a connection to
-/// a worker the directory lists as soon as it has a reason to, and a worker that lives goes on
-/// serving a connection made before its endpoint path was taken away, so a read could still be
-/// answered over one. None is left to reuse here, and none can be made.
-async fn reported_with_its_endpoint_gone(process: ProcessStartIdentity) -> (Served, Reservation) {
-    let (world, reservation_id) = Served::claimed().await;
-    let reservation = world
-        .controller
-        .registry
-        .lock()
-        .await
-        .reservation(reservation_id)
-        .expect("the registry answers")
-        .expect("the reservation is recorded");
-    world.forget_the_worker().await;
-    let endpoint = world
-        .controller
-        .paths()
-        .worker_endpoint(DisplayNumber::new(reservation.display_number.get() + 1))
-        .expect("an endpoint");
-    let mut worker = world.worker.clone();
-    worker.descriptor.endpoint = endpoint.as_text();
-    worker.endpoint = endpoint;
-    world
-        .controller
-        .registry
-        .lock()
-        .await
-        .adopt_worker(
-            &worker_record(&reservation, &worker, process),
-            Some(&DesktopBinding::none()),
+/// No worker lives here, and none was ever listed. A worker that lived would go on serving a
+/// connection made before its endpoint path was taken away, and the daemon's own publisher opens a
+/// connection to a worker the directory lists as soon as it has a reason to, so a read could be
+/// answered over one. With none to reach, nothing the publisher or the create does can be.
+struct Gone {
+    controller: Arc<Controller>,
+    reservation: Reservation,
+    /// Declared last, so the tree is removed after the daemon's handles to it are gone.
+    _temp: kr_ipc::testing::TempHost,
+}
+
+impl Gone {
+    async fn with_the_worker_process(process: ProcessStartIdentity) -> Self {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = Controller::start(world::setup(&temp))
+            .await
+            .expect("the daemon starts");
+        let actor_id = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+        let mut identity = None;
+        let reservation = seed_claim_as(
+            &controller,
+            &actor_id,
+            WorkerProfile::HeadlessUser,
+            |reservation| {
+                let made = kr_ipc::verify::WorkerIdentity::generate(
+                    reservation.session_id,
+                    kr_protocol::ids::SessionEpoch::V1,
+                    controller.boot_identity.clone(),
+                    kr_ipc::identity::current_process_start_identity().expect("a process identity"),
+                    kr_protocol::hello::PROTOCOL_VERSION,
+                )
+                .expect("a session key");
+                let key = *made.public_key();
+                identity = Some(made);
+                key
+            },
         )
-        .expect("the registry records the worker");
-    world.controller.directory.lock().await.insert(worker, None);
-    (world, reservation)
+        .await;
+        let identity = identity.expect("the worker was made for its claim");
+        let endpoint = controller
+            .paths()
+            .worker_endpoint(reservation.display_number)
+            .expect("an endpoint");
+        let worker = KnownWorker {
+            level: kr_protocol::retained::Level::this(),
+            descriptor: WorkerDescriptor {
+                session_id: reservation.session_id,
+                session_epoch: kr_protocol::ids::SessionEpoch::V1,
+                environment_id: controller.paths().environment_id(),
+                display_number: reservation.display_number,
+                boot_identity: identity.boot_identity().clone(),
+                process_start_identity: process.clone(),
+                protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+                endpoint: endpoint.as_text(),
+                worker_public_key: *identity.public_key(),
+                worker_profile: WorkerProfile::HeadlessUser,
+                published_at_ms: kr_ipc::now_ms(),
+            },
+            endpoint,
+        };
+        controller
+            .registry
+            .lock()
+            .await
+            .adopt_worker(
+                &worker_record(&reservation, &worker, process),
+                Some(&DesktopBinding::none()),
+            )
+            .expect("the registry records the worker");
+        controller.directory.lock().await.insert(worker, None);
+        Self {
+            controller,
+            reservation,
+            _temp: temp,
+        }
+    }
+
+    /// The create's answer or its failure.
+    async fn answer(&self) -> crate::error::Result<kr_protocol::envelope::ParamsValue> {
+        answer(
+            &self.controller,
+            &self.reservation,
+            "unused: no worker lives here".to_owned(),
+        )
+        .await
+    }
+
+    async fn closure_is_recorded(&self) -> bool {
+        self.controller
+            .registry
+            .lock()
+            .await
+            .closure(self.reservation.session_id)
+            .expect("the registry answers")
+            .is_some()
+    }
 }
 
 fn assert_closed(answer: &SessionCreateResult, session_id: SessionId) {
@@ -182,22 +257,14 @@ async fn a_create_whose_session_closed_after_its_worker_reported_is_answered_fro
 /// once takes its worker with it, and the create meets the worker's endpoint gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_create_whose_worker_ended_before_it_was_described_is_answered_from_a_closure_for_it() {
-    // An identifier this host watched end, which no process can be mistaken for.
-    let (world, reservation) =
-        reported_with_its_endpoint_gone(kr_ipc::identity::ended_process_identity(4_000_000)).await;
-    assert!(
-        world
-            .controller
-            .registry
-            .lock()
-            .await
-            .closure(world.session_id)
-            .expect("the registry answers")
-            .is_none(),
-        "no closure is recorded"
-    );
+    // A process identity that reads as ended without a question to the kernel, which no running
+    // process can be mistaken for.
+    let gone =
+        Gone::with_the_worker_process(kr_ipc::identity::ended_process_identity(4_000_000)).await;
+    assert!(!gone.closure_is_recorded().await, "no closure is recorded");
 
-    assert_closed(&answered(&world, &reservation).await, world.session_id);
+    let answered = to_a_result(gone.answer().await.expect("the create is answered"));
+    assert_closed(&answered, gone.reservation.session_id);
 }
 
 /// KR-REQ-09.12: where no closure is established for a worker that cannot be reached, the create
@@ -206,12 +273,13 @@ async fn a_create_whose_worker_ended_before_it_was_described_is_answered_from_a_
 /// the worker's end gives up at its bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_create_whose_worker_cannot_be_reached_and_has_not_ended_fails_with_the_connection() {
-    let (world, reservation) = reported_with_its_endpoint_gone(
+    let gone = Gone::with_the_worker_process(
         kr_ipc::identity::current_process_start_identity().expect("this process is described"),
     )
     .await;
 
-    let refused = answer(&world, &reservation)
+    let refused = gone
+        .answer()
         .await
         .expect_err("a worker that has not ended and cannot be reached leaves no answer");
     assert!(
@@ -222,17 +290,7 @@ async fn a_create_whose_worker_cannot_be_reached_and_has_not_ended_fails_with_th
         ),
         "the failure is the connection that was not made: {refused:?}"
     );
-    assert!(
-        world
-            .controller
-            .registry
-            .lock()
-            .await
-            .closure(world.session_id)
-            .expect("the registry answers")
-            .is_none(),
-        "no closure was invented"
-    );
+    assert!(!gone.closure_is_recorded().await, "no closure was invented");
 }
 
 /// A process this test holds, ended when the test lets it go.
@@ -274,13 +332,11 @@ impl Drop for Held {
 /// process is still running is answered from the closure the daemon establishes once that process
 /// ends, not with the failure of the connection. A worker that has finished its closure stops
 /// accepting and drops its connections before its process ends, so the create waits for the end of
-/// the process. The worker here is held at the create's read, and its process ends after the
-/// create has looked for the end of the worker once and found it running.
+/// the process. The worker here goes at the create's read, and its process ends while the create
+/// is held after a look that found the process running.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_create_whose_worker_ends_while_the_create_waits_for_it_is_answered_from_a_closure() {
-    use std::sync::Arc;
-
     use super::a_read_that_meets_a_worker_on_its_way_out::{Scripted, reported_late};
 
     let script = Scripted::new();
@@ -312,15 +368,7 @@ async fn a_create_whose_worker_ends_while_the_create_waits_for_it_is_answered_fr
     let mut create = tokio::spawn({
         let controller = Arc::clone(&controller);
         let endpoint = world.worker.endpoint.as_text();
-        async move {
-            controller
-                .answer_a_created_session(
-                    &create_params(controller.paths().environment_id()),
-                    &reservation,
-                    endpoint,
-                )
-                .await
-        }
+        async move { answer(&controller, &reservation, endpoint).await }
     });
     tokio::select! {
         looked = looked => looked.expect("the create has looked for the end of the worker"),

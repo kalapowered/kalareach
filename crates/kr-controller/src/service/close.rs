@@ -470,7 +470,8 @@ impl Controller {
     ///
     /// # Errors
     ///
-    /// Returns an error when the registry cannot be read or written.
+    /// Returns an error when the registry cannot be read or written, or when this daemon stops
+    /// before it has recorded a closure it started.
     pub(super) async fn closure_after_a_worker_could_not_be_reached(
         self: &Arc<Self>,
         session_id: SessionId,
