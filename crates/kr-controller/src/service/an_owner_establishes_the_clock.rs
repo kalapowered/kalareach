@@ -858,6 +858,12 @@ async fn an_expired_grant_stays_out_in_a_new_boot_and_the_owners_establishment_k
         .expect("the device")
         .expired_at_ms
         .expect("the end is on the device's record");
+    let stored_tombstone = controller
+        .sharing()
+        .grants()
+        .grant_expired_at(stored.grant.grant_id)
+        .expect("readable")
+        .expect("the end is on the stored grant's record");
     // What the host owes its record is written, as its own task writes it, before it stops.
     controller
         .lifetimes()
@@ -937,6 +943,15 @@ async fn an_expired_grant_stays_out_in_a_new_boot_and_the_owners_establishment_k
         "a grant that has not run out is decided again"
     );
     held_out(&controller);
+    assert_eq!(
+        controller
+            .sharing()
+            .grants()
+            .grant_expired_at(stored.grant.grant_id)
+            .expect("readable"),
+        Some(stored_tombstone),
+        "the establishment keeps the end on the stored grant's record"
+    );
     // The stored grant's own lifetime, now that the clock is proven again, is still over: the
     // wall clock reads before its expiry, and what keeps the grant out is what the host wrote
     // down when it ran out (its tombstone, and the floor the end was found at).
