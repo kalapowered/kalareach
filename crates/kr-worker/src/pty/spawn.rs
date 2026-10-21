@@ -494,6 +494,27 @@ pub(super) mod tests {
                 marked(&second[1]),
                 "marked by the start's way: and the one far up it"
             );
+
+            // Room for one descriptor is not room for the table this process holds. The kernel's
+            // list is then not the whole of it, and a start that cannot account for every
+            // descriptor does not go ahead.
+            #[cfg(target_vendor = "apple")]
+            {
+                let mut cramped = TableRoom {
+                    list: vec![
+                        libc::proc_fdinfo {
+                            proc_fd: 0,
+                            proc_fdtype: 0,
+                        };
+                        1
+                    ],
+                    table_end: table_end(),
+                };
+                assert!(
+                    mark_close_on_exec(&mut cramped).is_err(),
+                    "a list that may not hold every descriptor fails the start"
+                );
+            }
             return;
         }
         let ran = std::process::Command::new(std::env::current_exe().expect("this binary"))
