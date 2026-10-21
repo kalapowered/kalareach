@@ -2840,6 +2840,75 @@ fn a_removal_does_not_wait_on_a_mount_put_on_a_directory_it_has_emptied() {
     }
 }
 
+/// KR-REQ-14.05: a mount put on the name of the tree a removal is asked to take, after the caller
+/// opened the tree and before the removal starts, is not waited on. The removal's first look at the
+/// name, which asks whether it still holds the directory the caller opened, must not go into a
+/// mount that never answers: it is refused as a replacement of the tree, and nothing is removed.
+/// The control is the same removal with nothing mounted, which takes the tree away.
+///
+/// The mount is attached where no seam of the removal's own is needed: before the call. A host
+/// without `/dev/fuse` or the helper leaves the case out as the cases above do.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_removal_does_not_wait_on_a_mount_put_on_the_name_it_was_asked_to_take() {
+    let root = kr_ipc::testing::PrivateTempDir::create();
+    std::fs::create_dir_all(root.path().join("tree/branch")).expect("the tree");
+    std::fs::write(root.path().join("tree/branch/staged"), b"staged\n").expect("a file");
+    std::fs::create_dir_all(root.path().join("control/branch")).expect("the control tree");
+    std::fs::create_dir(root.path().join("probe")).expect("a place to try a mount");
+    match HungMount::attach(&root.path().join("probe")) {
+        Ok(probe) => drop(probe),
+        Err(why) => {
+            assert!(
+                std::env::var_os("KR_REQUIRE_FUSE").is_none(),
+                "this host cannot place the mount this check needs: {why}"
+            );
+            eprintln!("skipped: {why}");
+            return;
+        }
+    }
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+    let control = RelativeName::parse("control").expect("a name");
+    let opened = authority.subdirectory(&control).expect("the control opens");
+    authority
+        .remove_tree(&control, opened)
+        .expect("a tree with nothing mounted on it is removed");
+    assert!(
+        !root.path().join("control").exists(),
+        "the control tree is gone"
+    );
+
+    let name = RelativeName::parse("tree").expect("a name");
+    let opened = authority.subdirectory(&name).expect("the tree opens");
+    // After the caller has opened the tree, as a mount put on it by somebody else would be.
+    let hung = HungMount::attach(&root.path().join("tree")).expect("the mount is placed");
+
+    // On another thread, so that a removal that waits on the mount is a failure of this case and
+    // not a case that never ends.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let removal = std::thread::spawn(move || {
+        let _ = sender.send(authority.remove_tree(&name, opened));
+    });
+    let outcome = receiver.recv_timeout(HUNG_REMOVAL_DEADLINE);
+    // Letting the mount go ends a call that is still waiting on it, so the thread can be joined
+    // whatever the outcome was.
+    drop(hung);
+    removal.join().expect("the removal's thread ends");
+    let refusal = outcome
+        .expect("the removal waits on a mount that never answers")
+        .expect_err("a mount on the tree's name stops the removal");
+    assert!(
+        matches!(refusal, Escape::IdentityChanged { .. }),
+        "because its name no longer holds the directory that was opened: {refusal}"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("tree/branch/staged")).expect("the file is still there"),
+        b"staged\n",
+        "nothing was removed"
+    );
+}
+
 /// KR-REQ-14.05: the same on macOS, where this account can attach a disk image inside the tree.
 ///
 /// A mount this account places itself is the graft a removal has to refuse: the image's volume is
