@@ -488,6 +488,41 @@ pub fn unpack(archive: &Path, staging: &Path) -> Result<(PathBuf, Written)> {
     Ok((staging.join(top), written))
 }
 
+/// Packs the release unpacked at `tree` as the archive `kr host update --archive` takes, every entry
+/// under the directory `top`, and writes it to `archive`.
+///
+/// A link in the tree is written as a link, which the archive's reading refuses by name; a file is
+/// written whole. What the tree holds is checked by whoever unpacks the archive, against the
+/// manifest it carries.
+///
+/// # Errors
+///
+/// Returns a refusal naming the failure to read the tree or write the archive.
+pub fn pack_tree(tree: &Path, top: &str, archive: &Path) -> Result<()> {
+    let failed = |error: &std::io::Error| {
+        CliError::Other(shown!(
+            "the release at {} could not be packed to be offered as an update: {}",
+            Shown::root(tree),
+            Shown::io(error)
+        ))
+    };
+    let file = std::fs::File::create(archive).map_err(|error| failed(&error))?;
+    let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+    let mut builder = tar::Builder::new(encoder);
+    // Every file whole, as a release archive has them: a file that has holes would otherwise be
+    // written as a sparse entry, which an archive's reading refuses.
+    builder.sparse(false);
+    builder.follow_symlinks(false);
+    builder
+        .append_dir_all(top, tree)
+        .map_err(|error| failed(&error))?;
+    builder
+        .into_inner()
+        .and_then(flate2::write::GzEncoder::finish)
+        .and_then(|mut file| file.flush())
+        .map_err(|error| failed(&error))
+}
+
 /// Copies an unpacked release's tree into `staging`, an owner-only directory, and returns the copy
 /// and what was written.
 ///

@@ -370,6 +370,44 @@ fn a_release_kept_after_a_rollback_is_not_switched_back_to() {
     );
 }
 
+/// KR-REQ-26.03: a release that an update left staged because it waited is offered again at the next
+/// command, and the host switches to it once nothing holds it. The release kept after a rollback is
+/// the control: it is not offered, and the rollback stands.
+#[test]
+fn a_release_an_update_left_staged_is_offered_again() {
+    let home = Home::new();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    let first = home.prefix("Cellar", &one);
+    assert!(home.versions(&kr(&first)).0.status.success());
+
+    // An update that waited for a live worker left the new release in the store, staged for the
+    // next attempt, and made nothing current.
+    let directory = home.store.release_directory(two.name());
+    two.write(&directory);
+    start_each_once(&directory);
+    std::fs::write(
+        home.store.record(),
+        serde_json::json!({
+            "format": kr_cli::update::RECORD_FORMAT,
+            "previous": null,
+            "staged": two.name().as_str(),
+        })
+        .to_string(),
+    )
+    .expect("the record");
+
+    let second = home.prefix("Cellar", &two);
+    let (taken, listed) = home.versions(&kr(&second));
+    assert!(taken.status.success(), "{}", said(&taken));
+    assert_eq!(
+        home.store.current().expect("reads"),
+        Some(two.name().clone()),
+        "the staged release is made current at the next command: {} {listed}",
+        said(&taken)
+    );
+}
+
 /// KR-REQ-26.03: a package manager's copy of the release already current takes ownership of the
 /// store, since the store's copy is that release byte for byte; a copy that only has its name does
 /// not, and is refused.

@@ -120,15 +120,16 @@ deletes the one before it. So the first command of such a `kr` admits its releas
 and the command then runs as the store's own copy of that release.
 
 With no release in the store, the release is installed as `kr host install` installs one. With
-another release current, and this one newer and not in the store yet, the current release's `kr` is
-asked to take this one in as an update (`kr host update --archive <directory>`, which takes the
-directory a package manager keeps a release unpacked in as well as an archive), so the release is
-checked against the update channel's root, the daemons are handed over and `current` is switched
-under the same rules. An update that waits for a live worker, exit 9, is not a failure: its reason
-is said on standard error and the command goes on with the release that is still current. A
-release that is already in the store, as one is after a rollback, or that is no newer than the
-current one is not offered again: the command goes on with the release that is current, and a
-rollback stands. A release that carries no update channel root, or cannot be checked, is refused
+another release current, and this one newer and not in the store yet, the release is packed as a
+release archive and the current release's `kr` is asked to take it in as an update
+(`kr host update --archive <archive>`, which every release takes, one from before package managers
+included), so the release is checked against the update channel's root, the daemons are handed over
+and `current` is switched under the same rules. An update that waits for a live worker, exit 9, is
+not a failure: its reason is said on standard error and the command goes on with the release that
+is still current, and the release the update left staged is offered again at the next command. A
+release that is already in the store and not staged, as one is after a rollback, or that is no newer
+than the current one is not offered again: the command goes on with the release that is current,
+and a rollback stands. A release that carries no update channel root, or cannot be checked, is refused
 with the reason, and the command does not run. Two first commands at once take the store's locks
 in turn, and the one that does not get them goes on with the release that is current.
 

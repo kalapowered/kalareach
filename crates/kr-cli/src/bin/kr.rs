@@ -1109,12 +1109,8 @@ async fn run(cli: Cli) -> Result<Completion> {
                 Ok(Completion::Done)
             }
             HostCommand::Update(update) => {
-                let updated = kr_cli::update::update(
-                    update.archive.as_deref(),
-                    update.check,
-                    update.installer.as_deref(),
-                )
-                .await?;
+                let updated =
+                    kr_cli::update::update(update.archive.as_deref(), update.check).await?;
                 if cli.json {
                     output::document(&updated.document());
                 } else {

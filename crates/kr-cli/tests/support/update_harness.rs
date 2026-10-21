@@ -1970,12 +1970,18 @@ impl Host {
 
     /// Installs a first release with the unpacked release's own `kr`, and starts its programs once.
     fn install(&self, assembled: &Assembled) {
+        self.install_in(&self.store, assembled);
+    }
+
+    /// As [`Self::install`], into `store`: a store at the place a default install names, for a case
+    /// that runs a `kr` which looks there.
+    fn install_in(&self, store: &Store, assembled: &Assembled) {
         let unpacked = self.scratch("unpacked").join(assembled.name().as_str());
         assembled.write(&unpacked);
-        let store = self.store.root().display().to_string();
+        let root = store.root().display().to_string();
         let output = self.run(
             &unpacked.join("bin").join(Program::Kr.file_name()),
-            &["host", "install", "--store", &store, "--json"],
+            &["host", "install", "--store", &root, "--json"],
         );
         assert!(
             output.status.success(),
@@ -1984,7 +1990,7 @@ impl Host {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        start_each_once(&self.store.release_directory(assembled.name()));
+        start_each_once(&store.release_directory(assembled.name()));
     }
 }
 

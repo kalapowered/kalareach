@@ -1081,11 +1081,7 @@ pub fn versions() -> Result<Vec<Kept>> {
 /// and what to do, with every daemon it stopped started again from the release still current; and
 /// a refusal or a failure otherwise.
 #[cfg(unix)]
-pub async fn update(
-    archive: Option<&std::path::Path>,
-    check: bool,
-    installer: Option<&str>,
-) -> Result<Updated> {
+pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Updated> {
     let (store, source) = this_release_store()?;
     let Some(archive) = archive else {
         return Err(CliError::Usage(Shown::said(
@@ -1130,13 +1126,6 @@ pub async fn update(
     );
     let _ = remove_staging(&staging);
     let target = staged?;
-    // A release the package manager's tree holds is checked and in the store: the manager owns
-    // which release is current from here, whether this run switches to it or waits.
-    if let Some(installer) = installer
-        && !check
-    {
-        write_installer(&store, installer)?;
-    }
     if target.release == source {
         // The release that is current is not an update to go on past a failed one with: the daemons
         // it left unstarted are owed their start from it. An archive of any other release is
@@ -1514,13 +1503,7 @@ fn stage_archive(
     check: bool,
 ) -> Result<kr_protocol::update::ReleaseManifest> {
     kr_ipc::paths::create_private_tree(store.root(), staging)?;
-    // An archive is unpacked; a release already unpacked, as a package manager keeps one, is
-    // copied. Either is held to the same checks before anything of it is trusted.
-    let (staged, written) = if archive.is_dir() {
-        release::copy_tree(archive, staging)?
-    } else {
-        release::unpack(archive, staging)?
-    };
+    let (staged, written) = release::unpack(archive, staging)?;
     let document = release::manifest_document(&staged)?;
     let manifest = trusted.verify(&document)?;
     release::check_files(&manifest, &written)?;
@@ -2556,11 +2539,7 @@ pub fn versions() -> Result<Vec<Kept>> {
 
 /// `kr host update` on a platform that keeps no store.
 #[cfg(not(unix))]
-pub async fn update(
-    _archive: Option<&std::path::Path>,
-    _check: bool,
-    _installer: Option<&str>,
-) -> Result<Updated> {
+pub async fn update(_archive: Option<&std::path::Path>, _check: bool) -> Result<Updated> {
     Err(unsupported())
 }
 

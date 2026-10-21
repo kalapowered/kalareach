@@ -1366,17 +1366,12 @@ pub struct InstallArguments {
 /// `kr host update`.
 #[derive(Args)]
 pub struct UpdateArguments {
-    /// The release to update to: its archive, `kalareach-<target>-<release>.tar.gz`, or the
-    /// directory a package manager keeps it unpacked in.
+    /// The release archive to update to, `kalareach-<target>-<release>.tar.gz`.
     #[arg(long)]
     pub archive: Option<PathBuf>,
     /// Check the release and what holds an update now, and change nothing.
     #[arg(long)]
     pub check: bool,
-    /// The package manager that put the release where it is, when the first run of its `kr` is
-    /// the one asking for the update.
-    #[arg(long, hide = true)]
-    pub installer: Option<String>,
 }
 
 /// `kr host rollback`.

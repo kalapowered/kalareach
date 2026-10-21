@@ -744,6 +744,71 @@ impl Prepared {
     }
 }
 
+/// KR-REQ-26.03, KR-REQ-26.06: the first command of a package manager's `kr` brings a host that
+/// runs the release before to this release. The release before knows nothing of package managers,
+/// so what is offered it is what it takes of any update, a release archive; it checks the release
+/// and switches as it does for one a person names, and the manager is recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_package_managers_first_command_updates_a_host_on_the_release_before() {
+    struct Writable(PathBuf);
+    impl Drop for Writable {
+        fn drop(&mut self) {
+            // An installed release is read-only, and the tree goes whole.
+            writable(&self.0);
+        }
+    }
+
+    let one = previous().assembled(1);
+    let two = Assembled::at_this_level(&format!("{PACKAGE_VERSION}+bbbbbbbbbbbb"), 2)
+        .retaining_what_this_build_does();
+    let host = Host::bare();
+    // The store at the place a default install names, which the package manager's `kr` looks in.
+    let home = host.scratch("home");
+    let store = Store::at(if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/KalaReach/host")
+    } else {
+        home.join(".local/share/kalareach/host")
+    });
+    let _clear = Writable(store.root().to_path_buf());
+    host.install_in(&store, &one);
+
+    let tree = host
+        .scratch("Cellar")
+        .join("kalareach")
+        .join(two.name().as_str())
+        .join("libexec");
+    two.write(&tree);
+    start_each_once(&tree);
+    let mut command = host.command(
+        &tree.join("bin").join(Program::Kr.file_name()),
+        &["--json", "host", "versions"],
+    );
+    command
+        .env("HOME", &home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().expect("kr starts");
+    let output = finish_within(child, Duration::from_secs(300));
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    assert!(output.status.success(), "{said}");
+    assert_eq!(
+        store.current().expect("reads"),
+        Some(two.name().clone()),
+        "the release before's own kr took this release in as an update: {said}"
+    );
+    assert_eq!(
+        kr_cli::update::installer(&store).expect("reads").as_deref(),
+        Some("homebrew"),
+        "the package manager is recorded"
+    );
+}
+
 /// KR-REQ-26.06, KR-REQ-26.08, KR-REQ-20.23, KR-ACC-035: a host on the release before is updated,
 /// by that release's own `kr`, to this one while a session's worker still runs the release before:
 /// the update goes on and does not wait, the worker is the process it was, the new control daemon

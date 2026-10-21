@@ -171,22 +171,29 @@ address of the archive it installs and the archive's SHA-256, which the script r
 and never takes from a person. A family renders only when both of its architectures are given.
 
 None of them runs anything after it unpacks the release: Homebrew's `post_install` runs sandboxed,
-and a winget portable package has no hook. The `kr` that a package manager puts on the search path
-admits its own release instead. Its first command checks the release against the channel's root as
-`kr host install` does, puts it in the user's store of releases, and runs as the store's copy, so the
-daemon, the workers and the helpers never run from the package manager's directory. When another
-release is current, the first command hands the new one to the current release's `kr` as an update,
-which switches to it or waits for a live worker as any update does, and the command goes on with
-the release that is current. A release the store keeps already, or one no newer than the current
-release, is not offered again, so a rollback stands. The store names the package manager in a file of
-its own, `installer`, which owns which release is current; a release before this one does not know
-the file and treats the install as its own. Removing the package removes the package manager's
-directory and never touches `versions/`.
+and a winget portable package has no hook. On macOS and Linux the `kr` that Homebrew puts on the
+search path admits its own release instead. Its first command checks the release against the
+channel's root as `kr host install` does, puts it in the user's store of releases, and runs as the
+store's copy, so the daemon, the workers and the helpers never run from the package manager's
+directory. When another release is current, the first command packs the new one as a release archive
+and hands it to the current release's `kr` as an update, which switches to it or waits for a live
+worker as any update does, and the command goes on with the release that is current. The current
+release may be one from before package managers, and it takes an archive as it takes any update. An
+update that waited leaves its release staged, and the next command offers it again. A release the
+store keeps already, and no update left staged, or one no newer than the current release, is not
+offered again, so a rollback stands. The store names the package manager in a file of its own,
+`installer`, which owns which release is current; a release before this one does not know the file
+and treats the install as its own. Removing the package removes the package manager's directory and
+never touches `versions/`. A Windows host keeps no store of releases, so the winget package's `kr`
+runs from the directory winget unpacked the release in. The winget manifest asks for that directory
+to go on the search path, because the programs of a release are found beside the one that starts
+them, and a link to `kr` in winget's links directory would hide them.
 
 `scripts/check-homebrew-install.sh` installs a release with Homebrew itself from a tap of the run's
 own, upgrades it to the next release and removes it, and holds each of those to what the store says.
 The tree job runs it for the cask on the macOS runners, and the `formula` job runs it for the formula
-on Linux runners of a newer image than the floor-checked build, since Homebrew on an older one builds
-a toolchain of its own to install anything. A Homebrew in a directory of its own runs it on a machine
-that has none to spare. Opening a tap repository and submitting to winget's community
+on an x86_64 Linux runner of a newer image than the floor-checked build, since Homebrew on an older
+one builds a toolchain of its own to install anything. The hosted Arm Linux image carries no Homebrew,
+so the formula for Arm Linux is rendered by the same code from the same archives and installed by no
+run. A Homebrew in a directory of its own runs the check on a machine that has none to spare. Opening a tap repository and submitting to winget's community
 repository are the project owner's to do.
