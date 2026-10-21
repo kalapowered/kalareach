@@ -704,6 +704,8 @@ export interface FakeHostControls {
   readonly intakes: IntakeSource[]
   /** How many times the page asked to open this application's page in the system's settings. */
   readonly settingsOpened: { count: number }
+  /** Whether the screen is being kept on, and how many times it was asked to be. */
+  readonly keptAwake: { on: boolean; asked: number }
   /** The codes the page started pairing with, in order. */
   readonly startedCodes: string[]
   /** Sets the confirmations the hosts ask for, as native code would publish them. */
@@ -943,6 +945,7 @@ export function fakeHost(
   }
   const intakes: IntakeSource[] = []
   const settingsOpened = { count: 0 }
+  const keptAwake = { on: false, asked: 0 }
   const takeIn = (source: IntakeSource): Promise<IntakeView> => {
     intakes.push(source)
     const result = intakeResults[source]
@@ -2142,6 +2145,11 @@ export function fakeHost(
       settingsOpened.count += 1
       return Promise.resolve()
     },
+    pairingKeepAwake: (on) => {
+      keptAwake.on = on
+      keptAwake.asked += 1
+      return Promise.resolve()
+    },
     pairingStartRead: () => {
       if (pairing.invitation === null) refuse('PERMISSION_DENIED', 'No invitation is waiting.')
       publishPairing({ invitation: null, state: { state: 'working', stage: 'reaching_host' } })
@@ -3216,6 +3224,7 @@ export function fakeHost(
     },
     intakes,
     settingsOpened,
+    keptAwake,
     startedCodes,
     setConfirmations(view) {
       publishOwner(view)

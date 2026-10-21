@@ -185,6 +185,21 @@ export function PairingFlow({
     heading.current?.focus()
   }, [screen, focusTheField])
 
+  // A person holds this device beside the host's screen to compare the value on both, so a phone's
+  // screen stays on for as long as the value shows, and may sleep again when it goes. A computer
+  // has nothing to keep on, and the host says so by doing nothing.
+  const showsValue =
+    view?.state.state === 'awaiting_approval' ||
+    (view?.state.state === 'reconnecting' && view.state.value !== null)
+  const keepsAwake = showsValue && device === 'phone'
+  useEffect(() => {
+    if (!keepsAwake) return
+    port.pairingKeepAwake(true).catch(() => undefined)
+    return () => {
+      port.pairingKeepAwake(false).catch(() => undefined)
+    }
+  }, [port, keepsAwake])
+
   // The countdown ticks while the person decides, and says "One minute left" once.
   const expiresAt =
     view?.state.state === 'awaiting_approval' || view?.state.state === 'reconnecting'

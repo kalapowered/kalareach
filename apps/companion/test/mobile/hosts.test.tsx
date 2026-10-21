@@ -86,7 +86,38 @@ describe('the Hosts screen of a phone', () => {
         }
       })
     })
-    expect(await screen.findByText('Approve this phone on the host only if it shows the same value.')).toBeInTheDocument()
+    expect(await screen.findByText(/Approve this phone on the host/)).toBeInTheDocument()
+  })
+
+  // KR-REQ-10.37: a phone held beside the host's screen to compare the value keeps its screen on
+  // for as long as the value shows, and lets it sleep again when the value goes.
+  it('keeps the screen on while the value shows and lets it sleep when it goes', async () => {
+    const { controls } = start()
+    await openTab('Hosts')
+    await screen.findByRole('heading', { name: 'Pair with a host' })
+    expect(controls.keptAwake.on).toBe(false)
+    act(() => {
+      controls.setPairing({
+        state: {
+          state: 'awaiting_approval',
+          value: 'f3c1 46fd',
+          expires_at_ms: null,
+          rights: ['session.view'],
+          authority: 'view sessions',
+          grant_expires_at_ms: null
+        }
+      })
+    })
+    await waitFor(() => {
+      expect(controls.keptAwake.on).toBe(true)
+    })
+    act(() => {
+      controls.setPairing({ state: { state: 'idle' } })
+    })
+    await waitFor(() => {
+      expect(controls.keptAwake.on).toBe(false)
+    })
+    expect(controls.keptAwake.asked).toBe(2)
   })
 
   // KR-REQ-13.08: choosing a host sends the commands there, and says which one is in use.

@@ -34,6 +34,11 @@ struct AttemptArguments: Decodable {
   let attempt: String
 }
 
+/// Whether the screen is kept on.
+struct KeepAwakeArguments: Decodable {
+  let on: Bool
+}
+
 /// What opening a call takes: its name, and the channel its news is sent on.
 struct CallOpenArguments: Decodable {
   let call: String
@@ -267,6 +272,16 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
         // The reader is held until its answer, by this closure.
         withExtendedLifetime(reader) { scan.answer(outcome) }
       }
+    }
+  }
+
+  /// Keeps the screen on while a value the person compares with another device's shows, and lets
+  /// it sleep again afterwards.
+  @objc public func keepAwake(_ invoke: Invoke) throws {
+    let arguments = try invoke.parseArgs(KeepAwakeArguments.self)
+    DispatchQueue.main.async {
+      UIApplication.shared.isIdleTimerDisabled = arguments.on
+      invoke.resolve(["done": true])
     }
   }
 

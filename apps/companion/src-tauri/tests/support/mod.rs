@@ -559,6 +559,7 @@ impl Companion {
                 companion_tauri::commands::pairing_scan,
                 companion_tauri::commands::pairing_scan_photo,
                 companion_tauri::commands::pairing_open_settings,
+                companion_tauri::commands::pairing_keep_awake,
                 companion_tauri::commands::pairing_start_read,
                 companion_tauri::commands::pairing_stop,
                 companion_tauri::commands::owner_confirmations,
