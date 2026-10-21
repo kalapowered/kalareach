@@ -23,8 +23,9 @@ use crate::capability::PluginCapability;
 use crate::connector::{
     BrokerTransport, ConnectorManifest, DecisionDestination, DecisionResponse, FieldPath,
     FieldSegment, Framing, MAX_CLASSIFIED_METHODS, MAX_DECISION_VALUE_BYTES, MAX_FIELD_PATH_DEPTH,
-    MAX_OBSERVED_ROUTES, MAX_RESPONSE_METHODS, MethodClass, Observation, ResponseCorrelation,
-    RouteDirection,
+    MAX_OBSERVED_ROUTES, MAX_RESPONSE_METHODS, MAX_TEMPLATE_DEPTH, MAX_TEMPLATE_LITERAL_BYTES,
+    MAX_TEMPLATE_NODES, MethodClass, Observation, Operations, ResponseCorrelation, RouteDirection,
+    TemplateHole,
 };
 use crate::digest::PayloadDigest;
 use crate::effect::{
@@ -2537,6 +2538,162 @@ fn check_connector(connector: &ConnectorManifest, report: &mut Report) {
     }
     if let Some(observation) = connector.observation.as_ref() {
         check_observation(connector, observation, report);
+    }
+    if let Some(operations) = connector.operations.as_ref() {
+        check_operations(connector, operations, report);
+    }
+}
+
+/// What walking a template found.
+#[derive(Default)]
+struct TemplateWalk {
+    nodes: usize,
+    holes: BTreeSet<TemplateHole>,
+    problems: Vec<String>,
+}
+
+/// Walks a template, counting what it holds and finding what it fills in.
+fn walk_template(value: &serde_json::Value, depth: usize, walk: &mut TemplateWalk) {
+    walk.nodes += 1;
+    if depth > MAX_TEMPLATE_DEPTH {
+        walk.problems.push(format!(
+            "the template nests deeper than {MAX_TEMPLATE_DEPTH} levels"
+        ));
+        return;
+    }
+    match value {
+        serde_json::Value::Object(members) => {
+            if members.contains_key(TemplateHole::MEMBER) {
+                match TemplateHole::of(value) {
+                    Some(hole) => {
+                        walk.holes.insert(hole);
+                    }
+                    None => walk.problems.push(format!(
+                        "an object with the member {:?} is a hole, which holds only {:?} naming thread_id, turn_id or text",
+                        TemplateHole::MEMBER,
+                        TemplateHole::MEMBER
+                    )),
+                }
+                return;
+            }
+            for member in members.values() {
+                walk_template(member, depth + 1, walk);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                walk_template(item, depth + 1, walk);
+            }
+        }
+        serde_json::Value::String(text) => {
+            if text.len() > MAX_TEMPLATE_LITERAL_BYTES || text.chars().any(char::is_control) {
+                walk.problems.push(format!(
+                    "a literal in the template is over {MAX_TEMPLATE_LITERAL_BYTES} bytes or holds a control character"
+                ));
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+/// Checks how a table says the core's operations are written.
+///
+/// Each operation names a method the table routes from the host to the application and classifies
+/// as a mutation, and no two operations share one. Its template is bounded, holds only the holes
+/// that operation has a value for, and holds every one it needs: a cancellation without the turn
+/// would cancel whatever is running, and a prompt without the thread would go to nobody. A reply's
+/// turn is read inside the table's result member.
+fn check_operations(connector: &ConnectorManifest, operations: &Operations, report: &mut Report) {
+    let Some(messages) = connector.messages.as_ref() else {
+        table_invalid(
+            report,
+            "operations are written as requests with the members the table names for a message, and the table names no message members (messages)"
+                .to_owned(),
+        );
+        return;
+    };
+    if operations.declared().is_empty() {
+        table_invalid(
+            report,
+            "the table's operations member declares none; a table that spells none leaves the member out"
+                .to_owned(),
+        );
+    }
+    let mut methods = BTreeSet::new();
+    for (name, route, needs) in operations.declared() {
+        let mut invalid = |detail: String| table_invalid(report, detail);
+        match connector
+            .routes
+            .iter()
+            .find(|candidate| candidate.method == route.method)
+        {
+            None => invalid(format!(
+                "the operation {name} is written as {}, which the table does not route",
+                route.method
+            )),
+            Some(routed) if routed.direction == RouteDirection::UpstreamToHost => invalid(format!(
+                "the operation {name} is written as {}, which the table routes from the application to the host",
+                route.method
+            )),
+            Some(_) => {}
+        }
+        if connector.classify(&route.method) != MethodClass::Mutation {
+            invalid(format!(
+                "the operation {name} is written as {}, which the table does not classify as a mutation",
+                route.method
+            ));
+        }
+        if !methods.insert(&route.method) {
+            invalid(format!(
+                "two operations are written as {}, so the host could not tell which it sends",
+                route.method
+            ));
+        }
+        if !route.params.is_object() {
+            invalid(format!(
+                "the operation {name}'s parameters are not an object"
+            ));
+        }
+        let mut walk = TemplateWalk::default();
+        walk_template(&route.params, 0, &mut walk);
+        if walk.nodes > MAX_TEMPLATE_NODES {
+            invalid(format!(
+                "the operation {name}'s template holds {} values; the most is {MAX_TEMPLATE_NODES}",
+                walk.nodes
+            ));
+        }
+        for problem in walk.problems {
+            invalid(format!("the operation {name}: {problem}"));
+        }
+        for hole in &walk.holes {
+            if !needs.contains(hole) {
+                invalid(format!(
+                    "the operation {name} fills in {}, which it has no value for",
+                    hole.as_str()
+                ));
+            }
+        }
+        for hole in needs {
+            if !walk.holes.contains(hole) {
+                invalid(format!(
+                    "the operation {name} does not fill in {}, which it needs",
+                    hole.as_str()
+                ));
+            }
+        }
+        if let Some(turn) = route.reply_turn.as_ref() {
+            check_field_path(turn, &format!("the operation {name}'s reply turn"), report);
+            if !starts_with_member(turn, messages.result.as_str()) {
+                table_invalid(
+                    report,
+                    format!(
+                        "the operation {name} reads the turn at {}, which is not inside the table's {} member",
+                        dotted(turn),
+                        messages.result
+                    ),
+                );
+            }
+        }
     }
 }
 

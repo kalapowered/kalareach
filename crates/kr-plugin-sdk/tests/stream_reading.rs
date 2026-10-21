@@ -1,9 +1,11 @@
-//! What a table of an application server says the host reads: how its approvals are answered, and
-//! which conversation and turn its stream names.
+//! What a table of an application server says the host reads and writes: how its approvals are
+//! answered, which conversation and turn its stream names, and how its protocol spells the core's
+//! own operations.
 //!
 //! A table of a server a native terminal speaks to answers an approval as the response to the
-//! request itself, and tells the host the places in its messages that name a thread, a turn and a
-//! cleared request. The package validator every host, publisher and pipeline runs decides whether
+//! request itself, tells the host the places in its messages that name a thread, a turn and a
+//! cleared request, and gives the request the host writes for a prompt, a steer and a
+//! cancellation. The package validator every host, publisher and pipeline runs decides whether
 //! a table says that completely and in a way the host can read. These cases build the example
 //! connector package around each declaration and break it one way at a time.
 //!
@@ -11,12 +13,13 @@
 //! | --- | --- |
 //! | KR-REQ-11.33 | a table that answers an approval as the response to its request, with each decision mapped to its own value, is accepted; each way it can say that wrongly (both ways at once, no message members, a request the application never asks, an unrouted or unsupported request, a duplicated value, a result member that is one the table reads a message by, responses matched by order, an answer action that offers a decision the table does not map, a package that does not ask for the approval grants) is named |
 //! | KR-REQ-12.06 | a table whose observation names the selection, leave, turn and cleared-request places the host reads is accepted; a route that is unrouted, travels the other way, reads outside the member the table names for that kind of message, gives one method two roles or reads a thread and a turn at overlapping places, and an observation with no message members, are each named |
+//! | KR-REQ-12.12 | a table that spells the core's operations, each as a routed host-to-application mutation with a bounded template that fills in exactly the thread, turn and text the operation has, is accepted; an unrouted method, one that travels the other way or is not a mutation, two operations on one method, a malformed or unknown hole, a missing or surplus hole, an oversized or control-character template, a reply turn outside the result member and operations with no message members are each named |
 
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::connector::{
     ConnectorManifest, DecisionResponse, DecisionValue, FieldPath, FieldSegment, LeaveRoute,
-    MessageMembers, MethodClass, MethodClassification, Observation, ResolvedRoute,
-    ResponseCorrelation, Route, RouteDirection, SelectionRoute, TurnRoute,
+    MessageMembers, MethodClass, MethodClassification, Observation, OperationRoute, Operations,
+    ResolvedRoute, ResponseCorrelation, Route, RouteDirection, SelectionRoute, TurnRoute,
 };
 use kr_plugin_sdk::example;
 use kr_plugin_sdk::ids::{MethodName, ParameterName};
@@ -123,6 +126,12 @@ fn server_table() -> ConnectorManifest {
             RouteDirection::UpstreamToHost,
             MethodClass::Observation,
         ),
+        (
+            "turn.steer",
+            "turn/steer",
+            RouteDirection::HostToUpstream,
+            MethodClass::Mutation,
+        ),
     ] {
         table.routes.push(route(name, wire, direction));
         table.methods.push(classified(name, class));
@@ -149,6 +158,34 @@ fn server_table() -> ConnectorManifest {
         request_resolved: Some(ResolvedRoute {
             method: method("request.resolved"),
             request_id: path(&["params", "requestId"]),
+        }),
+    });
+    table.operations = Some(Operations {
+        prompt_submit: Some(OperationRoute {
+            method: method("turn.start"),
+            params: serde_json::json!({
+                "threadId": { "$": "thread_id" },
+                "input": [{ "type": "text", "text": { "$": "text" } }],
+            }),
+            reply_turn: Some(path(&["result", "turn", "id"])),
+        }),
+        prompt_queue: None,
+        turn_steer: Some(OperationRoute {
+            method: method("turn.steer"),
+            params: serde_json::json!({
+                "threadId": { "$": "thread_id" },
+                "expectedTurnId": { "$": "turn_id" },
+                "input": [{ "type": "text", "text": { "$": "text" } }],
+            }),
+            reply_turn: Some(path(&["result", "turnId"])),
+        }),
+        turn_cancel: Some(OperationRoute {
+            method: method("turn.cancel"),
+            params: serde_json::json!({
+                "threadId": { "$": "thread_id" },
+                "turnId": { "$": "turn_id" },
+            }),
+            reply_turn: None,
         }),
     });
     table
@@ -201,6 +238,13 @@ fn response(table: &mut ConnectorManifest) -> &mut DecisionResponse {
         .decision_response
         .as_mut()
         .expect("the table declares a response")
+}
+
+fn operations(table: &mut ConnectorManifest) -> &mut Operations {
+    table
+        .operations
+        .as_mut()
+        .expect("the table declares operations")
 }
 
 fn observation(table: &mut ConnectorManifest) -> &mut Observation {
@@ -367,4 +411,182 @@ fn kr_req_12_06_an_observation_names_places_inside_messages_the_table_routes() {
         .expect("an end");
     ended.method = method("turn.started");
     refused(&start_and_end, "both the start and the end of a turn");
+}
+
+/// KR-REQ-12.12: the core's operations a table spells are the only requests the host writes of its
+/// own, so each is a routed mutation to the application with a template that holds exactly the
+/// values the core has for it.
+#[test]
+fn kr_req_12_12_an_operation_is_a_routed_mutation_with_a_template_that_fits_it() {
+    let hole = |name: &str| serde_json::json!({ "$": name });
+
+    let mut unrouted = server_table();
+    operations(&mut unrouted)
+        .turn_cancel
+        .as_mut()
+        .expect("a cancel")
+        .method = method("turn.unrouted");
+    refused(&unrouted, "which the table does not route");
+
+    let mut backwards = server_table();
+    operations(&mut backwards)
+        .turn_cancel
+        .as_mut()
+        .expect("a cancel")
+        .method = method("turn.started");
+    refused(&backwards, "routes from the application to the host");
+
+    let mut not_a_mutation = server_table();
+    operations(&mut not_a_mutation)
+        .turn_cancel
+        .as_mut()
+        .expect("a cancel")
+        .method = method("status.read");
+    refused(&not_a_mutation, "does not classify as a mutation");
+
+    let mut one_method = server_table();
+    let submit = operations(&mut one_method)
+        .prompt_submit
+        .clone()
+        .expect("a submit");
+    operations(&mut one_method).prompt_queue = Some(submit);
+    refused(&one_method, "could not tell which it sends");
+
+    let mut none = server_table();
+    *operations(&mut none) = Operations::default();
+    refused(&none, "declares none");
+
+    let mut not_an_object = server_table();
+    operations(&mut not_an_object)
+        .turn_cancel
+        .as_mut()
+        .expect("a cancel")
+        .params = serde_json::json!([]);
+    refused(&not_an_object, "are not an object");
+
+    // A hole is a whole value naming one of three things, and nothing else.
+    let mut unknown_hole = server_table();
+    operations(&mut unknown_hole)
+        .turn_cancel
+        .as_mut()
+        .expect("a cancel")
+        .params = serde_json::json!({ "threadId": hole("thread_id"), "turnId": hole("turn") });
+    refused(&unknown_hole, "is a hole");
+    let mut hole_with_more = server_table();
+    operations(&mut hole_with_more)
+        .turn_cancel
+        .as_mut()
+        .expect("a cancel")
+        .params = serde_json::json!({
+        "threadId": hole("thread_id"),
+        "turnId": { "$": "turn_id", "extra": 1 },
+    });
+    refused(&hole_with_more, "is a hole");
+
+    let mut no_thread = server_table();
+    operations(&mut no_thread)
+        .turn_cancel
+        .as_mut()
+        .expect("a cancel")
+        .params = serde_json::json!({ "turnId": hole("turn_id") });
+    refused(&no_thread, "does not fill in thread_id");
+    let mut no_turn = server_table();
+    operations(&mut no_turn)
+        .turn_cancel
+        .as_mut()
+        .expect("a cancel")
+        .params = serde_json::json!({ "threadId": hole("thread_id") });
+    refused(&no_turn, "does not fill in turn_id");
+    let mut no_text = server_table();
+    operations(&mut no_text)
+        .prompt_submit
+        .as_mut()
+        .expect("a submit")
+        .params = serde_json::json!({ "threadId": hole("thread_id") });
+    refused(&no_text, "does not fill in text");
+    let mut surplus_text = server_table();
+    operations(&mut surplus_text)
+        .turn_cancel
+        .as_mut()
+        .expect("a cancel")
+        .params = serde_json::json!({
+        "threadId": hole("thread_id"),
+        "turnId": hole("turn_id"),
+        "reason": hole("text"),
+    });
+    refused(&surplus_text, "fills in text, which it has no value for");
+    let mut surplus_turn = server_table();
+    operations(&mut surplus_turn)
+        .prompt_submit
+        .as_mut()
+        .expect("a submit")
+        .params = serde_json::json!({
+        "threadId": hole("thread_id"),
+        "turnId": hole("turn_id"),
+        "text": hole("text"),
+    });
+    refused(&surplus_turn, "fills in turn_id, which it has no value for");
+
+    // The template is bounded.
+    let mut deep = server_table();
+    let mut nested =
+        serde_json::json!({ "threadId": hole("thread_id"), "turnId": hole("turn_id") });
+    for _ in 0..9 {
+        nested = serde_json::json!({ "inner": nested });
+    }
+    operations(&mut deep)
+        .turn_cancel
+        .as_mut()
+        .expect("a cancel")
+        .params = nested;
+    refused(&deep, "nests deeper than 8 levels");
+    let mut wide = server_table();
+    operations(&mut wide)
+        .turn_cancel
+        .as_mut()
+        .expect("a cancel")
+        .params = serde_json::json!({
+        "threadId": hole("thread_id"),
+        "turnId": hole("turn_id"),
+        "pad": vec![0_u8; 70],
+    });
+    refused(&wide, "the most is 64");
+    let mut long = server_table();
+    operations(&mut long)
+        .turn_cancel
+        .as_mut()
+        .expect("a cancel")
+        .params = serde_json::json!({
+        "threadId": hole("thread_id"),
+        "turnId": hole("turn_id"),
+        "pad": "x".repeat(300),
+    });
+    refused(&long, "over 256 bytes");
+    let mut control = server_table();
+    operations(&mut control)
+        .turn_cancel
+        .as_mut()
+        .expect("a cancel")
+        .params = serde_json::json!({
+        "threadId": hole("thread_id"),
+        "turnId": hole("turn_id"),
+        "pad": "a\nb",
+    });
+    refused(&control, "holds a control character");
+
+    // A reply names its turn inside the result member the table names.
+    let mut reply_in_params = server_table();
+    operations(&mut reply_in_params)
+        .prompt_submit
+        .as_mut()
+        .expect("a submit")
+        .reply_turn = Some(path(&["params", "turn", "id"]));
+    refused(&reply_in_params, "not inside the table's result member");
+
+    // The members the template and the reply are read by come from the table.
+    let mut no_messages = server_table();
+    no_messages.messages = None;
+    no_messages.decision_response = None;
+    no_messages.observation = None;
+    refused(&no_messages, "operations are written as requests");
 }

@@ -1393,6 +1393,14 @@ export interface ConnectorManifest {
    */
   observation?: Observation | null
   /**
+   * How the application's protocol spells the core's own operations, for a table of an
+   * application server a native terminal speaks to.
+   *
+   * A table that does not leaves the member out, and the host sends no prompt, steer or
+   * cancellation of its own to the application.
+   */
+  operations?: Operations | null
+  /**
    * A plugin identifier from its manifest.
    */
   plugin_id: string
@@ -1401,13 +1409,13 @@ export interface ConnectorManifest {
    * What the publisher says about the qualification behind this table.
    */
   qualification_note: Summary | null
-  request_id_path: FieldPath8
+  request_id_path: FieldPath9
   /**
    * How a response is matched to its request.
    */
   response_correlation:
     | {
-        id_path: FieldPath9
+        id_path: FieldPath10
         type: 'matching_id'
       }
     | {
@@ -1697,6 +1705,72 @@ export interface FieldPath7 {
   segments: FieldSegment[]
 }
 /**
+ * The core's operations, as the application's protocol spells them.
+ *
+ * An operation the table does not declare is one the core does not send: the table is closed, and
+ * a connector that declares none has the host send nothing of its own to the application.
+ */
+export interface Operations {
+  /**
+   * Queue a prompt behind the turn that is running.
+   */
+  prompt_queue?: OperationRoute | null
+  /**
+   * Submit a prompt now.
+   */
+  prompt_submit?: OperationRoute | null
+  /**
+   * Cancel the turn that is running.
+   */
+  turn_cancel?: OperationRoute | null
+  /**
+   * Steer the turn that is running.
+   */
+  turn_steer?: OperationRoute | null
+}
+/**
+ * One of the core's operations as an application server writes it.
+ *
+ * The core writes a prompt, a steer and a cancellation itself, and this says how the application's
+ * protocol spells each: the routed method, the request's parameters with a hole where the thread,
+ * the turn or the text goes, and where the reply names the turn it started. Nothing else of what
+ * the application reads can be said here, so a package cannot make the core send something it did
+ * not qualify.
+ *
+ * A hole is a whole value, `{"$": "thread_id"}`, `{"$": "turn_id"}` or `{"$": "text"}`, and the
+ * core fills it with a JSON string. Everything else in the template is written as it is.
+ */
+export interface OperationRoute {
+  /**
+   * A native protocol method name in the connector's classification table.
+   */
+  method: string
+  /**
+   * The request's parameters, with a hole where each value the core supplies goes.
+   */
+  params: {
+    [k: string]: unknown
+  }
+  /**
+   * Where the reply names the turn the operation started, from the root of the reply, where it
+   * names one.
+   */
+  reply_turn?: FieldPath8 | null
+}
+/**
+ * A bounded path into a decoded native message.
+ *
+ * The grammar is member names and array indices only, with no wildcard, no filter and no
+ * recursive descent. The broker evaluates it against every framed message on the forwarding
+ * path, so it must cost a fixed number of lookups.
+ */
+export interface FieldPath8 {
+  /**
+   * The path segments, from the root of the message.
+   */
+  segments: FieldSegment[]
+}
+/**
  * The upstream protocol this table is qualified against.
  */
 export interface ProtocolPin {
@@ -1714,18 +1788,26 @@ export interface ProtocolPin {
   tested_version: string
 }
 /**
- * Where a request carries its identifier.
+ * A bounded path into a decoded native message.
+ *
+ * The grammar is member names and array indices only, with no wildcard, no filter and no
+ * recursive descent. The broker evaluates it against every framed message on the forwarding
+ * path, so it must cost a fixed number of lookups.
  */
-export interface FieldPath8 {
+export interface FieldPath9 {
   /**
    * The path segments, from the root of the message.
    */
   segments: FieldSegment[]
 }
 /**
- * Where the identifier is in a response.
+ * A bounded path into a decoded native message.
+ *
+ * The grammar is member names and array indices only, with no wildcard, no filter and no
+ * recursive descent. The broker evaluates it against every framed message on the forwarding
+ * path, so it must cost a fixed number of lookups.
  */
-export interface FieldPath9 {
+export interface FieldPath10 {
   /**
    * The path segments, from the root of the message.
    */
@@ -3463,7 +3545,7 @@ export interface ActionDeclaration {
  * One declared parameter bound to a field of an upstream request.
  */
 export interface ParameterBinding {
-  field: FieldPath10
+  field: FieldPath11
   /**
    * The declared parameter supplying the value.
    */
@@ -3472,7 +3554,7 @@ export interface ParameterBinding {
 /**
  * Where the value goes in the upstream request.
  */
-export interface FieldPath10 {
+export interface FieldPath11 {
   /**
    * The path segments, from the root of the message.
    */

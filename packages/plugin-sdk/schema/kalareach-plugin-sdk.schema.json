@@ -1029,6 +1029,17 @@
           ],
           "description": "What the host reads out of the backend's stream to know the terminal's conversation and\nturn, for a table of an application server a native terminal speaks to.\n\nA table that does not leaves the member out, and the host then reads no thread from the\nstream."
         },
+        "operations": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Operations"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How the application's protocol spells the core's own operations, for a table of an\napplication server a native terminal speaks to.\n\nA table that does not leaves the member out, and the host sends no prompt, steer or\ncancellation of its own to the application."
+        },
         "plugin_id": {
           "$ref": "#/$defs/PluginId",
           "description": "The package this table belongs to."
@@ -2901,6 +2912,86 @@
         "windows"
       ],
       "type": "string"
+    },
+    "OperationRoute": {
+      "additionalProperties": false,
+      "description": "One of the core's operations as an application server writes it.\n\nThe core writes a prompt, a steer and a cancellation itself, and this says how the application's\nprotocol spells each: the routed method, the request's parameters with a hole where the thread,\nthe turn or the text goes, and where the reply names the turn it started. Nothing else of what\nthe application reads can be said here, so a package cannot make the core send something it did\nnot qualify.\n\nA hole is a whole value, `{\"$\": \"thread_id\"}`, `{\"$\": \"turn_id\"}` or `{\"$\": \"text\"}`, and the\ncore fills it with a JSON string. Everything else in the template is written as it is.",
+      "properties": {
+        "method": {
+          "$ref": "#/$defs/MethodName",
+          "description": "The routed method that carries the operation, which travels from the host to the\napplication."
+        },
+        "params": {
+          "description": "The request's parameters, with a hole where each value the core supplies goes."
+        },
+        "reply_turn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldPath"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where the reply names the turn the operation started, from the root of the reply, where it\nnames one."
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "type": "object"
+    },
+    "Operations": {
+      "additionalProperties": false,
+      "description": "The core's operations, as the application's protocol spells them.\n\nAn operation the table does not declare is one the core does not send: the table is closed, and\na connector that declares none has the host send nothing of its own to the application.",
+      "properties": {
+        "prompt_queue": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OperationRoute"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Queue a prompt behind the turn that is running."
+        },
+        "prompt_submit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OperationRoute"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Submit a prompt now."
+        },
+        "turn_cancel": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OperationRoute"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Cancel the turn that is running."
+        },
+        "turn_steer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OperationRoute"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Steer the turn that is running."
+        }
+      },
+      "type": "object"
     },
     "PackagePath": {
       "description": "A relative POSIX path inside the package, in ASCII letters, digits, '.', '-' and '_'. At most 8 segments. A '..' or '.' segment, a segment of only dots, a trailing dot, a Windows device name, a case-folded collision with another path and a path that shadows another's directory are all rejected by the host; a pattern cannot express them.",

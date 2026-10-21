@@ -347,6 +347,130 @@ impl DecisionResponse {
     }
 }
 
+/// The deepest an operation's template may nest.
+pub const MAX_TEMPLATE_DEPTH: usize = 8;
+/// How many values one operation's template may hold.
+pub const MAX_TEMPLATE_NODES: usize = 64;
+/// The longest text a literal in a template may be, in bytes.
+pub const MAX_TEMPLATE_LITERAL_BYTES: usize = 256;
+
+/// What a hole in an operation's template is filled with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TemplateHole {
+    /// The conversation the operation acts in.
+    ThreadId,
+    /// The turn the operation acts on.
+    TurnId,
+    /// The text the operation carries.
+    Text,
+}
+
+impl TemplateHole {
+    /// The member of a hole's object, which holds its name.
+    pub const MEMBER: &'static str = "$";
+
+    /// Returns the name a hole is written with.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ThreadId => "thread_id",
+            Self::TurnId => "turn_id",
+            Self::Text => "text",
+        }
+    }
+
+    /// Reads a hole's name.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::ThreadId, Self::TurnId, Self::Text]
+            .into_iter()
+            .find(|hole| hole.as_str() == name)
+    }
+
+    /// Returns the hole a value is, where it is one: an object whose one member is
+    /// [`Self::MEMBER`], holding a hole's name.
+    #[must_use]
+    pub fn of(value: &serde_json::Value) -> Option<Self> {
+        let members = value.as_object()?;
+        if members.len() != 1 {
+            return None;
+        }
+        members
+            .get(Self::MEMBER)?
+            .as_str()
+            .and_then(Self::from_name)
+    }
+}
+
+/// One of the core's operations as an application server writes it.
+///
+/// The core writes a prompt, a steer and a cancellation itself, and this says how the application's
+/// protocol spells each: the routed method, the request's parameters with a hole where the thread,
+/// the turn or the text goes, and where the reply names the turn it started. Nothing else of what
+/// the application reads can be said here, so a package cannot make the core send something it did
+/// not qualify.
+///
+/// A hole is a whole value, `{"$": "thread_id"}`, `{"$": "turn_id"}` or `{"$": "text"}`, and the
+/// core fills it with a JSON string. Everything else in the template is written as it is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct OperationRoute {
+    /// The routed method that carries the operation, which travels from the host to the
+    /// application.
+    pub method: MethodName,
+    /// The request's parameters, with a hole where each value the core supplies goes.
+    pub params: serde_json::Value,
+    /// Where the reply names the turn the operation started, from the root of the reply, where it
+    /// names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_turn: Option<FieldPath>,
+}
+
+/// The core's operations, as the application's protocol spells them.
+///
+/// An operation the table does not declare is one the core does not send: the table is closed, and
+/// a connector that declares none has the host send nothing of its own to the application.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct Operations {
+    /// Submit a prompt now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_submit: Option<OperationRoute>,
+    /// Queue a prompt behind the turn that is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_queue: Option<OperationRoute>,
+    /// Steer the turn that is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_steer: Option<OperationRoute>,
+    /// Cancel the turn that is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_cancel: Option<OperationRoute>,
+}
+
+/// One declared operation, with its name and the holes its template has to hold.
+pub type DeclaredOperation<'a> = (&'static str, &'a OperationRoute, &'static [TemplateHole]);
+
+impl Operations {
+    /// Returns each declared operation with its name and the holes it needs.
+    #[must_use]
+    pub fn declared(&self) -> Vec<DeclaredOperation<'_>> {
+        use TemplateHole::{Text, ThreadId, TurnId};
+        [
+            ("prompt_submit", &self.prompt_submit, &[ThreadId, Text][..]),
+            ("prompt_queue", &self.prompt_queue, &[ThreadId, Text][..]),
+            (
+                "turn_steer",
+                &self.turn_steer,
+                &[ThreadId, TurnId, Text][..],
+            ),
+            ("turn_cancel", &self.turn_cancel, &[ThreadId, TurnId][..]),
+        ]
+        .into_iter()
+        .filter_map(|(name, route, holes)| route.as_ref().map(|route| (name, route, holes)))
+        .collect()
+    }
+}
+
 /// A request of the terminal whose success reply names the conversation it selected.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -498,6 +622,13 @@ pub struct ConnectorManifest {
     /// stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation: Option<Observation>,
+    /// How the application's protocol spells the core's own operations, for a table of an
+    /// application server a native terminal speaks to.
+    ///
+    /// A table that does not leaves the member out, and the host sends no prompt, steer or
+    /// cancellation of its own to the application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operations: Option<Operations>,
     /// Whether the connector has a tested volatile forwarding mode.
     ///
     /// Without one it is not a resilient managed gateway, so this host serves no gateway for it:
@@ -749,6 +880,7 @@ mod tests {
             decision_destination: Nullable(None),
             decision_response: None,
             observation: None,
+            operations: None,
             volatile_forwarding: false,
             qualification_note: Nullable(None),
         }
