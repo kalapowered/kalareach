@@ -16,7 +16,18 @@
 //! one private key could answer for both. A root that names one key under two identifiers in a role
 //! is refused here, before any signature is counted.
 
+mod agents;
+pub mod assemble;
+pub mod dev;
+mod pins;
+mod profile;
+pub mod record;
+mod refusal;
+mod shells;
 mod signing;
+mod tree;
+
+pub use refusal::{Refusal, Result};
 
 pub use signing::{
     SignError, Signable, VerifyError, check_root_keys, sign_manifest, verify_manifest,

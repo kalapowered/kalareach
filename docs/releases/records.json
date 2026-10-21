@@ -1,0 +1,101 @@
+{
+  "format": 1,
+  "classes": {
+    "vendor_routes": {
+      "state": "recorded",
+      "records": [
+        {
+          "repository": "https://github.com/kalapowered/kalareach-plugins",
+          "revision": "af72bb15b34c92657f9bd8b5a57c40a09b7cac71",
+          "path": "docs/qualification-notes.md",
+          "sha256": "e28bd430e7ea3f95bf4904e580946d6f791db47dcc29e9bb1b8e28864f93baa7"
+        }
+      ]
+    },
+    "dependency_and_runtime_revisions": {
+      "state": "recorded",
+      "records": [
+        {
+          "path": "Cargo.toml"
+        },
+        {
+          "path": "Cargo.lock"
+        },
+        {
+          "path": "rust-toolchain.toml"
+        },
+        {
+          "path": "shells/zsh/manifest.json"
+        },
+        {
+          "path": "shells/bash/manifest.json"
+        },
+        {
+          "path": "shells/fish/manifest.json"
+        },
+        {
+          "path": "shells/psreadline/manifest.json"
+        },
+        {
+          "path": "fixtures/shells/stacks.lock"
+        },
+        {
+          "path": "bundled-plugins.lock"
+        },
+        {
+          "path": "stored-formats.lock"
+        }
+      ]
+    },
+    "model_assets": {
+      "state": "recorded",
+      "records": [
+        {
+          "path": "crates/kr-describe/profiles/*.json"
+        }
+      ]
+    },
+    "provider_event_schemas": {
+      "state": "recorded",
+      "records": [
+        {
+          "repository": "https://github.com/kalapowered/kalareach-web",
+          "revision": "1b1051bcf042c46e69e20d1e4a0752edc341fce8",
+          "path": "infra/providers/gpt-live-1/profile.json",
+          "sha256": "c253f4f00c5d8c1a7fc4ada6f4c5ee5a459d2048d08aa8c0fc72d1897323193c"
+        },
+        {
+          "repository": "https://github.com/kalapowered/kalareach-web",
+          "revision": "1b1051bcf042c46e69e20d1e4a0752edc341fce8",
+          "path": "infra/providers/gpt-live-1/profile.digest",
+          "text": "2641c984ebd71ac131ddcaa2f7f8d7c0a59461860d0023ac157820b2677f6b8f",
+          "covers": "the profile and every schema it names"
+        },
+        {
+          "repository": "https://github.com/kalapowered/kalareach-web",
+          "revision": "1b1051bcf042c46e69e20d1e4a0752edc341fce8",
+          "path": "infra/providers/reasoning-1/profile.json",
+          "sha256": "018248d4db56e11ec1176981b4678ddc5b230496d5d8fd3934b73d0c3a52aed4"
+        },
+        {
+          "repository": "https://github.com/kalapowered/kalareach-web",
+          "revision": "1b1051bcf042c46e69e20d1e4a0752edc341fce8",
+          "path": "infra/providers/reasoning-1/profile.digest",
+          "text": "e21f36d6f9ea2c583e377b5bfa5f6a7371664456b2da88d518a6390898a264d9",
+          "covers": "the profile and every schema it names"
+        }
+      ]
+    },
+    "service_limits": {
+      "state": "recorded",
+      "records": [
+        {
+          "repository": "https://github.com/kalapowered/kalareach-web",
+          "revision": "1b1051bcf042c46e69e20d1e4a0752edc341fce8",
+          "path": "infra/service-limits.json",
+          "sha256": "b9bcefc9390a661423c774189a9a18a06bd764b0659c58f8c38146d5b94e577c"
+        }
+      ]
+    }
+  }
+}
