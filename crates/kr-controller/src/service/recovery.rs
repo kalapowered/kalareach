@@ -585,12 +585,22 @@ fn report_unretained(
     display_number: kr_protocol::session::DisplayNumber,
     refused: &ControllerError,
 ) {
-    if let ControllerError::Ipc(kr_ipc::IpcError::UnretainedLevel { worker, level }) = refused {
-        eprintln!(
-            "kr-controller: session {} runs {worker}, and this daemon speaks to workers at protocol \
-             level {level} only: the session is left running, unreached by this daemon, until it \
-             closes or a daemon of its own release serves this environment",
-            display_number.get()
-        );
+    match refused {
+        ControllerError::Ipc(kr_ipc::IpcError::UnretainedLevel { worker, level }) => {
+            eprintln!(
+                "kr-controller: session {} runs {worker}, and this daemon speaks to workers at \
+                 protocol level {level} only: the session is left running, unreached by this \
+                 daemon, until it closes or a daemon of its own release serves this environment",
+                display_number.get()
+            );
+        }
+        ControllerError::Ipc(kr_ipc::IpcError::OutsideLevel(why)) => {
+            eprintln!(
+                "kr-controller: session {}: {why}: the session is left running, unreached by this \
+                 daemon, until it closes or a daemon of its own release serves this environment",
+                display_number.get()
+            );
+        }
+        _ => {}
     }
 }

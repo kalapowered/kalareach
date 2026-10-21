@@ -187,10 +187,10 @@ pub(super) fn majors_of(store: &Store, release: &ReleaseName) -> Vec<u16> {
 
 /// Asks the daemon that holds an environment to resume.
 ///
-/// A daemon that states another public major than this build's, which the manifest of `target`
-/// lists, is not one this run prepared: only a daemon of this build's major begins an attempt, and
-/// every daemon an update stopped has gone before the switch. It is serving, and nothing is sent to
-/// it.
+/// A daemon that states another public major than this build's, which the manifest of `expected`
+/// (the release whose daemon the update waits for) lists, is not one this run prepared: only a
+/// daemon of this build's major begins an attempt, and every daemon an update stopped has gone
+/// before the switch. It is serving, and nothing is sent to it.
 ///
 /// # Errors
 ///
@@ -199,9 +199,10 @@ pub async fn resume_holder(
     store: &Store,
     environment: &Environment,
     target: &ReleaseName,
+    expected: &ReleaseName,
 ) -> Result<Resumed> {
     let endpoint = environment.paths.controller_endpoint()?;
-    let majors = majors_of(store, target);
+    let majors = majors_of(store, expected);
     let connected = tokio::time::timeout(
         DAEMON_ANSWER,
         LocalClient::connect_listing(&endpoint, LocalClientKind::Cli, crate::build_id(), &majors),

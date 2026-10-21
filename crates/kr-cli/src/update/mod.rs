@@ -1584,7 +1584,9 @@ async fn hand_over(
                 // The daemon that did not prepare may have closed its gate all the same, and its
                 // answer been lost: whichever attempt it holds ends, this run being the only one
                 // that can have begun it.
-                let _ = handover::resume_holder(store, environment, &target.release).await;
+                let _ =
+                    handover::resume_holder(store, environment, &target.release, &target.release)
+                        .await;
                 forget_update(store, record);
                 return Err(refused);
             }
@@ -2048,7 +2050,7 @@ async fn start_one(
 ) -> Result<()> {
     let environment = restart.environment()?;
     if handover::held(store, &environment, handover::INSTALL_LOCK_WAIT).await? {
-        match handover::resume_holder(store, &environment, target).await? {
+        match handover::resume_holder(store, &environment, target, current).await? {
             handover::Resumed::Serving => {
                 return match handover::answers_as(store, &environment, current, None).await {
                     Ok(()) => Ok(()),

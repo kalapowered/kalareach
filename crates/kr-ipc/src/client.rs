@@ -603,15 +603,19 @@ impl BoundLink {
                 // The two things the worker says of itself agree: the version its hello answered
                 // is the one its level names, so a worker that answered a major the level does not
                 // speak is not bound to it.
-                let named = level.protocol();
-                if named.is_none_or(|named| named.major != acknowledgement.selected_version.major) {
-                    return Err(IpcError::VersionMismatch {
-                        host: named.map_or_else(
-                            || "no protocol, for a level that records none".to_owned(),
-                            |named| named.to_string(),
-                        ),
-                        offered: acknowledgement.selected_version.to_string(),
-                    });
+                let answered = acknowledgement.selected_version;
+                match level.protocol() {
+                    Some(named) if named.major == answered.major => {}
+                    Some(named) => {
+                        return Err(IpcError::OutsideLevel(format!(
+                            "the worker answered protocol {answered}, and its level names {named}"
+                        )));
+                    }
+                    None => {
+                        return Err(IpcError::OutsideLevel(format!(
+                            "the worker answered protocol {answered}, and its level records none"
+                        )));
+                    }
                 }
                 level
             }
