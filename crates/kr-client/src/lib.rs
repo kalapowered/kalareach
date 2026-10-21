@@ -26,6 +26,7 @@
 //! | [`controls`] | What a client shows, and what it lets a person invoke |
 //! | [`drafts`] | Drafts this device owns, and the attachment that only presents one |
 //! | [`ipc`] | The local socket or named pipe, with the host-stamped freshness context |
+//! | [`mailbox_reader`] | One pass of reading one's own mailbox: what an item has to pass to be taken, and what is written down before the service is told |
 //! | [`pairing`] | Pairing from a device's side: the room socket, the invitation reader, both candidate modes, the paired hosts and the owner's confirmations |
 //! | [`projection`] | The screen a projected client holds, and the renderer that draws it |
 //! | [`session`] | Requests, receipts, events and the action window |
@@ -56,6 +57,7 @@ pub mod drafts;
 pub mod encoder;
 pub mod error;
 pub mod ipc;
+pub mod mailbox_reader;
 pub mod pairing;
 // The module documents itself. A doc comment here as well would be joined to its own, and the links
 // in that would then be read from this crate's root, where they name nothing.

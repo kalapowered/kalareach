@@ -20,7 +20,8 @@
 //!
 //! An item is taken only if it opens against the stored-envelope key of a device this host has
 //! paired and whose pairing is in force (a device that is revoked, or whose grant has run out and
-//! the end is on record, is no sender), under the rules of section 20 ([`kr_crypto::envelope`]):
+//! the end is on record, is no sender), under the rules of section 20, which this reader and the
+//! companion's share ([`kr_client::mailbox_reader`], over [`kr_crypto::envelope`]):
 //! the routing record outside the envelope is untrusted and must match what the box authenticated,
 //! the expiry must not have passed at the moment the item is opened, and an identifier the host has
 //! accepted before is refused. Anything else is dropped. An item that opens but is not an
@@ -50,15 +51,17 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use kr_client::error::ClientError;
+use kr_client::mailbox_reader::{Outcome, Page, Reading, Stop, read_mailbox};
 use kr_client::services::mailbox::MailboxClient;
 use kr_client::services::{
     HttpDeadlines, HttpService, ServiceHttp, ServiceSigner, managed_response_limits,
 };
-use kr_crypto::envelope::{PairedSenders, open_delivered_envelope};
+use kr_crypto::envelope::{PairedSenders, ReplayLedger};
 use kr_crypto::keys::StoredEnvelopeKeyPair;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::export::Sentence;
 use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
+use kr_protocol::ids::EnvelopeId;
 use kr_protocol::mailbox::MailboxPayloadType;
 use kr_protocol::service::GatewayOrigin;
 use kr_transport::config::ProxyUrl;
@@ -83,10 +86,6 @@ pub const MAILBOX_DEADLINES: HttpDeadlines = HttpDeadlines {
 /// How often the host reads its mailbox when nothing asked for a pass sooner. It is shorter than
 /// the poll of the authority feed, which is what an announcement exists to beat.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(10);
-
-/// The most pages one pass reads before it waits, so a mailbox that fills as fast as it is read
-/// does not hold the pass for ever.
-const MOST_PAGES: usize = 16;
 
 /// The mailbox client for `origin`, signing as the host.
 ///
@@ -437,108 +436,98 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
     }
 }
 
-/// One pass: read the mailbox page by page, take what opens, write each accepted identifier down,
-/// act on what was taken, and tell the service what is stored.
+/// What the host supplies to a pass of the shared reader: the devices it has paired, the record of
+/// what it has accepted, and what it does with an announcement.
+struct HostReading<'a> {
+    shared: &'a Arc<Shared>,
+    running: &'a Running,
+    controller: &'a Arc<Controller>,
+}
+
+impl Reading for HostReading<'_> {
+    type Error = ControllerError;
+
+    fn now_ms(&self) -> u64 {
+        self.controller.wall_now_ms()
+    }
+
+    async fn senders(&self) -> Result<PairedSenders> {
+        let devices = Arc::clone(&self.running.devices);
+        tokio::task::spawn_blocking(move || -> Result<PairedSenders> {
+            let mut senders = PairedSenders::new();
+            for device in devices.devices()? {
+                if device.is_paired()
+                    && let Some(key) = device.stored_envelope
+                {
+                    senders.pair(key);
+                }
+            }
+            Ok(senders)
+        })
+        .await
+        .map_err(|_| ControllerError::registry("the host's devices could not be read"))?
+    }
+
+    async fn ledger(&self, now_ms: u64) -> Result<ReplayLedger> {
+        // The record is the source of truth for what has been accepted: the ledger is read from it
+        // for each pass, so an identifier that was not written down is not one the pass remembers.
+        self.shared
+            .on_record(move |record| record.ledger(now_ms))
+            .await
+    }
+
+    async fn record(&self, id: EnvelopeId, retained_until_ms: u64) -> Result<()> {
+        self.shared
+            .on_record(move |record| record.remember(id, retained_until_ms))
+            .await
+    }
+
+    fn taken(&self, page: Page) {
+        let mut announced = false;
+        {
+            let mut observed = self.shared.observed();
+            observed.dropped += page.dropped as u64;
+            for item in &page.accepted {
+                if item.payload_type == MailboxPayloadType::AuthorityFeedChange {
+                    announced = true;
+                    observed.announcements += 1;
+                } else {
+                    observed.ignored += 1;
+                }
+            }
+        }
+        // The announcement says the feed changed, and the carrier reads it now rather than at its
+        // next poll. What is on record is acted on even when a later item on the page could not be
+        // written down: that item is read again, and nothing is acknowledged until it is.
+        if announced && let Some(feed) = self.controller.feed_runtime() {
+            feed.wake();
+        }
+    }
+}
+
+/// One pass: read the mailbox through the shared reader, which takes what opens, writes each
+/// accepted identifier down and tells the service what is stored.
 async fn pass(
     shared: &Arc<Shared>,
     running: &Running,
     controller: &Arc<Controller>,
 ) -> std::result::Result<(), Stopped> {
     let now = controller.wall_now_ms();
-    let devices = Arc::clone(&running.devices);
-    let senders = tokio::task::spawn_blocking(move || -> Result<PairedSenders> {
-        let mut senders = PairedSenders::new();
-        for device in devices.devices()? {
-            if device.is_paired()
-                && let Some(key) = device.stored_envelope
-            {
-                senders.pair(key);
+    let reading = HostReading {
+        shared,
+        running,
+        controller,
+    };
+    match read_mailbox(&shared.client, &shared.key, &reading).await {
+        Ok(outcome) => {
+            let mut observed = shared.observed();
+            observed.stopped = None;
+            if outcome == Outcome::ReadThrough {
+                observed.read_at_ms = Some(now);
             }
+            Ok(())
         }
-        Ok(senders)
-    })
-    .await
-    .map_err(|_| Stopped::Local)?
-    .map_err(|error| Stopped::local(&error))?;
-    // The record is the source of truth for what has been accepted: the ledger is read from it for
-    // each pass, so an identifier that was not written down is not one the pass remembers.
-    let mut ledger = shared
-        .on_record(move |record| record.ledger(now))
-        .await
-        .map_err(|error| Stopped::local(&error))?;
-
-    let mut read_through = false;
-    for _ in 0..MOST_PAGES {
-        let page = shared
-            .client
-            .read_as(&shared.key, None)
-            .await
-            .map_err(|error| Stopped::of(&error, &shared.quiet))?;
-        let Some(last) = page.items.last().map(|item| item.sequence.get()) else {
-            read_through = true;
-            break;
-        };
-        let mut announced = false;
-        let mut unwritten = None;
-        for item in &page.items {
-            // Read for each item: the expiry is judged at the moment the item is opened, not at
-            // the moment the pass began, which may be a page of exchanges ago.
-            let opened = open_delivered_envelope(
-                &shared.key,
-                &senders,
-                &mut ledger,
-                &item.envelope,
-                controller.wall_now_ms(),
-            );
-            match opened {
-                Ok(plaintext) => {
-                    // Written down before anything is done with it, and before the service is
-                    // told it may remove the item.
-                    let id = plaintext.envelope_id;
-                    let until = kr_protocol::mailbox::replay_id_retained_until_ms(
-                        plaintext.expires_at_ms.get(),
-                    );
-                    if let Err(error) = shared
-                        .on_record(move |record| record.remember(id, until))
-                        .await
-                    {
-                        unwritten = Some(Stopped::local(&error));
-                        break;
-                    }
-                    if plaintext.payload_type == MailboxPayloadType::AuthorityFeedChange {
-                        announced = true;
-                        shared.observed().announcements += 1;
-                    } else {
-                        shared.observed().ignored += 1;
-                    }
-                }
-                Err(_) => shared.observed().dropped += 1,
-            }
-        }
-        // The announcement says the feed changed, and the carrier reads it now rather than at its
-        // next poll. What is on record is acted on even when a later item on the page could not
-        // be written down: that item is read again, and nothing is acknowledged until it is.
-        if announced && let Some(feed) = controller.feed_runtime() {
-            feed.wake();
-        }
-        if let Some(stopped) = unwritten {
-            return Err(stopped);
-        }
-        // Everything on the page is written down or dropped, so the service may remove it.
-        shared
-            .client
-            .acknowledge(shared.key.public(), last)
-            .await
-            .map_err(|error| Stopped::of(&error, &shared.quiet))?;
-        if !page.more {
-            read_through = true;
-            break;
-        }
+        Err(Stop::Service(error)) => Err(Stopped::of(&error, &shared.quiet)),
+        Err(Stop::Local(error)) => Err(Stopped::local(&error)),
     }
-    let mut observed = shared.observed();
-    observed.stopped = None;
-    if read_through {
-        observed.read_at_ms = Some(now);
-    }
-    Ok(())
 }

@@ -546,8 +546,8 @@ async fn a_change_published_with_no_announcement_waits_for_the_poll() {
         .expect_err("the poll carried the revocation out");
 }
 
-/// An item whose acknowledgement the service did not receive is read again, and the host takes it
-/// once: the identifier it accepted is on record, so the second reading is a replay.
+/// KR-REQ-20.05: an item whose acknowledgement the service did not receive is read again, and the
+/// host takes it once: the identifier it accepted is on record, so the second reading is a replay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_item_whose_acknowledgement_was_lost_is_taken_once() {
     let rig = Rig::start().await;
@@ -594,8 +594,8 @@ async fn an_item_whose_acknowledgement_was_lost_is_taken_once() {
     assert_eq!(rig.feed_wakes(), woken + 1, "the replay woke nothing");
 }
 
-/// What the host accepted survives a restart: an item the service offers again to a daemon that was
-/// stopped before it could say it had the item is refused, not taken a second time.
+/// KR-REQ-20.05: what the host accepted survives a restart: an item the service offers again to a
+/// daemon that was stopped before it could say it had the item is refused, not taken a second time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_item_taken_before_a_restart_is_not_taken_again_after_it() {
     let rig = Rig::start().await;
@@ -637,8 +637,8 @@ async fn an_item_taken_before_a_restart_is_not_taken_again_after_it() {
     );
 }
 
-/// An item from a key the host has not paired with opens for nobody: it is dropped, the service is
-/// told the host is done with it, and the carrier is not woken.
+/// KR-REQ-20.05: an item from a key the host has not paired with opens for nobody: it is dropped,
+/// the service is told the host is done with it, and the carrier is not woken.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_item_from_a_key_the_host_has_not_paired_with_is_dropped() {
     let rig = Rig::start().await;
@@ -669,8 +669,45 @@ async fn an_item_from_a_key_the_host_has_not_paired_with_is_dropped() {
     );
 }
 
-/// A device the host unpaired stops being a sender: what it announced while it was paired woke the
-/// carrier, and what it announces after is dropped.
+/// KR-REQ-20.05: the routing record the service stores beside an item is untrusted and must match
+/// what the box authenticated. An announcement from a paired owner whose record was rewritten, with
+/// its expiry moved, is dropped: it wakes nothing and leaves no identifier on record, and the
+/// service is told the host is done with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_20_05_an_announcement_whose_routing_record_was_rewritten_is_dropped() {
+    let rig = Rig::start().await;
+    let mut rewritten = rig.sealed(
+        &rig.owner.stored_envelope,
+        MailboxPayloadType::AuthorityFeedChange,
+        0xd1,
+    );
+    rewritten.routing.expires_at_ms =
+        TimestampMs::new(rewritten.routing.expires_at_ms.get() - 1_000);
+    rig.mailbox
+        .deliver(rig.host_key(), &rewritten)
+        .await
+        .expect("the service takes the item: it cannot read it");
+    assert_eq!(rig.items_held(), 1);
+    let woken = rig.feed_wakes();
+
+    rig.the_reader_reads().await;
+
+    assert_eq!(rig.items_held(), 0, "the host is done with it");
+    assert_eq!(
+        rig.feed_wakes(),
+        woken,
+        "nothing the rewritten record said woke the carrier"
+    );
+    assert!(
+        rig.reader().record().is_empty().expect("the record"),
+        "an item that did not open leaves no identifier"
+    );
+    let shown = rig.check().await;
+    assert!(shown.detail().contains("1 dropped"), "{}", shown.detail());
+}
+
+/// KR-REQ-20.05: a device the host unpaired stops being a sender: what it announced while it was
+/// paired woke the carrier, and what it announces after is dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_item_from_a_device_the_host_has_since_unpaired_is_dropped() {
     let rig = Rig::start().await;
@@ -722,8 +759,8 @@ async fn an_item_from_a_device_the_host_has_since_unpaired_is_dropped() {
     );
 }
 
-/// A paired device's item that is not an announcement that the feed changed is taken off the
-/// service and does nothing: the mailbox carries no command, and the host acts on none.
+/// KR-REQ-20.04: a paired device's item that is not an announcement that the feed changed is taken
+/// off the service and does nothing: the mailbox carries no command, and the host acts on none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_item_that_is_not_an_announcement_does_nothing_whoever_sent_it() {
     let rig = Rig::start().await;
@@ -1156,8 +1193,8 @@ async fn an_announcement_the_host_cannot_record_wakes_nothing_until_it_can() {
     assert_eq!(rig.feed_wakes(), woken + 1, "taken once it is on record");
 }
 
-/// What the host accepted is remembered until the item's expiry and a day more: not for the
-/// expiry alone, and not an instant longer.
+/// KR-REQ-20.05: what the host accepted is remembered until the item's expiry and a day more: not
+/// for the expiry alone, and not an instant longer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_accepted_identifier_is_kept_for_the_items_expiry_and_a_day_more() {
     const DAY_MS: u64 = 24 * 60 * 60 * 1000;
@@ -1199,8 +1236,8 @@ async fn an_accepted_identifier_is_kept_for_the_items_expiry_and_a_day_more() {
     );
 }
 
-/// A device whose grant has run out is no sender, whether or not it was revoked: what it leaves in
-/// the mailbox is dropped and wakes nothing.
+/// KR-REQ-20.05: a device whose grant has run out is no sender, whether or not it was revoked: what
+/// it leaves in the mailbox is dropped and wakes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_item_from_a_device_whose_grant_has_run_out_is_dropped() {
     let rig = Rig::start().await;
