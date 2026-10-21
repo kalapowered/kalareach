@@ -16,7 +16,11 @@
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
-    <!-- Camera and photo input, which the WebView's own file chooser opens. -->
+    <!--
+      The camera, for the scanner that reads a pairing code and for the photo the WebView's own file
+      chooser opens. It is asked for when the first of them is used.
+    -->
+    <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <!-- AndroidTV support -->
