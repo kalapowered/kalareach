@@ -108,7 +108,7 @@ class CodeScanner(
     private fun bind(cameraProvider: ProcessCameraProvider) {
         provider = cameraProvider
         val view = Preview.Builder().build().also { it.setSurfaceProvider(preview.surfaceProvider) }
-        // A host's largest code is a version-20 one, close to a hundred modules wide: it needs more
+        // A host's direct invitation is a version-23 code, 109 modules wide: it needs more
         // than the default analysis resolution to be read from a hand's length.
         val selector = ResolutionSelector.Builder()
             .setResolutionStrategy(

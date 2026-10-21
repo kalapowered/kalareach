@@ -20,7 +20,7 @@ import com.google.zxing.qrcode.QRCodeReader
 object QrDecoder {
     private val hints = mapOf(
         DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE),
-        // A host's largest code is a version-20 one, close to a hundred modules wide: it is worth
+        // A host's direct invitation is a version-23 code, 109 modules wide: it is worth
         // the time the thorough search takes, which a scanner that reads a few frames a second has.
         DecodeHintType.TRY_HARDER to true,
     )
