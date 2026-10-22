@@ -396,6 +396,25 @@
     },
     {
       "entry": {
+        "store": "policy-mirror",
+        "scope": "environment",
+        "path": "policy-mirror.json",
+        "recording": {
+          "kind": "cbor_member",
+          "member": "version",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "31fb83faeed948bff8d9684f247a054a5a69359307774ccfc55c4a159fee018c",
+      "kept": [
+        "Record (crates/kr-controller/src/grants/mirror.rs)",
+        "StoredPolicy, StoredEnrolment, StoredBinding, StoredLeaseRecord (crates/kr-controller/src/grants/durable.rs)"
+      ]
+    },
+    {
+      "entry": {
         "store": "privacy",
         "scope": "environment",
         "path": "privacy.sqlite3",
