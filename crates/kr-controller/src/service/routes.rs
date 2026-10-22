@@ -25,12 +25,13 @@ use super::{Controller, encode, error_reply, net, parse, respond};
 /// missing runs while the fence is owed. `every_local_write_method_the_daemon_performs_is_placed`
 /// walks the registry and fails for a method that is on neither this list nor the list of those
 /// that take an admission.
-pub(super) const NO_ADMISSION: [Method; 7] = [
+pub(super) const NO_ADMISSION: [Method; 8] = [
     Method::EnvironmentEnrol,
     Method::EnvironmentForget,
     Method::EnvironmentRefresh,
     Method::HostUpdateHandover,
     Method::BackupEnable,
+    Method::BackupBundleWrite,
     Method::AccountSignIn,
     Method::AccountSignOut,
 ];
@@ -915,6 +916,21 @@ impl Controller {
                 match accepted.filter(|accepted| self.clock.now() < accepted.deadline) {
                     Some(_) => match self.authorised(connection_id) {
                         Ok(_) => self.backup_enable(mutation).await,
+                        Err(error) => Err(error),
+                    },
+                    None => Err(ControllerError::WindowExpired {
+                        detail: "the deadline this action was admitted under passed before it \
+                                 could run"
+                            .to_owned(),
+                    }),
+                }
+            }
+            // Moving the recovery bundle on writes the account's storage at the service and
+            // nothing a session holds. A call carries a new identity each time.
+            Method::BackupBundleWrite => {
+                match accepted.filter(|accepted| self.clock.now() < accepted.deadline) {
+                    Some(_) => match self.authorised(connection_id) {
+                        Ok(_) => self.backup_bundle_write(mutation).await,
                         Err(error) => Err(error),
                     },
                     None => Err(ControllerError::WindowExpired {

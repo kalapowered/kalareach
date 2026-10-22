@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 184,
+  "method_count": 185,
   "methods": [
     {
       "capability": "none",
@@ -578,6 +578,39 @@
         "environment"
       ],
       "summary": "Set this host's backups up, at the host itself: write the sealed recovery bundle to the storage service, enrol the host's writer for the archive, turn managed backup storage on, and record the setup, in that order. The host is given the recovery recipient's public key, the bundle's locator and the sealed bundle, and never the recovery seed. A call whose answer was lost is made again with the same bytes and is answered from what the first left.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "keyed": {
+          "key": "request identity"
+        }
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "backup.bundle.write",
+      "name": "backup.bundle.write",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "Move the recovery bundle on by one compare-and-swap at its locator, for a restore that has verified a generation and records it. The call names the place the bundle was read at and carries the sealed bundle; it replaces a bundle that is still there and makes none. The host relays ciphertext with its own account and sees no seed or content. It sends nothing while privacy mode is on or while the service has asked to be left alone, and keeps no record of the write.",
       "version": 1
     },
     {

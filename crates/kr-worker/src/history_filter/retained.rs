@@ -234,6 +234,7 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::SyncCompareExchange
         | Method::BackupManifest
         | Method::BackupEnable
+        | Method::BackupBundleWrite
         | Method::StorageRetentionSet
         | Method::StorageUploadCreate
         | Method::StorageUploadPart

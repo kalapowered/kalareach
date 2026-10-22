@@ -56,6 +56,7 @@ use crate::automation::{
     WorkflowPauseResult, WorkflowReadParams, WorkflowReadResult, WorkflowResourceScope,
     WorkflowRunParams, WorkflowRunResult, WorkflowRunStatus, WorkflowRunSummary, WorkflowTrigger,
 };
+use crate::backup_bundle::{BackupBundlePlace, BackupBundleWriteParams, BackupBundleWriteResult};
 use crate::backup_read::{BackupBundle, BackupReadParams, BackupReadResult, BackupSignIn};
 use crate::backup_setup::{
     BackupEnableCause, BackupEnableParams, BackupEnableResult, BackupHostKeys, BackupLastAttempt,
@@ -885,6 +886,10 @@ pub fn protocol_schema() -> Value {
         "backup_storage_state" => BackupStorageState,
         "backup_storage_unread" => BackupStorageUnread,
         "backup_unusable" => BackupUnusable,
+        // Moving the recovery bundle on after a restore, appended for the same reason.
+        "backup_bundle_place" => BackupBundlePlace,
+        "backup_bundle_write_params" => BackupBundleWriteParams,
+        "backup_bundle_write_result" => BackupBundleWriteResult,
         // Session descriptions: the setup read and the two writes, the facts a worker keeps per
         // session and the request and page the control daemon reads them with. Appended for the
         // same reason.
