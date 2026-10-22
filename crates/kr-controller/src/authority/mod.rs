@@ -1283,10 +1283,16 @@ impl AuthorityBarrier {
             // A barrier that holds can still owe evidence: the names are in the worker's journal
             // and travel a page at a time, so a page exchange that has not happened yet leaves
             // this to say rather than nothing.
-            BarrierState::Acknowledged | BarrierState::Ended if pending_names > 0 => format!(
+            BarrierState::Acknowledged if pending_names > 0 => format!(
                 "this worker's barrier holds, and {pending_names} of the actions its fence named \
                  have not reached this daemon yet; they are in its journal and the daemon asks \
                  for them again, from where the last page ended"
+            ),
+            // A worker that ended cannot be asked, and its journal is not read for evidence.
+            BarrierState::Ended if pending_names > 0 => format!(
+                "this worker's execution is confirmed ended, and {pending_names} of the actions \
+                 its fence named did not reach this daemon before it did; nothing can ask for \
+                 them now"
             ),
             // Names that went before they arrived. The worker says how many it no longer holds,
             // and a result missing that many actions is not the complete one section 9 asks for.

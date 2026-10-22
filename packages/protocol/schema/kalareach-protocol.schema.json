@@ -40544,7 +40544,7 @@
         },
         "names_pending": {
           "$ref": "#/$defs/U64",
-          "description": "How many names this worker holds that have not reached this daemon yet.\n\nNought means the evidence is complete. Anything else says a page exchange has not happened\nyet or did not finish; the names are in the worker's journal and the daemon asks for them\nagain, from where the last page ended, apart from any announcement."
+          "description": "How many names this worker holds that have not reached this daemon yet.\n\nNought means the evidence is complete. Anything else says a page exchange has not happened\nyet or did not finish; the names are in the worker's journal and the daemon asks for them\nagain, from where the last page ended, apart from any announcement, for as long as the\nworker runs. The names of a worker that ended before they arrived are not asked for again,\nand `state` says it ended."
         },
         "omitted_actions": {
           "$ref": "#/$defs/U64",
