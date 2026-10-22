@@ -3,10 +3,12 @@
 //! A chain of workflows that trigger one another has one budget, and when it runs out the chain is
 //! paused and one attention item says so. Only an explicit, authorised rearm gives it a new
 //! budget, and `kr workflow rearm` is that request: it names the chain, the grant it is made under
-//! and the budget generation it leaves, and the control daemon decides every refusal. The command
-//! sends one request and prints what the daemon answered.
+//! and the budget generation it leaves, and the control daemon decides whether it is allowed.
+//! Without a generation the command reads the one the chain is on, and says so; it refuses a chain
+//! the daemon holds no budget for itself, and sends one request, whose answer it prints.
 
 use kr_client::shown;
+use kr_client::shown::Shown;
 use kr_protocol::automation::{
     WorkflowReadParams, WorkflowReadResult, WorkflowRearmParams, WorkflowRearmResult,
 };
@@ -19,7 +21,7 @@ use crate::cli::{WorkflowCommand, WorkflowRearmArguments};
 use crate::daemon::{Daemon, identifier};
 use crate::error::{CliError, Result};
 use crate::output::{self, closed_word};
-use crate::{answer, stdout_line};
+use crate::{answer, report, stdout_line};
 
 /// Runs one `kr workflow` command and prints its result.
 ///
@@ -49,7 +51,15 @@ async fn rearm(
         Some(named) => named,
         None => current_generation(&mut daemon, root).await?,
     };
-    let rearmed: WorkflowRearmResult = daemon
+    // Said before the request is sent: a reply that is lost leaves a person with no other way to
+    // know which generation to name, and a repeat that names it gives no second budget.
+    report::say(&shown!(
+        "Rearming chain {} from budget generation {}. {}",
+        closed_word(&root),
+        generation,
+        repeat_with(generation)
+    ));
+    let rearmed: WorkflowRearmResult = match daemon
         .mutate(
             Method::WorkflowRearm,
             &WorkflowRearmParams {
@@ -58,7 +68,18 @@ async fn rearm(
                 generation: U64::new(generation),
             },
         )
-        .await?;
+        .await
+    {
+        Ok(rearmed) => rearmed,
+        // A refusal says what is wrong. Anything else may have followed a rearm that was made.
+        Err(error) => {
+            if !matches!(&error, CliError::Refused(refusal) if refusal.code != ErrorCode::OutcomeUnknown)
+            {
+                report::say(&repeat_with(generation));
+            }
+            return Err(error);
+        }
+    };
     if json {
         output::document(&answer::workflow_rearm_result(&rearmed));
     } else {
@@ -69,6 +90,15 @@ async fn rearm(
         ));
     }
     Ok(())
+}
+
+/// What a person does when the reply to a rearm may not have reached them.
+fn repeat_with(generation: u64) -> Shown {
+    shown!(
+        "If the reply does not arrive, run the command again with --generation {}: a chain already \
+         on the generation after it is told so and is given no second budget.",
+        generation
+    )
 }
 
 /// The budget generation the daemon says a chain is on.
