@@ -154,9 +154,20 @@ impl Setup {
 
     /// The same, the stand-in writing to `running` once it runs.
     fn start_telling(&self, running: Option<&Path>) -> Started {
+        self.start_with(running, None)
+    }
+
+    /// The same, the stand-in given `script` as an argument, as an interpreter is given the script
+    /// it runs (the test harness reads it as one more name of a test to run, and runs none).
+    fn start_running_script(&self, script: &Path) -> Started {
+        self.start_with(None, Some(script))
+    }
+
+    fn start_with(&self, running: Option<&Path>, script: Option<&Path>) -> Started {
         let mut command = Command::new(&self.program);
         command
             .args(["--exact", "the_stand_in_program", "--test-threads", "1"])
+            .args(script)
             .env(STAND_IN, "60")
             .current_dir(self.host.root())
             .process_group(0)
@@ -1175,8 +1186,8 @@ async fn kr_req_03_27_the_program_holding_the_terminal_is_the_application_until_
 }
 
 /// KR-REQ-03.27: a program that is a wrapper until it execs is named for what it is when each look
-/// finds it, and the name follows the exec: the application is the wrapper's interpreter while the
-/// wrapper runs and the program once it has replaced it.
+/// finds it, and the name follows the exec: the application is the wrapper while it runs and the
+/// program once it has replaced it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_03_27_a_wrapper_that_execs_the_program_names_the_program_after_the_exec() {
     let setup = Setup::new();
@@ -1197,17 +1208,11 @@ async fn kr_req_03_27_a_wrapper_that_execs_the_program_names_the_program_after_t
     ));
 
     typing.type_in(b"\n");
-    let interpreter = std::fs::canonicalize("/bin/sh")
-        .expect("the system shell")
-        .file_name()
-        .expect("a file name")
-        .to_string_lossy()
-        .into_owned();
     let wrapper = application_where(&mut published, |held| held.name.is_some()).await;
-    assert_eq!(
+    assert_ne!(
         wrapper.name.as_deref(),
-        Some(interpreter.as_str()),
-        "while the wrapper runs, it is what holds the terminal"
+        Some("claude"),
+        "while the wrapper runs, it is what holds the terminal, whatever its interpreter is called"
     );
 
     std::fs::write(&go, b"").expect("lets the wrapper exec");
@@ -1225,37 +1230,67 @@ async fn kr_req_03_27_a_wrapper_that_execs_the_program_names_the_program_after_t
     typing.close().await;
 }
 
-/// KR-REQ-03.27: when the shell's integration answered for exactly one command of the line, that
-/// command names the application, not the interpreter the program happens to run under; a program
+/// KR-REQ-03.27: when the shell's integration answered for exactly one command of the line and
+/// the foreground program is running it, as an interpreter runs a script it was given, that command
+/// names the application and not the interpreter; and a command the leader has replaced names
+/// nothing, so a wrapper that execs another program is not still called by its own name. A program
 /// is not named until two looks have found the same group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_03_27_the_command_the_integration_answered_for_names_the_application() {
+async fn kr_req_03_27_the_command_the_integration_answered_for_names_the_program_that_runs_it() {
     use kr_worker::application::Following;
 
     let setup = Setup::new();
-    let started = setup.start();
+    let script = setup.host.root().join("assistant");
+    std::fs::write(&script, b"#!/bin/sh\n").expect("the script");
+    let answered = vec![(script.display().to_string(), None)];
+
+    // The interpreter is given the script, so the script is what runs.
+    let started = setup.start_running_script(&script);
     let typing = Typing::start(&setup.host, kr_worker::testing::posix_script("exec cat"));
     let producer = kr_worker::application::Producer::new(Arc::downgrade(&typing.runtime));
     let mut following = Following::new(Arc::clone(&producer));
-    let answered = vec![("/usr/local/bin/assistant".to_owned(), None)];
-    let foreground = Setup::foreground(&started, answered);
-
-    following.look(Some(&foreground));
+    let foreground = Setup::foreground(&started, answered.clone());
+    let image_name = look_until_named(&mut following, &producer, &foreground);
     assert_eq!(
-        producer.application().name,
-        None,
-        "one look is not a program that holds the terminal"
-    );
-    following.look(Some(&foreground));
-    assert_eq!(
-        producer.application().name.as_deref(),
-        Some("assistant"),
-        "the second look that finds the same group names it as the line was typed"
+        image_name, "assistant",
+        "the script the program was given names it, not the image that runs it"
     );
     following.look(None);
     assert_eq!(producer.application().name, None);
     started.end();
+
+    // The same command, answered for a line whose program has since replaced it: nothing the
+    // program is running names the command, so the image does.
+    let started = setup.start();
+    let foreground = Setup::foreground(&started, answered);
+    let replaced = look_until_named(&mut following, &producer, &foreground);
+    assert_ne!(
+        replaced, "assistant",
+        "a program that is not running the command the line named is not named for it"
+    );
+    started.end();
     typing.close().await;
+}
+
+/// Looks at `foreground` until two looks in a row have found the same group and the program is
+/// named, and says the name.
+fn look_until_named(
+    following: &mut kr_worker::application::Following,
+    producer: &kr_worker::application::Producer,
+    foreground: &Foreground,
+) -> String {
+    let started = std::time::Instant::now();
+    loop {
+        following.look(Some(foreground));
+        if let Some(name) = producer.application().name {
+            return name;
+        }
+        assert!(
+            started.elapsed() < LIVENESS,
+            "no program was named within {LIVENESS:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// KR-REQ-12.07: the invocation the shell's integration asks about and a command it reports

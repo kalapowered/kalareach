@@ -28,9 +28,10 @@
 //! connector table, such as one whose hooks give no turn boundary, is never reported as busy: the
 //! worker does not know that it is.
 //!
-//! What a program is called is the file name of what the shell integration answered for the line
-//! when it answered exactly one, and otherwise of the executable the group leader runs. A program
-//! run through an interpreter is named by the interpreter: the worker cannot establish more.
+//! What a program is called is the file name of what the shell integration answered for the line,
+//! when it answered exactly one and that is what the group's leader is running (the image itself,
+//! or the script an interpreter was given), and otherwise of the executable the leader runs. A
+//! program run through an interpreter with no script to name is named by the interpreter.
 
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -336,18 +337,55 @@ impl Following {
 /// Returns what a person knows the program in the foreground by.
 ///
 /// The file name of what the shell integration answered for the line, when it answered for exactly
-/// one command, and otherwise of the executable the group's leader runs. A line of several
-/// commands names none of them, and the leader is the process the group is named after, or, once it
+/// one command and that command is what the group's leader is running now, and otherwise of the
+/// executable the leader runs. A line of several commands names none of them, and a command the
+/// leader has replaced, as a wrapper does when it execs the program it starts, is not the program
+/// that holds the terminal now. The leader is the process the group is named after, or, once it
 /// has gone, the lowest-numbered member the root shell started.
 #[cfg(unix)]
 fn program_of(foreground: &crate::broker::adoption::Foreground) -> Option<String> {
+    let leader = leader_of(foreground)?;
+    let image = crate::questions::binding::executable_of(leader)?;
     if let [(typed, _)] = foreground.answered.as_slice()
+        && runs(typed, &image, leader)
         && let Some(name) = name_of(typed)
     {
         return Some(name);
     }
-    let leader = leader_of(foreground)?;
-    name_of(&crate::questions::binding::executable_of(leader)?)
+    name_of(&image)
+}
+
+/// How many of a program's arguments are looked at for the script an interpreter was given.
+#[cfg(unix)]
+const ARGUMENTS_LOOKED_AT: usize = 8;
+
+/// Whether the command a person typed, as the shell integration resolved it, is what `leader` is
+/// running: the image itself, or the script an interpreter was started with.
+///
+/// A script is named by an argument that is its path, or, where the program was given a path
+/// relative to a directory this worker cannot see it from, by an argument with its file name.
+#[cfg(unix)]
+fn runs(typed: &str, image: &str, leader: u32) -> bool {
+    let canonical = |path: &str| std::fs::canonicalize(path).ok();
+    let Some(typed_file) = canonical(typed) else {
+        return false;
+    };
+    if canonical(image).is_some_and(|image| image == typed_file) {
+        return true;
+    }
+    crate::broker::adoption::arguments_of(leader).is_some_and(|arguments| {
+        arguments
+            .iter()
+            .skip(1)
+            .take(ARGUMENTS_LOOKED_AT)
+            .any(|argument| {
+                if std::path::Path::new(argument).is_absolute() {
+                    canonical(argument).is_some_and(|argument| argument == typed_file)
+                } else {
+                    std::path::Path::new(argument).file_name() == typed_file.file_name()
+                }
+            })
+    })
 }
 
 /// Returns the process the foreground group is named after, or the first of the root shell's
