@@ -30,13 +30,13 @@ use kr_crypto::kdf::RecoverySeed;
 use kr_protocol::archive::{CollectionLocator, RecoveryBundle, TrustedProducer, TrustedWriter};
 use kr_protocol::backup_read::BackupSignIn;
 use kr_protocol::backup_setup::{
-    BackupEnableCause, BackupEnableParams, BackupEnableResult, BackupSetupState,
+    BackupEnableCause, BackupEnableParams, BackupEnableResult, BackupHostKeys, BackupSetupState,
     BackupStatusParams, BackupStatusResult, BackupUnusable,
 };
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::ids::{ArchiveId, EnvironmentId};
 use kr_protocol::method::Method;
-use kr_protocol::scalars::{Bytes, DurationMs, TimestampMs, Uuid};
+use kr_protocol::scalars::{Bytes, DurationMs, StoredEnvelopeKey, TimestampMs, Uuid};
 
 use crate::error::ClientError;
 use crate::recovery::files::is_a_lost_answer;
@@ -386,25 +386,24 @@ pub async fn cover_host_archive(
     let entries = entries(archive_id);
     let mut bundle = bundles.fetch(seed).await?;
     let enabled = entries.commit(bundles, seed, &mut bundle, now).await?;
-    let sealed = bundles.sealed_as_committed().await?;
-    let bundle_locator = bundles
-        .context()
-        .bundle_locator
-        .parse::<Uuid>()
-        .map_err(|_| RecoveryError::MalformedKit {
-            what: "a bundle locator that is not an identifier",
-        })?;
-    let params = BackupEnableParams {
+    // The host is not asked until the call is ready to send, and a failure before that leaves the
+    // bundle naming an archive the host never heard of: it is taken out again.
+    let params = match setup_for(
+        bundles,
+        &recipient,
+        &ours,
         archive_id,
-        recovery_public_key: recipient,
-        kit_fingerprint: ours.clone(),
-        bundle_locator,
-        sealed_bundle: Bytes::new(sealed),
-        request_id: kr_transport::random::fresh_uuid_v4().map_err(ClientError::from)?,
-        enabled_at_ms: now,
-        writer_key_id: keys.writer_key_id,
-        producer_key_id: keys.producer_key_id,
-        replace: replaced.is_some(),
+        keys,
+        replaced.is_some(),
+        now,
+    )
+    .await
+    {
+        Ok(params) => params,
+        Err(error) => {
+            let _ = entries.withdraw(bundles, seed, now).await;
+            return Err(error);
+        }
     };
     match host.enable(&params).await {
         Ok(BackupEnableResult::Enabled {
@@ -439,13 +438,61 @@ pub async fn cover_host_archive(
         }) => Err(RecoveryError::HostOutcomeUnknown {
             retry_after_seconds: retry_after_seconds.0.map(|seconds| seconds.get()),
         }),
-        Err(error) if is_a_lost_answer(&error) => Err(RecoveryError::HostOutcomeUnknown {
-            retry_after_seconds: None,
-        }),
-        // The host refused the call itself, in its own words, before it did anything.
-        Err(error) => {
+        // The host answered with a refusal of its own, which it gives before it does anything, so
+        // nothing was recorded.
+        Err(error) if is_a_definite_refusal(&error) => {
             let _ = entries.withdraw(bundles, seed, now).await;
             Err(RecoveryError::Service(error))
         }
+        // Anything else may have followed a call that was carried out: a lost answer, a broken
+        // connection, a reply that could not be read. The entry stays, and the repeat finds the
+        // setup if it landed.
+        Err(_) => Err(RecoveryError::HostOutcomeUnknown {
+            retry_after_seconds: None,
+        }),
     }
+}
+
+/// Whether a failed call to the host is the host refusing it in its own words: an answer that
+/// carries an error and is not one of the codes for an answer that was lost.
+fn is_a_definite_refusal(error: &ClientError) -> bool {
+    matches!(error, ClientError::Host(_)) && !is_a_lost_answer(error)
+}
+
+/// The call that sets the host up under this computer's recovery, made from the bundle as the
+/// service holds it now.
+///
+/// # Errors
+///
+/// Returns whatever [`BundleStore::sealed_as_committed`] returns, and a malformed kit when the
+/// bundle's locator is not an identifier.
+async fn setup_for(
+    bundles: &BundleStore,
+    recipient: &StoredEnvelopeKey,
+    kit_fingerprint: &str,
+    archive_id: ArchiveId,
+    keys: &BackupHostKeys,
+    replace: bool,
+    now: TimestampMs,
+) -> Result<BackupEnableParams> {
+    let sealed = bundles.sealed_as_committed().await?;
+    let bundle_locator = bundles
+        .context()
+        .bundle_locator
+        .parse::<Uuid>()
+        .map_err(|_| RecoveryError::MalformedKit {
+            what: "a bundle locator that is not an identifier",
+        })?;
+    Ok(BackupEnableParams {
+        archive_id,
+        recovery_public_key: *recipient,
+        kit_fingerprint: kit_fingerprint.to_owned(),
+        bundle_locator,
+        sealed_bundle: Bytes::new(sealed),
+        request_id: kr_transport::random::fresh_uuid_v4().map_err(ClientError::from)?,
+        enabled_at_ms: now,
+        writer_key_id: keys.writer_key_id,
+        producer_key_id: keys.producer_key_id,
+        replace,
+    })
 }
