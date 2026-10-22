@@ -360,6 +360,12 @@ pub struct Continuation {
     pub parent_node_id: String,
 }
 
+/// Whether a chain on `generation` is where a rearm that left `leaves` put it. The last
+/// generation a counter holds has no next one.
+const fn follows(generation: u64, leaves: u64) -> bool {
+    leaves != u64::MAX && generation == leaves + 1
+}
+
 /// What a rearm came to.
 #[derive(Debug)]
 pub enum Rearm<T> {
@@ -1404,7 +1410,7 @@ impl<'c> Journal<'c> {
         let mut budget = self
             .load_budget(root_id)?
             .ok_or_else(|| AutomationError::InvalidArgument("causal root not found".to_owned()))?;
-        if leaves != u64::MAX && budget.generation == leaves + 1 {
+        if follows(budget.generation, leaves) {
             return Ok(Rearm::Already {
                 generation: budget.generation,
             });
@@ -1446,6 +1452,15 @@ impl<'c> Journal<'c> {
             generation: budget.generation,
             continued,
         })
+    }
+
+    /// The generation a chain stands on when it stands on the one after `leaves`, which is where a
+    /// rearm that left `leaves` put it, and none when it stands anywhere else or holds no budget.
+    fn rearmed_after(&self, root_id: CausalRootId, leaves: u64) -> Result<Option<u64>> {
+        Ok(self
+            .load_budget(root_id)?
+            .map(|budget| budget.generation)
+            .filter(|generation| follows(*generation, leaves)))
     }
 
     fn load_budget(&self, root_id: CausalRootId) -> Result<Option<CausalBudget>> {
@@ -2882,6 +2897,32 @@ impl WorkflowStore {
         let value = effect(&journal)?;
         tx.commit()?;
         Ok(value)
+    }
+
+    /// The generation a chain stands on when a rearm that left `leaves` has already put it there,
+    /// and none when it has not, for a caller that may see the chain: a paired device
+    /// (`caller_grant`) sees only a chain under the grant it holds.
+    ///
+    /// This is a read. It is what answers the repeat of a rearm that was performed, before the
+    /// freshness a new rearm needs is asked of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be read.
+    pub fn rearmed_after(
+        &self,
+        root_id: CausalRootId,
+        leaves: u64,
+        caller_grant: Option<GrantId>,
+    ) -> Result<Option<u64>> {
+        self.read(|journal| {
+            if let Some(held) = caller_grant
+                && journal.chain_grant(root_id)? != Some(held)
+            {
+                return Ok(None);
+            }
+            journal.rearmed_after(root_id, leaves)
+        })
     }
 
     /// Retrieves the durable run record the host verifies causal ancestry against.
