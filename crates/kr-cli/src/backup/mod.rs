@@ -141,16 +141,24 @@ async fn restore(
     let selector = EnvironmentSelector { environment: None };
     let environment = crate::resolve::select(paths, None)?;
     let bundles = DaemonBundleWriter::new(paths.clone(), None);
+    let export = arguments
+        .from_export
+        .as_deref()
+        .map(read_export)
+        .transpose()?;
     let on_disk = OnDisk {
         environment: environment.paths.clone(),
     };
     let mut privacy = Daemon::open(paths, &selector).await?;
     let began = privacy.status().await?;
     restore::refuse_while_private(&began)?;
-    let source = Arc::new(DaemonSource::new(
-        Daemon::open(paths, &selector).await?,
-        real_pause(),
-    ));
+    let source: Arc<dyn kr_client::recovery::RestoreSource> = match export {
+        Some(export) => Arc::new(kr_client::recovery::ExportSource::new(export)),
+        None => Arc::new(DaemonSource::new(
+            Daemon::open(paths, &selector).await?,
+            real_pause(),
+        )),
+    };
 
     // The kit: read with a handler installed, so Ctrl-C puts the terminal back and clears it.
     let mut interrupt = Interrupt::install()?;
@@ -182,7 +190,10 @@ async fn restore(
     let outcome = {
         let run = Run {
             source,
-            bundles: &bundles,
+            bundles: arguments
+                .from_export
+                .is_none()
+                .then_some(&bundles as &dyn kr_client::recovery::BundleWriter),
             accept_older: arguments
                 .accept_older
                 .map(kr_protocol::ids::BackupGeneration::new),
@@ -216,6 +227,34 @@ async fn restore(
     };
     print(&outcome, json);
     Ok(Completion::Done)
+}
+
+/// Reads an offline export from a file the person named: a regular file, no larger than an export
+/// is, and an export in the format this release reads.
+fn read_export(path: &std::path::Path) -> Result<kr_client::recovery::OfflineExport> {
+    use std::io::Read as _;
+
+    let refuse = |what: &'static str| CliError::Usage(Shown::said(what));
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| refuse("the export file could not be read"))?;
+    if !metadata.is_file() {
+        return Err(refuse("the export file has to be a regular file"));
+    }
+    // The cap leaves room for the bundle and the file's own framing beside the archive.
+    let limit = kr_client::recovery::MAX_EXPORT_BYTES + 1024 * 1024;
+    if metadata.len() > limit {
+        return Err(refuse("the export file is larger than an export is"));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    std::fs::File::open(path)
+        .and_then(|file| file.take(limit).read_to_end(&mut bytes))
+        .map_err(|_| refuse("the export file could not be read"))?;
+    kr_client::recovery::OfflineExport::from_canonical_slice(&bytes).map_err(|error| match error {
+        kr_client::recovery::RecoveryError::UnsupportedExport => {
+            refuse("that file is an offline export in a format this release does not read")
+        }
+        _ => refuse("that file is not an offline export"),
+    })
 }
 
 /// This host's configuration document, on disk, as `kr host power` and `kr host startup` change it.
