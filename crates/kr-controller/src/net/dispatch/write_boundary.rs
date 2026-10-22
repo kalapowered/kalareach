@@ -1247,12 +1247,12 @@ async fn a_response_is_not_written_under_a_lease_installed_after_its_own_ended()
 
 /// KR-REQ-26.43: what the host measured about itself goes in a diagnostics answer only to the
 /// decision the answer is written under, whichever decision it was read under. An answer read
-/// under a decision that held `host.manage` and written under one that does not goes without its
-/// counts, as one written under the decision that holds it goes with them.
+/// under a decision that held `host.manage` and written under one that does not says the metrics
+/// are withheld, as one written under the decision that holds it goes with the counts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_diagnostics_answer_is_written_with_the_metrics_only_under_a_decision_that_manages_the_host()
  {
-    use kr_protocol::metrics::{Adapter, MetricOutcome};
+    use kr_protocol::metrics::{Adapter, HostMetrics, MetricOutcome};
 
     let temp = kr_ipc::testing::TempHost::create();
     let controller = super::super::tests::daemon(&temp).await;
@@ -1288,7 +1288,7 @@ async fn a_diagnostics_answer_is_written_with_the_metrics_only_under_a_decision_
         .expect("an answer");
     let frame = read.frame().clone();
     assert_eq!(
-        counted_in(&frame),
+        failures_counted_in(&frame),
         Some(1),
         "the answer is read with the count"
     );
@@ -1312,45 +1312,16 @@ async fn a_diagnostics_answer_is_written_with_the_metrics_only_under_a_decision_
         assert_eq!(kept.frames().len(), 1, "one answer");
     }
     assert_eq!(
-        counted_in(&kept_by_the_manager.frames()[0]),
+        failures_counted_in(&kept_by_the_manager.frames()[0]),
         Some(1),
         "written under the decision that manages the host, the answer holds the count"
     );
     assert_eq!(
-        counted_in(&kept_by_the_viewer.frames()[0]),
-        Some(0),
-        "written under one that does not, it counts nothing"
-    );
-    assert!(
-        matches!(
-            state_of(&kept_by_the_manager.frames()[0]),
-            Some(kr_cbor::CanonicalValue::Map(map)) if map.get("counted").is_some()
-        ),
-        "the manager is given the report as the host's counted state"
-    );
-    assert!(
-        matches!(
-            state_of(&kept_by_the_viewer.frames()[0]),
-            Some(kr_cbor::CanonicalValue::Text(word)) if word == "withheld"
-        ),
-        "and the viewer is told the host withholds it, which is not a report of nothing"
+        metrics_in(&kept_by_the_viewer.frames()[0]),
+        Some(HostMetrics::Withheld),
+        "written under one that does not, it says the host withholds its metrics"
     );
     drop(controller);
-}
-
-/// The `metrics` member of a diagnostics answer as the wire carries it.
-fn state_of(frame: &ControlFrame) -> Option<kr_cbor::CanonicalValue> {
-    let ControlFrame::Response(kr_protocol::envelope::Response {
-        outcome: kr_protocol::envelope::Outcome::Ok(value),
-        ..
-    }) = frame
-    else {
-        panic!("not the diagnostics' answer: {frame:?}");
-    };
-    let kr_cbor::CanonicalValue::Map(map) = value.as_value() else {
-        panic!("not a map: {value:?}");
-    };
-    map.get("metrics").cloned()
 }
 
 /// A diagnostics request of a paired device.
@@ -1363,9 +1334,8 @@ fn diagnostics(request_id: u64) -> kr_protocol::envelope::Request {
     }
 }
 
-/// How many adapter failures a diagnostics answer counts, or `None` when it has no `metrics`
-/// member.
-fn counted_in(frame: &ControlFrame) -> Option<u64> {
+/// What a diagnostics answer says of the host's metrics.
+fn metrics_in(frame: &ControlFrame) -> Option<kr_protocol::metrics::HostMetrics> {
     let ControlFrame::Response(kr_protocol::envelope::Response {
         outcome: kr_protocol::envelope::Outcome::Ok(value),
         ..
@@ -1373,20 +1343,25 @@ fn counted_in(frame: &ControlFrame) -> Option<u64> {
     else {
         panic!("not the diagnostics' answer: {frame:?}");
     };
-    let kr_cbor::CanonicalValue::Map(map) = value.as_value() else {
-        panic!("not a map: {value:?}");
-    };
-    map.get("metrics")?;
-    let answer: kr_protocol::hostinfo::HostDoctorResult =
-        value.to_typed().expect("a diagnostics answer");
-    Some(
-        answer
-            .metrics
-            .adapter_failure
-            .iter()
-            .map(|series| series.count.get())
-            .sum(),
-    )
+    value
+        .to_typed::<kr_protocol::hostinfo::HostDoctorResult>()
+        .expect("a diagnostics answer")
+        .metrics
+}
+
+/// How many adapter failures a diagnostics answer counts, or `None` when it counts none for this
+/// reader.
+fn failures_counted_in(frame: &ControlFrame) -> Option<u64> {
+    match metrics_in(frame)? {
+        kr_protocol::metrics::HostMetrics::Counted(report) => Some(
+            report
+                .adapter_failure
+                .iter()
+                .map(|series| series.count.get())
+                .sum(),
+        ),
+        kr_protocol::metrics::HostMetrics::Withheld => None,
+    }
 }
 
 /// A session listing asked by a paired device.

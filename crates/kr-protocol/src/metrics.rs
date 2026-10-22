@@ -22,10 +22,10 @@
 //! Local diagnostics. A host keeps its totals in memory for the life of the process and reports
 //! them to its owner, into a support bundle the owner chooses to write, and to a paired device
 //! whose grant, as this host's policy and ceilings leave it, holds the right to manage the host.
-//! Any other device is answered the host's diagnostics with a report that counts nothing, because
-//! a count names a bundled connector that failed, which is a fact about the host and not about a
-//! session. No service receives them from the host. A total starts again when the process that
-//! counted it does.
+//! Any other device is answered the host's diagnostics with the state [`HostMetrics::Withheld`],
+//! because a count names a bundled connector that failed, which is a fact about the host and not
+//! about a session. No service receives them from the host. A total starts again when the process
+//! that counted it does.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -431,6 +431,21 @@ pub struct MetricsReport {
     /// Every adapter.failure series, in a fixed order.
     #[serde(default)]
     pub adapter_failure: Vec<AdapterFailure>,
+}
+
+/// What a host says of its metrics to the caller that asks for its diagnostics.
+///
+/// A host counts them for its owner and for a device that manages it, and withholds them from any
+/// other caller. A report that counted nothing is not a host that does not say, so the two are
+/// states of their own. A host of an earlier level says neither: the member that holds this is
+/// missing from its answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum HostMetrics {
+    /// The host's report, which holds no series when nothing has been counted.
+    Counted(MetricsReport),
+    /// The host does not give this caller its metrics.
+    Withheld,
 }
 
 impl MetricsReport {
