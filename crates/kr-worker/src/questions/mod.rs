@@ -412,6 +412,24 @@ impl Questions {
         })
     }
 
+    /// Whether a question is open: asked, not answered, not cancelled and not expired.
+    ///
+    /// Expiry is applied first, as it is before every read, so a question whose deadline has passed
+    /// or whose asker has gone is not open. Nothing is decoded and nothing is returned about the
+    /// questions themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuestionError::Unavailable`] when the ledger cannot be read.
+    pub fn any_open(&self, now: Now) -> Result<bool> {
+        let mut store = self.locked()?;
+        let events = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
+        let open = store.any_pending();
+        drop(store);
+        self.woken_by(&events);
+        open
+    }
+
     /// Reads the questions an answering actor may see.
     ///
     /// # Errors

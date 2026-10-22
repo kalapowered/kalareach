@@ -8,6 +8,7 @@
 //! | Module | What it owns |
 //! | --- | --- |
 //! | [`action`] | Section 9's action model: freshness windows, de-duplication, cancellation, observation and the host time contract |
+//! | [`application`] | What a session's application is doing: what holds its terminal, and what its agents wait for |
 //! | [`attachments`] | Attachments, geometry ownership and succession |
 //! | [`attention_source`] | This session's attention records, as the environment's attention store reads them |
 //! | [`description_facts`] | What this session was doing, as the control daemon's descriptions read it |
@@ -38,6 +39,7 @@
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 
 pub mod action;
+pub mod application;
 pub mod attachments;
 pub mod attention_fence;
 pub mod attention_source;

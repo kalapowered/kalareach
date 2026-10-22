@@ -345,6 +345,15 @@ impl Binding {
 pub const THREAD_NOT_READ: &str = "the terminal's conversation is not read from its stream, so \
                                    which thread it has selected is unknown";
 
+/// What the broker holds that says what a session's application is doing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ApplicationFacts {
+    /// A request is waiting for a decision: an approval, interpreted, that nothing has settled.
+    pub approval_pending: bool,
+    /// An instance is running a turn.
+    pub turn_running: bool,
+}
+
 /// One managed application instance.
 #[derive(Debug)]
 pub struct Instance {
@@ -840,6 +849,10 @@ struct BrokerState {
     component_notes: BTreeMap<BrokerBindingId, component::ComponentNotes>,
     /// Woken when the set of bindings the plugin runtime is wanted for may have changed.
     component_changes: Arc<tokio::sync::Notify>,
+    /// Woken when what the session's application is doing may have changed: a transition of a
+    /// pending resource, published whether or not the journal took it, and a turn that began,
+    /// ended or was dropped with its binding.
+    application_changes: Arc<tokio::sync::Notify>,
 }
 
 /// The tables one installation was qualified with, as the installation pinned them.
@@ -1026,6 +1039,7 @@ impl Broker {
                 component_states: BTreeMap::new(),
                 component_notes: BTreeMap::new(),
                 component_changes: Arc::new(tokio::sync::Notify::new()),
+                application_changes: Arc::new(tokio::sync::Notify::new()),
             }),
             notices_ready: tokio::sync::Notify::new(),
             recorder: Mutex::new(recorder),
@@ -1268,7 +1282,41 @@ impl Broker {
         instance.turn_id = turn_id;
         // What a component is told about its bound execution may have changed.
         state.component_changes.notify_one();
+        state.application_changed();
         Ok(())
+    }
+
+    /// Returns what wakes whoever follows what this session's application is doing.
+    ///
+    /// It is woken after every transition of a pending resource this broker publishes, after the
+    /// journal took it or not, and whenever an instance's running turn begins, ends or is dropped
+    /// because its binding moved or the instance ended. A wake says that [`Broker::application`]
+    /// may answer differently, not that it does.
+    #[must_use]
+    pub fn application_changes(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.state().application_changes)
+    }
+
+    /// Returns what the broker holds that says what the session's application is doing: whether a
+    /// request is waiting for a decision, and whether an instance is running a turn.
+    ///
+    /// A request counts only once it is an approval, which is when the connector's table answers
+    /// its method and a binding that holds the decoding grant has interpreted it; a reverse request
+    /// that nothing interpreted is no approval. It counts until its resource reaches a state
+    /// nothing follows.
+    #[must_use]
+    pub fn application(&self) -> ApplicationFacts {
+        let state = self.state();
+        ApplicationFacts {
+            approval_pending: state.arbitration.iter().any(|pending| {
+                pending.resource.kind == kr_protocol::gateway::PendingKind::Approval
+                    && !pending.resource.state.is_terminal()
+            }),
+            turn_running: state
+                .instances
+                .values()
+                .any(|instance| instance.turn_id.is_some()),
+        }
     }
 
     /// Suspends rich mutations until the binding can be verified.
@@ -1467,6 +1515,7 @@ impl Broker {
         state.profiles.release(application_instance_id);
         state.capabilities.forget(application_instance_id);
         state.forget_instance(application_instance_id, kr_ipc::now_ms());
+        state.application_changed();
         drop(state);
         self.notices_ready.notify_one();
         true
@@ -3920,6 +3969,7 @@ impl BrokerState {
         let revision = instance.binding_revision;
         // What a component is told about its bound execution has changed.
         self.component_changes.notify_one();
+        self.application_changed();
         self.tokens.withdraw(application_instance_id);
         self.capabilities.invalidate_instance(
             application_instance_id,
@@ -4956,6 +5006,11 @@ impl BrokerState {
         GatewayConnectionId::new(self.next_connection)
     }
 
+    /// Wakes whoever follows what the session's application is doing.
+    fn application_changed(&self) {
+        self.application_changes.notify_waiters();
+    }
+
     /// Returns the turn one instance is running, where it is running one.
     fn running_turn(
         &self,
@@ -5211,6 +5266,7 @@ impl BrokerState {
     /// Who is authorised is this state's own answer: a connection observes the instance it was
     /// opened against, and nothing else is told.
     fn publish(&self, resource: &PendingResource, event: &crate::broker::ledger::TransitionEvent) {
+        self.application_changed();
         let authorised: Vec<GatewayConnectionId> = self
             .gateway
             .observers(resource.application_instance_id)

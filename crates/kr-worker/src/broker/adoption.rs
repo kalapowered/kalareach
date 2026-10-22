@@ -116,6 +116,9 @@ pub struct Adoptions {
     adopted: Mutex<BTreeMap<ApplicationInstanceId, Adopted>>,
     /// The session whose views are told, where there is one.
     views: Option<Weak<crate::runtime::SessionRuntime>>,
+    /// What follows the looks this set's watch takes, to say what holds the terminal, where
+    /// something does.
+    following: Option<Mutex<crate::application::Following>>,
     /// Where the next identification stops before it reads the image, for this host's own tests.
     #[cfg(feature = "testing")]
     reading_pause: Mutex<Option<ReadingPause>>,
@@ -146,6 +149,7 @@ impl Adoptions {
             closing: tokio::sync::Notify::new(),
             adopted: Mutex::new(BTreeMap::new()),
             views: None,
+            following: None,
             #[cfg(feature = "testing")]
             reading_pause: Mutex::new(None),
         }
@@ -156,6 +160,24 @@ impl Adoptions {
     pub fn with_views(mut self, runtime: Weak<crate::runtime::SessionRuntime>) -> Self {
         self.views = Some(runtime);
         self
+    }
+
+    /// Has the producer of the session's application follow every look this set's watch takes.
+    #[must_use]
+    pub fn following(mut self, producer: Arc<crate::application::Producer>) -> Self {
+        self.following = Some(Mutex::new(crate::application::Following::new(producer)));
+        self
+    }
+
+    /// Tells whoever follows the looks what one found: `None` when the root shell holds the
+    /// terminal, and what was read when a command does.
+    fn followed(&self, foreground: Option<&Foreground>) {
+        if let Some(following) = &self.following {
+            following
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .look(foreground);
+        }
     }
 
     /// Stops the next identification before it reads the image, for this host's own tests: a
@@ -547,6 +569,9 @@ pub async fn watch_foreground(
         };
         // No foreground to read, or the root shell at its prompt: the group was the whole look.
         if holding.is_none() || (root_group.is_some() && holding == root_group) {
+            if holding.is_some() {
+                adoptions.followed(None);
+            }
             command = false;
             continue;
         }
@@ -561,6 +586,7 @@ pub async fn watch_foreground(
             root_group = group_of(&foreground.root_shell);
         }
         command = root_group != Some(foreground.group);
+        adoptions.followed(command.then_some(&foreground));
         if command && identifying.is_none() && adoptions.can_adopt() {
             let looking = Arc::clone(&adoptions);
             identifying = Some(tokio::task::spawn_blocking(move || {
@@ -622,7 +648,7 @@ impl Pace {
 }
 
 /// Returns the process group a process is in, where it can be read.
-fn group_of(process: &ProcessStartIdentity) -> Option<i32> {
+pub(crate) fn group_of(process: &ProcessStartIdentity) -> Option<i32> {
     let pid = i32::try_from(process.pid.get()).ok()?;
     let pid = rustix::process::Pid::from_raw(pid)?;
     rustix::process::getpgid(Some(pid))
