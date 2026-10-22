@@ -2740,6 +2740,8 @@ async fn mutated_through_a_lapse(
 /// before the service's lock writes nothing. A draft is the effect here: neither a fence this host
 /// comes to owe nor a registration withdrawn in that interval lets it be created, and the refusal
 /// is not kept as the action's answer.
+/// KR-REQ-02.08, the part that is about current state: the service decides again, under its own
+/// lock and from what the host holds then, whether the admission a mutation carries still stands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_draft_whose_admission_lapses_before_the_services_lock_is_not_created() {
     for lapse in [Lapse::AFence, Lapse::TheRegistration] {

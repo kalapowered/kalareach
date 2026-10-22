@@ -1003,6 +1003,8 @@ async fn daemon_host_on(clocks: Clocks) -> Daemon {
 /// KR-REQ-09.09, KR-REQ-09.16: a mutation admitted before its deadline and reaching its store
 /// transaction after it is refused inside the transaction, not before the wait and not after the
 /// effect.
+/// KR-REQ-02.08, the part that is about current state: whether the freshness a mutation was
+/// admitted under still stands is decided against the clock when the effect is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_mutation_whose_admission_lapses_before_its_transaction_is_refused_inside_it() {
     let daemon = daemon_host().await;
@@ -1179,6 +1181,8 @@ async fn a_mutation_admitted_before_its_deadline_is_refused_when_the_lock_wait_o
 }
 
 /// The same, for a revocation that lands while the mutation waits.
+/// KR-REQ-02.08, the part that is about current state: the authority a mutation was admitted under
+/// is read again when the effect is written, and a revocation since then refuses it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_mutation_whose_authority_is_withdrawn_during_the_lock_wait_is_refused_inside_it() {
     let daemon = daemon_host().await;
@@ -1227,6 +1231,10 @@ async fn a_mutation_whose_authority_is_withdrawn_during_the_lock_wait_is_refused
 /// while it is in there, and the holder does not let go until it has seen it go: so nothing can
 /// have taken the registry in between, and the refusal the write gets is one decided inside its
 /// wait rather than before it.
+///
+/// KR-REQ-02.08, the part that is about current state: the connection a mutation was admitted
+/// through must still be registered when the effect is written, and one that was withdrawn since
+/// refuses it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_mutation_whose_registration_is_withdrawn_during_the_lock_wait_is_refused_inside_it() {
     let daemon = daemon_host().await;
@@ -1350,6 +1358,8 @@ async fn a_connection_that_admits_no_mutation_is_refused_by_the_daemon() {
 
 /// KR-REQ-09.16, KR-REQ-23.24: a retry whose freshness *and* authority have both gone is refused
 /// for the authority, rather than answered because the freshness went first.
+/// KR-REQ-02.08, the part that is about current state: the authority a retry is decided under is
+/// the authority in force now.
 ///
 /// Both are gone before the retry is submitted, which is the ordinary case rather than a race: what
 /// this proves is the order the admission answers in. A withdrawal that happens *during* a wait is
@@ -1616,6 +1626,9 @@ async fn a_retry_reaches_its_retained_answer_after_its_window_stops_admitting_an
 }
 
 /// KR-REQ-23.24: a retained action is disclosed under current authority and not otherwise.
+/// KR-REQ-02.08, the part that is about current state: what an action made earlier produced is
+/// told to a connection only under the authority in force now, not the authority it had when it
+/// made the action.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_retained_action_is_disclosed_under_current_authority_and_not_under_withdrawn_authority()
 {
@@ -2359,6 +2372,8 @@ impl Drop for ApartWorker {
 /// KR-ACC-022: the whole sequence through this daemon's own revocation path - a worker isolated
 /// after its intents were durably accepted, a revocation announced while it cannot answer, the
 /// barrier reported pending in the meantime, and no affected undispatched action executed.
+/// KR-REQ-02.08, the part that is about current state: an intent accepted under authority that a
+/// revocation then withdrew is rejected as revoked, and never reaches its dispatch marker.
 ///
 /// The worker is held for the daemon's whole round, which is as long as the daemon bounds its
 /// steps, and the worker's session runtime and connections run on runtimes of their own for it,
@@ -2624,6 +2639,8 @@ async fn an_action_inside_the_dispatch_boundary_is_named_rather_than_taken_back(
 
 /// KR-ACC-022: an action this host really admitted and never dispatched is taken back by the
 /// revocation, and its effect never happens.
+/// KR-REQ-02.08, the part that is about current state: the same through an action this host really
+/// admitted, whose dispatch marker could not be written, rather than one placed in the journal.
 ///
 /// The intent is left where section 9 says a fence finds one: accepted durably, with no dispatch
 /// marker. This host writes the marker in the same locked step as the acceptance, so the way to be
