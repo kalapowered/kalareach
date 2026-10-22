@@ -25,7 +25,8 @@ application is refused before anything is written.
 
 A paired device acts under the grant it holds and no other. It may install a workflow only under
 that grant, and only as a new workflow or a new revision of one that already acts under it; it may
-enable, pause, run and read only the workflows that act under it. Whether it may reach a revision
+enable, pause, run and read only the workflows that act under it, and re-arm only a chain whose
+root run acts under it. Whether it may reach a revision
 is decided before anything else is said about it, and a revision it cannot reach is answered
 exactly as a revision that is not installed, so it learns neither that the revision exists nor
 which grant it acts under. A revision number the journal cannot hold names no revision at all.
@@ -56,7 +57,9 @@ acts on, and a request whose revision does not match the document it carries is 
 
 `workflow.install`, `workflow.enable`, `workflow.pause` and `workflow.run` are actions. Each
 carries the caller's action identifier, and the workflow journal records what it came to in the
-same transaction as its effect.
+same transaction as its effect. `workflow.rearm` is the one mutation that keeps no such record: the
+generation it names is its own key, and the chain's state is what answers a repeat of it (see
+"Re-arming" below).
 
 * **One transaction.** The journal first looks for the record an earlier submission of the same
   action left. If there is one, it is the answer and nothing is written. Otherwise the journal asks
@@ -374,15 +377,35 @@ the unit it derives them for. Nothing a caller sends names any of them.
   transaction as the pause. The record outlives a restart and is settled only once the host's
   attention state has written its own, so a chain that ran out owes one item however many
   refusals follow and whatever restarts intervene.
-* **Re-arming.** Only an authorised re-arm establishes a new budget: one made under a grant this
-  host holds as live, for this environment, with the right to manage automation, which no event
-  carries. It advances the chain's generation and resets its counters without anybody raising a
-  ceiling, and it continues the chain in the same transaction: every descendant the exhausted
-  budget refused, which the journal kept with the refusal, is admitted once as a run of the same
-  chain in the new generation, under its own workflow's grant and limits, and the record of it is
-  spent whatever that admission decides. A descendant of a run from the previous generation that
-  arrives afterwards carries that earlier generation and is refused as late, and a replay of a
-  continued trigger is a duplicate.
+* **Re-arming.** Only an authorised re-arm establishes a new budget, and `workflow.rearm` is that
+  request. It names the chain by its causal root, the grant it is made under, and the budget
+  generation it leaves, which `workflow.read` shows beside the chain's budget. The grant has to be
+  one this host holds as live, for this environment, with the right to manage automation; no event
+  carries one. A paired device names the grant it holds and reaches only a chain whose root run
+  acts under that grant. Any other chain is answered as a root this host holds no budget for.
+  A chain whose budget has not run out is refused, since nothing about it is stopped. The re-arm
+  advances the chain's generation and resets its counters without anybody raising a ceiling, and
+  it continues the chain in the same transaction: every descendant the exhausted budget refused,
+  which the journal kept with the refusal, is admitted once as a run of the same chain in the new
+  generation, under its own workflow's grant and limits, and the record of it is spent whatever
+  that admission decides. The runs that start execute once the re-arm has committed. A daemon
+  that stops between the two finds them running in the journal and takes them up when it starts.
+  A descendant of a run from the previous generation that arrives afterwards carries that earlier
+  generation and is refused as late, and a replay of a continued trigger is a duplicate.
+* **A repeat of a re-arm.** The generation the request names is what tells a repeat from a second
+  re-arm. The request that moves a chain from generation 0 to generation 1 is answered with
+  generation 1. Sent again, because its reply was lost, it finds the chain on generation 1, is
+  answered with that, and changes nothing, even if the chain has run out again in the meantime. A
+  request that names any other generation is refused as a conflict. Nothing is stored for the
+  request, so the journal's stored form is the one it had before the method existed.
+* **What a re-arm does not do.** It continues the descendants the budget refused when the chain
+  tried to admit them, which is how a chain that reached its depth or run ceiling goes on. A run
+  stopped at a node, because the chain's action, session or spend allowance ran out when the node
+  was to be dispatched, stays paused. Nothing resumes a paused run, so the re-arm gives that
+  chain a new budget and does not restart the run; the chain goes on from a new external trigger.
+  The attention item the exhausted chain raised also stays open after a re-arm until it is
+  acknowledged, because ending it takes a journal event that the journal's stored form has no
+  place for.
 * **External triggers.** A trigger with no verifiable causal parent, an unauthenticated callback
   among them, is a new external trigger: the host mints its root and host-wide admission bounds
   it. It can never adopt a causal root of its choosing. The host does not claim to recover

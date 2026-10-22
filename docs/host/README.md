@@ -4774,11 +4774,13 @@ across a restart and a reboot.
 
 The six methods of the automation group arrive through the daemon's ordinary path, and the grant
 each definition names is read from the daemon's own grant store rather than from the request. The
-four mutations are actions: each one's effect and the record of what it came to commit in one
+`workflow.install`, `workflow.enable`, `workflow.pause` and `workflow.run` are actions: each one's effect and the record of what it came to commit in one
 transaction of the workflow journal, and the admission the daemon accepted the mutation under is
 carried into that transaction and asked immediately before the action's first write: the same check
 the project service asks inside its own work, the fence this host may owe, the registration and the
-deadline. A repeat is answered from the record before its freshness is considered. The daemon reads
+deadline. A repeat is answered from the record before its freshness is considered. `workflow.rearm` is the
+fifth mutation and keeps no record: it names the budget generation it leaves, so the chain's own
+state answers a repeat of it. The daemon reads
 the grant again before every node a run dispatches, so a revocation or an expiry stops the run where
 it stands, and a node is dispatched only when that grant carries the right its effect needs. It
 decides a workflow's grant with the model it decides a paired device's request with: the configured
@@ -4807,7 +4809,9 @@ either is asked to stop and stops its run. A limit exceeded pauses the workflow 
 attention item. A new chain inherits the session
 number admission enforces as a ceiling on the sessions it creates. Breaching a causal budget pauses
 the chain with error code `CAUSAL_LIMIT`, rejects further descendants, and commits one attention
-record in the same transaction as the pause.
+record in the same transaction as the pause. Only a `workflow.rearm` gives the chain a new budget:
+made under a grant the daemon holds with the right to manage automation, it moves the chain from the
+generation it names to the next in one transaction and continues the descendants the budget refused.
 
 `docs/automation/` has the six methods, graph validation, the budget model, and the evidence a test run leaves.
 
