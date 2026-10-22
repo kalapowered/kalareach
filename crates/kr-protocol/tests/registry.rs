@@ -425,10 +425,11 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
     // A restore reads what the managed storage service holds through the host's own account: one
     // read, served on the local socket alone and asking for host management. A paired device does
     // not read a backup through the host.
-    let backup: [(&str, EffectClass); 3] = [
+    let backup: [(&str, EffectClass); 4] = [
         ("backup.read", EffectClass::Read),
         ("backup.status", EffectClass::Read),
         ("backup.enable", EffectClass::Write),
+        ("backup.bundle.write", EffectClass::Write),
     ];
     for (name, effect) in backup {
         let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
