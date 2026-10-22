@@ -364,6 +364,12 @@ fn now_ms() -> u64 {
     .expect("a time in range")
 }
 
+/// What the service holds at a locator, read when the host is sent a setup.
+type HeldBundle = Box<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
+
+/// One way a host cannot be covered: its name, how the host is changed, and what the card shows.
+type WayLeft = (&'static str, Box<dyn Fn(&Host)>, LeftView);
+
 /// The host on this computer, as far as this suite needs it: what its status says, the calls it is
 /// sent, and what it answers. The daemon itself is exercised against a real service and a real
 /// bundle in the controller's suite; what is held here is what the application does around it.
@@ -376,7 +382,7 @@ struct Host {
     enabled: Mutex<Vec<(BackupEnableParams, bool)>>,
     statuses: Mutex<usize>,
     /// Where the service's bundles are read from, to check the order of the calls.
-    held: Box<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>,
+    held: HeldBundle,
 }
 
 impl std::fmt::Debug for Host {
@@ -809,7 +815,7 @@ async fn a_host_that_cannot_be_covered_as_it_stands_is_left_alone_and_nothing_is
     assert_eq!(writes_sent(&computer), before);
 
     // Each way the host cannot be covered as it stands.
-    let ways: Vec<(&str, Box<dyn Fn(&Host)>, LeftView)> = vec![
+    let ways: Vec<WayLeft> = vec![
         (
             "no service",
             Box::new(|host| {
@@ -1067,8 +1073,6 @@ fn scanned(svg: &str) -> (rqrr::MetaData, String) {
 /// recovery is off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_kit_saved_as_a_qr_code_scans_back_to_the_kit_and_is_private() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let computer = Computer::new().await;
     let page = computer.page().await;
     let out = tempfile::tempdir().expect("a directory");
@@ -1101,11 +1105,15 @@ async fn the_kit_saved_as_a_qr_code_scans_back_to_the_kit_and_is_private() {
             .to_string(),
         "a scanner reads the document a person could have typed"
     );
-    let mode = std::fs::metadata(&path)
-        .expect("the file")
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o600, "the code is private to its owner");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path)
+            .expect("the file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the code is private to its owner");
+    }
     // The page was told where, and nothing the code holds.
     assert!(!page.told().contains(&kit.bundle_locator));
 }
@@ -1115,8 +1123,6 @@ async fn the_kit_saved_as_a_qr_code_scans_back_to_the_kit_and_is_private() {
 /// an archive the bundle does not name, or while recovery is off, writes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_bundle_exports_alone_as_a_private_file_of_ciphertext() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let computer = Computer::new().await;
     let page = computer.page().await;
     let out = tempfile::tempdir().expect("a directory");
@@ -1172,11 +1178,15 @@ async fn the_bundle_exports_alone_as_a_private_file_of_ciphertext() {
         "the export holds no kit text"
     );
     drop(seed);
-    let mode = std::fs::metadata(&path)
-        .expect("the file")
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o600, "the export is private to its owner");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path)
+            .expect("the file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the export is private to its owner");
+    }
 
     // An archive the bundle does not name writes nothing.
     let other = out.path().join("other.krexport");
