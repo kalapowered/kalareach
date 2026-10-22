@@ -462,6 +462,7 @@ impl BrokerState {
                 package_digest,
                 origin: package.origin.clone(),
             }),
+            repository_generation: Some(package.repository_generation),
             ending: false,
             frame: Some(frame),
             executable: Some(BoundExecutable {
