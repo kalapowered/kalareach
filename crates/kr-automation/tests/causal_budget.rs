@@ -1350,39 +1350,11 @@ async fn a_repeat_of_a_rearm_gives_no_second_budget() {
     assert!(!service.store().get_budget(root).unwrap().unwrap().exhausted);
 }
 
-/// KR-REQ-25.17: a chain whose budget has not run out is not rearmed, and a root nothing is known
-/// for is a root nothing is known for.
-///
-/// Nothing about a live chain is stopped, and a rearm would advance its generation under the runs
-/// that are using the budget it has.
+/// KR-REQ-25.17: the repeat of a rearm that was performed is recognised by a read that changes
+/// nothing, for a caller that may rearm the chain and for nobody else. A paired device rearms a
+/// chain that acts under the grant it holds.
 #[tokio::test]
-async fn a_chain_whose_budget_has_not_run_out_is_not_rearmed() {
-    let service = in_memory();
-    let def = recurring_workflow(61, "live", "manual", WorkflowActionKind::AttentionNotice);
-    install_and_enable(&service, &def, 1_000);
-    let root = service
-        .submit_run(&run_params(&def, "evt-live"), 1_000)
-        .await
-        .expect("the root runs")
-        .causal_root_id;
-
-    let refused = service
-        .submit_rearm(root, test_grant_id(1), 0, 2_000)
-        .expect_err("nothing about the chain is stopped");
-    assert_eq!(code(&refused), ErrorCode::InvalidArgument, "{refused}");
-    let kept = service.store().get_budget(root).unwrap().unwrap();
-    assert_eq!((kept.generation, kept.rearmed_at_ms), (0, None));
-
-    let unknown = service
-        .submit_rearm(test_root_id(0x77), test_grant_id(1), 0, 2_000)
-        .expect_err("no such chain");
-    assert_eq!(code(&unknown), ErrorCode::InvalidArgument, "{unknown}");
-}
-
-/// KR-REQ-25.17: a paired device rearms only a chain that acts under the grant it holds, and names
-/// that grant. A chain it may not reach is answered as a root nothing is known for.
-#[tokio::test]
-async fn a_paired_device_rearms_only_a_chain_under_its_own_grant() {
+async fn the_repeat_of_a_rearm_is_recognised_by_a_read_that_changes_nothing() {
     // Grant 1 is the owner's workflow grant, and grant 3 is a device's, with management rights.
     let table = common::every_right(&[test_grant_id(1), test_grant_id(3)]);
     let service = AutomationService::in_memory(common::host(
@@ -1392,47 +1364,116 @@ async fn a_paired_device_rearms_only_a_chain_under_its_own_grant() {
     ))
     .expect("a service");
     let root = an_exhausted_chain(&service, 62).await;
-    let params = |grant: GrantId| kr_protocol::automation::WorkflowRearmParams {
+    let params = |grant: GrantId, leaves: u64| kr_protocol::automation::WorkflowRearmParams {
         causal_root_id: root,
         grant_reference: grant,
-        generation: kr_protocol::scalars::U64::new(0),
+        generation: kr_protocol::scalars::U64::new(leaves),
     };
 
-    let borrowed = service
-        .rearm(
-            &params(test_grant_id(1)),
-            &common::admitted,
-            Some(test_grant_id(3)),
-            2_000,
-        )
-        .expect_err("a device names the grant it holds");
-    assert_eq!(code(&borrowed), ErrorCode::PermissionDenied, "{borrowed}");
-
-    let other = service
-        .rearm(
-            &params(test_grant_id(3)),
-            &common::admitted,
-            Some(test_grant_id(3)),
-            2_000,
-        )
-        .expect_err("the chain is the owner's");
-    assert_eq!(code(&other), ErrorCode::InvalidArgument, "{other}");
+    // Before the rearm there is nothing to recognise.
     assert!(
-        other.to_string().contains("not found"),
-        "it learns nothing of the chain: {other}"
+        service
+            .rearmed(&params(test_grant_id(1), 0), None, 2_000)
+            .expect("the read")
+            .is_none()
     );
-    assert!(service.store().get_budget(root).unwrap().unwrap().exhausted);
 
-    // The control: the grant the chain acts under, held by the device that asks.
+    // The control: a device rearms a chain that acts under the grant it holds.
     let own = service
         .rearm(
-            &params(test_grant_id(1)),
+            &params(test_grant_id(1), 0),
             &common::admitted,
             Some(test_grant_id(1)),
             2_000,
         )
         .expect("a device rearms its own grant's chain");
     assert_eq!(own.result.generation.get(), 1);
+    let before = service.store().get_budget(root).unwrap().unwrap();
+
+    let repeat = |grant: GrantId, leaves: u64, caller: Option<GrantId>| {
+        service.rearmed(&params(grant, leaves), caller, 3_000)
+    };
+    // The owner and the device that rearmed it are told where the chain is.
+    for caller in [None, Some(test_grant_id(1))] {
+        let told = repeat(test_grant_id(1), 0, caller)
+            .expect("the read")
+            .expect("the repeat is recognised");
+        assert_eq!(told, own.result);
+    }
+    // A request leaving any other generation is not a repeat.
+    assert!(repeat(test_grant_id(1), 1, None).expect("read").is_none());
+    assert!(repeat(test_grant_id(1), 5, None).expect("read").is_none());
+    // A device under a grant the chain does not act under is told nothing of it, and one that names
+    // a grant it does not hold is refused.
+    assert!(
+        repeat(test_grant_id(3), 0, Some(test_grant_id(3)))
+            .expect("the read")
+            .is_none()
+    );
+    let borrowed = repeat(test_grant_id(1), 0, Some(test_grant_id(3)))
+        .expect_err("a device names the grant it holds");
+    assert_eq!(code(&borrowed), ErrorCode::PermissionDenied, "{borrowed}");
+    // A grant that may not rearm is told nothing.
+    let unheld = repeat(test_grant_id(9), 0, None).expect_err("a grant the host does not hold");
+    assert_eq!(code(&unheld), ErrorCode::PermissionDenied, "{unheld}");
+
+    assert_eq!(
+        service.store().get_budget(root).unwrap().unwrap(),
+        before,
+        "none of the reads changed the chain"
+    );
+}
+
+/// KR-REQ-25.17: the runs a rearm continues are in the journal when it commits, so a daemon that
+/// stops before it has started them finds them and runs them when it starts again.
+#[tokio::test]
+async fn a_rearm_whose_runs_were_not_started_before_a_restart_continues_after_it() {
+    let journal = tempfile::tempdir().expect("a journal directory");
+    let clock = Arc::new(ManualClock::new(1_000));
+    let tests = recurring_workflow(1, "tests", "review.completed", WorkflowActionKind::RunTests);
+    let review = recurring_workflow(
+        2,
+        "review",
+        "tests.passed",
+        WorkflowActionKind::RequestReview,
+    );
+    let root = {
+        let service = open(journal.path(), &clock);
+        install_and_enable(&service, &tests, 1_000);
+        install_and_enable(&service, &review, 1_000);
+        let root = service
+            .submit_run(&run_params(&tests, "external-1"), 1_000)
+            .await
+            .expect("the root runs")
+            .causal_root_id;
+        let refused = loop {
+            let decision = only(service.dispatch_triggers(2_000).await.expect("a pass"));
+            if let Err(error) = decision.outcome {
+                break error;
+            }
+        };
+        assert_eq!(code(&refused), ErrorCode::CausalLimit, "{refused}");
+
+        // The rearm commits, and the process stops before it has started what it continued.
+        let continued = service
+            .submit_rearm(root, test_grant_id(1), 0, 3_000)
+            .expect("an authorised rearm");
+        assert_eq!(continued.started.len(), 1);
+        root
+    };
+
+    let service = open(journal.path(), &clock);
+    let mut resumed = service.recover(4_000).expect("recovery");
+    assert_eq!(resumed.len(), 1, "the continued run is taken up");
+    let ran = service
+        .execute(resumed.remove(0))
+        .await
+        .expect("the continued run executes");
+    assert_eq!(ran.status, WorkflowRunStatus::Completed, "{ran:?}");
+    assert_eq!(ran.causal_root_id, root);
+    assert_eq!(ran.depth.get(), DEFAULT_CAUSAL_DEPTH_LIMIT + 1);
+    let budget = service.store().get_budget(root).unwrap().unwrap();
+    assert_eq!(budget.generation, 1);
 }
 
 /// KR-REQ-25.17: an admission that no longer stands writes nothing, because it is asked before the
