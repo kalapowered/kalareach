@@ -309,6 +309,8 @@ pub struct View {
     /// Whether the component was offered something made while privacy mode was on, so that its
     /// state may hold it. None is taken from it until it starts again.
     pub private_content: bool,
+    /// The count of marks made on the lane when the latest one was made.
+    pub marked_at: u64,
     /// The first entry the binding may be offered: those pushed before it was made ready are older
     /// than its view.
     pub ready_from: u64,
@@ -361,6 +363,8 @@ struct Inner {
     checkpoint_bytes: u64,
     /// Whether privacy mode has been on since the link made the connection it now holds.
     words_tainted: bool,
+    /// How many times a component has been marked as handed something made in privacy mode.
+    marks: u64,
 }
 
 impl Inner {
@@ -674,21 +678,37 @@ impl ObservationLane {
 
     // -- the views ----------------------------------------------------------------------------
 
-    /// Says whether a binding may be offered anything.
-    pub fn set_ready(&self, binding: BrokerBindingId, ready: bool) {
+    /// Says that a component is about to be registered afresh, and returns the mark count that the
+    /// registration is made ready under ([`Self::set_ready`]).
+    ///
+    /// The binding has a view from here on, so that a component handed something made in privacy
+    /// mode between its registration and its becoming ready is marked as having been.
+    pub fn registering(&self, binding: BrokerBindingId) -> u64 {
+        let mut inner = self.inner();
+        let marks = inner.marks;
+        inner.views.entry(binding).or_default();
+        marks
+    }
+
+    /// Makes a binding ready to be offered anything, its component registered afresh under the mark
+    /// count [`Self::registering`] returned.
+    ///
+    /// A component registered afresh holds nothing it was offered before, so a mark made before the
+    /// registration began goes. A mark made after it began stays, whatever made it: the component
+    /// may already hold what it was handed, and it is not asked for its state until it starts
+    /// again.
+    pub fn set_ready(&self, binding: BrokerBindingId, registering: u64) {
         let mut inner = self.inner();
         let next = inner.next_seq;
         let view = inner.views.entry(binding).or_default();
-        view.ready = ready;
+        view.ready = true;
         view.silent_until = None;
-        if ready {
-            // A component made ready has been registered afresh, so it holds nothing it was offered
-            // before, and nothing pushed before it is for it.
+        if view.marked_at <= registering {
             view.private_content = false;
-            view.silence = None;
-            view.snapshot_retry = None;
-            view.ready_from = next;
         }
+        view.silence = None;
+        view.snapshot_retry = None;
+        view.ready_from = next;
         drop(inner);
         self.wake.notify_one();
     }
@@ -864,8 +884,11 @@ impl ObservationLane {
         }
         let mut inner = self.inner();
         inner.words_tainted = true;
+        inner.marks += 1;
+        let marks = inner.marks;
         if let Some(view) = inner.views.get_mut(&binding) {
             view.private_content = true;
+            view.marked_at = marks;
         }
     }
 
