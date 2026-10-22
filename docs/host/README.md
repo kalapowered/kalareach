@@ -3455,11 +3455,13 @@ that counted them does, and no service receives them from this host. `kr doctor`
 support bundle carries them: counts under labels from the closed lists below, which name no person,
 session, path or program a person ran.
 
-A paired device reads them only when its grant holds the right to manage the host, as an owner's
-device does. The metrics are about the host, and the `adapter` label names a bundled connector
-that failed, so a device that holds only `session.view`, or any other right over a session, is
-answered `host.doctor` with its checks and configuration as before and a metrics report with nothing
-counted. That empty report says nothing about the host.
+A paired device reads them only when its grant, as this host's policy and ceilings leave it,
+holds the right to manage the host, as an owner's device does. The metrics are about the host, and
+the `adapter` label names a bundled connector that failed, so the answer to any other device, one
+that holds only `session.view` or any other right over a session, has its checks and configuration
+as before and a `metrics` member that counts nothing, which says nothing about the host. The counts
+are taken out where the answer is written, under the decision it is written under, so a grant that
+stops holding the right while the answer waits does not send them.
 
 The daemon counts the gaps between a device's connections. Each session's worker counts the faults
 its terminal's parser met and the failures of the adapters it runs, for the life of its session.
