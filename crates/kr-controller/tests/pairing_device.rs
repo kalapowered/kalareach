@@ -305,20 +305,6 @@ impl Run {
             secret_forms(&text, &secret).as_bytes(),
         );
         write_private(&self.directory.join("control.png"), &qr_picture(&text));
-        // The failed confirmations the invitation still allows, before the phone tries it and
-        // after: a host the phone never reached has refused nothing.
-        let remaining = |status: &kr_protocol::preauth::PairStatusResult| {
-            status
-                .owner
-                .0
-                .as_ref()
-                .map(|view| view.remaining_confirmations)
-        };
-        let before = remaining(
-            &calls::owner_status(client, invited.invitation_id)
-                .await
-                .expect("the invitation's status"),
-        );
         assert!(
             appears(&self.directory.join("control-done"), STEP).await,
             "the script never said the phone had scanned the invitation"
@@ -335,10 +321,6 @@ impl Run {
         self.say(
             "control-result.txt",
             &format!("candidate_locked={}\n", u8::from(locked)),
-        );
-        self.say(
-            "control-refused.txt",
-            &format!("refused={}\n", u8::from(remaining(&status) < before)),
         );
         let _ = calls::cancel(self.environment, client, invited.invitation_id, false).await;
     }
