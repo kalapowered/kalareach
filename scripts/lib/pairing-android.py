@@ -140,29 +140,70 @@ class Phone:
                 return node
         return None
 
-    def wait(self, wanted, what: str, timeout: float = 60) -> dict:
-        """Waits until a node on the screen is labelled as `wanted` says, never by a fixed delay."""
-        end = time.monotonic() + timeout
-        while time.monotonic() < end:
-            node = self.find(wanted)
+    def wait(self, wanted, what: str, timeout: float = 60, nudging: bool = False) -> dict:
+        """Waits until a node on the screen is labelled as `wanted` says, never by a fixed delay.
+
+        A wait that is for content the page draws after the screen was first read passes `nudging`:
+        see `draw_again`."""
+        found: list[dict] = []
+
+        def seen(nodes: list[dict]) -> bool:
+            node = next((each for each in nodes if each["label"] and wanted(each["label"])), None)
             if node is not None:
-                return node
-            time.sleep(0.4)
-        self.give_up(f"timed out waiting for {what}")
+                found.append(node)
+            return node is not None
+
+        self.wait_screen(seen, what, timeout, nudging)
+        return found[-1]
 
     def wait_gone(self, unwanted, what: str, timeout: float = 60) -> None:
         """Waits until no node on the screen is labelled as `unwanted` says, never by a fixed delay."""
+        self.wait_screen(
+            lambda nodes: not any(each["label"] and unwanted(each["label"]) for each in nodes), f"{what} to go", timeout
+        )
+
+    def wait_screen(self, holds, what: str, timeout: float = 60, nudging: bool = False) -> None:
+        """Waits until `holds` says the screen's nodes are as wanted, never by a fixed delay.
+
+        The web view hands its accessibility tree over a piece at a time: content the page draws
+        after the tree was first read can be missing from it while it is on the screen, and a screen
+        that shows nothing of what a condition needs is never taken for one where that is gone, so a
+        wait for an absence names what must be there beside it. A wait for such content (`nudging`)
+        has the screen drawn afresh now and then, and says when it needed to."""
         end = time.monotonic() + timeout
+        started = time.monotonic()
+        nudges = 0
         while time.monotonic() < end:
-            if self.find(unwanted) is None:
+            if holds(self.screen()):
+                if nudges:
+                    print(f"PAIRING-NOTE {what} appeared after {nudges} round trips to another tab", flush=True)
                 return
+            if nudging and (time.monotonic() - started) > 8 * (nudges + 1):
+                self.draw_again()
+                nudges += 1
             time.sleep(0.4)
-        self.give_up(f"timed out waiting for {what} to go")
+        self.give_up(f"timed out waiting for {what}")
+
+    def draw_again(self) -> None:
+        """Goes to another tab and back, which draws the Attention screen afresh and has the web view
+        send all of it."""
+        away = self.find(lambda each: each == "Sessions")
+        back = self.find(lambda each: each.startswith("Attention"))
+        if away is not None and back is not None:
+            # Each tap is its own call to the device, which is longer than the screen takes to
+            # change tab.
+            self.tap(away)
+            self.tap(back)
 
     def give_up(self, message: str) -> None:
         """Ends the run, saying what the screen showed, for whoever reads the failure."""
-        labels = " | ".join(each["label"] for each in self.screen() if each["label"])
+        nodes = self.screen()
+        labels = " | ".join(each["label"] for each in nodes if each["label"])
         self.shot("timeout")
+        # Every node `uiautomator` reported, with its class and box, for whoever reads the failure.
+        (self.shots / "android-timeout-nodes.txt").write_text(
+            "\n".join(f"{each['class']} {each['box']} {each['label']!r}" for each in nodes) + "\n", encoding="utf-8"
+        )
         raise SystemExit(f"{message}; the screen shows: {labels}")
 
     def tap(self, node: dict) -> None:
@@ -394,7 +435,7 @@ def owner_confirmations(phone: Phone, directory: Path) -> None:
         # and the button appears named for it without the request coming or going.
         phone.wait(lambda each: "1 waiting for you" in each, "the host's request counted on the Attention tab", 120)
         phone.run("shell", "locksettings", "set-pin", SCREEN_LOCK_PIN)
-        phone.tap(phone.wait(lambda each: each == confirm, "the button that confirms the host's request", 120))
+        phone.tap(phone.wait(lambda each: each == confirm, "the button that confirms the host's request", 45, nudging=True))
         phone.wait(lambda each: each == "Confirm on this phone", "the system's prompt", 30)
         phone.shot("confirm-prompt")
         phone.run("shell", "input", "keyevent", "KEYCODE_BACK")
@@ -405,7 +446,7 @@ def owner_confirmations(phone: Phone, directory: Path) -> None:
         if not read(directory, "challenge-open.txt").startswith("unanswered=1"):
             raise SystemExit(f"the cancelled request was answered: {read(directory, 'challenge-open.txt')}")
         touch(directory, "confirm-go")
-        phone.tap(phone.wait(lambda each: each == confirm, "the button that confirms the host's request", 30))
+        phone.tap(phone.wait(lambda each: each == confirm, "the button that confirms the host's request", 30, nudging=True))
         enter_screen_lock(phone)
         phone.wait(lambda each: each.startswith("Confirmed."), "the words for a confirmed request", 60)
         wait_for_file(directory, "confirm-result.txt", 60)
@@ -416,20 +457,27 @@ def owner_confirmations(phone: Phone, directory: Path) -> None:
         wait_for_file(directory, "device-value.txt", 90)
         value = read(directory, "device-value.txt").replace(" ", "")
         spelled = ", ".join(" ".join(group) for group in (value[:4], value[4:]))
-        phone.wait(lambda each: spelled in each, f"the value {value} the second device shows", 60)
-        phone.wait(lambda each: each == confirm, "the button that confirms the second device", 30)
+        phone.wait(lambda each: spelled in each, f"the value {value} the second device shows", 60, nudging=True)
+        phone.wait(lambda each: each == confirm, "the button that confirms the second device", 30, nudging=True)
         # The page is shown the request with a ceremony; the lock goes while it is listed, and the
-        # page is told: the button goes, and the request and its value stay.
+        # page is told: the button goes, and the request and its value stay. The screen must show the
+        # request's value without the button: a screen that shows neither is a tree not yet drawn.
         phone.run("shell", "locksettings", "clear", "--old", SCREEN_LOCK_PIN)
-        phone.wait_gone(
-            lambda each: each.startswith("Confirm with"), "the button, once the phone has no screen lock", 120
+
+        def listed_without_the_button(nodes: list[dict]) -> bool:
+            labels = [each["label"] for each in nodes if each["label"]]
+            return any(spelled in each for each in labels) and not any(each.startswith("Confirm with") for each in labels)
+
+        phone.wait_screen(
+            listed_without_the_button,
+            "the request listed with no button, once the phone has no screen lock",
+            120,
+            nudging=True,
         )
-        if phone.find(lambda each: spelled in each) is None:
-            phone.give_up("the request left the list when the screen lock went")
         phone.shot("confirm-no-lock")
         say("a phone with no screen lock offers no way to confirm, and still lists the request")
         phone.run("shell", "locksettings", "set-pin", SCREEN_LOCK_PIN)
-        phone.tap(phone.wait(lambda each: each == confirm, "the button, once the screen lock is back", 120))
+        phone.tap(phone.wait(lambda each: each == confirm, "the button, once the screen lock is back", 120, nudging=True))
         enter_screen_lock(phone)
         phone.wait(lambda each: each.startswith("Confirmed."), "the words for a confirmed request", 60)
         wait_for_file(directory, "device-result.txt", 90)
