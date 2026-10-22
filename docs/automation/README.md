@@ -53,7 +53,7 @@ effect class, the ingress an actor may reach it through, the rights it requires,
 selectors, its freshness and its idempotency. Each method names the exact definition revision it
 acts on, and a request whose revision does not match the document it carries is refused.
 
-## Every mutation is an action
+## Actions and their records
 
 `workflow.install`, `workflow.enable`, `workflow.pause` and `workflow.run` are actions. Each
 carries the caller's action identifier, and the workflow journal records what it came to in the
@@ -381,31 +381,40 @@ the unit it derives them for. Nothing a caller sends names any of them.
   request. It names the chain by its causal root, the grant it is made under, and the budget
   generation it leaves, which `workflow.read` shows beside the chain's budget. The grant has to be
   one this host holds as live, for this environment, with the right to manage automation; no event
-  carries one. A paired device names the grant it holds and reaches only a chain whose root run
-  acts under that grant. Any other chain is answered as a root this host holds no budget for.
-  A chain whose budget has not run out is refused, since nothing about it is stopped. The re-arm
+  carries one. The owner names any such grant by its identifier, which `kr share list` and
+  `grant.list` show among the grants this host holds; `workflow.read` shows the grant each workflow acts under as its
+  `grant_reference`, and when that grant carries the right it is one to name. A paired device
+  names the grant it holds and reaches only a chain whose root run acts under that grant. Any
+  other chain is answered as a root this host holds no budget for. A chain whose budget has not run out is refused, since nothing about it is stopped. The re-arm
   advances the chain's generation and resets its counters without anybody raising a ceiling, and
   it continues the chain in the same transaction: every descendant the exhausted budget refused,
   which the journal kept with the refusal, is admitted once as a run of the same chain in the new
   generation, under its own workflow's grant and limits, and the record of it is spent whatever
-  that admission decides. The runs that start execute once the re-arm has committed. A daemon
-  that stops between the two finds them running in the journal and takes them up when it starts.
+  that admission decides. Each continued run keeps the grant its own workflow acts under, so a
+  re-arm made by a device also continues the workflows of the owner's that sit in its chain, under
+  their own grants. The runs that start execute once the re-arm has committed. A daemon that stops
+  between the two finds them running in the journal and takes them up when it starts.
   A descendant of a run from the previous generation that arrives afterwards carries that earlier
   generation and is refused as late, and a replay of a continued trigger is a duplicate.
 * **A repeat of a re-arm.** The generation the request names is what tells a repeat from a second
   re-arm. The request that moves a chain from generation 0 to generation 1 is answered with
   generation 1. Sent again, because its reply was lost, it finds the chain on generation 1, is
-  answered with that, and changes nothing, even if the chain has run out again in the meantime. A
-  request that names any other generation is refused as a conflict. Nothing is stored for the
-  request, so the journal's stored form is the one it had before the method existed.
+  answered with that, and changes nothing, even if the chain has run out again in the meantime. The
+  original request, freshness window and all, is answered the same way on a new connection before
+  its window is considered, to a caller that may re-arm the chain. Only the generation just after
+  the one the request names gets that answer. A request that names any other generation, a request
+  from an earlier re-arm included once the chain has been re-armed again, is refused as a conflict
+  or, when its window has expired, as a stale request, and gives no budget either way. Nothing is
+  stored for the request, so the journal's stored form is the one it had before the method existed.
 * **What a re-arm does not do.** It continues the descendants the budget refused when the chain
   tried to admit them, which is how a chain that reached its depth or run ceiling goes on. A run
   stopped at a node, because the chain's action, session or spend allowance ran out when the node
   was to be dispatched, stays paused. Nothing resumes a paused run, so the re-arm gives that
-  chain a new budget and does not restart the run; the chain goes on from a new external trigger.
-  The attention item the exhausted chain raised also stays open after a re-arm until it is
-  acknowledged, because ending it takes a journal event that the journal's stored form has no
-  place for.
+  chain a new budget and does not restart the run. A new external trigger starts an independent
+  chain with a root of its own and spends none of this chain's budget. The attention item the
+  exhausted chain raised also stays open after a re-arm until it is acknowledged, because ending it
+  takes a journal event that the journal's stored form has no place for. A chain that runs out a
+  second time adds to the item that is still open and raises no new one.
 * **External triggers.** A trigger with no verifiable causal parent, an unauthenticated callback
   among them, is a new external trigger: the host mints its root and host-wide admission bounds
   it. It can never adopt a causal root of its choosing. The host does not claim to recover
@@ -588,15 +597,16 @@ A test result is what this host observed, and nothing a caller reports.
   records, after the copy is made and before the suite starts, what the platform says about the
   copy's own directory and about every file and directory beneath it: the kind of object, its
   device and inode, its length, the time it was last modified and the time its inode last changed.
-  The change time is the one a run cannot put back. A write, a truncation, a rename, a change of
-  mode and a change of time each move it to the moment they happen, and no call a process can make
-  sets it to an earlier one. When the session has closed, the host records the same again. An
-  entry that is added, gone or different means something was written while the suite ran, and then
-  the result attests no version although the copy reads as the version. A file made and removed
-  again counts, because it moves the change time of the directory it was in. Two checks make equal
+  The change time is the one a run cannot put back. A write, a truncation, a change of mode and a
+  change of time each move it to the moment they happen, a rename moves it for the directories it
+  changes (and on some filesystems for the renamed entry too), and no call a process can make sets
+  it to an earlier one. When the session has closed, the host records the same again. An entry
+  that is added, gone or different means something was written while the suite ran, and then the
+  result attests no version although the copy reads as the version. A file made and removed again
+  counts, because it moves the change time of the directory it was in. Two checks make equal
   records mean what they say. The filesystem has to be one whose change times this host knows to be
-  kept (ext2 to ext4, XFS, Btrfs, tmpfs, overlayfs, F2FS and ZFS on Linux; APFS and HFS+ on
-  macOS), and on any other the result is indeterminate. And before the suite starts the host waits,
+  kept (ext2 to ext4, XFS, Btrfs, tmpfs, overlayfs, F2FS and ZFS on Linux; APFS on macOS), and on
+  any other the result is indeterminate. And before the suite starts the host waits,
   for up to three seconds, until the filesystem's own clock has passed the newest change time it
   recorded, so that a change made in the same tick as the record still shows. The record is kept in
   the daemon's memory by the dispatch that waits for the session, so a daemon that stops while the
@@ -625,18 +635,29 @@ A test result is what this host observed, and nothing a caller reports.
   the output's parent, is the one place whose own record the host does not compare, because
   creating the output changes it, and a record cannot tell the output from a name written beside
   it. The host watches the parent by name instead, from before the suite starts to after it has
-  ended. A name created, removed, renamed, written or changed there, other than a declared output,
-  makes the result indeterminate however briefly it existed: a scratch file the suite made and
-  removed again at the copy's root, beside an output called `target`, is such a name. On Linux the
-  watcher is the kernel's inotify. On macOS it is FSEvents, which reports on its own schedule, so
-  the host writes a file of its own beside the copy and waits, for up to ten seconds, until the
-  watcher reports it, which means every report up to then has arrived. A watcher that cannot
-  start, that lost reports or that does not answer in that time makes the result indeterminate,
-  and so does a platform with no watcher whenever a suite declares an output. A suite that removes
-  a directory above its declared output is writing outside the output. A file the suite adds
+  ended. A name created, removed, renamed or changed there, other than a declared output, makes
+  the result indeterminate however briefly it existed: a scratch file the suite made and removed
+  again at the copy's root, beside an output called `target`, is such a name. The parent itself is
+  watched too, because a record that leaves it out would miss what is done to it: a report that it
+  was renamed, removed, or had its mode, owner or attributes changed makes the result
+  indeterminate, and so does the same for the copy's own directory, which is a parent when an
+  output is at its root. A suite that removes a directory above its declared output, or moves its
+  copy away, writes in it and moves it back, is writing outside the output. On Linux the watcher
+  is the kernel's inotify, which follows the directory it was set on wherever it is renamed to. On
+  macOS it is FSEvents, which reports by path and on its own schedule. The host judges each
+  report as it arrives, and it writes a file of its own beside the copy and waits, for up to ten
+  seconds, until the watcher reports it, which means every report up to then has arrived.
+  FSEvents reports that it dropped reports with the path of the volume's root, and the library it
+  is used through discards a report whose path is not at or beneath a path watched, so the host
+  also watches the root of the volume, without descending into it, and any such report makes the
+  result indeterminate. A watcher that cannot start, that lost reports or that does not answer in
+  that time makes the result indeterminate, and so does a platform with no watcher whenever a
+  suite declares an output. A file the suite adds
   beside an output is not left out of the comparison and changes the source (an added empty
-  directory does not, unless the reading cannot open or list it, reaches a bound, or the change
-  set's rules keep its path out, which makes the source indeterminate), so a tool that writes beside
+  directory leaves the source as it was, unless the reading cannot open or list it, reaches a
+  bound, or the change set's rules keep its path out, which makes the source indeterminate, so no
+  version of its own is stored for it; the record sees the new entry all the same, and the result
+  attests no version), so a tool that writes beside
   each source directory (a compiled-code cache is the usual one) makes a run of that suite that
   exits with status zero unknown and, where what the copy held can be read completely, stores what
   it wrote as a version of its own under the conditions given above. An output path must be exactly
