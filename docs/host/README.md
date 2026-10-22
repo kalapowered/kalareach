@@ -1588,8 +1588,8 @@ only, or battery as well.
 
 With it on, the host holds the platform's own assertion against automatic sleep while it has
 verified foreground work or a request it has accepted and not answered: a session whose worker
-reports an agent at work, a session waiting for a decision to be answered, or a closure that is
-still stopping processes and draining their output. Work begins and ends without this daemon being
+reports an agent at work, a session waiting for a decision or for the answer to a question an
+agent asked, or a closure that is still stopping processes and draining their output. Work begins and ends without this daemon being
 told, so while the setting is on it looks at the question every fifteen seconds as well as whenever
 a session is created or closed and whenever it is asked; while the setting is off nothing looks at
 anything. A close that arrived over the network reaches the same review at the same point, when
@@ -1604,6 +1604,21 @@ The assertion is held by running the platform's facility as a child with a pipe 
 releasing it is closing the pipe and a daemon that dies releases everything it held. A facility
 that has already exited holds nothing, so one that does is reported as an assertion this host does
 not have rather than as one it does.
+
+What a session's worker reports is what holds the session's terminal and what its agents wait for,
+and it is the worker's own account, not a guess from the output. A request counts once a connector's
+table has answered its method and a binding with the decoding grant has interpreted it as an
+approval, until it is settled; a reverse request that nothing interpreted is not one a person can
+decide, and counts for nothing. A question counts while it is open, which ends when it is answered,
+withdrawn or expired, or when the program that asked has gone. An agent counts as at work for a turn
+that its connector's table names the start and the end of; a program with no turn routes in its
+table, such as one whose hooks give no turn boundary, is never reported as at work, because the
+worker does not know that it is. A program that holds the terminal, with none of these, has no state
+of its own, and the shell at its prompt is ready. The program's name is the file name of the command
+the shell integration answered for when it answered for one, and otherwise of the executable the
+foreground process group's leader runs, once two looks in a row have found the same group; a
+program run through an interpreter is named by the interpreter. A session that has closed reports no
+state.
 
 An assertion asks the operating system not to sleep on its own. It does not stop a closed lid, a
 forced sleep or a platform policy that overrides the request, and none of those need to be stopped:
