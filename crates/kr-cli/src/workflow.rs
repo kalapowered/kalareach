@@ -17,7 +17,7 @@ use kr_protocol::ids::{CausalRootId, GrantId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64};
 
-use crate::cli::{WorkflowCommand, WorkflowRearmArguments};
+use crate::cli::{EnvironmentSelector, WorkflowCommand, WorkflowRearmArguments};
 use crate::daemon::{Daemon, identifier};
 use crate::error::{CliError, Result};
 use crate::output::{self, closed_word};
@@ -53,11 +53,12 @@ async fn rearm(
     };
     // Said before the request is sent: a reply that is lost leaves a person with no other way to
     // know which generation to name, and a repeat that names it gives no second budget.
+    let environment = environment_flag(&daemon, &arguments.selector);
     report::say(&shown!(
         "Rearming chain {} from budget generation {}. {}",
         closed_word(&root),
         generation,
-        repeat_with(root, grant, generation)
+        repeat_with(root, grant, generation, &environment)
     ));
     let rearmed: WorkflowRearmResult = match daemon
         .mutate(
@@ -75,7 +76,7 @@ async fn rearm(
         Err(error) => {
             if !matches!(&error, CliError::Refused(refusal) if refusal.code != ErrorCode::OutcomeUnknown)
             {
-                report::say(&repeat_with(root, grant, generation));
+                report::say(&repeat_with(root, grant, generation, &environment));
             }
             return Err(error);
         }
@@ -94,14 +95,25 @@ async fn rearm(
 
 /// What a person does when the reply to a rearm may not have reached them: the command that
 /// names the generation, which a chain already on the generation after it answers without giving a
-/// second budget.
-fn repeat_with(root: CausalRootId, grant: GrantId, generation: u64) -> Shown {
+/// second budget. It names the environment the rearm was sent to when this command was given one.
+fn repeat_with(root: CausalRootId, grant: GrantId, generation: u64, environment: &Shown) -> Shown {
     shown!(
-        "If the reply does not arrive, run: kr workflow rearm {} --grant {} --generation {}",
+        "If the reply does not arrive, run: kr workflow rearm {} --grant {} --generation {}{}",
         closed_word(&root),
         closed_word(&grant),
-        generation
+        generation,
+        *environment
     )
+}
+
+/// What `--environment` says in a command printed for a person to run: nothing when this command
+/// was not given one, since the default is the same for the person's next command.
+fn environment_flag(daemon: &Daemon, selector: &EnvironmentSelector) -> Shown {
+    if selector.environment.is_some() {
+        shown!(" --environment {}", daemon.environment_id())
+    } else {
+        Shown::said("")
+    }
 }
 
 /// The budget generation the daemon says a chain is on.
