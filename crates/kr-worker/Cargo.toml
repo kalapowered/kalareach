@@ -79,7 +79,7 @@ sysinfo.workspace = true
 # The pause the host's own tests use to enter the window between a durable receipt acceptance and
 # the broker's admission of the same mutation. It compiles to nothing without this feature, and no
 # shipped build enables it.
-testing = []
+testing = ["kr-plugin-service/testing"]
 
 [dev-dependencies]
 # This crate's own tests, with the pause above compiled in. A test cannot otherwise stand inside

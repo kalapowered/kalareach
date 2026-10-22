@@ -888,6 +888,8 @@ pub struct Broker {
     /// What the worker has to offer the components of its bindings to observe, and what each has
     /// missed.
     observation: Arc<observation::ObservationLane>,
+    /// The requests waiting for a component to decode them.
+    decoding: Arc<decoding::DecodeQueue>,
     /// What this worker asks the control daemon about drafts.
     drafts: Arc<crate::daemon_link::Drafts>,
     /// Where the next recovery stops before it writes the gap, for this host's own tests.
@@ -1030,6 +1032,7 @@ impl Broker {
             description_facts: std::sync::OnceLock::new(),
             component_calls: Arc::new(prepare::ComponentCalls::new()),
             observation: Arc::new(observation::ObservationLane::new()),
+            decoding: Arc::new(decoding::DecodeQueue::default()),
             drafts: Arc::new(crate::daemon_link::Drafts::new()),
             #[cfg(feature = "testing")]
             recovery_pause: Mutex::new(None),

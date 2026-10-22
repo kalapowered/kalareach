@@ -226,7 +226,7 @@ async fn read_until_ended(
             }) => {
                 launch.broker.note_relayed_approval(connection, now);
                 // A request no binding may decode stays recorded and unanswerable here.
-                let _ = launch.broker.interpret_declared(resource.resource_id, now);
+                let _ = launch.broker.interpret_request(resource.resource_id, now);
             }
             Ok(UpstreamArrival::Forward { resource: None, .. }) => {}
             Ok(UpstreamArrival::Reverse(_)) => {
