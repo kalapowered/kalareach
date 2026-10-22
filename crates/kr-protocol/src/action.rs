@@ -485,8 +485,8 @@ pub struct WorkerBarrier {
     /// How many names this worker holds that have not reached this daemon yet.
     ///
     /// Nought means the evidence is complete. Anything else says a page exchange has not happened
-    /// yet or did not finish; the names are in the worker's journal and the next announcement
-    /// continues from where the last page ended.
+    /// yet or did not finish; the names are in the worker's journal and the daemon asks for them
+    /// again, from where the last page ended, apart from any announcement.
     pub names_pending: U64,
     /// Why this worker's barrier has not held, or what is still outstanding about one that has.
     pub detail: String,

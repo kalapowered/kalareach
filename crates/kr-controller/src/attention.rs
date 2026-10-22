@@ -4396,7 +4396,7 @@ pub(crate) mod tests {
     }
 
     /// KR-REQ-18.02 and KR-REQ-10.49: a summary is generated text, so it is served to a paired device
-    /// whatever its grant's history, and asked for by none. A grant that starts before the earliest
+    /// under no grant's history, and asked for by none. A grant that starts before the earliest
     /// change is not served one either, since the moments the log holds are when the host observed
     /// the changes and not when the text they name was produced; the owner's is asked for the
     /// interval, with the moments of its earliest and latest change.

@@ -1285,8 +1285,8 @@ impl AuthorityBarrier {
             // this to say rather than nothing.
             BarrierState::Acknowledged | BarrierState::Ended if pending_names > 0 => format!(
                 "this worker's barrier holds, and {pending_names} of the actions its fence named \
-                 have not reached this daemon yet; they are in its journal and the next \
-                 announcement continues from where the last page ended"
+                 have not reached this daemon yet; they are in its journal and the daemon asks \
+                 for them again, from where the last page ended"
             ),
             // Names that went before they arrived. The worker says how many it no longer holds,
             // and a result missing that many actions is not the complete one section 9 asks for.
