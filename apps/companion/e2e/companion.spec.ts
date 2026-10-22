@@ -3944,6 +3944,32 @@ test.describe('a new session and its shell', () => {
   })
 })
 
+// KR-REQ-26.13: the shell a new session starts on is the host's answer, and the sheet says which
+// rung of the host's order gave it, at every width the window has.
+test.describe('a new session on the shell the host defaults to', () => {
+  test('starts on the host’s configured shell and says where that came from', async ({ page }) => {
+    await open(page)
+    await page.evaluate(() => {
+      window.krTestHost?.withDefaultShell('native_compat', 'host_configuration')
+    })
+    await page.getByRole('button', { name: 'Sessions' }).click()
+    await page.getByRole('button', { name: 'New session' }).click()
+    const sheet = page.getByTestId('sheet')
+    await expect(sheet).toHaveAttribute('data-presentation', 'here', { timeout: PRESENTATION_DEADLINE })
+    await expect(sheet.getByRole('radio', { name: /Stock shell/ })).toBeChecked()
+    const said = sheet.getByTestId('shell-default')
+    await expect(said).toContainText('This host starts a stock shell unless a session asks for another')
+    await expect(said).toContainText('chosen in its configuration')
+    await still(page, 'shell-default-from-configuration-26.13')
+
+    await sheet.getByRole('radio', { name: /Managed shell/ }).check()
+    await expect(said).toContainText('Your choice here is for this session only')
+    // Nothing the sheet says spills past its own width.
+    const overflow = await sheet.evaluate((element) => element.scrollWidth - element.clientWidth)
+    expect(overflow).toBeLessThanOrEqual(0)
+  })
+})
+
 // KR-REQ-13.17: a pinch on the phone's terminal scales the text around the point between the
 // fingers, as far as they go and back, and settles on a zoom step only when they lift. Two fingers
 // are sent through Chromium's own input pipeline, which WebKit's driver has no way to do.
