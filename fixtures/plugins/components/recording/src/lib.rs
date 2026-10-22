@@ -10,7 +10,7 @@
 //!
 //! What it does with an event's bytes, so that a case can make it misbehave from outside:
 //!
-//! | Bytes begin with | The component |
+//! | Bytes hold | The component |
 //! | --- | --- |
 //! | `!spin-observe` | never returns from `observe` |
 //! | `!spin-snapshot` | never returns from the next `snapshot` |
@@ -106,6 +106,11 @@ fn digest(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Whether `bytes` hold `pattern` anywhere.
+fn holds(bytes: &[u8], pattern: &[u8]) -> bool {
+    bytes.windows(pattern.len()).any(|window| window == pattern)
+}
+
 fn provenance_name(provenance: Provenance) -> &'static str {
     match provenance {
         Provenance::NativeProtocol => "native_protocol",
@@ -158,13 +163,13 @@ impl Guest for Component {
                 state.requests.remove(0);
             }
         }
-        if event.bytes.starts_with(b"!spin-snapshot") {
+        if holds(&event.bytes, b"!spin-snapshot") {
             state.spin_snapshot = true;
         }
-        if event.bytes.starts_with(b"!spin-observe") {
+        if holds(&event.bytes, b"!spin-observe") {
             spin();
         }
-        if event.bytes.starts_with(b"!trap") {
+        if holds(&event.bytes, b"!trap") {
             core::arch::wasm32::unreachable();
         }
         draw("observed", state.observes)

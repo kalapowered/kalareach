@@ -144,7 +144,7 @@ pub struct Options {
     /// Whether the plugin host's epoch runs or is held.
     pub epoch: Epoch,
     /// The command the session runs.
-    pub shell: &'static str,
+    pub shell: String,
     /// The bindings to make.
     pub bindings: Vec<Spec>,
 }
@@ -154,7 +154,7 @@ impl Options {
     pub fn with(bindings: Vec<Spec>) -> Self {
         Self {
             epoch: Epoch::Held,
-            shell: "exec cat",
+            shell: "exec cat".to_owned(),
             bindings,
         }
     }
@@ -302,7 +302,7 @@ impl Observing {
             }
         }
         let mut installed_components = Vec::new();
-        let hosted = hosted_running(options.epoch, None, options.shell).await;
+        let hosted = hosted_running(options.epoch, None, &options.shell).await;
         for name in &components {
             let wasm = component(name)?;
             installed_components.push((*name, install_named(&hosted, name, &wasm)));
@@ -488,6 +488,24 @@ impl Observing {
         self.sender
             .send(frame.to_string())
             .expect("the upstream is running");
+    }
+
+    /// Everything the session has retained of the terminal's output, as text.
+    pub fn output(&self) -> String {
+        let session = self.hosted._runtime.session();
+        let mut seen = Vec::new();
+        let mut cursor = 0_u64;
+        loop {
+            let Ok(page) = session.history_page(cursor, 1024 * 1024) else {
+                break;
+            };
+            if page.bytes.as_slice().is_empty() {
+                break;
+            }
+            seen.extend_from_slice(page.bytes.as_slice());
+            cursor = page.next_cursor.get();
+        }
+        String::from_utf8_lossy(&seen).into_owned()
     }
 
     /// Waits until a binding is registered and ready to be offered observations.
@@ -685,3 +703,19 @@ async fn upstream(
 
 /// How long a case lets the daemon and the host settle before it gives up on a start.
 pub const START_PATIENCE: Duration = PATIENCE;
+
+/// The highest `kalareach-<n>` line in the terminal's output.
+pub fn highest_line(text: &str) -> Option<u64> {
+    text.match_indices("kalareach-")
+        .filter_map(|(at, _)| {
+            let rest = &text[at + "kalareach-".len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse::<u64>().ok()
+        })
+        .max()
+}
+
+/// How many questions of the shell's the terminal has answered.
+pub fn answered(text: &str) -> usize {
+    text.matches("answered-").count()
+}
