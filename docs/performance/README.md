@@ -14,9 +14,10 @@ A reference host has:
 * at least 8 GiB of memory, as the operating system reports it (`MemTotal` on Linux, `hw.memsize` on
   macOS);
 * its operating system and architecture recorded beside every figure taken on it;
-* for a figure that waits on a durable write, as an attach does, a disk that makes one in at most
-  25 ms in the slowest tenth of a run of synced appends, read at both edges in the directory the host
-  keeps its state in (on Linux; other platforms leave it unverified);
+* for a figure that waits on a durable write, as an attach does, a normal local disk, which this
+  record reads as one that makes a durable write in at most 25 ms in the slowest tenth of a run of
+  synced appends, read at both edges in the directory the host keeps its state in (on Linux; other
+  platforms leave it unverified);
 * nothing else running while a figure is taken.
 
 `scripts/bench-all.sh` checks the last condition from ten seconds before each measurement until it
