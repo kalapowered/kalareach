@@ -507,17 +507,17 @@ fn the_doctor_shows_what_each_launch_probe_read() {
 /// adapter that did not answer.
 fn measured() -> HostDoctorResult {
     use kr_protocol::metrics::{
-        Adapter, Attempt, Environment, Fault, Outcome, Recorder, Transport,
+        Adapter, Attempt, Environment, Fault, MetricOutcome, Recorder, Transport,
     };
     let recorder = Recorder::new(Environment::Production);
     recorder.reconnected(
         Transport::Relay,
         Attempt::TwoToThree,
-        Outcome::Ok,
+        MetricOutcome::Ok,
         std::time::Duration::from_millis(4_250),
     );
     recorder.parse_faulted(Fault::InvalidEncoding, 3);
-    recorder.adapter_failed(Adapter::GeminiCli, Outcome::Timeout);
+    recorder.adapter_failed(Adapter::GeminiCli, MetricOutcome::Timeout);
     result().with_metrics(recorder.report())
 }
 

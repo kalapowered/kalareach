@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use kr_protocol::ids::DeviceId;
-use kr_protocol::metrics::{Attempt, Outcome, Recorder, Transport};
+use kr_protocol::metrics::{Attempt, MetricOutcome, Recorder, Transport};
 use kr_transport::clock::ContinuousInstant;
 
 /// What the host has seen of one device's connections.
@@ -54,7 +54,7 @@ impl Reconnects {
         device: DeviceId,
         now: ContinuousInstant,
         transport: Transport,
-        outcome: Outcome,
+        outcome: MetricOutcome,
     ) {
         let mut devices = self
             .devices
@@ -72,7 +72,7 @@ impl Reconnects {
                 );
             }
         }
-        if outcome == Outcome::Ok {
+        if outcome == MetricOutcome::Ok {
             presence.live = presence.live.saturating_add(1);
             presence.ended_at = None;
             presence.seen = 0;
@@ -102,7 +102,7 @@ mod tests {
 
     use kr_protocol::ids::DeviceId;
     use kr_protocol::metrics::{
-        Attempt, Environment, Outcome, ReconnectTime, Recorder, Report, Transport,
+        Attempt, Environment, MetricOutcome, ReconnectTime, Recorder, Report, Transport,
     };
     use kr_protocol::scalars::{U64, Uuid};
     use kr_transport::clock::{ContinuousClock as _, ManualClock};
@@ -125,7 +125,7 @@ mod tests {
     fn series(
         transport: Transport,
         attempt: Attempt,
-        outcome: Outcome,
+        outcome: MetricOutcome,
         count: u64,
         total_ms: u64,
         longest_ms: u64,
@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn a_device_that_comes_back_is_counted_with_the_time_it_was_gone() {
         let (clock, recorder, reconnects) = world();
-        reconnects.arrived(device(1), clock.now(), Transport::Relay, Outcome::Ok);
+        reconnects.arrived(device(1), clock.now(), Transport::Relay, MetricOutcome::Ok);
         assert!(
             recorder.report().is_empty(),
             "the first connection since the host started has no gap before it"
@@ -154,13 +154,13 @@ mod tests {
         clock.advance(Duration::from_secs(60));
         reconnects.departed(device(1), clock.now());
         clock.advance(Duration::from_millis(4_500));
-        reconnects.arrived(device(1), clock.now(), Transport::Direct, Outcome::Ok);
+        reconnects.arrived(device(1), clock.now(), Transport::Direct, MetricOutcome::Ok);
         assert_eq!(
             recorder.report().reconnect_time,
             [series(
                 Transport::Direct,
                 Attempt::One,
-                Outcome::Ok,
+                MetricOutcome::Ok,
                 1,
                 4_500,
                 4_500
@@ -173,9 +173,9 @@ mod tests {
     #[test]
     fn a_gap_begins_when_the_last_connection_of_a_device_ends() {
         let (clock, recorder, reconnects) = world();
-        reconnects.arrived(device(1), clock.now(), Transport::Relay, Outcome::Ok);
+        reconnects.arrived(device(1), clock.now(), Transport::Relay, MetricOutcome::Ok);
         clock.advance(Duration::from_secs(1));
-        reconnects.arrived(device(1), clock.now(), Transport::Direct, Outcome::Ok);
+        reconnects.arrived(device(1), clock.now(), Transport::Direct, MetricOutcome::Ok);
         clock.advance(Duration::from_secs(1));
         reconnects.departed(device(1), clock.now());
         clock.advance(Duration::from_secs(10));
@@ -185,13 +185,13 @@ mod tests {
         );
         reconnects.departed(device(1), clock.now());
         clock.advance(Duration::from_secs(7));
-        reconnects.arrived(device(1), clock.now(), Transport::Relay, Outcome::Ok);
+        reconnects.arrived(device(1), clock.now(), Transport::Relay, MetricOutcome::Ok);
         assert_eq!(
             recorder.report().reconnect_time,
             [series(
                 Transport::Relay,
                 Attempt::One,
-                Outcome::Ok,
+                MetricOutcome::Ok,
                 1,
                 7_000,
                 7_000
@@ -205,14 +205,19 @@ mod tests {
     #[test]
     fn a_refused_attempt_is_counted_and_the_one_that_succeeds_reports_its_ordinal() {
         let (clock, recorder, reconnects) = world();
-        reconnects.arrived(device(1), clock.now(), Transport::Relay, Outcome::Ok);
+        reconnects.arrived(device(1), clock.now(), Transport::Relay, MetricOutcome::Ok);
         reconnects.departed(device(1), clock.now());
         for _ in 0..3 {
             clock.advance(Duration::from_secs(2));
-            reconnects.arrived(device(1), clock.now(), Transport::Relay, Outcome::Refused);
+            reconnects.arrived(
+                device(1),
+                clock.now(),
+                Transport::Relay,
+                MetricOutcome::Refused,
+            );
         }
         clock.advance(Duration::from_secs(2));
-        reconnects.arrived(device(1), clock.now(), Transport::Relay, Outcome::Ok);
+        reconnects.arrived(device(1), clock.now(), Transport::Relay, MetricOutcome::Ok);
         let report = recorder.report();
         assert_eq!(
             report.reconnect_time,
@@ -220,7 +225,7 @@ mod tests {
                 series(
                     Transport::Relay,
                     Attempt::One,
-                    Outcome::Refused,
+                    MetricOutcome::Refused,
                     1,
                     2_000,
                     2_000
@@ -228,7 +233,7 @@ mod tests {
                 series(
                     Transport::Relay,
                     Attempt::TwoToThree,
-                    Outcome::Refused,
+                    MetricOutcome::Refused,
                     2,
                     10_000,
                     6_000
@@ -236,7 +241,7 @@ mod tests {
                 series(
                     Transport::Relay,
                     Attempt::FourToEight,
-                    Outcome::Ok,
+                    MetricOutcome::Ok,
                     1,
                     8_000,
                     8_000
@@ -245,7 +250,7 @@ mod tests {
         );
         // Admitted, the device has a connection and is no longer counted against a gap.
         clock.advance(Duration::from_secs(1));
-        reconnects.arrived(device(1), clock.now(), Transport::Relay, Outcome::Ok);
+        reconnects.arrived(device(1), clock.now(), Transport::Relay, MetricOutcome::Ok);
         assert_eq!(recorder.report(), report);
     }
 
@@ -254,24 +259,29 @@ mod tests {
     #[test]
     fn a_device_never_seen_connected_has_no_gap_and_devices_are_counted_apart() {
         let (clock, recorder, reconnects) = world();
-        reconnects.arrived(device(1), clock.now(), Transport::Relay, Outcome::Refused);
+        reconnects.arrived(
+            device(1),
+            clock.now(),
+            Transport::Relay,
+            MetricOutcome::Refused,
+        );
         clock.advance(Duration::from_secs(5));
-        reconnects.arrived(device(1), clock.now(), Transport::Relay, Outcome::Ok);
+        reconnects.arrived(device(1), clock.now(), Transport::Relay, MetricOutcome::Ok);
         assert_eq!(recorder.report(), Report::default());
 
-        reconnects.arrived(device(2), clock.now(), Transport::Relay, Outcome::Ok);
+        reconnects.arrived(device(2), clock.now(), Transport::Relay, MetricOutcome::Ok);
         reconnects.departed(device(1), clock.now());
         reconnects.departed(device(2), clock.now());
         clock.advance(Duration::from_secs(3));
-        reconnects.arrived(device(2), clock.now(), Transport::Relay, Outcome::Ok);
+        reconnects.arrived(device(2), clock.now(), Transport::Relay, MetricOutcome::Ok);
         clock.advance(Duration::from_secs(1));
-        reconnects.arrived(device(1), clock.now(), Transport::Relay, Outcome::Ok);
+        reconnects.arrived(device(1), clock.now(), Transport::Relay, MetricOutcome::Ok);
         assert_eq!(
             recorder.report().reconnect_time,
             [series(
                 Transport::Relay,
                 Attempt::One,
-                Outcome::Ok,
+                MetricOutcome::Ok,
                 2,
                 7_000,
                 4_000
