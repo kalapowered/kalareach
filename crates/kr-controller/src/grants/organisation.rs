@@ -809,6 +809,11 @@ impl Enrolment {
         });
     }
 
+    /// Takes the policy `earlier`, the same enrolment before a change, had applied, or none.
+    pub(crate) fn take_applied_policy_of(&mut self, earlier: Option<&Self>) {
+        self.applied = earlier.and_then(|earlier| earlier.applied.clone());
+    }
+
     /// The highest head revision this host has accepted.
     #[must_use]
     pub const fn accepted_head(&self) -> PolicyKeyRevision {

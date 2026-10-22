@@ -22,6 +22,12 @@
 //! writes nothing here. A stop between the two writes leaves the policy the host last answered
 //! for in force at the next start, with the registry's part of the change, which is the chain a
 //! request followed, recorded. The same policy applied again then writes the file.
+//!
+//! A write of the file that fails leaves the host as that stop does, and the policy in force is
+//! the same in memory: the chain the registry took is in force, and so is the policy the host last
+//! answered for. A write that failed only when it flushed the directory may have put the new
+//! record in place, and then the next start applies a policy that the answer said was not
+//! applied.
 
 use std::path::{Path, PathBuf};
 

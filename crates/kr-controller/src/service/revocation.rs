@@ -524,6 +524,7 @@ impl Controller {
         self.commit_policy(
             |policy| Ok(change(policy)),
             |grants, snapshot, _| grants.store_policy(snapshot),
+            |_| Ok(()),
         )
     }
 
@@ -546,15 +547,19 @@ impl Controller {
         change: impl FnOnce(&mut crate::grants::HostPolicy) -> Result<(T, Vec<u8>)>,
         still_admitted: impl FnOnce() -> Result<()>,
     ) -> Result<T> {
-        self.commit_policy(change, |grants, snapshot, (_, answer)| {
-            grants.store_policy_claimed(
-                snapshot,
-                hold,
-                answer,
-                kr_ipc::now_ms().get(),
-                still_admitted,
-            )
-        })
+        self.commit_policy(
+            change,
+            |grants, snapshot, (_, answer)| {
+                grants.store_policy_claimed(
+                    snapshot,
+                    hold,
+                    answer,
+                    kr_ipc::now_ms().get(),
+                    still_admitted,
+                )
+            },
+            |_| Ok(()),
+        )
         .map(|(value, _)| value)
     }
 
@@ -572,16 +577,20 @@ impl Controller {
         ending: Option<&crate::grants::ExclusiveEnding>,
         still_admitted: impl FnOnce(&rusqlite::Connection) -> Result<()>,
     ) -> Result<T> {
-        self.commit_policy(change, |grants, snapshot, (_, answer)| {
-            grants.store_policy_checked(
-                snapshot,
-                hold,
-                answer,
-                kr_ipc::now_ms().get(),
-                ending,
-                still_admitted,
-            )
-        })
+        self.commit_policy(
+            change,
+            |grants, snapshot, (_, answer)| {
+                grants.store_policy_checked(
+                    snapshot,
+                    hold,
+                    answer,
+                    kr_ipc::now_ms().get(),
+                    ending,
+                    still_admitted,
+                )
+            },
+            |_| Ok(()),
+        )
         .map(|(value, _)| value)
     }
 
@@ -594,9 +603,19 @@ impl Controller {
     /// persist take effect anyway, and an error the caller sees would be an error about something
     /// that happened. A change that refuses leaves the policy, its epoch and the store as they were.
     ///
-    /// `write` is the whole of what is written down for the change, and gets the snapshot to write
-    /// to the registry. A change that writes more than the registry does it there, in the order
-    /// that leaves nothing the caller was refused behind.
+    /// `write` is what the registry takes of the change, and gets the snapshot to write to it.
+    /// `then` is what the change writes beside the registry, after the registry took it: the
+    /// applied policies, which the registry has no place for. A request the registry refuses
+    /// writes nothing in `then`, and a stop between the two leaves what `then` writes as it was.
+    ///
+    /// Once the registry took the change it is the host's policy, whatever `then` answers. The
+    /// registry is what a restart reads, and the policy in force follows it: a change the registry
+    /// holds but the policy in force lacks would be written over by the next change, which is
+    /// made from the policy in force. So when `then` fails, the policy in force takes the change
+    /// as the registry holds it, which is all of it but the applied policies `then` writes, and
+    /// the error is returned after that. Stopping the host's decisions until a write succeeded
+    /// would instead turn a disk fault that a repeated request repairs into a host that cannot
+    /// decide.
     pub(super) fn commit_policy<C>(
         &self,
         change: impl FnOnce(&mut crate::grants::HostPolicy) -> Result<C>,
@@ -605,6 +624,7 @@ impl Controller {
             &crate::grants::StoredPolicy,
             &C,
         ) -> Result<()>,
+        then: impl FnOnce(&C) -> Result<()>,
     ) -> Result<C> {
         let mut held = self
             .policy
@@ -625,6 +645,10 @@ impl Controller {
         )?;
         let snapshot = candidate.snapshot();
         write(self.sharing.grants(), &snapshot, &value)?;
+        let unwritten = then(&value).err();
+        if unwritten.is_some() {
+            candidate = candidate.with_applied_policies_of(&held);
+        }
         self.utc_floor.wrote(snapshot.utc_floor_ms.get());
         if next != previous
             && let Err(error) = self
@@ -648,7 +672,7 @@ impl Controller {
         // Published with the policy, under its lock, so a decision that reads this epoch reads the
         // policy it names or a later one.
         self.advance_authority_epoch();
-        Ok(value)
+        unwritten.map_or(Ok(value), Err)
     }
 
     /// Removes a revoked device's bindings from every organisation this host is enrolled in, so

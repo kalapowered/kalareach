@@ -927,6 +927,67 @@ async fn a_stop_between_the_two_writes_leaves_the_earlier_policy_and_the_policy_
     fixture.host.stop().await;
 }
 
+/// The chain a request followed is in the registry before the file of applied policies is written,
+/// and it stays in force when that file cannot be written: the key it replaced signs nothing more,
+/// while the file cannot be written, once it can, and after a restart. The policy the file could
+/// not hold is not in force, and the same policy applied again writes the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chain_the_registry_took_stays_in_force_when_the_file_of_applied_policies_cannot_be_written()
+ {
+    let mut fixture = Fixture::start().await;
+    let _repository = install_the_example(&fixture).await;
+    let now = fixture.now();
+    fixture.organisation.rotate(now - 1_000);
+    let policy = fixture.organisation.policy(3, 1, Some(&[CODEX]), now);
+    let chain = fixture.organisation.authority(now);
+    let old_key = fixture
+        .organisation
+        .policy(2, 1, Some(&[CODEX, EXAMPLE]), now - 2_000);
+    // A directory in the file's place: the registry takes the request, and the file is refused.
+    let in_the_way = applied::file_in(&state_dir(&fixture));
+    std::fs::create_dir(&in_the_way).expect("a directory in the file's place");
+
+    let refused = apply(&fixture, policy.clone(), Some(chain))
+        .await
+        .expect_err("the file of applied policies cannot be written");
+    assert_eq!(refused.code, ErrorCode::StorageUnavailable, "{refused:?}");
+    let listed = fixture.listed().await;
+    assert_eq!(
+        listed.enrolments[0].accepted_head.get(),
+        3,
+        "the chain the registry took is in force"
+    );
+    assert_eq!(
+        listed.enrolments[0].organisation_policy_revision,
+        Nullable::null(),
+        "the policy the file could not hold is not in force"
+    );
+    assert_eq!(listed.effective_adapter_allowlist, Nullable::null());
+
+    refused_as(
+        apply(&fixture, old_key.clone(), None).await,
+        "earlier_revision",
+    );
+    std::fs::remove_dir(&in_the_way).expect("the way is clear");
+    assert!(applied_policies(&fixture).is_empty());
+
+    let fixture = restart_over(fixture, |_| {}).await;
+    assert_eq!(
+        fixture.listed().await.enrolments[0].accepted_head.get(),
+        3,
+        "a restart keeps the chain the registry took"
+    );
+    refused_as(apply(&fixture, old_key, None).await, "earlier_revision");
+    assert!(is_admitted(&admission(&fixture).await));
+
+    apply(&fixture, policy, None)
+        .await
+        .expect("the same policy again applies, the chain being held");
+    assert_eq!(applied_policies(&fixture).len(), 1);
+    assert!(is_left_out_by_the_allowlist(&admission(&fixture).await));
+    fixture.host.stop().await;
+}
+
 /// Asks the host to apply `params`, lets the request reach the registry, passes `by` on both
 /// clocks while it waits for the registry's lock, and returns the refusal it ends with.
 async fn applied_while_time_passes(

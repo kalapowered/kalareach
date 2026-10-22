@@ -3102,7 +3102,7 @@ written to disk, is refused as every other decision of the clock is (`CLOCK_UNTR
    that a lease the host holds, and that is still in force, was signed after its key was succeeded
    (`chain_drops_leases`): dropping it owes a fence, which presenting the chain with a lease
    raises. That refusal ends with the lease, which lasts at most fifteen minutes; a lease that has
-   ended is dropped with the chain. A refused request keeps no chain.
+   ended is dropped with the chain. A request that these rules refuse keeps no chain.
 4. The policy is signed under the highest key revision the host has accepted. A policy under a
    later revision is refused, and asks for the chain beside it (`later_revision`). A policy under an
    earlier revision is refused whether or not the host still holds that revision's link, because
@@ -3146,11 +3146,22 @@ The request writes the registry row first and the file second, so a request the 
 writes nothing to the file, and a policy the file cannot hold is refused before anything is
 written. A stop between the two writes leaves the policy the host last answered for in force, with
 the chain the request followed recorded, and the same policy applied again, which needs no chain
-beside it any more, writes the file. An entry applies only to the enrolment it was applied for. A
-withdrawal writes the file again, without the entry of the organisation it left, or removes the
-file when no entry is left. A stop that leaves an entry of an enrolment that has ended behind
-names an enrolment the host no longer holds, so the next start drops it, and no later enrolment in
-the same organisation takes it.
+beside it any more, writes the file.
+
+A file that cannot be written once the registry took the request leaves the host the same way, with
+no restart: the request answers `STORAGE_UNAVAILABLE`, the chain it followed is in force, so the key
+it replaced signs no policy, and the policy the host last answered for stays in force with it. The
+host decides from what it will read again after a restart, and that is the registry: a chain that
+the disk holds and memory lacks would be written back over by the next change to the host's policy.
+The host does not stop deciding while the file cannot be written, because a disk fault that the same
+request repairs would then leave it unable to decide. A write that failed only when it flushed the
+directory may have put the new file in place, and then the next start applies a policy that the
+answer said was not applied.
+
+An entry applies only to the enrolment it was applied for. A withdrawal writes the file again,
+without the entry of the organisation it left, or removes the file when no entry is left. A stop
+that leaves an entry of an enrolment that has ended behind names an enrolment the host no longer
+holds, so the next start drops it, and no later enrolment in the same organisation takes it.
 
 The policy states other settings too: the least client version, the longest grant, what members'
 clients may reach outside KalaReach, the backup requirements and the audit retention. The host

@@ -386,11 +386,15 @@ impl Controller {
     /// is held, and then the policy is kept in the store of applied policies: a request that is
     /// refused, or whose policy the store could not hold, writes nothing there, and a stop between
     /// the two writes leaves the policy the host last answered for in force, with the chain the
-    /// request followed recorded. Only that the owner asked decides the admission: the
-    /// organisation's own statement binds this host through the keys the owner confirmed when
-    /// enrolling, and it never enlarges what this host allows without one, so it asks for no new
-    /// confirmation and owes no fence. A narrower list ends the bindings of the packages it leaves
-    /// out through the admission round every restriction on a package uses.
+    /// request followed recorded. A file that cannot be written once the registry took the request
+    /// answers `STORAGE_UNAVAILABLE` and leaves the host the same way, with no stop: the chain is
+    /// in force, and the earlier policy stays in force with it.
+    ///
+    /// Only that the owner asked decides the admission: the organisation's own statement binds
+    /// this host through the keys the owner confirmed when enrolling, and it never enlarges what
+    /// this host allows without one, so it asks for no new confirmation and owes no fence. A
+    /// narrower list ends the bindings of the packages it leaves out through the admission round
+    /// every restriction on a package uses.
     ///
     /// No answer is kept for the request, and none is needed: the same policy again is accepted as
     /// a repeat, changes nothing the host keeps and puts the list in force again, and the answer is
@@ -403,7 +407,8 @@ impl Controller {
     /// # Errors
     ///
     /// Returns the rule that refuses the policy, what the admission, the clock or the stores refuse
-    /// with, and `RESOURCE_UNAVAILABLE` or `STORAGE_UNAVAILABLE` when the policy is recorded and
+    /// with, `STORAGE_UNAVAILABLE` when the chain is recorded and the policy could not be written
+    /// down, and `RESOURCE_UNAVAILABLE` or `STORAGE_UNAVAILABLE` when the policy is recorded and
     /// its list is not yet in force.
     pub(super) async fn organisation_policy_apply(
         &self,
@@ -463,7 +468,7 @@ impl Controller {
                     let record = crate::grants::applied::encode(&policy.applied_policies())?;
                     Ok((answer, record))
                 },
-                |grants, snapshot, (_, record)| {
+                |grants, snapshot, _| {
                     grants.store_presentation(snapshot, None, || {
                         self.check_admission(&registry, &carried)?;
                         // A chain the policy followed was judged at a reading taken before the
@@ -477,8 +482,18 @@ impl Controller {
                             ),
                             None => Ok(()),
                         }
-                    })?;
-                    crate::grants::applied::publish(self.paths.state_dir(), record)
+                    })
+                },
+                |(_, record)| {
+                    crate::grants::applied::publish(self.paths.state_dir(), record).map_err(
+                        |error| ControllerError::Storage {
+                            operation: "write down the organisation policies this host applies",
+                            detail: format!(
+                                "the policy this host answered for before this request stays in \
+                                 force, and a newer chain the request carried is recorded: {error}"
+                            ),
+                        },
+                    )
                 },
             )?;
             answer

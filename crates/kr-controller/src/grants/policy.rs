@@ -928,6 +928,19 @@ impl HostPolicy {
         }
     }
 
+    /// This policy with the applied policies `earlier` holds in place of its own: what the
+    /// registry holds of a change whose applied policies could not be written down. The registry
+    /// has no place for the applied policies, so a change to the chains and the leases is in it
+    /// and the policy it was applied with is not. The change must not have added or removed an
+    /// enrolment.
+    #[must_use]
+    pub fn with_applied_policies_of(mut self, earlier: &Self) -> Self {
+        for (organisation_id, enrolment) in &mut self.enrolments {
+            enrolment.take_applied_policy_of(earlier.enrolments.get(organisation_id));
+        }
+        self
+    }
+
     /// The adapters this host admits under the policies its organisations applied: the adapters
     /// every enrolled organisation that states a list allows, which is the intersection of the
     /// lists, or none stated while no enrolled organisation states one.
