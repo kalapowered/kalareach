@@ -407,10 +407,24 @@ async fn a_daemon_does_not_take_over_work_that_runs_in_another_login_session() {
             "a daemon took over {left:?} work in another session"
         ));
         assert!(
-            refused.contains("login session") && refused.contains(&elsewhere.session.to_string()),
+            refused.contains(&format!("in session {}", elsewhere.session)),
             "the refusal names the session the work is in: {refused}"
         );
     }
+
+    // An earlier record may name the number the process now has, with the start of one that has
+    // ended: it is the later record that is work, and the earlier one does not hide it.
+    let stale = kr_protocol::identity::ProcessStartIdentity::new(
+        elsewhere.identity.pid.get(),
+        elsewhere.identity.source,
+        elsewhere.identity.start_value.get() - 1,
+    );
+    let host = TempHost::create();
+    leave(&host, Left::Worker, &stale);
+    leave(&host, Left::Claimed, &elsewhere.identity);
+    start_daemon(&host)
+        .await
+        .expect_err("a record of an ended process does not hide a record of a live one");
 
     // What runs in this daemon's own session is its to take over.
     let here = std::process::Command::new(system("PING.EXE"))
@@ -442,6 +456,31 @@ async fn a_daemon_does_not_take_over_work_that_runs_in_another_login_session() {
         .await
         .expect("a worker that has ended in another session is not work");
     let _ = here.0.kill();
+}
+
+/// KR-REQ-07.58: a recorded process the kernel will not describe is not work in another session.
+/// The processes of an environment are created by a task of the account that runs its daemon,
+/// which can open them, so a recorded number that this account cannot open belongs to another
+/// account's process by now, and a daemon that refused to start for it could not be cleared by
+/// anything but a restart of the machine. The kernel's answer for the number it never describes,
+/// the system idle process's, is the same "not established" that a refused access gives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recorded_process_the_kernel_will_not_describe_is_not_work_in_another_session() {
+    use kr_ipc::identity::{ProcessState, process_state};
+    use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
+
+    let recorded = ProcessStartIdentity::new(0, ProcessStartSource::WindowsProcessCreationTime, 1);
+    assert!(
+        matches!(process_state(&recorded), ProcessState::Unknown { .. }),
+        "the kernel does not establish what the number is"
+    );
+    for left in [Left::Worker, Left::Claimed] {
+        let host = TempHost::create();
+        leave(&host, left, &recorded);
+        start_daemon(&host).await.unwrap_or_else(|refused| {
+            panic!("{left:?} work on a number the kernel does not describe: {refused}")
+        });
+    }
 }
 
 /// Ends the process it holds when it is dropped.
