@@ -163,6 +163,11 @@ impl HeldDeviceAction {
 /// as one that may have executed. The worker then resumes, and the action is answered with the
 /// rejected receipt, its dispatch never marked and the upstream never written. The control below
 /// holds the same action, resumes it the same way and revokes nothing; it executes.
+///
+/// KR-REQ-02.08, the part that is about a paired device's current state: an action a device's
+/// authority admitted is decided against the authority in force when the host acts on it, so a
+/// revision announced after it was accepted takes it back, and a device's action is not carried
+/// out on what it was admitted under.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_acc_022_a_paired_devices_held_action_is_taken_back_by_a_revocation_and_never_executes()
 {
