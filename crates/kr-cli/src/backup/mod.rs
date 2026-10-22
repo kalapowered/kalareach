@@ -323,7 +323,7 @@ fn print(outcome: &Outcome, json: bool) {
             let configuration_words = match configuration {
                 ConfigurationResult::NotAsked => None,
                 ConfigurationResult::NothingInTheBackup => Some(Shown::said(
-                    "The backup holds no configuration, so none was applied.",
+                    "The backup has no configuration this restore wrote, so none was applied.",
                 )),
                 ConfigurationResult::Applied { revision, changes } => Some(if changes.is_empty() {
                     shown!(
