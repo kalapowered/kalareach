@@ -42,6 +42,7 @@
 //! | [`barrier`] | The lock a command takes before it writes a stored record, which an update holds across its check of the stores and its switch |
 //! | [`output`] | Everything written on standard output, and the only writer there |
 //! | [`report`] | Text for people and the `--json` shapes |
+//! | [`workflow`] | `kr workflow`: giving a causal chain whose budget ran out a new one |
 //! | [`error`] | The failures above, each with its own exit code |
 
 pub mod account;
@@ -87,6 +88,7 @@ pub mod startup;
 pub mod terminal;
 pub mod update;
 pub mod windows;
+pub mod workflow;
 pub mod workspace;
 
 pub use crate::error::{CliError, Result};
