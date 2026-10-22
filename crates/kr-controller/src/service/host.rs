@@ -797,7 +797,8 @@ impl Controller {
         let launch_probes = self.launch_probe_report().await;
         Ok(HostDoctorResult::new(checks, effective)
             .with_command_integrations(integrations)
-            .with_launch_probes(launch_probes))
+            .with_launch_probes(launch_probes)
+            .with_metrics(self.metrics.report()))
     }
 
     /// The doctor's checks of what this host serves a paired device in repository operations:

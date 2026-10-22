@@ -313,6 +313,99 @@ pub fn doctor(result: &HostDoctorResult) -> Document {
                 .map(launch_probe)
                 .collect::<Vec<_>>(),
         )
+        .with("metrics", metrics(&result.metrics))
+}
+
+/// What the host measured about itself, in the shape the protocol answers it.
+///
+/// Every label is one of this build's own words and every figure a number, so nothing here is a
+/// value an export has to withhold.
+#[must_use]
+pub fn metrics(report: &kr_protocol::metrics::Report) -> Document {
+    Document::new()
+        .with(
+            "reconnect_time",
+            report
+                .reconnect_time
+                .iter()
+                .map(|series| {
+                    Document::new()
+                        .with("transport", series.transport.as_str())
+                        .with("attempt", series.attempt.as_str())
+                        .with("outcome", series.outcome.as_str())
+                        .with("environment", series.environment.as_str())
+                        .with("count", series.count.get())
+                        .with("total_ms", series.total_ms.get())
+                        .with("longest_ms", series.longest_ms.get())
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with(
+            "terminal_parse_fault",
+            report
+                .terminal_parse_fault
+                .iter()
+                .map(|series| {
+                    Document::new()
+                        .with("fault", series.fault.as_str())
+                        .with("environment", series.environment.as_str())
+                        .with("count", series.count.get())
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with(
+            "adapter_failure",
+            report
+                .adapter_failure
+                .iter()
+                .map(|series| {
+                    Document::new()
+                        .with("adapter", series.adapter.as_str())
+                        .with("outcome", series.outcome.as_str())
+                        .with("environment", series.environment.as_str())
+                        .with("count", series.count.get())
+                })
+                .collect::<Vec<_>>(),
+        )
+}
+
+/// What the host measured about itself, one line for each series.
+///
+/// A host that has counted nothing says nothing: a line that says there is nothing to say is noise
+/// in a report that runs to dozens of lines.
+#[must_use]
+pub fn metric_lines(report: &kr_protocol::metrics::Report) -> Vec<Shown> {
+    let mut lines = Vec::new();
+    for series in &report.reconnect_time {
+        lines.push(shown!(
+            "metric         reconnect.time {}, attempt {}, {}: count {}, {} ms in all, longest {} ms ({})",
+            series.transport.as_str(),
+            series.attempt.as_str(),
+            series.outcome.as_str(),
+            series.count.get(),
+            series.total_ms.get(),
+            series.longest_ms.get(),
+            series.environment.as_str()
+        ));
+    }
+    for series in &report.terminal_parse_fault {
+        lines.push(shown!(
+            "metric         terminal.parse_fault {}: {} ({})",
+            series.fault.as_str(),
+            series.count.get(),
+            series.environment.as_str()
+        ));
+    }
+    for series in &report.adapter_failure {
+        lines.push(shown!(
+            "metric         adapter.failure {}, {}: {} ({})",
+            series.adapter.as_str(),
+            series.outcome.as_str(),
+            series.count.get(),
+            series.environment.as_str()
+        ));
+    }
+    lines
 }
 
 /// One package's launch probe, in the shape the protocol answers it.
@@ -862,6 +955,9 @@ pub fn doctor_lines(result: &HostDoctorResult, verbose: bool) -> Vec<Line> {
             "               ",
         ));
     }
+    for line in metric_lines(&result.metrics) {
+        lines.push(stdout_line!("{}", line));
+    }
     lines.push(stdout_line!("{}", summary(result)));
     lines
 }
@@ -898,6 +994,8 @@ pub fn report_lines(result: &HostDoctorResult) -> Vec<Shown> {
             report.state.as_str()
         ));
     }
+    // Made only of this build's own words and numbers, so the bundle carries them as they are.
+    lines.extend(metric_lines(&result.metrics));
     lines.push(summary(result));
     lines
 }

@@ -61,6 +61,8 @@ fn vector_files() -> Vec<(PathBuf, String)> {
                 "service"
             } else if name == PUSH_FILE_NAME {
                 "push"
+            } else if name == kr_protocol::metrics::VECTOR_FILE_NAME {
+                "metrics"
             } else {
                 unreachable!("every vector file names its area")
             };
