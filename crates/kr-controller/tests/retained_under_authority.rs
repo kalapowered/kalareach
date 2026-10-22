@@ -20,6 +20,7 @@ use kr_protocol::receipt::{ActionReadResult, ReceiptState};
 use kr_protocol::rights::ActionRight;
 
 use net_support::environment::{Environment, from, read_by_id, resolved, yes};
+use net_support::worker::revoke;
 
 // ---------------------------------------------------------------------------------------------
 // The tests
@@ -207,5 +208,92 @@ async fn kr_req_23_34_an_action_is_read_by_its_identifier_only_under_view_author
         }
         device.connection.close();
     }
+    environment.stop().await;
+}
+
+/// KR-REQ-23.24: an exact duplicate of an action that kept a result is answered with that result,
+/// as it was kept, and does nothing a second time; and the answer is owed only while the device's
+/// authority stands.
+///
+/// A device answers a question and presents the same action again. The worker holds one receipt and
+/// one resolution, so the duplicate is answered from them: it is the same answer, byte for byte,
+/// the question stays at the revision the first answer left it, and the receipt is not rewritten.
+/// Once the grant is withdrawn the same presentation is refused, or the connection ends, before any
+/// answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_24_a_duplicate_of_an_action_with_a_result_is_answered_with_it_while_authority_stands()
+ {
+    let environment = Environment::start().await;
+    let question = environment.worker.ask("answered-once");
+    let rights = [ActionRight::SessionView, ActionRight::QuestionRespond];
+    let device = environment.device(from(&rights, 1)).await;
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let params = yes(&environment, &question);
+
+    let first = device
+        .connection
+        .mutate(
+            Method::QuestionAnswer,
+            action_id,
+            environment.target(),
+            &params,
+        )
+        .await
+        .expect("answered");
+    let resolution = environment.worker.held(&question);
+    assert_eq!(resolution.state, QuestionState::Answered);
+    let receipt: ActionReadResult = device
+        .connection
+        .read::<_>(Method::ActionRead, &read_by_id(action_id))
+        .await
+        .expect("a device that may view reads its receipt")
+        .to_typed()
+        .expect("a receipt");
+
+    let again = device
+        .connection
+        .mutate(
+            Method::QuestionAnswer,
+            action_id,
+            environment.target(),
+            &params,
+        )
+        .await
+        .expect("a duplicate is answered");
+    assert_eq!(
+        again, first,
+        "the duplicate is answered with the result the first attempt kept"
+    );
+    assert_eq!(
+        environment.worker.held(&question).revision,
+        resolution.revision,
+        "the question was answered once"
+    );
+    let reread: ActionReadResult = device
+        .connection
+        .read::<_>(Method::ActionRead, &read_by_id(action_id))
+        .await
+        .expect("the receipt is read again")
+        .to_typed()
+        .expect("a receipt");
+    assert_eq!(
+        reread.receipt.revision, receipt.receipt.revision,
+        "the duplicate wrote nothing to the receipt"
+    );
+
+    revoke(&environment.host, device._record.grant.grant_id).await;
+    let after = device
+        .connection
+        .try_mutate(
+            Method::QuestionAnswer,
+            action_id,
+            environment.target(),
+            &params,
+        )
+        .await;
+    assert!(
+        !matches!(after, Some(Ok(_))),
+        "a device whose grant is withdrawn is given no answer by presenting its action again: {after:?}"
+    );
     environment.stop().await;
 }
