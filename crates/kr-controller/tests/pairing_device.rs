@@ -318,7 +318,10 @@ impl Run {
             &self.directory.join(format!("secrets-{name}.txt")),
             secret_forms(&text, &secret).as_bytes(),
         );
-        write_private(&self.directory.join(format!("{name}.png")), &qr_picture(&text));
+        write_private(
+            &self.directory.join(format!("{name}.png")),
+            &qr_picture(&text),
+        );
         assert!(
             appears(&self.directory.join(format!("{name}-done")), STEP).await,
             "the script never said the phone had taken in the invitation"
