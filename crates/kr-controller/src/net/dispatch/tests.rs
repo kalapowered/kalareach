@@ -1510,6 +1510,7 @@ async fn close_for_a_device_of(
             Some(&connection.expiry_observer()),
             answer,
             delivered,
+            connection.receive,
         )
         .await;
     answered

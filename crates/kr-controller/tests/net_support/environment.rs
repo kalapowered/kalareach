@@ -100,6 +100,25 @@ impl Environment {
     }
 }
 
+impl Environment {
+    /// As [`Self::device`], for a device that says it can receive `max_receive` and no more.
+    pub async fn device_receiving(
+        &self,
+        proposal: kr_protocol::pairing::ProposedGrant,
+        max_receive: kr_protocol::hello::ReceiveLimits,
+    ) -> Paired {
+        let device = Device::create().await;
+        let record = pair_with(&self.host, &device, &self.owner, proposal).await;
+        let connection =
+            RawDevice::connect_receiving(&self.host, &device, &record, max_receive).await;
+        Paired {
+            _device: device,
+            _record: record,
+            connection,
+        }
+    }
+}
+
 pub struct Paired {
     pub _device: Device,
     pub _record: DeviceRecord,

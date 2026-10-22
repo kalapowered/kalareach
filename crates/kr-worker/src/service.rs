@@ -4586,10 +4586,10 @@ impl WorkerService {
             Method::EventsSubscribe => self.events_subscribe(state, &request.params, caller),
             Method::ActionRead => self.action_read(state, caller, &request.params),
             Method::QuestionReadOwn => self.question_read_own(state, &request.params),
-            Method::QuestionRead => self.question_read(&request.params, caller),
-            Method::AgentCapabilities => self.agent_capabilities(&request.params),
+            Method::QuestionRead => self.question_read(state, &request.params, caller),
+            Method::AgentCapabilities => self.agent_capabilities(state, &request.params),
             Method::AgentSnapshot => self.agent_snapshot(state, &request.params, caller),
-            Method::AgentCommands => self.agent_commands(&request.params),
+            Method::AgentCommands => self.agent_commands(state, &request.params),
             Method::AgentApprovalInspect => {
                 self.agent_approval_inspect(state, &request.params, caller)
             }
@@ -7844,7 +7844,12 @@ impl WorkerService {
     /// under a grant whose scope did not come with the read is refused with the reason
     /// ([`Self::history_of`]). A read naming one question the scope does not reach is refused
     /// rather than answered as if the question did not exist.
-    fn question_read(&self, params: &ParamsValue, caller: &Caller) -> Result<ParamsValue> {
+    fn question_read(
+        &self,
+        state: &ConnectionState,
+        params: &ParamsValue,
+        caller: &Caller,
+    ) -> Result<ParamsValue> {
         let params: kr_protocol::question::QuestionReadParams = parse(params)?;
         let filter = Self::history_of(caller, Method::QuestionRead, "a question")?;
         {
@@ -7868,15 +7873,23 @@ impl WorkerService {
                     .to_owned(),
             });
         }
-        encode(&kr_protocol::question::QuestionReadResult {
+        let answer = kr_protocol::question::QuestionReadResult {
             questions: result.questions.into_iter().filter(admitted).collect(),
-        })
+        };
+        Self::within_the_frame(state, &answer)?;
+        encode(&answer)
     }
 
     /// Answers `agent.capabilities`: what this installation can do, with its evidence.
-    fn agent_capabilities(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    fn agent_capabilities(
+        &self,
+        state: &ConnectionState,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
         let params: kr_protocol::agent::AgentCapabilitiesParams = parse(params)?;
-        encode(&self.broker.agent_capabilities(&params)?)
+        let answer = self.broker.agent_capabilities(&params)?;
+        Self::within_the_frame(state, &answer)?;
+        encode(&answer)
     }
 
     /// Answers `agent.snapshot`, through the caller's own history filter.
@@ -7938,9 +7951,11 @@ impl WorkerService {
     }
 
     /// Answers `agent.commands`: what the bound agent advertises.
-    fn agent_commands(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    fn agent_commands(&self, state: &ConnectionState, params: &ParamsValue) -> Result<ParamsValue> {
         let params: kr_protocol::agent::AgentCommandsParams = parse(params)?;
-        encode(&self.broker.agent_commands(&params)?)
+        let answer = self.broker.agent_commands(&params)?;
+        Self::within_the_frame(state, &answer)?;
+        encode(&answer)
     }
 
     /// Answers `agent.approval.inspect`: what an approval's decoder read and what it offered.

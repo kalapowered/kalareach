@@ -1506,6 +1506,7 @@ impl Controller {
         budget: Arc<RelayBudget>,
         lost: Arc<tokio::sync::Notify>,
         purpose: proxy::Purpose,
+        receive: kr_protocol::hello::ReceiveLimits,
     ) -> Result<Arc<WorkerProxy>> {
         // A worker that has started answering since the last attempt rejoins the directory here,
         // so a device can attach to a session the daemon had not reached at startup.
@@ -1523,7 +1524,7 @@ impl Controller {
             })?;
         #[cfg(test)]
         self.before_a_proxy_is_opened.wait().await;
-        let proxy = WorkerProxy::open(self, &worker, notifications, budget, lost).await?;
+        let proxy = WorkerProxy::open(self, &worker, notifications, budget, lost, receive).await?;
         // The worker was read from the directory before the link was opened, and its session may
         // have closed since.
         self.hold_proxy(&proxy, purpose).await?;
@@ -1559,6 +1560,10 @@ impl Controller {
     /// the moment the link may be released: section 7 has the worker hold the session's
     /// termination until its acceptance has been delivered, and closing this link is what says it
     /// has. A device that disconnects, or a hold that runs out, releases it too.
+    ///
+    /// `receive` is what the device the close came from said it can receive, which the link the
+    /// close opens says to the worker; a close with no device behind it says the usual limits.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn close_remote_session(
         self: &Arc<Self>,
         mutation: &kr_protocol::envelope::MutationRequest,
@@ -1567,6 +1572,7 @@ impl Controller {
         observer: Option<&dispatch::ExpiryObserver>,
         answer: tokio::sync::oneshot::Sender<Result<ClosedRemotely>>,
         delivered: tokio::sync::oneshot::Receiver<()>,
+        receive: kr_protocol::hello::ReceiveLimits,
     ) {
         let mut link = None;
         let mut retained = Retained::Not;
@@ -1578,6 +1584,7 @@ impl Controller {
                 observer,
                 &mut link,
                 &mut retained,
+                receive,
             )
             .await
             .map(|value| ClosedRemotely { value, retained });
@@ -1604,6 +1611,7 @@ impl Controller {
         observer: Option<&dispatch::ExpiryObserver>,
         link: &mut Option<Arc<WorkerProxy>>,
         retained: &mut Retained,
+        receive: kr_protocol::hello::ReceiveLimits,
     ) -> Result<kr_protocol::envelope::ParamsValue> {
         let params: kr_protocol::session::SessionCloseParams =
             crate::service::parse(&mutation.params)?;
@@ -1650,6 +1658,7 @@ impl Controller {
                 Arc::new(RelayBudget::new(0)),
                 Arc::new(tokio::sync::Notify::new()),
                 proxy::Purpose::Close,
+                receive,
             )
             .await
         {
