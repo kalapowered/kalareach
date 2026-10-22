@@ -447,9 +447,8 @@ fn a_confirmation_that_runs_out_while_the_store_is_waited_for_writes_nothing() {
     );
 }
 
-/// KR-REQ-10.05: the owner's confirmation of a transfer keeps the challenge's own deadline of two
-/// minutes and dies with the boot it was accepted in, and a wall clock that went back lengthens
-/// nothing.
+/// KR-REQ-10.05: the owner's confirmation of a transfer keeps the challenge's own deadline and dies
+/// with the boot it was accepted in, and a wall clock that went back lengthens nothing.
 #[test]
 fn a_confirmation_keeps_its_own_deadline_and_its_own_boot() {
     /// A clock the test moves: the monotonic reading and the boot identity are both settable.
@@ -589,9 +588,9 @@ fn a_confirmation_keeps_its_own_deadline_and_its_own_boot() {
 /// A challenge answered for another host does not confirm a transfer on this one.
 /// KR-REQ-02.09: changing who holds a session's host authority needs an owner confirmation bound
 /// to this host.
-/// KR-REQ-10.05: the verifier builds its expectation from the plan and this host, so the answer to
-/// a challenge that names another host, or other destination keys than the plan hands the session
-/// to, is refused.
+/// KR-REQ-10.05: given the expectation the plan and this host make, the verifier refuses the answer
+/// to a challenge that names another host, and the answer to one that names other destination keys
+/// than the plan hands the session to.
 #[test]
 fn a_confirmation_issued_for_another_host_does_not_authorise_a_transfer_here() {
     let clock = Clock;
@@ -1232,8 +1231,8 @@ fn transfer_of_control_issues_one_authority_and_revokes_the_other() {
     assert!(done.revoked.revoked.contains(&owner.grant.grant_id));
 }
 
-/// KR-REQ-25.10: a preview that was cut shows the issuer less than the recipient will read, so
-/// nothing is shared for it: the share is refused and no grant or invitation is written.
+/// KR-REQ-25.10, KR-REQ-18.12: a preview that was cut shows the issuer less than the recipient will
+/// read, so nothing is shared for it: the share is refused and no grant or invitation is written.
 #[test]
 fn a_screen_that_was_cut_is_not_shared() {
     use kr_protocol::sharing::LiveScreenPreview;
