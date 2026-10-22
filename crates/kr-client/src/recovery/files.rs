@@ -813,12 +813,25 @@ impl RestorePlan {
     /// The record left beside the files once every member is written.
     ///
     /// It holds the plan as confirmed, what was written and what was refused and why, and no value
-    /// of the kit. The sentence says what this restore gives: readable copies, nothing imported.
+    /// of the kit. The sentence says what this restore gives: readable copies, and nothing
+    /// imported beyond the device configuration the person asked to apply
+    /// (`applying_configuration`), which the command does after the record is published and reports
+    /// on its own.
     #[must_use]
-    pub fn record(&self, plan_digest: &str, written: &[BackupObjectId]) -> serde_json::Value {
+    pub fn record(
+        &self,
+        plan_digest: &str,
+        written: &[BackupObjectId],
+        applying_configuration: bool,
+    ) -> serde_json::Value {
+        let what_this_is = if applying_configuration {
+            "Readable copies of the data in a backup. No key or authority came back. The person asked for the device's configuration in the backup to be applied to this host after these files were written, which the command reports on its own; the copy here is a file to read."
+        } else {
+            "Readable copies of the data in a backup. Nothing was imported into this host, no key or authority came back, and the host's configuration is a file to read, not applied."
+        };
         serde_json::json!({
             "format": RESTORE_RECORD_FORMAT,
-            "what_this_is": "Readable copies of the data in a backup. Nothing was imported into this host, no key or authority came back, and the host's configuration is a file to read, not applied.",
+            "what_this_is": what_this_is,
             "service": self.origin,
             "archive": self.archive_id.to_string(),
             "backup_generation": self.generation.get(),
