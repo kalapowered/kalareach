@@ -106,10 +106,11 @@ pub struct Dialect {
     /// is acted on at the next line it reads.
     ///
     /// The shell takes an interrupt up straight away only when it arrives while the editor waits
-    /// for a key. One that arrives while it is reading an earlier key is kept, and the next line
-    /// the shell accepts is cut short at its first character, the rest of it running as a command
-    /// of its own. Nothing the editor reports shows an interrupt kept: its queues are empty before
-    /// the shell takes it up and after.
+    /// for a key. One that arrives while it is reading an earlier key, or while the editor serves
+    /// a request of the host's, is kept, and the next line the shell accepts is cut short at its
+    /// first character, the rest of it running as a command of its own. Nothing the editor
+    /// reports shows an interrupt kept: its queues are empty before the shell takes it up and
+    /// after.
     pub late_interrupt_waits_for_a_line: bool,
 }
 
