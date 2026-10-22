@@ -300,17 +300,34 @@ fn reports_from_several_places_join_into_one() {
 /// A host's diagnostics as the wire carries them, with the `metrics` member as `metrics` says, or
 /// with no such member at all.
 fn diagnostics_with(metrics: Option<Value>) -> ParamsValue {
-    let mut document = serde_json::to_value(HostDoctorResult::new(
+    use kr_cbor::{CanonicalMap, CanonicalValue};
+
+    let answer = ParamsValue::from_typed(&HostDoctorResult::new(
         Vec::new(),
         EffectiveConfiguration::unread(),
     ))
-    .expect("the result serialises");
-    let members = document.as_object_mut().expect("a map");
-    members.remove("metrics");
-    if let Some(metrics) = metrics {
-        members.insert("metrics".to_owned(), metrics);
+    .expect("encodes");
+    let CanonicalValue::Map(map) = answer.as_value() else {
+        panic!("an answer is a map");
+    };
+    let mut entries: Vec<(String, CanonicalValue)> = map
+        .entries()
+        .iter()
+        .filter(|(key, _)| key != "metrics")
+        .cloned()
+        .collect();
+    if let Some(state) = metrics {
+        entries.push((
+            "metrics".to_owned(),
+            ParamsValue::from_typed(&state)
+                .expect("encodes")
+                .as_value()
+                .clone(),
+        ));
     }
-    ParamsValue::from_typed(&document).expect("encodes")
+    ParamsValue::from(CanonicalValue::Map(
+        CanonicalMap::from_entries(entries).expect("a map"),
+    ))
 }
 
 /// A host of the level before this one sends no `metrics` member, and a client at this level reads
