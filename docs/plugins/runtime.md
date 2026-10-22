@@ -323,8 +323,9 @@ entry is a reason to recompile rather than a reason to refuse the binding.
 
 One process for each protocol and environment, `kr-plugin-host`, started by the control daemon
 through the same supervisor trait a worker is started through: a launchd job, a systemd transient
-user service, or a detached process (which on Windows is created outside the daemon's
-kill-on-close job), in each case its own job outside the daemon's kill tree.
+user service, or a detached process on a Unix host with no service manager, or, on Windows, a
+process the starter of the environment's scheduled task creates, in each case its own job outside
+the daemon's kill tree.
 
 The daemon starts it when a worker asks and not before. The request travels on the daemon's
 rendezvous endpoint, after the hello a worker sends there, as a `PluginRuntimeWanted` frame naming
