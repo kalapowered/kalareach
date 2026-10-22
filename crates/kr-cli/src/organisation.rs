@@ -528,11 +528,28 @@ async fn list(paths: &HostPaths, arguments: &PrivacyArguments, json: bool) -> Re
             }
         }
     }
-    output::line(&stdout_line!("The organisations' policies allow together:"));
-    output::lines(&adapter_lines(
-        &listed.effective_adapter_allowlist,
-        "every adapter this host qualifies",
-    ));
+    if listed.adapter_allowlist_in_force == listed.effective_adapter_allowlist {
+        output::line(&stdout_line!(
+            "The organisations' policies allow together, and this host admits:"
+        ));
+        output::lines(&adapter_lines(
+            &listed.effective_adapter_allowlist,
+            "every adapter this host qualifies",
+        ));
+    } else {
+        output::line(&stdout_line!("The organisations' policies allow together:"));
+        output::lines(&adapter_lines(
+            &listed.effective_adapter_allowlist,
+            "every adapter this host qualifies",
+        ));
+        output::line(&stdout_line!(
+            "This host admits now, until it puts that list in force:"
+        ));
+        output::lines(&adapter_lines(
+            &listed.adapter_allowlist_in_force,
+            "every adapter this host qualifies",
+        ));
+    }
     output::line(&stdout_line!(
         "A lease for this host's own local owner is signed for device {} and authorisation key {} \
          (key identifier {}).",
@@ -642,6 +659,10 @@ fn document(listed: &OrganisationListResult) -> Document {
         .with(
             "effective_adapter_allowlist",
             adapters_held(&listed.effective_adapter_allowlist),
+        )
+        .with(
+            "adapter_allowlist_in_force",
+            adapters_held(&listed.adapter_allowlist_in_force),
         )
         .with(
             "host_device",

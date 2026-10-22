@@ -598,8 +598,8 @@ methods! {
     history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,
     doc: "The organisations this host is enrolled in, the key each is pinned to, the policy \
-          applied for each with the adapters it allows, the adapters the policies allow together, \
-          the devices bound to member accounts and the lease each holds, whether exclusive \
+          applied for each with the adapters it allows, the adapters the policies allow together \
+          and the adapters the catalogue admits under now, the devices bound to member accounts and the lease each holds, whether exclusive \
           management is on, and every time it was turned off, with how the owner confirmed it.";
 
     OrganisationPolicyApply = "organisation.policy.apply", HostAndEnvironment,

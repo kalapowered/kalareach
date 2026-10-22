@@ -91,7 +91,7 @@ pub struct OrganisationPolicyApplyResult {
     /// The adapters the enrolled organisations' policies allow together as the answer was made: the
     /// adapters every organisation that states a list allows, or null while none does. The host puts
     /// this list in force when it records the policy; `organisation.list` reports the list the
-    /// policies state at any time.
+    /// policies state and the list in force at any time.
     pub effective_adapter_allowlist: Nullable<CanonicalSet<PluginId>>,
 }
 
@@ -213,8 +213,17 @@ pub struct OrganisationListResult {
     /// organisation that states a list allows, or null while none does. Two organisations whose
     /// lists share nothing leave an empty set, which allows no adapter. This is the list the host
     /// puts in force when a policy changes, and again at each admissions pass until it lands;
-    /// `plugin.list` says which packages the admissions in force leave out.
+    /// `adapter_allowlist_in_force` is the list in force now, and `plugin.list` says which packages
+    /// the admissions in force leave out.
     pub effective_adapter_allowlist: Nullable<CanonicalSet<PluginId>>,
+    /// The adapters the catalogue admits under now: the list the host has put in force, or null
+    /// while it admits every adapter the host qualifies. It is the list in
+    /// `effective_adapter_allowlist` once the host has put that in force, and it differs from it
+    /// only until then, while a change waits for a synchronisation that holds the catalogue. It is
+    /// what the catalogue holds when the answer is made; it does not show that every session's
+    /// worker has finished the round that follows a change, and it is read beside the other list,
+    /// not with it, so a change made at that moment can show in one alone.
+    pub adapter_allowlist_in_force: Nullable<CanonicalSet<PluginId>>,
     /// Whether this host is exclusively organisation-managed.
     pub exclusive: bool,
     /// Whether this host trusts its own clock. While it does not, it installs no lease and

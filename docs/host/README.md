@@ -3070,6 +3070,11 @@ devices bound to member accounts with the lease the host last recorded for each.
 whether exclusive management is on, whether the host trusts its clock, and every time exclusive
 management was turned off. It also reports the host's own device identifier and the key a lease for
 its local owner is signed for, and the sessions whose workers cannot be told what that owner may do.
+It reports the adapters the enrolled organisations' policies allow together and the adapters the
+catalogue admits under now. They are the same once the host has put the first list in force. They
+differ while a change waits for a synchronisation that holds the catalogue, and the second is then
+the earlier list. The second is what the catalogue holds when the answer is made: it does not show
+that every session's worker has finished the round that follows a change.
 
 ### Applying a policy
 
@@ -3195,9 +3200,9 @@ that ends. Like every floor, the floor goes back when the whole state directory 
 The adapters the host admits are those that every enrolled organisation which states an allowlist
 allows: the intersection of the lists. An organisation with no list adds no constraint, a host with
 no list admits every adapter it qualifies, and lists that share nothing leave an empty set, which
-admits none. `organisation.list` reports each enrolment's revision and list and the list the
-policies allow together; `plugin.list` says which packages the admissions in force leave out. The
-host puts the list in force in four places:
+admits none. `organisation.list` reports each enrolment's revision and list, the list the policies
+allow together and the list in force; `plugin.list` says which packages the admissions in force
+leave out. The host puts the list in force in four places:
 
 - When the daemon starts, the policy is restored before the catalogue opens, and the catalogue
   opens with the list. Each start that has a list raises the admission revision once, because the
@@ -3207,7 +3212,8 @@ host puts the list in force in four places:
   seconds, because a synchronisation holds the catalogue across its network work. If the catalogue
   is still busy then, or the revision cannot be raised, the policy is recorded and the request
   answers `RESOURCE_UNAVAILABLE` or `STORAGE_UNAVAILABLE`, saying the host puts the list in force at
-  its next admissions pass; until it does, the list the policies state and the list in force differ.
+  its next admissions pass; until it does, the list the policies state and the list in force differ,
+  and `organisation.list` reports both.
   The host keeps no answer for the request. The same policy sent again, as a new request, applies
   again, which changes nothing the host keeps, and puts the list in force.
 - After `organisation.withdraw`, which can only widen the list. A put that does not land waits for
