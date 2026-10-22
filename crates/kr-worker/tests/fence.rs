@@ -1922,7 +1922,9 @@ fn in_a_process_with_this_login_manager(case: &str, script: &str) -> Option<std:
     // The case ends when it is done. A case whose launch hold waited for the reading it was to be
     // shown not to wait for would not end for as long as the reading is given, which is an hour, so
     // the wait is bounded by a liveness deadline and a case that outlasts it is stopped and failed.
-    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    // The case's own bounds, taken one after another, come to less than this, so on a slow machine
+    // it is one of them that fails the case, with what it was waiting for.
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
     let ended = loop {
         match case_process.try_wait().expect("the case can be waited for") {
             Some(status) => break Some(status),
