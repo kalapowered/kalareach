@@ -498,6 +498,10 @@ async fn an_action_the_host_never_saw_is_not_done_only_after_the_bound() {
 /// describes, and the transfer is sent only after it answered. The giving device loses the session,
 /// the receiving device holds it, and the page is answered with the host's result. Cancelling
 /// before the owner answers sends nothing, and a reference is spent by the one transfer it sends.
+/// KR-REQ-02.09, the application's half: the application that hands a session over, which enlarges
+/// what another device holds, asks an owner device for its confirmation first and sends the
+/// transfer to the host only with that answer; the host's own refusal without it is shown by the
+/// daemon's cases.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hand_over_asks_an_owner_device_and_sends_only_what_it_confirmed() {
     use kr_protocol::confirmation::{ConfirmationDisplay, TransferControlPlan};

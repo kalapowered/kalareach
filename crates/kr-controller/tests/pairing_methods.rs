@@ -291,6 +291,12 @@ async fn the_bootstrap_confirms_the_first_owner_and_the_clock_and_nothing_else()
 /// not; the clock needs its own; and the three actions no method performs yet are answered for
 /// their exact description and nothing else. Enlarging persistent authority is pairing a personal
 /// owner grant, which needs both of its own.
+/// KR-REQ-02.09: the rights-enlarging owner operations named here, issuing an invitation,
+/// confirming a device, enlarging a grant, trusting a repository root and granting an executable
+/// capability, each fail with `OWNER_CONFIRMATION_REQUIRED` until an owner device has confirmed
+/// exactly them; a confirmation for other rights, or for another action, does not stand in.
+/// KR-REQ-23.47, the part about the confirmation's digest and its single use: each confirmation
+/// names one action digest with its destination and rights, and is spent once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_sensitive_action_needs_a_fresh_confirmation_naming_it() {
     let owner_keys = keys();
@@ -536,6 +542,8 @@ async fn every_sensitive_action_needs_a_fresh_confirmation_naming_it() {
 /// KR-REQ-10.07: a noninteractive confirmation from a session, plugin or contact-tool channel is
 /// refused, even signed by the owner device's own key; and a host with no enrolled presence
 /// signer refuses that channel too.
+/// KR-REQ-23.47, the part about the verification context: a confirmation carried by a channel that
+/// is not an owner's own ceremony is refused, so it never reaches the digest it would be spent on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn noninteractive_channels_never_carry_a_confirmation() {
     let owner_keys = keys();
