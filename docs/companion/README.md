@@ -437,12 +437,14 @@ screen says nothing of the camera. It then shows the paired phone as an owner de
 it to confirm one of its own requests and, separately, a second device it would add. A cancelled
 prompt confirms nothing and leaves the request listed and the invitation behind it refused. On the
 simulator the alert is cancelled once, and the system's Face ID is then sent a face that does not
-match and cancelled at the system's sheet, so that Face ID is shown to run and a refusal there to
-leave the request unanswered; on the emulator the system's prompt for the screen lock is cancelled.
+match and cancelled at the system's sheet once it says the face was not recognised, so that Face ID
+is shown to run and a refusal there to leave the request unanswered; on the emulator the system's prompt for the screen lock is cancelled.
 The same request is then confirmed, with a matching face on the simulator and the PIN of the
 emulator's screen lock, and the host spends that confirmation on the invitation. On the emulator the
 PIN is taken away while the second device's request is listed: the button that confirms goes while
-the request and its value stay, and the button returns when the PIN is set again. The run then
+the request and its value stay, and the button returns when the PIN is set again. On the simulator the run
+also pastes an invitation another application copied, answers the system's question about
+pasting, and presses "Pair" on the invitation that is still held. The run then
 searches the phone's log for the invitation's text and secret, and for the text and code of the
 code QR; a log that could not be read, or that shows nothing of the application, fails that check
 and is never counted as clean. It also checks the development package: the network security
