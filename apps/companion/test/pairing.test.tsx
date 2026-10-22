@@ -354,7 +354,7 @@ describe('pairing with a host', () => {
     )
   })
 
-  // KR-REQ-10.38: a phone offers the scanner and the picker beside the pasteboard, and a desktop
+  // A phone offers the scanner and the picker beside the pasteboard, and a desktop
   // offers neither.
   it('offers the scanner and the picker only where the device reads a code', async () => {
     const { controls } = start()
@@ -467,7 +467,25 @@ describe('pairing with a host', () => {
     expect(screen.queryByTestId('open-settings')).toBeNull()
   })
 
-  // KR-REQ-10.38: while the scanner or the picker is up, the person cannot start another intake.
+  it('speaks of the picture, not the camera, when a picture could not be opened on a phone that has a camera', async () => {
+    const { controls } = start()
+    act(() => {
+      controls.setPairing({ sources: { camera: true, photo: true } })
+    })
+    controls.setIntake('photo', {
+      invitation: null,
+      failure: 'reader_failed',
+      cleared: false,
+      declined: false,
+      cancelled: false
+    })
+    await userEvent.click(await screen.findByTestId('choose-photo'))
+    const told = (await screen.findByTestId('paste-failure')).textContent ?? ''
+    expect(told).toMatch(/picture could not be opened/)
+    expect(told).not.toMatch(/camera/)
+  })
+
+  // While the scanner or the picker is up, the person cannot start another intake.
   it('offers no second intake while one is under way', async () => {
     const { controls } = start()
     act(() => {
@@ -490,7 +508,7 @@ describe('pairing with a host', () => {
     expect(screen.getByTestId('choose-photo')).toBeEnabled()
   })
 
-  // KR-REQ-10.38: where a direct invitation is taken in with the scanner, trying it again is
+  // Where a direct invitation is taken in with the scanner, trying it again is
   // scanning it again, never pasting.
   it('scans again after a direct invitation did not work, where the device has a scanner', async () => {
     const { controls } = start()

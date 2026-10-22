@@ -251,7 +251,10 @@ export function PairingFlow({
   // comes back says what it was, never what it says; a scanner or a picker the person closed is no
   // failure and says nothing.
   const [taking, setTaking] = useState(false)
-  const takeIn = (take: () => Promise<IntakeView>) => {
+  // Where the failure that is shown came from: the words speak of the source that failed, not of
+  // the one this device offers first.
+  const [failedFrom, setFailedFrom] = useState<Reading>('pasteboard')
+  const takeIn = (from: Reading, take: () => Promise<IntakeView>) => {
     // One at a time: a second request while the scanner or the picker is up would ask the system
     // the same question twice.
     if (taking) return
@@ -259,7 +262,10 @@ export function PairingFlow({
     setPasteFailure(null)
     take()
       .then((result) => {
-        if (result.failure !== null) setPasteFailure(result.failure)
+        if (result.failure !== null) {
+          setFailedFrom(from)
+          setPasteFailure(result.failure)
+        }
         if (result.cleared) say('The invitation was taken from the clipboard and cleared from it.')
         if (result.declined) say('Nothing was contacted.')
       })
@@ -271,13 +277,13 @@ export function PairingFlow({
       })
   }
   const paste = () => {
-    takeIn(() => port.pairingPaste())
+    takeIn('pasteboard', () => port.pairingPaste())
   }
   const scan = () => {
-    takeIn(() => port.pairingScan())
+    takeIn('camera', () => port.pairingScan())
   }
   const choosePhoto = () => {
-    takeIn(() => port.pairingScanPhoto())
+    takeIn('photo', () => port.pairingScanPhoto())
   }
   const reading: Reading = readingFrom(view?.sources)
   // The same invitation brought in again, the way this device brings one in first.
@@ -427,7 +433,7 @@ export function PairingFlow({
             </div>
             {pasteFailure !== null ? (
               <p className="small danger-text" role="alert" data-testid="paste-failure">
-                {failureWords(pasteFailure, service, 'code', reading).sentence}
+                {failureWords(pasteFailure, service, 'code', failedFrom).sentence}
               </p>
             ) : null}
             {pasteFailure === 'camera_denied' ? (
