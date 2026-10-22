@@ -2028,6 +2028,7 @@ async fn a_worker_that_withholds_its_attachments(host: &Standalone, session_id: 
         launch_profile: Nullable::null(),
         last_command_block: Nullable::null(),
         outstanding_launches: Nullable::null(),
+        metrics: None,
     };
     let boot_epoch = kr_ipc::identity::boot_epoch(&boot).expect("a boot epoch");
     let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
@@ -2089,6 +2090,80 @@ async fn a_worker_that_withholds_its_attachments(host: &Standalone, session_id: 
             }
         }
     });
+}
+
+/// KR-REQ-26.43: what a running session's terminal parser could not make sense of is in what
+/// `kr doctor` reports of the host, which the daemon reads from the session's own worker.
+///
+/// A session's shell writes bytes that are not valid text and then waits, so nothing else is
+/// written. The daemon, which never saw those bytes, is asked about the host until the worker's
+/// count reaches it, and the document names the class of fault and how often it met one: no byte
+/// of the output is in it.
+#[test]
+fn doctor_reports_the_faults_a_running_sessions_terminal_met() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let host = Standalone::create();
+    host.select_standalone();
+    let shell = host.tree.root().join("faulty-shell.sh");
+    std::fs::write(
+        &shell,
+        "#!/bin/sh\nprintf 'ok\\355\\240\\200more'\nexec cat\n",
+    )
+    .expect("writes the shell");
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))
+        .expect("makes it executable");
+    let cwd = host.tree.root().display().to_string();
+    let output = start(host.kr(&[
+        "--json",
+        "new",
+        "--invisible",
+        "--headless",
+        "--cwd",
+        &cwd,
+        "--shell",
+        &shell.display().to_string(),
+        "--shell-mode",
+        "native_compat",
+        "--startup",
+        "interactive",
+    ]))
+    .finish("kr new");
+    let created = document(&output, "kr new");
+    assert!(output.status.success(), "{created}");
+
+    let begun = Instant::now();
+    let counted = loop {
+        let output = start(host.kr(&["--json", "doctor"])).finish("kr doctor");
+        let report = document(&output, "kr doctor");
+        let found = report["doctor"]["metrics"]["terminal_parse_fault"]
+            .as_array()
+            .and_then(|series| {
+                series
+                    .iter()
+                    .find(|series| series["fault"] == "invalid_encoding")
+                    .cloned()
+            });
+        if let Some(found) = found {
+            break (found, report);
+        }
+        assert!(
+            begun.elapsed() < LIVENESS_DEADLINE,
+            "the host reported no invalid text within {LIVENESS_DEADLINE:?}: {report}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let (series, report) = counted;
+    assert!(
+        series["count"].as_u64().is_some_and(|count| count >= 1),
+        "{series}"
+    );
+    assert_eq!(series["environment"], "development", "{series}");
+    assert!(
+        !report["doctor"]["metrics"].to_string().contains("more"),
+        "the report carries the class of fault and nothing the program wrote"
+    );
+    host.close(&created);
 }
 
 /// KR-REQ-08.02: a worker that answers the session read and never the question about its

@@ -3416,7 +3416,12 @@ the way a bundle is written, so it reads them too: counts under labels from the 
 which name no person, session, path or program a person ran.
 
 The daemon counts the gaps between a device's connections. Each session's worker counts the faults
-its terminal's parser met and the failures of the adapters it runs, for the life of its session.
+its terminal's parser met and the failures of the adapters it runs, for the life of its session,
+and says them in words that the daemon reads against its own lists and leaves out where it has no
+entry for the word. When `kr doctor` asks, the daemon reads every running worker at once, each for
+no longer than a worker exchange, and adds what they say to its own counts. A worker that does not
+answer in time is left out of that reading and counted in the next, and a session that has closed
+takes its counts with it.
 
 | Metric | Unit | What it counts | Labels |
 | --- | --- | --- | --- |

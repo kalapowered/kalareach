@@ -86,14 +86,32 @@ struct Same {
     reason: &'static str,
 }
 
-const SAME: &[Same] = &[Same {
-    root: "SessionSummary",
-    digest: "9cafe1ef37ff6a31db1abb0699f015b6acc699ba612418fdead619af6a845943",
-    reason: "A member that is absent from the wire: the name of the application in the \
+const SAME: &[Same] = &[
+    Same {
+        root: "SessionSummary",
+        digest: "9cafe1ef37ff6a31db1abb0699f015b6acc699ba612418fdead619af6a845943",
+        reason: "A member that is absent from the wire: the name of the application in the \
              session's foreground where the worker knows one. A worker of the retained level \
              never writes it, and this build reads a summary without it as a session that has no \
              application, so what that level writes is read as before.",
-}];
+    },
+    Same {
+        root: "SessionReadResult",
+        digest: "0b27d07232d00d68f310b4a3774f341a9decf6493f562d002a06ae46b5fa0a9d",
+        reason: "A member that is absent from the wire: what the worker has counted of the host's \
+                 own metrics, where it has counted anything. A worker of the retained level never \
+                 writes it, and this build reads a result without it as one that carries none, so \
+                 what that level writes is read as before.",
+    },
+    Same {
+        root: "Sentence",
+        digest: "9f4b0107de82aad73aaf84c2d9578ddc15437c5cecbc29459d2cdf3ffd8b61e3",
+        reason: "The table of the fields an export classes names the host's metrics report and \
+                 the default shell mode that `host.info` answers. Every member of both is one of \
+                 this build's own words or a number, so none holds text a sentence could withhold, \
+                 and the rules a sentence applies to what it is given are as they were.",
+    },
+];
 
 /// The rules of the surface, as the roots the walker follows them from:
 ///

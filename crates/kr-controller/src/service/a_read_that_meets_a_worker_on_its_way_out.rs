@@ -57,6 +57,8 @@ pub(super) struct Scripted {
     refusing: AtomicBool,
     /// Whether it keeps its connection open and answers no read.
     muted: AtomicBool,
+    /// What it says it has counted of the host's own metrics, once a test has it say some.
+    counted: std::sync::Mutex<Option<kr_protocol::metrics::WorkerMetrics>>,
     /// The read it goes at, once a test has set one.
     end: std::sync::Mutex<Option<End>>,
     /// Tells the endpoint to stop accepting.
@@ -129,6 +131,7 @@ impl Scripted {
             reads: AtomicUsize::new(0),
             refusing: AtomicBool::new(false),
             muted: AtomicBool::new(false),
+            counted: std::sync::Mutex::new(None),
             end: std::sync::Mutex::new(None),
             going: Notify::new(),
             gone: Notify::new(),
@@ -560,6 +563,14 @@ impl Scripted {
         self.refusing.store(refusing, Ordering::Release);
     }
 
+    /// Has this worker say what it has counted of the host's own metrics in each read it answers.
+    pub(super) fn count(&self, metrics: kr_protocol::metrics::WorkerMetrics) {
+        *self
+            .counted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(metrics);
+    }
+
     /// Has this worker keep its connection open and answer no read, or answer again.
     pub(super) fn mute_reads(&self, muted: bool) {
         self.muted.store(muted, Ordering::Release);
@@ -614,6 +625,11 @@ impl Scripted {
             cwd: "/work".to_owned(),
             cwd_revision: CwdRevision(U64::new(1)),
         });
+        read.metrics = self
+            .counted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         read
     }
 }
@@ -2096,6 +2112,87 @@ async fn a_worker_that_is_connected_and_silent_does_not_hold_the_list() {
         .await
         .expect("the list is answered although a worker is silent");
     assert_eq!(listed, vec![(world.session_id, SessionState::Live)]);
+    world.serving.abort();
+}
+
+/// KR-REQ-26.43: what a running worker has counted of the host's own metrics is in what the doctor
+/// reports of the host, as counts made where this daemon runs, and a word the daemon has no list
+/// entry for is left out. A worker that is connected and answers nothing does not hold the doctor's
+/// answer: the answer comes once the worker has had its exchange, without that worker's counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workers_counts_are_in_the_doctors_report_and_a_silent_worker_does_not_hold_it() {
+    use kr_protocol::metrics::{
+        Adapter, Fault, MetricOutcome, WorkerAdapterCount, WorkerFaultCount, WorkerMetrics,
+    };
+
+    let script = Scripted::new();
+    let world = reported_late(&script).await;
+    script.count(WorkerMetrics {
+        terminal_parse_fault: vec![
+            WorkerFaultCount {
+                fault: "invalid_encoding".to_owned(),
+                count: U64::new(3),
+            },
+            WorkerFaultCount {
+                fault: "a class a later release has".to_owned(),
+                count: U64::new(9),
+            },
+        ],
+        adapter_failure: vec![WorkerAdapterCount {
+            adapter: "codex".to_owned(),
+            outcome: "timeout".to_owned(),
+            count: U64::new(2),
+        }],
+    });
+
+    // The daemon has not heard from this worker yet; a read of its session is what admits it. The
+    // doctor then asks the worker for what it has counted, and where the daemon's link to the worker
+    // is in another exchange's hands the doctor leaves the worker out of that reading, so the
+    // case asks until the worker's counts are in one.
+    read(&world).await.expect("the worker is admitted");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let counted = loop {
+        let metrics = world
+            .controller
+            .host_doctor()
+            .await
+            .expect("the doctor answers")
+            .metrics;
+        if !metrics.terminal_parse_fault.is_empty() {
+            break metrics;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the doctor never reported what the worker counted"
+        );
+    };
+    let faults: Vec<_> = counted
+        .terminal_parse_fault
+        .iter()
+        .map(|series| (series.fault, series.count.get()))
+        .collect();
+    assert_eq!(
+        faults,
+        vec![(Fault::InvalidEncoding, 3)],
+        "the word this build has is counted and the word it has not is left out"
+    );
+    let failures: Vec<_> = counted
+        .adapter_failure
+        .iter()
+        .map(|series| (series.adapter, series.outcome, series.count.get()))
+        .collect();
+    assert_eq!(failures, vec![(Adapter::Codex, MetricOutcome::Timeout, 2)]);
+
+    script.mute_reads(true);
+    let silent = tokio::time::timeout(Duration::from_secs(60), world.controller.host_doctor())
+        .await
+        .expect("the doctor is answered although a worker is silent")
+        .expect("the doctor answers")
+        .metrics;
+    assert!(
+        silent.terminal_parse_fault.is_empty() && silent.adapter_failure.is_empty(),
+        "a worker that did not answer is left out of the reading: {silent:?}"
+    );
     world.serving.abort();
 }
 

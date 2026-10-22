@@ -798,7 +798,37 @@ impl Controller {
         Ok(HostDoctorResult::new(checks, effective)
             .with_command_integrations(integrations)
             .with_launch_probes(launch_probes)
-            .with_metrics(self.metrics.report()))
+            .with_metrics(self.measurements().await))
+    }
+
+    /// What this host has measured about itself: the daemon's own counts and the counts of each
+    /// running worker, which a worker keeps for the life of its session.
+    ///
+    /// Every worker is asked at once, each for no longer than a worker exchange, so a worker that
+    /// does not answer holds up neither the others nor the rest of the doctor's answers: it is left
+    /// out of this reading and counted in the next. A session that has closed takes what its worker
+    /// counted with it.
+    async fn measurements(self: &Arc<Self>) -> kr_protocol::metrics::MetricsReport {
+        let workers: Vec<_> = self.directory.lock().await.iter().cloned().collect();
+        let environment = kr_ipc::install::measured_environment();
+        let mut asked = tokio::task::JoinSet::new();
+        for worker in workers {
+            let controller = Arc::clone(self);
+            asked.spawn(async move {
+                controller
+                    .read_from_worker_within(&worker, Some(super::workers::WORKER_EXCHANGE))
+                    .await
+            });
+        }
+        let mut parts = vec![self.metrics.report()];
+        while let Some(read) = asked.join_next().await {
+            if let Ok(Ok(read)) = read
+                && let Some(counted) = read.metrics
+            {
+                parts.push(counted.read(environment));
+            }
+        }
+        kr_protocol::metrics::MetricsReport::joined(parts)
     }
 
     /// The doctor's checks of what this host serves a paired device in repository operations:

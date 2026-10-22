@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use super::{
     Adapter, AdapterFailure, Environment, Fault, HOST_METRICS, MetricOutcome, MetricsReport,
     ParseFault, ReconnectAttempt, ReconnectTime, Recorder, Shape, Transport, VECTOR_FILE_NAME,
-    vector,
+    WorkerAdapterCount, WorkerFaultCount, WorkerMetrics, vector,
 };
 use crate::scalars::U64;
 
@@ -293,4 +293,44 @@ fn reports_from_several_places_join_into_one() {
     assert_eq!(joined.reconnect_time[0].total_ms.get(), 1_000);
     assert_eq!(joined.reconnect_time[0].longest_ms.get(), 900);
     assert_eq!(joined.events(), 8);
+}
+
+/// A worker says its counts in words and the daemon keeps the ones this build has: each word of
+/// this build's own lists comes back as the value it spells, in the daemon's environment, and a
+/// word it has not is left out, so a list that grows on one side does not break the other.
+#[test]
+fn what_a_worker_says_is_read_against_this_builds_own_lists() {
+    let recorder = Recorder::new(Environment::Production);
+    recorder.parse_faulted(Fault::OversizedFrame, 4);
+    recorder.adapter_failed(Adapter::OpencodeAttach, MetricOutcome::Unavailable);
+    let said = WorkerMetrics::of(&recorder.report());
+    assert!(!said.is_empty());
+    assert!(WorkerMetrics::default().is_empty());
+
+    let read = said.read(Environment::Development);
+    assert_eq!(read.terminal_parse_fault.len(), 1);
+    assert_eq!(read.terminal_parse_fault[0].fault, Fault::OversizedFrame);
+    assert_eq!(read.terminal_parse_fault[0].count.get(), 4);
+    assert_eq!(
+        read.terminal_parse_fault[0].environment,
+        Environment::Development,
+        "the environment a count was made in is the daemon's to say"
+    );
+    assert_eq!(read.adapter_failure[0].adapter, Adapter::OpencodeAttach);
+
+    let mut later = said;
+    later.adapter_failure.push(WorkerAdapterCount {
+        adapter: "a-connector-bundled-later".to_owned(),
+        outcome: "timeout".to_owned(),
+        count: U64::new(1),
+    });
+    later.terminal_parse_fault.push(WorkerFaultCount {
+        fault: "a-class-added-later".to_owned(),
+        count: U64::new(1),
+    });
+    assert_eq!(
+        later.read(Environment::Development),
+        read,
+        "a word this build has no entry for changes nothing it reads"
+    );
 }
