@@ -7,7 +7,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-26.43 | each class of parse fault a program can write is counted under its closed label as often as the terminal engine counted it, the diagnostics that are not parse faults are not counted, and a second read adds nothing; an adapter whose component the plugin runtime cannot run is counted once for each step into that state, and a package that is not a bundled connector is counted under no name |
+//! | KR-REQ-26.43 | each class of parse fault a program can write is counted under its closed label as often as the terminal engine counted it, the diagnostics that are not parse faults are not counted, and a second read adds nothing; an adapter whose component the plugin runtime cannot run is counted once for each outage, however often the runtime is asked again, and once when the runtime stops running the component for good, and a package that is not a bundled connector is counted under no name |
 
 #![cfg(unix)]
 
@@ -170,11 +170,13 @@ fn faults(report: &MetricsReport) -> Vec<(Fault, u64)> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_26_43_each_class_of_parse_fault_a_program_writes_is_counted_under_its_label() {
     // A sequence the profile has no class for; text that is not UTF-8; a control sequence cut off
-    // by CAN; and an operating-system command past the bound on a control string.
+    // by CAN; an operating-system command past the bound on a control string; and, which is no
+    // fault, a cursor movement a screen's width past the edge, as a program that does not know the
+    // size writes at every prompt.
     let world = World::running(
         "printf 'ok\\355\\240\\200more'; printf '\\033[?77h'; printf '\\033[1\\030'; \
          printf '\\033]0;'; head -c 70000 /dev/zero | tr '\\0' x; printf '\\007'; \
-         printf 'kr-faults-written'; exec cat",
+         printf '\\033[9999C'; printf 'kr-faults-written'; exec cat",
     )
     .await;
     let classes = [
@@ -249,10 +251,15 @@ async fn kr_req_26_43_each_class_of_parse_fault_a_program_writes_is_counted_unde
             faults(&first)
         );
     }
+    assert!(
+        engine_counted(DiagnosticKind::ParameterReduced) >= 1,
+        "the shell moved the cursor past the edge: {totals:?}"
+    );
     assert_eq!(
         settled.terminal_parse_fault.len(),
         4,
-        "the diagnostics that are not parse faults are not counted as one: {totals:?}"
+        "a movement the grid reduced to its edge is not a parse fault, and is not counted as one: \
+         {totals:?}"
     );
     assert_eq!(
         world.service.metrics(),
@@ -265,10 +272,11 @@ async fn kr_req_26_43_each_class_of_parse_fault_a_program_writes_is_counted_unde
 }
 
 /// KR-REQ-26.43: an adapter whose component the plugin runtime cannot run is counted once for each
-/// step into that state, the runtime saying so again is not another failure, and a package the
-/// product does not bundle as a connector is counted under no name.
+/// outage, however often the runtime is asked again and says so, and once when the runtime stops
+/// running the component for good; a package the product does not bundle as a connector is counted
+/// under no name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_26_43_an_adapter_the_runtime_cannot_run_is_counted_once_for_each_step_into_it() {
+async fn kr_req_26_43_an_adapter_the_runtime_cannot_run_is_counted_once_for_each_outage() {
     let world = World::running("exec cat").await;
     let broker = world.service.broker();
     let instance = ApplicationInstanceId::new(Uuid::from_bytes([2; 16]));
@@ -307,10 +315,18 @@ async fn kr_req_26_43_an_adapter_the_runtime_cannot_run_is_counted_once_for_each
 
     broker.set_component_state(codex, ComponentState::Unavailable, Some("no runtime"));
     broker.set_component_state(codex, ComponentState::Unavailable, Some("no runtime still"));
+    // The runtime's link asks again after a refusal, and reports each step of asking before it
+    // reports the failure again.
+    broker.set_component_state(
+        codex,
+        ComponentState::Pending,
+        Some("asking for the runtime"),
+    );
+    broker.set_component_state(codex, ComponentState::Unavailable, Some("no runtime yet"));
     assert_eq!(
         adapters(&world),
         vec![(Adapter::Codex, MetricOutcome::Unavailable, 1)],
-        "the runtime saying again that it cannot run the component is one failure"
+        "an outage the runtime keeps reporting, through each new attempt, is one failure"
     );
 
     broker.set_component_state(codex, ComponentState::Registered, None);
@@ -323,13 +339,26 @@ async fn kr_req_26_43_an_adapter_the_runtime_cannot_run_is_counted_once_for_each
     assert_eq!(
         adapters(&world),
         vec![(Adapter::Codex, MetricOutcome::Unavailable, 2)],
-        "a second step into the state is a second failure"
+        "a second outage, after the component ran, is a second failure"
+    );
+
+    // The runtime stops running a component for good: that is a failure too, once.
+    let gemini = bind(9, "kalareach/gemini-cli");
+    broker.disable_rich(gemini, "it faulted until the runtime gave up on it");
+    broker.disable_rich(gemini, "it faulted until the runtime gave up on it");
+    assert_eq!(
+        adapters(&world),
+        vec![
+            (Adapter::Codex, MetricOutcome::Unavailable, 2),
+            (Adapter::GeminiCli, MetricOutcome::Unavailable, 1)
+        ],
+        "a component stopped for good is one failure of its adapter"
     );
 
     broker.set_component_state(example, ComponentState::Unavailable, Some("no runtime"));
     assert_eq!(
-        adapters(&world),
-        vec![(Adapter::Codex, MetricOutcome::Unavailable, 2)],
+        adapters(&world).len(),
+        2,
         "a package that is not a bundled connector is counted under no name"
     );
 }
