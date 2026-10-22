@@ -4,9 +4,10 @@
 //! encrypted bundle at a stable locator on the sync service. The bundle holds the writers a restore
 //! may trust, and it is committed before a writer is declared recovery-enabled. This module is
 //! that client on a companion: it makes the seed, puts the first bundle at the service, writes the
-//! kit the person keeps, and commits the bundle again when a writer is enabled. The rules about
-//! the bundle itself, the compare-and-swap and the record of a write whose answer never came
-//! back, are `kr_client::recovery::BundleStore`'s.
+//! kit the person keeps, and covers the host on this computer with it. The rules about the bundle
+//! itself, the compare-and-swap and the record of a write whose answer never came back, are
+//! `kr_client::recovery::BundleStore`'s; the rules about setting the host up under this
+//! computer's recovery are `kr_client::recovery::cover_host_archive`'s.
 //!
 //! # What lives where
 //!
@@ -36,7 +37,8 @@ use std::sync::Arc;
 
 use kr_client::Shown;
 use kr_client::recovery::{
-    BundleStore, LostWrite, RecoveryError, WriterEnabled, fresh_locator, render_kit,
+    BundleStore, HostBackups, HostCover, Left, LostWrite, RecoveryError, cover_host_archive,
+    fresh_locator, render_kit,
 };
 use kr_client::services::account::{AccountTokenSource, BACKUP_WRITE_SCOPE};
 use kr_client::services::{
@@ -49,7 +51,9 @@ use kr_crypto::store::{SecretStore, load_recovery_seed, store_recovery_seed};
 use kr_ipc::paths::{
     create_private_directory, flush_path_names, read_owner_only_file, write_owner_only_file,
 };
-use kr_protocol::archive::{RecoveryContext, TrustedWriter};
+use kr_protocol::archive::RecoveryContext;
+use kr_protocol::backup_read::BackupSignIn;
+use kr_protocol::backup_setup::{BackupEnableCause, BackupUnusable};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::scalars::{AuthorisationKey, Signature64, TimestampMs};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
@@ -123,6 +127,92 @@ pub struct RecoveryView {
 pub struct KitSaved {
     /// Where it was written.
     pub path: String,
+}
+
+/// What covering the host on this computer with this computer's recovery came to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum HostCoverView {
+    /// The host's backups are set up under this computer's recovery, and its kit opens the archives
+    /// the host makes from now on.
+    Covered {
+        /// The fingerprint of this computer's kit.
+        kit_fingerprint: String,
+        /// The fingerprint of the kit the host was set up under before, when it was replaced.
+        replaced: Option<String>,
+        /// Whether the host was set up under this computer's recovery already.
+        already: bool,
+    },
+    /// Nothing was declared, and the host is as it was.
+    Left {
+        /// Why.
+        why: LeftView,
+    },
+}
+
+/// Why the host was left as it was.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum LeftView {
+    /// The host selects no storage service.
+    NoService,
+    /// The host selects another service than the one the bundle is kept at.
+    OtherService {
+        /// The host of the service the host selects.
+        host: String,
+    },
+    /// The host holds no account token a request may carry.
+    SignIn {
+        /// Why.
+        sign_in: BackupSignIn,
+    },
+    /// A setup of the host's backups has not ended.
+    SetupUnderWay {
+        /// The fingerprints of the kits the setups that have not ended carry.
+        kit_fingerprints: Vec<String>,
+    },
+    /// The host was set up under another kit; this computer's kit does not open its backups.
+    OtherKit {
+        /// The fingerprint of the kit the host was set up under.
+        host_fingerprint: String,
+    },
+    /// The host was set up under this computer's kit and cannot make backups now.
+    Unusable {
+        /// Why.
+        why: BackupUnusable,
+    },
+    /// The host declined, after the bundle was written.
+    Declined {
+        /// Why.
+        cause: BackupEnableCause,
+    },
+}
+
+impl From<HostCover> for HostCoverView {
+    fn from(cover: HostCover) -> Self {
+        match cover {
+            HostCover::Covered(covered) => Self::Covered {
+                kit_fingerprint: covered.kit_fingerprint,
+                replaced: covered.replaced,
+                already: covered.already,
+            },
+            HostCover::Left(left) => Self::Left {
+                why: match left {
+                    Left::NoService => LeftView::NoService,
+                    Left::OtherService { host } => LeftView::OtherService {
+                        host: GatewayOrigin::new(&host).map_or(host, |origin| host_of(&origin)),
+                    },
+                    Left::SignIn(sign_in) => LeftView::SignIn { sign_in },
+                    Left::SetupUnderWay { kit_fingerprints } => {
+                        LeftView::SetupUnderWay { kit_fingerprints }
+                    }
+                    Left::OtherKit { host_fingerprint } => LeftView::OtherKit { host_fingerprint },
+                    Left::Unusable { why } => LeftView::Unusable { why },
+                    Left::Declined(cause) => LeftView::Declined { cause },
+                },
+            },
+        }
+    }
 }
 
 /// Where this computer's bundle is, and whether the first write is known to have landed.
@@ -450,25 +540,30 @@ impl Recovery {
     }
 
     /* ---------------------------------------------------------------------- */
-    /* Enabling a writer                                                       */
+    /* Covering the host                                                       */
     /* ---------------------------------------------------------------------- */
 
-    /// Commits the bundle with `writer` named in it, and only then says the writer is enabled.
+    /// Covers the host on this computer with this computer's recovery, where that can be done, and
+    /// says so only when it has been.
     ///
-    /// The evidence this returns is what a host's backup writer needs before it is declared
-    /// recovery-enabled: a restore trusts a writer key only from this bundle, so a writer declared
-    /// first and written down second is a writer whose archives a restore cannot verify.
+    /// The bundle is committed first, naming the host's archive, producer and writer, and the host
+    /// is then set up under this computer's recovery with the very bytes that landed, so that the
+    /// kit opens the archives the host makes. A host set up under another kit keeps its archive
+    /// and its recipient, and is left as it is unless `replace` asks for a new archive under this
+    /// computer's recovery. Nothing is sent to the service until the host has been asked, and
+    /// nothing is declared until the host has answered.
     ///
     /// # Errors
     ///
-    /// Returns a refusal when recovery is not on, the account cannot be used or an earlier write is
-    /// waiting to be settled; `OUTCOME_UNKNOWN` when this write was not answered; and the service's
-    /// own failure otherwise. No evidence is returned for a write that was not answered.
-    pub async fn enable_writer(
+    /// Returns a refusal when recovery is not on, the account cannot be used or an earlier write
+    /// is waiting to be settled; `OUTCOME_UNKNOWN` when the host did not say how it ended, which
+    /// asking again settles; and the service's own failure otherwise.
+    pub async fn cover_host(
         &self,
         account: &Account,
-        writer: TrustedWriter,
-    ) -> Result<WriterEnabled> {
+        host: &dyn HostBackups,
+        replace: bool,
+    ) -> Result<HostCoverView> {
         let _step = self.step().await?;
         let record = self
             .record()?
@@ -477,10 +572,9 @@ impl Recovery {
         refuse_if_blocked(account, &record.origin()?)?;
         let seed = self.seed(false)?;
         let mut store = self.store(&record, account)?;
-        let mut bundle = store.fetch(&seed).await.map_err(said)?;
-        store
-            .enable_writer(&seed, &mut bundle, writer, now())
+        cover_host_archive(host, &mut store, &seed, replace, now())
             .await
+            .map(HostCoverView::from)
             .map_err(said)
     }
 
@@ -627,6 +721,11 @@ fn said(error: RecoveryError) -> CommandError {
             ErrorCode::OutcomeUnknown,
             "the sync service did not answer the write to the recovery bundle, so it is not known \
              whether it landed. Settle it before anything else is written",
+        ),
+        RecoveryError::HostOutcomeUnknown { .. } => CommandError::new(
+            ErrorCode::OutcomeUnknown,
+            "the host did not say how setting its backups up under this recovery ended. Ask again: \
+             the host's status shows whether it landed",
         ),
         RecoveryError::BundleWriteUnsettled { .. } => CommandError::refused(
             "a write to the recovery bundle was not answered. Settle it before anything else is \

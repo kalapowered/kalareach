@@ -58,6 +58,7 @@ import type {
   ImportedImage,
   KeyAction,
   KeypadCode,
+  HostCoverView,
   KitSaved,
   OpenRequest,
   OwnerView,
@@ -332,6 +333,10 @@ export interface FakeRecovery {
   readonly signedInForRecovery: number
   /** The destinations the page asked to have the kit written to. */
   readonly kitsSaved: readonly string[]
+  /** What the page asked when it asked to cover the host on this computer, in order. */
+  readonly hostCovers: readonly { readonly replace: boolean }[]
+  /** Sets what the backend answers to the next requests to cover the host. */
+  coverHostAnswers(answer: HostCoverView): void
   /** Sets where recovery stands, as the backend would report it. */
   set(view: Partial<Omit<RecoveryView, 'sync_service'>>): void
   /** Makes every read of recovery refuse with these words until it is given none. */
@@ -1185,6 +1190,13 @@ export function fakeHost(
   let recoverySettles = 0
   let recoverySignIns = 0
   let recoveryReadFails: string | null = null
+  let hostCoverAnswer: HostCoverView = {
+    state: 'covered',
+    kit_fingerprint: 'ABCD-EFGH',
+    replaced: null,
+    already: false
+  }
+  const hostCovers: { readonly replace: boolean }[] = []
   let heldTurnOn: Promise<void> | null = null
   let heldRecoveryRead: Promise<void> | null = null
   let heldSyncServiceRead: Promise<void> | null = null
@@ -2745,6 +2757,13 @@ export function fakeHost(
       kitsSaved.push(path)
       return Promise.resolve({ path })
     },
+    recoveryCoverHost: (replace) => {
+      if (recovery.state !== 'on') {
+        refuse('PERMISSION_DENIED', 'Recovery has not been turned on.')
+      }
+      hostCovers.push({ replace })
+      return Promise.resolve(hostCoverAnswer)
+    },
 
     subscribe: (listener) => register(listeners, listener),
     onFilesDropped: (listener) => register(dropListeners, listener)
@@ -2762,6 +2781,10 @@ export function fakeHost(
         return recoverySignIns
       },
       kitsSaved,
+      hostCovers,
+      coverHostAnswers(answer) {
+        hostCoverAnswer = answer
+      },
       set(view) {
         recovery = { ...recovery, ...view }
       },
