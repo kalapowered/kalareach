@@ -34,6 +34,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_worker::broker::bridge::BridgeProcess;
 use kr_worker::broker::connectors::{DECISION_SCHEMA, InstalledConnector, decoding_trust, fixture};
+use kr_worker::broker::decoding::{ComponentDecoded, DecodeRefusal, project};
 use kr_worker::broker::{
     Broker, BrokerError, BrokerTransport, Caller, Credential, ForegroundMark, Invocation, Ledger,
     ManagedProcess, MutationAdmission, PackageIdentity, PendingTransmission, Probe,
@@ -3346,4 +3347,168 @@ fn kr_req_12_02_a_launch_the_fence_refuses_leaves_the_profile_it_would_have_repl
         "0.9.1",
         "and the refused preparation replaced nothing"
     );
+}
+
+/// A broker with the Claude Code connector's channel open and one binding of its package, trusted as
+/// the installation derives for a package that ships a component.
+fn channel_broker(connector: &InstalledConnector) -> (Broker, GatewayConnectionId) {
+    let package = connector.package().clone();
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
+    broker
+        .register_instance(
+            instance(2),
+            IntegrationMode::NativeBridge,
+            None,
+            Some(managed(instance(2))),
+        )
+        .expect("the launched instance is registered");
+    broker
+        .bind_descriptor(
+            binding(9),
+            instance(2),
+            package.plugin_id.clone(),
+            package.publisher_id.clone(),
+            package.package_digest,
+            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+            Some(
+                decoding_trust(connector, TimestampMs::new(1)).expect("approval.decode is granted"),
+            ),
+            TimestampMs::new(1),
+        )
+        .expect("the channel's package is bound");
+    let connection = open_channel(&broker, connector);
+    (broker, connection)
+}
+
+/// KR-REQ-11.26: what a component decoded becomes an approval only in words the worker already
+/// holds. The request is the one the component was handed, the decisions are ones the connector's
+/// table maps, in the order the component named them, and each carries the table's label; the
+/// broker accepts the projection under the schema the plugin contract writes decoded requests
+/// against, and its ledger names the decoding package and keeps the source bytes.
+#[test]
+fn kr_req_11_26_a_components_decoding_becomes_an_approval_in_the_tables_own_words() {
+    let root = package_store();
+    let connector = claude_code(&root, true, &[]);
+    let (broker, connection) = channel_broker(&connector);
+    let relayed = relay(&broker, connection, "abcde", 2);
+    let pending = relayed.request.upstream.as_str().to_owned();
+    let table = connector.offered_decisions();
+    assert!(table.len() >= 2, "the table maps at least two decisions");
+    let reversed: Vec<OfferedDecision> = table.iter().rev().cloned().collect();
+
+    let decoded = ComponentDecoded {
+        request_id: pending.clone(),
+        summary: "List the files in the working directory".to_owned(),
+        decisions: reversed.iter().map(|d| d.option_id.clone()).collect(),
+    };
+    let projection = project(&decoded, &pending, &table).expect("the proposal is believed");
+    assert_eq!(projection.schema_version, component_schema());
+    assert_eq!(
+        projection.summary,
+        "List the files in the working directory"
+    );
+    assert_eq!(
+        projection.decisions, reversed,
+        "the table's labels, in the component's order"
+    );
+
+    let interpreted = broker
+        .interpret(
+            binding(9),
+            relayed.resource_id,
+            projection.clone(),
+            None,
+            TimestampMs::new(3),
+        )
+        .expect("the trust covers the component's schema");
+    assert_eq!(interpreted.kind, PendingKind::Approval);
+    assert!(interpreted.interpretation_verified);
+    let recorded = broker
+        .decoding(relayed.resource_id)
+        .expect("the ledger reads")
+        .expect("the interpretation is recorded");
+    assert_eq!(recorded.binding_id, binding(9));
+    assert_eq!(recorded.package_digest, connector.package().package_digest);
+    assert_eq!(recorded.projection, projection);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// KR-REQ-11.26: a component that decoded another request than the one it was handed, offers an
+/// answer the connector's table does not map, or offers one twice, makes no approval: the worker
+/// refuses the proposal by what it is, and a summary longer than the trust allows is carried whole
+/// to the broker, which refuses it, and the request stays recorded, opaque and unanswerable here
+/// for the native terminal to answer.
+#[test]
+fn kr_req_11_26_a_component_cannot_decode_another_request_or_an_answer_the_table_does_not_map() {
+    let root = package_store();
+    let connector = claude_code(&root, true, &[]);
+    let (broker, connection) = channel_broker(&connector);
+    let relayed = relay(&broker, connection, "abcde", 2);
+    let pending = relayed.request.upstream.as_str().to_owned();
+    let table = connector.offered_decisions();
+    let first = table[0].option_id.clone();
+    let proposal = |request_id: &str, decisions: &[&str]| ComponentDecoded {
+        request_id: request_id.to_owned(),
+        summary: "List the files here".to_owned(),
+        decisions: decisions.iter().map(|id| (*id).to_owned()).collect(),
+    };
+
+    assert_eq!(
+        project(&proposal("zzzzz", &[&first]), &pending, &table),
+        Err(DecodeRefusal::OtherRequest {
+            read: "zzzzz".to_owned(),
+            pending: pending.clone()
+        })
+    );
+    assert_eq!(
+        project(&proposal(&pending, &["always_allow"]), &pending, &table),
+        Err(DecodeRefusal::UnmappedDecision {
+            id: "always_allow".to_owned()
+        })
+    );
+    assert_eq!(
+        project(&proposal(&pending, &[&first, &first]), &pending, &table),
+        Err(DecodeRefusal::DuplicateDecision { id: first.clone() })
+    );
+
+    // A summary over the trust's bound is not cut to fit: the projection carries all of it, and the
+    // broker's own check is what refuses it.
+    let long = "x".repeat(kr_protocol::broker::MAX_PROJECTION_SUMMARY_LEN + 1);
+    let projection = project(
+        &ComponentDecoded {
+            summary: long.clone(),
+            ..proposal(&pending, &[&first])
+        },
+        &pending,
+        &table,
+    )
+    .expect("the proposal names a request and decisions the worker knows");
+    assert_eq!(projection.summary, long);
+    let refusal = broker
+        .interpret(
+            binding(9),
+            relayed.resource_id,
+            projection,
+            None,
+            TimestampMs::new(3),
+        )
+        .expect_err("a summary over the bound is refused");
+    assert!(
+        matches!(
+            refusal,
+            BrokerError::Trust(kr_protocol::broker::TrustError::SummaryTooLong { .. })
+        ),
+        "{refusal}"
+    );
+    let held = broker.pending(relayed.resource_id).expect("still recorded");
+    assert_eq!(held.state, PendingState::Pending);
+    assert!(!held.interpretation_verified, "and still opaque");
+    assert!(
+        broker
+            .decoding(relayed.resource_id)
+            .expect("the ledger reads")
+            .is_none(),
+        "nothing was recorded as decoded"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
