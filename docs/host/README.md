@@ -1232,10 +1232,11 @@ binding's life.
 
 The worker also feeds the components it registered. The terminal's read loop and the gateway's
 reader push what a component may observe onto a 4 MiB lane and carry on, and a task of the worker's
-link makes the calls, so nothing on the terminal waits for a component. What a component misses is
-counted and made up with a fresh snapshot. The link takes a component's state when it has been
-quiet, keeps it in memory only, and restores it when the runtime has been replaced. Privacy mode
-drops that state and stops it being taken. `docs/plugins/runtime.md` has the calls, the bounds and
+link makes the calls, so nothing on the terminal waits for a component. What a ready component
+misses is counted and made up with a fresh snapshot before it is offered anything else. The link
+takes a component's state when it has been quiet for two seconds or a minute has passed, keeps it
+in memory only, and restores it when the runtime has been replaced. Privacy mode drops that state
+and stops it being taken, from a component that was offered anything made while it was on as well. `docs/plugins/runtime.md` has the calls, the bounds and
 the order.
 
 `docs/plugins/runtime.md` has the execution model, the per-instance limits, the compiled-code cache
