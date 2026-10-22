@@ -7,7 +7,13 @@
  * Like the account's words, these say nothing about money.
  */
 
-import type { HostCoverView, HostLeft, RecoveryBlocker, RecoveryView } from '../host/port'
+import type {
+  HostCoverView,
+  HostLeft,
+  RecoveryArchive,
+  RecoveryBlocker,
+  RecoveryView
+} from '../host/port'
 
 /** What recovery is for, and what the kit is. */
 export const RECOVERY_HELP =
@@ -19,6 +25,20 @@ export const SYNC_SERVICE_HELP = 'An https address, like https://reach.kala.to.'
 
 /** The name a kit is offered under in the save dialog. */
 export const KIT_FILE_NAME = 'kalareach-recovery-kit.txt'
+
+/** The name a kit drawn as a QR code is offered under in the save dialog. */
+export const QR_FILE_NAME = 'kalareach-recovery-kit.svg'
+
+/** What a printed code is, said where the person chooses to make one. */
+export const QR_HELP =
+  'The code carries the whole kit, the seed included. Print it and keep it where only you can ' +
+  'reach it.'
+
+/** What an offline copy is, and what it is not. */
+export const EXPORT_HELP =
+  'An offline copy is the encrypted recovery bundle and one archive as the service holds them. It ' +
+  'opens only with the kit, and it adds no protection of its own: keep it somewhere the service ' +
+  'is not.'
 
 /** The sentence a person reads first, for where recovery stands. */
 export function describeRecovery(view: RecoveryView): string {
@@ -137,4 +157,23 @@ export function describeHostCover(view: HostCoverView): string {
     `The host's backups are set up under this recovery (kit ${view.kit_fingerprint}): this ` +
     `recovery's kit opens what the host backs up from now on.${replaced}`
   )
+}
+
+/** The name an offline copy is offered under in the save dialog. */
+export function exportFileName(archive: RecoveryArchive | null): string {
+  return archive === null
+    ? 'kalareach-recovery-bundle.krexport'
+    : `kalareach-archive-${archive.archive_id.slice(0, 8)}.krexport`
+}
+
+/** How one archive is named in the list of what can be copied. */
+export function describeArchive(archive: RecoveryArchive): string {
+  const name = `Archive ${archive.archive_id.slice(0, 8)}`
+  if (archive.generation === null || archive.published_at_ms === null) {
+    return archive.withheld === 'refused'
+      ? `${name}: what the service holds is not an archive this kit trusts.`
+      : `${name}: the service holds no generation of it.`
+  }
+  const day = new Date(archive.published_at_ms).toISOString().slice(0, 10)
+  return `${name}, generation ${archive.generation}, backed up ${day}.`
 }
