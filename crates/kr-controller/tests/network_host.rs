@@ -132,20 +132,56 @@ async fn the_diagnostics_answer_both_doors_and_carry_no_credential_to_a_device()
     host.stop().await;
 }
 
+/// The state a diagnostics answer gives of the host's metrics, as the wire carries it.
+fn metrics_state(answer: &ParamsValue) -> Option<&kr_cbor::CanonicalValue> {
+    kr_worker::history_filter::retained::member(answer, "metrics")
+}
+
+/// Whether `state` is the host's report, held under its own name.
+fn is_counted(state: Option<&kr_cbor::CanonicalValue>) -> bool {
+    matches!(state, Some(kr_cbor::CanonicalValue::Map(map)) if map.get("counted").is_some())
+}
+
+/// Whether `state` is the host saying it gives the caller no metrics.
+fn is_withheld(state: Option<&kr_cbor::CanonicalValue>) -> bool {
+    matches!(state, Some(kr_cbor::CanonicalValue::Text(word)) if word == "withheld")
+}
+
+/// The diagnostics as the owner at the machine, a device that manages the host and a device that
+/// only views a session each read them.
+async fn read_all(
+    local: &mut kr_ipc::client::LocalClient,
+    managing: &kr_client::session::Session,
+    viewing: &kr_client::session::Session,
+) -> (ParamsValue, ParamsValue, ParamsValue) {
+    let at_the_machine = local
+        .request(Method::HostDoctor, &())
+        .await
+        .expect("the call reaches the daemon")
+        .expect("host.doctor is served on the local socket");
+    let by_the_manager = managing
+        .read::<_, ParamsValue>(Method::HostDoctor, &())
+        .await
+        .expect("host.doctor is served to a device that manages the host");
+    let by_the_viewer = viewing
+        .read::<_, ParamsValue>(Method::HostDoctor, &())
+        .await
+        .expect("host.doctor is served to a device that views a session");
+    (at_the_machine, by_the_manager, by_the_viewer)
+}
+
 /// KR-REQ-26.43: what the host measured about itself is read by its owner and by a paired device
-/// whose grant holds `host.manage`, and a device without it is answered the diagnostics with a
-/// report that counts nothing. The counts name a bundled connector that failed, which is a fact about the
-/// host and not about any session, so a right over one session does not reach them; the rest of
-/// the diagnostics are the same for that device as for the manager.
+/// whose grant holds `host.manage`, as a report that may hold nothing; a device without it is told
+/// the host withholds them, which is not a report that counts nothing. The counts name a bundled
+/// connector that failed, which is a fact about the host and not about any session, so a right
+/// over one session does not reach them; the rest of the diagnostics are the same for that device
+/// as for the manager.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_26_43_the_hosts_metrics_reach_a_paired_device_only_under_host_management() {
     use kr_protocol::metrics::{Adapter, MetricOutcome};
 
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
-    host.controller()
-        .metrics()
-        .adapter_failed(Adapter::Codex, MetricOutcome::Unavailable);
     let (_manager, managing) = net_support::paired_device(
         &host,
         &owner,
@@ -156,26 +192,37 @@ async fn kr_req_26_43_the_hosts_metrics_reach_a_paired_device_only_under_host_ma
         net_support::paired_device(&host, &owner, &[ActionRight::SessionView]).await;
     let mut local = host.client().await;
 
-    let at_the_machine: HostDoctorResult = typed(
-        &local
-            .request(Method::HostDoctor, &())
-            .await
-            .expect("the call reaches the daemon")
-            .expect("host.doctor is served on the local socket"),
+    // Nothing counted yet: the owner and the manager are told so, and the viewer is told it is not
+    // told, which is another thing.
+    let (at_the_machine, by_the_manager, by_the_viewer) =
+        read_all(&mut local, &managing, &viewing).await;
+    assert!(
+        is_counted(metrics_state(&at_the_machine)),
+        "{at_the_machine:?}"
     );
-    let by_the_manager: HostDoctorResult = typed(
-        &managing
-            .read(Method::HostDoctor, &())
-            .await
-            .expect("host.doctor is served to a device that manages the host"),
+    assert!(
+        is_counted(metrics_state(&by_the_manager)),
+        "{by_the_manager:?}"
     );
-    let by_the_viewer: HostDoctorResult = typed(
-        &viewing
-            .read(Method::HostDoctor, &())
-            .await
-            .expect("host.doctor is served to a device that views a session"),
+    assert!(
+        is_withheld(metrics_state(&by_the_viewer)),
+        "a device that holds only session.view is not given a report: {by_the_viewer:?}"
     );
 
+    host.controller()
+        .metrics()
+        .adapter_failed(Adapter::Codex, MetricOutcome::Unavailable);
+    let (at_the_machine, by_the_manager, by_the_viewer) =
+        read_all(&mut local, &managing, &viewing).await;
+    let (at_the_machine, by_the_manager, by_the_viewer): (
+        HostDoctorResult,
+        HostDoctorResult,
+        HostDoctorResult,
+    ) = (
+        typed(&at_the_machine),
+        typed(&by_the_manager),
+        typed(&by_the_viewer),
+    );
     for (who, answer) in [
         ("the owner at the machine", &at_the_machine),
         ("a device that manages the host", &by_the_manager),

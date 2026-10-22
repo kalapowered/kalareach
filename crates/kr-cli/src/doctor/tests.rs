@@ -564,6 +564,69 @@ fn what_the_host_measured_about_itself_is_reported_in_both_forms() {
     );
 }
 
+/// A host's diagnostics as a client reads them, with the `metrics` member as `metrics` says, or
+/// with none at all.
+fn answered_with(metrics: Option<serde_json::Value>) -> HostDoctorResult {
+    let mut document = serde_json::to_value(result()).expect("a result serialises");
+    let members = document.as_object_mut().expect("a map");
+    members.remove("metrics");
+    if let Some(metrics) = metrics {
+        members.insert("metrics".to_owned(), metrics);
+    }
+    serde_json::from_value(document).expect("an answer parses")
+}
+
+/// KR-REQ-23.56: a host's metrics are counted, withheld from the caller, or not reported at all by
+/// a host of an earlier level, and `kr doctor` keeps the three apart: a host that withholds them
+/// says so on a line of its own, a host that counted nothing says nothing, and the document names
+/// the state.
+#[test]
+fn the_state_of_the_hosts_metrics_is_kept_in_both_forms() {
+    use serde_json::{Value, json};
+
+    let counted_nothing = answered_with(Some(json!({
+        "counted": {"reconnect_time": [], "terminal_parse_fault": [], "adapter_failure": []}
+    })));
+    let withheld = answered_with(Some(json!("withheld")));
+    let older = answered_with(None);
+
+    assert_eq!(
+        doctor(&counted_nothing).json()["metrics"]["state"],
+        "counted"
+    );
+    assert_eq!(
+        doctor(&counted_nothing).json()["metrics"]["reconnect_time"],
+        json!([])
+    );
+    assert_eq!(
+        doctor(&withheld).json()["metrics"],
+        json!({"state": "withheld"})
+    );
+    assert_eq!(doctor(&older).json()["metrics"], Value::Null);
+
+    let metric_lines_of = |result: &HostDoctorResult| -> Vec<String> {
+        doctor_lines(result, false)
+            .iter()
+            .map(|line| line.text().to_owned())
+            .filter(|line| line.contains("metric"))
+            .collect()
+    };
+    let said = metric_lines_of(&withheld);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].contains("withheld"), "{said:?}");
+    assert!(metric_lines_of(&counted_nothing).is_empty());
+    assert!(metric_lines_of(&older).is_empty());
+
+    // The bundle is read by somebody else and says the same of a host that withheld.
+    let bundle: Vec<String> = report_lines(&withheld)
+        .iter()
+        .map(|line| line.to_string())
+        .filter(|line| line.contains("metric"))
+        .collect();
+    assert_eq!(bundle.len(), 1, "{bundle:?}");
+    assert!(bundle[0].contains("withheld"), "{bundle:?}");
+}
+
 /// KR-REQ-26.44: a support bundle carries the measurements, and they carry nothing a bundle must
 /// withhold: every label is one of this build's own words, so a reply that planted anything else
 /// in one is not a reply that parses, and a bundle of a result that did parse holds only words.
