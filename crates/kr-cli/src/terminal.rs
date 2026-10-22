@@ -936,7 +936,9 @@ mod unix {
         ///
         /// A terminal that cannot be waited for (a device the system answers a poll of at once,
         /// as it does `/dev/tty` on macOS) is paused for a millisecond instead, as is one that
-        /// has hung up, so that neither makes the loop spin.
+        /// has hung up or failed. A hung-up terminal reports itself readable and hung up together
+        /// while a read of it returns nothing, so reporting readable is not taken as a reason to
+        /// go straight back to the read.
         fn pause(
             &self,
             interest: rustix::event::PollFlags,
@@ -957,8 +959,13 @@ mod unix {
             match rustix::event::poll(&mut waiting, Some(&timeout)) {
                 Ok(_) => {
                     let events = waiting[0].revents();
-                    *pollable = !events.contains(rustix::event::PollFlags::NVAL);
-                    if !events.contains(interest) {
+                    let unwaitable = rustix::event::PollFlags::NVAL
+                        | rustix::event::PollFlags::HUP
+                        | rustix::event::PollFlags::ERR;
+                    if events.intersects(unwaitable) {
+                        *pollable = false;
+                        std::thread::sleep(millisecond);
+                    } else if !events.contains(interest) {
                         std::thread::sleep(millisecond);
                     }
                 }
