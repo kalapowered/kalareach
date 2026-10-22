@@ -479,6 +479,36 @@ for the revocation-list fetch is that build: Android's revocation check needs a 
 and the certificates Cloudflare serves for the deployed service name nothing else. The attempt is
 sent only once the pairing screen names the deployed service as the one codes go through.
 
+## Notifications on a phone
+
+Each paired host has a row under its name on the Hosts screen that says where its notifications
+stand and offers the one thing the person can do about it. Off, it says so and offers "Turn on
+notifications". While the steps run, the words name the step, announced politely as a status and
+never as an alert, since nothing is wrong. On, it says so and offers nothing: the system's setting
+stops notifications on this phone, and only the host ends a destination. A stop says what happened
+and offers "Try again", and "Open settings" when the system's setting is what the person has to
+change. A computer has no notifications to turn on and the row does not appear.
+
+The page asks four commands of the backend: `push_view`, `push_enable`, `push_refresh` and
+`notification_route`, and is told of a change on the `kr://push` event. `push.rs` sequences the
+steps for the host the person chose and holds the result in `push/push.json` under the data
+directory: per host, whether the person asked, the authorisation identifier this phone issued for it
+(so that asking again issues under the same one) and the last outcome in words. The file holds no
+token, no key and no credential. `docs/delivery/README.md` ("What the phone does first") says what
+the steps are. The page looks again with `push_refresh` when the application starts and each time it
+comes to the front, because a person who left to change the system's setting comes back to this
+screen. A tap on a notification opens the application, and `notification_route` hands the page the
+screen once; the page goes to the attention screen, where what needs the person is.
+
+The platform plugin carries the commands the steps need to native code: the permission, the token,
+the record of the registration being waited for, the limited key store, and the route of a tap. Its
+Android half is `PlatformPlugin.kt` and the receiver in `native/android`; its iOS half forwards to
+the application target through an adapter found by name (`KRPushAdapter`), as the voice call does.
+The receivers answer a registration challenge through one function of the Rust library
+(`native/platform/src/push.rs`), reached by JNI on Android and by C symbols on iOS. A debug build
+reads the registration token and the gateway's origin from `kr-probe/push-request.json` in the data
+directory, because a device run has no provider; a release build reads neither.
+
 ## An owner's confirmations
 
 On a computer that is one of a host's owner devices, `src-tauri/src/owner.rs` asks each such host
@@ -909,6 +939,10 @@ pnpm -C apps/companion build       # the production bundle
 cargo build -p kr-worker         # the worker the backend's session cases start
 cargo test -p companion-tauri      # the backend, including the boundary
 ```
+
+The push legs run on a device under the device lease: `scripts/e2e-push-device.sh ios` or `android`, with
+`KR_WEB_TREE` naming a built web checkout. `scripts/e2e-push-android-receiver.sh` runs the receiver's
+instrumented cases.
 
 On macOS the same command opens real windows for two checks with a main thread of their own.
 `tests/navigation.rs` holds what the web view does with the navigation handlers. `tests/host_events.rs`

@@ -917,6 +917,18 @@ through `services::signed`, which is the one credential every method of the sect
 group is proven by: the gateway origin, the method, a fresh nonce, the time and the digest of the
 canonical request body.
 
+`services::push` is the push gateway's client. `signed_push_request` is the one place a push request
+is built and signed, for whichever side sends it: the installation's key signs the registration and
+issue calls, and the host's key signs renewal and revocation. The daemon's senders and a phone's
+installation both build through it, so their requests cannot differ. `InstallationSigner` signs a
+managed-service request and the answer to a registration challenge, and refuses a statement under any
+other domain. `PushGateway` is what an installation calls: `propose` sends a registration token and
+says whether the gateway sent its challenge, `answer` presents the signed answer and activates the
+binding, and `issue` asks for a delivery credential scoped to one host. The credential comes back once, and a rendering of it or of
+the request that asked for it carries none of it. A phone's receiver does not use this client. It
+reaches the same builder through one Rust function and reads only the installation's authorisation key
+from its store (`kr_crypto::store::load_authorisation_key`).
+
 A request for something an account owns, rather than the key that asks, carries a second
 authorisation beside that credential. `signed::AccountAuthorisation` names a token source and the
 scope the resource reads; the token the source holds at that moment is taken before the request is
