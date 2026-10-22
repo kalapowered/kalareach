@@ -13,7 +13,9 @@ links = "companion-platform"
 
 [dependencies]
 base64.workspace = true
+kr-client.workspace = true
 kr-crypto.workspace = true
+kr-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
@@ -36,10 +38,10 @@ rustls-platform-verifier.workspace = true
 [build-dependencies]
 tauri-plugin = { version = "=2.6.3", features = ["build"] }
 
-# The workspace forbids unsafe code, which one platform call cannot honour: the Android TLS
-# verifier's start is a native method the JVM calls by its exported name, an unsafe attribute. This
-# crate denies unsafe code and allows it on exactly that function, `tls`'s start. Nothing else here
-# may relax the rule.
+# The workspace forbids unsafe code, which two kinds of platform call cannot honour: a native method
+# the JVM finds by its exported name, and a C function Swift finds by its. This crate denies unsafe
+# code and allows it on exactly those functions: the Android TLS verifier's start in `tls`, and the
+# push receiver's functions in `push`. Nothing else here may relax the rule.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"
