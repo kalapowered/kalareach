@@ -773,6 +773,8 @@ pub struct Controller {
     /// and writing its closure happen once: the second to arrive waits and finds the closure.
     crash_flights:
         std::sync::Mutex<std::collections::HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
+    /// What the daemon collects of the sessions that have closed, and the task that does it.
+    collection: crate::collection::Collection,
     /// This daemon's side of an update of the host: its gate to new sessions, the creates under
     /// way, and whether it has been told to stop.
     handover: host::Handover,
@@ -1052,6 +1054,11 @@ impl Controller {
         &self.attention
     }
 
+    /// Returns what the daemon collects of the sessions that have closed.
+    pub(crate) const fn collection(&self) -> &crate::collection::Collection {
+        &self.collection
+    }
+
     /// Returns the registry, for a module that needs to read the environment's own records.
     pub(crate) const fn registry_handle(&self) -> &Mutex<Registry> {
         &self.registry
@@ -1247,6 +1254,14 @@ mod a_withdrawal_that_meets_an_end_not_yet_written;
 /// An action an earlier build claimed in the grant store alone, as the route check finds it.
 #[cfg(test)]
 mod a_voice_receipt_from_an_earlier_build;
+
+/// What the daemon collects of the sessions that have closed, begun by the daemon itself.
+#[cfg(test)]
+mod a_collection_started_with_the_daemon;
+
+/// The sessions a daemon finds recorded in an earlier boot, when another recovery holds one.
+#[cfg(test)]
+mod a_previous_boot_left_to_a_held_recovery;
 
 /// The transfer service's de-duplication records, forgotten on a clock this host can prove.
 #[cfg(test)]
