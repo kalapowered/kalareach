@@ -33,6 +33,8 @@ harness = false
 tauri-build = { workspace = true, features = [] }
 
 [dependencies]
+# Draws the kit as a QR code to print.
+qrcodegen.workspace = true
 # The one secure store, the Android TLS verifier's start and the browser-backed sign-in session.
 companion-platform.workspace = true
 kr-cbor.workspace = true
@@ -94,6 +96,9 @@ testing = ["kr-client/testing"]
 exacl.workspace = true
 
 [dev-dependencies]
+# Reads the QR code the kit is saved as, which a test holds to the kit's own text: an encoder that
+# misrendered would otherwise be decoded by its own code.
+rqrr.workspace = true
 # This crate's own tests, with the seams above compiled in.
 companion-tauri = { path = ".", features = ["testing"] }
 # The pinned width model, which a test measures a placed run against.

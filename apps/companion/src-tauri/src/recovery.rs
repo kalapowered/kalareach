@@ -37,8 +37,9 @@ use std::sync::Arc;
 
 use kr_client::Shown;
 use kr_client::recovery::{
-    BundleStore, HostBackups, HostCover, Left, LostWrite, RecoveryError, cover_host_archive,
-    fresh_locator, render_kit,
+    AccountSource, BundleStore, CandidateState, FilesRestore, HostBackups, HostCover, Left,
+    LostWrite, RecoveryError, RestoreError, RestoreSource, cover_host_archive, fresh_locator,
+    qr_payload, render_kit,
 };
 use kr_client::services::account::{AccountTokenSource, BACKUP_WRITE_SCOPE};
 use kr_client::services::{
@@ -51,10 +52,11 @@ use kr_crypto::store::{SecretStore, load_recovery_seed, store_recovery_seed};
 use kr_ipc::paths::{
     create_private_directory, flush_path_names, read_owner_only_file, write_owner_only_file,
 };
-use kr_protocol::archive::RecoveryContext;
+use kr_protocol::archive::{RecoveryContext, RecoveryKit};
 use kr_protocol::backup_read::BackupSignIn;
 use kr_protocol::backup_setup::{BackupEnableCause, BackupUnusable};
 use kr_protocol::error::ErrorCode;
+use kr_protocol::ids::ArchiveId;
 use kr_protocol::scalars::{AuthorisationKey, Signature64, TimestampMs};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use serde::{Deserialize, Serialize};
@@ -127,6 +129,42 @@ pub struct RecoveryView {
 pub struct KitSaved {
     /// Where it was written.
     pub path: String,
+}
+
+/// One archive the recovery bundle names, as the page lists it for export.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ArchiveView {
+    /// The archive's identifier, which the page gives back to name the one to export.
+    pub archive_id: String,
+    /// The newest generation the service holds of it, once verified as a restore verifies one.
+    pub generation: Option<u64>,
+    /// When the writer signed that generation, in UTC milliseconds.
+    pub published_at_ms: Option<u64>,
+    /// Why the service's newest generation is not offered, when it is not.
+    pub withheld: Option<WithheldView>,
+}
+
+/// Why no generation of an archive is offered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WithheldView {
+    /// The service holds no generation of it, or none as new as the bundle's checkpoint.
+    Nothing,
+    /// The service holds a publication that a restore would refuse.
+    Refused,
+}
+
+/// What the page is told once an export has been written.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ExportSaved {
+    /// Where it was written.
+    pub path: String,
+    /// The archive exported, or nothing for the bundle alone.
+    pub archive_id: Option<String>,
+    /// The generation exported.
+    pub generation: Option<u64>,
+    /// How many bytes were written.
+    pub bytes: u64,
 }
 
 /// What covering the host on this computer with this computer's recovery came to.
@@ -540,6 +578,182 @@ impl Recovery {
     }
 
     /* ---------------------------------------------------------------------- */
+    /* The kit as a QR code, and the offline export                            */
+    /* ---------------------------------------------------------------------- */
+
+    /// Writes the recovery kit to `destination` as a QR code, an SVG, with the owner-only mode as
+    /// the text kit has. The code carries the kit's own text at error correction Q, so that a
+    /// scanner reads the document a person could have typed and a printed copy survives a scuff.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when recovery is not on, and a local failure when the kit does not fit a
+    /// QR code or the file cannot be written.
+    pub async fn save_kit_qr(&self, destination: &Path) -> Result<()> {
+        let svg = {
+            let _step = self.step().await?;
+            let kit = self.kit()?;
+            let payload = qr_payload(&kit).map_err(said_of)?;
+            let code = qrcodegen::QrCode::encode_binary(&payload, qrcodegen::QrCodeEcc::Quartile)
+                .map_err(|_| {
+                CommandError::local_failure("the recovery kit is too large to print as a QR code")
+            })?;
+            qr_svg(&code)
+        };
+        let destination = destination.to_path_buf();
+        tauri::async_runtime::spawn_blocking(move || write_private(&destination, svg.as_bytes()))
+            .await
+            .map_err(|error| {
+                CommandError::local_failure(format!("the QR code was not written: {error}"))
+            })?
+            .map_err(|error| {
+                CommandError::local_failure(format!("the QR code could not be written: {error}"))
+            })
+    }
+
+    /// The archives the recovery bundle names at the service, each with the newest generation the
+    /// service holds, verified as a restore verifies it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when recovery is not on or the account cannot be used, and the service's
+    /// own failure when it cannot be read.
+    pub async fn archives(&self, account: &Account) -> Result<Vec<ArchiveView>> {
+        let _step = self.step().await?;
+        let (record, source) = self.reading(account)?;
+        let listed = FilesRestore::archives(self.kit_of(&record)?, source)
+            .await
+            .map_err(said_by_restore)?;
+        Ok(listed
+            .into_iter()
+            .map(|candidate| match candidate.newest {
+                CandidateState::Newest(newest) => ArchiveView {
+                    archive_id: candidate.archive_id.to_string(),
+                    generation: Some(newest.generation.get()),
+                    published_at_ms: Some(newest.published_at_ms.get()),
+                    withheld: None,
+                },
+                CandidateState::Nothing => ArchiveView {
+                    archive_id: candidate.archive_id.to_string(),
+                    generation: None,
+                    published_at_ms: None,
+                    withheld: Some(WithheldView::Nothing),
+                },
+                CandidateState::Refused(_) => ArchiveView {
+                    archive_id: candidate.archive_id.to_string(),
+                    generation: None,
+                    published_at_ms: None,
+                    withheld: Some(WithheldView::Refused),
+                },
+            })
+            .collect())
+    }
+
+    /// Writes an offline export to `destination`: the recovery bundle as the service holds it and,
+    /// when `archive` is named, that archive's newest generation as ciphertext. The bundle is
+    /// authenticated and the archive's manifest opened here to find what it names; nothing
+    /// decrypted is written or sent. The export is read with the kit alone, by
+    /// `kr backup restore --from-export`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when recovery is not on or the account cannot be used, a failure of the
+    /// service when it cannot be read, a refusal by name for an archive the bundle does not list or
+    /// one too large to be a file, and a local failure when the file cannot be written.
+    pub async fn export_offline(
+        &self,
+        account: &Account,
+        destination: &Path,
+        archive: Option<ArchiveId>,
+    ) -> Result<ExportSaved> {
+        let (bytes, archive_id, generation) = {
+            let _step = self.step().await?;
+            let (record, source) = self.reading(account)?;
+            let kit = self.kit_of(&record)?;
+            let (export, generation) = match archive {
+                None => (
+                    FilesRestore::export_bundle(kit, source)
+                        .await
+                        .map_err(said_by_restore)?,
+                    None,
+                ),
+                Some(archive) => {
+                    let prepared = FilesRestore::prepare(kit, source, Some(archive), None)
+                        .await
+                        .map_err(said_by_restore)?;
+                    let generation = prepared.plan().generation.get();
+                    (
+                        prepared.export().await.map_err(said_by_restore)?,
+                        Some(generation),
+                    )
+                }
+            };
+            let bytes = export.to_canonical_bytes().map_err(said_of)?;
+            (
+                bytes,
+                archive.map(|archive| archive.to_string()),
+                generation,
+            )
+        };
+        let written = bytes.len() as u64;
+        let destination = destination.to_path_buf();
+        let path = destination.to_string_lossy().into_owned();
+        tauri::async_runtime::spawn_blocking(move || write_private(&destination, &bytes))
+            .await
+            .map_err(|error| {
+                CommandError::local_failure(format!("the export was not written: {error}"))
+            })?
+            .map_err(|error| {
+                CommandError::local_failure(format!("the export could not be written: {error}"))
+            })?;
+        Ok(ExportSaved {
+            path,
+            archive_id,
+            generation,
+            bytes: written,
+        })
+    }
+
+    /// The kit of this computer's recovery, made from the seed and the record.
+    fn kit(&self) -> Result<RecoveryKit> {
+        let record = self
+            .record()?
+            .filter(|record| record.kept)
+            .ok_or_else(|| CommandError::refused("recovery is not on, so there is no kit"))?;
+        self.kit_of(&record)
+    }
+
+    fn kit_of(&self, record: &Record) -> Result<RecoveryKit> {
+        Ok(self.seed(false)?.to_kit(
+            vec![record.service_origin.clone()],
+            record.bundle_locator.clone(),
+        ))
+    }
+
+    /// The record and a source that reads the service with the account, for a step that reads.
+    fn reading(&self, account: &Account) -> Result<(Record, Arc<dyn RestoreSource>)> {
+        let record = self
+            .record()?
+            .filter(|record| record.kept)
+            .ok_or_else(|| CommandError::refused("recovery has not been turned on"))?;
+        let origin = record.origin()?;
+        refuse_if_blocked(account, &origin)?;
+        let http = HttpService::with(
+            origin.clone(),
+            HttpDeadlines::default(),
+            managed_response_limits(),
+        )
+        .map_err(|error| {
+            CommandError::local_failure(format!(
+                "this computer cannot reach the sync service: {error}"
+            ))
+        })?;
+        let tokens: Arc<dyn AccountTokenSource> = account.tokens();
+        let source = AccountSource::new(origin, Arc::new(http), Arc::clone(&self.signer), tokens);
+        Ok((record, Arc::new(source)))
+    }
+
+    /* ---------------------------------------------------------------------- */
     /* Covering the host                                                       */
     /* ---------------------------------------------------------------------- */
 
@@ -734,6 +948,49 @@ fn said(error: RecoveryError) -> CommandError {
         RecoveryError::Service(error) => CommandError::from(error),
         other => CommandError::local_failure(other.to_string()),
     }
+}
+
+/// What a recovery failure that is not the service's is to the person.
+fn said_of(error: RecoveryError) -> CommandError {
+    said(error)
+}
+
+/// What a restore's failure is to the person: the service's own when it was the service, and words
+/// of this program's otherwise.
+fn said_by_restore(error: RestoreError) -> CommandError {
+    match error {
+        RestoreError::Read(error) => CommandError::from(error),
+        RestoreError::Recovery(cause) => said(*cause),
+        too_large @ RestoreError::TooLargeToExport { .. } => {
+            CommandError::too_large(too_large.to_string())
+        }
+        other => CommandError::refused(other.to_string()),
+    }
+}
+
+/// The QR code as an SVG: one path of unit squares, dark on white, with the four-module quiet zone
+/// a scanner needs.
+fn qr_svg(code: &qrcodegen::QrCode) -> String {
+    const BORDER: i32 = 4;
+    let size = code.size() + BORDER * 2;
+    let mut squares = String::new();
+    for y in 0..code.size() {
+        for x in 0..code.size() {
+            if code.get_module(x, y) {
+                if !squares.is_empty() {
+                    squares.push(' ');
+                }
+                squares.push_str(&format!("M{},{}h1v1h-1z", x + BORDER, y + BORDER));
+            }
+        }
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" viewBox=\"0 0 {size} {size}\" \
+         width=\"{size}\" height=\"{size}\" shape-rendering=\"crispEdges\">\
+         <rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>\
+         <path d=\"{squares}\" fill=\"#000000\"/></svg>\n"
+    )
 }
 
 /// Writes `body` as the whole of the file the person chose for the kit, readable by this user alone
