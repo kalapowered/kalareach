@@ -86,7 +86,14 @@ struct Same {
     reason: &'static str,
 }
 
-const SAME: &[Same] = &[];
+const SAME: &[Same] = &[Same {
+    root: "SessionSummary",
+    digest: "9cafe1ef37ff6a31db1abb0699f015b6acc699ba612418fdead619af6a845943",
+    reason: "A member that is absent from the wire: the name of the application in the \
+             session's foreground where the worker knows one. A worker of the retained level \
+             never writes it, and this build reads a summary without it as a session that has no \
+             application, so what that level writes is read as before.",
+}];
 
 /// The rules of the surface, as the roots the walker follows them from:
 ///

@@ -322,7 +322,21 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
     include_str!("../retained/0.76/RELEASE"),
     include_str!("../retained/0.76/PLUGIN_HOST"),
     &[],
-    &[],
+    &[Compatible {
+        at: "SessionSummary.application",
+        reason: "A member that is absent from the wire for a session whose worker knows no \
+                 foreground application, and a worker of the retained level never writes it, so \
+                 this build's daemon reads what that level writes as a session with no \
+                 application, and a session of that level shows none. A summary that carries the \
+                 member is written only by a worker of this build. Summaries travel from a worker \
+                 to the daemon, which hands them on to callers through `session.list` and \
+                 `session.read`; an earlier release's reader, whose summary is a closed object, \
+                 cannot read one that carries the member. No client was released, so there is no \
+                 shim: the public contract may change with a level move until public 1.0 freezes \
+                 at the first client release (`docs/releases/packages.md`). A worker's journal \
+                 keeps the summary in the shape every release reads and the application in a row \
+                 of its own.",
+    }],
 )
 .with_public_majors(include_str!("../retained/0.76/PUBLIC_MAJORS"))];
 
