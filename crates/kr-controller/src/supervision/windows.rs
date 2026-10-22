@@ -2288,8 +2288,8 @@ pub mod testing {
                 logon,
                 starter: powershell,
                 arguments: format!(
-                    "-NoProfile -NonInteractive -Command \"[Environment]::ProcessId | \
-                     Set-Content -LiteralPath '{}'; Start-Sleep -Seconds 600\"",
+                    "-NoProfile -NonInteractive -Command \"[IO.File]::WriteAllText('{}', \
+                     [string][Environment]::ProcessId); Start-Sleep -Seconds 600\"",
                     written.display()
                 ),
                 working_directory: directory.to_path_buf(),
@@ -2307,8 +2307,10 @@ pub mod testing {
                 }
                 if std::time::Instant::now() >= deadline {
                     return Err(format!(
-                        "the task {} did not start its process within two minutes",
-                        task.0.name
+                        "the task {} did not start its process within two minutes; the Task \
+                         Scheduler's last result: {:?}",
+                        task.0.name,
+                        super::last_result(&task.0)
                     ));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
