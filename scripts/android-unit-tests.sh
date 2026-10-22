@@ -10,8 +10,9 @@
 #   --                      What follows goes to Gradle after the task, for example
 #                           `--tests to.kala.reach.companion.mobile.VoiceCaptureGateTest.<method>`.
 #
-# The exit status is Gradle's. It needs a JDK (17 or newer), `cargo` with the pinned toolchain,
-# which the build asks for the Android TLS verifier's repository, and a network.
+# The exit status is Gradle's. It needs a JDK (17 or newer) and a network: the build reads the
+# lock file for the Android TLS verifier's version and fetches that component from its project's
+# archive.
 #
 # Gradle reads two files Tauri's build writes when it packages the application, and a checkout that
 # has not packaged it has neither. The module under test needs neither, so a missing one is written
@@ -44,11 +45,6 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-
-if ! command -v cargo > /dev/null 2>&1; then
-    echo "android-unit-tests: cargo is needed and is not on the path" >&2
-    exit 2
-fi
 
 written=()
 # shellcheck disable=SC2329 # run by the trap below
