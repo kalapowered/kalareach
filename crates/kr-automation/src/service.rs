@@ -1156,7 +1156,9 @@ impl AutomationService {
     /// the same request sent again, because its reply was lost, finds the chain already on the
     /// next generation, is answered with it and starts nothing; the chain may have run out again
     /// by then, and that is no reason to give it a second budget for a request that was answered.
-    /// Nothing is recorded for the request, because the chain's own state is what answers it.
+    /// Nothing is recorded for the request, because the chain's own state is what answers it. An
+    /// exact repeat, which carries the freshness window the request was first admitted under, is
+    /// answered from that state before the window is asked about ([`Self::rearmed`]).
     ///
     /// The runs that start now are in [`Rearmed::started`], for the host to execute; one that
     /// waits for a slot starts when one frees.
@@ -1176,23 +1178,7 @@ impl AutomationService {
         caller_grant: Option<GrantId>,
         now_ms: u64,
     ) -> Result<Rearmed> {
-        if let Some(held) = caller_grant
-            && params.grant_reference != held
-        {
-            return Err(AutomationError::PermissionDenied(
-                "a paired device rearms a chain only under the grant it holds".to_owned(),
-            ));
-        }
-        let grant = self.authority.grant(params.grant_reference, now_ms)?;
-        if !grant.permits(ActionRight::AutomationManage)
-            || !grant.environment_selector.admits(self.environment_id)
-        {
-            return Err(AutomationError::PermissionDenied(format!(
-                "grant {} does not carry automation.manage in environment {}, which a rearm \
-                 needs",
-                params.grant_reference, self.environment_id
-            )));
-        }
+        self.may_rearm(params, caller_grant, now_ms)?;
         let root = params.causal_root_id;
         self.store.guarded(admission, |journal| {
             // A chain belongs to the grant its root run acts under, and a device reaches only
@@ -1232,6 +1218,62 @@ impl AutomationService {
                 },
             })
         })
+    }
+
+    /// Checks that a rearm is made under a grant that may make it.
+    fn may_rearm(
+        &self,
+        params: &WorkflowRearmParams,
+        caller_grant: Option<GrantId>,
+        now_ms: u64,
+    ) -> Result<()> {
+        if let Some(held) = caller_grant
+            && params.grant_reference != held
+        {
+            return Err(AutomationError::PermissionDenied(
+                "a paired device rearms a chain only under the grant it holds".to_owned(),
+            ));
+        }
+        let grant = self.authority.grant(params.grant_reference, now_ms)?;
+        if !grant.permits(ActionRight::AutomationManage)
+            || !grant.environment_selector.admits(self.environment_id)
+        {
+            return Err(AutomationError::PermissionDenied(format!(
+                "grant {} does not carry automation.manage in environment {}, which a rearm \
+                 needs",
+                params.grant_reference, self.environment_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Answers the repeat of a rearm that was performed, if `params` is one (`workflow.rearm`).
+    ///
+    /// A request that lost its reply is sent again as it was, carrying the freshness window it
+    /// was first admitted under, and the host asks for this before it asks whether that window
+    /// still stands: a rearm that was performed has nothing left to admit. It is an answer and
+    /// not an action. It is given to a caller that may rearm the chain, under the checks a rearm
+    /// makes, and only when the chain stands on the generation after the one the request leaves.
+    /// For anything else the answer is none, and the request goes on to be admitted and decided
+    /// as a new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns what a rearm returns for a grant that may not rearm, and a storage error.
+    pub fn rearmed(
+        &self,
+        params: &WorkflowRearmParams,
+        caller_grant: Option<GrantId>,
+        now_ms: u64,
+    ) -> Result<Option<WorkflowRearmResult>> {
+        self.may_rearm(params, caller_grant, now_ms)?;
+        Ok(self
+            .store
+            .rearmed_after(params.causal_root_id, params.generation.get(), caller_grant)?
+            .map(|generation| WorkflowRearmResult {
+                causal_root_id: params.causal_root_id,
+                generation: U64::new(generation),
+            }))
     }
 
     /// Admits one continuation of a rearmed chain, inside the rearm's transaction.
