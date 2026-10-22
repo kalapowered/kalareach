@@ -311,7 +311,9 @@ fn a_grant_that_loses_its_admission_at_the_store_writes_neither_grant_nor_invita
     service.share(&request, || Ok(())).expect("issued");
 }
 
-/// A confirmation that runs out while the store is waited for transfers nothing.
+/// KR-REQ-10.05: the owner's confirmation of a transfer is checked again where the transfer writes,
+/// so one that runs out while the store is waited for transfers nothing: the receiver is given no
+/// grant and the giver keeps the control it was handing over.
 #[test]
 fn a_confirmation_that_runs_out_while_the_store_is_waited_for_writes_nothing() {
     /// The clock the ceremony runs on: fixed, so the deadline this test is about is exact.
@@ -445,7 +447,9 @@ fn a_confirmation_that_runs_out_while_the_store_is_waited_for_writes_nothing() {
     );
 }
 
-/// A confirmation keeps the challenge's own deadline, and dies with the boot it was accepted in.
+/// KR-REQ-10.05: the owner's confirmation of a transfer keeps the challenge's own deadline of two
+/// minutes and dies with the boot it was accepted in, and a wall clock that went back lengthens
+/// nothing.
 #[test]
 fn a_confirmation_keeps_its_own_deadline_and_its_own_boot() {
     /// A clock the test moves: the monotonic reading and the boot identity are both settable.
@@ -585,6 +589,9 @@ fn a_confirmation_keeps_its_own_deadline_and_its_own_boot() {
 /// A challenge answered for another host does not confirm a transfer on this one.
 /// KR-REQ-02.09: changing who holds a session's host authority needs an owner confirmation bound
 /// to this host.
+/// KR-REQ-10.05: the verifier builds its expectation from the plan and this host, so the answer to
+/// a challenge that names another host, or other destination keys than the plan hands the session
+/// to, is refused.
 #[test]
 fn a_confirmation_issued_for_another_host_does_not_authorise_a_transfer_here() {
     let clock = Clock;

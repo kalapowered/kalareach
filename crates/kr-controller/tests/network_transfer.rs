@@ -69,13 +69,16 @@ async fn still_waiting(
         .any(|waiting| waiting.answered && &waiting.request == challenge)
 }
 
-/// KR-REQ-18.03 and KR-REQ-23.49: an owner device confirms a transfer of control for exactly the
-/// plan the host describes, and `grant.transfer` spends that confirmation once. The giving device
-/// holds a grant that another device delegated to it; the receiving device is given an active grant
-/// over the session that keeps that issuer and parent and ends no later than the grant it replaces,
-/// the giving device's grant is revoked through the barrier and the grant it was delegated from is
-/// not, a connection acting under the grant that was given up is ended promptly, and a repeat of
-/// the action is answered as it was, spending nothing.
+/// KR-REQ-18.03, KR-REQ-23.49 and KR-REQ-10.05: an owner device confirms a transfer of control for
+/// exactly the plan the host describes, and `grant.transfer` spends that confirmation. The plan the
+/// owner device is shown carries the digest of the challenge, the receiving device and its keys; an
+/// answer the owner gave under another action is not spent by this one, and the answer for this
+/// action is consumed by the transfer. The giving device holds a grant that another device
+/// delegated to it; the receiving device is given an active grant over the session that keeps that
+/// issuer and parent and ends no later than the grant it replaces, the giving device's grant is
+/// revoked through the barrier and the grant it was delegated from is not, a connection acting
+/// under the grant that was given up is ended promptly, and a repeat of the action is answered as
+/// it was, spending nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_18_03_a_transfer_hands_a_session_to_another_device_on_the_owners_confirmation() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -157,6 +160,10 @@ async fn kr_req_18_03_a_transfer_hands_a_session_to_another_device_on_the_owners
     let done = transfer(&host, &mut client, &params, action)
         .await
         .expect("the owner's confirmation is spent");
+    assert!(
+        !still_waiting(&host, &challenge).await,
+        "the owner's answer for this action was consumed by the transfer"
+    );
 
     // The receiving device holds an active grant over the session and nothing else, which keeps
     // the issuer and the parent the giving device's grant had: it is not a delegation.
@@ -246,11 +253,13 @@ async fn kr_req_18_03_a_transfer_hands_a_session_to_another_device_on_the_owners
     host.stop().await;
 }
 
-/// KR-REQ-18.03 and KR-REQ-23.49: nothing is handed over without the owner's confirmation of this
-/// exact transfer. An answer for another destination is not spent, a destination that is not
-/// paired is refused before any answer is looked at, no answer at all hands over nothing, and a
-/// paired device asks neither for the confirmation nor for the transfer. After each the giving
-/// device still holds the session.
+/// KR-REQ-18.03, KR-REQ-23.49 and KR-REQ-10.05: nothing is handed over without the owner's
+/// confirmation of this exact transfer. An answer for another destination is not spent, a
+/// destination that is not paired is refused before any answer is looked at, and no answer at all
+/// hands over nothing although the request comes from the person at this machine over the local
+/// socket: the peer's credentials are no confirmation. A paired device, an owner device included,
+/// asks neither for the confirmation nor for the transfer. After each the giving device still holds
+/// the session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_18_03_a_transfer_the_owner_did_not_confirm_hands_nothing_over() {
     let owner = DeviceKeys::generate().expect("owner keys");
