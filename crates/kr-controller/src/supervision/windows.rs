@@ -2289,7 +2289,7 @@ pub mod testing {
                 starter: powershell,
                 arguments: format!(
                     "-NoProfile -NonInteractive -Command \"[IO.File]::WriteAllText('{}', \
-                     [string][Environment]::ProcessId); Start-Sleep -Seconds 600\"",
+                     [string]$PID); Start-Sleep -Seconds 600\"",
                     written.display()
                 ),
                 working_directory: directory.to_path_buf(),
