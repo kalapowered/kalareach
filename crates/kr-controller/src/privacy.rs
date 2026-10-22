@@ -1810,7 +1810,7 @@ impl crate::service::Controller {
         .map_err(|_| ControllerError::RegistryUnavailable {
             detail: "the privacy change stopped before it could say what it did".to_owned(),
         })??;
-        kr_protocol::envelope::ParamsValue::from_typed(&report)
+        kr_protocol::envelope::ParamsValue::from_typed(&self.with_viewer_copies(report))
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
 
@@ -1827,8 +1827,66 @@ impl crate::service::Controller {
             .map_err(|_| ControllerError::RegistryUnavailable {
                 detail: "privacy mode's report could not be made".to_owned(),
             })?;
-        kr_protocol::envelope::ParamsValue::from_typed(&report)
+        kr_protocol::envelope::ParamsValue::from_typed(&self.with_viewer_copies(report))
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+
+    /// Adds to a report the copies that authorised viewers may hold.
+    ///
+    /// Section 24: copies held by authorised viewers are not retroactively erased, and they are
+    /// shown as retained artifacts. A device that was let see this host's sessions may hold what it
+    /// was shown, on a screen or in its own scrollback, and this host cannot recall it: revoking the
+    /// device ends what it can read from now on and nothing before. So each device that has held a
+    /// grant with the right to view is listed once, with the moment it first could, whether the grant
+    /// is still in force or not. The entry says *possible* because the host does not record what a
+    /// device was sent, and it is never deletable: there is no route to ask a device's own store to
+    /// forget.
+    ///
+    /// A grant store this host cannot read is named among what could not be listed, and the report
+    /// is not shorter without saying so.
+    fn with_viewer_copies(&self, mut report: PrivacyReport) -> PrivacyReport {
+        use kr_protocol::privacy::{PrivacyExported, PrivacyUnavailable};
+
+        let records = match self.sharing().grants().records() {
+            Ok(records) => records,
+            Err(error) => {
+                report.unlisted.push(PrivacyUnavailable {
+                    subsystem: "viewers".to_owned(),
+                    reason: format!("the grants this host has issued could not be read: {error}"),
+                });
+                return report;
+            }
+        };
+        let mut first_able: std::collections::BTreeMap<kr_protocol::ids::DeviceId, u64> =
+            std::collections::BTreeMap::new();
+        for record in &records {
+            let Some(activated) = record.activated_at_ms else {
+                continue;
+            };
+            if !record
+                .grant
+                .permits(kr_protocol::rights::ActionRight::SessionView)
+            {
+                continue;
+            }
+            first_able
+                .entry(record.grant.recipient_device_id)
+                .and_modify(|earliest| *earliest = (*earliest).min(activated))
+                .or_insert(activated);
+        }
+        report
+            .exported
+            .extend(
+                first_able
+                    .into_iter()
+                    .map(|(device_id, activated)| PrivacyExported {
+                        kind: "possible copy held by a viewer's device".to_owned(),
+                        reference: format!("device {device_id}"),
+                        left_at_ms: TimestampMs::new(activated),
+                        deletable: false,
+                    }),
+            );
+        report
     }
 }
 

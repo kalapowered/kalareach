@@ -1243,6 +1243,10 @@ mod a_voice_receipt_from_an_earlier_build;
 #[cfg(test)]
 mod a_collection_started_with_the_daemon;
 
+/// The copies that authorised viewers may hold, listed among what has left the host.
+#[cfg(test)]
+mod a_copy_a_viewer_may_hold;
+
 /// The transfer service's de-duplication records, forgotten on a clock this host can prove.
 #[cfg(test)]
 mod a_sweep_on_a_clock_in_doubt;
