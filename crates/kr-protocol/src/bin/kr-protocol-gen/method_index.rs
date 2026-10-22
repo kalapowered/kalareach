@@ -483,8 +483,11 @@ pub(crate) fn unnamed_methods(docs: &Path) -> std::io::Result<Vec<&'static str>>
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use kr_protocol::method::REGISTRY;
+
     use super::{
-        INDEX_PATH, broken_links, has_heading, markdown_documents, names, render, unnamed_methods,
+        INDEX_PATH, broken_links, described_in, has_heading, markdown_documents, names, render,
+        unnamed_methods,
     };
 
     fn docs() -> PathBuf {
@@ -596,7 +599,18 @@ mod tests {
         let copy = DocsCopy::of_the_documentation("missing-document");
         std::fs::remove_file(copy.path().join("automation/README.md")).expect("remove");
         let broken = broken_links(copy.path());
-        assert_eq!(broken.len(), 5, "{broken:?}");
+        let described_there = REGISTRY
+            .iter()
+            .filter(|entry| {
+                described_in(entry.method)
+                    .is_some_and(|section| section.document.path == "automation/README.md")
+            })
+            .count();
+        assert!(
+            described_there > 0,
+            "the automation methods are described there"
+        );
+        assert_eq!(broken.len(), described_there, "{broken:?}");
         assert!(
             broken
                 .iter()
