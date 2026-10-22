@@ -91,7 +91,7 @@ export function describeBytes(bytes: number): string {
 
 /** What the picker says when the camera is not allowed, and how to allow it. */
 export const CAMERA_NOT_ALLOWED =
-  'KalaReach cannot use the camera. Allow it in Settings to take a photo.'
+  'KalaReach cannot use the camera. Allow it in Settings, if this phone lets you, to take a photo.'
 
 /** What the picker does about the camera, and says. */
 export interface CameraOffer {
