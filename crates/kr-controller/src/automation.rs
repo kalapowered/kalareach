@@ -43,7 +43,7 @@ use kr_protocol::actor::ActorIngress;
 use kr_protocol::automation::{
     NodeOutput, WorkflowActionKind, WorkflowDefinition, WorkflowEnableParams,
     WorkflowInstallParams, WorkflowNode, WorkflowPauseParams, WorkflowReadParams,
-    WorkflowRunParams,
+    WorkflowRearmParams, WorkflowRunParams,
 };
 use kr_protocol::changeset::{ChangesetCaptureParams, ChangesetMaterializeParams, Provenance};
 use kr_protocol::envelope::{
@@ -2933,6 +2933,9 @@ impl AutomationModule {
             Method::WorkflowPause => {
                 let _: WorkflowPauseParams = parse(&mutation.params)?;
             }
+            Method::WorkflowRearm => {
+                let _: WorkflowRearmParams = parse(&mutation.params)?;
+            }
             Method::WorkflowRun => {
                 let params: WorkflowRunParams = parse(&mutation.params)?;
                 if params.event_id.trim().is_empty() {
@@ -3104,6 +3107,27 @@ impl AutomationModule {
                     encode(&service.pause(&asked, &submitted, now_ms)?)
                 })
                 .await
+            }
+            // A rearm keeps no record: it names the budget generation it leaves, and the chain's
+            // own state answers a repeat. The runs it continued execute here, each on a task of
+            // its own, once the rearm has committed; a daemon that stops in between leaves them
+            // running in the journal, and its next start takes them up.
+            Method::WorkflowRearm => {
+                let executing = Arc::clone(&service);
+                let rearmed = blocking(move || {
+                    let asked: WorkflowRearmParams = typed(&params)?;
+                    Ok::<_, ProtocolError>(service.rearm(
+                        &asked,
+                        &still_admitted,
+                        caller_grant,
+                        now_ms,
+                    )?)
+                })
+                .await?;
+                for run in rearmed.started {
+                    execute_apart(&executing, run);
+                }
+                encode(&rearmed.result)
             }
             other => Err(ProtocolError::new(
                 ErrorCode::InvalidArgument,
@@ -3729,6 +3753,7 @@ mod tests {
             Method::WorkflowEnable,
             Method::WorkflowPause,
             Method::WorkflowRun,
+            Method::WorkflowRearm,
             Method::WorkflowRead,
         ] {
             assert!(
@@ -3753,6 +3778,7 @@ mod tests {
             Method::WorkflowEnable,
             Method::WorkflowPause,
             Method::WorkflowRun,
+            Method::WorkflowRearm,
             Method::WorkflowRead,
         ] {
             let entry = method.entry();
@@ -4301,6 +4327,7 @@ mod tests {
             Method::WorkflowEnable,
             Method::WorkflowPause,
             Method::WorkflowRun,
+            Method::WorkflowRearm,
             Method::WorkflowRead,
         ] {
             let decision = kr_protocol::method::decide(

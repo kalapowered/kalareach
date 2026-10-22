@@ -69,12 +69,12 @@ pub use crate::engine::{
 };
 pub use crate::error::{AutomationError, Result};
 pub use crate::service::{
-    AdmittedTriggers, Answer, AutomationService, DERIVED_TRIGGER_PREFIX, StartedRun,
+    AdmittedTriggers, Answer, AutomationService, DERIVED_TRIGGER_PREFIX, Rearmed, StartedRun,
     TRIGGER_CONSUMER, TriggerDecision,
 };
 pub use crate::store::{
     Acted, ActionKey, ActionRecord, AttentionOutboxRecord, AttentionSubject, Breach, Continuation,
-    InstalledDefinition, Journal, JournalEvent, JournalEventKind, NodeSettlement, Outlived,
+    InstalledDefinition, Journal, JournalEvent, JournalEventKind, NodeSettlement, Outlived, Rearm,
     StoredRunRecord, Submitted, WorkflowStore,
 };
 
