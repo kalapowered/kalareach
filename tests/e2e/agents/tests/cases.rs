@@ -9526,12 +9526,31 @@ fn a_tree_whose_descendant_keeps_starting_children_is_caught_whole() {
         &format!("/bin/sh -c 'while :; do {MARKED_SLEEP} & /bin/sleep 0.01; done'; :"),
         1,
     );
-    std::thread::sleep(Duration::from_millis(300));
+    let root_pid = u32::try_from(root.pid.get()).expect("the shell's number");
+    // The inner shell has started a few children by now, and goes on starting them while the walk
+    // goes down to it. How long that takes is the machine's, so the tree is waited for.
+    let started = std::time::Instant::now();
+    loop {
+        let table = kr_e2e_m1b::run::process_table().expect("the process table");
+        let tree_now = beneath(&table, root_pid);
+        let children = table
+            .iter()
+            .filter(|entry| entry.command == MARKED_SLEEP && tree_now.contains(&entry.pid))
+            .count();
+        if children >= 3 {
+            break;
+        }
+        assert!(
+            started.elapsed() < LIVENESS,
+            "the inner shell started {children} children in {:?}, and the case needs three",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let frozen = freeze(std::slice::from_ref(&root));
     tree.named.extend(frozen.stopped.iter().cloned());
     tree.named.extend(frozen.unconfirmed.iter().cloned());
     assert!(frozen.complete, "{frozen:?}");
-    let root_pid = u32::try_from(root.pid.get()).expect("the shell's number");
     let table = kr_e2e_m1b::run::process_table().expect("the process table");
     let beneath_the_tree = beneath(&table, root_pid);
     let before: Vec<u32> = table
