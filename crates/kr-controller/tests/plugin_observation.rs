@@ -19,7 +19,7 @@
 //! | KR-REQ-11.40 | an observation the component never returns from is stopped by fuel when its deadline cannot fire, and named so |
 //! | KR-REQ-11.41 | a component that was compiled when it was registered is observed without a fault, the compile outside the observation's deadline |
 //! | KR-REQ-24.06 | a plugin runtime killed with a receipt, a question and an approval live leaves all three as they were and answerable, and its component is registered again in the replacement and restored to the state the worker held |
-//! | KR-REQ-24.27 | turning privacy mode on drops the state held for a component and none is taken or held while it is on, observation for live use goes on, a component offered anything made in it has no state taken until it starts again, and then state is taken again; the runtime's words in a fault, and in the reason a component is disabled for, are never kept once privacy mode has stood on the connection that carries them, however many notices wait and however late the link reads them |
+//! | KR-REQ-24.27 | the plugin runtime is told whether privacy mode stands, each time it changes and before the first component is registered on a runtime that replaces another, and no document of the worker's connection reaches the worker once the runtime has said it holds privacy mode; turning privacy mode on drops the state held for a component and none is taken or held while it is on, observation for live use goes on, a component offered anything made in it has no state taken until it starts again, and then state is taken again; the runtime's words in a fault, and in the reason a component is disabled for, are never kept once privacy mode has stood on the connection that carries them, however many notices wait and however late the link reads them |
 
 #![cfg(unix)]
 
@@ -963,4 +963,105 @@ async fn kr_req_24_27_the_runtimes_words_are_never_kept_once_privacy_mode_has_st
     .await;
     assert!(disabled.contains("withheld for privacy mode"), "{disabled}");
     assert!(!disabled.contains("3 faults within 60 s"), "{disabled}");
+}
+
+/// KR-REQ-24.27: the plugin runtime is told whether privacy mode stands, each time it changes, and
+/// from the moment it has said it holds that, no document of the worker's connection reaches the
+/// worker: the worker reads documents and drops them, so what stops them is the runtime's.
+///
+/// The `recording` component draws a document in every call. Privacy mode is turned on; the runtime
+/// acknowledges it; the component is then made to draw and, after it, to fault, which is a notice
+/// that is not a document and comes after every document the runtime wrote before it on the one
+/// stream. When the worker has read the fault, no document it read is one drawn after the
+/// acknowledgement. The control is the document the worker read before privacy mode. A runtime that
+/// replaces the one that was killed is told before the first component is registered on it: its
+/// first document, the one `bind` draws, is never read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_27_the_runtime_is_told_privacy_mode_and_no_document_reaches_the_worker_once_it_has_said_it_holds_it()
+ {
+    let Some(world) = Observing::start(Options::with(vec![Spec::semantic_only(1)])).await else {
+        return;
+    };
+    world.until_ready(1).await;
+    let lane = world.broker().observation();
+    world.until_runtime_told(false).await;
+    until("the worker to have read the document bind drew", || async {
+        lane.highest_document_read(binding(1)).map(|_| ())
+    })
+    .await;
+
+    let mut authority = world
+        .hosted
+        .daemon_connection(ControllerConnectionRole::Authority)
+        .await;
+    world.tell_privacy(&mut authority, 1, true).await;
+    world.until_runtime_told(true).await;
+    // Every call the component has made so far drew one document; what it has drawn when the
+    // runtime says it holds privacy mode is the most that can have been written before.
+    let account = world.raw_account(1).await.expect("the component answers");
+    let drawn = |text: &str| -> u64 {
+        ["bind=", "observe=", "snapshot="]
+            .iter()
+            .map(|key| {
+                text.split(';')
+                    .find_map(|part| part.strip_prefix(key))
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0)
+            })
+            .sum()
+    };
+    let at_acknowledgement = drawn(&account);
+
+    // The component draws, and then faults; the fault is read after everything before it.
+    world.send(&notification("drawn while the runtime holds privacy mode"));
+    world
+        .until_account(1, "the component to draw it", |account| {
+            account.observes >= 1
+        })
+        .await;
+    world.send(&notification("!trap"));
+    world.until_reason(1, "last fault, in observe").await;
+    let read = lane
+        .highest_document_read(binding(1))
+        .expect("the worker read a document before");
+    assert!(
+        read <= at_acknowledgement,
+        "the worker read document {read}, drawn after the runtime said it held privacy mode (it had \
+         drawn {at_acknowledgement})"
+    );
+
+    // The runtime that replaces a killed one is told before anything is registered on it: nothing
+    // the first component draws is read, and what the control read before is not carried over.
+    let host = world.hosted.published().expect("the runtime is published");
+    plugin_world::kill(&host);
+    until("a replacement runtime to be published", || async {
+        world
+            .hosted
+            .published()
+            .filter(|published| *published != host)
+    })
+    .await;
+    world
+        .until_account(1, "the component to be registered again", |account| {
+            account.binds >= 1
+        })
+        .await;
+    world.until_ready(1).await;
+    world.until_runtime_told(true).await;
+    world.send(&notification("!trap"));
+    world.until_reason(1, "last fault, in observe").await;
+    assert_eq!(
+        lane.highest_document_read(binding(1)),
+        None,
+        "a document drawn by the component on the replacement reached the worker"
+    );
+
+    // Privacy mode off: the runtime is told, and documents arrive again.
+    world.tell_privacy(&mut authority, 2, false).await;
+    world.until_runtime_told(false).await;
+    world.send(&notification("drawn once privacy mode has ended"));
+    until("the worker to read a document again", || async {
+        lane.highest_document_read(binding(1)).map(|_| ())
+    })
+    .await;
 }

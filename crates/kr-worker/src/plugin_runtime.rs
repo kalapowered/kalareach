@@ -132,6 +132,8 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
     let _pump = AbortOnDrop(tokio::spawn(crate::plugin_observation::pump(Weak::clone(
         &broker,
     ))));
+    // The task that tells the runtime whether privacy mode stands likewise.
+    let _privacy = AbortOnDrop(tokio::spawn(privacy_sync(Weak::clone(&broker))));
     // The task that asks components to decode the requests they are trusted to decode likewise.
     let _decoder = AbortOnDrop(tokio::spawn(crate::plugin_decoding::decoder(Weak::clone(
         &broker,
@@ -153,6 +155,66 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
         };
         let delay = link.settle(&broker, wants).await;
         link.wait(&broker, &changes, delay).await;
+    }
+}
+
+/// How long the task that tells the runtime about privacy mode waits before it tries again after a
+/// telling the runtime did not acknowledge.
+const PRIVACY_RETRY: Duration = Duration::from_secs(1);
+
+/// Tells the plugin runtime whether privacy mode stands, and again each time that changes, for as
+/// long as the broker lives.
+///
+/// The only sender of the request once a connection is published, so the runtime hears the changes
+/// in the order they were made; it reads the state and the connection fresh each time round and
+/// sends what it finds when either differs from what the runtime was last told, then looks again,
+/// since either may have moved while the request was out. A telling that fails is forgotten and
+/// tried again, and the worker's own drop of documents, words and checkpoints in privacy mode does
+/// not wait for it.
+async fn privacy_sync(broker: Weak<Broker>) {
+    let Some((lane, calls)) = broker
+        .upgrade()
+        .map(|broker| (broker.observation(), broker.component_calls()))
+    else {
+        return;
+    };
+    // The connection last told, by identity and without keeping it alive, and what it was told.
+    let mut told: Option<(Weak<PluginClient>, bool)> = None;
+    loop {
+        let private = lane.is_private();
+        let mut retry = None;
+        match calls.client() {
+            None => {
+                told = None;
+                lane.runtime_was_told(None);
+            }
+            Some(client) => {
+                let current = told.as_ref().is_some_and(|(held, was)| {
+                    *was == private && std::ptr::eq(held.as_ptr(), Arc::as_ptr(&client))
+                });
+                if !current {
+                    if client.privacy(private).await.is_ok() {
+                        told = Some((Arc::downgrade(&client), private));
+                        lane.runtime_was_told(Some(private));
+                        // Either may have moved while the request was out.
+                        continue;
+                    }
+                    told = None;
+                    lane.runtime_was_told(None);
+                    retry = Some(PRIVACY_RETRY);
+                }
+            }
+        }
+        tokio::select! {
+            () = lane.privacy_changed() => {}
+            () = calls.changed() => {}
+            () = async {
+                match retry {
+                    Some(wait) => tokio::time::sleep(wait).await,
+                    None => std::future::pending().await,
+                }
+            } => {}
+        }
     }
 }
 
@@ -387,6 +449,20 @@ impl Link {
             let Some(client) = self.reach(broker, &pending, wants).await else {
                 return Some(self.pace.remaining(tokio::time::Instant::now()));
             };
+            // Told before the connection is published and before anything is registered on it, so
+            // that what the first binding's `bind` draws is judged by privacy mode as it stands. A
+            // runtime that cannot be told is a runtime that cannot be reached.
+            if let Err(error) = client.privacy(self.lane.is_private()).await {
+                self.stopped(
+                    broker,
+                    wants,
+                    &format!(
+                        "the plugin runtime could not be told whether privacy mode stands: {error}"
+                    ),
+                    None,
+                );
+                return Some(self.pace.remaining(tokio::time::Instant::now()));
+            }
             self.hold(broker, Some(Arc::new(client)));
             self.last_reason = None;
             self.pace.connected(tokio::time::Instant::now());
@@ -618,6 +694,15 @@ impl Link {
                     // one, so the many a busy component draws do not each cost a pass of the link.
                     Some(client) => loop {
                         match client.notice().await {
+                            #[cfg(feature = "testing")]
+                            Some(Notice::Document {
+                                binding_id,
+                                document,
+                                ..
+                            }) => self
+                                .lane
+                                .document_was_read(BrokerBindingId::new(binding_id), document),
+                            #[cfg(not(feature = "testing"))]
                             Some(Notice::Document { .. }) => {}
                             other => break other,
                         }

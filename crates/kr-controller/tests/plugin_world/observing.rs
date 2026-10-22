@@ -910,29 +910,18 @@ impl Observing {
         generation: u64,
         enabled: bool,
     ) {
-        use kr_protocol::envelope::ControlFrame;
-        authority
-            .send(&ControlFrame::PrivacyGeneration(
-                kr_protocol::privacy::PrivacyGenerationNotice {
-                    environment_id: self.hosted.environment_id,
-                    generation: U64::new(generation),
-                    enabled,
-                },
-            ))
-            .await
-            .expect("writes the notice");
-        let acknowledged = tokio::time::timeout(PATIENCE, async {
-            loop {
-                match authority.recv().await.expect("the worker answers") {
-                    ControlFrame::PrivacyGenerationAck(ack) => return ack,
-                    ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
-                    other => panic!("the worker answered {other:?}"),
-                }
-            }
+        self.hosted
+            .tell_privacy(authority, generation, enabled)
+            .await;
+    }
+
+    /// Waits until the plugin runtime has acknowledged being told whether privacy mode stands.
+    pub async fn until_runtime_told(&self, private: bool) {
+        let lane = self.broker().observation();
+        until("the plugin runtime to be told", || async {
+            (lane.runtime_told() == Some(private)).then_some(())
         })
-        .await
-        .expect("the worker acknowledges the privacy generation in time");
-        assert_eq!(acknowledged.generation.get(), generation);
+        .await;
     }
 }
 
