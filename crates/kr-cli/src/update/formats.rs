@@ -6,6 +6,11 @@
 //! each one where the target's manifest says it is, with nothing of its own to say which stores
 //! there are, so a store a release adds is found by an updater of an earlier release.
 //!
+//! One store is read whether or not the target lists it: the policies the owner applied for the
+//! organisations the host is enrolled in. A release that names no such store ignores them, so a
+//! switch to it would lift every adapter list they state; it is refused while one does, and the
+//! owner ends the list with `kr organisation withdraw`.
+//!
 //! It runs once every daemon has stopped and every environment's lock is held, before anything is
 //! brought forward, and changes nothing but what a daemon that ended by a signal left in a log,
 //! which is taken into its file first. What a command registered is read before that too, under the
@@ -16,7 +21,8 @@ use std::path::{Path, PathBuf};
 
 use kr_client::shown;
 use kr_client::shown::Shown;
-use kr_protocol::ids::EnvironmentId;
+use kr_controller::grants::applied;
+use kr_protocol::ids::{EnvironmentId, OrganisationId};
 use kr_protocol::update::{Recording, ReleaseManifest, ReleaseStore, StoreScope};
 
 use super::Unreached;
@@ -47,6 +53,9 @@ enum Why {
     Unreadable(Shown),
     /// The target lists it in a way this build does not know.
     Unknown(&'static str),
+    /// The store of applied organisation policies states an adapter list for each of these
+    /// organisations, and the target names no store that would apply it.
+    AppliedLists(Vec<OrganisationId>),
 }
 
 impl Refusal {
@@ -98,6 +107,21 @@ impl Refusal {
                 self.called(),
                 release,
                 *what
+            ),
+            Why::AppliedLists(organisations) => shown!(
+                "{} at {} states an adapter list for these organisations: {}; {} lists no store of \
+                 that name, so it would admit every adapter. `kr organisation withdraw <id>` ends \
+                 an organisation's list, after `kr organisation exclusive off` on a host that is \
+                 exclusively organisation-managed",
+                self.called(),
+                Shown::root(&self.place),
+                Shown::joined(
+                    organisations
+                        .iter()
+                        .map(|organisation| shown!("{}", *organisation)),
+                    ", "
+                ),
+                release
             ),
         }
     }
@@ -158,7 +182,8 @@ struct Registered {
 }
 
 /// Looks at every store `target` lists, where the manifest says it is, and returns each that is at
-/// a version the target does not read, with those [`unlookable`] too.
+/// a version the target does not read, with those [`unlookable`] too, and with the adapter lists a
+/// target that names no store of applied organisation policies would lift ([`lifted_lists`]).
 ///
 /// `environments` are the environments whose daemons have stopped and whose locks are held.
 /// `published` are the directories the daemons said they read their configuration documents in,
@@ -225,10 +250,64 @@ pub fn check(
             }
         }
     }
+    let state_dirs: Vec<(EnvironmentId, &Path)> = environments
+        .iter()
+        .map(|environment| (environment.environment_id, environment.paths.state_dir()))
+        .collect();
+    refusals.extend(lifted_lists(target, &state_dirs));
     Checked {
         refusals,
         unreached,
     }
+}
+
+/// The refusals for the adapter lists a switch to `target` would lift, one for each environment
+/// whose applied organisation policies state a list.
+///
+/// A release reads the store of applied policies only when its manifest names it, so for a target
+/// that does not, the lists stand in a file nothing would read and every adapter would be
+/// admitted. The file is read here, with every daemon stopped and the environment's lock held, by
+/// the reader a daemon starts with. A policy that states no list lifts nothing. A file that cannot
+/// be read is refused, because what it states is not known, as is every store that cannot be read.
+/// An entry of an enrolment the host no longer holds is named too; a daemon drops it when it
+/// starts. An environment the survey did not reach is not read.
+fn lifted_lists(target: &ReleaseManifest, state_dirs: &[(EnvironmentId, &Path)]) -> Vec<Refusal> {
+    if target
+        .stores
+        .iter()
+        .any(|listed| listed.store == applied::STORE_NAME)
+    {
+        return Vec::new();
+    }
+    state_dirs
+        .iter()
+        .filter_map(|(environment, state_dir)| {
+            let why = match applied::read(state_dir) {
+                Ok(policies) => {
+                    let stating: Vec<OrganisationId> = policies
+                        .iter()
+                        .filter(|policy| policy.adapter_allowlist.0.is_some())
+                        .map(|policy| policy.organisation_id)
+                        .collect();
+                    if stating.is_empty() {
+                        return None;
+                    }
+                    Why::AppliedLists(stating)
+                }
+                Err(_) => Why::Unreadable(Shown::said(
+                    "it is not a record of applied organisation policies that this release reads, \
+                     or another account owns it, or it is a link, so the adapter lists it states \
+                     are not known",
+                )),
+            };
+            Some(Refusal {
+                store: applied::STORE_NAME.to_owned(),
+                environment: Some(*environment),
+                place: applied::file_in(state_dir),
+                why,
+            })
+        })
+        .collect()
 }
 
 /// What can be known of the registrations and recorded documents before anything is stopped: the
@@ -730,6 +809,15 @@ mod tests {
 
     /// A release that lists `shell-entries` and `machine-group`, at versions 1 to 1.
     fn target() -> ReleaseManifest {
+        target_listing(&[
+            ("shell-entries", "state_root", "shell-entries.json"),
+            ("machine-group", "environment", "machine-group"),
+        ])
+    }
+
+    /// A release that lists the stores `stores` names, each as a name, a scope and a path, at
+    /// versions 1 to 1.
+    fn target_listing(stores: &[(&str, &str, &str)]) -> ReleaseManifest {
         let listed = |name: &str, scope: &str, path: &str| {
             serde_json::json!({
                 "store": name,
@@ -752,10 +840,10 @@ mod tests {
                 "public_majors": [1],
                 "retained_levels": ["0.48"],
                 "shells": [],
-                "stores": [
-                    listed("shell-entries", "state_root", "shell-entries.json"),
-                    listed("machine-group", "environment", "machine-group"),
-                ],
+                "stores": stores
+                    .iter()
+                    .map(|(name, scope, path)| listed(name, scope, path))
+                    .collect::<Vec<_>>(),
                 "files": [],
             },
             "signatures": [],
@@ -1061,6 +1149,69 @@ mod tests {
             cbor(&directory.path().join("absent"), "version", 0).ok(),
             Some(None)
         );
+    }
+
+    /// KR-REQ-18.06, KR-REQ-26.10: a release that names no store of applied organisation policies
+    /// ignores them, so a switch to it is refused for each environment whose policies state an
+    /// adapter list, naming the organisations. A release that names the store, a policy that
+    /// states no list and an environment with no policy lift nothing; a file that cannot be read
+    /// is refused, because the lists it states are not known.
+    #[test]
+    fn a_release_that_would_ignore_an_applied_adapter_list_is_refused_naming_its_organisations() {
+        use kr_protocol::ids::{AuthorityRevision, OrganisationPolicyRevision, PluginId};
+        use kr_protocol::scalars::{CanonicalSet, Nullable, Uuid};
+
+        let policy = |byte: u8, list: Option<&str>| applied::StoredAppliedPolicy {
+            organisation_id: OrganisationId::new(Uuid::from_bytes([byte; 16])),
+            enrolment_revision: AuthorityRevision::new(1),
+            organisation_policy_revision: OrganisationPolicyRevision::new(1),
+            adapter_allowlist: Nullable(list.map(|name| {
+                std::iter::once(PluginId::new(name).expect("a plugin identifier"))
+                    .collect::<CanonicalSet<_>>()
+            })),
+        };
+        let without = target();
+        let with = target_listing(&[(
+            applied::STORE_NAME,
+            "environment",
+            "organisation-policy.json",
+        )]);
+        let environment = EnvironmentId::new(kr_ipc::new_uuid());
+        let directory = tempfile::tempdir().expect("a directory");
+        let state = directory.path();
+        let looked = |target: &ReleaseManifest| lifted_lists(target, &[(environment, state)]);
+
+        assert!(looked(&without).is_empty(), "an environment with no policy");
+
+        applied::write(state, &[policy(1, None)]).expect("a policy that states no list");
+        assert!(looked(&without).is_empty(), "a policy that states no list");
+
+        applied::write(
+            state,
+            &[policy(1, None), policy(2, Some("kalareach/codex"))],
+        )
+        .expect("two policies");
+        let refused = looked(&without);
+        assert_eq!(refused.len(), 1, "one environment is refused");
+        assert!(
+            matches!(&refused[0].why, Why::AppliedLists(named) if *named == [policy(2, None).organisation_id]),
+            "and names the organisation that states a list, not the one that states none"
+        );
+        assert_eq!(refused[0].environment, Some(environment));
+        assert_eq!(refused[0].place, applied::file_in(state));
+        assert!(
+            looked(&with).is_empty(),
+            "a release that names the store applies the list"
+        );
+
+        kr_ipc::paths::write_owner_only_file(&applied::file_in(state), b"{ not a record")
+            .expect("a damaged file");
+        let refused = looked(&without);
+        assert!(
+            matches!(refused.as_slice(), [one] if matches!(one.why, Why::Unreadable(_))),
+            "a file that cannot be read is refused"
+        );
+        assert!(looked(&with).is_empty());
     }
 
     fn rusqlite_open(path: &Path) -> rusqlite::Connection {

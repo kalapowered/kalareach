@@ -1244,14 +1244,13 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
     host.worker_ended(&updated.worker).await;
 }
 
-/// KR-REQ-26.10, KR-REQ-26.08: the policy a host applied for an organisation is kept in
-/// a store the release before does not name, so a rollback to that release goes on while it is
-/// there. The release before reads the registry, which holds the enrolment as it always did, and
-/// the file beside it stays on disk, which that release ignores: it applies no organisation policy
-/// and shows none.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_rollback_leaves_an_applied_organisation_policy_in_its_store_and_the_release_before_ignores_it()
- {
+/// Enrols the host of `updated` in an organisation on the confirmation of the owner's device and
+/// applies the policy the organisation signed, which states `list` as its adapters. Returns the
+/// organisation and the file the host keeps the applied policies in.
+async fn enrolled_with_a_policy(
+    updated: &Updated,
+    list: Option<&[&str]>,
+) -> (kr_protocol::ids::OrganisationId, PathBuf) {
     use kr_protocol::confirmation::ConfirmationSubject;
     use kr_protocol::organisation::{
         OrganisationEnrolParams, OrganisationEnrolResult, OrganisationListParams,
@@ -1259,7 +1258,6 @@ async fn a_rollback_leaves_an_applied_organisation_policy_in_its_store_and_the_r
     };
 
     const DAY_MS: u64 = 24 * 60 * 60 * 1000;
-    let updated = Updated::on_the_network().await;
     let host = &updated.host;
     let endpoint = host
         .tree
@@ -1269,8 +1267,6 @@ async fn a_rollback_leaves_an_applied_organisation_policy_in_its_store_and_the_r
     let environment_id = host.tree.environment_id();
     let door = door::Door::pair_the_first_owner(&endpoint, environment_id).await;
 
-    // The owner enrols the host in an organisation, on the confirmation of the owner's device, and
-    // applies the policy the organisation signed.
     let now = kr_ipc::now_ms().get();
     let mut organisation = organisation_support::Organisation::new(0x21, now - 2 * DAY_MS);
     organisation.rotate(now - DAY_MS);
@@ -1303,15 +1299,18 @@ async fn a_rollback_leaves_an_applied_organisation_policy_in_its_store_and_the_r
         kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
         Method::OrganisationPolicyApply,
         &OrganisationPolicyApplyParams {
-            policy: organisation.policy(2, 1, Some(&["kalareach/codex"]), now),
+            policy: organisation.policy(2, 1, list, now),
             authority: Nullable::null(),
         },
     )
     .await
     .expect("the host applies the organisation's policy");
     assert_eq!(
-        applied.effective_adapter_allowlist.0.map(|list| list.len()),
-        Some(1)
+        applied
+            .effective_adapter_allowlist
+            .0
+            .map(|stated| stated.len()),
+        list.map(<[&str]>::len)
     );
     let listed: OrganisationListResult = pairing::read(
         &mut client,
@@ -1327,11 +1326,93 @@ async fn a_rollback_leaves_an_applied_organisation_policy_in_its_store_and_the_r
         .state_dir()
         .join("organisation-policy.json");
     assert!(store.is_file(), "the policy is kept in its store");
-    drop(client);
-    drop(door);
+    (organisation.organisation_id, store)
+}
 
-    // The rollback goes on: the registry is at a version the release before reads, and the store
-    // is one it does not name.
+/// KR-REQ-26.10, KR-REQ-26.08, KR-REQ-18.06: the release before does not name the store the host
+/// keeps the applied policies in, so it would admit every adapter. A rollback to it while an
+/// organisation's policy states an adapter list is refused, naming the organisation, with nothing
+/// switched and the daemon serving again. The way through is the withdrawal from the organisation,
+/// which needs no confirmation; after it the rollback goes on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_that_would_lift_an_organisations_adapter_list_is_refused_until_the_host_leaves_it()
+ {
+    let updated = Updated::on_the_network().await;
+    let host = &updated.host;
+    let (organisation_id, store) =
+        enrolled_with_a_policy(&updated, Some(&["kalareach/codex"])).await;
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a rollback that would lift the list is refused: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains(&organisation_id.to_string())
+            && message.contains("kr organisation withdraw"),
+        "the refusal names the organisation and the way through: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(updated.two.name().clone()),
+        "nothing was switched"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", updated.two.name()),
+        "the daemon the rollback stopped serves again"
+    );
+    assert!(store.is_file(), "the refusal leaves the store alone");
+
+    let (output, said) = host.kr_json(&[
+        "organisation",
+        "withdraw",
+        &organisation_id.to_string(),
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the withdrawal needs no confirmation: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!store.exists(), "the list went with the enrolment");
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(updated.one.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", updated.one.name()),
+        "the daemon is the release before's again"
+    );
+    updated.the_worker_is_as_it_was().await;
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+}
+
+/// KR-REQ-26.10, KR-REQ-26.08: a policy that states no adapter list lifts nothing, so a rollback to
+/// the release before goes on while the host keeps it. That release reads the registry, which holds
+/// the enrolment as it always did, and the file beside it stays on disk, which that release
+/// ignores: it applies no organisation policy and shows none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_leaves_an_applied_policy_that_states_no_list_in_its_store_and_the_release_before_ignores_it()
+ {
+    let updated = Updated::on_the_network().await;
+    let host = &updated.host;
+    let (_, store) = enrolled_with_a_policy(&updated, None).await;
+
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
