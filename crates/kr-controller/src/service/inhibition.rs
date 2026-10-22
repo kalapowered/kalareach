@@ -73,8 +73,9 @@ pub(super) struct DemandScan {
 struct SessionDemand {
     /// Whether its worker reported an agent at work.
     work: bool,
-    /// Whether its worker reported a decision waiting to be answered.
-    approval: bool,
+    /// Whether its worker reported a decision or an answer waiting for a person: an approval, or
+    /// a question an agent asked.
+    waiting: bool,
     /// Whether this host has a closure for it that it has not finished recording.
     closing: bool,
     /// How many launch confirmations its worker is waiting on its reader for.
@@ -193,7 +194,7 @@ impl Controller {
     ///
     /// Both counts are of admitted work rather than of activity. A session counts as work when its
     /// worker reports an agent working. A request counts as outstanding when the host has accepted
-    /// it and not finished it: a decision waiting for an answer, a closure that is still stopping
+    /// it and not finished it: a decision or a question waiting for an answer, a closure that is still stopping
     /// processes and draining their output, and a create that has not reported its worker yet. An
     /// idle shell counts for nothing, however much output it has produced.
     ///
@@ -261,7 +262,7 @@ impl Controller {
                             session_id,
                             SessionDemand {
                                 work: false,
-                                approval: false,
+                                waiting: false,
                                 closing: true,
                                 // Its process is gone, so nothing is waiting on its reader.
                                 launches: 0,
@@ -291,10 +292,17 @@ impl Controller {
             {
                 observed.work = true;
             }
-            if summary.application_state.as_ref()
-                == Some(&kr_protocol::session::ApplicationState::AwaitingApproval)
-            {
-                observed.approval = true;
+            // A request an agent has put to the person is a pending request, whether it asks for
+            // a decision or for an answer: the person is on their way to it, and the host that
+            // suspends under it delays the reply. Section 3 counts "pending requests" with work.
+            if matches!(
+                summary.application_state.0,
+                Some(
+                    kr_protocol::session::ApplicationState::AwaitingApproval
+                        | kr_protocol::session::ApplicationState::AwaitingInput
+                )
+            ) {
+                observed.waiting = true;
             }
             // A closure this host accepted and has not finished. Suspending in the middle of one
             // is how a session's own processes stop being accounted for. The worker's part of it
@@ -315,7 +323,7 @@ impl Controller {
         let outstanding = scan
             .seen
             .values()
-            .map(|seen| u64::from(seen.approval) + u64::from(seen.closing) + seen.launches)
+            .map(|seen| u64::from(seen.waiting) + u64::from(seen.closing) + seen.launches)
             .sum::<u64>();
         drop(scan);
         Demand {
