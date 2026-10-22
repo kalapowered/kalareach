@@ -503,6 +503,92 @@ fn the_doctor_shows_what_each_launch_probe_read() {
     assert_eq!(reported[3]["state"], "no_executable");
 }
 
+/// A host's measurements of itself: a device that came back, a fault a terminal's parser met and an
+/// adapter that did not answer.
+fn measured() -> HostDoctorResult {
+    use kr_protocol::metrics::{
+        Adapter, Attempt, Environment, Fault, Outcome, Recorder, Transport,
+    };
+    let recorder = Recorder::new(Environment::Production);
+    recorder.reconnected(
+        Transport::Relay,
+        Attempt::TwoToThree,
+        Outcome::Ok,
+        std::time::Duration::from_millis(4_250),
+    );
+    recorder.parse_faulted(Fault::InvalidEncoding, 3);
+    recorder.adapter_failed(Adapter::GeminiCli, Outcome::Timeout);
+    result().with_metrics(recorder.report())
+}
+
+/// Section 26: what a host measures about itself is in the document `--json` prints and in the
+/// lines a person reads, and a host that has measured nothing says nothing about it.
+#[test]
+fn what_the_host_measured_about_itself_is_reported_in_both_forms() {
+    let document = doctor(&measured()).json();
+    let reconnects = document["metrics"]["reconnect_time"]
+        .as_array()
+        .expect("the reconnect series are in the document");
+    assert_eq!(reconnects.len(), 1);
+    assert_eq!(reconnects[0]["transport"], "relay");
+    assert_eq!(reconnects[0]["attempt"], "2-3");
+    assert_eq!(reconnects[0]["outcome"], "ok");
+    assert_eq!(reconnects[0]["environment"], "production");
+    assert_eq!(reconnects[0]["count"], 1);
+    assert_eq!(reconnects[0]["total_ms"], 4_250);
+    assert_eq!(
+        document["metrics"]["terminal_parse_fault"][0]["fault"],
+        "invalid_encoding"
+    );
+    assert_eq!(document["metrics"]["terminal_parse_fault"][0]["count"], 3);
+    assert_eq!(
+        document["metrics"]["adapter_failure"][0]["adapter"],
+        "gemini-cli"
+    );
+
+    let text = text(&doctor_lines(&measured(), false));
+    for shown in [
+        "reconnect.time relay, attempt 2-3, ok: count 1, 4250 ms in all, longest 4250 ms (production)",
+        "terminal.parse_fault invalid_encoding: 3 (production)",
+        "adapter.failure gemini-cli, timeout: 1 (production)",
+    ] {
+        assert!(text.contains(shown), "{shown} is missing: {text}");
+    }
+    let empty = doctor(&result()).json();
+    assert_eq!(empty["metrics"]["reconnect_time"], serde_json::json!([]));
+    assert!(
+        !crate::doctor::doctor_lines(&result(), false)
+            .iter()
+            .any(|line| line.text().contains("metric")),
+        "nothing counted is nothing said"
+    );
+}
+
+/// KR-REQ-26.44: a support bundle carries the measurements, and they carry nothing a bundle must
+/// withhold: every label is one of this build's own words, so a reply that planted anything else
+/// in one is not a reply that parses, and a bundle of a result that did parse holds only words.
+#[test]
+fn a_support_bundle_carries_the_measurements_as_this_builds_own_words() {
+    let lines: Vec<String> = report_lines(&measured())
+        .iter()
+        .map(|line| line.to_string())
+        .collect();
+    let said = lines.join("\n");
+    for shown in [
+        "reconnect.time relay, attempt 2-3, ok",
+        "terminal.parse_fault invalid_encoding: 3",
+        "adapter.failure gemini-cli, timeout: 1",
+    ] {
+        assert!(said.contains(shown), "{shown} is missing: {said}");
+    }
+    let mut planted = serde_json::to_value(measured()).expect("a result serialises");
+    planted["metrics"]["terminal_parse_fault"][0]["fault"] = serde_json::json!(PLANTED);
+    assert!(
+        serde_json::from_value::<HostDoctorResult>(planted).is_err(),
+        "a label that is not one of this build's words does not parse, so it cannot reach a bundle"
+    );
+}
+
 /// Section 26: each effective value is shown; one made of names the owner wrote down, the packages
 /// whose command integration a new session applies, whole, and a path or a word by its class.
 #[test]

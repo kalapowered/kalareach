@@ -750,6 +750,8 @@ pub struct Controller {
     inhibitor: Mutex<Inhibitor>,
     /// How far the last look at what this host has outstanding got, and what it saw.
     demand_scan: Mutex<DemandScan>,
+    /// What this host has measured about itself, which `host.doctor` reports.
+    metrics: Arc<kr_protocol::metrics::Recorder>,
     /// Held while a session's closure is being finalised.
     ///
     /// Finding that no closure has been recorded and recording one are two steps. Two callers that
