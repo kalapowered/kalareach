@@ -36,6 +36,7 @@
 
 mod archive;
 mod bundle;
+mod checkpoint;
 mod files;
 mod kit;
 mod record;
@@ -56,11 +57,13 @@ pub use crate::recovery::bundle::{
     BundleStore, LostWrite, Migrated, MigrationRecord, OfflineExport, WriterEnabled,
     bundle_collection, fresh_locator,
 };
+pub use crate::recovery::checkpoint::advance_checkpoint;
 pub use crate::recovery::files::{
-    Candidate, CandidateGeneration, CandidateState, FilesRestore, MAX_CONFIGURATION_MEMBER_BYTES,
-    MAX_RANGE_BYTES, MAX_RESTORED_BYTES, MAX_SESSION_MEMBER_BYTES, MemberRefusal, MemberRole,
-    MemberVerdict, PlannedMember, PreparedRestore, PublicationRefusal, RESTORE_RECORD_FORMAT,
-    RestoreError, RestorePlan, RestoreSource, SignInCause, SourceService, SourceSignIn,
+    BundleWrite, BundleWriter, BundleWritten, Candidate, CandidateGeneration, CandidateState,
+    CheckpointRecorded, FilesRestore, MAX_CONFIGURATION_MEMBER_BYTES, MAX_RANGE_BYTES,
+    MAX_RESTORED_BYTES, MAX_SESSION_MEMBER_BYTES, MemberRefusal, MemberRole, MemberVerdict,
+    PlannedMember, PreparedRestore, PublicationRefusal, RESTORE_RECORD_FORMAT, RestoreError,
+    RestorePlan, RestoreSource, SignInCause, SourceService, SourceSignIn,
 };
 pub use crate::recovery::kit::{
     MAX_RECOVERY_KIT_BYTES, RECOVERY_KIT_FORMAT, parse_kit, qr_payload, render_kit,
@@ -166,6 +169,18 @@ pub enum RecoveryError {
         "that migration's write never landed at the destination, so there is nothing to complete"
     )]
     MigrationDidNotLand,
+    /// The bundle records the generation a restore verified, with another encrypted manifest.
+    ///
+    /// One of the two is not the archive the owner verified, and a checkpoint is not recorded
+    /// over the other.
+    #[error(
+        "the recovery bundle records generation {generation} with another manifest than the one \
+         this restore verified, so it is not recorded over"
+    )]
+    CheckpointDisagrees {
+        /// The generation both name.
+        generation: u64,
+    },
     /// The bundle at the locator was written by somebody else since this device last read it.
     #[error("the recovery bundle has moved on since this device last read it; read it again")]
     BundleConflict {
