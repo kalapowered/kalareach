@@ -155,11 +155,13 @@ offline media, never in a tree, an archive or a repository.
 ## Publishing
 
 A `host/v<version>+<commit>` tag starts two workflows: `release-tree.yml` for the four macOS and Linux
-targets and `release-windows.yml` for the two Windows targets. In each, one job builds the programs
-on a runner of the target's own kind, assembles the tree, signs its manifest with keys of its own,
-packs it and holds the archive to what a host stages. It reads no secret and uses no environment,
-and the archive it keeps says in its name that it is not a release. A second job signs for release
-behind the `release-signing` environment: the platform's own signature first (Developer ID and
+targets and `release-windows.yml` for the two Windows targets. In each, a first job settles which
+commit the run is about, and every job after it checks that commit out by its identifier and not by
+the ref, so a branch that moves while the trees build, or while the signing waits for approval,
+cannot change what is built or signed. The next job builds the programs on a runner of the target's
+own kind, assembles the tree, signs its manifest with keys of its own, packs it and holds the archive
+to what a host stages. It reads no secret and uses no environment, and the archive it keeps says in
+its name that it is not a release. The last job signs for release behind the `release-signing` environment: the platform's own signature first (Developer ID and
 notarisation on macOS, Authenticode on Windows), then the manifest again, since the first changed the
 files, with the channel's release keys. It runs for a tag and the default branch only.
 
