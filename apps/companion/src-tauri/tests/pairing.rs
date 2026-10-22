@@ -1265,7 +1265,9 @@ async fn a_phone_with_no_ceremony_still_lists_what_its_host_asks() {
     let _ = calls::request(environment, &mut client, an_invitation())
         .await
         .expect("the local owner asks");
-    let request = as_owner.listed(|request| request["checkable"] == true).await;
+    let request = as_owner
+        .listed(|request| request["checkable"] == true)
+        .await;
     assert_eq!(request["checkable"], true);
 }
 
