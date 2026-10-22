@@ -949,6 +949,80 @@
         }
       ]
     },
+    "Adapter": {
+      "description": "An adapter, from the connectors this product bundles. An adapter nobody bundled is counted\nunder no name at all.",
+      "oneOf": [
+        {
+          "const": "claude-code",
+          "description": "Claude Code.",
+          "type": "string"
+        },
+        {
+          "const": "codex",
+          "description": "Codex.",
+          "type": "string"
+        },
+        {
+          "const": "gemini-cli",
+          "description": "Gemini CLI.",
+          "type": "string"
+        },
+        {
+          "const": "kimi-cli",
+          "description": "Kimi CLI.",
+          "type": "string"
+        },
+        {
+          "const": "kimi-code-cli",
+          "description": "Kimi Code CLI.",
+          "type": "string"
+        },
+        {
+          "const": "opencode",
+          "description": "OpenCode.",
+          "type": "string"
+        },
+        {
+          "const": "opencode-attach",
+          "description": "OpenCode attached to a running server.",
+          "type": "string"
+        },
+        {
+          "const": "qoder-cli",
+          "description": "Qoder CLI.",
+          "type": "string"
+        }
+      ]
+    },
+    "AdapterFailure": {
+      "additionalProperties": false,
+      "description": "One adapter.failure series.",
+      "properties": {
+        "adapter": {
+          "$ref": "#/$defs/Adapter",
+          "description": "The adapter."
+        },
+        "count": {
+          "$ref": "#/$defs/U64",
+          "description": "How many times it happened."
+        },
+        "environment": {
+          "$ref": "#/$defs/Environment",
+          "description": "Which environment measured it."
+        },
+        "outcome": {
+          "$ref": "#/$defs/Outcome2",
+          "description": "How it ended."
+        }
+      },
+      "required": [
+        "adapter",
+        "outcome",
+        "environment",
+        "count"
+      ],
+      "type": "object"
+    },
     "AdapterNotice": {
       "additionalProperties": false,
       "description": "A plugin binding's revocation state, as the session's worker records it.",
@@ -3317,6 +3391,31 @@
         "window_revision"
       ],
       "type": "object"
+    },
+    "Attempt": {
+      "description": "Which attempt ended a reconnection, as a range rather than a number.",
+      "oneOf": [
+        {
+          "const": "1",
+          "description": "The first.",
+          "type": "string"
+        },
+        {
+          "const": "2-3",
+          "description": "The second or third.",
+          "type": "string"
+        },
+        {
+          "const": "4-8",
+          "description": "The fourth to the eighth.",
+          "type": "string"
+        },
+        {
+          "const": "9+",
+          "description": "The ninth or later.",
+          "type": "string"
+        }
+      ]
     },
     "AttemptId": {
       "description": "One pairing attempt by one candidate: 128 random bits.",
@@ -15600,6 +15699,26 @@
         }
       ]
     },
+    "Environment": {
+      "description": "Which environment produced a measurement.",
+      "oneOf": [
+        {
+          "const": "development",
+          "description": "A build that is not a release.",
+          "type": "string"
+        },
+        {
+          "const": "staging",
+          "description": "A staging deployment. A host never reports it.",
+          "type": "string"
+        },
+        {
+          "const": "production",
+          "description": "A released build.",
+          "type": "string"
+        }
+      ]
+    },
     "EnvironmentAccess": {
       "description": "How this host reaches one enrolled environment.\n\nSection 3 keeps two of these apart on purpose. A WSL distribution and an enrolled container are\nreached by a **local process bridge**: a child process started inside the target that speaks\nthis protocol over its own standard streams. An SSH login and a paired remote host are not.\nAn SSH user runs the destination command line under their own login, which is genuinely local\noperating-system access there, and a named remote host in the application uses that\nenvironment's paired endpoint. Neither is a bridge, and neither becomes one by forwarding a\nsocket.",
       "oneOf": [
@@ -16995,6 +17114,31 @@
         {
           "const": "any",
           "description": "Any provider a member configures, including their own credential.",
+          "type": "string"
+        }
+      ]
+    },
+    "Fault": {
+      "description": "A class of fault in the bytes a terminal's program wrote. Never the bytes that caused it.",
+      "oneOf": [
+        {
+          "const": "unterminated_sequence",
+          "description": "A control string that was abandoned before its terminator, or a sequence cut short.",
+          "type": "string"
+        },
+        {
+          "const": "invalid_encoding",
+          "description": "Text that was not valid in the encoding the terminal is read in.",
+          "type": "string"
+        },
+        {
+          "const": "oversized_frame",
+          "description": "A control string, or a sequence, that went past a bound and was discarded whole.",
+          "type": "string"
+        },
+        {
+          "const": "unknown_control",
+          "description": "A sequence with no class in the profile.",
           "type": "string"
         }
       ]
@@ -18561,6 +18705,15 @@
             "$ref": "#/$defs/LaunchProbeReport"
           },
           "type": "array"
+        },
+        "metrics": {
+          "$ref": "#/$defs/Report",
+          "default": {
+            "adapter_failure": [],
+            "reconnect_time": [],
+            "terminal_parse_fault": []
+          },
+          "description": "What this host has measured about itself: how long its paired devices were without a\nconnection, the faults its terminals' parsers met and the failures of its adapters.\n\nLocal diagnostics, counted in memory from this daemon's start and sent nowhere. Every label\nis one of this build's own words, so the report carries no terminal content, key, prompt or\nfilename and a support bundle takes it as it is."
         }
       },
       "required": [
@@ -24812,6 +24965,41 @@
         }
       ]
     },
+    "Outcome2": {
+      "description": "How something ended. Never why, in the words of whatever failed.",
+      "oneOf": [
+        {
+          "const": "ok",
+          "description": "It worked.",
+          "type": "string"
+        },
+        {
+          "const": "refused",
+          "description": "The host refused it.",
+          "type": "string"
+        },
+        {
+          "const": "timeout",
+          "description": "It was not answered in time.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "Nothing was there to answer it.",
+          "type": "string"
+        },
+        {
+          "const": "exhausted",
+          "description": "What it needed ran out.",
+          "type": "string"
+        },
+        {
+          "const": "invalid",
+          "description": "It was not valid.",
+          "type": "string"
+        }
+      ]
+    },
     "OutputEvent": {
       "additionalProperties": false,
       "description": "One batch of output bytes on the output stream.",
@@ -26058,6 +26246,30 @@
     "ParamsValue": {
       "description": "An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.",
       "tsType": "unknown"
+    },
+    "ParseFault": {
+      "additionalProperties": false,
+      "description": "One terminal.parse_fault series.",
+      "properties": {
+        "count": {
+          "$ref": "#/$defs/U64",
+          "description": "How many times it happened."
+        },
+        "environment": {
+          "$ref": "#/$defs/Environment",
+          "description": "Which environment measured it."
+        },
+        "fault": {
+          "$ref": "#/$defs/Fault",
+          "description": "The class of fault."
+        }
+      },
+      "required": [
+        "fault",
+        "environment",
+        "count"
+      ],
+      "type": "object"
     },
     "PathClass": {
       "description": "Which part of the working tree one captured path came from.\n\nThe project service's [`crate::project::InclusionClass`] names the four classes a *policy*\ndecides about. A captured tree also holds the ordinary tracked files that no policy decision\ntouches, so this has a member for them: a count of \"the tracked files\" is what tells a reader\nhow much of the tree is the base's own content.",
@@ -32121,6 +32333,50 @@
       ],
       "type": "object"
     },
+    "ReconnectTime": {
+      "additionalProperties": false,
+      "description": "One reconnect.time series: how long a paired device was without a connection, counted under the\nlabels that say how the connection that ended the gap reached the host and how it ended.",
+      "properties": {
+        "attempt": {
+          "$ref": "#/$defs/Attempt",
+          "description": "Which attempt, among the connections the host saw from the device since its last one ended,\nis the one reported."
+        },
+        "count": {
+          "$ref": "#/$defs/U64",
+          "description": "How many gaps this series counts."
+        },
+        "environment": {
+          "$ref": "#/$defs/Environment",
+          "description": "Which environment measured it."
+        },
+        "longest_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "The longest of them, in milliseconds."
+        },
+        "outcome": {
+          "$ref": "#/$defs/Outcome2",
+          "description": "How that attempt ended."
+        },
+        "total_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "The sum of their lengths, in milliseconds."
+        },
+        "transport": {
+          "$ref": "#/$defs/Transport",
+          "description": "How the connection that ended the gap reached the host."
+        }
+      },
+      "required": [
+        "transport",
+        "attempt",
+        "outcome",
+        "environment",
+        "count",
+        "total_ms",
+        "longest_ms"
+      ],
+      "type": "object"
+    },
     "RecoveryBundle": {
       "additionalProperties": false,
       "description": "The versioned recovery bundle an owner keeps at a stable locator.\n\nEnabling a new backup writer or rotating its signing key commits an updated bundle before that\nwriter is declared recovery-enabled.",
@@ -33296,6 +33552,37 @@
       "maxLength": 128,
       "pattern": "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*|\\[[0-9a-f:]+\\])(:[1-9][0-9]{0,4})?$",
       "type": "string"
+    },
+    "Report": {
+      "additionalProperties": false,
+      "description": "What a host reports of the metrics it measures about itself.\n\nClosed in every member: a report is made of this build's own words, so one that was read back\nfrom elsewhere naming anything else does not parse, and there is nowhere in it for a line of\noutput, a prompt or a filename to go.",
+      "properties": {
+        "adapter_failure": {
+          "default": [],
+          "description": "Every adapter.failure series, in a fixed order.",
+          "items": {
+            "$ref": "#/$defs/AdapterFailure"
+          },
+          "type": "array"
+        },
+        "reconnect_time": {
+          "default": [],
+          "description": "Every reconnect.time series, in a fixed order.",
+          "items": {
+            "$ref": "#/$defs/ReconnectTime"
+          },
+          "type": "array"
+        },
+        "terminal_parse_fault": {
+          "default": [],
+          "description": "Every terminal.parse_fault series, in a fixed order.",
+          "items": {
+            "$ref": "#/$defs/ParseFault"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
     },
     "ReportedLocation": {
       "additionalProperties": false,
@@ -38426,6 +38713,26 @@
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "Transport": {
+      "description": "How the two ends of a connection reached each other.",
+      "oneOf": [
+        {
+          "const": "direct",
+          "description": "A direct path between the two.",
+          "type": "string"
+        },
+        {
+          "const": "relay",
+          "description": "Through a relay.",
+          "type": "string"
+        },
+        {
+          "const": "local",
+          "description": "On this machine.",
+          "type": "string"
+        }
+      ]
     },
     "TreeSummary": {
       "additionalProperties": false,

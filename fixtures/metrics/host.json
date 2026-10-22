@@ -1,0 +1,99 @@
+{
+  "document": "kalareach host metrics",
+  "labels": {
+    "adapter": {
+      "kind": "enumerated",
+      "values": [
+        "claude-code",
+        "codex",
+        "gemini-cli",
+        "kimi-cli",
+        "kimi-code-cli",
+        "opencode",
+        "opencode-attach",
+        "qoder-cli"
+      ]
+    },
+    "attempt": {
+      "buckets": [
+        "1",
+        "2-3",
+        "4-8",
+        "9+"
+      ],
+      "kind": "bucket"
+    },
+    "environment": {
+      "kind": "enumerated",
+      "values": [
+        "development",
+        "staging",
+        "production"
+      ]
+    },
+    "fault": {
+      "kind": "enumerated",
+      "values": [
+        "unterminated_sequence",
+        "invalid_encoding",
+        "oversized_frame",
+        "unknown_control"
+      ]
+    },
+    "outcome": {
+      "kind": "enumerated",
+      "values": [
+        "ok",
+        "refused",
+        "timeout",
+        "unavailable",
+        "exhausted",
+        "invalid"
+      ]
+    },
+    "transport": {
+      "kind": "enumerated",
+      "values": [
+        "direct",
+        "relay",
+        "local"
+      ]
+    }
+  },
+  "metrics": [
+    {
+      "kind": "duration",
+      "labels": [
+        "transport",
+        "attempt",
+        "outcome",
+        "environment"
+      ],
+      "name": "reconnect.time",
+      "unit": "milliseconds",
+      "where": "host"
+    },
+    {
+      "kind": "counter",
+      "labels": [
+        "fault",
+        "environment"
+      ],
+      "name": "terminal.parse_fault",
+      "unit": "events",
+      "where": "host"
+    },
+    {
+      "kind": "counter",
+      "labels": [
+        "adapter",
+        "outcome",
+        "environment"
+      ],
+      "name": "adapter.failure",
+      "unit": "events",
+      "where": "host"
+    }
+  ],
+  "version": 1
+}
