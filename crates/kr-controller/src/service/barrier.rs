@@ -1097,7 +1097,7 @@ impl Controller {
     /// host's or cannot be named.
     ///
     /// A debt that reaches every connection is the whole host. The others are the grants that carry
-    /// `terminal.input` and the devices they name. A delegation tree cannot hold more grants than a
+    /// `terminal.input` or `terminal.geometry` and the devices they name. A delegation tree cannot hold more grants than a
     /// notice names ([`crate::grants::MAX_GRANTS_PER_TREE`]), so a revocation is named exactly; what
     /// is left to name more is a tree from before that limit, and the fence it owes is the whole
     /// host's. That fence can go once no tree is left that holds more than the limit.
