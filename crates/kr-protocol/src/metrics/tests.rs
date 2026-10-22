@@ -5,7 +5,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::{
-    Adapter, AdapterFailure, Attempt, Environment, Fault, HOST_METRICS, Outcome, ParseFault,
+    Adapter, AdapterFailure, Attempt, Environment, Fault, HOST_METRICS, MetricOutcome, ParseFault,
     ReconnectTime, Recorder, Report, Shape, Transport, VECTOR_FILE_NAME, vector,
 };
 use crate::scalars::U64;
@@ -156,25 +156,25 @@ fn a_recorder_counts_each_series_and_reports_them_in_a_fixed_order() {
     recorder.reconnected(
         Transport::Relay,
         Attempt::One,
-        Outcome::Ok,
+        MetricOutcome::Ok,
         Duration::from_millis(1_500),
     );
     recorder.reconnected(
         Transport::Relay,
         Attempt::One,
-        Outcome::Ok,
+        MetricOutcome::Ok,
         Duration::from_millis(4_000),
     );
     recorder.reconnected(
         Transport::Direct,
         Attempt::TwoToThree,
-        Outcome::Refused,
+        MetricOutcome::Refused,
         Duration::from_millis(10),
     );
     recorder.parse_faulted(Fault::InvalidEncoding, 3);
     recorder.parse_faulted(Fault::InvalidEncoding, 2);
     recorder.parse_faulted(Fault::UnknownControl, 0);
-    recorder.adapter_failed(Adapter::Codex, Outcome::Timeout);
+    recorder.adapter_failed(Adapter::Codex, MetricOutcome::Timeout);
 
     let report = recorder.report();
     assert_eq!(
@@ -183,7 +183,7 @@ fn a_recorder_counts_each_series_and_reports_them_in_a_fixed_order() {
             ReconnectTime {
                 transport: Transport::Direct,
                 attempt: Attempt::TwoToThree,
-                outcome: Outcome::Refused,
+                outcome: MetricOutcome::Refused,
                 environment: Environment::Development,
                 count: U64::new(1),
                 total_ms: U64::new(10),
@@ -192,7 +192,7 @@ fn a_recorder_counts_each_series_and_reports_them_in_a_fixed_order() {
             ReconnectTime {
                 transport: Transport::Relay,
                 attempt: Attempt::One,
-                outcome: Outcome::Ok,
+                outcome: MetricOutcome::Ok,
                 environment: Environment::Development,
                 count: U64::new(2),
                 total_ms: U64::new(5_500),
@@ -213,7 +213,7 @@ fn a_recorder_counts_each_series_and_reports_them_in_a_fixed_order() {
         report.adapter_failure,
         [AdapterFailure {
             adapter: Adapter::Codex,
-            outcome: Outcome::Timeout,
+            outcome: MetricOutcome::Timeout,
             environment: Environment::Development,
             count: U64::new(1),
         }]
@@ -262,11 +262,11 @@ fn a_report_naming_a_word_this_build_does_not_have_does_not_parse() {
 fn reports_from_several_places_join_into_one() {
     let one = Recorder::new(Environment::Production);
     one.parse_faulted(Fault::OversizedFrame, 2);
-    one.adapter_failed(Adapter::GeminiCli, Outcome::Unavailable);
+    one.adapter_failed(Adapter::GeminiCli, MetricOutcome::Unavailable);
     one.reconnected(
         Transport::Relay,
         Attempt::One,
-        Outcome::Ok,
+        MetricOutcome::Ok,
         Duration::from_millis(100),
     );
     let other = Recorder::new(Environment::Production);
@@ -274,7 +274,7 @@ fn reports_from_several_places_join_into_one() {
     other.reconnected(
         Transport::Relay,
         Attempt::One,
-        Outcome::Ok,
+        MetricOutcome::Ok,
         Duration::from_millis(900),
     );
 

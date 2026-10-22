@@ -1011,7 +1011,7 @@
           "description": "Which environment measured it."
         },
         "outcome": {
-          "$ref": "#/$defs/Outcome2",
+          "$ref": "#/$defs/MetricOutcome",
           "description": "How it ended."
         }
       },
@@ -23268,6 +23268,41 @@
       "minimum": 0,
       "type": "integer"
     },
+    "MetricOutcome": {
+      "description": "How something ended. Never why, in the words of whatever failed.",
+      "oneOf": [
+        {
+          "const": "ok",
+          "description": "It worked.",
+          "type": "string"
+        },
+        {
+          "const": "refused",
+          "description": "The host refused it.",
+          "type": "string"
+        },
+        {
+          "const": "timeout",
+          "description": "It was not answered in time.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "Nothing was there to answer it.",
+          "type": "string"
+        },
+        {
+          "const": "exhausted",
+          "description": "What it needed ran out.",
+          "type": "string"
+        },
+        {
+          "const": "invalid",
+          "description": "It was not valid.",
+          "type": "string"
+        }
+      ]
+    },
     "MutationRequest": {
       "additionalProperties": false,
       "description": "A mutation request.\n\nThe payload digest covers the method and version, the actor and grant, the complete target, the\npreconditions, the action identifier, the freshness window and time to live, and the\nparameters. Replacing the window changes the digest, so it is never an automatic retry.",
@@ -24962,41 +24997,6 @@
             "error"
           ],
           "type": "object"
-        }
-      ]
-    },
-    "Outcome2": {
-      "description": "How something ended. Never why, in the words of whatever failed.",
-      "oneOf": [
-        {
-          "const": "ok",
-          "description": "It worked.",
-          "type": "string"
-        },
-        {
-          "const": "refused",
-          "description": "The host refused it.",
-          "type": "string"
-        },
-        {
-          "const": "timeout",
-          "description": "It was not answered in time.",
-          "type": "string"
-        },
-        {
-          "const": "unavailable",
-          "description": "Nothing was there to answer it.",
-          "type": "string"
-        },
-        {
-          "const": "exhausted",
-          "description": "What it needed ran out.",
-          "type": "string"
-        },
-        {
-          "const": "invalid",
-          "description": "It was not valid.",
-          "type": "string"
         }
       ]
     },
@@ -32354,7 +32354,7 @@
           "description": "The longest of them, in milliseconds."
         },
         "outcome": {
-          "$ref": "#/$defs/Outcome2",
+          "$ref": "#/$defs/MetricOutcome",
           "description": "How that attempt ended."
         },
         "total_ms": {

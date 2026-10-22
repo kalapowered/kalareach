@@ -11,7 +11,7 @@ mod net_support;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::hostinfo::HostDoctorResult;
 use kr_protocol::method::Method;
-use kr_protocol::metrics::{Attempt, Environment, Outcome};
+use kr_protocol::metrics::{Attempt, Environment, MetricOutcome};
 use kr_protocol::rights::ActionRight;
 use net_support::{Device, Host, connect, pair_with, proposal};
 
@@ -67,7 +67,7 @@ async fn kr_req_26_43_a_device_that_comes_back_is_a_reconnection_in_what_the_hos
         "the host counted none of the {CYCLES} times the device came back"
     );
     for series in &report.reconnect_time {
-        assert_eq!(series.outcome, Outcome::Ok, "{series:?}");
+        assert_eq!(series.outcome, MetricOutcome::Ok, "{series:?}");
         assert_eq!(series.attempt, Attempt::One, "{series:?}");
         assert_eq!(series.environment, Environment::Development, "{series:?}");
         assert!(series.count.get() >= 1);

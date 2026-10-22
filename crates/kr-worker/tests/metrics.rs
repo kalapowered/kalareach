@@ -24,7 +24,7 @@ use kr_protocol::ids::{
     ApplicationInstanceId, BrokerBindingId, BuildId, ControllerGeneration, PluginId, PublisherId,
     SessionEpoch, SessionId,
 };
-use kr_protocol::metrics::{Adapter, Environment, Fault, Outcome, Report};
+use kr_protocol::metrics::{Adapter, Environment, Fault, MetricOutcome, Report};
 use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
 use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
 use kr_term::diag::DiagnosticKind;
@@ -293,7 +293,7 @@ async fn kr_req_26_43_an_adapter_the_runtime_cannot_run_is_counted_once_for_each
     };
     let codex = bind(7, "kalareach/codex");
     let example = bind(8, "kalareach/example-declarative");
-    let adapters = |world: &World| -> Vec<(Adapter, Outcome, u64)> {
+    let adapters = |world: &World| -> Vec<(Adapter, MetricOutcome, u64)> {
         world
             .service
             .metrics()
@@ -309,7 +309,7 @@ async fn kr_req_26_43_an_adapter_the_runtime_cannot_run_is_counted_once_for_each
     broker.set_component_state(codex, ComponentState::Unavailable, Some("no runtime still"));
     assert_eq!(
         adapters(&world),
-        vec![(Adapter::Codex, Outcome::Unavailable, 1)],
+        vec![(Adapter::Codex, MetricOutcome::Unavailable, 1)],
         "the runtime saying again that it cannot run the component is one failure"
     );
 
@@ -322,14 +322,14 @@ async fn kr_req_26_43_an_adapter_the_runtime_cannot_run_is_counted_once_for_each
     );
     assert_eq!(
         adapters(&world),
-        vec![(Adapter::Codex, Outcome::Unavailable, 2)],
+        vec![(Adapter::Codex, MetricOutcome::Unavailable, 2)],
         "a second step into the state is a second failure"
     );
 
     broker.set_component_state(example, ComponentState::Unavailable, Some("no runtime"));
     assert_eq!(
         adapters(&world),
-        vec![(Adapter::Codex, Outcome::Unavailable, 2)],
+        vec![(Adapter::Codex, MetricOutcome::Unavailable, 2)],
         "a package that is not a bundled connector is counted under no name"
     );
 }

@@ -142,7 +142,7 @@ impl Attempt {
 
 closed_label! {
     /// How something ended. Never why, in the words of whatever failed.
-    Outcome, "outcome", Enumerated, {
+    MetricOutcome, "outcome", Enumerated, {
         /// It worked.
         Ok => "ok",
         /// The host refused it.
@@ -268,7 +268,12 @@ pub const HOST_METRICS: &[Declaration] = &[
     Declaration {
         name: "reconnect.time",
         kind: Kind::Duration,
-        labels: &[Transport::KEY, Attempt::KEY, Outcome::KEY, Environment::KEY],
+        labels: &[
+            Transport::KEY,
+            Attempt::KEY,
+            MetricOutcome::KEY,
+            Environment::KEY,
+        ],
         reports: "how long a paired device was without a connection to this host, and which \
                   attempt ended it",
     },
@@ -282,7 +287,7 @@ pub const HOST_METRICS: &[Declaration] = &[
     Declaration {
         name: "adapter.failure",
         kind: Kind::Counter,
-        labels: &[Adapter::KEY, Outcome::KEY, Environment::KEY],
+        labels: &[Adapter::KEY, MetricOutcome::KEY, Environment::KEY],
         reports: "an adapter that did not answer, by the adapter and by how it ended",
     },
 ];
@@ -299,7 +304,11 @@ fn values_of(key: &str) -> Option<(Shape, Vec<&'static str>)> {
     match key {
         Transport::KEY => all(Transport::SHAPE, Transport::ALL, Transport::as_str),
         Attempt::KEY => all(Attempt::SHAPE, Attempt::ALL, Attempt::as_str),
-        Outcome::KEY => all(Outcome::SHAPE, Outcome::ALL, Outcome::as_str),
+        MetricOutcome::KEY => all(
+            MetricOutcome::SHAPE,
+            MetricOutcome::ALL,
+            MetricOutcome::as_str,
+        ),
         Fault::KEY => all(Fault::SHAPE, Fault::ALL, Fault::as_str),
         Adapter::KEY => all(Adapter::SHAPE, Adapter::ALL, Adapter::as_str),
         Environment::KEY => all(Environment::SHAPE, Environment::ALL, Environment::as_str),
@@ -360,7 +369,7 @@ pub struct ReconnectTime {
     /// is the one reported.
     pub attempt: Attempt,
     /// How that attempt ended.
-    pub outcome: Outcome,
+    pub outcome: MetricOutcome,
     /// Which environment measured it.
     pub environment: Environment,
     /// How many gaps this series counts.
@@ -390,7 +399,7 @@ pub struct AdapterFailure {
     /// The adapter.
     pub adapter: Adapter,
     /// How it ended.
-    pub outcome: Outcome,
+    pub outcome: MetricOutcome,
     /// Which environment measured it.
     pub environment: Environment,
     /// How many times it happened.
@@ -500,9 +509,9 @@ impl Report {
 /// What a series counts under: its metric and every label it carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Key {
-    Reconnect(Transport, Attempt, Outcome),
+    Reconnect(Transport, Attempt, MetricOutcome),
     ParseFault(Fault),
-    AdapterFailure(Adapter, Outcome),
+    AdapterFailure(Adapter, MetricOutcome),
 }
 
 /// What a series has counted.
@@ -551,7 +560,7 @@ impl Recorder {
         &self,
         transport: Transport,
         attempt: Attempt,
-        outcome: Outcome,
+        outcome: MetricOutcome,
         took: Duration,
     ) {
         let took_ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
@@ -566,7 +575,7 @@ impl Recorder {
     }
 
     /// Records one failure of `adapter` that ended as `outcome`.
-    pub fn adapter_failed(&self, adapter: Adapter, outcome: Outcome) {
+    pub fn adapter_failed(&self, adapter: Adapter, outcome: MetricOutcome) {
         self.add(Key::AdapterFailure(adapter, outcome), 1, 0);
     }
 
