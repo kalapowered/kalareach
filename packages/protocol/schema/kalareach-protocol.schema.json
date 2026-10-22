@@ -22022,7 +22022,7 @@
         },
         {
           "const": "backup.bundle.write",
-          "description": "Move the recovery bundle on by one compare-and-swap at its locator, for a restore that has verified a generation and records it. The call names the place the bundle was read at and carries the sealed bundle; it replaces a bundle that is still there and makes none. The host relays ciphertext with its own account and sees no seed or content. It sends nothing while privacy mode is on or while the service has asked to be left alone, and keeps no record of the write.",
+          "description": "Move the recovery bundle on by one compare-and-swap at its locator, for a restore that has verified a generation and records it. The call names the place the bundle was read at and carries the sealed bundle; it replaces a bundle that is still there and makes none. The host relays ciphertext with its own account and sees no seed or content. The bundle is key material, so privacy mode does not stop the call. It sends nothing while the service has asked to be left alone, and keeps no record of the write.",
           "type": "string"
         },
         {
