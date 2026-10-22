@@ -36,6 +36,7 @@ import {
   failureMessage,
   type HostCoverView,
   type HostPort,
+  type RecoveryArchive,
   type RecoveryView,
   type SettingsChoice,
   type SettingsView,
@@ -44,16 +45,21 @@ import {
 import { minimumTarget, type Surface } from '../mobile/platform'
 import type { AccountView } from '../model/account'
 import {
+  EXPORT_HELP,
   HOST_COVER_HELP,
   HOST_REPLACE_WARNING,
   KIT_FILE_NAME,
+  QR_FILE_NAME,
+  QR_HELP,
   RECOVERY_HELP,
   SETTLE_HELP,
   SYNC_SERVICE_HELP,
+  describeArchive,
   describeBlocker,
   describeHostCover,
   describeRecovery,
   describeStaysAt,
+  exportFileName,
   offersReplacement
 } from '../model/recovery'
 import {
@@ -109,6 +115,7 @@ export function SyncPanel({
   const [recoveryProblem, setRecoveryProblem] = useState<string | null>(null)
   const [hostCover, setHostCover] = useState<HostCoverView | null>(null)
   const [confirmingReplace, setConfirmingReplace] = useState(false)
+  const [copies, setCopies] = useState<readonly RecoveryArchive[] | null>(null)
   const [changing, setChanging] = useState(false)
   const [draft, setDraft] = useState('')
   const [said, setSaid] = useState<Said | null>(null)
@@ -669,6 +676,11 @@ export function SyncPanel({
                     {HOST_REPLACE_WARNING}
                   </p>
                 ) : null}
+                {copies !== null ? (
+                  <p className="account-note" data-testid="recovery-export-help">
+                    {EXPORT_HELP}
+                  </p>
+                ) : null}
                 {recoveryProblem !== null ? (
                   <p className="account-note" data-testid="recovery-problem">
                     {recoveryProblem}
@@ -809,7 +821,84 @@ export function SyncPanel({
                     Save the recovery kit
                   </Button>
                 ) : null}
+                {recovery?.state === 'on' ? (
+                  <Button
+                    data-testid="recovery-save-qr"
+                    data-wraps
+                    disabled={busy}
+                    style={{ minBlockSize: target }}
+                    onClick={() => {
+                      step('recovery', async () => {
+                        const path = await port.chooseExportPath(QR_FILE_NAME)
+                        if (path === null) return null
+                        await port.recoverySaveKitQr(path)
+                        return `Recovery kit saved as a QR code. ${QR_HELP}`
+                      })
+                    }}
+                  >
+                    Save the kit as a QR code
+                  </Button>
+                ) : null}
+                {recovery?.state === 'on' && blocker === null && copies === null ? (
+                  <Button
+                    data-testid="recovery-export-offline"
+                    data-wraps
+                    disabled={busy}
+                    style={{ minBlockSize: target }}
+                    onClick={() => {
+                      step('recovery', async () => {
+                        setCopies(await port.recoveryArchives())
+                        return null
+                      })
+                    }}
+                  >
+                    Make an offline copy
+                  </Button>
+                ) : null}
               </div>
+              {copies !== null ? (
+                <ul className="device-list" data-testid="recovery-copies">
+                  {[null, ...copies].map((archive) => (
+                    <li key={archive?.archive_id ?? 'bundle'} className="device-row">
+                      <div className="device-words">
+                        <p className="account-lead">
+                          {archive === null
+                            ? 'The recovery bundle alone.'
+                            : describeArchive(archive)}
+                        </p>
+                      </div>
+                      <Button
+                        data-testid={`recovery-copy-${archive?.archive_id ?? 'bundle'}`}
+                        data-wraps
+                        disabled={busy || (archive !== null && archive.generation === null)}
+                        style={{ minBlockSize: target }}
+                        onClick={() => {
+                          step('recovery', async () => {
+                            const path = await port.chooseExportPath(exportFileName(archive))
+                            if (path === null) return null
+                            await port.recoveryExportOffline(path, archive?.archive_id ?? null)
+                            return 'Offline copy saved. It opens only with the kit.'
+                          })
+                        }}
+                      >
+                        Save a copy
+                      </Button>
+                    </li>
+                  ))}
+                  <li className="device-row">
+                    <Button
+                      data-testid="recovery-copies-close"
+                      disabled={busy}
+                      style={{ minBlockSize: target }}
+                      onClick={() => {
+                        setCopies(null)
+                      }}
+                    >
+                      Done
+                    </Button>
+                  </li>
+                </ul>
+              ) : null}
             </div>
           </Card>
         </>

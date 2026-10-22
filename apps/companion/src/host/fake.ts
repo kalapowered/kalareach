@@ -57,8 +57,10 @@ import type {
   ImportedImage,
   KeyAction,
   KeypadCode,
+  ExportSaved,
   HostCoverView,
   KitSaved,
+  RecoveryArchive,
   OpenRequest,
   OwnerView,
   PairingUnavailable,
@@ -335,6 +337,12 @@ export interface FakeRecovery {
   readonly hostCovers: readonly { readonly replace: boolean }[]
   /** Sets what the backend answers to the next requests to cover the host. */
   coverHostAnswers(answer: HostCoverView): void
+  /** The destinations the page asked to have the kit drawn as a QR code to. */
+  readonly qrSaved: readonly string[]
+  /** Sets the archives the backend lists for an offline copy. */
+  setArchives(archives: readonly RecoveryArchive[]): void
+  /** What the page asked to have exported, in order. */
+  readonly exportsMade: readonly { readonly path: string; readonly archive: string | null }[]
   /** Sets where recovery stands, as the backend would report it. */
   set(view: Partial<Omit<RecoveryView, 'sync_service'>>): void
   /** Makes every read of recovery refuse with these words until it is given none. */
@@ -1147,6 +1155,9 @@ export function fakeHost(
     already: false
   }
   const hostCovers: { readonly replace: boolean }[] = []
+  const qrSaved: string[] = []
+  let archives: readonly RecoveryArchive[] = []
+  const exportsMade: { readonly path: string; readonly archive: string | null }[] = []
   let heldTurnOn: Promise<void> | null = null
   let heldRecoveryRead: Promise<void> | null = null
   let heldSyncServiceRead: Promise<void> | null = null
@@ -2691,6 +2702,32 @@ export function fakeHost(
       kitsSaved.push(path)
       return Promise.resolve({ path })
     },
+    recoverySaveKitQr: (path): Promise<KitSaved> => {
+      if (recovery.state !== 'on') {
+        refuse('PERMISSION_DENIED', 'Recovery is not on, so there is no kit.')
+      }
+      qrSaved.push(path)
+      return Promise.resolve({ path })
+    },
+    recoveryArchives: () => {
+      if (recovery.state !== 'on') {
+        refuse('PERMISSION_DENIED', 'Recovery has not been turned on.')
+      }
+      return Promise.resolve(archives)
+    },
+    recoveryExportOffline: (path, archive): Promise<ExportSaved> => {
+      if (recovery.state !== 'on') {
+        refuse('PERMISSION_DENIED', 'Recovery has not been turned on.')
+      }
+      exportsMade.push({ path, archive })
+      const held = archives.find((candidate) => candidate.archive_id === archive)
+      return Promise.resolve({
+        path,
+        archive_id: archive,
+        generation: held?.generation ?? null,
+        bytes: 1024
+      })
+    },
     recoveryCoverHost: (replace) => {
       if (recovery.state !== 'on') {
         refuse('PERMISSION_DENIED', 'Recovery has not been turned on.')
@@ -2716,8 +2753,13 @@ export function fakeHost(
       },
       kitsSaved,
       hostCovers,
+      qrSaved,
+      exportsMade,
       coverHostAnswers(answer) {
         hostCoverAnswer = answer
+      },
+      setArchives(next) {
+        archives = next
       },
       set(view) {
         recovery = { ...recovery, ...view }

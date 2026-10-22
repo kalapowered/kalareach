@@ -339,6 +339,27 @@ export interface KitSaved {
   readonly path: string
 }
 
+/** One archive the recovery bundle names, as the page lists it for an offline copy. */
+export interface RecoveryArchive {
+  /** The identifier the page gives back to name the archive to export. */
+  readonly archive_id: string
+  /** The newest generation the service holds of it, once verified; null when none is offered. */
+  readonly generation: number | null
+  /** When the writer signed that generation, in UTC milliseconds. */
+  readonly published_at_ms: number | null
+  /** Why no generation is offered, when none is. */
+  readonly withheld: 'nothing' | 'refused' | null
+}
+
+/** Where an offline copy was written, and what is in it. */
+export interface ExportSaved {
+  readonly path: string
+  /** The archive in it, or null for the recovery bundle alone. */
+  readonly archive_id: string | null
+  readonly generation: number | null
+  readonly bytes: number
+}
+
 /**
  * Why the host on this computer was left as it was when recovery was asked to cover it. The causes
  * a sign-in, an unusable setup or a host's refusal name are the protocol's own words, kept as the
@@ -1966,6 +1987,20 @@ export interface HostPort {
    * covered only after the host has said it is set up, and otherwise says why nothing was changed.
    */
   recoveryCoverHost(replace: boolean): Promise<HostCoverView>
+  /**
+   * Writes the recovery kit to `path` as a QR code, an SVG, for printing. `path` must be one
+   * `chooseExportPath` returned. Native code draws and writes it; nothing the code holds reaches
+   * the page.
+   */
+  recoverySaveKitQr(path: string): Promise<KitSaved>
+  /** The archives the recovery bundle names at the sync service, each with its newest generation. */
+  recoveryArchives(): Promise<readonly RecoveryArchive[]>
+  /**
+   * Writes an offline copy to `path`, which must be one `chooseExportPath` returned: the recovery
+   * bundle and, when `archive` names one, that archive's newest generation, as ciphertext that only
+   * the kit opens. Nothing decrypted is written.
+   */
+  recoveryExportOffline(path: string, archive: string | null): Promise<ExportSaved>
 
   /**
    * Tells `listener` each event the host publishes. Resolves, with the function that stops it,
