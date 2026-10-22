@@ -60,6 +60,9 @@ final class NotificationService: UNNotificationServiceExtension {
         through contentHandler: (UNNotificationContent) -> Void
     ) {
         #if DEBUG
+        // A device run reads this to see that the extension ran: the reason it showed what it showed,
+        // and nothing of the notification.
+        NSLog("KalaReachExtension: ran, %@", decision.reasonName)
         let probe = ExtensionProbe(keys: KeychainPreviewKeyStore(), private: KeychainProbeReader())
         if let added = probe.additions(for: request.content.userInfo, reason: decision.reasonName),
             let answered = content.mutableCopy() as? UNMutableNotificationContent
