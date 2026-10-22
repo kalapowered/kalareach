@@ -126,6 +126,9 @@ impl Answering {
 
 /// Types `reply` through `keys` the moment `question` is among the bytes sent, or at once when it
 /// already is.
+///
+/// A terminal answers one question this way: a second registration of the same question finds the
+/// first one's in the transcript and is answered at once.
 #[must_use]
 pub fn reply_to(
     collected: &Collected,

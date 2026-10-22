@@ -3159,7 +3159,10 @@ fn triggered_recording(
 /// A program that keeps whatever it reads from the terminal in the file it is given, as it reads it
 /// and with nothing written back.
 const KEEPS_WHAT_IT_READS: &str = "/usr/bin/perl -e 'open(KEPT, \">\", shift) or die; \
-     while (sysread(STDIN, $chunk, 65536)) { syswrite(KEPT, $chunk) }'";
+     while (1) { \
+       my $n = sysread(STDIN, $chunk, 65536); defined $n or die \"read: $!\"; $n or last; \
+       for (my $at = 0; $at < $n; ) { \
+         my $w = syswrite(KEPT, $chunk, $n - $at, $at); defined $w or die \"write: $!\"; $at += $w } }'";
 
 /// A worker with a session whose application keeps what it is typed, and the attachment typing.
 struct Rig {
@@ -3189,9 +3192,10 @@ impl Rig {
     ///
     /// The application is a program of the case's own and not the system's `tee`: what a late
     /// application is typed at is a backlog, and the `tee` of a host whose core utilities are
-    /// uutils' takes what a terminal holds in one read through a pipe of its own and aborts when
-    /// that is more than the pipe has room for, which depends on how much of the backlog the
-    /// kernel has handed on by the time it first reads.
+    /// uutils' hands what a terminal gives it to a second pipe of its own and aborts when that
+    /// pipe has less room than the read gave it. A pipe made while its user holds more pipe
+    /// buffers than the kernel's soft limit has room for two pages (8 KiB), which is what a host
+    /// has when many suites run on it at once, and one read of the backlog can be more.
     async fn start_late() -> Self {
         Self::from_script(|received, trigger| {
             format!(
