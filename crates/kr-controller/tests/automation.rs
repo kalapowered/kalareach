@@ -2220,14 +2220,19 @@ fn refuse_fences(environment: &kr_ipc::paths::EnvironmentPaths) -> rusqlite::Con
     registry
 }
 
+/// How long a case waits for something to happen before it calls it hung. It only ends a case
+/// that is stuck: a wait that is met costs what it costs.
+const LIVENESS: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Waits until `condition` holds, and fails when it does not within a liveness bound: what the
 /// wait measures is whether the condition is ever met, and one that is met costs what it costs.
 async fn until(what: &str, mut condition: impl FnMut() -> bool) {
     let started = std::time::Instant::now();
     while !condition() {
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(60),
-            "waited 60 s for {what}"
+            started.elapsed() < LIVENESS,
+            "waited {} s for {what}",
+            LIVENESS.as_secs()
         );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
@@ -2314,9 +2319,10 @@ async fn a_start_that_fails_at_its_configuration_gate_dispatches_nothing() {
 }
 
 /// A withdrawal whose fence could not be raised stops a workflow mutation that was admitted just
-/// before it. The install passes the daemon's first check, waits for the journal, and meanwhile
-/// the registry refuses the fence a narrowed configuration owes; asked again inside the journal's
-/// transaction, the admission refuses, and nothing is installed.
+/// before it. The install passes the daemon's first check and is stopped there, and meanwhile the
+/// registry refuses the fence a narrowed configuration owes; asked again inside the journal's
+/// transaction, the admission refuses, and nothing is installed. The first check would refuse a
+/// fence owed before it, so the narrowing waits for the install to have passed it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fence_owed_after_admission_stops_the_workflow_write() {
     let host = host().await;
@@ -2338,21 +2344,12 @@ async fn a_fence_owed_after_admission_stops_the_workflow_write() {
     );
     let mut control = client(&host).await;
 
-    // Another writer holds the workflow journal's write lock. Reads go on, so the install is
-    // answered no retained record, passes the daemon's first check, and waits for the journal's
-    // transaction.
-    let journal = rusqlite::Connection::open(
-        environment
-            .state_dir()
-            .join(kr_automation::store::WORKFLOW_DB_NAME),
-    )
-    .expect("opens the journal");
-    journal
-        .execute_batch("BEGIN IMMEDIATE")
-        .expect("another writer holds the journal");
+    // The install is answered no retained record, passes the daemon's first check, and is stopped
+    // before the journal's transaction.
+    let (arrived, go) = host.controller.pause_after_the_automation_admission();
     let installing = document.clone();
     let environment_id = host.environment_id;
-    let pending = tokio::spawn(async move {
+    let mut pending = tokio::spawn(async move {
         control
             .mutate(
                 Method::WorkflowInstall,
@@ -2368,7 +2365,16 @@ async fn a_fence_owed_after_admission_stops_the_workflow_write() {
             .await
             .expect("the call reaches the daemon")
     });
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    tokio::select! {
+        reached = tokio::time::timeout(LIVENESS, arrived) => {
+            reached
+                .expect("the install reached the daemon's first check within the liveness bound")
+                .expect("the install is stopped after its first check");
+        }
+        answered = &mut pending => {
+            panic!("the install was answered before it was stopped after its first check: {answered:?}");
+        }
+    }
 
     // The configuration narrows the grants' rights, and the fence that owes cannot be raised.
     let registry = refuse_fences(&environment);
@@ -2383,9 +2389,7 @@ async fn a_fence_owed_after_admission_stops_the_workflow_write() {
         effective.not_in_force
     );
 
-    journal
-        .execute_batch("COMMIT")
-        .expect("the other writer finishes");
+    go.send(()).expect("the install goes on to the journal");
     let refusal = pending
         .await
         .expect("the install answers")
@@ -2978,10 +2982,13 @@ fn versions_in(environment: &kr_ipc::paths::EnvironmentPaths) -> i64 {
         .expect("counts the versions")
 }
 
-/// KR-REQ-19.04: a grant withdrawn while a node's change-set write waits for the change-set store
-/// stops the write. The node passed every check before its effect began; the grant is asked again
-/// inside the store's own transaction, under the daemon's hold, so the capture writes nothing once
-/// the grant is gone, and the node pauses on the refusal rather than failing.
+/// KR-REQ-19.04: a grant withdrawn between a node's change-set write passing its checks and the
+/// change-set store's transaction stops the write. The node passed every check before its effect
+/// began; the grant is asked again inside the store's own transaction, under the daemon's hold, so
+/// the capture writes nothing once the grant is gone, and the node pauses on the refusal rather
+/// than failing. The capture is stopped after the check that comes before it reads the working
+/// tree, and the grant is withdrawn there, so the withdrawal cannot come before that check or
+/// after the store's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_grant_withdrawn_while_the_change_set_write_waits_writes_nothing() {
     let host = host().await;
@@ -2999,19 +3006,13 @@ async fn a_grant_withdrawn_while_the_change_set_write_waits_writes_nothing() {
     enable(&mut control, &host, &document).await;
     assert_eq!(versions_in(&environment), 0);
 
-    // Another writer holds the change-set store's write lock. The run passes every check the
-    // engine and the runner make, reads the working tree, and then waits for the store.
-    let store = rusqlite::Connection::open(
-        environment
-            .state_dir()
-            .join(kr_changeset::store::CHANGESETS_DIRECTORY)
-            .join(kr_changeset::store::STORE_FILE_NAME),
-    )
-    .expect("opens the change-set store");
-    store
-        .execute_batch("BEGIN IMMEDIATE")
-        .expect("another writer holds the store");
-    let running = {
+    // The run passes every check the engine and the runner make, and its capture is stopped before
+    // it reads the working tree and asks the change-set store for anything.
+    let (arrived, go) = host
+        .controller
+        .automation()
+        .pause_the_capture_after_its_admission();
+    let mut running = {
         let host_environment = host.environment_id;
         let endpoint = host.endpoint.clone();
         let document = document.clone();
@@ -3036,17 +3037,27 @@ async fn a_grant_withdrawn_while_the_change_set_write_waits_writes_nothing() {
                 .expect("the call reaches the daemon")
         })
     };
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let stopped = tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS));
+    // A run that is answered first never reaches the capture: it fails naming that, and does not
+    // wait for the liveness bound with its answer unread.
+    tokio::select! {
+        reached = stopped => {
+            reached
+                .expect("the wait for the capture ends")
+                .expect("the capture reached the place it is stopped at within the liveness bound");
+        }
+        answered = &mut running => {
+            panic!("the run was answered before its capture was stopped: {answered:?}");
+        }
+    }
 
-    // The grant is withdrawn while the write waits, and then the store is free again.
+    // The grant is withdrawn while the capture is stopped, and then the capture goes on.
     host.controller
         .sharing()
         .grants()
         .revoke(grant_id(19), kr_ipc::now_ms().get(), || Ok(()))
         .expect("the grant is withdrawn");
-    store
-        .execute_batch("COMMIT")
-        .expect("the other writer finishes");
+    go.send(()).expect("the capture goes on");
 
     let refused = running
         .await
@@ -3579,13 +3590,7 @@ async fn a_capture_that_requires_a_quiesced_tree_fails_and_names_why() {
         "nothing was captured"
     );
     // The journal keeps why.
-    let journal = rusqlite::Connection::open(
-        host._temp
-            .environment()
-            .state_dir()
-            .join(kr_automation::store::WORKFLOW_DB_NAME),
-    )
-    .expect("opens the workflow journal");
+    let journal = journal_reader(&host);
     let why: String = journal
         .query_row(
             "SELECT error_json FROM node_receipts WHERE run_id = ?1",
@@ -4709,8 +4714,9 @@ async fn closed_session(
     }
 }
 
-/// The rows of the resource ledger that are still owed their release.
-fn owed_rows(host: &Host) -> i64 {
+/// A connection to the resource ledger for reading it, which waits for the daemon's writes as long
+/// as a case waits for anything, as [`journal_reader`] does.
+fn ledger_reader(host: &Host) -> rusqlite::Connection {
     let ledger = rusqlite::Connection::open(
         host._temp
             .environment()
@@ -4718,6 +4724,15 @@ fn owed_rows(host: &Host) -> i64 {
             .join(kr_automation::resources::RESOURCES_DB_NAME),
     )
     .expect("opens the resource ledger");
+    ledger
+        .busy_timeout(LIVENESS)
+        .expect("waits for the daemon's writes");
+    ledger
+}
+
+/// The rows of the resource ledger that are still owed their release.
+fn owed_rows(host: &Host) -> i64 {
+    let ledger = ledger_reader(host);
     ledger
         .query_row(
             "SELECT COUNT(*) FROM owned WHERE state = 'open'",
@@ -4727,8 +4742,11 @@ fn owed_rows(host: &Host) -> i64 {
         .expect("counts the open rows")
 }
 
-/// The statuses the journal holds for the nodes of every run, as it holds them now.
-fn node_statuses(host: &Host) -> Vec<String> {
+/// A connection to the workflow journal for reading it, which waits for the daemon's writes as long
+/// as a case waits for anything. The daemon's commit to the journal takes its exclusive lock for
+/// as long as the disk takes to make it durable, and a reader that gave up sooner would fail a case
+/// that is slow and not hung.
+fn journal_reader(host: &Host) -> rusqlite::Connection {
     let journal = rusqlite::Connection::open(
         host._temp
             .environment()
@@ -4736,6 +4754,15 @@ fn node_statuses(host: &Host) -> Vec<String> {
             .join(kr_automation::store::WORKFLOW_DB_NAME),
     )
     .expect("opens the journal");
+    journal
+        .busy_timeout(LIVENESS)
+        .expect("waits for the daemon's writes");
+    journal
+}
+
+/// The statuses the journal holds for the nodes of every run, as it holds them now.
+fn node_statuses(host: &Host) -> Vec<String> {
+    let journal = journal_reader(host);
     let mut statement = journal
         .prepare("SELECT status FROM node_receipts ORDER BY rowid")
         .expect("prepares");
@@ -4748,13 +4775,7 @@ fn node_statuses(host: &Host) -> Vec<String> {
 
 /// The run the journal holds, when it holds one.
 fn only_run(host: &Host) -> kr_protocol::ids::WorkflowRunId {
-    let journal = rusqlite::Connection::open(
-        host._temp
-            .environment()
-            .state_dir()
-            .join(kr_automation::store::WORKFLOW_DB_NAME),
-    )
-    .expect("opens the journal");
+    let journal = journal_reader(host);
     let run: String = journal
         .query_row("SELECT run_id FROM workflow_runs", [], |row| row.get(0))
         .expect("one run");
@@ -6249,13 +6270,7 @@ async fn a_command_a_stopped_daemon_left_running_is_closed_and_released_by_the_n
     // The dispatch wrote down its session's worker. A dispatch that ended before it had is the
     // same row without the worker, and the next daemon's sweep takes the worker from the registry,
     // which keeps the process the launcher started.
-    let ledger = rusqlite::Connection::open(
-        host._temp
-            .environment()
-            .state_dir()
-            .join(kr_automation::resources::RESOURCES_DB_NAME),
-    )
-    .expect("opens the resource ledger");
+    let ledger = ledger_reader(&host);
     let worker_of_the_row = || -> Option<String> {
         ledger
             .query_row("SELECT worker_process FROM owned", [], |row| row.get(0))
@@ -6503,13 +6518,7 @@ async fn a_run_cancelled_before_the_worker_claims_its_launch_creates_no_session(
 
 /// The rows of the resource ledger that were released.
 fn released_rows(host: &Host) -> i64 {
-    let ledger = rusqlite::Connection::open(
-        host._temp
-            .environment()
-            .state_dir()
-            .join(kr_automation::resources::RESOURCES_DB_NAME),
-    )
-    .expect("opens the resource ledger");
+    let ledger = ledger_reader(host);
     ledger
         .query_row(
             "SELECT COUNT(*) FROM owned WHERE state = 'released'",
@@ -6754,19 +6763,13 @@ fn quiesced_capture_node(workspace: WorkspaceId) -> WorkflowNode {
 
 /// What the journal says a run's failed node came to.
 fn why_a_node_failed(host: &Host, run_id: kr_protocol::ids::WorkflowRunId) -> String {
-    rusqlite::Connection::open(
-        host._temp
-            .environment()
-            .state_dir()
-            .join(kr_automation::store::WORKFLOW_DB_NAME),
-    )
-    .expect("opens the workflow journal")
-    .query_row(
-        "SELECT error_json FROM node_receipts WHERE run_id = ?1",
-        [run_id.to_string()],
-        |row| row.get(0),
-    )
-    .expect("the failed node's reason")
+    journal_reader(host)
+        .query_row(
+            "SELECT error_json FROM node_receipts WHERE run_id = ?1",
+            [run_id.to_string()],
+            |row| row.get(0),
+        )
+        .expect("the failed node's reason")
 }
 
 /// Starts a person's session whose shell starts in `directory`, through the daemon's own create.
