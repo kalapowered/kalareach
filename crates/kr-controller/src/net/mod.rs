@@ -1088,6 +1088,10 @@ async fn keep_the_record(
 ///   `session.view`. Where the decision no longer does, the member that would hold it is set to
 ///   null, not removed: it is a required member.
 ///
+/// A third is the daemon's own. The host's diagnostics carry what the host measured about itself
+/// only to a decision that holds `host.manage`; for any other the `metrics` member is taken out,
+/// whatever decision the answer was read under.
+///
 /// The members are read from, taken out of, or set null in the answer's map as the worker wrote
 /// it, without decoding the answer: one this build cannot decode, as one from a worker built after
 /// it may be, loses what the decision withholds, and every other member goes as it came. Every
@@ -1107,8 +1111,11 @@ pub(crate) fn answer_shown<'a>(
     else {
         return std::borrow::Cow::Borrowed(frame);
     };
-    let view = rights.contains(&kr_protocol::rights::ActionRight::SessionView);
-    let Some(changed) = shown_value(shown_as, value, view, history) else {
+    let held = Held {
+        view: rights.contains(&kr_protocol::rights::ActionRight::SessionView),
+        manage: rights.contains(&kr_protocol::rights::ActionRight::HostManage),
+    };
+    let Some(changed) = shown_value(shown_as, value, held, history) else {
         return std::borrow::Cow::Borrowed(frame);
     };
     std::borrow::Cow::Owned(ControlFrame::Response(Response {
@@ -1117,11 +1124,23 @@ pub(crate) fn answer_shown<'a>(
     }))
 }
 
+/// What the decision an answer is written under holds of the rights a shown answer depends on.
+#[derive(Clone, Copy)]
+struct Held {
+    /// `session.view`.
+    view: bool,
+    /// `host.manage`.
+    manage: bool,
+}
+
+/// The member of `host.doctor`'s answer that holds what the host measured about itself.
+const METRICS_MEMBER: &str = "metrics";
+
 /// Returns `value` as `method`'s answer is shown, or `None` when it is shown as it is.
 fn shown_value(
     method: kr_protocol::method::Method,
     value: &kr_protocol::envelope::ParamsValue,
-    view: bool,
+    held: Held,
     history: &kr_protocol::grant::HistoryScope,
 ) -> Option<kr_cbor::CanonicalValue> {
     use kr_protocol::method::Method;
@@ -1129,6 +1148,8 @@ fn shown_value(
         DESCRIPTION_MEMBER, QUESTION_MEMBER, ResultContent, member, result_content,
         with_member_nulled, without_member,
     };
+
+    let Held { view, manage } = held;
 
     if method == Method::ActionRead {
         // The receipt names the method that kept the result, and the result is shown as that
@@ -1145,7 +1166,7 @@ fn shown_value(
         let shown = shown_value(
             named,
             &kr_protocol::envelope::ParamsValue::new(kept.clone()),
-            view,
+            held,
             history,
         )?;
         let kr_cbor::CanonicalValue::Map(answer) = value.as_value() else {
@@ -1165,6 +1186,15 @@ fn shown_value(
         return kr_cbor::CanonicalMap::from_sorted_entries(replaced)
             .ok()
             .map(kr_cbor::CanonicalValue::Map);
+    }
+    if method == Method::HostDoctor {
+        if manage || member(value, METRICS_MEMBER).is_none() {
+            return None;
+        }
+        return match without_member(value, METRICS_MEMBER).into_value() {
+            kr_cbor::CanonicalValue::Map(members) => Some(kr_cbor::CanonicalValue::Map(members)),
+            _ => None,
+        };
     }
     match result_content(method) {
         ResultContent::SessionDescription => {
