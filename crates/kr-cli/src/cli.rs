@@ -2095,8 +2095,8 @@ mod tests {
         );
     }
 
-    /// `kr host terminal` with no option changes nothing, `--set` names a terminal, and naming one
-    /// while clearing it is not one request.
+    /// `kr host terminal` with no option changes nothing, `--set` names a terminal, `--clear`
+    /// clears the preference, and naming one while clearing it is not one request.
     #[test]
     fn the_terminal_preference_is_shown_set_and_cleared() {
         let parsed = Cli::try_parse_from(["kr", "host", "terminal"]).expect("parses");
@@ -2117,6 +2117,15 @@ mod tests {
             panic!("terminal");
         };
         assert_eq!(terminal.set.as_deref(), Some("iterm2"));
+
+        let parsed = Cli::try_parse_from(["kr", "host", "terminal", "--clear"]).expect("parses");
+        let Command::Host(arguments) = parsed.command else {
+            panic!("host");
+        };
+        let HostCommand::Terminal(terminal) = arguments.command else {
+            panic!("terminal");
+        };
+        assert!(terminal.clear && terminal.set.is_none());
 
         assert!(
             Cli::try_parse_from(["kr", "host", "terminal", "--set", "iterm2", "--clear"]).is_err(),
