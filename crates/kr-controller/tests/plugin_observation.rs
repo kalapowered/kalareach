@@ -74,8 +74,8 @@ async fn kr_req_06_07_a_frame_the_worker_offers_reaches_the_components_that_may_
     for number in [1, 2, 3, 4] {
         world.until_ready(number).await;
     }
-    // The fourth binding is registered and ready, and then loses its rich capabilities: the runtime
-    // has not unbound it yet, and it is offered nothing from here on.
+    // The fourth binding is registered and ready, and then loses its rich capabilities: it is
+    // offered nothing from here on.
     world
         .broker()
         .disable_rich(binding(4), "disabled before the run");
@@ -181,10 +181,11 @@ async fn kr_req_06_07_a_frame_the_worker_offers_reaches_the_components_that_may_
 /// notifications. While the pump is held the shell goes on: it prints a line and asks the terminal a
 /// question each time round and stops until it is answered, so a higher line number and another
 /// answer are the terminal draining and being answered. The request is kept in the lane and in the
-/// broker's ledger, and when the pump is let go the component is offered it exactly once, after a
-/// snapshot.
+/// broker's ledger, and when the pump is let go the component is offered it exactly once and has
+/// been taken through a snapshot. (The lane's own test shows that what it lost is older than what it
+/// hands over.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_11_38_a_full_lane_loses_the_oldest_observations_and_never_the_request() {
+async fn kr_req_11_38_a_full_lane_loses_observations_counts_them_and_never_the_request() {
     let Some(world) = Observing::start(Options {
         shell: ASKING_SHELL.to_owned(),
         ..Options::with(vec![Spec::observer(1)])
@@ -820,7 +821,7 @@ async fn kr_req_24_27_privacy_mode_drops_the_state_held_for_a_component_and_none
         .until_account(
             1,
             "the component to observe a frame sent while private",
-            |account| account.observes >= 2,
+            |account| account.observes >= 3,
         )
         .await;
     world.until_offered(1).await;
