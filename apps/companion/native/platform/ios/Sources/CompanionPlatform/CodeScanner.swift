@@ -5,7 +5,8 @@ import UIKit
 import UniformTypeIdentifiers
 
 /// What reading a code came to: the text of the code, that the person closed the scanner or the
-/// picker, that a picture showed no code, or that the camera is not allowed.
+/// picker, that a picture showed no code, that the camera is not allowed, or that the camera could
+/// not be started or the picture opened.
 ///
 /// The text of a code holds an invitation's secret, so printing an outcome never shows it.
 enum ScanOutcome: CustomStringConvertible, CustomDebugStringConvertible {
@@ -13,6 +14,7 @@ enum ScanOutcome: CustomStringConvertible, CustomDebugStringConvertible {
   case cancelled
   case noCode
   case cameraDenied
+  case failed
 
   var description: String {
     switch self {
@@ -20,6 +22,7 @@ enum ScanOutcome: CustomStringConvertible, CustomDebugStringConvertible {
     case .cancelled: return "cancelled"
     case .noCode: return "noCode"
     case .cameraDenied: return "cameraDenied"
+    case .failed: return "failed"
     }
   }
 
@@ -43,6 +46,7 @@ struct ScanAnswer: Encodable, CustomStringConvertible, CustomDebugStringConverti
     case .cancelled: self.outcome = "cancelled"
     case .noCode: self.outcome = "no_code"
     case .cameraDenied: self.outcome = "camera_denied"
+    case .failed: self.outcome = "failed"
     }
   }
 }
@@ -80,6 +84,12 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
   private var device: AVCaptureDevice?
   private var done: ((ScanOutcome) -> Void)?
   private var finished = false
+  /// How the scan ended while the scanner was still coming onto the screen: UIKit ignores a
+  /// dismissal asked for then, so the scan ends when the scanner has appeared.
+  private var deferred: ScanOutcome?
+  private var appeared = false
+  /// Whether the camera was set up: when it was not, the scanner has nothing to show.
+  private var setUp = false
   private var found = false
   private var lastRead = CFAbsoluteTime(0)
   private static let readEvery: CFAbsoluteTime = 0.12
@@ -102,7 +112,7 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
       scanner.modalPresentationStyle = .fullScreen
       scanner.view.accessibilityViewIsModal = true
       handle.scanner = scanner
-      presenter.present(scanner, animated: true)
+      presenter.present(scanner, animated: !UIAccessibility.isReduceMotionEnabled)
     }
     switch AVCaptureDevice.authorizationStatus(for: .video) {
     case .authorized:
@@ -120,7 +130,7 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
   override func viewDidLoad() {
     super.viewDidLoad()
     view.backgroundColor = .black
-    configureCamera()
+    setUp = configureCamera()
     preview.session = session
     preview.videoGravity = .resizeAspectFill
     view.layer.addSublayer(preview)
@@ -162,12 +172,35 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
       self, selector: #selector(showPreview), name: UIApplication.didBecomeActiveNotification, object: nil)
     center.addObserver(
       self, selector: #selector(cancelTapped), name: UIApplication.didEnterBackgroundNotification, object: nil)
+    // A camera another application takes, or one that fails while it runs, leaves a black screen
+    // with nothing to say: the scan ends and says the camera could not be used.
+    center.addObserver(
+      self, selector: #selector(cameraFailed), name: .AVCaptureSessionRuntimeError, object: session)
+    center.addObserver(
+      self, selector: #selector(cameraFailed), name: .AVCaptureSessionWasInterrupted, object: session)
   }
 
   override func viewDidAppear(_ animated: Bool) {
     super.viewDidAppear(animated)
+    appeared = true
+    if let outcome = deferred {
+      deferred = nil
+      finish(outcome)
+      return
+    }
+    guard !finished else { return }
+    guard setUp else {
+      finish(.failed)
+      return
+    }
     frames.async { self.session.startRunning() }
     UIAccessibility.post(notification: .screenChanged, argument: hint)
+  }
+
+  /// VoiceOver's escape gesture closes the scanner as Cancel does.
+  override func accessibilityPerformEscape() -> Bool {
+    cancelTapped()
+    return true
   }
 
   override func viewDidLayoutSubviews() {
@@ -193,23 +226,29 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
     hint.frame = CGRect(x: 24, y: max(lowest, square.minY - 24 - height), width: wide, height: height)
   }
 
-  private func configureCamera() {
+  /// Sets the camera up, and says whether it could be: a camera with no input, or a session that
+  /// takes no input or no output, is one the scanner cannot read from.
+  private func configureCamera() -> Bool {
     guard
       let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
         ?? AVCaptureDevice.default(for: .video),
       let input = try? AVCaptureDeviceInput(device: camera)
-    else { return }
+    else { return false }
     device = camera
     session.beginConfiguration()
     // A host's direct invitation is a version-23 code, 109 modules wide: it needs more than the
     // default preview resolution to be read from a hand's length.
     session.sessionPreset = session.canSetSessionPreset(.hd1920x1080) ? .hd1920x1080 : .high
-    if session.canAddInput(input) { session.addInput(input) }
     let output = AVCaptureVideoDataOutput()
     output.alwaysDiscardsLateVideoFrames = true
     output.setSampleBufferDelegate(self, queue: frames)
-    if session.canAddOutput(output) { session.addOutput(output) }
+    let usable = session.canAddInput(input) && session.canAddOutput(output)
+    if usable {
+      session.addInput(input)
+      session.addOutput(output)
+    }
     session.commitConfiguration()
+    return usable
   }
 
   // MARK: Frames
@@ -238,6 +277,8 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
 
   @objc private func cancelTapped() { finish(.cancelled) }
 
+  @objc private func cameraFailed() { finish(.failed) }
+
   @objc private func torchTapped() {
     guard let device = device, device.hasTorch else { return }
     do {
@@ -250,14 +291,26 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
     } catch {}
   }
 
-  /// What the camera sees is not shown in the application switcher.
-  @objc private func hidePreview() { preview.isHidden = true }
-  @objc private func showPreview() { preview.isHidden = false }
+  /// What the camera sees is not shown in the application switcher, so it goes at once: the layer's
+  /// own change would fade it, and the picture the switcher takes would be of the fade.
+  @objc private func hidePreview() { setPreview(hidden: true) }
+  @objc private func showPreview() { setPreview(hidden: false) }
+
+  private func setPreview(hidden: Bool) {
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    preview.isHidden = hidden
+    CATransaction.commit()
+  }
 
   /// Ends the scan once, whichever of the person, a code or the system ends it first, and answers
   /// after the scanner has gone from the screen.
   func finish(_ outcome: ScanOutcome) {
     guard !finished else { return }
+    if !appeared {
+      if deferred == nil { deferred = outcome }
+      return
+    }
     finished = true
     NotificationCenter.default.removeObserver(self)
     frames.async {
@@ -269,7 +322,7 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
     }
     let answer = done
     done = nil
-    dismiss(animated: true) { answer?(outcome) }
+    dismiss(animated: !UIAccessibility.isReduceMotionEnabled) { answer?(outcome) }
   }
 }
 
@@ -314,7 +367,13 @@ final class PhotoReader: NSObject, PHPickerViewControllerDelegate {
     }
     // The picture is read in memory, and never written anywhere.
     provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
-      let outcome: ScanOutcome = data.flatMap { QrReader.text(in: $0) }.map { .text($0) } ?? .noCode
+      // A picture that could not be opened is not a picture with no code.
+      let outcome: ScanOutcome
+      if let data = data {
+        outcome = QrReader.text(in: data).map { .text($0) } ?? .noCode
+      } else {
+        outcome = .failed
+      }
       DispatchQueue.main.async { self.finish(outcome) }
     }
   }
