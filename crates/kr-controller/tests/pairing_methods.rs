@@ -291,8 +291,8 @@ async fn the_bootstrap_confirms_the_first_owner_and_the_clock_and_nothing_else()
 /// not; the clock needs its own; and the three actions no method performs yet are answered for
 /// their exact description and nothing else. Enlarging persistent authority is pairing a personal
 /// owner grant, which needs both of its own.
-/// KR-REQ-02.09, the part about the two operations this host serves: issuing an invitation and
-/// confirming a device each fail with `OWNER_CONFIRMATION_REQUIRED` until an owner device has
+/// KR-REQ-02.09, the part about the owner operations: issuing an invitation and
+/// confirming a device, which this host serves, each fail with `OWNER_CONFIRMATION_REQUIRED` until an owner device has
 /// confirmed exactly them, and a confirmation for other rights or for another action does not
 /// stand in. For enlarging a grant, trusting a repository root and granting an executable
 /// capability, which no method performs yet, the owner ledger spends only a confirmation that names
