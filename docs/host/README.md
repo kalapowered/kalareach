@@ -1612,10 +1612,12 @@ that its connector's table names the start and the end of; a program with no tur
 table, such as one whose hooks give no turn boundary, is never reported as at work, because the
 worker does not know that it is. A program that holds the terminal, with none of these, has no state
 of its own, and the shell at its prompt is ready. The program's name is the file name of the command
-the shell integration answered for when it answered for one, and otherwise of the executable the
-foreground process group's leader runs, once two looks in a row have found the same group; a
-program run through an interpreter is named by the interpreter. A session that has closed reports no
-state.
+the shell integration answered for when it answered for exactly one and the foreground process
+group's leader is running it (the image itself, or the script an interpreter was given), and
+otherwise of the executable the leader runs, once two looks in a row have found the same group. A
+wrapper that replaces itself with another program is therefore named for the program, and a program
+run through an interpreter that was given no script to name is named by the interpreter. A session
+that has closed reports no state.
 
 An assertion asks the operating system not to sleep on its own. It does not stop a closed lid, a
 forced sleep or a platform policy that overrides the request, and none of those need to be stopped:
@@ -3405,17 +3407,16 @@ Two contracts `docs/transport/README.md` names, and where they are kept:
 
 ## What the host measures about itself
 
-A host counts three things about its own work and shows them to its owner: how long a paired device
-was without a connection, the faults a session's terminal parser met, and the failures of the
-adapters a session runs. They are local diagnostics. The totals are kept in memory, start again
-from zero when the process that counted them does, appear in `kr doctor` and in a support bundle
-the owner writes, and are sent nowhere.
+A host counts three things about its own work: how long a paired device was without a connection,
+the faults a session's terminal parser met, and the failures of the adapters a session runs. They
+are local diagnostics. The totals are kept in memory and start again from zero when the process
+that counted them does, and no service receives them from this host. `kr doctor` prints them, a
+support bundle carries them, and a paired device that asks the host for its diagnostics is answered
+the way a bundle is written, so it reads them too: counts under labels from the closed lists below,
+which name no person, session, path or program a person ran.
 
-The daemon counts the gaps between a device's connections. The faults and the adapter failures are
-counted by each session's worker, which keeps its totals for the life of its session; the daemon
-reads them from each running worker when `kr doctor` asks and adds them to its own. A worker that
-does not answer in time is left out of that reading, and a session that has closed takes its
-counts with it.
+The daemon counts the gaps between a device's connections. Each session's worker counts the faults
+its terminal's parser met and the failures of the adapters it runs, for the life of its session.
 
 | Metric | Unit | What it counts | Labels |
 | --- | --- | --- | --- |
@@ -3428,9 +3429,10 @@ Every label is one of a closed list, declared once in the protocol crate and wri
 name, a unit or a permitted value cannot change on one side alone. There is no label that carries
 text a caller chose, so no line of terminal output, prompt, key or file name can reach one.
 
-* `transport` is `direct` or `relay`: the path the connection was sending on when the host admitted
-  it, the first path it has where none is selected yet, and `relay` where it has none. The daemon
-  never reports `local`.
+* `transport` is `direct` or `relay`: the path the connection was sending on when the host first
+  read it, which is before the host decides to admit it, the first path it has where none is
+  selected yet, and `relay` where it has none. The daemon never reports `local`. A connection the
+  handshake refuses never reaches this count.
 * `attempt` is `1`, `2-3`, `4-8` or `9+`: the position, among the connections of that device the
   host admitted or refused since its last one ended, of the connection that ended the gap. An
   attempt that never reached the host is not seen and is not counted.
@@ -3440,21 +3442,23 @@ text a caller chose, so no line of terminal output, prompt, key or file name can
   continuous clock every deadline of this host is read on, so time spent suspended counts.
 * `fault` is `unterminated_sequence` (a control sequence or string abandoned before its end),
   `invalid_encoding`, `oversized_frame` (a control string past its bound, or a passthrough envelope
-  nested too deep) or `unknown_control` (a sequence the terminal profile has no class for). The other
-  diagnostics of a session's terminal, such as a query the host answered or a clipboard write it
-  refused, are not parse faults and are not counted here.
+  nested too deep) or `unknown_control` (a sequence the terminal profile has no class for, or that
+  the canonical grid does not implement). The other diagnostics of a session's terminal, such as a
+  cursor movement past the edge that the grid reduced to the edge, a query the host answered or a
+  clipboard write it refused, are well-formed and are not parse faults.
 * `adapter` is one of the agent connectors the product bundles. A package that is not one of them
   is counted under no name. `outcome` is `unavailable` when the adapter's connection could not take
   a frame the host sent, or when the plugin runtime could not run its component, counted once for
-  each step into that state, and `timeout` when the adapter took a request and did not answer it in
-  time.
+  each outage however often the runtime is asked again, and once more when the runtime stops
+  running the component for good; it is `timeout` when the adapter took a request and did not answer
+  it in time, counted at the adapter's deadline whether or not the caller is still waiting.
 * `environment` is `production` for a build that runs from a release in the install store and
   `development` for any other. A host never reports `staging`, which is a deployment of the
   service.
 
-`kr doctor` prints each series as a `metric` line and carries the same in `--json` under `metrics`;
-a support bundle carries the lines as they are, since they are made only of this build's own words
-and numbers.
+`kr doctor` prints each series the daemon holds as a `metric` line and carries the same in `--json`
+under `metrics`; a support bundle carries the lines as they are, since they are made only of this
+build's own words and numbers.
 
 ## Journals and the receipt contract
 
