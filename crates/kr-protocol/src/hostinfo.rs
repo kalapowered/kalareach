@@ -58,6 +58,24 @@ pub struct HostInfoResult {
     // A reader built before `d7f4d2ff1` refuses a member it does not know; none is in use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub privacy: Option<HostPrivacyState>,
+    /// The shell mode this host creates a session in when the request names none, and the rung of
+    /// section 26's order it came from: the per-user host configuration, or the product default.
+    /// Absent from a host of an earlier release, whose commands named a mode themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_shell_mode: Option<DefaultShellMode>,
+}
+
+/// The shell mode a host creates a session in when the request names none.
+///
+/// Read-only metadata, like the answer that carries it. The request rung is the caller's own, so
+/// the source is the host configuration or the product default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("x-kalareach-read-only-metadata" = true))]
+pub struct DefaultShellMode {
+    /// The mode.
+    pub mode: crate::session::ShellMode,
+    /// The rung it came from.
+    pub source: configuration::ValueSource,
 }
 
 /// Where a host's privacy mode stands, as every paired device may read it.
@@ -2066,6 +2084,17 @@ pub mod configuration {
         /// here is the owner's own.
         #[serde(default, skip_serializing_if = "levels::is_unused")]
         pub automation: AutomationSelection,
+        /// The shell mode a session is created in when its request names none.
+        ///
+        /// A section of level 6: written when its `mode` member is not null, and ignored, with a
+        /// count, by a release that reads level 5. A release that does not know it creates a
+        /// session in the mode its own command names, so a host rolled back to one applies this
+        /// choice to nothing until it is brought forward again. Read when a session is created,
+        /// so a change applies to the sessions made afterwards. No profile, request or
+        /// environment variable can set it here: a request names a mode itself, and no profile
+        /// carries one.
+        #[serde(default, skip_serializing_if = "levels::is_unused")]
+        pub shell: ShellSelection,
         /// How this environment's control daemon is started when a command finds none running.
         ///
         /// Read by `kr new` when it finds no daemon to ask, so a change applies at the next start.
@@ -2123,6 +2152,7 @@ pub mod configuration {
                 mailbox: MailboxSelection::default(),
                 relay: RelaySelection::default(),
                 automation: AutomationSelection::default(),
+                shell: ShellSelection::default(),
                 startup: StartupSelection::default(),
                 descriptions: DescriptionsSelection::default(),
                 agents: BTreeMap::new(),
@@ -2745,6 +2775,41 @@ pub mod configuration {
         #[must_use]
         pub fn origin(&self) -> Option<&str> {
             self.origin.as_ref().map(String::as_str)
+        }
+    }
+
+    /// The shell mode this host creates a session in when its request names none.
+    ///
+    /// Section 7 makes the managed shell the default and a stock shell an explicit choice, never an
+    /// automatic fallback. Section 26 orders an ordinary preference as the request, the selected
+    /// profile, the per-user host configuration and the product default; this is the host
+    /// configuration's rung, and no profile carries a shell mode, so that rung is empty until one
+    /// does.
+    ///
+    /// The section arrived with level 6. A release that reads level 5 does not know it: it applies
+    /// the rest of the document, counts the section among the members it ignores, and does not edit
+    /// the document.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct ShellSelection {
+        /// The mode. Null or absent leaves the choice to the product default.
+        pub mode: Nullable<crate::session::ShellMode>,
+    }
+
+    impl Default for ShellSelection {
+        /// Nothing chosen, which is what an absent section reads as.
+        fn default() -> Self {
+            Self {
+                mode: Nullable::null(),
+            }
+        }
+    }
+
+    impl ShellSelection {
+        /// The mode the document chooses, when it chooses one.
+        #[must_use]
+        pub fn mode(&self) -> Option<crate::session::ShellMode> {
+            self.mode.0
         }
     }
 
@@ -3957,6 +4022,9 @@ pub mod configuration {
             /// Whether its integration is on.
             enabled: bool,
         },
+        /// Choose the shell mode a session is created in when its request names none, or clear
+        /// the choice so the product default decides.
+        ShellMode(Option<crate::session::ShellMode>),
         /// Set either or both of the owner's settings for descriptions. A setting left `None` is
         /// left as the document has it.
         Descriptions {
@@ -3980,6 +4048,7 @@ pub mod configuration {
                 Self::ControllerStartup(_) => STARTUP_CONTROLLER.key,
                 Self::CommandIntegration { .. } => COMMAND_INTEGRATIONS.key,
                 Self::Descriptions { .. } => "descriptions",
+                Self::ShellMode(_) => SHELL_MODE.key,
             }
         }
 
@@ -3992,7 +4061,7 @@ pub mod configuration {
                 | Self::GrantRights(_)
                 | Self::Enrolment(_)
                 | Self::Descriptions { .. } => ValueEffect::Immediately,
-                Self::WorkerProfile(_) | Self::CommandIntegration { .. } => {
+                Self::WorkerProfile(_) | Self::CommandIntegration { .. } | Self::ShellMode(_) => {
                     ValueEffect::NewSessionsOnly
                 }
                 Self::ControllerStartup(_) => Selection::EFFECT,
@@ -4186,6 +4255,9 @@ pub mod configuration {
             }
             Change::ControllerStartup(startup) => {
                 document.startup.controller = Nullable(*startup);
+            }
+            Change::ShellMode(mode) => {
+                document.shell.mode = Nullable(*mode);
             }
             Change::Descriptions {
                 enabled,
@@ -4594,6 +4666,20 @@ pub mod configuration {
         about: "the execution context a session is created in",
     };
 
+    /// The shell mode a session is created in.
+    ///
+    /// It resolves through the same ladder as the other preferences, with no profile rung while
+    /// no profile carries a shell mode, and the product default is the managed shell.
+    pub const SHELL_MODE: Preference = Preference {
+        key: "shell.mode",
+        effect: ValueEffect::NewSessionsOnly,
+        about: "the shell mode a session is created in when its request names none",
+    };
+
+    /// The mode a session is created in when nothing chooses one: the managed shell, which section
+    /// 7 makes the default. A stock shell is an explicit choice and never an automatic fallback.
+    pub const DEFAULT_SHELL_MODE: crate::session::ShellMode = crate::session::ShellMode::Managed;
+
     /// The runtime tree this installation uses.
     pub const RUNTIME_DIRECTORY: Preference = Preference {
         key: "runtime_directory",
@@ -4628,9 +4714,10 @@ pub mod configuration {
     /// an allowlisted variable supplies them at the request rung, and the platform default is the
     /// bottom rung. Keeping them in this table is also what makes the allowlist checkable, because
     /// every entry must name a key that appears here.
-    pub const PREFERENCES: [Preference; 6] = [
+    pub const PREFERENCES: [Preference; 7] = [
         SLEEP_INHIBITION,
         WORKER_PROFILE,
+        SHELL_MODE,
         COMMAND_INTEGRATIONS,
         ENVIRONMENT_ADDITIONS,
         RUNTIME_DIRECTORY,
@@ -5764,6 +5851,7 @@ pub mod configuration {
             || crate::desktop::CAPABILITIES.contains(&value)
             || crate::desktop::SleepInhibitionSetting::from_wire(value).is_some()
             || ControllerStartup::from_wire(value).is_some()
+            || crate::session::ShellMode::from_wire(value).is_some()
             || value.parse::<crate::rights::ActionRight>().is_ok()
     }
 
@@ -8387,6 +8475,10 @@ mod tests {
                 generation: U64::new(3),
                 changing: false,
             }),
+            default_shell_mode: Some(DefaultShellMode {
+                mode: crate::session::ShellMode::NativeCompat,
+                source: configuration::ValueSource::HostConfiguration,
+            }),
         }
     }
 
@@ -9926,6 +10018,68 @@ mod tests {
             configuration::edit(&spelled, &off),
             Err(configuration::EditRefused::NotOurs(_))
         ));
+    }
+
+    /// KR-REQ-26.13: the `shell` section holds the owner's default shell mode, a section of level
+    /// 6 that is written only while it chooses one. An edit changes that member and no other, takes
+    /// effect for the sessions made afterwards, and clearing it writes the document without the
+    /// section again, at the level the rest of it needs.
+    #[test]
+    fn the_shell_section_holds_the_owners_default_mode_and_an_edit_changes_only_its_own() {
+        use crate::session::ShellMode;
+        use configuration::ValueEffect;
+
+        let empty = ConfigurationDocument::empty();
+        assert_eq!(empty.shell.mode(), None);
+
+        let stock = Change::ShellMode(Some(ShellMode::NativeCompat));
+        assert_eq!(stock.key(), "shell.mode");
+        assert_eq!(stock.effect(), ValueEffect::NewSessionsOnly);
+        let first = configuration::edit(&configuration::load(None), &stock).expect("an edit");
+        assert_eq!(first.revision, 1);
+        assert_eq!(first.document.shell.mode(), Some(ShellMode::NativeCompat));
+        assert_eq!(first.document.level, 6, "the section is one of level 6");
+        let written: serde_json::Value =
+            serde_json::from_str(&first.contents).expect("the document is JSON");
+        assert_eq!(written["shell"]["mode"], "native_compat", "{written}");
+        let reread = configuration::load(Some(first.contents.as_bytes()));
+        assert_eq!(reread.status.state, DocumentState::Loaded);
+        assert_eq!(reread.document.as_ref(), Some(&first.document));
+
+        // Another setting's edit leaves the section as it was.
+        let power = Change::SleepInhibition(crate::desktop::SleepInhibitionSetting::MainsOnly);
+        let second = configuration::edit(&reread, &power).expect("an edit");
+        assert_eq!(second.document.shell.mode(), Some(ShellMode::NativeCompat));
+        assert_eq!(
+            configuration::owed(reread.document.as_ref(), Some(&second.document)),
+            configuration::Owed::default(),
+            "a default for new sessions fences nothing and invalidates nothing"
+        );
+
+        // Clearing the choice leaves no section behind, and the level falls with it.
+        let cleared = configuration::edit(
+            &configuration::load(Some(second.contents.as_bytes())),
+            &Change::ShellMode(None),
+        )
+        .expect("an edit");
+        assert_eq!(cleared.document.shell.mode(), None);
+        assert_eq!(cleared.document.level, 1, "nothing of level 6 is held");
+        let written: serde_json::Value =
+            serde_json::from_str(&cleared.contents).expect("the document is JSON");
+        assert!(written.get("shell").is_none(), "{written}");
+
+        // A mode this build does not have, and a member the section does not declare, are
+        // documents it does not rewrite.
+        for text in [
+            r#"{"version": 3, "level": 6, "shell": {"mode": "automatic"}}"#,
+            r#"{"version": 3, "level": 6, "shell": {"mode": "managed", "fallback": true}}"#,
+        ] {
+            assert_eq!(
+                configuration::load(Some(text.as_bytes())).status.state,
+                DocumentState::Invalid,
+                "{text}"
+            );
+        }
     }
 
     /// KR-REQ-25.14: the document's `automation` section is the one place a command a workflow

@@ -241,6 +241,33 @@ impl Resolver {
         self.loaded.description_settings()
     }
 
+    /// Resolves the shell mode a session is created in.
+    ///
+    /// The request, then the per-user host configuration, then the product default, which is the
+    /// managed shell. The profile rung is empty: no profile carries a shell mode, so a profile
+    /// the request names contributes nothing here, which is the ladder's own rule for a profile
+    /// that does not choose.
+    #[must_use]
+    pub fn shell_mode(
+        &self,
+        requested: Option<kr_protocol::session::ShellMode>,
+    ) -> Effective<kr_protocol::session::ShellMode> {
+        configuration::resolve(
+            configuration::SHELL_MODE,
+            Layers {
+                request: requested.map(Offered::plain),
+                profile: None,
+                host: self
+                    .loaded
+                    .document
+                    .as_ref()
+                    .and_then(|document| document.shell.mode())
+                    .map(|mode| Offered::from(mode, self.document.display().to_string())),
+                default: configuration::DEFAULT_SHELL_MODE,
+            },
+        )
+    }
+
     /// Returns the execution context this configuration chooses, when it chooses one.
     ///
     /// The three rungs above the product default, without it: a caller that has to establish the

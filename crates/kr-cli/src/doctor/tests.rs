@@ -567,6 +567,8 @@ fn host_info(build: &str) -> kr_protocol::hostinfo::HostInfoResult {
         },
         machine: None,
         privacy: None,
+        // A host of an earlier release names none, so the reply is one such a host would give.
+        default_shell_mode: None,
     }
 }
 

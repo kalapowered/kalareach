@@ -169,6 +169,16 @@ impl ShellMode {
         }
     }
 
+    /// Returns the mode a stable wire string names.
+    #[must_use]
+    pub fn from_wire(text: &str) -> Option<Self> {
+        match text {
+            "managed" => Some(Self::Managed),
+            "native_compat" => Some(Self::NativeCompat),
+            _ => None,
+        }
+    }
+
     /// Returns true when the mode claims the managed empty-prompt Ctrl-D and fenced launch.
     #[must_use]
     pub const fn claims_managed_editor(self) -> bool {

@@ -543,6 +543,7 @@ mod tests {
                 ),
                 machine: None,
                 privacy: None,
+                default_shell_mode: None,
             })
             .expect("a payload"),
         )
