@@ -507,6 +507,8 @@ impl Standalone {
         self.kr(&[
             "--json",
             "new",
+            "--shell-mode",
+            "native_compat",
             "--invisible",
             "--headless",
             "--cwd",
@@ -1825,6 +1827,58 @@ fn a_session_made_with_no_shell_mode_takes_the_hosts_default_in_the_order_sectio
     host.close(&created);
 }
 
+/// KR-REQ-26.13: `kr host shell-mode` shows, chooses and clears the mode a session is created in
+/// when none is named, each choice one validated revision of the host's own configuration
+/// document, and what is in force is the host's answer with the rung it came from.
+#[test]
+fn kr_host_shell_mode_chooses_and_clears_the_default_for_new_sessions() {
+    let host = Standalone::create();
+    host.select_standalone();
+    let shell_mode = |arguments: &[&str]| {
+        let mut command = vec!["--json", "host", "shell-mode"];
+        command.extend_from_slice(arguments);
+        let output = start(host.kr(&command)).finish("kr host shell-mode");
+        let shown = document(&output, "kr host shell-mode");
+        assert!(output.status.success(), "{shown}");
+        shown["shell_mode"].clone()
+    };
+
+    let shown = shell_mode(&[]);
+    assert_eq!(shown["mode"], "managed", "{shown}");
+    assert_eq!(shown["source"], "default", "{shown}");
+
+    let chosen = shell_mode(&["--set", "native_compat"]);
+    assert_eq!(chosen["mode"], "native_compat", "{chosen}");
+    assert_eq!(chosen["source"], "host_configuration", "{chosen}");
+    let written: Value =
+        serde_json::from_slice(&std::fs::read(host.document()).expect("the document was written"))
+            .expect("the document is JSON");
+    assert_eq!(written["shell"]["mode"], "native_compat", "{written}");
+    assert_eq!(written["level"], 6, "{written}");
+    assert_eq!(
+        written["startup"]["controller"], "standalone",
+        "an edit of the section leaves the others as they were: {written}"
+    );
+    let row = host.doctor_row("shell.mode");
+    assert_eq!(row["value"], "native_compat", "{row}");
+    assert_eq!(row["source"], "host_configuration", "{row}");
+
+    let cleared = shell_mode(&["--clear"]);
+    assert_eq!(cleared["mode"], "managed", "{cleared}");
+    assert_eq!(cleared["source"], "default", "{cleared}");
+    let written: Value =
+        serde_json::from_slice(&std::fs::read(host.document()).expect("the document is there"))
+            .expect("the document is JSON");
+    assert!(written.get("shell").is_none(), "{written}");
+
+    // A mode that is neither is refused and writes nothing.
+    let output = start(host.kr(&["--json", "host", "shell-mode", "--set", "automatic"]))
+        .finish("kr host shell-mode");
+    let refused = document(&output, "kr host shell-mode");
+    assert!(!output.status.success(), "{refused}");
+    assert_eq!(refused["code"], "INVALID_ARGUMENT", "{refused}");
+}
+
 /// KR-REQ-08.02: `kr status` reports each terminal attachment's presentation and the reason for it.
 ///
 /// Two terminals attach to a session the started daemon holds: one at the session's own size that
@@ -2436,6 +2490,8 @@ impl ServiceHost {
         self.kr(&[
             "--json",
             "new",
+            "--shell-mode",
+            "native_compat",
             "--invisible",
             "--headless",
             "--cwd",
@@ -3740,6 +3796,8 @@ impl Inside {
         let output = start(host.kr(&[
             "--json",
             "new",
+            "--shell-mode",
+            "native_compat",
             "--invisible",
             "--headless",
             "--cwd",
@@ -4335,6 +4393,8 @@ fn a_daemon_started_outside_a_service_asks_for_no_scope() {
         &[
             "--json",
             "new",
+            "--shell-mode",
+            "native_compat",
             "--invisible",
             "--headless",
             "--cwd",
