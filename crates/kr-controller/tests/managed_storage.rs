@@ -5756,3 +5756,111 @@ async fn a_setup_whose_answer_was_lost_is_found_by_the_next_try_which_sends_noth
     assert_eq!(found.archive_id, row.record.archive_id);
     assert_eq!(web.bundle_write(&computer.context.bundle_locator), written);
 }
+
+/// KR-REQ-20.18: an archive the host made exports as one file of ciphertext that this computer
+/// writes after reading the service with its account, and a host that holds nothing but the kit and
+/// that file restores the session the host backed up, byte for byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_archive_the_host_made_exports_as_a_file_that_the_kit_alone_restores() {
+    use kr_client::recovery::{
+        AccountSource, CandidateState, ExportSource, FilesRestore, HostCover, MemberRole,
+        OfflineExport, cover_host_archive,
+    };
+
+    let timer = HeldTimer::held();
+    let (rig, session) = a_host_to_set_up(&timer).await;
+    let mut computer = Computer::with_recovery_on(&rig).await;
+    let host = the_host_as_the_application_reaches_it(&rig).await;
+    let HostCover::Covered(covered) = cover_host_archive(
+        &host,
+        &mut computer.bundles,
+        &computer.seed,
+        false,
+        kr_ipc::now_ms(),
+    )
+    .await
+    .expect("the host is covered") else {
+        panic!("the host was left");
+    };
+    rig.until("the host's first generation is published", |rig| {
+        rig.published_of(covered.archive_id) > 0
+    })
+    .await;
+
+    // This computer reads the service with its account, lists what the bundle names, and exports.
+    let origin = GatewayOrigin::new(rig.served.origin()).expect("the service's origin");
+    let http = HttpService::with(
+        origin.clone(),
+        kr_client::services::HttpDeadlines::default(),
+        managed_response_limits(),
+    )
+    .expect("a transport");
+    let source = Arc::new(AccountSource::new(
+        origin,
+        Arc::new(http),
+        Arc::new(Owner {
+            key: AuthorisationKeyPair::generate().expect("a key"),
+        }),
+        Arc::new(Bearer(TOKEN.to_owned())),
+    ));
+    let kit = computer
+        .seed
+        .to_kit(vec![rig.origin()], computer.context.bundle_locator.clone());
+    let listed = FilesRestore::archives(kit.clone(), Arc::clone(&source) as _)
+        .await
+        .expect("the archives are listed");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].archive_id, covered.archive_id);
+    assert!(matches!(
+        &listed[0].newest,
+        CandidateState::Newest(newest) if newest.generation.get() == 1
+    ));
+    let export = FilesRestore::prepare(
+        kit.clone(),
+        Arc::clone(&source) as _,
+        Some(covered.archive_id),
+        None,
+    )
+    .await
+    .expect("a plan")
+    .export()
+    .await
+    .expect("an export");
+    let file = export.to_canonical_bytes().expect("canonical bytes");
+    assert!(
+        !file
+            .windows(b"a line".len())
+            .any(|window| window == b"a line"),
+        "the file holds ciphertext and nothing in the clear"
+    );
+
+    // With the file and the kit alone: the session the host backed up, byte for byte.
+    let from_file = FilesRestore::prepare(
+        kit,
+        Arc::new(ExportSource::new(
+            OfflineExport::from_canonical_slice(&file).expect("the file reads back"),
+        )),
+        None,
+        None,
+    )
+    .await
+    .expect("a restore from the file");
+    let planned: Vec<_> = from_file.plan().restored().collect();
+    let (member, _, _) = planned
+        .iter()
+        .find(|(_, _, role)| *role == MemberRole::Session)
+        .expect("the session is in the plan");
+    let exported = from_file
+        .member(member.object_id)
+        .await
+        .expect("the member opens");
+    let document: serde_json::Value =
+        serde_json::from_slice(exported.expose()).expect("a session export");
+    assert_eq!(document["format"], "kalareach-session-export/1");
+    assert!(
+        document["output"]["chunks"]
+            .as_array()
+            .is_some_and(|chunks| !chunks.is_empty()),
+        "{session}: the output came back"
+    );
+}
