@@ -383,10 +383,19 @@ scanner is a full-screen camera view (CameraX on Android, `AVCaptureSession` on 
 is the system's own. Both decode with the platform's detector, Vision on iOS and ZXing on Android,
 and the text of a code goes from the platform's half to Rust and no further. Printing a reading
 shows its kind and never its text. The Android scanner's window is secure, so a screenshot does not
-show what the camera sees. The page is told that an invitation was found, never what it says.
+show what the camera sees. iOS has no way to keep a screenshot from being taken, and says so only
+afterwards, so the iOS scanner hides its preview when the application leaves the active state and
+while the screen is recorded or shared, and cannot stop a screenshot; a direct invitation does not
+pair a device by itself, since the host's owner approves it against the value both screens show.
+The page is told that an invitation was found, never what it says.
 
 One intake runs at a time, and a new one ends the one before it. An invitation a phone read is
-dropped when the application stops being in front, and so is a picture still being read. The
+dropped when the application goes to the background (on Android, when it pauses), and so is a
+picture still being read; a code the scanner or the picker decoded is handed over only by an
+application that has been in front since it began, so one that left while the scanner was closing
+gives the code to nobody. Taking the application out of the active state for the Control Center,
+the Notification Center or a question the system asks, such as the one about pasting, drops
+nothing. A scanner or a picker the system does not show within ten seconds ends the request. The
 camera's failures have words of their own: the camera is not allowed, with a button that opens only
 this application's page in the system's settings, the picture shows no code, and the camera or the
 picture could not be opened. A phone keeps its screen on while the value to compare with the host's
