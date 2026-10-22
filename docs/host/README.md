@@ -4806,7 +4806,7 @@ is an environment SQLite store in the environment's state directory that commits
 and budget reservations transactionally before execution dispatches, and that keeps a budget
 across a restart and a reboot.
 
-The five methods of the automation group arrive through the daemon's ordinary path, and the grant
+The six methods of the automation group arrive through the daemon's ordinary path, and the grant
 each definition names is read from the daemon's own grant store rather than from the request. The
 four mutations are actions: each one's effect and the record of what it came to commit in one
 transaction of the workflow journal, and the admission the daemon accepted the mutation under is
@@ -4843,7 +4843,7 @@ number admission enforces as a ceiling on the sessions it creates. Breaching a c
 the chain with error code `CAUSAL_LIMIT`, rejects further descendants, and commits one attention
 record in the same transaction as the pause.
 
-`docs/automation/` has the five methods, graph validation, the budget model, and the evidence a test run leaves.
+`docs/automation/` has the six methods, graph validation, the budget model, and the evidence a test run leaves.
 
 ## The host time contract
 
