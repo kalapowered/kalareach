@@ -536,12 +536,14 @@ counted. The two sources have no order between them, and each keeps the order it
 Whatever a ready component does not get is a numbered loss: an entry the lane pushed out or
 refused, one the pump passed over, one the host's queue refused. What was pushed before a binding
 became ready, or while the worker had no connection to the runtime, predates the binding's view and
-is not a loss. The lane hands the pump nothing while it holds a loss the pump has not applied, and
-the pump offers a binding nothing while it owes the binding a snapshot, so a component is asked for
-a fresh snapshot before anything later is handed to it. The snapshot waits until the client has
-written what it already held, for up to a second; if the client has not, the binding is passed over
-and asked again soon. A loss that arrives while a snapshot runs has a number of its own and asks for
-another. A snapshot the component answers or declines discharges its number. One that does not
+is not a loss. The pump offers a binding nothing while it owes the binding a snapshot, so a
+component is asked for
+a fresh snapshot before anything later is handed to it. The snapshot waits, for up to a second,
+until the client's queue of events is empty; if it is not, the binding is passed over and asked
+again after a wait that grows. The lane gives the pump what it lost together with the entry it
+hands over, and what it lost is older than that entry, so the pump applies the loss, takes the
+snapshot and then offers the entry. A loss that arrives while a snapshot runs has a number of its
+own and asks for another. A snapshot the component answers or declines discharges its number. One that does not
 reach the component is asked for again after a wait that doubles from one second to thirty.
 
 The link keeps three more things. When a component has been offered something since its state was
@@ -565,11 +567,14 @@ the link treats the same way.
 A component's report carries how it was registered (compiled, with the time it took, or loaded from
 the compiled-code cache), what it last missed, and its last fault, in the words the runtime gave.
 
-Privacy mode does not stop observation for live use. While it is on, the worker takes and holds no
-component state, and the runtime's words in a fault are withheld from the report. Turning it on drops
-the state held. A component that was offered anything the worker had while privacy mode was on,
-including something that waited in the lane and was offered after it ended, is not asked for its
-state again until it starts again, since what it holds may be what it was offered. The documents a
+Privacy mode does not stop observation for live use. While it is on, the worker asks for no
+component state, and it holds none that was asked for before privacy mode was turned on or off. The
+runtime's words in a fault, and in the reason a component is disabled for, are withheld from the
+report while it is on and for a fault the link read after it changed. Turning it on drops the state
+held. A component that was handed anything the worker had while privacy mode was on, including
+something that waited in the lane and was handed over after it ended, or whose hand-over was not
+answered, is marked before the hand-over and is not asked for its state again until it starts again,
+since what it holds may be what it was handed. The documents a
 component draws are read and dropped by the worker, in privacy mode as at any other time.
 
 ## Where the broker fits
