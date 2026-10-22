@@ -2332,6 +2332,7 @@ conversation view, which is semantic and cannot claim, never competes for it.
 | An attachment reports its viewport | nothing; it decides only how that attachment is shown the session |
 | The owner resizes at the current epoch | moves the pseudo-terminal and the canonical grid together |
 | The owner detaches or withdraws its claim | the oldest remaining eligible claim succeeds and supplies its own dimensions |
+| A revision withdraws the grant a claim was made under, or the whole host's authority | the claim is withdrawn as above, the claims of other callers first and the owner's last, so the session is resized once; the caller claims again when it may, since a withdrawn claim does not come back by itself |
 | No eligible claim remains | the last geometry is retained, and the next eligible claimant takes it |
 | `terminal.geometry.transfer` at the expected epoch | moves it deliberately, and every attachment learns at once |
 | An input takeover | nothing |
@@ -5689,20 +5690,21 @@ those connections only: a read the daemon answers itself counts, and a connectio
 link to the worker counts. The device's other connections, other devices and the owner's own
 connections keep their registration and their links. The revocation will advance the host's
 authority revision. That refuses the actions each worker admitted and did not dispatch, and it takes
-the input lease of the callers acting under a grant the revocation withdrew, or from a device it
-named. A device that was typing under a grant the revocation did not touch keeps its lease and goes
-on typing at the epoch it holds, though a batch it had in flight when the revision advanced is
-refused and sent again. The host tells each worker whose authority the revisions after the one that
-worker last acknowledged withdrew. It names the grants that carry `terminal.input`, and the devices
-a revision withdrew. A share cannot hold more grants than one notice carries (4,096), so the
-revocation of a share, and of everything delegated from it, is named in full: it ends the input
-lease of the callers under those grants and of no other. The host keeps this for the last 256
+the input lease and the claim on the session's size of the callers acting under a grant the
+revocation withdrew, or from a device it named. A device that was typing under a grant the
+revocation did not touch keeps its lease and goes on typing at the epoch it holds, though a batch
+it had in flight when the revision advanced is refused and sent again. The host tells each worker
+whose authority the revisions after the one that worker last acknowledged withdrew. It names the
+grants that carry `terminal.input` or `terminal.geometry`, and the devices a revision withdrew.
+A share cannot hold more grants than one notice carries (4,096), so the revocation of a share, and
+of everything delegated from it, is named in full: it ends the input lease and the size claim of
+the callers under those grants and of no other. The host keeps this for the last 256
 revisions. A barrier takes together only the withdrawals that fit one notice, and the rest wait for
 a barrier of their own. A worker that was refused an announcement because it was inside a dispatch
 transition keeps what it was refused. It joins that to the next announcement it accepts, a repeat of
 the newest revision it was refused included, or fences it on its own at the next maintenance pass,
-whichever comes first, up to 65,536 names. The worker takes the input lease of every caller acting
-under a grant when the host cannot say whose authority was withdrawn: when a revision reached the
+whichever comes first, up to 65,536 names. The worker takes the input lease and the size claim of
+every caller acting under a grant when the host cannot say whose authority was withdrawn: when a revision reached the
 whole host (revoking a device, or changing the rights ceiling), when the host restarted since the
 revision, when the worker last acknowledged a revision more than 256 back or missed one the notice
 does not describe, or when a share from before the limit held more grants than one notice carries.
@@ -6155,6 +6157,20 @@ notice again. Setting a clock back will not make any numbers be lower than any p
   The floors live in the same store as the grants they protect, so restoring that store wholesale
   takes them back with it. That is a recovery event rather than a policy document, and the remedy is
   the remote feed, whose revisions this host accepts but never issues on another host's behalf.
+
+  The registry's policy row, which holds the floors, the enrolments, the exclusive-management flag,
+  the offline bound and the lease records, carries a sequence beside it that every write of the row
+  raises in the same transaction. After each write the host copies the policy and the sequence to
+  `policy-mirror.cbor` beside the registry, in a store of its own that an earlier release does not
+  read. At a start the host reads both, and when the registry's sequence is below the copy's, the
+  registry was put back to an earlier state: the copy is the policy, and the older row revives
+  nothing, an enrolment that was withdrawn included. The copy is written after the row has
+  committed, so a stop between the two leaves the row the newer, and it is kept. A copy that fails
+  to write is reported once and does not stop a change. The protection has three limits: a registry
+  and a copy put back together are one earlier state; a copy that cannot be read protects nothing
+  until the next write replaces it; and an earlier release writes the row without raising the
+  sequence, so a registry put back and then written by that release has what it wrote replaced by
+  the copy's policy when this build starts again.
 
 ### The shared history filter
 
@@ -7148,9 +7164,11 @@ with `session.view`; once the approval has ended, the bound decides, as for any 
 caller under a grant whose scope did not come with its read is refused as
 `UNSUPPORTED_CAPABILITY`, with that reason and nothing of the record. The worker refuses an answer
 larger than the control frame declared on the connection it answers, with both sizes, rather than
-send it. A paired device's read reaches the worker over the daemon's own link, so for a device that
-check is against the frame of that link, not against a smaller one the device negotiated on its own
-connection.
+send it. A paired device's read reaches the worker over a link the daemon opens for that device,
+and the link declares the frame the device negotiated on its own connection, so the check is against
+the smaller of the two. The reads of a question, of the agent's capabilities and of its commands are
+measured this way, besides those that already were; a mutation's first answer and the retained
+result of a duplicate are not measured against a device's frame.
 
 The five agent mutations each carry the binding revision they were prepared against. A revision
 behind the one in force is `STALE_SESSION`; a draft that moved is `DRAFT_CONFLICT`. A steer or a
