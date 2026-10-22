@@ -497,10 +497,13 @@ when it reads it, takes the queue in batches of sixteen and may answer a snapsho
 two batches, so the snapshot is the view of what the component held when it ran, and each
 observation after it draws the view again. The lane gives the pump what it lost together with the
 entry it hands over, and what it lost is older than that entry, so the pump applies the loss, takes
-the snapshot and then offers the entry. A loss that arrives while a snapshot runs has a number of
-its own and asks for another. A snapshot the component answers or declines discharges its number.
-One that does not reach the component is asked for again after a wait that doubles from one second
-to thirty.
+the snapshot and then offers the entry. The lane loses ordinary entries before it loses a request
+the upstream is waiting on, and refuses an entry larger than itself whatever waits, so something
+lost after a request was pushed is newer than the request: each loss goes with the first entry newer
+than it, or waits for one, and the request is offered before that loss is applied. A loss that
+arrives while a snapshot runs has a number of its own and asks for another. A snapshot the component
+answers or declines discharges its number. One that does not reach the component is asked for again
+after a wait that doubles from one second to thirty.
 
 The link keeps three more things. When a component has been offered something since its state was
 last asked for and has then been left alone for two seconds, or its last request is a minute old or
