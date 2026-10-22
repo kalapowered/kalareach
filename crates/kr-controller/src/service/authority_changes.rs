@@ -252,11 +252,7 @@ impl Controller {
                 continue;
             }
             if let Some(now) = live.workers.iter().find(|now| {
-                now.session_id == worker.session_id
-                    && now.state.holds()
-                    && now.names_pending.get() < worker.names_pending.get()
-                    && now.rejected_actions_total.get() >= worker.rejected_actions_total.get()
-                    && now.possibly_executed_total.get() >= worker.possibly_executed_total.get()
+                now.session_id == worker.session_id && carries_what_was_given(now, worker)
             }) {
                 *worker = now.clone();
             }
@@ -3081,6 +3077,31 @@ fn open_number(
         .map(|reservation| reservation.display_number))
 }
 
+/// Whether the daemon's entry for a worker now can stand in for the one an answer was given with:
+/// the barrier holds for it, fewer names are still to come, and every name the answer gave is in
+/// it, with no more gone than there were.
+///
+/// The totals alone do not say it. The result of a revision also reads the reports of the revisions
+/// its announcement carried, and when one of those goes the names it gave go from the entry while
+/// the entry's own totals go on rising as its pages arrive.
+fn carries_what_was_given(
+    now: &kr_protocol::action::WorkerBarrier,
+    given: &kr_protocol::action::WorkerBarrier,
+) -> bool {
+    now.state.holds()
+        && now.names_pending.get() < given.names_pending.get()
+        && now.omitted_actions.get() <= given.omitted_actions.get()
+        && given
+            .rejected_actions
+            .iter()
+            .all(|name| now.rejected_actions.contains(name))
+        && given.possibly_executed.iter().all(|name| {
+            now.possibly_executed
+                .iter()
+                .any(|held| held.action_id == name.action_id && held.actor_id == name.actor_id)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -3107,6 +3128,7 @@ mod tests {
     use crate::authority::AdmittedMutation;
     use crate::service::Controller;
     use crate::service::admission::AdmittedConnection;
+    use crate::service::authority_changes::carries_what_was_given;
     use crate::service::net::devices::DeviceRecord;
     use crate::service::net::tests::{daemon_on, manual_clocks};
 
@@ -3441,5 +3463,54 @@ mod tests {
             .await
             .expect("a standing admission registers");
         assert_eq!(host.revisions(), (2, None));
+    }
+
+    /// KR-REQ-09.13: the daemon's entry for a worker replaces the one an answer was given with only
+    /// when it carries every name that answer gave. An entry whose totals are as high but from
+    /// which a carried report's names have gone, as the report of an earlier revision does when
+    /// the daemon lets it go, is not the same answer with more of it.
+    #[test]
+    fn a_live_entry_stands_in_for_the_given_one_only_when_it_carries_its_names() {
+        use kr_protocol::action::{BarrierState, FencedAction, WorkerBarrier};
+        use kr_protocol::ids::{ActorId, SessionId};
+        use kr_protocol::scalars::U64;
+
+        let phone = ActorId::new("device:phone").expect("an actor");
+        let named = |byte: u8| FencedAction {
+            actor_id: phone.clone(),
+            action_id: ActionId::new(uuid(byte)),
+        };
+        let entry = |names: &[u8], total: u64, pending: u64, omitted: u64| WorkerBarrier {
+            session_id: SessionId::new(uuid(1)),
+            state: BarrierState::Acknowledged,
+            acknowledged_revision: Nullable::some(AuthorityRevision::new(5)),
+            rejected_actions: names.iter().map(|byte| named(*byte)).collect(),
+            rejected_actions_total: U64::new(total),
+            possibly_executed: Vec::new(),
+            possibly_executed_total: U64::new(0),
+            omitted_actions: U64::new(omitted),
+            names_pending: U64::new(pending),
+            detail: String::new(),
+        };
+        // The answer named three actions, two of its own report and one of an earlier revision's,
+        // and left four to come.
+        let given = entry(&[10, 11, 12], 3, 4, 0);
+
+        assert!(
+            carries_what_was_given(&entry(&[10, 11, 12, 13, 14, 15, 16], 7, 0, 0), &given),
+            "everything it gave, and the rest"
+        );
+        assert!(
+            !carries_what_was_given(&entry(&[10, 11, 13, 14, 15, 16, 17], 7, 0, 0), &given),
+            "the totals are higher and one name it gave is gone"
+        );
+        assert!(
+            !carries_what_was_given(&entry(&[10, 11, 12, 13], 4, 0, 1), &given),
+            "more names went than the answer said had gone"
+        );
+        assert!(
+            !carries_what_was_given(&entry(&[10, 11, 12], 3, 4, 0), &given),
+            "no fewer names to come"
+        );
     }
 }
