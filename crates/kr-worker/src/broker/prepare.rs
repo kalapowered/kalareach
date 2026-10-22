@@ -625,39 +625,9 @@ impl Broker {
         // it was handed, and a component handed anything in privacy mode, or on a connection it
         // stood on, has its words withheld from what a person is told.
         let withheld = self.observation.words_withheld();
-        let called = called.map_err(|error| match error {
-            // What a person has to change: a component the runtime has disabled for the
-            // binding's life.
-            ServiceError::Disabled { .. } if withheld => BrokerError::UnsupportedCapability {
-                detail: "the component is disabled; the runtime's words are withheld for privacy \
-                         mode"
-                    .to_owned(),
-            },
-            ServiceError::Disabled { reason } => BrokerError::UnsupportedCapability {
-                detail: format!("the component is disabled: {reason}"),
-            },
-            // What the runtime refused, in words the component can have chosen.
-            ServiceError::Protocol { .. } if withheld => BrokerError::ResourceUnavailable {
-                detail: "the plugin runtime refused to ask the component to prepare the action; \
-                         its words are withheld for privacy mode"
-                    .to_owned(),
-            },
-            // What did not answer this time: a runtime that is gone or slow, and a component that
-            // used its whole allowance. Asking again can succeed.
-            other => BrokerError::ResourceUnavailable {
-                detail: format!("the component could not be asked to prepare the action: {other}"),
-            },
-        })?;
+        let called = called.map_err(|error| not_asked(error, withheld))?;
         if let Some(fault) = called.fault {
-            let fault = if withheld {
-                "its words are withheld for privacy mode".to_owned()
-            } else {
-                fault
-            };
-            return Err(BrokerError::InvalidArgument(format!(
-                "{}'s component declined to prepare it: {fault}",
-                request.params.action
-            )));
+            return Err(declined(&request.params.action, fault, withheld));
         }
         let plan = called.plan.ok_or_else(|| {
             BrokerError::InvalidArgument(format!(
@@ -667,6 +637,47 @@ impl Broker {
         })?;
         effect_of(&plan, request)
     }
+}
+
+/// What a person is told when the runtime could not be asked to prepare an action.
+///
+/// The runtime's words, and the reason it disabled a component for, are made of what the component
+/// was handed. Once privacy mode has stood on the connection (`withheld`) they are not repeated.
+fn not_asked(error: ServiceError, withheld: bool) -> BrokerError {
+    match error {
+        // What a person has to change: a component the runtime has disabled for the binding's life.
+        ServiceError::Disabled { .. } if withheld => BrokerError::UnsupportedCapability {
+            detail: "the component is disabled; the runtime's words are withheld for privacy mode"
+                .to_owned(),
+        },
+        ServiceError::Disabled { reason } => BrokerError::UnsupportedCapability {
+            detail: format!("the component is disabled: {reason}"),
+        },
+        // What the runtime refused, in words the component can have chosen.
+        ServiceError::Protocol { .. } if withheld => BrokerError::ResourceUnavailable {
+            detail: "the plugin runtime refused to ask the component to prepare the action; its \
+                     words are withheld for privacy mode"
+                .to_owned(),
+        },
+        // What did not answer this time: a runtime that is gone or slow, and a component that used
+        // its whole allowance. Asking again can succeed.
+        other => BrokerError::ResourceUnavailable {
+            detail: format!("the component could not be asked to prepare the action: {other}"),
+        },
+    }
+}
+
+/// What a person is told when the component declined to prepare an action: its fault, unless the
+/// words are withheld.
+fn declined(action: &impl std::fmt::Display, fault: String, withheld: bool) -> BrokerError {
+    let fault = if withheld {
+        "its words are withheld for privacy mode".to_owned()
+    } else {
+        fault
+    };
+    BrokerError::InvalidArgument(format!(
+        "{action}'s component declined to prepare it: {fault}"
+    ))
 }
 
 /// Reads an invocation's arguments, as the declaration says each one is.
@@ -987,6 +998,41 @@ const fn class_of(operation: PreparedOperation) -> DeclaredClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KR-REQ-24.27: what the runtime says when it will not ask a component to prepare an action,
+    /// and what the component says when it declines, are made of what the component was handed,
+    /// so once privacy mode has stood on the connection a person is told neither. The words are
+    /// told when it has not. The window in which the runtime has disabled a component and the
+    /// worker has not yet heard of it cannot be held open by a running worker, so the mapping is
+    /// decided here.
+    #[test]
+    fn kr_req_24_27_the_words_a_refusal_or_a_decline_carries_are_withheld_once_privacy_mode_has_stood()
+     {
+        let words = "an account number the component was handed";
+        let told = |error: BrokerError| match error {
+            BrokerError::UnsupportedCapability { detail }
+            | BrokerError::ResourceUnavailable { detail }
+            | BrokerError::InvalidArgument(detail) => detail,
+            other => panic!("unexpected {other:?}"),
+        };
+        for error in [
+            ServiceError::Disabled {
+                reason: words.to_owned(),
+            },
+            ServiceError::Protocol {
+                detail: words.to_owned(),
+            },
+        ] {
+            assert!(told(not_asked(error.clone(), false)).contains(words));
+            let withheld = told(not_asked(error, true));
+            assert!(!withheld.contains(words), "{withheld}");
+            assert!(withheld.contains("withheld"), "{withheld}");
+        }
+        assert!(told(declined(&"cancel", words.to_owned(), false)).contains(words));
+        let withheld = told(declined(&"cancel", words.to_owned(), true));
+        assert!(!withheld.contains(words), "{withheld}");
+        assert!(withheld.contains("withheld"), "{withheld}");
+    }
     use kr_protocol::ids::{DraftId, DraftRevision, EnvironmentId, GrantId};
     use kr_protocol::insertion::{BindingFacts, InsertionClaim};
     use kr_protocol::scalars::{TimestampMs, Uuid};
