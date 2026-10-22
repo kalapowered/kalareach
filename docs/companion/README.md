@@ -105,8 +105,10 @@ nothing. Attaching, detaching, closing, file transfer, agents and the terminal w
 creation sheet shows the two side by side before anything exists, and a stock shell is labelled in
 the session list, the session's header and settings, and the phone's list. A managed shell the host
 cannot qualify is refused with the host's reason; a stock shell is created only when the person
-chooses one. The creation sends none of this device's environment: the host decides what the
-session starts with.
+chooses one. The sheet starts on the shell the host says it creates when nothing names one, which is
+the mode in the host's configuration and otherwise the managed shell, and it says which of the two
+that is; a choice made in the sheet is for that session only. The creation sends none of this
+device's environment: the host decides what the session starts with.
 
 Each row in the session list will display the name that has been provided by the host. Until the host provides a name, the session directory name will be displayed instead. A title the host made from the session's metadata will be shown with no label. If the session has been pinned with a name, the name will be displayed next to “Pinned”. If the local model has written a title for the session, it will be displayed next to “Generated”, with the line the model wrote about what the session is doing below it. If that line is out of date, or there is a newer line waiting, a line will be included saying so. For each session listing displayed on screen, and a buffer above and below, the host will be asked for this information, and again every thirty seconds while the list is shown. If the user is searching, all session listings will be asked, so that the search can be run against the titles. If a read fails, the row stays as it was.
 
