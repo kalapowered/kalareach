@@ -79,6 +79,12 @@ async fn still_waiting(
 /// revoked through the barrier and the grant it was delegated from is not, a connection acting
 /// under the grant that was given up is ended promptly, and a repeat of the action is answered as
 /// it was, spending nothing.
+/// KR-REQ-02.09, the part about a rights-enlarging owner operation: a transfer, which gives another
+/// device what the giving one held, is performed only on an owner device's answer to its exact
+/// plan.
+/// KR-REQ-23.47, the part about the confirmation's digest: the answer is bound to this action, an
+/// answer given under another action is not spent by it, and the answer for this one is spent by
+/// the transfer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_18_03_a_transfer_hands_a_session_to_another_device_on_the_owners_confirmation() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -260,6 +266,10 @@ async fn kr_req_18_03_a_transfer_hands_a_session_to_another_device_on_the_owners
 /// socket: the peer's credentials are no confirmation. A paired device, an owner device included,
 /// asks neither for the confirmation nor for the transfer. After each the giving device still holds
 /// the session.
+/// KR-REQ-02.09, the part about a rights-enlarging owner operation: nothing is handed over without
+/// the owner's confirmation, whoever asks.
+/// KR-REQ-23.47, the part about the confirmation's digest: an answer for another destination is a
+/// different digest, is not spent by this transfer and stays waiting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_18_03_a_transfer_the_owner_did_not_confirm_hands_nothing_over() {
     let owner = DeviceKeys::generate().expect("owner keys");
