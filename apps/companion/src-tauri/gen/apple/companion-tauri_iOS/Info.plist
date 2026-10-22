@@ -30,6 +30,8 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>Scan a pairing code, or take a photo to attach it to a session on one of your hosts.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Confirm that it is you before a host you own does something that needs your say-so.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Reach a host on your local network, to pair with it and to use it.</string>
 	<key>NSMicrophoneUsageDescription</key>

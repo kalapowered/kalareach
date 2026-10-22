@@ -31,6 +31,7 @@ import {
   type AttentionFilter,
   type AttentionRow
 } from '../../model/attention'
+import { Confirmations } from '../../pairing/Confirmations'
 import { ApprovalRequests } from '../../views/Approvals'
 import { KeptAnswers, QuestionRequests } from '../../views/Questions'
 import { ask } from '../model/call'
@@ -155,6 +156,7 @@ export function Inbox({
 
   return (
     <div ref={content}>
+      <Confirmations surface={surface} />
       <Offers surface={surface} />
 
       {error ? (

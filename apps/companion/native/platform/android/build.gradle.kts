@@ -1,7 +1,7 @@
 /*
  * The Android half of the companion's platform plugin: the Auth Tab and Custom Tab sign-in
- * session, the Keystore-sealed secret store, the TLS verifier's start and the scanner that reads a
- * QR code. Its decisions live in the
+ * session, the Keystore-sealed secret store, the TLS verifier's start, the scanner that reads a
+ * QR code and the prompt that confirms the owner is present. Its decisions live in the
  * plugin's Rust crate and in the plain Kotlin module `:krnative`, where tests reach them without a
  * device.
  */
@@ -47,6 +47,9 @@ dependencies {
     implementation("androidx.camera:camera-camera2:1.4.2")
     implementation("androidx.camera:camera-lifecycle:1.4.2")
     implementation("androidx.camera:camera-view:1.4.2")
+    // The prompt the system draws to confirm that the phone's owner is in front of it, at the version
+    // the application and its voice ceremony use.
+    implementation("androidx.biometric:biometric:1.2.0-alpha05")
     // The platform TLS verifier's Kotlin half, from the local Maven repository inside its Rust
     // crate, which the application's root build declares for every project.
     implementation("rustls:rustls-platform-verifier:0.1.1")

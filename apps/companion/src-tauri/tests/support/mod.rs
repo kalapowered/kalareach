@@ -663,8 +663,15 @@ impl Companion {
                 },
             );
         }
-        companion_tauri::start_pairing(app.handle(), data, parts, ceremony, paste)
-            .expect("this computer opens as a device that pairs");
+        companion_tauri::start_pairing(
+            app.handle(),
+            data,
+            parts,
+            Arc::clone(&ceremony),
+            ceremony,
+            paste,
+        )
+        .expect("this computer opens as a device that pairs");
         Self {
             app,
             window,

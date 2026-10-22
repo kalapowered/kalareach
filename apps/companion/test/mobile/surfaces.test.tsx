@@ -19,7 +19,7 @@ import type { AttentionItem } from '@kalareach/protocol'
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
 import { FakeDraftStore } from '../../src/host/fake-drafts'
-import type { HostPort } from '../../src/host/port'
+import type { CeremonyKind, ConfirmationRequest, HostPort } from '../../src/host/port'
 import { Shell } from '../../src/mobile/entry'
 import { MobileApp, type MobileBuild } from '../../src/mobile/MobileApp'
 import { AttachmentPicker } from '../../src/mobile/components/picker'
@@ -315,6 +315,74 @@ describe('the camera of the attachment picker, when the system refuses it (KR-RE
       expect(controls.cameraAsked.count).toBeGreaterThan(asked)
     })
     expect(screen.getByTestId('camera-notice')).toBeEmptyDOMElement()
+  })
+})
+
+describe("the owner's confirmations on a phone (KR-REQ-10.52)", () => {
+  const owed = (): ConfirmationRequest => ({
+    reference: 'r-1',
+    host_name: 'studio',
+    title: 'Add a device',
+    detail: 'Confirm adding Pixel 8 (Android) to studio, which may view sessions for 60 minutes.',
+    value: 'f3c1 46fd',
+    facts: [],
+    notice: null,
+    statement: null,
+    reading: null,
+    expires_at_ms: Date.now() + 110_000,
+    checkable: true
+  })
+
+  it('head Attention with a button named for the phone\u2019s own ceremony, and count in the tab badge', async () => {
+    const person = userEvent.setup()
+    const { controls } = start('ios')
+    const tab = await screen.findByRole('button', { name: /^Attention/ })
+    await waitFor(() => {
+      expect(within(tab).getByText('3')).toBeInTheDocument()
+    })
+    const ceremonies: [CeremonyKind, string][] = [
+      ['face_id', 'Confirm with Face ID'],
+      ['touch_id', 'Confirm with Touch ID'],
+      ['passcode', 'Confirm with your passcode'],
+      ['biometric', 'Confirm with your fingerprint or face'],
+      ['screen_lock', 'Confirm with your screen lock']
+    ]
+    for (const [ceremony, label] of ceremonies) {
+      act(() => {
+        controls.setConfirmations({ ceremony, requests: [owed()] })
+      })
+      expect((await screen.findByTestId('confirm-request')).textContent).toBe(label)
+    }
+    // The request is one more thing to act on, and the button is a touch target.
+    expect(tab.textContent).toContain('4 waiting for you')
+    expect(declaredTarget(screen.getByTestId('confirm-request')).block).toBeGreaterThanOrEqual(
+      TOUCH_TARGET.ios
+    )
+    await person.click(screen.getByTestId('confirm-request'))
+    await waitFor(() => {
+      expect(controls.reviewed).toEqual(['r-1'])
+    })
+    expect(await screen.findByText('Confirmed. studio can go ahead.')).toBeInTheDocument()
+  })
+
+  it('says this phone, and not this computer, when the phone can check nothing', async () => {
+    const person = userEvent.setup()
+    const { controls } = start('android')
+    act(() => {
+      controls.setConfirmations({ ceremony: 'none', requests: [owed()] })
+    })
+    const none = await screen.findByTestId('no-ceremony')
+    expect(none.textContent).toContain('This phone')
+    expect(none.textContent).not.toContain('computer')
+    expect(screen.queryByTestId('confirm-request')).toBeNull()
+    // A review that finds no ceremony at the moment of asking says the same.
+    controls.setReviewOutcome('no_ceremony')
+    act(() => {
+      controls.setConfirmations({ ceremony: 'screen_lock', requests: [owed()] })
+    })
+    await person.click(await screen.findByTestId('confirm-request'))
+    const told = await screen.findByText(/This phone cannot check it is you/)
+    expect(told.textContent).not.toContain('computer')
   })
 })
 

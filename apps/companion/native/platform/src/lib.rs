@@ -1,6 +1,6 @@
 //! The companion's native platform services, shared by every feature that needs them.
 //!
-//! Seven services, each a mechanism with no feature's policy in it:
+//! Eight services, each a mechanism with no feature's policy in it:
 //!
 //! * [`secrets`]: the one secure store the companion keeps secrets in. The Keychain on macOS and
 //!   iOS, the Credential Manager on Windows, the Secret Service on Linux, and on Android files
@@ -11,6 +11,8 @@
 //! * [`protection`]: whether the device's protected data can be read yet, and the system's word
 //!   when it can. iOS holds an application's files and keychain items back from a restart until the
 //!   first unlock.
+//! * [`presence`]: whether the phone's owner is in front of it now, asked of the ceremony the
+//!   operating system draws: Face ID, Touch ID or the passcode, and Android's biometric prompt.
 //! * [`scan`]: reading a QR code from the phone's camera or from a picture, in native code, so that an
 //!   invitation's secret goes no further than native code.
 //! * [`browser`]: the browser-backed session a sign-in hands its ceremony to on a phone: iOS's
@@ -31,6 +33,7 @@ use tauri::{Manager as _, Runtime};
 pub mod backup;
 pub mod browser;
 pub mod call;
+pub mod presence;
 pub mod protection;
 pub mod scan;
 pub mod secrets;

@@ -39,6 +39,12 @@ struct KeepAwakeArguments: Decodable {
   let on: Bool
 }
 
+/// What the ceremony is asked: the words of what is being confirmed, and how long it has.
+struct PresenceArguments: Decodable {
+  let reason: String
+  let withinMs: Double
+}
+
 /// What opening a call takes: its name, and the channel its news is sent on.
 struct CallOpenArguments: Decodable {
   let call: String
@@ -313,6 +319,33 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
     DispatchQueue.main.async {
       UIApplication.shared.isIdleTimerDisabled = arguments.on
       invoke.resolve(["done": true])
+    }
+  }
+
+  // MARK: The owner's presence
+
+  /// The ceremony that is running, when one is: one at a time, so a newer request ends the older one.
+  private var presenting: OwnerPresenceRun?
+
+  /// Which ceremony this device offers its owner.
+  @objc public func presenceKind(_ invoke: Invoke) {
+    invoke.resolve(["kind": OwnerPresenceKind.offered().rawValue])
+  }
+
+  /// Runs the ceremony for the words it is given, inside the time it is given, and answers once.
+  @objc public func presence(_ invoke: Invoke) throws {
+    let arguments = try invoke.parseArgs(PresenceArguments.self)
+    DispatchQueue.main.async {
+      self.presenting?.end()
+      guard OwnerPresenceKind.offered() != .none, let presenter = self.topViewController() else {
+        invoke.resolve(["outcome": "unavailable"])
+        return
+      }
+      let run = OwnerPresenceRun(
+        reason: arguments.reason, within: arguments.withinMs / 1000
+      ) { outcome in invoke.resolve(["outcome": outcome]) }
+      self.presenting = run
+      run.begin(over: presenter)
     }
   }
 

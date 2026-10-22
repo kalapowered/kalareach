@@ -649,7 +649,15 @@ export interface IntakeView {
 export type CameraAccess = 'granted' | 'prompt' | 'denied'
 
 /** The ceremony this computer offers an owner. */
-export type CeremonyKind = 'touch_id' | 'password' | 'windows_hello' | 'none'
+export type CeremonyKind =
+  | 'touch_id'
+  | 'password'
+  | 'face_id'
+  | 'passcode'
+  | 'biometric'
+  | 'screen_lock'
+  | 'windows_hello'
+  | 'none'
 
 /** One fact a confirmation names: what it is, and its exact value. */
 export interface ConfirmationFact {

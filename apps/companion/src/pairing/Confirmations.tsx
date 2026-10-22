@@ -32,6 +32,7 @@ import {
   type ConfirmationRequest,
   type ReviewOutcome
 } from '../host/port'
+import { minimumTarget, type Surface } from '../mobile/platform'
 import { SpelledValue } from './VerificationValue'
 import { secondsLeft } from './words'
 
@@ -53,6 +54,14 @@ export function confirmLabel(ceremony: CeremonyKind): string | null {
       return 'Confirm with Touch ID'
     case 'password':
       return 'Confirm with your password'
+    case 'face_id':
+      return 'Confirm with Face ID'
+    case 'passcode':
+      return 'Confirm with your passcode'
+    case 'biometric':
+      return 'Confirm with your fingerprint or face'
+    case 'screen_lock':
+      return 'Confirm with your screen lock'
     case 'windows_hello':
       return 'Confirm with Windows Hello'
     case 'none':
@@ -60,8 +69,8 @@ export function confirmLabel(ceremony: CeremonyKind): string | null {
   }
 }
 
-/** What the person is told once a review ends. */
-function outcomeWords(outcome: ReviewOutcome, host: string): string {
+/** What the person is told once a review ends, on a computer or on a phone. */
+function outcomeWords(outcome: ReviewOutcome, host: string, phone: boolean): string {
   switch (outcome) {
     case 'confirmed':
       return `Confirmed. ${host} can go ahead.`
@@ -72,7 +81,9 @@ function outcomeWords(outcome: ReviewOutcome, host: string): string {
     case 'cannot_check':
       return 'This request could not be checked, so it cannot be confirmed here.'
     case 'no_ceremony':
-      return 'This computer cannot check it is you. Confirm on your phone.'
+      return phone
+        ? 'This phone cannot check it is you. Confirm on another device that can.'
+        : 'This computer cannot check it is you. Confirm on your phone.'
     case 'unknown':
       return `${host} did not say whether it took the confirmation.`
   }
@@ -168,8 +179,13 @@ function useRows(shown: readonly ConfirmationRequest[]): readonly Row[] {
   return rows
 }
 
-/** The requests, as rows. */
-export function Confirmations(): ReactNode {
+/**
+ * The requests, as rows. On a phone (`surface` names it) the words say a phone, and a control is as
+ * large as the platform asks a touch target to be.
+ */
+export function Confirmations({ surface = 'desktop' }: { readonly surface?: Surface }): ReactNode {
+  const phone = surface !== 'desktop'
+  const target = phone ? minimumTarget(surface) : undefined
   const { port, say, confirmations } = useApp()
   const { view, shown, focusing } = useSyncExternalStore(
     confirmations.subscribe,
@@ -207,7 +223,7 @@ export function Confirmations(): ReactNode {
       port
         .ownerConfirmationReview(request.reference)
         .then((outcome) => {
-          say(outcomeWords(outcome, request.host_name), outcomeTone(outcome))
+          say(outcomeWords(outcome, request.host_name, phone), outcomeTone(outcome))
         })
         .catch((error: unknown) => {
           say(failureMessage(error), 'danger')
@@ -216,7 +232,7 @@ export function Confirmations(): ReactNode {
           setReviewing(null)
         })
     },
-    [port, say]
+    [port, say, phone]
   )
 
   if (view === null || rows.length === 0) return null
@@ -286,7 +302,9 @@ export function Confirmations(): ReactNode {
                 </p>
               ) : label === null ? (
                 <p className="small muted" data-testid="no-ceremony">
-                  Confirm this on your phone, or on another device that can check it is you.
+                  {phone
+                    ? 'This phone cannot check that it is you. Set a screen lock in Settings, or confirm this on another device that can.'
+                    : 'Confirm this on your phone, or on another device that can check it is you.'}
                 </p>
               ) : null}
             </div>
@@ -296,6 +314,7 @@ export function Confirmations(): ReactNode {
                 <CommitButton
                   tone="primary"
                   data-testid="confirm-request"
+                  style={target === undefined ? undefined : { minBlockSize: target }}
                   disabled={reviewing !== null}
                   onCommit={() => {
                     review(request)
@@ -307,6 +326,7 @@ export function Confirmations(): ReactNode {
               <Button
                 tone="quiet"
                 data-testid="not-now"
+                style={target === undefined ? undefined : { minBlockSize: target }}
                 onClick={() => {
                   confirmations.setAside(request)
                 }}

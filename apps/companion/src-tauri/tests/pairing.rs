@@ -1223,6 +1223,57 @@ async fn the_page_is_told_where_this_device_reads_a_code_from() {
     .expect("the page is told what this device offers");
 }
 
+/// A ceremony whose kind a test changes after the application has started, as a phone's does when
+/// the person sets up a face or a screen lock in Settings, or when the platform answers late.
+struct ChangingCeremony {
+    kind: Mutex<CeremonyKind>,
+}
+
+impl Ceremony for ChangingCeremony {
+    fn kind(&self) -> CeremonyKind {
+        *self.kind.lock().expect("the kind")
+    }
+
+    fn verify<'a>(&'a self, _reason: &'a str, _within: Duration) -> BoxFuture<'a, CeremonyOutcome> {
+        Box::pin(async { CeremonyOutcome::NotConfirmed })
+    }
+}
+
+/// KR-REQ-10.52: a ceremony the phone starts to offer after the application started reaches the page
+/// without a request coming or going, so the button is named for it as soon as it is known.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_page_is_told_when_the_ceremony_this_phone_offers_changes() {
+    let data = tempfile::tempdir().expect("a directory");
+    let ceremony = Arc::new(ChangingCeremony {
+        kind: Mutex::new(CeremonyKind::None),
+    });
+    let companion = Companion::start(
+        data.path(),
+        support::parts(
+            Arc::new(MemoryStore::new()),
+            Arc::new(CountingRoom::default()),
+        ),
+        ceremony.clone(),
+        StubIntake::holding("", false),
+    );
+    *ceremony.kind.lock().expect("the kind") = CeremonyKind::FaceId;
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            if companion
+                .heard
+                .texts()
+                .iter()
+                .any(|text| text.contains("\"ceremony\":\"face_id\""))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the page is told which ceremony the phone offers");
+}
+
 /// KR-REQ-10.32: this computer counts its tries with a code in its own data directory, under its
 /// own secret store. Five charged attempts leave the sixth refused without a room being opened,
 /// and a second instance over the same directory and store refuses it too. The same code through
