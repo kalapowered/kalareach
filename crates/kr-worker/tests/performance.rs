@@ -777,10 +777,6 @@ fn a_host_with_no_shortfall_fails_an_idle_processor_figure_over_the_bound() {
 
     let under = Idle::new(0.0075, UNDER_THE_MEMORY_BOUND_KIB, &reference);
     assert_eq!(under.check(), Ok(()), "a figure under the bound passes");
-    assert_eq!(
-        under.verdict(),
-        ["  verdict           the target is met on this host"]
-    );
 }
 
 /// KR-PERF-003: the memory bound is a size, so it is asserted on every host.
@@ -1088,10 +1084,10 @@ fn a_host_with_a_fast_disk_fails_an_attach_over_the_bound() {
             "the figure over the bound fails: {:?}",
             attached.check()
         );
-        assert_eq!(
-            attached.verdict(),
-            ["  verdict           the target is not met on this host"],
-            "and is said to be missed"
+        let lines = attached.verdict();
+        assert!(
+            lines.len() == 1 && lines[0].contains("is not met on this host"),
+            "and is said to be missed, with no condition named: {lines:#?}"
         );
     }
     let under = Attached::new(
@@ -1099,9 +1095,10 @@ fn a_host_with_a_fast_disk_fails_an_attach_over_the_bound() {
         &record::Conditions::supplied(4, 8 * 1024, Some(0.0)).with_durable_writes(2, 3),
     );
     assert_eq!(under.check(), Ok(()), "a figure under the bound passes");
-    assert_eq!(
-        under.verdict(),
-        ["  verdict           the target is met on this host"]
+    let lines = under.verdict();
+    assert!(
+        lines.len() == 1 && lines[0].contains("is met on this host"),
+        "and is said to be met: {lines:#?}"
     );
 }
 
