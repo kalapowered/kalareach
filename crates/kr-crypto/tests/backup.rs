@@ -1430,6 +1430,85 @@ fn a_checkpoint_catches_a_replayed_older_archive() {
     ));
 }
 
+/// KR-REQ-24.16: the one older generation a person names is admitted past the checkpoint, and only
+/// that one: another older generation is still a replay, and the checkpoint's own generation with
+/// another manifest is still a substitution.
+#[test]
+fn a_named_older_generation_is_admitted_past_the_checkpoint_and_no_other() {
+    let parties = Parties::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let two = seal(&parties, 2, &objects);
+    let three = seal(&parties, 3, &objects);
+    let seven = seal(&parties, 7, &objects);
+    let other_seven = seal(&parties, 7, &[stage(2, "b.cbor", b"two")]);
+
+    let verified = checkpoint(7, seven.descriptor.encrypted_manifest.encrypted_object_hash);
+    let naming = |accepted: u64| GenerationExpectation::AcceptingOlder {
+        checkpoint: &verified,
+        accepted: BackupGeneration::new(accepted),
+    };
+
+    let named = RestoreGeneration::against(&three.descriptor, naming(3));
+    assert!(matches!(
+        named.standing,
+        GenerationStanding::OlderAccepted { .. }
+    ));
+    assert!(named.is_admissible());
+    assert!(named.describe().contains("generation 7"));
+    let against = ArchiveExpectation {
+        archive_id: archive_id(),
+        generation: naming(3),
+    };
+    let opened = open_archive(
+        &ArchiveReader::Device(&parties.device),
+        &parties.sender_key(),
+        &[trusted(&parties.writer)],
+        &against,
+        &three.descriptor_bytes,
+        &three.encrypted_manifest,
+    )
+    .expect("the generation the person named opens");
+    assert!(matches!(
+        opened.generation().standing,
+        GenerationStanding::OlderAccepted { .. }
+    ));
+
+    // The control: without the name, the same archive is a replay and the restore refuses it.
+    let unnamed = ArchiveExpectation {
+        archive_id: archive_id(),
+        generation: GenerationExpectation::Checkpoint(&verified),
+    };
+    assert!(
+        open_archive(
+            &ArchiveReader::Device(&parties.device),
+            &parties.sender_key(),
+            &[trusted(&parties.writer)],
+            &unnamed,
+            &three.descriptor_bytes,
+            &three.encrypted_manifest,
+        )
+        .is_err()
+    );
+
+    // A name for one generation admits no other.
+    let other = RestoreGeneration::against(&two.descriptor, naming(3));
+    assert!(matches!(
+        other.standing,
+        GenerationStanding::Replayed { .. }
+    ));
+    assert!(!other.is_admissible());
+
+    // A name does not reach the checkpoint's own generation, nor a substitute for it.
+    let at = RestoreGeneration::against(&seven.descriptor, naming(3));
+    assert!(matches!(at.standing, GenerationStanding::AtCheckpoint));
+    let substitute = RestoreGeneration::against(&other_seven.descriptor, naming(7));
+    assert!(matches!(
+        substitute.standing,
+        GenerationStanding::Substituted { .. }
+    ));
+    assert!(!substitute.is_admissible());
+}
+
 #[test]
 fn an_archive_of_another_collection_is_not_the_backup_that_was_asked_for() {
     let parties = Parties::generate();
