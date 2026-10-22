@@ -666,6 +666,122 @@ async fn a_worker_told_more_notices_than_a_result_reads_is_told_the_host() {
     drop(controller);
 }
 
+/// A paired device's record, for the device `device_id` names.
+fn a_paired_device(
+    controller: &Controller,
+    device_id: kr_protocol::ids::DeviceId,
+    grant: kr_protocol::grant::Grant,
+) {
+    controller
+        .devices()
+        .commit(&crate::service::net::devices::DeviceRecord {
+            device_id,
+            endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([9; 32]),
+            device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+            authorisation: kr_protocol::scalars::AuthorisationKey::from_bytes([9; 32]),
+            stored_envelope: None,
+            notification_preview: None,
+            device_name: kr_protocol::pairing::DeviceName::new("A phone").expect("a name"),
+            platform: kr_protocol::pairing::DevicePlatform::Ios,
+            grant,
+            paired_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+            revoked_at_ms: None,
+            committed_invitation_id: None,
+            expired_at_ms: None,
+        })
+        .expect("paired");
+}
+
+/// The tree a device holds below one root: `grants` grants that each carry input and the size, the
+/// first of them the root. Returns the root and the grant the device's record is paired under.
+fn a_device_holding(
+    controller: &Controller,
+    grants: u32,
+) -> (kr_protocol::ids::GrantId, kr_protocol::grant::Grant) {
+    use kr_protocol::rights::ActionRight::{SessionView, TerminalGeometry, TerminalInput};
+
+    let typing = [SessionView, TerminalInput, TerminalGeometry];
+    let numbered = |number: u32| {
+        let mut bytes = [0_u8; 16];
+        bytes[..4].copy_from_slice(&number.to_be_bytes());
+        bytes[15] = 0x45;
+        kr_protocol::ids::GrantId::new(kr_protocol::scalars::Uuid::from_bytes(bytes))
+    };
+    let root = numbered(0);
+    for number in 0..grants {
+        let parent = (number > 0).then_some(root);
+        controller
+            .sharing()
+            .grants()
+            .issue(
+                &crate::grants::GrantRecord {
+                    grant: a_typists_grant(numbered(number), parent, &typing),
+                    session_id: None,
+                    issued_at_ms: 1_000,
+                    activated_at_ms: Some(1_000),
+                    revoked_at_ms: None,
+                    revoked_by_parent: None,
+                },
+                || Ok(()),
+            )
+            .expect("written");
+    }
+    (root, a_typists_grant(numbered(u32::MAX), None, &typing))
+}
+
+/// KR-REQ-10.45: a device's revocation is one barrier whatever the device held. The grants it held
+/// and the device itself are named in one notice when they fit one, and fenced as the whole host
+/// when they do not, so that the answer never comes between the two halves of the fence.
+///
+/// A device that holds a few grants is named with them. One that holds a delegation tree at the
+/// most it may hold, with the device, names more than a notice carries: the barrier then takes both
+/// of the revocation's debts at once, as the whole host's, and the revision advances once with
+/// nothing owed when the answer comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_revocation_is_one_barrier_whether_or_not_what_it_names_fits_a_notice() {
+    use kr_protocol::worker::RevisionReach;
+
+    let limit = u32::try_from(crate::grants::MAX_GRANTS_PER_TREE).expect("fits");
+    for (grants, named) in [(3, true), (limit, false)] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::a_floor_owed_its_record::daemon(&temp).await;
+        let (root, pairing) = a_device_holding(&controller, grants);
+        let device_id = pairing.recipient_device_id;
+        a_paired_device(&controller, device_id, pairing);
+
+        let before = revision(&controller).await;
+        let answered = controller
+            .revoke_device_authority(device_id, None, None)
+            .await
+            .expect("the device is revoked");
+        let after = revision(&controller).await;
+        assert_eq!(after, before + 1, "one revision, for {grants} grants");
+        assert_eq!(answered.authority_revision.get(), after);
+        assert!(answered.barrier.holds(), "{answered:?}");
+        assert!(
+            owed(&controller).is_empty(),
+            "nothing of this revocation is left to a later barrier, for {grants} grants"
+        );
+        let revision = kr_protocol::ids::AuthorityRevision::new(after);
+        let reach = controller
+            .revision_notice(revision, one_before(revision), 0)
+            .reach;
+        match (named, reach) {
+            (
+                true,
+                RevisionReach::Within {
+                    devices, grants, ..
+                },
+            ) => {
+                assert!(devices.contains(&device_id) && grants.contains(&root));
+            }
+            (false, RevisionReach::Host) => {}
+            (named, reach) => panic!("named: {named}, announced: {reach:?}"),
+        }
+        drop(controller);
+    }
+}
+
 /// A grant of the kind a device holds below another, for the store, that carries `actions`.
 fn a_typists_grant(
     id: kr_protocol::ids::GrantId,

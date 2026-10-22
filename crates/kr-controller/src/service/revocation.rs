@@ -112,14 +112,42 @@ impl Controller {
     }
 
     /// A device record's debt, when it wrote one, as one that reaches the connections of that
-    /// device and what it holds at a worker, and no others.
+    /// device and what it holds at a worker, and no others; as one that reaches every connection
+    /// when the device and the grants it held together name more than one notice carries, which a
+    /// barrier would otherwise split across two revisions, the second of them after the answer.
     fn for_the_device(
         device_id: kr_protocol::ids::DeviceId,
+        names_beside: usize,
         debt: Option<crate::grants::store::DebtId>,
     ) -> Vec<(crate::grants::store::DebtId, Reach)> {
         debt.into_iter()
-            .map(|debt| (debt, Reach::Device(device_id)))
+            .map(|debt| (debt, Self::device_reach(device_id, names_beside)))
             .collect()
+    }
+
+    /// The reach of a device's own record, given how many names the grants it held are named by.
+    fn device_reach(device_id: kr_protocol::ids::DeviceId, names_beside: usize) -> Reach {
+        if names_beside < kr_protocol::worker::MAX_REVISION_REACH_NAMES {
+            Reach::Device(device_id)
+        } else {
+            Reach::Host
+        }
+    }
+
+    /// The debt of the grants a device held, as [`Self::under_the_grants`] names them, or as one
+    /// that reaches every connection when they and the device name more than a notice carries.
+    fn for_the_device_grants(
+        revocation: &crate::grants::GrantRevocation,
+    ) -> Vec<(crate::grants::store::DebtId, Reach)> {
+        if revocation.reached_holding_leases.len() < kr_protocol::worker::MAX_REVISION_REACH_NAMES {
+            Self::under_the_grants(revocation)
+        } else {
+            revocation
+                .debt
+                .into_iter()
+                .map(|debt| (debt, Reach::Host))
+                .collect()
+        }
     }
 
     /// A revocation's debt, when it wrote one, as one that reaches the connections acting under
@@ -149,14 +177,15 @@ impl Controller {
 
     /// Revokes every grant one device holds, then revokes the device itself.
     ///
-    /// The grants go first for the same reason as above. The in-memory registrations belong to
-    /// `net::Network::revoke_device`, which the network entry point calls, and this daemon reaches
-    /// them through the barrier its debts raise: the barrier withdraws the registrations of the
-    /// device and of the connections acting under the grants it withdrew, admits every other
-    /// connection again at the revision now in force, and the revoked device's record is already
-    /// marked so it cannot be re-admitted at all. The workers are told the device and the grants,
-    /// so what they take is the input lease and the size claim of the device's attachments and of
-    /// those made under the grants withdrawn, and not those of any other device.
+    /// The grants go first for the same reason as above. The registrations are the daemon's table
+    /// of admitted connections, and the barrier its debts raise withdraws those of the device and
+    /// of the connections acting under the grants it withdrew, admits every other connection again
+    /// at the revision now in force, and closes the connections that lost theirs; the revoked
+    /// device's record is already marked so it cannot be re-admitted at all. The workers are told
+    /// the device and the grants, so what they take is the input lease and the size claim of the
+    /// device's attachments and of those made under the grants withdrawn, and not those of any
+    /// other device. A device that held so many grants that, with the device, they name more than
+    /// a notice carries is fenced as the whole host is, in one barrier.
     ///
     /// `carried` and `claim` are as [`Self::revoke_grant`]: the admission of the mutation this is
     /// performing, and its hold on its action, which the withdrawn rows are written beside.
@@ -197,7 +226,7 @@ impl Controller {
                 claim,
             )?;
             // The transaction that revoked is the restriction, and it has committed.
-            let own = self.publish_debts(&Self::under_the_grants(&revocation));
+            let own = self.publish_debts(&Self::for_the_device_grants(&revocation));
             // The device record is marked revoked before the revision advances, so nothing can be
             // authorised against it in between. The directory is a view on this daemon's own
             // registry database, which is the file the network half keeps its device records in.
@@ -234,7 +263,7 @@ impl Controller {
                 }
                 Some(self.owe_debt(
                     &format!("the revocation of device {device_id}'s record"),
-                    Reach::Device(device_id),
+                    Self::device_reach(device_id, revocation.reached_holding_leases.len()),
                 )?)
             } else {
                 None
@@ -258,7 +287,11 @@ impl Controller {
             // a restriction that did not land withdraws nothing more, and a debt left pending would
             // never be retired. A record that could not be marked answers with its error, and what
             // it published is left to the debt pass.
-            let own = own.and(self.publish_debts(&Self::for_the_device(device_id, record_debt)));
+            let own = own.and(self.publish_debts(&Self::for_the_device(
+                device_id,
+                revocation.reached_holding_leases.len(),
+                record_debt,
+            )));
             if recorded.is_ok() && lapsed.is_none() {
                 self.unbind_device(device_id);
             }
