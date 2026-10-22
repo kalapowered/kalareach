@@ -18,7 +18,9 @@
 # `infra/scripts/testing/local-restore.mjs`, starts, exports, prepares, restores and stops them. The
 # restore leg is a source deployment, an export on its schedule, the source stopped, a target
 # prepared from that export and restored on its own schedule, and a device's stores meeting each in
-# turn. The retention leg is a deployment of its own: backup storage turned on, thirty-one generations
+# turn. The revocation and multi-device legs share a deployment of their own: three installations
+# that share one settings collection, one taken out while another is away, and two that change one
+# setting from one revision. The retention leg is a deployment of its own: backup storage turned on, thirty-one generations
 # kept as thirty, the objects of the one pushed out deleted, and the driver's `sweep` and `age` steps
 # between three phases that read the storage status, so the seven days a tombstone is kept are
 # shown without waiting for them. On macOS, keep the tree on the internal disk: the Workers it starts read it.
@@ -266,6 +268,8 @@ if [ "$mode" = deployment ]; then
   printf '  %-7s %-10s %s\n' '-' services "local only: needs two services on this machine"
   printf '  %-7s %-10s %s\n' '-' restore "local only: needs a deployment restored from its export on this machine"
   printf '  %-7s %-10s %s\n' '-' retention "local only: needs the driver to move a tombstone's window"
+  printf '  %-7s %-10s %s\n' '-' revocation "local only: its devices and collections would stay on a deployment, since no client operation removes a shared collection's key records"
+  printf '  %-7s %-10s %s\n' '-' multi-device "local only: as revocation"
 else
   run="$(mktemp -d "${TMPDIR:-/tmp}/kr-e2e-backup-XXXXXX")"
   state="$run/web"
@@ -378,6 +382,34 @@ else
   fi
   step stop --name retention >/dev/null || stopped=0
 
+  # Settings sync across devices, on a deployment of its own: three installations that share one
+  # collection, one of them taken out while another is away; and two that change one setting.
+  sync_failed=""
+  sync=""
+  if answer="$(step start --name sync)"; then
+    sync="$(member "$answer" origin)"
+  else
+    sync_failed="the settings-sync deployment did not serve; see $evidence/driver.log"
+  fi
+  sync_leg() {
+    local leg="$1"
+    local test="$2"
+    local rc=0
+    if [ -n "$sync_failed" ]; then
+      report 'NOT RUN' "$leg" "$sync_failed"
+      return
+    fi
+    run_test sync "$test" "$evidence/$leg.log" KR_DEPLOYED_ORIGIN="$sync" || rc=$?
+    case "$rc" in
+      0) report ok "$leg" "$(proved "$evidence/$leg.log" "$sync")" ;;
+      1) report FAILED "$leg" "$(reason "$evidence/$leg.log")" ;;
+      *) report 'NOT RUN' "$leg" "the leg ran nothing" ;;
+    esac
+  }
+  sync_leg revocation a_device_taken_out_while_another_is_away_is_answered_as_missing_and_the_other_seals_again_under_the_new_epoch
+  sync_leg multi-device two_devices_that_change_a_setting_from_one_revision_keep_both_and_neither_is_chosen_by_a_clock
+  step stop --name sync >/dev/null || stopped=0
+
   # The client across a restored deployment: a source, its export, a target restored from it.
   device="$run/device"
   restore_failed=""
@@ -471,6 +503,7 @@ if [ "${#unfinished[@]}" -ne 0 ]; then
       restore) echo "  restore-1.log, restore-2.log, restore-3.log and driver.log, as far as the leg got" ;;
       services) echo "  services-1.log and services-2.log, as far as the leg got" ;;
       retention) echo "  retention-1.log, retention-2.log, retention-3.log, retention-steps.log and driver.log, as far as the leg got" ;;
+      revocation | multi-device) echo "  $what.log and driver.log, as far as the leg got" ;;
       *) echo "  $what.log" ;;
     esac
   done
