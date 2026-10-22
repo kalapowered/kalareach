@@ -332,6 +332,40 @@ mod tests {
         }
     }
 
+    /// KR-REQ-10.50: a voice grant narrows the grant of the device that asks for it, so it cannot
+    /// name a session, or an environment, that grant does not select, and it carries the device's
+    /// own history scope and no wider one.
+    #[test]
+    fn a_voice_grant_cannot_reach_a_session_or_environment_the_devices_grant_does_not_select() {
+        use kr_protocol::ids::SessionId;
+
+        let session = |byte: u8| SessionId::new(Uuid::from_bytes([byte; 16]));
+        let mut device_grant = grant_with(&[ActionRight::SessionView]);
+        device_grant.session_selector = SessionSelector::These {
+            session_ids: [session(1)].into_iter().collect(),
+        };
+        let naming = |sessions: &[SessionId]| GrantBinding {
+            session_ids: sessions.iter().copied().collect(),
+            ..binding(GrantExpiry::Never)
+        };
+
+        let planned = plan_voice_grant(&device_grant, None, &naming(&[session(1)]))
+            .expect("a session the device's grant selects");
+        assert_eq!(planned.plan.history, device_grant.history);
+        for outside in [&[session(2)][..], &[session(1), session(2)][..]] {
+            assert!(
+                plan_voice_grant(&device_grant, None, &naming(outside)).is_err(),
+                "{outside:?}"
+            );
+        }
+
+        let elsewhere = GrantBinding {
+            environment_id: EnvironmentId::new(Uuid::from_bytes([0xe1; 16])),
+            ..binding(GrantExpiry::Never)
+        };
+        assert!(plan_voice_grant(&device_grant, None, &elsewhere).is_err());
+    }
+
     /// KR-REQ-15.21: the statement a person is shown lists what the grant will permit when it is
     /// read back, not only the actions they named.
     #[test]
