@@ -63,7 +63,7 @@ use serde::Serialize;
 
 use crate::error::ClientError;
 use crate::recovery::bundle::read_bundle;
-use crate::recovery::checkpoint::hold_to_the_first_read;
+use crate::recovery::checkpoint::Strongest;
 use crate::recovery::{
     ExportedArchive, ExportedObject, FreshRestore, MAX_EXPORT_BYTES, OfflineExport, RecoveryError,
     RetrievalPolicy, ServiceAccess, TrustedMaterial, advance_checkpoint,
@@ -965,10 +965,9 @@ pub struct PreparedRestore {
     context: RecoveryContext,
     /// Where the first read found the bundle, which every later read is held to.
     first_place: SyncPosition,
-    /// Every checkpoint the first read found, for every archive, which every later read is held
-    /// to with the revision the first read found: the strongest this restore has seen
-    /// authenticated.
-    known_checkpoints: Vec<ArchiveCheckpoint>,
+    /// The revision and every archive's checkpoint the first read found, which every later read is
+    /// held to: the strongest this restore had seen authenticated before it recorded anything.
+    first_read: Strongest,
     /// The bundle as the service sealed it there, for an export.
     sealed_bundle: Vec<u8>,
     /// The publication this restore verified, for an export.
@@ -1022,8 +1021,10 @@ impl PreparedRestore {
     /// again and the change made on what is there; a write whose answer was lost is treated the
     /// same way, because the next read either finds the checkpoint recorded or finds the bundle
     /// where the lost write compared, and a request that arrives late then compares against a
-    /// place the bundle has left and changes nothing. Nothing is kept about an attempt, so no
-    /// attempt can be based on a state the bundle is no longer in.
+    /// place the bundle has left and changes nothing. Between the attempts only the strongest
+    /// read is kept, the newest revision and every archive's highest checkpoint, and every read is
+    /// held to it, so that no attempt writes on a bundle older than one an attempt read or seals a
+    /// checkpoint below one an attempt read.
     ///
     /// # Errors
     ///
@@ -1053,17 +1054,13 @@ impl PreparedRestore {
             .bundle_key_for(&self.context)
             .map_err(|error| RestoreError::Recovery(Box::new(error.into())))?;
         let mut seen = self.first_place;
+        let mut strongest = self.first_read.clone();
         let mut last_failure: Option<ClientError> = None;
         for _ in 0..CHECKPOINT_ATTEMPTS {
             let read = read_bundle(&reader, &self.context, Some(seen), &self.seed)
                 .await
                 .map_err(from_recovery)?;
-            hold_to_the_first_read(
-                &read.bundle,
-                self.plan.bundle_revision,
-                &self.known_checkpoints,
-            )
-            .map_err(from_recovery)?;
+            strongest.hold(&read.bundle).map_err(from_recovery)?;
             let Some(mut advanced) =
                 advance_checkpoint(&read.bundle, &verified).map_err(from_recovery)?
             else {
@@ -1377,7 +1374,7 @@ impl FilesRestore {
             seed,
             context,
             first_place,
-            known_checkpoints: material.checkpoints.clone(),
+            first_read: Strongest::first_read(material.bundle_revision, &material.checkpoints),
             sealed_bundle,
             publication,
             encrypted_manifest,
