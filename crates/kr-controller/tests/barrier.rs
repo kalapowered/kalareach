@@ -3587,7 +3587,7 @@ async fn a_repeat_of_a_revocation_whose_report_has_gone_keeps_the_names_it_was_g
             break;
         }
     }
-    let mut left = left.expect("a revocation was acknowledged before another holder refused it");
+    let left = left.expect("a revocation was acknowledged before another holder refused it");
     for _ in 0..=kr_controller::authority::MAX_HELD_FENCE_REPORTS {
         let later = tokio::time::timeout(
             Duration::from_secs(60),
@@ -3599,8 +3599,13 @@ async fn a_repeat_of_a_revocation_whose_report_has_gone_keeps_the_names_it_was_g
         announced_until(&left.hosted.controller, later, |barrier| barrier.holds()).await;
     }
 
-    let again: kr_protocol::sharing::RevocationResult = left
-        .client
+    // The connection the revocation was sent on was admitted before the later revisions, so the
+    // caller opens another to ask again.
+    let mut client =
+        LocalClient::connect(&left.hosted.client_endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects to the daemon");
+    let again: kr_protocol::sharing::RevocationResult = client
         .repeat(&left.mutation)
         .await
         .expect("the daemon answers")
