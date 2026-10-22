@@ -50,9 +50,12 @@ dependencies {
     // The prompt the system draws to confirm that the phone's owner is in front of it, at the version
     // the application and its voice ceremony use.
     implementation("androidx.biometric:biometric:1.2.0-alpha05")
-    // The platform TLS verifier's Kotlin half, from the local Maven repository inside its Rust
-    // crate, which the application's root build declares for every project.
-    implementation("rustls:rustls-platform-verifier:0.1.1")
+    // The platform TLS verifier's Kotlin half, from the Maven repository its project publishes,
+    // which the application's root build declares for every project. It carries the network
+    // security configuration that lets the verifier fetch the revocation lists certificate
+    // authorities publish over HTTP: without it a release build, which allows no cleartext traffic,
+    // reports a certificate whose authority publishes only such a list as revoked.
+    implementation("org.rustls:rustls-platform-verifier:0.2.0")
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }

@@ -86,6 +86,21 @@ Two things a build needs to know:
   A build started from Android Studio goes through Gradle, which sets the same four tools itself.
 - **An iOS build writes into `src-tauri/gen/apple/build` and will not write over itself.** A second
   run in the same tree stops at "Directory not empty"; remove that directory first.
+- **A release build needs the platform verifier's network configuration to reach a service.**
+  Android's check of a certificate's revocation status, in the verifier's Kotlin half, fetches the
+  revocation list a certificate authority publishes over plain HTTP. Let's Encrypt, Google Trust
+  Services and SSL.com no longer publish OCSP, so the certificates Cloudflare serves for the
+  deployed service name a list and nothing else, and a release build, which allows no cleartext
+  traffic, was refused the fetch and reported the certificate as revoked (a debug build allows
+  cleartext and was unaffected): it could reach no service whose certificate came from such an
+  authority. Version 0.2.0 of the verifier's Kotlin half, which goes with version 0.7.1 of the
+  crate, merges into the application a network security configuration that permits cleartext only
+  to the public authorities' revocation-list hosts and leaves it off everywhere else; see
+  <https://github.com/rustls/rustls-platform-verifier/issues/221>. The build fetches the Kotlin half
+  from the verifier project's Maven archive, checks its bytes against a digest it pins, and fails
+  when its version is not the crate's in `Cargo.lock`. `scripts/check-android-release-package.sh`
+  checks a package for the configuration, and `scripts/e2e-android-release.sh` runs a minified
+  release build on the emulator.
 
 Installed on a simulator or an emulator, each application opens on the attention inbox and says
 there is no host on this device, which is the truth about a phone that has not been paired with
