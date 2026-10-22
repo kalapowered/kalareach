@@ -351,14 +351,8 @@ No reader of a mailbox in this product takes authority from one. A host takes it
 own records and its authority feed, and a device from its paired hosts' records, so a mailbox only
 tells a reader that something is there to read. `open_envelope` and `open_delivered_envelope`
 therefore refuse a payload that bears authority (`SignedAuthorityObject`) with
-`AuthorityNotAccepted`, after the box, the bindings and the expiry have passed. An object its issuer
-never signed, inside an envelope that is valid in every other way, is refused, and so is a signed
-one. The refusal does not record the replay identifier.
-
-`ForwardedAuthority` is the closed set of signed objects that kind names: a signed revocation
-request and a host's ordered authority revision record. The signature of a revocation request, and
-the bytes it covers, are published as a vector in `fixtures/crypto/envelopes.json`, and the
-TypeScript package reads the same bytes.
+`AuthorityNotAccepted`, after the box, the bindings and the expiry have passed, whatever the payload holds. The
+refusal does not record the replay identifier.
 
 ## Recovery
 
