@@ -335,9 +335,10 @@ say("a tap on the delivery's notification opened the application on its Attentio
     "PUSH-TAPPED" in tapped and "Attention" in tapped, tapped[:200].replace("\n", " "))
 say("the person answered from there, and the worker's ledger holds the answer as this paired device's (09.21)",
     report.get("question_answered_from_the_notification") is True and report.get("answer_is_the_paired_devices") is True)
-late_send = report.get("late_send_step") or ""
-say("a second question answered at the host first: the phone's answer was refused and the page says the question is no longer waiting (09.21)",
-    report.get("second_resolved_at_the_host") is True and "No longer waiting" in late_send, late_send[:300].replace("\n", " "))
+late_seen = report.get("late_observe_step") or ""
+say("a second question answered at the host while the person had chosen an answer to it: the phone no longer offers it to send, and says nothing is waiting or that the question is no longer waiting (09.21)",
+    report.get("second_resolved_at_the_host") is True and "PUSH-ENDED" in late_seen and "Send answer" not in late_seen,
+    late_seen[:300].replace("\n", " "))
 say("and the host's answer is the one the worker keeps (09.21)", report.get("host_answer_kept") is True)
 
 if report.get("later_phases_ran") is not True:
@@ -413,7 +414,7 @@ pump_android() { # <adb> <serial>
                 sleep 1
             done
             "$adb" -s "$serial" shell input keyevent KEYCODE_HOME >/dev/null 2>&1
-            "$adb" -s "$serial" shell am kill "$app_id" >/dev/null 2>&1
+            "$adb" -s "$serial" shell am force-stop "$app_id" >/dev/null 2>&1
             echo "pid before the message: '$("$adb" -s "$serial" shell pidof "$app_id" | tr -d '\r')'" >"$artefacts/cold-start.txt"
         fi
         "$adb" -s "$serial" shell "run-as $app_id sh" <"$harness/inject-$n.sh" >"$harness/inject-$n.out" 2>&1
@@ -477,13 +478,16 @@ android_launch() { # <adb> <serial> <name> <json fields>
 # and chooses an answer; for `send` it then sends it. What the phone showed is written to the step's
 # done file.
 action_android() { # <adb> <serial> <step> <words of the question> <choice> <send|stop>
-    local adb="$1" serial="$2" step="$3" words="$4" choice="$5" ending="$6" alert out="$harness/done-$3.tmp"
+    local adb="$1" serial="$2" step="$3" words="$4" choice="$5" ending="$6" alert out="$harness/done-$3.tmp" blind=""
     alert="$(python3 "$here/scripts/lib/push-inject.py" alert "$(ls -t "$harness"/inject-*.json | head -1)")"
+    # The first sheet the application opens is not always in the tree the web view hands over, so
+    # the person who answers from it presses where the form draws its choices.
+    [ "$ending" = send ] && blind=blind
     : >"$out"
-    python3 "$here/scripts/lib/push-android.py" tap "$adb" "$serial" "$shots" "$alert" >>"$out" 2>&1 \
-        && python3 "$here/scripts/lib/push-android.py" choose "$adb" "$serial" "$shots" "$words" "$choice" >>"$out" 2>&1
-    if [ "$ending" = send ]; then
-        python3 "$here/scripts/lib/push-android.py" send "$adb" "$serial" "$shots" >>"$out" 2>&1
+    if python3 "$here/scripts/lib/push-android.py" tap "$adb" "$serial" "$shots" "$alert" >>"$out" 2>&1 \
+        && python3 "$here/scripts/lib/push-android.py" choose "$adb" "$serial" "$shots" "$words" "$choice" $blind >>"$out" 2>&1 \
+        && [ "$ending" = send ]; then
+        python3 "$here/scripts/lib/push-android.py" send "$adb" "$serial" "$shots" $blind >>"$out" 2>&1
     fi
     mv "$out" "$harness/done-$step"
 }
@@ -509,12 +513,10 @@ steps_android() { # <adb> <serial>
             : >"$harness/started-late"
             action_android "$adb" "$serial" late "A question is waiting for an answer" "Yes" stop
         fi
-        if [ -e "$harness/step-late-send.json" ] && [ ! -e "$harness/started-late-send" ]; then
-            : >"$harness/started-late-send"
-            "$adb" -s "$serial" shell input keyevent KEYCODE_HOME >/dev/null 2>&1
-            "$adb" -s "$serial" shell am start -n "$app_id/.MainActivity" >/dev/null 2>&1
-            python3 "$here/scripts/lib/push-android.py" send "$adb" "$serial" "$shots" >"$harness/done-late-send.tmp" 2>&1
-            mv "$harness/done-late-send.tmp" "$harness/done-late-send"
+        if [ -e "$harness/step-late-observe.json" ] && [ ! -e "$harness/started-late-observe" ]; then
+            : >"$harness/started-late-observe"
+            python3 "$here/scripts/lib/push-android.py" observe "$adb" "$serial" "$shots" >"$harness/done-late-observe.tmp" 2>&1
+            mv "$harness/done-late-observe.tmp" "$harness/done-late-observe"
         fi
         if [ -e "$harness/step-newtoken.json" ] && [ ! -e "$harness/started-newtoken" ]; then
             : >"$harness/started-newtoken"
@@ -735,10 +737,10 @@ steps_ios() { # <udid>
             out="$(act_ios tap; act_ios choose)"
             printf '%s\n' "$out" >"$harness/done-late.tmp" && mv "$harness/done-late.tmp" "$harness/done-late"
         fi
-        if [ -e "$harness/step-late-send.json" ] && [ ! -e "$harness/started-late-send" ]; then
-            : >"$harness/started-late-send"
-            out="$(act_ios send)"
-            printf 'PUSH-SENT %s\n' "$out" >"$harness/done-late-send.tmp" && mv "$harness/done-late-send.tmp" "$harness/done-late-send"
+        if [ -e "$harness/step-late-observe.json" ] && [ ! -e "$harness/started-late-observe" ]; then
+            : >"$harness/started-late-observe"
+            out="$(act_ios observe)"
+            printf 'PUSH-ENDED %s\n' "$out" >"$harness/done-late-observe.tmp" && mv "$harness/done-late-observe.tmp" "$harness/done-late-observe"
         fi
         if [ -e "$harness/step-reissue.json" ] && [ ! -e "$harness/started-reissue" ]; then
             : >"$harness/started-reissue"
