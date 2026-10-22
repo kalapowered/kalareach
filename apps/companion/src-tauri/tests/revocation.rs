@@ -1750,8 +1750,7 @@ async fn the_host_on_this_computer_takes_the_revocation_itself_and_its_answer_is
             && reasons[0].ends_with("on this computer"),
         "the dialog reads as a sentence about this computer: {reasons:?}"
     );
-    // Settings sync is told, and takes the device out of the settings it shares: the connection it
-    // would ask the host over is the one the revocation withdrew.
+    // Settings sync is told, and takes the device out of the settings it shares.
     rig.settings_sync_hears_of(&rig.phone).await;
     let again = rig
         .revoke(
@@ -1963,11 +1962,23 @@ async fn a_direct_revocation_is_told_to_settings_sync_though_the_view_after_it_c
     let local = host_by(&view, "direct");
     let phone = the_phone(&local);
 
-    let after = rig
-        .revoke(
-            local["reference"].as_str().expect("a reference"),
-            phone["reference"].as_str().expect("a reference"),
-        )
+    // While the person is at the dialog the host moves to a revision of the whole host, which
+    // withdraws the connection this computer holds. The revocation goes over the one the host
+    // admits then, and the view that follows has no other to ask over.
+    let (shown, release) = rig.ceremony.hold_the_dialog();
+    let revoking = rig.app.start_call(
+        "revocation_revoke",
+        json!({ "host": local["reference"], "device": phone["reference"] }),
+    );
+    tokio::time::timeout(WATCHDOG, shown.notified())
+        .await
+        .expect("the dialog is shown");
+    the_host_narrows_its_rights_ceiling(&rig).await;
+    release.notify_one();
+    let after = tokio::time::timeout(WATCHDOG, revoking)
+        .await
+        .expect("the call ends")
+        .expect("the call ends")
         .expect("the host on this computer revokes the device");
     assert_eq!(
         host_by(&after, "direct")["contact"],
@@ -2031,7 +2042,7 @@ async fn a_device_the_host_on_this_computer_lists_as_revoked_is_taken_out_of_the
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_host_on_this_computer_takes_a_second_revocation_though_the_first_withdrew_the_connection()
+async fn the_host_on_this_computer_takes_a_second_revocation_though_a_revision_withdrew_the_connection()
  {
     let rig = Rig::start().await;
     rig.pairs_another().await;
@@ -2055,9 +2066,12 @@ async fn the_host_on_this_computer_takes_a_second_revocation_though_the_first_wi
     let local = host_by(&view, "direct");
     let phones = the_phones(&local);
     assert_eq!(phones.len(), 2, "two devices are paired: {local}");
-    for phone in &phones {
-        // Each revocation withdraws the connection the host admitted before it, and the next goes
-        // over the one the host admits then.
+    for (nth, phone) in phones.iter().enumerate() {
+        // A revision of the whole host between the two withdraws the connection the host admitted
+        // before it, and the second revocation goes over the one the host admits then.
+        if nth == 1 {
+            the_host_narrows_its_rights_ceiling(&rig).await;
+        }
         let done = rig
             .revoke(
                 local["reference"].as_str().expect("a reference"),
@@ -2074,6 +2088,11 @@ async fn the_host_on_this_computer_takes_a_second_revocation_though_the_first_wi
         );
     }
     assert_eq!(rig.ceremony.reasons().len(), 2);
+    assert_eq!(
+        rig.app.app.state::<AppState>().connection_state().replaced,
+        1,
+        "the connection the revision withdrew was replaced once, and the first revocation withdrew none"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2133,31 +2152,9 @@ async fn a_host_on_this_computer_whose_connection_cannot_be_replaced_is_not_said
     rig.app.app.state::<AppState>().connected(connection);
     assert_eq!(host_by(&rig.view().await, "direct")["contact"], "answered");
 
-    // The owner at the machine revokes a device, which withdraws the connection this one was
+    // The host moves to a revision of the whole host, which withdraws the connection this one was
     // admitted on. The host says so, which says nothing of what this computer may do there.
-    let phone = rig
-        .host
-        .controller()
-        .devices()
-        .devices()
-        .expect("the device directory answers")
-        .into_iter()
-        .find(|record| {
-            record.is_paired()
-                && Some(record.device_id) != rig.host.owner.as_ref().map(|owner| owner.device_id)
-        })
-        .expect("the paired device");
-    let mut client = rig.host.client().await;
-    let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
-        rig.host.environment_id,
-        &mut client,
-        kr_protocol::method::Method::DeviceRevoke,
-        &kr_protocol::sharing::DeviceRevokeParams {
-            device_id: phone.device_id,
-        },
-    )
-    .await
-    .expect("the owner at the machine revokes the device");
+    the_host_narrows_its_rights_ceiling(&rig).await;
 
     let after = host_by(&rig.view().await, "direct");
     assert_eq!(
@@ -2430,8 +2427,9 @@ async fn held_connection(rig: &Rig) -> companion_tauri::connection::Connection {
     connection
 }
 
-/// The owner at the machine revokes the paired device over a connection of its own, which
-/// withdraws the connections the host admitted before: this computer's is one of them.
+/// The owner at the machine revokes the paired device over a connection of its own. The revocation
+/// names that device, so the host withdraws its connections and no other's: this computer's
+/// connection goes on being admitted.
 async fn the_owner_at_the_machine_revokes_the_paired_device(rig: &Rig) {
     let phone = rig
         .host
@@ -2456,6 +2454,45 @@ async fn the_owner_at_the_machine_revokes_the_paired_device(rig: &Rig) {
     )
     .await
     .expect("the owner at the machine revokes the device");
+}
+
+/// The host's rights ceiling is narrowed by one right in its configuration document, which the host
+/// puts in force as it does an edit made at its machine. The right left out is one these cases do
+/// not use: nobody loses anything, but a ceiling that moves is a revision of the whole host, which
+/// the revocation of one device is not. The host withdraws every connection it admitted before it,
+/// this computer's among them. Each call leaves out the last right the ceiling still names.
+async fn the_host_narrows_its_rights_ceiling(rig: &Rig) {
+    let path = kr_worker::config::document_path(&rig.host.tree().environment());
+    let mut document = kr_protocol::hostinfo::configuration::load(Some(
+        &std::fs::read(&path).expect("the host's configuration document"),
+    ))
+    .document
+    .expect("a document the host can use");
+    let mut ceiling = document.ceilings.grant_rights.0.unwrap_or_else(|| {
+        ActionRight::ALL
+            .iter()
+            .map(|right| right.as_str().to_owned())
+            .collect()
+    });
+    ceiling.pop();
+    document.revision += 1;
+    document.ceilings.grant_rights = Nullable::some(ceiling);
+    kr_ipc::paths::write_owner_only_file(
+        &path,
+        kr_protocol::hostinfo::configuration::contents(&document).as_bytes(),
+    )
+    .expect("the document is written");
+    let before = rig.host.controller().policy().authority_revision();
+    let effective = rig.host.controller().effective_configuration().await;
+    assert!(
+        effective.not_in_force.0.is_none(),
+        "the host puts the document in force: {:?}",
+        effective.not_in_force
+    );
+    assert!(
+        rig.host.controller().policy().authority_revision().get() > before.get(),
+        "the ceiling that moved is a new revision of the host"
+    );
 }
 
 /// Ends the task that keeps the application's connection to the host when a case ends, so that
@@ -2541,7 +2578,7 @@ async fn a_connection_the_host_withdrew_is_replaced_whichever_way_the_applicatio
         .expect("the host answers on the connection it admitted");
     assert_eq!(state.connection_state().replaced, 0);
 
-    the_owner_at_the_machine_revokes_the_paired_device(&rig).await;
+    the_host_narrows_its_rights_ceiling(&rig).await;
 
     // The host keeps the connection and refuses what is asked over it, which is its way of saying
     // to open another. A request made straight over the session, as any path of the application may
@@ -2593,7 +2630,7 @@ async fn a_view_of_the_hosts_replaces_a_connection_the_host_withdrew_before_anyt
     let held = held_connection(&rig).await;
     let state = rig.app.app.state::<AppState>();
 
-    the_owner_at_the_machine_revokes_the_paired_device(&rig).await;
+    the_host_narrows_its_rights_ceiling(&rig).await;
 
     // The view asks the host for its devices, is told to open another connection, does, and the
     // application keeps that one.
@@ -2616,7 +2653,7 @@ async fn a_view_over_a_copy_of_a_connection_that_was_replaced_still_lists_the_ho
     // What a revocation holds while the person is at the ceremony: a copy of the connection.
     let copy = state.connection().expect("connected");
 
-    the_owner_at_the_machine_revokes_the_paired_device(&rig).await;
+    the_host_narrows_its_rights_ceiling(&rig).await;
     // Another look at the hosts replaces the connection, which ends the one the copy is.
     assert_eq!(host_by(&rig.view().await, "direct")["contact"], "answered");
     assert!(
@@ -2640,6 +2677,55 @@ async fn a_view_over_a_copy_of_a_connection_that_was_replaced_still_lists_the_ho
         direct.contact,
         companion_tauri::revocation::Contact::Answered,
         "a connection that ended says nothing of the host"
+    );
+}
+
+/// KR-REQ-10.45: revoking a device names that device, so it takes nothing from the devices it does
+/// not name. The owner at the host's machine revokes the phone, and this computer's own connection
+/// to the host stays admitted: the host answers on that same connection, the application is never
+/// refused on it and opens no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoking_the_phone_leaves_this_computers_own_connection_admitted_and_answering() {
+    use kr_protocol::hostinfo::HostInfoResult;
+    use kr_protocol::method::Method;
+
+    let rig = Rig::start().await;
+    rig.host_polls().await;
+    let reopens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _keeper = keeps_its_connection(&rig, Arc::clone(&reopens)).await;
+    let state = rig.app.app.state::<AppState>();
+    let held = state.session().expect("connected");
+    let _: HostInfoResult = held
+        .read(Method::HostInfo, &json!({}))
+        .await
+        .expect("the host answers on the connection it admitted");
+
+    the_owner_at_the_machine_revokes_the_paired_device(&rig).await;
+
+    let _: HostInfoResult = held
+        .read(Method::HostInfo, &json!({}))
+        .await
+        .expect("the host answers on the connection the revocation did not name");
+    rig.app
+        .call("host_info", json!({}))
+        .expect("a command goes through on it");
+    let view = rig.view().await;
+    let direct = host_by(&view, "direct");
+    assert_eq!(direct["contact"], "answered", "{direct}");
+    assert_eq!(
+        the_phone(&direct)["standing"]["state"],
+        "revoked",
+        "the host lists the phone as revoked: {direct}"
+    );
+    assert!(
+        Arc::ptr_eq(&state.session().expect("connected"), &held),
+        "the application still holds the connection it had"
+    );
+    assert_eq!(state.connection_state().replaced, 0, "nothing was replaced");
+    assert_eq!(
+        reopens.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no other connection was opened"
     );
 }
 
