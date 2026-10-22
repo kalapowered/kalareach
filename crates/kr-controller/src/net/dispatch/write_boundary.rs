@@ -1259,27 +1259,13 @@ async fn a_diagnostics_answer_is_written_with_the_metrics_only_under_a_decision_
     controller
         .metrics()
         .adapter_failed(Adapter::Codex, MetricOutcome::Unavailable);
-    let connection_with = |byte: u8, actions: &[ActionRight]| {
-        let (mut grant, _) = super::super::tests::granted(
-            kr_protocol::grant::GrantExpiry::Never,
-            controller.policy().authority_revision(),
-        );
-        grant.actions = actions.iter().copied().collect();
-        let mut device = record_for(&grant);
-        device.endpoint_id = kr_protocol::scalars::EndpointKey::from_bytes([byte; 32]);
-        device.authorisation = kr_protocol::scalars::AuthorisationKey::from_bytes([byte; 32]);
-        controller.devices().commit(&device).expect("paired");
-        let recording = Arc::new(Recording::default());
-        let connection = super::RemoteConnection::for_test_writing_to(
-            &controller,
-            device,
-            Box::new(Arc::clone(&recording)),
-        );
-        (connection, recording)
-    };
-    let (managing, kept_by_the_manager) =
-        connection_with(61, &[ActionRight::SessionView, ActionRight::HostManage]);
-    let (viewing, kept_by_the_viewer) = connection_with(62, &[ActionRight::SessionView]);
+    let (managing, kept_by_the_manager) = paired_connection(
+        &controller,
+        61,
+        &[ActionRight::SessionView, ActionRight::HostManage],
+    );
+    let (viewing, kept_by_the_viewer) =
+        paired_connection(&controller, 62, &[ActionRight::SessionView]);
 
     // The answer is read under the decision that holds the right, and carries the count.
     let read = managing
@@ -1322,6 +1308,92 @@ async fn a_diagnostics_answer_is_written_with_the_metrics_only_under_a_decision_
         "written under one that does not, it says the host withholds its metrics"
     );
     drop(controller);
+}
+
+/// A device paired with `actions`, under the endpoint and key `byte` makes, and a connection of its
+/// own that records what it is written.
+fn paired_connection(
+    controller: &Arc<Controller>,
+    byte: u8,
+    actions: &[ActionRight],
+) -> (super::RemoteConnection, Arc<Recording>) {
+    let (mut grant, _) = super::super::tests::granted(
+        kr_protocol::grant::GrantExpiry::Never,
+        controller.policy().authority_revision(),
+    );
+    grant.actions = actions.iter().copied().collect();
+    let mut device = record_for(&grant);
+    device.endpoint_id = kr_protocol::scalars::EndpointKey::from_bytes([byte; 32]);
+    device.authorisation = kr_protocol::scalars::AuthorisationKey::from_bytes([byte; 32]);
+    controller.devices().commit(&device).expect("paired");
+    let recording = Arc::new(Recording::default());
+    let connection = super::RemoteConnection::for_test_writing_to(
+        controller,
+        device,
+        Box::new(Arc::clone(&recording)),
+    );
+    (connection, recording)
+}
+
+/// KR-REQ-26.43: a caller that is given no counts costs no worker a read. A diagnostics request of
+/// a device that does not manage the host is answered that the metrics are withheld without any
+/// worker being asked, and one of a device that does is answered with the counts, which it reads
+/// from each worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_diagnostics_request_reads_the_workers_only_for_a_caller_that_is_given_their_counts() {
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use kr_protocol::metrics::HostMetrics;
+
+    let recorded: fake::Recorded = Arc::default();
+    let world = fake::fake_worker(Some(Arc::clone(&recorded))).await;
+    let controller = &world.controller;
+    let (viewing, _) = paired_connection(controller, 62, &[ActionRight::SessionView]);
+    let (managing, _) = paired_connection(
+        controller,
+        61,
+        &[ActionRight::SessionView, ActionRight::HostManage],
+    );
+    let worker_reads = || {
+        recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|frame| {
+                matches!(frame, ControlFrame::Request(request)
+                    if request.method == Method::SessionRead.into())
+            })
+            .count()
+    };
+
+    let before = worker_reads();
+    let to_the_viewer = viewing
+        .answer_now(ControlFrame::Request(diagnostics(1)))
+        .await
+        .expect("an answer");
+    assert_eq!(
+        metrics_in(to_the_viewer.frame()),
+        Some(HostMetrics::Withheld),
+        "a device that does not manage the host is told the metrics are withheld"
+    );
+    assert_eq!(
+        worker_reads(),
+        before,
+        "and no worker was asked for what it would not be given"
+    );
+
+    let to_the_manager = managing
+        .answer_now(ControlFrame::Request(diagnostics(2)))
+        .await
+        .expect("an answer");
+    assert!(
+        matches!(
+            metrics_in(to_the_manager.frame()),
+            Some(HostMetrics::Counted(_))
+        ),
+        "a device that manages the host is given the counts"
+    );
+    assert!(worker_reads() > before, "which the workers were asked for");
+    drop(world);
 }
 
 /// A diagnostics request of a paired device.

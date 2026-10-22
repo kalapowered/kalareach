@@ -28937,6 +28937,17 @@ export interface SessionReadResult {
    */
   launch_profile: LaunchProfile1 | null
   /**
+   * What this worker has counted of the host's own metrics: the faults its session's terminal
+   * parser met and the failures of the adapters it brokers.
+   *
+   * Absent from the wire when the worker has counted nothing, and from a worker of a release
+   * that wrote no such member, so a result of one is byte for byte what that release reads. The
+   * totals are cumulative for the life of the worker, which is the life of the session. The
+   * labels are words the worker spells and the daemon reads against its own lists, so a word
+   * added to those lists later changes nothing in this member.
+   */
+  metrics?: WorkerMetrics | null
+  /**
    * How many `shell.launch` confirmations this session is still waiting on its reader for.
    *
    * Work this host has admitted and not finished: a launch is with the reader, and the caller
@@ -28977,6 +28988,57 @@ export interface LaunchProfile1 {
    * Which startup files the root shell reads.
    */
   startup: 'host_default' | 'interactive' | 'login'
+}
+/**
+ * What a worker tells the daemon that reads it of the host's own metrics, in an open form.
+ *
+ * The worker and the daemon are two programs that may be two releases. A label here is a word the
+ * worker spells, and the daemon keeps it only where this build has the word in its own closed
+ * list ([`WorkerMetrics::read`]): a connector the product bundles later, or a class of fault added
+ * later, is a word an older daemon leaves out and an older worker never says, and neither changes
+ * what the two can exchange. The environment a count was made in is the daemon's, not the
+ * worker's to say.
+ */
+export interface WorkerMetrics {
+  /**
+   * Every adapter.failure series.
+   */
+  adapter_failure?: WorkerAdapterCount[]
+  /**
+   * Every terminal.parse_fault series.
+   */
+  terminal_parse_fault?: WorkerFaultCount[]
+}
+/**
+ * How many times one adapter has failed in one way, as a worker says it.
+ */
+export interface WorkerAdapterCount {
+  /**
+   * The adapter.
+   */
+  adapter: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  count: string
+  /**
+   * How it ended.
+   */
+  outcome: string
+}
+/**
+ * How many sequences of one class of fault a session's terminal parser has met, as a worker says
+ * it: the class is the word it spells it, which the daemon reads against its own list.
+ */
+export interface WorkerFaultCount {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  count: string
+  /**
+   * The class of fault.
+   */
+  fault: string
 }
 /**
  * What a client knows about one session.

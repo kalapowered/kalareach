@@ -3470,7 +3470,13 @@ of them. The counts are taken out where the answer is written, under the decisio
 under, so a grant that stops holding the right while the answer waits does not send them.
 
 The daemon counts the gaps between a device's connections. Each session's worker counts the faults
-its terminal's parser met and the failures of the adapters it runs, for the life of its session.
+its terminal's parser met and the failures of the adapters it runs, for the life of its session,
+and says them in words that the daemon reads against its own lists and leaves out where it has no
+entry for the word. When `kr doctor` asks, or a device that manages the host does, the daemon reads
+every running worker at once, each for no longer than a worker exchange, and adds what they say to
+its own counts; for a caller that is given no counts it asks no worker. A worker that does not
+answer in time is left out of that reading and counted in the next, and a session that has closed
+takes its counts with it.
 
 | Metric | Unit | What it counts | Labels |
 | --- | --- | --- | --- |

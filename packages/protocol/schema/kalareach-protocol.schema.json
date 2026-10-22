@@ -36872,6 +36872,17 @@
           ],
           "description": "How this session starts its root shell and what may be launched inside it.\n\nNull where the host does not say, which is not the same as a session without a profile: a\nsession that has already closed, whose profile decides nothing any more, and a live session\nwhose worker is from a build that did not report one."
         },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerMetrics"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What this worker has counted of the host's own metrics: the faults its session's terminal\nparser met and the failures of the adapters it brokers.\n\nAbsent from the wire when the worker has counted nothing, and from a worker of a release\nthat wrote no such member, so a result of one is byte for byte what that release reads. The\ntotals are cumulative for the life of the worker, which is the life of the session. The\nlabels are words the worker spells and the daemon reads against its own lists, so a word\nadded to those lists later changes nothing in this member."
+        },
         "outstanding_launches": {
           "anyOf": [
             {
@@ -41023,6 +41034,30 @@
         }
       ]
     },
+    "WorkerAdapterCount": {
+      "additionalProperties": false,
+      "description": "How many times one adapter has failed in one way, as a worker says it.",
+      "properties": {
+        "adapter": {
+          "description": "The adapter.",
+          "type": "string"
+        },
+        "count": {
+          "$ref": "#/$defs/U64",
+          "description": "How many times."
+        },
+        "outcome": {
+          "description": "How it ended.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "adapter",
+        "outcome",
+        "count"
+      ],
+      "type": "object"
+    },
     "WorkerBarrier": {
       "additionalProperties": false,
       "description": "One worker's half of a revocation barrier.",
@@ -41159,6 +41194,25 @@
       ],
       "type": "object"
     },
+    "WorkerFaultCount": {
+      "additionalProperties": false,
+      "description": "How many sequences of one class of fault a session's terminal parser has met, as a worker says\nit: the class is the word it spells it, which the daemon reads against its own list.",
+      "properties": {
+        "count": {
+          "$ref": "#/$defs/U64",
+          "description": "How many."
+        },
+        "fault": {
+          "description": "The class of fault.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "fault",
+        "count"
+      ],
+      "type": "object"
+    },
     "WorkerLaunchSpec": {
       "additionalProperties": false,
       "description": "What the controller tells a worker to become, over the private rendezvous channel.\n\nThe job definition that started the worker carries only non-secret facts: the reservation, the\nrendezvous address and the runtime directory. Everything else arrives here, after the worker\nhas proved which reservation it belongs to, so a creator's environment snapshot never sits in\nan argument vector or an environment variable where another process could read it.",
@@ -41278,6 +41332,29 @@
         "environment_origin",
         "environment_additions"
       ],
+      "type": "object"
+    },
+    "WorkerMetrics": {
+      "additionalProperties": false,
+      "description": "What a worker tells the daemon that reads it of the host's own metrics, in an open form.\n\nThe worker and the daemon are two programs that may be two releases. A label here is a word the\nworker spells, and the daemon keeps it only where this build has the word in its own closed\nlist ([`WorkerMetrics::read`]): a connector the product bundles later, or a class of fault added\nlater, is a word an older daemon leaves out and an older worker never says, and neither changes\nwhat the two can exchange. The environment a count was made in is the daemon's, not the\nworker's to say.",
+      "properties": {
+        "adapter_failure": {
+          "default": [],
+          "description": "Every adapter.failure series.",
+          "items": {
+            "$ref": "#/$defs/WorkerAdapterCount"
+          },
+          "type": "array"
+        },
+        "terminal_parse_fault": {
+          "default": [],
+          "description": "Every terminal.parse_fault series.",
+          "items": {
+            "$ref": "#/$defs/WorkerFaultCount"
+          },
+          "type": "array"
+        }
+      },
       "type": "object"
     },
     "WorkerProfile": {
