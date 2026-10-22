@@ -21,10 +21,10 @@ use kr_crypto::keys::DeviceKeys;
 use kr_protocol::admission::RevocationPolicy;
 use kr_protocol::desktop::{CapabilityInvalidation, SleepInhibitionSetting};
 use kr_protocol::envelope::ParamsValue;
-use kr_protocol::hostinfo::HostDoctorResult;
 use kr_protocol::hostinfo::configuration::{
     Change, ConfigurationDocument, DocumentState, SecretReference, ValueEffect, ValueSource,
 };
+use kr_protocol::hostinfo::{HostDoctorResult, HostInfoResult};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Nullable;
@@ -3184,11 +3184,11 @@ fn record_unreachable_worker(
     reservation.session_id
 }
 
-/// A document of level 6: a setting this build knows, a ceiling, and two sections of a newer
+/// A document of level 7: a setting this build knows, a ceiling, and two sections of a newer
 /// release, one whose name looks like a credential.
 const AT_A_HIGHER_LEVEL: &[u8] = br#"{
   "version": 3,
-  "level": 6,
+  "level": 7,
   "revision": 5,
   "preferences": { "sleep_inhibition": "battery_too" },
   "ceilings": { "session_limit": 4 },
@@ -3259,7 +3259,7 @@ async fn a_document_at_a_higher_level_applies_its_known_members_and_reports_the_
     assert_eq!(check.status, kr_protocol::hostinfo::DoctorStatus::Warning);
     let said = check.detail();
     assert!(
-        said.contains("level 6") && said.contains("reads level 5") && said.contains("2 members"),
+        said.contains("level 7") && said.contains("reads level 6") && said.contains("2 members"),
         "the levels and the count: {said}"
     );
     assert!(check.remedy().is_some(), "and what to do about it");
@@ -3296,7 +3296,7 @@ async fn a_document_at_a_higher_level_applies_its_known_members_and_reports_the_
         .expect_err("an edit of a document above this build's level is refused");
     let said = format!("{refused}");
     assert!(
-        said.contains("level 6") && said.contains("nothing was written"),
+        said.contains("level 7") && said.contains("nothing was written"),
         "{said}"
     );
     assert_eq!(std::fs::read(&path).expect("the document"), before);
@@ -3593,6 +3593,76 @@ async fn a_document_that_names_a_test_suite_is_accepted_with_its_section() {
         kr_protocol::hostinfo::configuration::load(Some(&file)).document,
         "the copy is the file's reading"
     );
+}
+
+/// A document of level 6 that chooses a stock shell for the sessions that name no mode.
+const WITH_A_SHELL_MODE: &[u8] = br#"{
+  "version": 3,
+  "level": 6,
+  "revision": 5,
+  "shell": { "mode": "native_compat" }
+}"#;
+
+/// KR-REQ-26.13: what a host answers to `host.info` about the shell mode it creates a session in
+/// when the request names none is its own resolution, with the rung it came from, and a client
+/// uses it instead of a default of its own: the product default, the managed shell, until the
+/// per-user host configuration chooses another, and then the choice. A document at this build's
+/// level is accepted with the section, and the registry's copy states the choice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_says_the_shell_mode_it_creates_sessions_in_and_where_that_came_from() {
+    use kr_protocol::hostinfo::{DefaultShellMode, configuration::ValueSource};
+    use kr_protocol::session::ShellMode;
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let environment = host.tree().environment();
+    let info = |host: &Host| {
+        let host = host.client();
+        async move {
+            let mut local = host.await;
+            let info: HostInfoResult = typed(
+                &local
+                    .request(Method::HostInfo, &())
+                    .await
+                    .expect("the call reaches the daemon")
+                    .expect("host.info is served on the local socket"),
+            );
+            info
+        }
+    };
+
+    assert_eq!(
+        info(&host).await.default_shell_mode,
+        Some(DefaultShellMode {
+            mode: ShellMode::Managed,
+            source: ValueSource::Default,
+        }),
+        "nothing chosen: the managed shell, which section 7 makes the default"
+    );
+
+    write_document_bytes(&environment, WITH_A_SHELL_MODE);
+    let host = host.restart().await;
+    assert_eq!(
+        info(&host).await.default_shell_mode,
+        Some(DefaultShellMode {
+            mode: ShellMode::NativeCompat,
+            source: ValueSource::HostConfiguration,
+        }),
+        "the owner's choice in the host configuration"
+    );
+
+    let stopped = host.shut_down().await;
+    let database = stopped.tree().environment().registry_database();
+    let connection = rusqlite::Connection::open(&database).expect("the registry file");
+    let record: Option<String> = connection
+        .query_row("SELECT accepted_document FROM environment", [], |row| {
+            row.get(0)
+        })
+        .expect("the accepted document");
+    drop(connection);
+    let accepted = config::from_record(record.as_deref()).expect("accepted");
+    assert_eq!(accepted.level, 6);
+    assert_eq!(accepted.shell.mode(), Some(ShellMode::NativeCompat));
 }
 
 /// The key of the report's row of ignored members.

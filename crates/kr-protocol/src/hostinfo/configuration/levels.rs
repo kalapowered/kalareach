@@ -25,7 +25,7 @@ use crate::hostinfo::export::{ContentClass, Sentence};
 pub const BASE_LEVEL: u64 = 1;
 
 /// The highest level this build reads.
-pub const LEVEL: u64 = 5;
+pub const LEVEL: u64 = 6;
 
 /// How many edits apart a member of a document above the reader's level may be from a name this
 /// build knows before it is taken for a misspelling of that name rather than a member of a newer
@@ -90,6 +90,10 @@ pub const LEVELLED: &[Levelled] = &[
     Levelled {
         member: "automation",
         level: 5,
+    },
+    Levelled {
+        member: "shell",
+        level: 6,
     },
 ];
 

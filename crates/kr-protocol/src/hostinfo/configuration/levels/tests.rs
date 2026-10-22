@@ -15,6 +15,7 @@ use crate::hostinfo::configuration::{
 };
 use crate::hostinfo::export::Sentence;
 use crate::scalars::Nullable;
+use crate::session::ShellMode;
 
 const R1: Release = Release {
     level: 1,
@@ -103,6 +104,34 @@ const BEFORE_AUTOMATION: Release = Release {
         Levelled {
             member: "automation",
             level: 5,
+        },
+    ],
+};
+
+/// A release that reads level 5 and predates the shell section: it takes the section for a member
+/// of a newer release.
+const BEFORE_SHELL: Release = Release {
+    level: 5,
+    levelled: &[
+        Levelled {
+            member: "authority",
+            level: 2,
+        },
+        Levelled {
+            member: "mailbox",
+            level: 3,
+        },
+        Levelled {
+            member: "relay",
+            level: 4,
+        },
+        Levelled {
+            member: "automation",
+            level: 5,
+        },
+        Levelled {
+            member: "shell",
+            level: 6,
         },
     ],
 };
@@ -1048,6 +1077,139 @@ fn a_named_suite_survives_the_file_and_the_registrys_copy() {
     for stray in [
         r#"{"version": 3, "level": 5, "automation": {"test_suites": {}, "region": "eu"}}"#,
         r#"{"version": 3, "level": 5, "automation": {"test_suites": {"unit": {"command": "true", "shell": "zsh"}}}}"#,
+    ] {
+        assert_eq!(
+            load_in(Some(stray.as_bytes()), &THIS_RELEASE).status.state,
+            DocumentState::Invalid,
+            "{stray}"
+        );
+    }
+}
+
+/// A document that chooses a default shell mode, as this build writes it.
+fn with_a_shell_mode() -> ConfigurationDocument {
+    let mut document = ConfigurationDocument::empty();
+    document.shell.mode = Nullable::some(ShellMode::NativeCompat);
+    document.ceilings.session_limit = Nullable::some(4);
+    document
+}
+
+/// The shell section is a section of level 6, and a writer stamps the highest level among the
+/// sections the document holds. A document that holds only an automation suite stays at level 5,
+/// so a release that reads level 5 still reads and edits it; one that chooses no mode is written
+/// without the section.
+#[test]
+fn a_document_with_no_shell_section_is_stamped_below_the_sections_level() {
+    let mut suite_only = ConfigurationDocument::empty();
+    suite_only.automation.test_suites =
+        Nullable::some([("unit".to_owned(), a_suite())].into_iter().collect());
+    let written = contents_in(&suite_only, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 5, "{written}");
+    assert!(json(&written).get("shell").is_none(), "{written}");
+
+    let mut both = suite_only;
+    both.shell.mode = Nullable::some(ShellMode::Managed);
+    let written = contents_in(&both, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 6, "{written}");
+    assert_eq!(json(&written)["shell"]["mode"], "managed", "{written}");
+    assert_eq!(
+        json(&written)["automation"]["test_suites"]["unit"]["command"],
+        "cargo test --workspace",
+        "{written}"
+    );
+}
+
+/// A release that reads level 5 takes the shell section for a section of a newer release: it
+/// applies every member it knows, leaves the section out, counts and names it, does not fail
+/// closed, and does not edit the document. Without the section it creates a session in the mode
+/// its own command names.
+#[test]
+fn a_release_at_level_5_ignores_the_shell_section_and_applies_the_rest() {
+    let mut document = with_a_shell_mode();
+    document.relay.origin = Nullable::some(FEED.to_owned());
+    let written = contents_in(&document, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 6, "{written}");
+
+    let loaded = load_in(Some(written.as_bytes()), &BEFORE_SHELL);
+    assert_eq!(
+        loaded.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        loaded.status
+    );
+    assert!(!loaded.fails_closed());
+    assert_eq!(
+        loaded.newer,
+        Some(Newer {
+            declared: 6,
+            count: 1,
+            names: vec!["shell".to_owned()]
+        })
+    );
+    let used = loaded.document.as_ref().expect("the document is used");
+    assert_eq!(used.ceilings.session_limit.0, Some(4));
+    assert_eq!(used.relay.origin(), Some(FEED), "level 4 is still read");
+    assert_eq!(used.shell.mode(), None, "the section is left out");
+    assert!(matches!(
+        edit_in(&loaded, &Change::SessionLimit(Some(2)), &BEFORE_SHELL),
+        Err(EditRefused::NotOurs(_))
+    ));
+}
+
+/// The positive control of omission, and the round trip of an active value: a document that
+/// chooses no mode is written without the section and is read, and edited, by a release at level
+/// 5 as it was before the section existed; once a mode is chosen the next write is at level 6 and
+/// keeps every other member, and the choice survives the file, the typed document and the
+/// registry's copy.
+#[test]
+fn a_chosen_shell_mode_survives_the_file_and_the_registrys_copy() {
+    let mut earlier = ConfigurationDocument::empty();
+    earlier.relay.origin = Nullable::some(FEED.to_owned());
+    earlier.ceilings.session_limit = Nullable::some(4);
+    let before = contents_in(&earlier, &THIS_RELEASE);
+    assert!(json(&before).get("shell").is_none(), "{before}");
+    let read = load_in(Some(before.as_bytes()), &BEFORE_SHELL);
+    assert_eq!(read.status.state, DocumentState::Loaded);
+    assert!(
+        read.newer.is_none(),
+        "a document at the level is read strictly"
+    );
+
+    let mut document = load_in(Some(before.as_bytes()), &THIS_RELEASE)
+        .document
+        .expect("used");
+    document.shell = with_a_shell_mode().shell;
+    let written = contents_in(&document, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 6, "{written}");
+    assert_eq!(json(&written)["ceilings"]["session_limit"], 4, "{written}");
+    assert_eq!(json(&written)["relay"]["origin"], FEED, "{written}");
+
+    let read = load_in(Some(written.as_bytes()), &THIS_RELEASE);
+    assert_eq!(
+        read.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        read.status
+    );
+    let typed = read.document.expect("used");
+    assert_eq!(typed.shell.mode(), Some(ShellMode::NativeCompat));
+    assert_eq!(typed.level, 6);
+    let copy = contents_in(&typed, &THIS_RELEASE);
+    assert_eq!(
+        load_in(Some(copy.as_bytes()), &THIS_RELEASE)
+            .document
+            .as_ref(),
+        Some(&typed)
+    );
+    assert_eq!(
+        copy, written,
+        "the copy is the file's reading written again"
+    );
+
+    // The section is as strict as any other: a member it does not declare refuses the document.
+    for stray in [
+        r#"{"version": 3, "level": 6, "shell": {"mode": "managed", "fallback": true}}"#,
+        r#"{"version": 3, "level": 6, "shell": {"mode": "stock"}}"#,
     ] {
         assert_eq!(
             load_in(Some(stray.as_bytes()), &THIS_RELEASE).status.state,
