@@ -2,9 +2,11 @@
 //!
 //! The restore runs in this process. The control daemon relays the ciphertext it reads with the
 //! host's account ([`super::source`]); the kit, the seed derived from it and every plaintext stay
-//! here. Nothing is imported into the host. The files go into a folder the person made, and what
-//! comes back is data to read: no key, no grant, no device, and the host's configuration as a file
-//! and not applied.
+//! here. The files go into a folder the person made, and what comes back is data to read: no key,
+//! no grant, no device. Beyond the files the restore does two things, each shown in the plan the
+//! person confirms: it records the generation it verified in the recovery bundle at the service,
+//! and, when asked with `--apply-configuration`, it applies the device configuration in the
+//! backup to this host.
 //!
 //! The order is the library's ([`kr_client::recovery::FilesRestore`]), with this command's steps
 //! around it:
@@ -13,13 +15,17 @@
 //! 2. Privacy mode read: a restore puts content on disk outside the host's retention, so it does
 //!    not start while privacy mode is on.
 //! 3. The kit read, and shown back with echo on, so a mistyped locator shows before it is used.
-//! 4. The plan: what would be written, what is refused and why, and a digest of all of it with the
-//!    destination and the environment. The person confirms that digest: at the terminal, or by
-//!    giving it back with `--confirm-plan` after a `--preview`.
+//! 4. The plan: what would be written, what is refused and why, what the bundle will record, what
+//!    the configuration would change, and a digest of all of it with the destination and the
+//!    environment. The person confirms that digest: at the terminal, or by giving it back with
+//!    `--confirm-plan` after a `--preview`.
 //! 5. Only then the folder is opened and held, its publication probed, and each member read,
 //!    opened and written, one at a time.
 //! 6. Privacy mode read again. If it is on, or moved, the files are removed and no record is made.
 //! 7. `restore.json`, written last and given its name whole.
+//! 8. The generation is recorded in the recovery bundle (not after an export file, which reaches no
+//!    service), and the configuration is applied over the document it was planned against. Neither
+//!    undoes the files: a failure is said, and the next run can do it again.
 //!
 //! A run that fails or is interrupted before step 7 removes the files it made, by name, through
 //! the handle on the folder. A directory without `restore.json` is an incomplete restore.
@@ -35,6 +41,7 @@ use kr_client::recovery::{
 };
 use kr_client::shown;
 use kr_client::shown::{Said as _, Shown};
+use kr_crypto::backup::GenerationStanding;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::configuration::{Change, DeviceConfiguration, Loaded, edit, load};
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId};
@@ -151,8 +158,96 @@ pub struct Planned {
     folder: PathBuf,
     /// What applying the backup's configuration would do, when it was asked for.
     configuration: Asked,
-    /// The generation the bundle is to record once the files are written.
-    records: u64,
+    /// What the restore does to the recovery bundle once the files are written.
+    records: Records,
+}
+
+/// What a restore does to the recovery bundle once the files are written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Records {
+    /// The bundle is updated to record this generation as the newest this kit has verified.
+    Generation(u64),
+    /// The bundle already records this very generation, so it is left as it is.
+    AlreadyRecorded(u64),
+    /// The bundle records a newer generation, which stays: a checkpoint is never lowered.
+    KeepsNewer {
+        /// The generation restored.
+        restored: u64,
+        /// The newer generation the bundle records.
+        checkpoint: u64,
+    },
+    /// The restore read an export file and reached no service, so nothing is recorded.
+    Nothing,
+}
+
+impl Records {
+    /// What this restore does, from the generation's standing against the checkpoint and whether
+    /// it reaches the service.
+    const fn of(plan: &RestorePlan, reaches_the_service: bool) -> Self {
+        let generation = plan.generation.get();
+        if !reaches_the_service {
+            return Self::Nothing;
+        }
+        match plan.standing.standing {
+            GenerationStanding::AtCheckpoint => Self::AlreadyRecorded(generation),
+            GenerationStanding::OlderAccepted { checkpoint } => Self::KeepsNewer {
+                restored: generation,
+                checkpoint: checkpoint.get(),
+            },
+            _ => Self::Generation(generation),
+        }
+    }
+
+    /// The generation the bundle is updated to record, when it is.
+    const fn generation(self) -> Option<u64> {
+        match self {
+            Self::Generation(generation) => Some(generation),
+            Self::AlreadyRecorded(_) | Self::KeepsNewer { .. } | Self::Nothing => None,
+        }
+    }
+
+    /// The part of the confirmed digest that says what is done to the bundle.
+    fn bound(self) -> String {
+        match self {
+            Self::Generation(generation) => format!("records:{generation}"),
+            Self::AlreadyRecorded(generation) => format!("already:{generation}"),
+            Self::KeepsNewer {
+                restored,
+                checkpoint,
+            } => format!("keeps:{restored}:{checkpoint}"),
+            Self::Nothing => "none".to_owned(),
+        }
+    }
+
+    /// The plan's sentence about the bundle.
+    fn words(self) -> Shown {
+        match self {
+            Self::Generation(generation) => shown!(
+                "After the files are written, the recovery bundle at the service is updated to \
+                 record generation {} as the newest this kit has verified, so that a later \
+                 restore can tell a service that replays an older archive.",
+                generation
+            ),
+            Self::AlreadyRecorded(generation) => shown!(
+                "The recovery bundle at the service already records generation {}, so it is left \
+                 as it is.",
+                generation
+            ),
+            Self::KeepsNewer {
+                restored,
+                checkpoint,
+            } => shown!(
+                "The recovery bundle at the service keeps recording generation {} as the newest \
+                 this kit has verified; restoring generation {} does not lower it.",
+                checkpoint,
+                restored
+            ),
+            Self::Nothing => Shown::said(
+                "This restore reads an export file and reaches no service, so the recovery bundle \
+                 records nothing; restore from the service to record the generation.",
+            ),
+        }
+    }
 }
 
 /// What a restore that was asked to apply the backup's configuration found to apply.
@@ -242,12 +337,7 @@ impl Planned {
                 refusal.said()
             ));
         }
-        lines.push(shown!(
-            "After the files are written, the recovery bundle at the service is updated to record \
-             generation {} as the newest this kit has verified, so that a later restore can tell a \
-             service that replays an older archive.",
-            self.records
-        ));
+        lines.push(self.records.words());
         match &self.configuration {
             Asked::No => lines.push(Shown::said(
                 "No key, grant or device comes back, and the host's configuration, if it is in \
@@ -312,7 +402,7 @@ impl Planned {
             .with("writer_key", Shown::key_identifier(&plan.writer))
             .with("standing", Shown::restore_standing(&plan.standing))
             .with("bundle_revision", plan.bundle_revision)
-            .with("records_generation", self.records)
+            .with("records_generation", self.records.generation())
             .with(
                 "configuration_changes",
                 match &self.configuration {
@@ -477,13 +567,17 @@ pub async fn restore_with<P: Privacy, C: Conversation>(
     if after.enabled || after.generation != run.began.generation {
         return Err(moved());
     }
-    let record = serde_json::to_vec_pretty(&planned.plan.record(&planned.digest, &written))
-        .map_err(|error| {
-            CliError::Other(shown!(
-                "the record could not be encoded: {}",
-                Shown::json(&error)
-            ))
-        })?;
+    let record = serde_json::to_vec_pretty(&planned.plan.record(
+        &planned.digest,
+        &written,
+        matches!(planned.configuration, Asked::Yes(_)),
+    ))
+    .map_err(|error| {
+        CliError::Other(shown!(
+            "the record could not be encoded: {}",
+            Shown::json(&error)
+        ))
+    })?;
     let warnings = folder.publish_record(&record)?;
 
     // What the restore leaves besides the files. Neither undoes them: the record is published, and
@@ -625,6 +719,7 @@ fn plan_of(prepared: &PreparedRestore, run: &Run<'_>, configuration: Asked) -> R
     let plan = prepared.plan().clone();
     // What else the restore will do, bound into what the person confirms: the document it would
     // write, from the document it was prepared against.
+    let records = Records::of(&plan, run.bundles.is_some());
     let applying = match &configuration {
         Asked::Yes(applying) => {
             let mut bound = String::new();
@@ -635,11 +730,18 @@ fn plan_of(prepared: &PreparedRestore, run: &Run<'_>, configuration: Asked) -> R
         }
         Asked::No | Asked::NothingToApply => String::new(),
     };
+    // The digest binds both things the restore does besides the files: the bundle's record and the
+    // configuration, so a confirmation of a restore that reaches the service is not one of an
+    // offline restore, or of one that applies the configuration.
     let digest = plan
-        .digest(&run.environment, &run.destination.native_bytes(), &applying)
+        .digest(
+            &run.environment,
+            &run.destination.native_bytes(),
+            &format!("{}|{applying}", records.bound()),
+        )
         .ok_or_else(|| CliError::Other(Shown::said("the restore plan could not be encoded")))?;
     Ok(Planned {
-        records: plan.generation.get(),
+        records,
         plan,
         digest,
         folder: run.destination.path().to_path_buf(),

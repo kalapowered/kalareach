@@ -1242,6 +1242,10 @@ async fn a_service_that_offers_a_generation_older_than_the_bundles_checkpoint_is
             .is_some_and(|standing| standing.contains("was named")),
         "{plan}"
     );
+    assert!(
+        plan["records_generation"].is_null(),
+        "the bundle keeps its newer checkpoint, so the plan records nothing: {plan}"
+    );
     let digest = digest_of(&preview);
     // The confirmation is for the plan that named the generation: without the flag, the same
     // digest does not write.
@@ -1319,6 +1323,74 @@ fn export_of(world: &World, origin: &str, sealed: &Sealed) -> kr_client::recover
                 .collect(),
         }),
     )
+}
+
+/// KR-REQ-20.18 and 24.16: the plan a person confirms says what the restore does to the recovery
+/// bundle, and the confirmation is bound to it. A restore from the service records the generation it
+/// verified; a restore from an export file reaches no service and records none, and says so before
+/// it is confirmed. A digest confirmed for one is not the other's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_from_a_file_is_confirmed_apart_from_one_that_records_a_generation() {
+    let world = World::new();
+    let rig = Rig::start(SignIn::Usable).await;
+    let held = members();
+    let sealed = seal(&world, 1, &borrowed(&held));
+    rig.put(&world, &sealed, None).await;
+    let kit = rig.work.join("kit.txt");
+    std::fs::write(&kit, world.kit_text(&[rig.origin()])).expect("the kit file");
+    let kit_arg = kit.display().to_string();
+    let file = rig.work.join("backup.krexport");
+    std::fs::write(
+        &file,
+        export_of(&world, rig.origin(), &sealed)
+            .to_canonical_bytes()
+            .expect("canonical bytes"),
+    )
+    .expect("the export file");
+    let file_arg = file.display().to_string();
+    let into = folder(&rig, "restored");
+    let into_arg = into.display().to_string();
+    let preview = |extra: &[&str]| {
+        let mut arguments = vec![
+            "backup".to_owned(),
+            "restore".to_owned(),
+            "--into".to_owned(),
+            into_arg.clone(),
+            "--kit-file".to_owned(),
+            kit_arg.clone(),
+            "--preview".to_owned(),
+        ];
+        arguments.extend(extra.iter().map(|word| (*word).to_owned()));
+        let rig = &rig;
+        async move {
+            let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+            rig.run(&arguments, None).await
+        }
+    };
+
+    let online = preview(&["--json"]).await;
+    assert!(online.status.success(), "{}", text(&online.stderr));
+    let offline = preview(&["--from-export", &file_arg, "--json"]).await;
+    assert!(offline.status.success(), "{}", text(&offline.stderr));
+    let online_plan: Value = serde_json::from_slice(&online.stdout).expect("a document");
+    let offline_plan: Value = serde_json::from_slice(&offline.stdout).expect("a document");
+    assert_eq!(online_plan["records_generation"], 1, "{online_plan}");
+    assert!(
+        offline_plan["records_generation"].is_null(),
+        "an export file reaches no service: {offline_plan}"
+    );
+    assert_ne!(
+        digest_of(&online),
+        digest_of(&offline),
+        "what is confirmed covers whether the bundle records the generation"
+    );
+
+    // In words, before it is confirmed.
+    let said = preview(&["--from-export", &file_arg]).await;
+    assert!(said.status.success(), "{}", text(&said.stderr));
+    let lines = format!("{}{}", text(&said.stdout), text(&said.stderr));
+    assert!(lines.contains("records nothing"), "{lines}");
+    assert!(!lines.contains("is updated to record"), "{lines}");
 }
 
 /// KR-REQ-20.18: a host that is signed in to nothing restores from an export file and the kit
@@ -1618,6 +1690,7 @@ async fn a_restore_applies_the_devices_configuration_and_nothing_that_restricts_
     assert!(plain.status.success(), "{}", text(&plain.stderr));
     let plain_plan: Value = serde_json::from_slice(&plain.stdout).expect("a document");
     assert_eq!(plain_plan["applies_configuration"], false);
+    assert_eq!(plain_plan["records_generation"], 1, "{plain_plan}");
 
     let preview = rig
         .run(
@@ -1718,6 +1791,13 @@ async fn a_restore_applies_the_devices_configuration_and_nothing_that_restricts_
         )
         .await;
     assert!(applied.status.success(), "{}", text(&applied.stderr));
+    // The record beside the files does not say the configuration was left unapplied.
+    let record: Value =
+        serde_json::from_slice(&std::fs::read(into.join("restore.json")).expect("the record"))
+            .expect("a document");
+    let says = record["what_this_is"].as_str().expect("a sentence");
+    assert!(!says.contains("not applied"), "{says}");
+    assert!(says.contains("applied to this host"), "{says}");
     let after = host_document(&rig);
     assert_eq!(
         after.preferences.sleep_inhibition,
