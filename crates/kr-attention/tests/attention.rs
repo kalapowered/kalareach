@@ -1707,7 +1707,7 @@ fn a_viewer_is_shown_the_changes_its_history_reaches_and_no_earlier_ones() {
     let later = attention
         .changed(
             &phone,
-            &device(2_000),
+            &device(NOON + 2_000),
             session(1),
             100,
             0,
@@ -1720,7 +1720,7 @@ fn a_viewer_is_shown_the_changes_its_history_reaches_and_no_earlier_ones() {
             .result
             .changes
             .iter()
-            .all(|change| change.at_ms.get() >= 2_000),
+            .all(|change| change.at_ms.get() >= NOON + 2_000),
         "{:?}",
         later.result.changes
     );
