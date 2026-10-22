@@ -21,10 +21,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kr_plugin_service::vocabulary::BindingId;
-use kr_protocol::broker::{BrokerGrant, BrokerGrants, IntegrationMode};
+use kr_protocol::broker::{BrokerGrant, BrokerGrants, DecodingTrust, IntegrationMode};
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
-use kr_protocol::ids::{ApplicationInstanceId, BrokerBindingId, PluginId, PublisherId};
-use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
+use kr_protocol::ids::{
+    ActionId, ApplicationInstanceId, BrokerBindingId, PendingResourceId, PluginId, PublisherId,
+    QuestionId, UpstreamMethod,
+};
+use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_worker::broker::binder::Streams;
 use kr_worker::broker::{
     BrokerTransport, Credential, ManagedProcess, TransportHandle, UpstreamDispatch,
@@ -71,8 +74,11 @@ pub struct Spec {
     pub streams: Streams,
     /// Whether it holds the `Observation` grant.
     pub observation: bool,
-    /// The component it ships.
-    pub component: &'static str,
+    /// The component it ships, where it ships one.
+    pub component: Option<&'static str>,
+    /// Whether it holds the approval interpreter's grant and the trust to decode the connector's
+    /// approval request.
+    pub interpreting: bool,
 }
 
 impl Spec {
@@ -87,7 +93,24 @@ impl Spec {
                 terminal: true,
             },
             observation: true,
-            component: "recording",
+            component: Some("recording"),
+            interpreting: false,
+        }
+    }
+
+    /// A binding of the connection's own package that reads the connector's approval request into
+    /// an approval a person answers, and ships no component.
+    pub fn interpreter(number: u8) -> Self {
+        Self {
+            number,
+            own_package: true,
+            streams: Streams {
+                semantic: false,
+                terminal: false,
+            },
+            observation: false,
+            component: None,
+            interpreting: true,
         }
     }
 
@@ -116,7 +139,7 @@ impl Spec {
     /// With another component.
     #[must_use]
     pub const fn shipping(mut self, component: &'static str) -> Self {
-        self.component = component;
+        self.component = Some(component);
         self
     }
 
@@ -255,6 +278,20 @@ impl Terminal {
         self.lines.lock().expect("not poisoned").clone()
     }
 
+    /// Writes one frame as the native terminal, which a response to the upstream's request is.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the frame cannot be written.
+    pub async fn write(&self, frame: &serde_json::Value) {
+        self.writes
+            .lock()
+            .await
+            .write_all(format!("{frame}\n").as_bytes())
+            .await
+            .expect("the terminal writes its frame");
+    }
+
     /// Writes one request of the terminal's own and waits for the reply to it.
     ///
     /// # Panics
@@ -296,9 +333,9 @@ impl Observing {
     /// Starts the world, or returns `None` when the test components are not built.
     pub async fn start(options: Options) -> Option<Self> {
         let mut components = Vec::new();
-        for spec in &options.bindings {
-            if !components.contains(&spec.component) {
-                components.push(spec.component);
+        for name in options.bindings.iter().filter_map(|spec| spec.component) {
+            if !components.contains(&name) {
+                components.push(name);
             }
         }
         let mut installed_components = Vec::new();
@@ -335,11 +372,27 @@ impl Observing {
             } else {
                 (other_package(), 6)
             };
-            let source = &installed_components
-                .iter()
-                .find(|(name, _)| *name == spec.component)
-                .expect("the component was installed")
-                .1;
+            let mut grants = Vec::new();
+            if spec.observation {
+                grants.push(BrokerGrant::Observation);
+            }
+            if spec.interpreting {
+                grants.push(BrokerGrant::ApprovalInterpreter);
+            }
+            let trust = spec.interpreting.then(|| DecodingTrust {
+                plugin_id: plugin.clone(),
+                publisher_id: PublisherId::new("kalareach").expect("a publisher"),
+                package_digest: Digest256::from_bytes([digest_byte; 32]),
+                methods: [UpstreamMethod::new("session/request_permission").expect("a method")]
+                    .into_iter()
+                    .collect(),
+                schema_versions: [kr_worker::broker::connectors::DECISION_SCHEMA.to_owned()]
+                    .into_iter()
+                    .collect(),
+                max_decisions: U64::new(4),
+                may_encode_response: true,
+                granted_at: TimestampMs::new(1),
+            });
             broker
                 .bind_descriptor(
                     binding(spec.number),
@@ -347,18 +400,22 @@ impl Observing {
                     plugin.clone(),
                     PublisherId::new("kalareach").expect("a publisher"),
                     Digest256::from_bytes([digest_byte; 32]),
-                    if spec.observation {
-                        BrokerGrants::granted([BrokerGrant::Observation])
-                    } else {
-                        BrokerGrants::granted([])
-                    },
-                    None,
+                    BrokerGrants::granted(grants),
+                    trust,
                     TimestampMs::new(1),
                 )
                 .expect("the binding is recorded");
             broker
                 .grant_streams(binding(spec.number), spec.streams)
                 .expect("the streams are granted");
+            let Some(name) = spec.component else {
+                continue;
+            };
+            let source = &installed_components
+                .iter()
+                .find(|(installed, _)| *installed == name)
+                .expect("the component was installed")
+                .1;
             broker
                 .ship_component(
                     binding(spec.number),
@@ -395,11 +452,7 @@ impl Observing {
             .pin_table(instance(), installed(), table(), rich())
             .expect("the installed tables are pinned");
         broker
-            .pin_reading(
-                instance(),
-                &package(),
-                kr_worker::broker::reading::Reading::spelling(&rich()),
-            )
+            .pin_reading(instance(), &package(), reading())
             .expect("the reading is pinned");
         broker
             .open_native_connection(instance(), &[9; 32], &process, &package(), "1")
@@ -565,6 +618,308 @@ impl Observing {
         })
         .await
     }
+
+    /// Waits until the lane holds a state for a binding that says `part`, and returns it.
+    pub async fn until_held(&self, number: u8, part: &str) -> String {
+        let lane = self.broker().observation();
+        until(
+            &format!("the state held for the component to say {part:?}"),
+            || async {
+                let state =
+                    String::from_utf8_lossy(&lane.held_state(binding(number))?).into_owned();
+                state.contains(part).then_some(state)
+            },
+        )
+        .await
+    }
+
+    /// What a failing case needs to see of the lane, the client and the terminal.
+    pub fn diagnostics(&self, number: u8) -> String {
+        let lane = self.broker().observation();
+        let output = self.output();
+        let tail: String = output
+            .chars()
+            .rev()
+            .take(160)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        format!(
+            "lane: {:?}, held {} bytes, {} waiting, {} in flight; view: {:?}; client hand-off: \
+             {:?} bytes; report: {:?}; output is {} bytes, highest line {:?}, ends {tail:?}",
+            lane.account(),
+            lane.held_bytes(),
+            lane.waiting(),
+            lane.in_flight(),
+            lane.view(binding(number)),
+            self.broker()
+                .component_calls()
+                .client()
+                .map(|client| client.offered_bytes()),
+            self.reason(number),
+            output.len(),
+            highest_line(&output),
+        )
+    }
+
+    // -- what the worker holds live, as a person reads it ----------------------------------------
+
+    /// The local owner, on the worker's own socket.
+    pub async fn owner(&self) -> kr_ipc::client::LocalClient {
+        kr_ipc::client::LocalClient::connect(
+            &self.hosted.endpoint,
+            kr_protocol::local::LocalClientKind::Cli,
+            super::build(),
+        )
+        .await
+        .expect("the owner connects to the worker")
+    }
+
+    /// What a call to the session is addressed to.
+    pub fn target(&self) -> kr_protocol::envelope::ActionTarget {
+        kr_protocol::envelope::ActionTarget {
+            environment_id: self.hosted.environment_id,
+            session_id: Nullable::some(self.hosted.session_id),
+            session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+            application_instance_id: Nullable::null(),
+            agent_binding_revision: Nullable::null(),
+        }
+    }
+
+    /// Attaches the owner's terminal to the session, which leaves a receipt.
+    pub async fn attach(&self, window: &mut kr_ipc::client::LocalClient) -> ActionId {
+        let action_id = ActionId::new(kr_ipc::new_uuid());
+        let params = kr_protocol::attachment::SessionAttachParams {
+            session_id: self.hosted.session_id,
+            mode: kr_protocol::attachment::AttachMode::Terminal,
+            claim_geometry: false,
+            dimensions: Nullable::some(kr_protocol::session::Dimensions::new(80, 24)),
+            terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+            requested: [kr_protocol::attachment::AttachmentCapability::ObserveTerminal]
+                .into_iter()
+                .collect(),
+        };
+        window
+            .mutate(
+                kr_protocol::method::Method::SessionAttach,
+                action_id,
+                self.target(),
+                &params,
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the attach is admitted");
+        action_id
+    }
+
+    /// The agent in the session asks a person a question, which is pending in the worker's ledger.
+    pub fn ask(&self) -> (QuestionId, kr_protocol::question::CallerToken) {
+        let (asked, _) = self
+            .hosted
+            ._service
+            .questions()
+            .create(
+                &asker(),
+                &kr_protocol::question::QuestionCreateParams {
+                    session_id: self.hosted.session_id,
+                    request_id: "push-anyway".to_owned(),
+                    kind: kr_protocol::question::QuestionKind::Confirm,
+                    context: "Two tests are failing.".to_owned(),
+                    question: "Push the branch anyway?".to_owned(),
+                    choices: Vec::new(),
+                    agent_name: Nullable::some("kr-test-agent".to_owned()),
+                    requested_expiry_ms: Nullable::some(kr_protocol::scalars::DurationMs::new(
+                        600_000,
+                    )),
+                    wait_ms: Nullable::null(),
+                },
+                now(),
+            )
+            .expect("the agent asks");
+        assert_eq!(
+            asked.question.state,
+            kr_protocol::question::QuestionState::Pending
+        );
+        (asked.question.question_id, asked.caller_token)
+    }
+
+    /// What the agent that asked reads back about its question.
+    pub fn read_back(
+        &self,
+        question_id: QuestionId,
+        caller_token: kr_protocol::question::CallerToken,
+    ) -> kr_protocol::question::Question {
+        self.hosted
+            ._service
+            .questions()
+            .read_own(
+                &asker(),
+                &kr_protocol::question::QuestionReadOwnParams {
+                    session_id: self.hosted.session_id,
+                    question_id,
+                    caller_token,
+                    wait_ms: Nullable::null(),
+                },
+                now(),
+            )
+            .expect("the agent reads its own question")
+            .0
+            .question
+    }
+
+    /// The receipt, the question and the approval the worker holds, as the owner reads them.
+    pub async fn live(
+        &self,
+        window: &mut kr_ipc::client::LocalClient,
+        action_id: ActionId,
+        question_id: QuestionId,
+        approval: PendingResourceId,
+    ) -> Live {
+        use kr_protocol::method::Method;
+        let receipt: kr_protocol::receipt::ActionReadResult = read(
+            window,
+            Method::ActionRead,
+            &kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            },
+        )
+        .await;
+        let questions: kr_protocol::question::QuestionReadResult = read(
+            window,
+            Method::QuestionRead,
+            &kr_protocol::question::QuestionReadParams {
+                session_id: self.hosted.session_id,
+                question_id: Nullable::some(question_id),
+                include_resolved: true,
+            },
+        )
+        .await;
+        let snapshot: kr_protocol::recovery::EventsSnapshotResult = read(
+            window,
+            Method::EventsSnapshot,
+            &kr_protocol::recovery::EventsSnapshotParams {
+                session_id: self.hosted.session_id,
+                agent_resources_from: Nullable::null(),
+            },
+        )
+        .await;
+        Live {
+            receipt: receipt.receipt,
+            question: questions
+                .questions
+                .into_iter()
+                .find(|question| question.question_id == question_id)
+                .expect("the question is read"),
+            approval: snapshot
+                .agent_resources
+                .resources
+                .into_iter()
+                .find(|resource| resource.resource_id == approval),
+        }
+    }
+
+    /// The owner answers the question yes.
+    pub async fn answer_yes(
+        &self,
+        window: &mut kr_ipc::client::LocalClient,
+        question: &kr_protocol::question::Question,
+    ) -> kr_protocol::question::QuestionResolveResult {
+        window
+            .mutate(
+                kr_protocol::method::Method::QuestionAnswer,
+                ActionId::new(kr_ipc::new_uuid()),
+                self.target(),
+                &kr_protocol::question::QuestionAnswerParams {
+                    session_id: self.hosted.session_id,
+                    question_id: question.question_id,
+                    expected_revision: question.revision,
+                    answer: kr_protocol::question::QuestionAnswer::Decision { decided: true },
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the owner answers")
+            .to_typed()
+            .expect("decodes")
+    }
+
+    /// Tells the session its privacy generation on the daemon's authority connection, as the
+    /// daemon does, and returns once the worker has answered.
+    pub async fn tell_privacy(
+        &self,
+        authority: &mut kr_ipc::client::BoundLink,
+        generation: u64,
+        enabled: bool,
+    ) {
+        use kr_protocol::envelope::ControlFrame;
+        authority
+            .send(&ControlFrame::PrivacyGeneration(
+                kr_protocol::privacy::PrivacyGenerationNotice {
+                    environment_id: self.hosted.environment_id,
+                    generation: U64::new(generation),
+                    enabled,
+                },
+            ))
+            .await
+            .expect("writes the notice");
+        let acknowledged = tokio::time::timeout(PATIENCE, async {
+            loop {
+                match authority.recv().await.expect("the worker answers") {
+                    ControlFrame::PrivacyGenerationAck(ack) => return ack,
+                    ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
+                    other => panic!("the worker answered {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the worker acknowledges the privacy generation in time");
+        assert_eq!(acknowledged.generation.get(), generation);
+    }
+}
+
+/// The receipt, the question and the approval the worker holds, as the owner reads them.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Live {
+    pub receipt: kr_protocol::receipt::Receipt,
+    pub question: kr_protocol::question::Question,
+    /// The approval, while the snapshot still holds it.
+    pub approval: Option<kr_protocol::gateway::PendingResource>,
+}
+
+/// One read of the worker, by the owner.
+async fn read<T: serde::Serialize, R: kr_protocol::wire::WireMessage>(
+    window: &mut kr_ipc::client::LocalClient,
+    method: kr_protocol::method::Method,
+    params: &T,
+) -> R {
+    tokio::time::timeout(PATIENCE, window.request(method, params))
+        .await
+        .unwrap_or_else(|_| panic!("{} is answered within {PATIENCE:?}", method.as_str()))
+        .expect("the call reaches the worker")
+        .unwrap_or_else(|error| panic!("{} is answered: {error:?}", method.as_str()))
+        .to_typed()
+        .expect("decodes")
+}
+
+/// The agent in the session that asks, as the worker binds a helper: this process.
+fn asker() -> kr_worker::questions::binding::VerifiedSource {
+    kr_worker::questions::binding::VerifiedSource {
+        process: kr_ipc::identity::current_process_start_identity().expect("a process identity"),
+        executable: Some("kr-test-agent".to_owned()),
+        session_member: true,
+        ancestry: true,
+        launch_channel: true,
+        connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([3; 16])),
+    }
+}
+
+fn now() -> kr_worker::questions::Now {
+    kr_worker::questions::Now {
+        utc_ms: kr_ipc::now_ms(),
+        boot_ms: kr_ipc::clock::boot_elapsed_ms(),
+    }
 }
 
 /// Puts a component where the daemon says components are, under a directory of its own, so that
@@ -630,6 +985,27 @@ pub fn table() -> kr_protocol::gateway::DeclarativeTable {
     };
     table.digest = table.canonical_digest().expect("encodable");
     table
+}
+
+/// How the application reads the answer to an approval: the connector's decision response.
+fn reading() -> kr_worker::broker::reading::Reading {
+    let decision = |option: &str, label: &str| kr_protocol::broker::OfferedDecision {
+        option_id: option.to_owned(),
+        label: label.to_owned(),
+    };
+    let mut reading = kr_worker::broker::reading::Reading::spelling(&rich());
+    reading.answers = Some(kr_worker::broker::reading::AnswerShape {
+        methods: [UpstreamMethod::new("session/request_permission").expect("a method")]
+            .into_iter()
+            .collect(),
+        result_member: "outcome".to_owned(),
+        values: [("allow", "allow"), ("deny", "deny")]
+            .into_iter()
+            .map(|(decision, value)| (decision.to_owned(), value.to_owned()))
+            .collect(),
+        offered: vec![decision("allow", "Allow"), decision("deny", "Deny")],
+    });
+    reading
 }
 
 /// The frame of a notification the table lists, carrying `payload`.
