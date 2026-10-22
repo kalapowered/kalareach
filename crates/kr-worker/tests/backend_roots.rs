@@ -130,13 +130,17 @@ impl Server {
                 }
             }
         });
-        let command_pid: u32 = said_within(
-            &said,
-            "the server's command never said it had left the server's group",
-        )
-        .trim()
-        .parse()
-        .expect("a number");
+        // Its number is the one line that is a number: anything else the server's shell or the
+        // program that starts the command says on the way is not it.
+        let command_pid: u32 = loop {
+            let line = said_within(
+                &said,
+                "the server's command never said it had left the server's group",
+            );
+            if let Ok(number) = line.trim().parse() {
+                break number;
+            }
+        };
         let command_identity =
             kr_ipc::identity::process_start_identity(command_pid).expect("the command's identity");
         // The command set its session up before it said its number.
@@ -294,11 +298,12 @@ fn kr_req_07_60_a_command_whose_server_has_gone_is_still_read_and_stopped() {
     let _ = server.process.0.wait();
     assert!(ended(&server.identity));
     std::fs::write(&go, b"").expect("lets the command go on");
-    let grandchild_pid: u32 = server
-        .next_line("the command never started its process")
-        .trim()
-        .parse()
-        .expect("a number");
+    let grandchild_pid: u32 = loop {
+        let line = server.next_line("the command never started its process");
+        if let Ok(number) = line.trim().parse() {
+            break number;
+        }
+    };
     let grandchild_identity =
         kr_ipc::identity::process_start_identity(grandchild_pid).expect("its identity");
     let grandchild_guard = Escaped(Some(grandchild_identity.clone()));
