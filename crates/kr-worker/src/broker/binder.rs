@@ -549,6 +549,7 @@ impl BrokerState {
         self.bindings.insert(binding_id, binding);
         self.component_states.remove(&binding_id);
         self.component_notes.remove(&binding_id);
+        self.failing_components.remove(&binding_id);
         self.component_changes.notify_one();
         self.settle_owed_rows(now);
         self.renew_every_gateway_evidence(now);
@@ -860,6 +861,7 @@ impl BrokerState {
                 self.revoked_settled(&binding.plugin_id, binding_id);
                 self.component_states.remove(&binding_id);
                 self.component_notes.remove(&binding_id);
+                self.failing_components.remove(&binding_id);
                 self.component_changes.notify_one();
             }
         }

@@ -847,6 +847,9 @@ struct BrokerState {
     component_states: BTreeMap<BrokerBindingId, (ComponentState, Option<String>)>,
     /// What a person is told about each binding's component beyond where it stands.
     component_notes: BTreeMap<BrokerBindingId, component::ComponentNotes>,
+    /// The bindings whose component is failing: counted once as a failure of its adapter when it
+    /// began to, and not again however often the runtime is asked and says no, until it runs.
+    failing_components: std::collections::BTreeSet<BrokerBindingId>,
     /// Woken when the set of bindings the plugin runtime is wanted for may have changed.
     component_changes: Arc<component::ComponentChanges>,
     /// Woken when what the session's application is doing may have changed: a transition of a
@@ -1043,6 +1046,7 @@ impl Broker {
                 action_refusals: BTreeMap::new(),
                 component_states: BTreeMap::new(),
                 component_notes: BTreeMap::new(),
+                failing_components: std::collections::BTreeSet::new(),
                 component_changes: Arc::new(component::ComponentChanges::new(Arc::clone(
                     &decoding,
                 ))),
@@ -1796,10 +1800,17 @@ impl Broker {
         };
         binding.rich_disabled = Some(reason.into());
         binding.revocation_disabled = false;
+        let package = binding.plugin_id.clone();
+        // A component that is stopped for good has failed, once, whether or not the runtime had
+        // already said it was unavailable.
+        let began_failing = state.failing_components.insert(binding_id);
         state.renew_every_gateway_evidence(kr_ipc::now_ms());
         let changes = Arc::clone(&state.component_changes);
         drop(state);
         changes.notify_one();
+        if began_failing {
+            self.component_failed(&package);
+        }
     }
 
     /// Returns true when this instance has bindings and every one of them is rich-disabled.
