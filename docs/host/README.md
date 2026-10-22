@@ -2816,8 +2816,12 @@ What the grant decides, for every request:
   this request was decided with, made where the attachment is admitted. See "What an attachment
   may do".
 * **History.** Retained history is not served to a device at all: its scope is the grant's lower
-  bound, that bound is a moment in time and a history page is a byte range, and a host that cannot
-  narrow content to a grant refuses it rather than serving more than the grant allows. The
+  bound, that bound is a moment in time and a history page is a byte range, and a host that does
+  not narrow a page to a grant refuses it rather than serving more than the grant allows. The host
+  now records when each part of a closed session's output was written (see "When output was
+  produced"), which is what a narrowed page would be cut by, but it serves no page cut that way
+  yet: bytes with no recorded time, or timed on a clock the worker could not prove, are never
+  served to a bound, and a live session's record is not read by the daemon. The
   session's live screen and the stream that follows it are served when the grant includes them,
   and "the live screen" means the screen that is showing: a device's attachment is drawn the active
   buffer alone, and the rows of the buffer that is not showing are counted among what its
@@ -5463,8 +5467,10 @@ serving it from one of those would serve text written before a privacy transitio
 after it.
 
 Section 10 narrows retained content to the grant that asked for it, and this host cannot narrow a
-moment in time to an item's text, which is why it refuses a retained history page to a paired device
-outright. An attention item is not a history page, so it is narrowed rather than refused: a caller
+moment in time to an item's text: an item carries a sequence in its own source's records, which is
+not a cursor of any session's output, so the record of when output was produced gives it no time.
+That, and the page not yet being cut by the bound, is why it refuses a retained history page to a
+paired device outright. An attention item is not a history page, so it is narrowed rather than refused: a caller
 that did not arrive over the local socket is served the host's own record of a condition (which
 rule, at what level, how often and when) with the text left out and said to be left out, and no
 model summary either.
