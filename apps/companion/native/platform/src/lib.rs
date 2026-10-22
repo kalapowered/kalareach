@@ -1,6 +1,6 @@
 //! The companion's native platform services, shared by every feature that needs them.
 //!
-//! Eight services, each a mechanism with no feature's policy in it:
+//! Nine services, each a mechanism with no feature's policy in it:
 //!
 //! * [`secrets`]: the one secure store the companion keeps secrets in. The Keychain on macOS and
 //!   iOS, the Credential Manager on Windows, the Secret Service on Linux, and on Android files
@@ -17,6 +17,9 @@
 //!   invitation's secret goes no further than native code.
 //! * [`browser`]: the browser-backed session a sign-in hands its ceremony to on a phone: iOS's
 //!   authentication session, and Android's Auth Tab or a Custom Tab with a verified link.
+//! * [`push`]: a push receiver's answer to a registration challenge, decided and signed by one
+//!   function over the installation's own key, so that the receiver runs with no interface and no
+//!   JavaScript and signs nothing but that answer.
 //! * [`call`]: the voice call that native code holds (capture, playback and the media connection),
 //!   the commands that reach it and the news it sends back.
 //! * the Android TLS verifier's start: the platform verifier the HTTPS client uses needs the JVM
@@ -35,6 +38,7 @@ pub mod browser;
 pub mod call;
 pub mod presence;
 pub mod protection;
+pub mod push;
 pub mod scan;
 pub mod secrets;
 #[cfg(target_os = "android")]
