@@ -121,6 +121,10 @@ fn seal(parties: &Parties, generation: u64, objects: &[StagedObject]) -> SealedA
 // per-recipient wraps.
 // ---------------------------------------------------------------------------------------------
 
+/// KR-REQ-20.06: an object's key is random for each object: two objects with the same body never
+/// share one, and the same object staged twice, with the same identifier and the same body, is
+/// under two keys. The keys are compared, not the ciphertexts: a random nonce under one derived key
+/// also gives two ciphertexts.
 #[test]
 fn every_object_is_encrypted_under_its_own_random_key() {
     let first = stage(1, "a.cbor", b"the same body");
@@ -133,6 +137,15 @@ fn every_object_is_encrypted_under_its_own_random_key() {
         first.bytes(),
         second.bytes(),
         "identical plaintext under two keys is two ciphertexts"
+    );
+
+    // A key that was a function of the identifier, or of the identifier and the body, would pass
+    // the comparison above, which stages two identifiers. The same identifier and the same body
+    // staged again is where a derived key shows.
+    let again = stage(1, "a.cbor", b"the same body");
+    assert!(
+        !first.shares_key_with(&again),
+        "the same object staged twice is under two keys"
     );
 }
 
