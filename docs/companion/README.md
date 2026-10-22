@@ -721,6 +721,8 @@ answer never came back.
   were when the list cannot be removed. On Windows a new file has the permissions of the folder the
   person chose, and a file that already existed keeps its own. The page is sent none of its
   contents.
+- Saving the kit as a QR code draws the kit's own text, the document a person could have typed, at error correction level Q as an SVG with a four-module quiet zone, and writes it where the save dialog put it with the same owner-only rules as the text kit. The code holds the whole kit, the seed included, and the card says so.
+- An offline copy is a file of ciphertext. The card lists the archives the recovery bundle names, each with the newest generation the service holds of it, and writes the bundle alone or the bundle with one archive's newest generation to the file the save dialog returned. This computer reads the service with the account to make it, authenticates the bundle with the kit and opens the archive's manifest in memory to find the objects it names; nothing decrypted is written or sent, and the file holds no kit text. Reading the service is not a host's privacy-mode matter, so privacy mode does not stop it. The file opens with the kit alone, with `kr backup restore --from-export`. An archive of more than 256 MiB of ciphertext is refused by name and restored from the service instead.
 - Covering the host on this computer (`recovery_cover_host`, `Recovery::cover_host`) is how the
   host's backup writer is made recovery-enabled. A kit opens the archives a host makes only if the
   host was set up under that kit's recipient, so naming the writer in the bundle is not enough, and
