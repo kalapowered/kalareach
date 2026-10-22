@@ -865,8 +865,9 @@ async fn a_ceiling_naming_a_right_the_grant_lacks_adds_nothing() {
 
 /// KR-REQ-26.15: an edit that narrows the ceiling fences a paired device's dispatch before it is
 /// acknowledged, and the device's next connection is decided under the narrower ceiling.
-/// KR-REQ-10.40, the part about the policy intersection on every request: the policy in force when
-/// a request arrives decides it, for a connection already open and for the next one.
+/// KR-REQ-10.40, the part about the policy intersection on every request: after the ceiling is
+/// narrowed the connection admitted under the wider one is fenced, and the next connection's
+/// requests are decided under the narrower ceiling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_narrowed_ceiling_fences_a_device_before_the_edit_is_acknowledged() {
     let owner = DeviceKeys::generate().expect("owner keys");

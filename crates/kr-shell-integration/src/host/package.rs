@@ -926,8 +926,8 @@ mod tests {
     }
 
     /// KR-REQ-07.17, the part about what is recorded: the executable, the startup entry and the
-    /// module tree a package records for a session are those of the installation it was read
-    /// from, not those its build wrote, so a copied package is recorded and launched as the copy.
+    /// module search paths a package reports are those of the installation it was read from, not
+    /// those its build wrote, so a copied package reports the copy's.
     #[cfg(unix)]
     #[test]
     fn a_package_that_was_copied_launches_the_copy_rather_than_the_original() {
@@ -1024,9 +1024,9 @@ mod tests {
         );
     }
 
-    /// KR-REQ-07.17, the part about what is recorded: every path in one record, the module tree
-    /// included, is taken from the one installation, even where a module directory is named like
-    /// the identity or is the package itself.
+    /// KR-REQ-07.17, the part about what is recorded: every path in one record, the module search
+    /// paths included, is taken from the one installation, even where a module directory is named
+    /// like the identity or is the package itself.
     #[cfg(unix)]
     #[test]
     fn every_path_in_one_record_is_taken_from_the_same_installation() {
@@ -1243,9 +1243,9 @@ mod tests {
         assert!(matches!(fault, PackageFault::Unqualified { .. }), "{fault}");
     }
 
-    /// KR-REQ-07.17, the part about what is recorded: a session's package is launched as the
-    /// exact binary it was built as, and the identity recorded for it carries its kind, editor ABI,
-    /// patch revisions and module tree, with the module search paths resolved to the installation.
+    /// KR-REQ-07.17, the part about what is recorded: a package is the exact binary it was built as,
+    /// and the identity it reports carries its kind, its editor ABI, how many patches it holds and
+    /// its module search paths, resolved to the installation.
     #[test]
     fn a_package_is_launched_as_the_exact_binary_it_was_built_as() {
         let root = tempfile::tempdir().expect("a directory");
