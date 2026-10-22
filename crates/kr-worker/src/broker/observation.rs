@@ -218,6 +218,9 @@ pub struct View {
     pub last_checkpoint_attempt: Option<Instant>,
     /// What the component last missed, in the words a person is told.
     pub loss_note: Option<String>,
+    /// Whether the component was offered something while privacy mode was on, so that its state may
+    /// hold it. None is taken from it until it starts again.
+    pub private_content: bool,
 }
 
 impl View {
@@ -295,8 +298,11 @@ pub struct ObservationLane {
     native_wanted: AtomicBool,
     /// Whether any binding takes terminal output.
     terminal_wanted: AtomicBool,
-    /// Whether privacy mode is on: nothing is pushed and nothing is held.
+    /// Whether privacy mode is on: no component's state is taken or held.
     private: AtomicBool,
+    /// Wakes the link when a binding that was owed nothing is offered something, so that the time
+    /// its state falls due is worked out again.
+    checkpoint_wake: tokio::sync::Notify,
     #[cfg(feature = "testing")]
     hold: Mutex<Option<Arc<HoldState>>>,
 }
@@ -350,6 +356,7 @@ impl ObservationLane {
             native_wanted: AtomicBool::new(false),
             terminal_wanted: AtomicBool::new(false),
             private: AtomicBool::new(false),
+            checkpoint_wake: tokio::sync::Notify::new(),
             #[cfg(feature = "testing")]
             hold: Mutex::new(None),
         }
@@ -526,7 +533,11 @@ impl ObservationLane {
         let mut inner = self.inner();
         let view = inner.views.entry(binding).or_default();
         view.ready = ready;
-        if !ready {
+        if ready {
+            // A component made ready has been registered afresh, so it holds nothing it was offered
+            // before.
+            view.private_content = false;
+        } else {
             view.silent_until = None;
         }
         drop(inner);
@@ -618,13 +629,29 @@ impl ObservationLane {
         }
     }
 
-    /// Records that something was offered to the binding and answered, which ends a silence.
+    /// Records that something was offered to the binding, which is one more thing its state holds
+    /// that has not been taken.
     pub fn offered(&self, binding: BrokerBindingId, now: Instant) {
         let mut inner = self.inner();
-        if let Some(view) = inner.views.get_mut(&binding) {
-            view.offered_since_checkpoint = view.offered_since_checkpoint.saturating_add(1);
-            view.last_offer = Some(now);
+        let Some(view) = inner.views.get_mut(&binding) else {
+            return;
+        };
+        let first = view.offered_since_checkpoint == 0;
+        view.offered_since_checkpoint = view.offered_since_checkpoint.saturating_add(1);
+        view.last_offer = Some(now);
+        if self.private.load(Ordering::Acquire) {
+            view.private_content = true;
         }
+        drop(inner);
+        if first {
+            self.checkpoint_wake.notify_one();
+        }
+    }
+
+    /// Waits until a binding that had been offered nothing since its state was last asked for is
+    /// offered something, which is when the time its state falls due changes.
+    pub async fn until_state_is_owed(&self) {
+        self.checkpoint_wake.notified().await;
     }
 
     /// Records that a call to the binding was answered, which ends a silence.
@@ -675,6 +702,7 @@ impl ObservationLane {
             .views
             .iter()
             .filter(|(_, view)| view.ready && view.offered_since_checkpoint > 0)
+            .filter(|(_, view)| !view.private_content)
             .filter(|(_, view)| {
                 let quiet = view
                     .last_offer
@@ -699,6 +727,7 @@ impl ObservationLane {
             .views
             .values()
             .filter(|view| view.ready && view.offered_since_checkpoint > 0)
+            .filter(|view| !view.private_content)
             .map(|view| {
                 let quiet_at = view.last_offer.map(|at| at + QUIET_BEFORE_CHECKPOINT);
                 let old_at = view.last_checkpoint_attempt.map(|at| at + CHECKPOINT_EVERY);
@@ -774,13 +803,28 @@ impl ObservationLane {
         (inner.checkpoints.len(), inner.checkpoint_bytes)
     }
 
+    /// Returns the state held for a binding, without taking it. For this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn held_state(&self, binding: BrokerBindingId) -> Option<Vec<u8>> {
+        self.inner()
+            .checkpoints
+            .get(&binding)
+            .map(|held| held.state.clone())
+    }
+
     // -- privacy mode -------------------------------------------------------------------------
 
     /// Says whether privacy mode is on. Observation for live use goes on under it; what does not is
     /// anything derived from it that would outlive it: while it is on no checkpoint is taken or
-    /// held, and the ones held are dropped when it is turned on ([`Self::fence`]).
+    /// held, the ones held are dropped when it is turned on ([`Self::fence`]), and a component that
+    /// was offered something while it was on is not asked for its state again, since the state may
+    /// hold what it was offered, until it starts again.
     pub fn set_private(&self, private: bool) {
         self.private.store(private, Ordering::Release);
+        if !private {
+            self.checkpoint_wake.notify_one();
+        }
     }
 
     /// Returns true while privacy mode is on.
@@ -855,7 +899,9 @@ impl ObservationLane {
 /// Turning privacy mode on stops any more of a component's state being taken and drops the state
 /// held for each binding, so a component restored after that starts again from the live point; while
 /// it is on, a component is never asked for its state ([`ObservationLane::checkpoint_due`]) and
-/// nothing is held ([`ObservationLane::hold`]).
+/// nothing is held ([`ObservationLane::hold`]). A component that was offered something while it was
+/// on keeps no state afterwards either, until it starts again, since what it holds may be what it
+/// was offered.
 #[derive(Clone, Debug)]
 pub struct ObservationPrivacy {
     lane: Arc<ObservationLane>,
