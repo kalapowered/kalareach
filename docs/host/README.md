@@ -3422,6 +3422,12 @@ adapters a session runs. They are local diagnostics. The totals are kept in memo
 from zero when the process that counted them does, appear in `kr doctor` and in a support bundle
 the owner writes, and are sent nowhere.
 
+The daemon counts the gaps between a device's connections. The faults and the adapter failures are
+counted by each session's worker, which keeps its totals for the life of its session; the daemon
+reads them from each running worker when `kr doctor` asks and adds them to its own. A worker that
+does not answer in time is left out of that reading, and a session that has closed takes its
+counts with it.
+
 | Metric | Unit | What it counts | Labels |
 | --- | --- | --- | --- |
 | `reconnect.time` | milliseconds | A paired device's gap between one connection and the next. Each series keeps a count, the total time and the longest gap | `transport`, `attempt`, `outcome`, `environment` |
