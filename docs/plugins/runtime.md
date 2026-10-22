@@ -519,14 +519,21 @@ A component's report carries how it was registered (compiled, with the time it t
 the compiled-code cache), what it last missed, and its last fault, in the words the runtime gave.
 
 Privacy mode does not stop observation for live use. While it is on, the worker asks for no
-component state, and it holds none that was asked for before privacy mode was turned on or off. The
-runtime's words in a fault, and in the reason a component is disabled for, are withheld from the
-report while it is on and for a fault the link read after it changed. Turning it on drops the state
-held. A component that was handed anything the worker had while privacy mode was on, including
-something that waited in the lane and was handed over after it ended, or whose hand-over was not
-answered, is marked before the hand-over and is not asked for its state again until it starts again,
-since what it holds may be what it was handed. The documents a
-component draws are read and dropped by the worker, in privacy mode as at any other time.
+component state, and it holds none that was asked for before privacy mode was turned on or off.
+Turning it on drops the state held. A component that was handed anything the worker had while
+privacy mode was on, including something that waited in the lane and was handed over after it ended,
+or whose hand-over was not answered, is marked before the hand-over and is not asked for its state
+again until it starts again, since what it holds may be what it was handed.
+
+The runtime's words in a fault, and in the reason a component is disabled for, are withheld from the
+report once privacy mode has been on at any time since the worker made the connection to the runtime
+that carries them, and until it makes another. The connection decides it, not the notice: any
+component on it may have been handed something while privacy mode stood, by an observation, a
+restore or an action, and its words can be made of what it was handed. So every notice about every
+component on the connection is withheld, however many wait and however late each is read. A
+connection made while privacy mode is on is withheld from its start, and so is one that a component
+is handed something made in privacy mode on. The documents a component draws are read and dropped
+by the worker, in privacy mode as at any other time.
 
 ## Where the broker fits
 
