@@ -1609,6 +1609,13 @@ fn kr_req_11_33_a_device_answers_an_approval_the_terminal_holds_and_the_late_ter
         )
         .expect("the device's answer is carried");
     assert_eq!(answered.state, PendingState::Resolved);
+    // The server said the request was answered, and the terminal read it while it held its answer.
+    // `Resolved` says only that the gateway wrote the answer, so what the server received is read
+    // once the server has said it read it.
+    let _ = person.sees(
+        "TUI: serverRequest/resolved",
+        "the terminal reads the server's word that the request was answered",
+    );
     let received = received_lines(&ctx);
     assert_eq!(
         received
@@ -1617,11 +1624,6 @@ fn kr_req_11_33_a_device_answers_an_approval_the_terminal_holds_and_the_late_ter
             .count(),
         1,
         "{received:?}"
-    );
-    // The server said the request was answered, and the terminal read it while it held its answer.
-    let _ = person.sees(
-        "TUI: serverRequest/resolved",
-        "the terminal reads the server's word that the request was answered",
     );
 
     // The terminal sends its own answer late, and then asks the server a question. The server
