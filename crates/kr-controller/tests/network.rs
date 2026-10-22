@@ -5393,6 +5393,9 @@ fn asked_ids(
 /// preview, as the text itself. The device it is shared with, whose own pairing grant reaches no
 /// session, attaches and subscribes only once it has redeemed the invitation, is sent what the
 /// session prints from then on, and is cut off when the owner withdraws the share.
+/// KR-REQ-25.28, the part about a device paired with no session: a device paired under a grant that
+/// reaches no session is refused its attach until the invitation it is given is redeemed, reaches
+/// the session after, and is served nothing once the owner withdraws the share.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_25_10_a_device_given_the_screen_is_shown_it_and_follows_it_until_the_share_is_withdrawn()
@@ -5732,6 +5735,8 @@ async fn kr_req_10_49_a_device_under_a_grant_with_no_cursor_reads_what_is_first_
 /// is open, and not once it has been answered. A device whose grant reaches back to the same
 /// moment and names nothing never reads it, and a device the invitation does not name cannot
 /// redeem it and is told nothing about it.
+/// KR-REQ-25.28, the part about a device paired with no session: the device whose pairing grant
+/// reaches no session reads nothing of it, twice, before it redeems the invitation it was given.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_10_51_a_device_reads_the_question_its_grant_names_while_it_is_open() {
