@@ -86,7 +86,7 @@ async fn revoking_one_device_leaves_another_devices_size_claim_in_force() {
     assert_eq!(owner_of_the_size(&environment), Some(firsts));
 
     let mut owner = environment.host.client().await;
-    let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+    let revoked: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
         environment.environment_id(),
         &mut owner,
         Method::DeviceRevoke,
@@ -96,6 +96,7 @@ async fn revoking_one_device_leaves_another_devices_size_claim_in_force() {
     )
     .await
     .expect("the owner unpairs the first device");
+    assert!(revoked.barrier.holds(), "{revoked:?}");
 
     assert!(
         !claims_the_size(&environment, firsts),
@@ -112,7 +113,7 @@ async fn revoking_one_device_leaves_another_devices_size_claim_in_force() {
     );
 
     // The other direction: a device that does not own the size is revoked, and the owner keeps it.
-    let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+    let revoked: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
         environment.environment_id(),
         &mut owner,
         Method::DeviceRevoke,
@@ -122,6 +123,7 @@ async fn revoking_one_device_leaves_another_devices_size_claim_in_force() {
     )
     .await
     .expect("the owner unpairs the third device");
+    assert!(revoked.barrier.holds(), "{revoked:?}");
     assert!(!claims_the_size(&environment, thirds));
     assert!(claims_the_size(&environment, seconds));
     assert_eq!(owner_of_the_size(&environment), Some(seconds));

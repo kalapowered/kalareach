@@ -222,7 +222,11 @@ impl Caller {
     pub fn reaches_every_moment(&self) -> bool {
         match self {
             Self::Owner => true,
-            Self::Device { history, .. } => history.first_moment(Surface::Summary) == Some(0),
+            Self::Device {
+                session_view,
+                history,
+                ..
+            } => *session_view && history.first_moment(Surface::Summary) == Some(0),
         }
     }
 
