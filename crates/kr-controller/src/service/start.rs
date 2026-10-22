@@ -1109,6 +1109,7 @@ impl Controller {
             descriptions,
             delivery,
             delivery_runtime,
+            gateway_origin: crate::push::gateway_origin_for_start(),
             devices,
             lifetimes,
             owner,
