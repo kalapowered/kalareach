@@ -1232,35 +1232,60 @@ fn transfer_of_control_issues_one_authority_and_revokes_the_other() {
 }
 
 /// KR-REQ-25.10, KR-REQ-18.12: a preview that was cut shows the issuer less than the recipient will
-/// read, so nothing is shared for it: the share is refused and no grant or invitation is written.
+/// read, so nothing is shared for it: the share is refused as an invalid argument, and no grant or
+/// invitation is written. The same share with a screen shown whole is issued.
 #[test]
 fn a_screen_that_was_cut_is_not_shared() {
     use kr_protocol::sharing::LiveScreenPreview;
 
-    let service = SharingService::in_memory(device_id(0xf1)).expect("a sharing service");
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
     let selection = RoleSelection {
         include_live_screen: true,
         ..RoleSelection::plain(SessionRole::Viewer)
     };
-    let request = ShareRequest {
-        accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
-        selection,
-        live_screen: Some(LiveScreenPreview {
-            lines: vec!["the first lines of a longer screen".to_owned()],
-            truncated: true,
-        }),
-        ..share(SessionRole::Viewer, 1)
+    let screen = |truncated: bool| LiveScreenPreview {
+        lines: vec!["the first lines of a longer screen".to_owned()],
+        truncated,
     };
-    service
-        .preview(&request)
-        .expect_err("a cut screen is not a preview of what is shared");
-    service
-        .share(&request, || Ok(()))
-        .expect_err("and nothing is issued for it");
+    let sharing = |byte: u8, truncated: bool| ShareRequest {
+        accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+        selection: selection.clone(),
+        live_screen: Some(screen(truncated)),
+        ..share(SessionRole::Viewer, byte)
+    };
+
+    let cut = sharing(1, true);
+    assert!(
+        matches!(
+            service.preview(&cut),
+            Err(kr_controller::error::ControllerError::InvalidArgument(_))
+        ),
+        "a cut screen is not a preview of what is shared"
+    );
+    assert!(
+        matches!(
+            service.share(&cut, || Ok(())),
+            Err(kr_controller::error::ControllerError::InvalidArgument(_))
+        ),
+        "and nothing is issued for it"
+    );
     assert!(
         service.grants().records().expect("readable").is_empty(),
         "no grant is written"
     );
+    assert!(
+        service
+            .grants()
+            .invitation(cut.invitation_id)
+            .expect("readable")
+            .is_none(),
+        "and no invitation"
+    );
+
+    // The control: the same share with the screen shown whole is issued.
+    service
+        .share(&sharing(2, false), || Ok(()))
+        .expect("a screen shown whole is shared");
 }
 
 #[test]
