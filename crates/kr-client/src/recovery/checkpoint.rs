@@ -24,50 +24,94 @@ use kr_protocol::archive::{ArchiveCheckpoint, RecoveryBundle};
 
 use crate::recovery::{RecoveryError, Result};
 
-/// Holds a bundle read later to the bundle this restore read first: it is not an older revision, and
-/// every checkpoint the first read found is still there, at that generation or a newer one. A
-/// service that answers a later read with an older authentic bundle is not recorded into, because
-/// writing on it would lower a checkpoint it replaced, whichever archive's it was.
+/// The strongest the restore has read of the bundle, authenticated: its newest revision, and for
+/// every archive its highest checkpoint.
 ///
-/// # Errors
-///
-/// Returns [`RecoveryError::CheckpointWentBack`] when `bundle` is an older revision than
-/// `first_revision`, or records an older generation than one of `known` for an archive, or none;
-/// and [`RecoveryError::CheckpointDisagrees`] when it records the same generation of an archive
-/// with another encrypted manifest.
-pub(crate) fn hold_to_the_first_read(
-    bundle: &RecoveryBundle,
-    first_revision: u64,
-    known: &[ArchiveCheckpoint],
-) -> Result<()> {
-    if bundle.revision.get() < first_revision {
-        return Err(RecoveryError::BundleWentBackToAnOlderRevision {
-            first: first_revision,
-        });
+/// Every read is held to it, and a read that is held raises it to what that read holds, so what one
+/// read showed holds every read after it, whether or not a write was made on that read. A service
+/// that answers a later read with an older authentic bundle, or one that records a lower checkpoint
+/// of any archive than a read before it did, is not recorded into, because writing on it would put
+/// back what a newer bundle replaced: a lowered checkpoint, or a writer another device had added.
+#[derive(Clone)]
+pub(crate) struct Strongest {
+    revision: u64,
+    checkpoints: Vec<ArchiveCheckpoint>,
+}
+
+impl Strongest {
+    /// What a restore's first read of the bundle showed: its revision and its checkpoints.
+    pub(crate) fn first_read(revision: u64, checkpoints: &[ArchiveCheckpoint]) -> Self {
+        Self {
+            revision,
+            checkpoints: highest_of_each_archive(checkpoints),
+        }
     }
-    for known in known {
-        let held = bundle
-            .checkpoints
-            .iter()
-            .filter(|held| held.archive_id == known.archive_id)
-            .max_by_key(|held| held.backup_generation);
-        match held {
-            Some(held) if held.backup_generation > known.backup_generation => {}
-            Some(held) if held.backup_generation == known.backup_generation => {
-                if held.encrypted_manifest_hash != known.encrypted_manifest_hash {
-                    return Err(RecoveryError::CheckpointDisagrees {
-                        generation: known.backup_generation.get(),
+
+    /// Holds `bundle`, a later read, to the strongest read so far, and raises it to `bundle`: it is
+    /// not an older revision, and every checkpoint read before is still there, at that generation
+    /// or a newer one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryError::BundleWentBackToAnOlderRevision`] when `bundle` is an older revision
+    /// than one read before, [`RecoveryError::CheckpointWentBack`] when it records an older
+    /// generation than one read before for an archive, or none, and
+    /// [`RecoveryError::CheckpointDisagrees`] when it records the same generation of an archive
+    /// with another encrypted manifest. Nothing is raised then.
+    pub(crate) fn hold(&mut self, bundle: &RecoveryBundle) -> Result<()> {
+        if bundle.revision.get() < self.revision {
+            return Err(RecoveryError::BundleWentBackToAnOlderRevision {
+                first: self.revision,
+            });
+        }
+        for known in &self.checkpoints {
+            let held = bundle
+                .checkpoints
+                .iter()
+                .filter(|held| held.archive_id == known.archive_id)
+                .max_by_key(|held| held.backup_generation);
+            match held {
+                Some(held) if held.backup_generation > known.backup_generation => {}
+                Some(held) if held.backup_generation == known.backup_generation => {
+                    if held.encrypted_manifest_hash != known.encrypted_manifest_hash {
+                        return Err(RecoveryError::CheckpointDisagrees {
+                            generation: known.backup_generation.get(),
+                        });
+                    }
+                }
+                _ => {
+                    return Err(RecoveryError::CheckpointWentBack {
+                        known: known.backup_generation.get(),
                     });
                 }
             }
-            _ => {
-                return Err(RecoveryError::CheckpointWentBack {
-                    known: known.backup_generation.get(),
-                });
+        }
+        // Every checkpoint read before is in `bundle` at that generation or a newer one, so what
+        // `bundle` holds is at least as strong, and replaces it.
+        self.revision = bundle.revision.get();
+        self.checkpoints = highest_of_each_archive(bundle.checkpoints.iter());
+        Ok(())
+    }
+}
+
+/// The checkpoint held for each archive that has one, at its highest generation.
+fn highest_of_each_archive<'a>(
+    held: impl IntoIterator<Item = &'a ArchiveCheckpoint>,
+) -> Vec<ArchiveCheckpoint> {
+    let mut highest: Vec<ArchiveCheckpoint> = Vec::new();
+    for held in held {
+        match highest
+            .iter_mut()
+            .find(|known| known.archive_id == held.archive_id)
+        {
+            Some(known) if known.backup_generation < held.backup_generation => {
+                *known = held.clone();
             }
+            Some(_) => {}
+            None => highest.push(held.clone()),
         }
     }
-    Ok(())
+    highest
 }
 
 /// The bundle that records `verified`, or nothing when the bundle already records it or a newer
