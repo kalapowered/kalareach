@@ -1158,9 +1158,10 @@ impl Session {
     }
 
     /// Gives this session the lane its terminal output is offered to the observing components
-    /// through, and tells the lane whether privacy mode is on.
+    /// through, and tells the lane whether privacy mode is on. A session that cannot read whether
+    /// it is on is taken to be, as history and description facts take it.
     pub fn observe_with(&mut self, lane: Arc<crate::broker::observation::ObservationLane>) {
-        lane.set_private(self.privacy.is_enabled());
+        lane.set_private(self.privacy.is_enabled() || self.privacy_cleanup.unresolved.is_some());
         self.observation = Some(lane);
     }
 
@@ -4556,6 +4557,9 @@ impl Session {
                             )
                         });
                     self.privacy_cleanup.unresolved = None;
+                    if let Some(lane) = self.observation.as_ref() {
+                        lane.set_private(self.privacy.is_enabled());
+                    }
                 }
                 // Still unreadable, or still no journal to read. Nothing below runs.
                 Some(Err(_)) | None => return,
