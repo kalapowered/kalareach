@@ -527,7 +527,8 @@ impl Outputs {
     /// exact, with case). No declaration holds another, and no path of the version is a declared
     /// path or lies inside one: an output the version already contains is source, and a run that
     /// writes it has changed the source. A declaration beneath a file of the version is not
-    /// refused, because writing there takes the file away first, which reads as a change.
+    /// refused here: the host cannot make the directory above the output where the version has a
+    /// file, so a result about such a suite is always indeterminate.
     ///
     /// # Errors
     ///
@@ -1200,7 +1201,6 @@ pub fn record_result(
     binding: &RunBinding,
 ) -> Result<MaterialisationResult> {
     let (row, state, observed, found) = reread_with(service, materialisation_id, outputs)?;
-    let bound = binding.settle(service, materialisation_id);
     let input_version = VersionRef {
         change_set_id: row.change_set_id,
         version: row.version,
@@ -1220,7 +1220,7 @@ pub fn record_result(
              version"
                 .to_owned(),
         ),
-        Reread::Unmodified => match bound {
+        Reread::Unmodified => match binding.settle(service, materialisation_id) {
             Bound::Undisturbed => (
                 TestedSource::UnmodifiedVersion,
                 Some(input_version),
