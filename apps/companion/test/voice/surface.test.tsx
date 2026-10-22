@@ -50,7 +50,7 @@ function choice(over: Partial<ProviderChoice> = {}): ProviderChoice {
       { kind: 'the session', summary: 'its description, working directory and the last 20 messages' }
     ],
     withheld: [
-      { kind: 'file_contents', summary: 'the contents of files', reason: 'not selected' },
+      { kind: 'environment_variables', summary: 'environment variables', reason: 'not selected' },
       { kind: 'terminal_scrollback', summary: 'raw terminal scrollback', reason: 'not selected' }
     ],
     tokenCap: 8000,
@@ -114,7 +114,7 @@ describe('before voice starts', () => {
     expect(within(scope).getByText(/at most 8,000 tokens/)).toBeInTheDocument()
 
     // What is not sent, beside what is.
-    expect(within(scope).getByText('the contents of files')).toBeInTheDocument()
+    expect(within(scope).getByText('environment variables')).toBeInTheDocument()
     expect(within(scope).getByText('raw terminal scrollback')).toBeInTheDocument()
   })
 
