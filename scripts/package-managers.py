@@ -26,6 +26,7 @@ reads, and then plants each fault in the inputs, which has to be refused.
 
 import argparse
 import hashlib
+import importlib.util
 import os
 import re
 import shutil
@@ -99,6 +100,31 @@ def read_archives(paths, release):
     return found
 
 
+# Homebrew names a macOS release by its code name.
+MACOS_NAMES = {14: "sonoma", 15: "sequoia", 26: "tahoe"}
+
+
+def macos_floor():
+    """The code name of the macOS release the tree's Mach-O files are built to run on.
+
+    The floor is the one `check-release-floors.py` holds every Mach-O file to, so a cask that names
+    it cannot say another one.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check-release-floors.py")
+    spec = importlib.util.spec_from_file_location("check_release_floors", path)
+    floors = importlib.util.module_from_spec(spec)
+    # Reading the floors writes no compiled copy of them into the checkout.
+    kept, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        spec.loader.exec_module(floors)
+    finally:
+        sys.dont_write_bytecode = kept
+    major = floors.MACOS_MINIMUM[0]
+    if major not in MACOS_NAMES:
+        raise Refused(f"macOS {major} has no code name here for the cask to ask Homebrew for")
+    return MACOS_NAMES[major]
+
+
 def quoted(text):
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -116,6 +142,10 @@ def cask(release, url_prefix, archives):
   name "KalaReach"
   desc {quoted(DESCRIPTION)}
   homepage {quoted(HOMEPAGE)}
+
+  # The oldest macOS the release runs on, so that Homebrew refuses an older one before the first
+  # command of `kr` can fail on it.
+  depends_on macos: ">= :{macos_floor()}"
 
   # The release stays where Homebrew unpacked it. The first command of this `kr` admits that
   # release into the host's own store, so nothing runs after the unpack, and removing the cask
@@ -280,6 +310,10 @@ def self_test():
         report(
             "the cask names each architecture's digest, read from its archive",
             digest("aarch64-apple-darwin") in cask_text and digest("x86_64-apple-darwin") in cask_text,
+        )
+        report(
+            "the cask asks Homebrew for the macOS the release's Mach-O files are built to",
+            f'depends_on macos: ">= :{macos_floor()}"' in cask_text,
         )
         formula_text = text("Formula/kalareach.rb")
         report(

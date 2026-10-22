@@ -174,7 +174,9 @@ that has been published is never changed: a correction is a new commit under its
 `scripts/package-managers.py render` writes a Homebrew cask for macOS, a Homebrew formula for Linux
 and a winget portable manifest for Windows from the archives of one release. Each file carries the
 address of the archive it installs and the archive's SHA-256, which the script reads from the archive
-and never takes from a person. A family renders only when both of its architectures are given.
+and never takes from a person. The cask also names the macOS the release's files are built to, the
+floor `scripts/check-release-floors.py` holds them to, so Homebrew refuses an older system at the
+install and not at the first command. A family renders only when both of its architectures are given.
 
 None of them runs anything after it unpacks the release: Homebrew's `post_install` runs sandboxed,
 and a winget portable package has no hook. On macOS and Linux the `kr` that Homebrew puts on the
