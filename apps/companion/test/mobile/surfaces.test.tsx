@@ -384,6 +384,17 @@ describe("the owner's confirmations on a phone (KR-REQ-10.52)", () => {
     const told = await screen.findByText(/This phone cannot check it is you/)
     expect(told.textContent).not.toContain('computer')
   })
+
+  it.each([
+    ['ios', 'passcode'],
+    ['android', 'screen lock']
+  ] as const)('names what %s calls the lock to set when the phone can check nothing', async (surface, lock) => {
+    const { controls } = start(surface)
+    act(() => {
+      controls.setConfirmations({ ceremony: 'none', requests: [owed()] })
+    })
+    expect((await screen.findByTestId('no-ceremony')).textContent).toContain(`Set a ${lock}`)
+  })
 })
 
 describe('the attachment controls while a draft cannot take a file (KR-REQ-13.19)', () => {

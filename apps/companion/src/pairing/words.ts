@@ -171,7 +171,7 @@ function codeWords(
       }
     case 'camera_denied':
       return {
-        sentence: 'KalaReach cannot use the camera. Allow it in Settings, or type the code.',
+        sentence: 'KalaReach cannot use the camera. Allow it in Settings if this phone lets you, or type the code.',
         action: 'open_settings'
       }
     case 'no_code_found':

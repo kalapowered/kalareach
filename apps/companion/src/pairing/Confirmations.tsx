@@ -302,9 +302,11 @@ export function Confirmations({ surface = 'desktop' }: { readonly surface?: Surf
                 </p>
               ) : label === null ? (
                 <p className="small muted" data-testid="no-ceremony">
-                  {phone
-                    ? 'This phone cannot check that it is you. Set a screen lock in Settings, or confirm this on another device that can.'
-                    : 'Confirm this on your phone, or on another device that can check it is you.'}
+                  {surface === 'ios'
+                    ? 'This phone cannot check that it is you. Set a passcode in Settings, or confirm this on another device that can.'
+                    : phone
+                      ? 'This phone cannot check that it is you. Set a screen lock in Settings, and on Android 10 a fingerprint or face as well, or confirm this on another device that can.'
+                      : 'Confirm this on your phone, or on another device that can check it is you.'}
                 </p>
               ) : null}
             </div>
