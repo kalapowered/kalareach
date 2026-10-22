@@ -3072,8 +3072,8 @@ management was turned off. It also reports the host's own device identifier and 
 its local owner is signed for, and the sessions whose workers cannot be told what that owner may do.
 It reports the adapters the enrolled organisations' policies allow together and the adapters the
 catalogue admits under now. They are the same once the host has put the first list in force. They
-differ while a change waits for a synchronisation that holds the catalogue, and the second is then
-the earlier list. The second is what the catalogue holds when the answer is made: it does not show
+differ while a change waits for a synchronisation that holds the catalogue, or for the admission
+revision to be written, and the second is then the earlier list. The second is what the catalogue holds when the answer is made: it does not show
 that every session's worker has finished the round that follows a change.
 
 ### Applying a policy
@@ -3127,10 +3127,11 @@ never saw rotate is applied.
 
 After the organisation rotates its key, a host that has followed the new chain keeps the policy it
 holds and accepts the next one only under the new key. A policy the organisation signed under the
-old key is refused until the organisation signs it again, which the managed service does at the
-rotation: it signs the policy it holds again under the new key, as the next revision with the same
-settings, so the policy it serves afterwards is one that a host which followed the new chain
-applies. A host that has not followed the rotation needs the chain beside the policy:
+old key is refused until the organisation signs it again. The managed service signs the policy it
+holds again under the new key, as the next revision with the same settings, at the rotation, and
+again on a read that finds the policy under a key that no longer signs. It serves the stored policy
+when it cannot, so a policy it serves can still be one that a host which followed the new chain
+refuses. A host that has not followed the rotation needs the chain beside the policy:
 `kr organisation policy <policy-file> --chain <chain-file>`.
 
 The host keeps the policy's revision and its adapter allowlist in a store of its own,
@@ -3179,7 +3180,7 @@ request repairs would then leave it unable to decide.
 
 A write that failed only when it flushed the directory has put the new file in place, and the
 policy the host answered for stays in force in memory. The answer says so, by reading the file back
-after the failure: a start before the same policy is accepted again applies the new policy, which
+after the failure: a start before the same policy is accepted again may apply the new policy, which
 the answer said was not applied. The host does not take the new policy into memory, because after a
 failed flush nothing can say which file a power loss leaves, and an error that meant "applied" would
 be harder to act on than one that means "not applied, and the file may hold it". The same policy

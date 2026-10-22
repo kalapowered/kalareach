@@ -219,7 +219,8 @@ pub struct OrganisationListResult {
     /// The adapters the catalogue admits under now: the list the host has put in force, or null
     /// while it admits every adapter the host qualifies. It is the list in
     /// `effective_adapter_allowlist` once the host has put that in force, and it differs from it
-    /// only until then, while a change waits for a synchronisation that holds the catalogue. It is
+    /// only until then, while a change waits for a synchronisation that holds the catalogue or for
+    /// the admission revision to be written. It is
     /// what the catalogue holds when the answer is made; it does not show that every session's
     /// worker has finished the round that follows a change, and it is read beside the other list,
     /// not with it, so a change made at that moment can show in one alone.
