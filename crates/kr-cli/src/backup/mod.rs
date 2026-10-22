@@ -36,8 +36,11 @@ use crate::report::{self, Completion};
 use self::directory::Destination;
 use self::interrupt::Interrupt;
 use self::kit::{Entered, KitSource};
-use self::restore::{AtTheTerminal, Decision, Outcome, Privacy as _, Run};
-use self::source::{DaemonSource, real_pause};
+use self::restore::{
+    AtTheTerminal, CheckpointResult, ConfigurationResult, Decision, HostConfiguration, Outcome,
+    Privacy as _, Run,
+};
+use self::source::{DaemonBundleWriter, DaemonSource, real_pause};
 
 /// Runs one `kr backup` command and prints its result.
 ///
@@ -137,6 +140,10 @@ async fn restore(
 
     let selector = EnvironmentSelector { environment: None };
     let environment = crate::resolve::select(paths, None)?;
+    let bundles = DaemonBundleWriter::new(paths.clone(), None);
+    let on_disk = OnDisk {
+        environment: environment.paths.clone(),
+    };
     let mut privacy = Daemon::open(paths, &selector).await?;
     let began = privacy.status().await?;
     restore::refuse_while_private(&began)?;
@@ -175,6 +182,13 @@ async fn restore(
     let outcome = {
         let run = Run {
             source,
+            bundles: &bundles,
+            accept_older: arguments
+                .accept_older
+                .map(kr_protocol::ids::BackupGeneration::new),
+            configuration: arguments
+                .apply_configuration
+                .then_some(&on_disk as &dyn HostConfiguration),
             began: &began,
             destination: &destination,
             environment: environment.environment_id.to_string(),
@@ -204,6 +218,29 @@ async fn restore(
     Ok(Completion::Done)
 }
 
+/// This host's configuration document, on disk, as `kr host power` and `kr host startup` change it.
+struct OnDisk {
+    environment: kr_ipc::paths::EnvironmentPaths,
+}
+
+impl HostConfiguration for OnDisk {
+    fn load(&self) -> kr_protocol::hostinfo::configuration::Loaded {
+        crate::doctor::configuration::load(&self.environment)
+    }
+
+    fn apply(
+        &self,
+        change: &kr_protocol::hostinfo::configuration::Change,
+        baseline: &kr_protocol::hostinfo::configuration::Loaded,
+    ) -> Result<u64> {
+        // The writers' lock and the permit before the document is touched, as every writer of it
+        // holds them: an update that is switching releases is waited for.
+        let writers = crate::barrier::hold_for_configuration(&self.environment)?;
+        let permit = crate::barrier::permit(&writers, &crate::doctor::configuration::WRITTEN)?;
+        crate::doctor::configuration::apply_over(&self.environment, change, &permit, Some(baseline))
+    }
+}
+
 fn print(outcome: &Outcome, json: bool) {
     match outcome {
         Outcome::Previewed(planned) => {
@@ -215,10 +252,56 @@ fn print(outcome: &Outcome, json: bool) {
                 }
             }
         }
-        Outcome::Restored { planned, warnings } => {
+        Outcome::Restored {
+            planned,
+            warnings,
+            checkpoint,
+            configuration,
+        } => {
             for warning in warnings {
                 report::say(warning);
             }
+            let checkpoint_words = match checkpoint {
+                CheckpointResult::Recorded {
+                    generation,
+                    bundle_revision,
+                } => shown!(
+                    "The recovery bundle now records generation {} as the newest this kit has \
+                     verified (bundle revision {}). A later restore refuses a service that offers \
+                     an older one. The first restore after a loss still has nothing to compare \
+                     with, and a service can hold the bundle back as well.",
+                    *generation,
+                    *bundle_revision
+                ),
+                CheckpointResult::AlreadyThere { generation } => shown!(
+                    "The recovery bundle already records generation {} or a newer one of this \
+                     archive, so it was left as it is.",
+                    *generation
+                ),
+                CheckpointResult::NotRecorded(why) => why.clone(),
+            };
+            let configuration_words = match configuration {
+                ConfigurationResult::NotAsked => None,
+                ConfigurationResult::NothingInTheBackup => Some(Shown::said(
+                    "The backup holds no configuration, so none was applied.",
+                )),
+                ConfigurationResult::Applied { revision, changes } => Some(if changes.is_empty() {
+                    shown!(
+                        "This host's configuration already said what the backup's does; it is \
+                         now at revision {}.",
+                        *revision
+                    )
+                } else {
+                    shown!(
+                        "The backup's device configuration is applied to this host, which is now \
+                         at configuration revision {}. Run `kr host paths` to find the document. \
+                         It changed {} parts.",
+                        *revision,
+                        changes.len() as u64
+                    )
+                }),
+                ConfigurationResult::NotApplied(why) => Some(why.clone()),
+            };
             if json {
                 output::document(
                     &planned
@@ -226,7 +309,22 @@ fn print(outcome: &Outcome, json: bool) {
                         .with("ok", true)
                         .with("written", true)
                         .with("record", directory::RECORD_NAME)
-                        .with("warnings", warnings.clone()),
+                        .with("warnings", warnings.clone())
+                        .with("checkpoint", checkpoint_words.clone())
+                        .with(
+                            "checkpoint_recorded",
+                            matches!(
+                                checkpoint,
+                                CheckpointResult::Recorded { .. }
+                                    | CheckpointResult::AlreadyThere { .. }
+                            ),
+                        )
+                        .with(
+                            "configuration",
+                            configuration_words
+                                .clone()
+                                .unwrap_or_else(|| Shown::said("not asked for")),
+                        ),
                 );
             } else {
                 let files = planned.plan().restored().count();
@@ -236,6 +334,10 @@ fn print(outcome: &Outcome, json: bool) {
                     crate::shown::named(planned.folder()),
                     directory::RECORD_NAME
                 ));
+                output::say(&checkpoint_words);
+                if let Some(words) = &configuration_words {
+                    output::say(words);
+                }
             }
         }
     }
