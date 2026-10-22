@@ -216,12 +216,14 @@ pub trait Registrar: Send + Sync {
     ) -> PushFuture<'a, DevicePushRegisterResult>;
 }
 
+/// How the gateway at an origin is reached.
+pub type HttpFor =
+    dyn Fn(&GatewayOrigin) -> std::result::Result<Arc<dyn ServiceHttp>, String> + Send + Sync;
+
 /// The seams a test replaces: the gateway's transport per origin, and the clock.
 pub struct Wiring {
     /// How the gateway at an origin is reached.
-    pub http: Arc<
-        dyn Fn(&GatewayOrigin) -> std::result::Result<Arc<dyn ServiceHttp>, String> + Send + Sync,
-    >,
+    pub http: Arc<HttpFor>,
     /// The time, in UTC milliseconds.
     pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
