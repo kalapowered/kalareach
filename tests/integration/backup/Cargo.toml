@@ -9,6 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+kr-cbor.workspace = true
 kr-client.workspace = true
 kr-crypto.workspace = true
 kr-protocol.workspace = true
