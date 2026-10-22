@@ -1727,6 +1727,20 @@ fn a_viewer_is_shown_the_changes_its_history_reaches_and_no_earlier_ones() {
     assert_eq!(later.result.from_cursor.get(), all.from_cursor);
     assert_eq!(later.result.to_cursor.get(), all.to_cursor);
 
+    // A page holds the changes the viewer reaches, so earlier ones take none of its places.
+    let page = attention
+        .changed(
+            &phone,
+            &device(NOON + 2_000),
+            session(1),
+            2,
+            0,
+            Content::Narrowed,
+        )
+        .expect("the store is this owner's");
+    assert_eq!(page.result.changes.len(), 2);
+    assert!(page.result.more, "two more are reached past this page");
+
     let none = attention
         .changed(
             &phone,

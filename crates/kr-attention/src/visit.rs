@@ -339,6 +339,7 @@ impl SessionLog {
         actor: &ActorId,
         max_changes: u64,
         oldest_output_cursor: u64,
+        reaches: &dyn Fn(TimestampMs) -> bool,
     ) -> Changed {
         let visit = self.visits.get(actor);
         let from = visit.map_or(0, |visit| visit.cursor);
@@ -362,7 +363,7 @@ impl SessionLog {
         let changes: Vec<_> = self
             .log
             .iter()
-            .filter(|change| change.cursor >= start)
+            .filter(|change| change.cursor >= start && reaches(change.at_ms))
             .take(limit)
             .map(|change| (change.to_wire(), change.text.record()))
             .collect();
@@ -519,7 +520,10 @@ impl Visits {
     /// Answers what changed in one session since one actor's last visit to it.
     ///
     /// `oldest_output_cursor` is the oldest output the host can still replay, which is what decides
-    /// whether a retained log view can still be served from where it was left.
+    /// whether a retained log view can still be served from where it was left. `reaches` says
+    /// whether the reader's history reaches back to the moment a change was recorded: a change it
+    /// does not reach is not in the answer and does not take a place in a page, and the cursors of
+    /// the answer cover it.
     #[must_use]
     pub fn changed_since(
         &self,
@@ -527,6 +531,7 @@ impl Visits {
         session_id: SessionId,
         max_changes: u64,
         oldest_output_cursor: u64,
+        reaches: &dyn Fn(TimestampMs) -> bool,
     ) -> Changed {
         self.sessions.get(&session_id).map_or_else(
             || {
@@ -535,9 +540,18 @@ impl Visits {
                     actor,
                     max_changes,
                     oldest_output_cursor,
+                    reaches,
                 )
             },
-            |log| log.changed_since(session_id, actor, max_changes, oldest_output_cursor),
+            |log| {
+                log.changed_since(
+                    session_id,
+                    actor,
+                    max_changes,
+                    oldest_output_cursor,
+                    reaches,
+                )
+            },
         )
     }
 
