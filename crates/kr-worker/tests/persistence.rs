@@ -1192,6 +1192,7 @@ fn summary_with_root(
         closure: Nullable::null(),
         environment_sources: None,
         root: None,
+        application: None,
     }
 }
 
@@ -1228,6 +1229,69 @@ fn a_command_sessions_marker_is_kept_apart_from_the_summary_an_earlier_release_r
     );
     // The database stays open until the connection is closed, and a directory that holds an open
     // database cannot be removed on Windows, so the removal comes after it and says if it fails.
+    connection.close().expect("closes the journal");
+    std::fs::remove_dir_all(path.parent().expect("a parent"))
+        .expect("removes the journal's directory");
+}
+
+/// KR-REQ-13.10, KR-REQ-26.10: the journal of a session with a foreground application holds the
+/// session's summary in the form a release that does not know the application reads, and the
+/// application in a row of its own, which this build reads back into the summary. The row goes when
+/// the application does.
+#[test]
+fn an_applications_name_is_kept_apart_from_the_summary_an_earlier_release_reads() {
+    let path = journal_path("application");
+    let session_id = fixture_session();
+    let mut summary = summary_with_root(session_id, None);
+    summary.application = Some("Claude Code".to_owned());
+    let mut journal = Journal::open(&path).expect("opens");
+    journal.record_session(&summary).expect("records");
+    assert_eq!(
+        journal.read_session(session_id).expect("reads"),
+        Some(summary.clone()),
+        "this build reads the application back"
+    );
+
+    // The summary row is byte for byte the summary of a session with no application.
+    let connection = rusqlite::Connection::open(&path).expect("opens the journal");
+    let stored = |connection: &rusqlite::Connection| -> Vec<u8> {
+        connection
+            .query_row("SELECT summary FROM session", [], |row| row.get(0))
+            .expect("the summary row")
+    };
+    let mut without = summary.clone();
+    without.application = None;
+    assert_eq!(
+        stored(&connection),
+        kr_cbor::to_canonical_vec(&without).expect("encodes the summary"),
+        "an earlier release's reader, refusing a member it does not know, reads the summary row"
+    );
+
+    // The foreground returns to the prompt: the application is cleared, and its row with it.
+    journal.record_session(&without).expect("records again");
+    assert_eq!(
+        journal.read_session(session_id).expect("reads"),
+        Some(without.clone()),
+        "a session with no application is read as one"
+    );
+    let rows: i64 = connection
+        .query_row("SELECT COUNT(*) FROM session_application", [], |row| {
+            row.get(0)
+        })
+        .expect("counts");
+    assert_eq!(rows, 0, "the application's row went with the application");
+
+    // A journal an earlier build of this version wrote has no such table, and its session is read
+    // as one with no application.
+    connection
+        .execute_batch("DROP TABLE session_application")
+        .expect("drops the table");
+    assert_eq!(
+        journal.read_session(session_id).expect("reads"),
+        Some(without),
+        "a journal with no table reads its session as having no application"
+    );
+    drop(journal);
     connection.close().expect("closes the journal");
     std::fs::remove_dir_all(path.parent().expect("a parent"))
         .expect("removes the journal's directory");
@@ -1464,9 +1528,10 @@ fn the_importer_brings_a_version_one_journal_to_the_current_version_once() {
             .iter()
             .map(|name| (*name).to_owned())
             .collect();
-        // The one table the version's list leaves out because journals of the version are read
-        // with or without it.
+        // The tables the version's list leaves out because journals of the version are read with
+        // or without them.
         current.push("session_root".to_owned());
+        current.push("session_application".to_owned());
         current.sort();
         assert_eq!(
             tables, current,

@@ -36773,6 +36773,13 @@
       "additionalProperties": false,
       "description": "What a client knows about one session.",
       "properties": {
+        "application": {
+          "description": "The name of the application in the session's foreground, as a person recognises it.\n\nAbsent from the wire when the worker knows no application, which is every session at a\nprompt and every session of a worker of a release that wrote no such member, so a summary\nof one is byte for byte what that release reads. A session of such a worker shows no\napplication. A closed session shows the application its worker last recorded for it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "application_state": {
           "anyOf": [
             {
