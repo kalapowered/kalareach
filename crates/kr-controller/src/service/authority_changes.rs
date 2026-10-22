@@ -171,12 +171,6 @@ impl Controller {
                 .iter()
                 .any(|worker| worker.names_pending.get() > 0)
         };
-        let named = match mutation.method.method() {
-            Some(Method::GrantRevoke) => {
-                Some(parse::<kr_protocol::sharing::GrantRevokeParams>(&mutation.params)?.grant_id)
-            }
-            _ => None,
-        };
         match mutation.method.method() {
             Some(Method::GrantRevoke | Method::DeviceRevoke) => {
                 let Ok(given) = answer.to_typed::<kr_protocol::sharing::RevocationResult>() else {
@@ -185,6 +179,13 @@ impl Controller {
                 if !owes(&given) {
                     return Ok(answer);
                 }
+                let named = match mutation.method.method() {
+                    Some(Method::GrantRevoke) => Some(
+                        parse::<kr_protocol::sharing::GrantRevokeParams>(&mutation.params)?
+                            .grant_id,
+                    ),
+                    _ => None,
+                };
                 let audience = Audience::of(actor_id);
                 encode(&self.with_the_names_since(audience, named, given).await?)
             }
