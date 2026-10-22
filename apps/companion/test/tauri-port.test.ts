@@ -718,6 +718,10 @@ describe('the desktop port and recovery', () => {
     await port.recoverySaveKit('/tmp/kit.txt')
     await port.recoveryCoverHost(false)
     await port.recoveryCoverHost(true)
+    await port.recoverySaveKitQr('/tmp/kit.svg')
+    await port.recoveryArchives()
+    await port.recoveryExportOffline('/tmp/copy.krexport', 'archive-1')
+    await port.recoveryExportOffline('/tmp/bundle.krexport', null)
     await port.accountSignInForRecovery()
     expect(shell.invoked).toEqual([
       { command: 'sync_service_view', args: {} },
@@ -728,6 +732,13 @@ describe('the desktop port and recovery', () => {
       { command: 'recovery_save_kit', args: { path: '/tmp/kit.txt' } },
       { command: 'recovery_cover_host', args: { replace: false } },
       { command: 'recovery_cover_host', args: { replace: true } },
+      { command: 'recovery_save_kit_qr', args: { path: '/tmp/kit.svg' } },
+      { command: 'recovery_archives', args: {} },
+      {
+        command: 'recovery_export_offline',
+        args: { path: '/tmp/copy.krexport', archive: 'archive-1' }
+      },
+      { command: 'recovery_export_offline', args: { path: '/tmp/bundle.krexport', archive: null } },
       { command: 'account_sign_in_for_recovery', args: {} }
     ])
   })

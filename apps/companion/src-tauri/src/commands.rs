@@ -207,6 +207,12 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("recovery_turn_on", None),
     ("recovery_settle", None),
     ("recovery_save_kit", None),
+    // The kit as a QR code, the archives the recovery bundle names, and an offline export of the
+    // bundle and one archive. None is a host method: this computer reads the sync service with the
+    // account, and the page names a destination a save dialog returned and an archive it was shown.
+    ("recovery_save_kit_qr", None),
+    ("recovery_archives", None),
+    ("recovery_export_offline", None),
     // Covering the host on this computer with this computer's recovery. The page supplies nothing
     // but whether a replacement is asked for; native code reads the host's status, builds the call
     // from this computer's own seed and bundle, and sends it to the host.
@@ -617,6 +623,9 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         recovery_turn_on,
         recovery_settle,
         recovery_save_kit,
+        recovery_save_kit_qr,
+        recovery_archives,
+        recovery_export_offline,
         recovery_cover_host,
         settings_view,
         settings_colour_mode_set,
@@ -3506,6 +3515,9 @@ mod tests {
         "recovery_turn_on",
         "recovery_settle",
         "recovery_save_kit",
+        "recovery_save_kit_qr",
+        "recovery_archives",
+        "recovery_export_offline",
         "recovery_cover_host",
         "settings_view",
         "settings_colour_mode_set",
@@ -3657,8 +3669,11 @@ mod tests {
                 // page names only whether a replacement is asked for.
                 "sync_service_set",
                 "sync_service_view",
+                "recovery_archives",
                 "recovery_cover_host",
+                "recovery_export_offline",
                 "recovery_save_kit",
+                "recovery_save_kit_qr",
                 "recovery_settle",
                 "recovery_turn_on",
                 "recovery_view",
@@ -4471,6 +4486,51 @@ pub async fn recovery_settle(
     account: State<'_, crate::account::AccountSlot>,
 ) -> Result<crate::recovery::RecoveryView> {
     state.recovery()?.settle(account.get().await?).await
+}
+
+/// Writes the recovery kit to the file the person chose, as a QR code to print.
+///
+/// The kit holds the seed, so it is drawn and written by this process to a destination a save
+/// dialog returned, and the page is told only where.
+#[tauri::command]
+pub async fn recovery_save_kit_qr(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<crate::recovery::KitSaved> {
+    let destination = state.take_export_destination(std::path::Path::new(&path))?;
+    state.recovery()?.save_kit_qr(&destination).await?;
+    Ok(crate::recovery::KitSaved { path })
+}
+
+/// The archives the recovery bundle names at the sync service, each with its newest generation.
+#[tauri::command]
+pub async fn recovery_archives(
+    state: State<'_, AppState>,
+    account: State<'_, crate::account::AccountSlot>,
+) -> Result<Vec<crate::recovery::ArchiveView>> {
+    state.recovery()?.archives(account.get().await?).await
+}
+
+/// Writes an offline export to the file the person chose: the recovery bundle and, when an archive
+/// is named, that archive's newest generation, as ciphertext. Nothing decrypted is written.
+#[tauri::command]
+pub async fn recovery_export_offline(
+    state: State<'_, AppState>,
+    account: State<'_, crate::account::AccountSlot>,
+    path: String,
+    archive: Option<String>,
+) -> Result<crate::recovery::ExportSaved> {
+    let archive = archive
+        .map(|text| {
+            text.parse::<kr_protocol::ids::ArchiveId>()
+                .map_err(|_| CommandError::invalid("that is not an archive identifier"))
+        })
+        .transpose()?;
+    let destination = state.take_export_destination(std::path::Path::new(&path))?;
+    state
+        .recovery()?
+        .export_offline(account.get().await?, &destination, archive)
+        .await
 }
 
 /// Covers the host on this computer with this computer's recovery, or says why it cannot.

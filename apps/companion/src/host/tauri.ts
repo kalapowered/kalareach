@@ -25,8 +25,10 @@ import type {
   HostEvent,
   HostPort,
   ImportedImage,
+  ExportSaved,
   HostCoverView,
   KitSaved,
+  RecoveryArchive,
   OpenRequest,
   OwnerView,
   PairingOrigin,
@@ -443,6 +445,10 @@ export function tauriPort(): HostPort {
     recoverySettle: () => call<RecoveryView>('recovery_settle', {}),
     recoverySaveKit: (path) => call<KitSaved>('recovery_save_kit', { path }),
     recoveryCoverHost: (replace) => call<HostCoverView>('recovery_cover_host', { replace }),
+    recoverySaveKitQr: (path) => call<KitSaved>('recovery_save_kit_qr', { path }),
+    recoveryArchives: () => call<readonly RecoveryArchive[]>('recovery_archives', {}),
+    recoveryExportOffline: (path, archive) =>
+      call<ExportSaved>('recovery_export_offline', { path, archive }),
 
     subscribe: (listener: (event: HostEvent) => void) =>
       listening<PublishedEvent>(HOST_EVENT, (published) => {
