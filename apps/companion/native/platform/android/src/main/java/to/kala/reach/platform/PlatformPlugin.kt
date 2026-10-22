@@ -218,7 +218,9 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    // The owner's presence. The system draws the prompt; one at a time, so a newer request ends the older.
+    // The owner's presence. The system draws the prompt; one at a time. A request that comes while one
+    // is up is not confirmed, and the one that is up is left alone: the library keeps one callback for
+    // every prompt of an activity, so a second prompt would take the first one's answer.
 
     private var ownerPrompt: OwnerPrompt? = null
 
@@ -235,7 +237,10 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
     fun presence(invoke: Invoke) {
         val arguments = invoke.parseArgs(PresenceArguments::class.java)
         activity.runOnUiThread {
-            ownerPrompt?.end()
+            if (ownerPrompt != null) {
+                invoke.resolve(JSObject().put("outcome", "not_confirmed"))
+                return@runOnUiThread
+            }
             val host = activity as? FragmentActivity
             val ask = if (host == null) null else OwnerPrompt.ask(host)
             if (host == null || ask == null) {
