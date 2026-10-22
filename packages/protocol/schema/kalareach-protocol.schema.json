@@ -7588,6 +7588,10 @@
           "description": "Whether any limit was exhausted.",
           "type": "boolean"
         },
+        "generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The budget generation the chain is on: nought until it is rearmed, and one more for each\nrearm. A `workflow.rearm` names the generation it leaves."
+        },
         "managed_spend": {
           "$ref": "#/$defs/U64",
           "description": "Managed allowance the chain's actions have spent."
@@ -7631,6 +7635,7 @@
       },
       "required": [
         "causal_root_id",
+        "generation",
         "depth",
         "max_depth",
         "total_runs",
@@ -22997,6 +23002,11 @@
         {
           "const": "workflow.run",
           "description": "Start a run, recording the trigger event, definition version and causal parent.",
+          "type": "string"
+        },
+        {
+          "const": "workflow.rearm",
+          "description": "Give a causal chain whose budget ran out a new one, under a grant this host holds with the right to manage automation, and continue the chain from the descendants the exhausted budget refused. A chain whose budget has not run out is refused. The request names the generation it leaves, so a repeat of it after a lost reply is answered with the generation the chain went to and gives no second budget. Nothing an event carries can rearm a chain.",
           "type": "string"
         },
         {
@@ -42122,6 +42132,49 @@
       ],
       "type": "object"
     },
+    "WorkflowRearmParams": {
+      "additionalProperties": false,
+      "description": "Parameters for `workflow.rearm`.\n\nA rearm is the explicit, authorised act that gives a causal chain a new budget after its\nbudget ran out. Nothing an event carries can make one: the request names the chain, the grant\nit is made under, and the budget generation it leaves.\n\nThe generation is what makes a repeat of the request a repeat and not a second budget. The\nfirst request moves the chain from that generation to the next. A request that names a\ngeneration the chain has already left, such as the same request sent again after its reply was\nlost, is answered with the generation the chain went to and establishes nothing.",
+      "properties": {
+        "causal_root_id": {
+          "$ref": "#/$defs/CausalRootId",
+          "description": "The chain, by its causal root."
+        },
+        "generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The budget generation the chain is on now, as `workflow.read` shows it."
+        },
+        "grant_reference": {
+          "$ref": "#/$defs/GrantId",
+          "description": "The grant the rearm is made under, which this host holds as live, for this environment,\nwith the right to manage automation. A paired device names the grant it holds."
+        }
+      },
+      "required": [
+        "causal_root_id",
+        "grant_reference",
+        "generation"
+      ],
+      "type": "object"
+    },
+    "WorkflowRearmResult": {
+      "additionalProperties": false,
+      "description": "Result of `workflow.rearm`.",
+      "properties": {
+        "causal_root_id": {
+          "$ref": "#/$defs/CausalRootId",
+          "description": "The chain."
+        },
+        "generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The generation the chain's budget is on now: the one after the generation the request\nnamed."
+        }
+      },
+      "required": [
+        "causal_root_id",
+        "generation"
+      ],
+      "type": "object"
+    },
     "WorkflowResourceScope": {
       "additionalProperties": false,
       "description": "Resource scope binding for a workflow.",
@@ -44898,6 +44951,12 @@
     },
     "workflow_read_result": {
       "$ref": "#/$defs/WorkflowReadResult"
+    },
+    "workflow_rearm_params": {
+      "$ref": "#/$defs/WorkflowRearmParams"
+    },
+    "workflow_rearm_result": {
+      "$ref": "#/$defs/WorkflowRearmResult"
     },
     "workflow_resource_scope": {
       "$ref": "#/$defs/WorkflowResourceScope"

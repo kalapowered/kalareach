@@ -332,8 +332,9 @@ links to its document.
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `workflow.install` | write | `local_ipc`, `paired_device` | Install a versioned automation definition under an explicit workflow grant. | [Automation: The five methods](../automation/README.md) |
-| `workflow.enable` | write | `local_ipc`, `paired_device` | Enable an installed definition at an exact revision. | [Automation: The five methods](../automation/README.md) |
-| `workflow.pause` | write | `local_ipc`, `paired_device` | Pause a definition. Exceeding a concurrency or budget limit pauses it automatically. | [Automation: The five methods](../automation/README.md) |
-| `workflow.run` | write | `local_ipc`, `paired_device` | Start a run, recording the trigger event, definition version and causal parent. | [Automation: The five methods](../automation/README.md) |
-| `workflow.read` | read | `local_ipc`, `paired_device` | Read definitions, runs, node receipts and remaining causal budget. | [Automation: The five methods](../automation/README.md) |
+| `workflow.install` | write | `local_ipc`, `paired_device` | Install a versioned automation definition under an explicit workflow grant. | [Automation: The six methods](../automation/README.md) |
+| `workflow.enable` | write | `local_ipc`, `paired_device` | Enable an installed definition at an exact revision. | [Automation: The six methods](../automation/README.md) |
+| `workflow.pause` | write | `local_ipc`, `paired_device` | Pause a definition. Exceeding a concurrency or budget limit pauses it automatically. | [Automation: The six methods](../automation/README.md) |
+| `workflow.run` | write | `local_ipc`, `paired_device` | Start a run, recording the trigger event, definition version and causal parent. | [Automation: The six methods](../automation/README.md) |
+| `workflow.rearm` | write | `local_ipc`, `paired_device` | Give a causal chain whose budget ran out a new one, under a grant this host holds with the right to manage automation, and continue the chain from the descendants the exhausted budget refused. A chain whose budget has not run out is refused. The request names the generation it leaves, so a repeat of it after a lost reply is answered with the generation the chain went to and gives no second budget. Nothing an event carries can rearm a chain. | [Automation: The six methods](../automation/README.md) |
+| `workflow.read` | read | `local_ipc`, `paired_device` | Read definitions, runs, node receipts and remaining causal budget. | [Automation: The six methods](../automation/README.md) |

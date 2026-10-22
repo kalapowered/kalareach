@@ -249,6 +249,7 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::WorkflowEnable
         | Method::WorkflowPause
         | Method::WorkflowRun
+        | Method::WorkflowRearm
         | Method::HostUpdateHandover
         | Method::HostClockEstablish
         | Method::AccountSignIn

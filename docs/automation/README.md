@@ -4,7 +4,7 @@ Workflows are versioned directed acyclic graphs of typed execution nodes execute
 They react to verified event triggers, run under causal budgets, and observe per-workflow, per-host,
 and per-grant admission limits.
 
-## The five methods
+## The six methods
 
 | Method | What it does | Right |
 | --- | --- | --- |
@@ -12,9 +12,10 @@ and per-grant admission limits.
 | `workflow.enable` | Activates an installed workflow definition revision | `automation.manage` |
 | `workflow.pause` | Pauses an enabled workflow definition revision | `automation.manage` |
 | `workflow.run` | Explicitly triggers an execution run of an enabled workflow | `automation.manage` |
+| `workflow.rearm` | Gives a causal chain whose budget ran out a new budget and continues it | `automation.manage` |
 | `workflow.read` | Reads definitions and whether each revision is paused, runs, node receipts, a chain's remaining budget, and the alerts no attention state has taken | `automation.manage` |
 
-The control daemon serves all five, to the owner on the local socket and to a paired device over
+The control daemon serves all six, to the owner on the local socket and to a paired device over
 the network, and those are the only ingresses the method registry lists for them. They arrive
 through the daemon's ordinary path on either door: a read is checked against current authority,
 and a mutation carries an action window, is checked against the method registry and its rights,
