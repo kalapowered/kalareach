@@ -27,12 +27,12 @@ use kr_ipc::client::LocalClient;
 use kr_protocol::admission::ComponentState;
 use kr_protocol::envelope::{ActionTarget, ControlFrame, Outcome, ParamsValue};
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{ActionId, ControllerGeneration, RequestId};
+use kr_protocol::ids::{ActionId, RequestId};
 use kr_protocol::local::ControllerConnectionRole;
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::receipt::{ActionCancelParams, ActionReadParams, ActionReadResult};
 use kr_protocol::receipt::{Receipt, ReceiptState};
-use kr_protocol::scalars::{DurationMs, Nullable, Uuid};
+use kr_protocol::scalars::{DurationMs, Nullable};
 
 mod plugin_world;
 
