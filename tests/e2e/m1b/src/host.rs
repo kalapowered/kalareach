@@ -271,9 +271,10 @@ impl<'r> Host<'r> {
         };
         // The port was free when it was chosen, and it is bound when the daemon starts: other legs
         // choose theirs meanwhile, on this machine and on a shared one, and two can choose alike.
-        // A daemon that exited because its address was taken before it could bind it has started
-        // nothing, so another port is chosen and the daemon started again; nothing holds the old
-        // address yet, because no device has paired.
+        // A daemon that exited because it could not bind the address it was given served nothing
+        // (it did record its own start in its state, which nothing here reads), so another port is
+        // chosen and the daemon started again; nothing holds the old address yet, because no
+        // device has paired.
         for attempt in 1..=PORT_ATTEMPTS {
             match host.start_daemon_once() {
                 Ok(()) => return host,
@@ -343,11 +344,15 @@ impl<'r> Host<'r> {
         if let Some(packages) = &self.shell_packages {
             command.env("KR_SHELL_PACKAGES", packages);
         }
-        let child = command.spawn().expect("the daemon starts");
-        let identity = self
-            .run
-            .record_child(child.id(), "the control daemon")
-            .unwrap_or_else(|| panic!("the daemon ended at once: {}", self.daemon_said()));
+        let mut child = command.spawn().expect("the daemon starts");
+        let Some(identity) = self.run.record_child(child.id(), "the control daemon") else {
+            // A daemon that has already exited has no identity to read on some systems. Whether it
+            // exited, and what it wrote, is what decides what this start came to.
+            return match child.try_wait() {
+                Ok(Some(_)) => Err(self.daemon_said_since(earlier)),
+                _ => panic!("the daemon ended at once: {}", self.daemon_said()),
+            };
+        };
         *self.daemon.lock().unwrap_or_else(PoisonError::into_inner) =
             Some(Daemon { child, identity });
         let answered = Deadline::after(LIVENESS).poll(CLEANUP_COMMAND, ASK_AGAIN, |bound| {
@@ -766,7 +771,7 @@ impl Drop for Host<'_> {
 }
 
 /// How many times a host with a stable address is given a port before the daemon's refusal of it is
-/// reported. It ends a hang: each refusal is a port another leg chose at the same moment.
+/// reported. It ends a hang: each refusal is taken to be a port another leg chose at the same moment.
 const PORT_ATTEMPTS: usize = 5;
 
 /// A loopback port nothing holds now; the daemon binds it at each start, and the address a paired
@@ -779,7 +784,8 @@ fn free_loopback_port() -> u16 {
         .port()
 }
 
-/// Whether what a daemon wrote says it exited because its configured address was held by another.
+/// Whether what a daemon wrote says it exited because it could not bind its configured address.
+/// The daemon does not say why: a port another leg chose is the reason this harness knows of.
 fn address_was_taken(said: &str) -> bool {
     said.contains("network.bind_address") && said.contains("could not be bound")
 }
