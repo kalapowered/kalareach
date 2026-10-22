@@ -3440,6 +3440,16 @@ it. So a fresh identifier for a subject that already carries an uncertain outcom
 its preconditions name that action and the receipt revision the caller read it at. A service that
 wanted to hide the uncertainty would have to name the receipt it was hiding.
 
+The revision has to be one the caller was shown. The worker remembers, in memory and for a bounded
+number of receipts, the revision of each receipt that `action.read` answered to each actor, and a
+request that quotes any other revision is refused although the number is right: it is a number
+anyone can write. A worker that restarted, or let the entry go for room, has not shown it, and the
+caller reads the receipt again. Only the local owner and a paired device can show a receipt to
+a person, so a request through the workflow ingress never supersedes one.
+
+An exact duplicate of an action that kept a result is answered with that result, as it was kept,
+once the device's present authority has been checked, and does the action no second time.
+
 One actor holds at most eight admitted, unsettled mutations at once, lowered by whatever the
 connection negotiated. That is section 9's figure, and what it bounds is durable admissions this
 host still owes a decision on. A connection that offers to hold none is refused at the handshake
