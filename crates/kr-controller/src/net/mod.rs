@@ -53,6 +53,7 @@ pub mod methods;
 pub mod owner;
 pub mod pairing;
 pub mod proxy;
+mod reconnects;
 pub mod rendezvous;
 pub mod rendezvous_https;
 
@@ -63,6 +64,7 @@ use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::{SecretStore, StoreSelection};
 use kr_pairing::host::HostIdentity;
 use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, DeviceId, DeviceKeyRevision};
+use kr_protocol::metrics::{Outcome, Transport};
 use kr_protocol::pairing::NetworkConfig;
 use kr_protocol::scalars::EndpointKey;
 use kr_transport::clock::ContinuousInstant;
@@ -441,6 +443,8 @@ pub struct NetworkHost {
     live: std::sync::Mutex<std::collections::BTreeMap<ConnectionId, Weak<RemoteConnection>>>,
     /// This host's endpoint identity, which is what a pairing invitation pins.
     endpoint_id: EndpointKey,
+    /// How long each paired device is without a connection to this host.
+    reconnects: reconnects::Reconnects,
 }
 
 impl std::fmt::Debug for NetworkHost {
@@ -553,9 +557,21 @@ impl NetworkHost {
     /// Serves one authorised connection until it ends.
     async fn serve_connection(self: Arc<Self>, mut session: AuthorisedSession) {
         let connection_id = session.connection_id;
+        // What the host counts of a device that comes back: when this connection reached it, over
+        // which path, and whether it ends up served. A connection the host then turns away is a
+        // refused attempt, whichever of the steps below does it.
+        let device_id = session.peer_device_id;
+        let clock = Arc::clone(&session.clock);
+        let arrived_at = clock.now();
+        let transport = transport_of(&session.connection);
+        let refused = || {
+            self.reconnects
+                .arrived(device_id, arrived_at, transport, Outcome::Refused)
+        };
         let device = match self.admit(&session).await {
             Ok(device) => device,
             Err(error) => {
+                refused();
                 let _ = session
                     .control
                     .send(&refusal(&error.to_protocol_error()))
@@ -564,6 +580,7 @@ impl NetworkHost {
             }
         };
         let Ok(controller) = self.daemon() else {
+            refused();
             return;
         };
         // Section 10: synchronise the authority feed at reconnect before affected remote access.
@@ -581,6 +598,7 @@ impl NetworkHost {
         let grant_deadline = match self.lifetimes.deadline(&device) {
             Ok(deadline) => deadline,
             Err(error) => {
+                refused();
                 let _ = session
                     .control
                     .send(&refusal(&error.to_protocol_error()))
@@ -605,11 +623,17 @@ impl NetworkHost {
         // this future is *cancelled* rather than finished the moment the control stream ends: the
         // transport races the handler against the stream and against the connection, so the end of
         // the loop below is not a place cleanup can live.
+        // Served from here on, so the gap before this connection is over, and it is the guard
+        // that says when this one has ended: a destructor runs however the handler is dropped.
+        self.reconnects
+            .arrived(device_id, arrived_at, transport, Outcome::Ok);
         let mut guard = ConnectionGuard {
             host: Arc::clone(&self),
             controller: Arc::clone(&controller),
             remote: Arc::clone(&remote),
             connection_id,
+            device_id,
+            clock,
             relay: None,
             watch: None,
         };
@@ -1267,6 +1291,9 @@ struct ConnectionGuard {
     controller: Arc<Controller>,
     remote: Arc<RemoteConnection>,
     connection_id: ConnectionId,
+    /// The device the connection belongs to, and the clock its end is read on.
+    device_id: DeviceId,
+    clock: Arc<dyn kr_transport::clock::ContinuousClock>,
     relay: Option<tokio::task::AbortHandle>,
     /// Ends the connection when a grant it stands on ends ([`RemoteConnection::grant_ended`]).
     watch: Option<tokio::task::AbortHandle>,
@@ -1285,6 +1312,9 @@ impl Drop for ConnectionGuard {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.connection_id);
+        self.host
+            .reconnects
+            .departed(self.device_id, self.clock.now());
         let remote = Arc::clone(&self.remote);
         let controller = Arc::clone(&self.controller);
         let connection_id = self.connection_id;
@@ -1294,6 +1324,29 @@ impl Drop for ConnectionGuard {
             remote.release().await;
             controller.deregister(connection_id);
         });
+    }
+}
+
+/// How a connection reached this host: over the path the connection is sending on, and where none
+/// is selected yet, over the first it has, which for a connection that has only just been accepted
+/// is the relay it was dialled through.
+fn transport_of(connection: &iroh::endpoint::Connection) -> Transport {
+    let paths = connection.paths();
+    let mut first = None;
+    for path in &paths {
+        if path.is_selected() {
+            return if path.is_relay() {
+                Transport::Relay
+            } else {
+                Transport::Direct
+            };
+        }
+        first.get_or_insert(path.is_relay());
+    }
+    if first == Some(false) {
+        Transport::Direct
+    } else {
+        Transport::Relay
     }
 }
 
@@ -1369,6 +1422,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         lifetimes,
         live: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         endpoint_id,
+        reconnects: reconnects::Reconnects::new(Arc::clone(controller.metrics())),
     });
     // The record of the wall clock moves while this host runs, whether or not anything asks it a
     // question. A mark that only advanced when a device connected would stand still through a

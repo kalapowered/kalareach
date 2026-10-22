@@ -414,6 +414,14 @@ pub struct HostDoctorResult {
     /// names, in this daemon's own environment, which a launch's may differ from, and says what it
     /// read, word for word.
     pub launch_probes: Vec<LaunchProbeReport>,
+    /// What this host has measured about itself: how long its paired devices were without a
+    /// connection, the faults its terminals' parsers met and the failures of its adapters.
+    ///
+    /// Local diagnostics, counted in memory from this daemon's start and sent nowhere. Every label
+    /// is one of this build's own words, so the report carries no terminal content, key, prompt or
+    /// filename and a support bundle takes it as it is.
+    #[serde(default)]
+    pub metrics: crate::metrics::Report,
 }
 
 impl HostDoctorResult {
@@ -432,6 +440,7 @@ impl HostDoctorResult {
             configuration,
             command_integrations: Vec::new(),
             launch_probes: Vec::new(),
+            metrics: crate::metrics::Report::default(),
         }
     }
 
@@ -442,6 +451,13 @@ impl HostDoctorResult {
         command_integrations: Vec<CommandIntegrationReport>,
     ) -> Self {
         self.command_integrations = command_integrations;
+        self
+    }
+
+    /// The same result, reporting `metrics`.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: crate::metrics::Report) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -715,6 +731,8 @@ impl export::ForExport for HostDoctorResult {
                 .iter()
                 .map(LaunchProbeReport::withheld_form)
                 .collect(),
+            // Made only of this build's own words, whatever it was read back from.
+            metrics: self.metrics,
         })
     }
 }
@@ -6138,6 +6156,24 @@ pub mod export {
             ContentClass::Structure,
         ),
         field("HostDoctorResult", "launch_probes", ContentClass::Structure),
+        field("HostDoctorResult", "metrics", ContentClass::Structure),
+        field("Report", "reconnect_time", ContentClass::Structure),
+        field("Report", "terminal_parse_fault", ContentClass::Structure),
+        field("Report", "adapter_failure", ContentClass::Structure),
+        field("ReconnectTime", "transport", ContentClass::Term),
+        field("ReconnectTime", "attempt", ContentClass::Term),
+        field("ReconnectTime", "outcome", ContentClass::Term),
+        field("ReconnectTime", "environment", ContentClass::Term),
+        field("ReconnectTime", "count", ContentClass::Number),
+        field("ReconnectTime", "total_ms", ContentClass::Number),
+        field("ReconnectTime", "longest_ms", ContentClass::Number),
+        field("ParseFault", "fault", ContentClass::Term),
+        field("ParseFault", "environment", ContentClass::Term),
+        field("ParseFault", "count", ContentClass::Number),
+        field("AdapterFailure", "adapter", ContentClass::Term),
+        field("AdapterFailure", "outcome", ContentClass::Term),
+        field("AdapterFailure", "environment", ContentClass::Term),
+        field("AdapterFailure", "count", ContentClass::Number),
         field("LaunchProbeReport", "plugin_id", ContentClass::Name),
         field("LaunchProbeReport", "version", ContentClass::Name),
         field("LaunchProbeReport", "state", ContentClass::Term),

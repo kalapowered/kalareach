@@ -19,6 +19,13 @@ impl Controller {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// What this host measures about itself: how long paired devices were without a connection, and
+    /// what its sessions and adapters counted, once those reach it.
+    #[must_use]
+    pub fn metrics(&self) -> &Arc<kr_protocol::metrics::Recorder> {
+        &self.metrics
+    }
+
     /// Reads this environment's configuration.
     ///
     /// One reader, so the value a check reports and the value the host acts on cannot be two
