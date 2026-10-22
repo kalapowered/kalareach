@@ -367,11 +367,20 @@ impl SessionLog {
             .take(limit)
             .map(|change| (change.to_wire(), change.text.record()))
             .collect();
-        let to_cursor = changes
+        let mut to_cursor = changes
             .last()
             .map_or(self.next_cursor.max(start), |(change, _)| {
                 change.cursor.get().saturating_add(1)
             });
+        // Changes after the page that the reader does not reach are not something more to ask for:
+        // the view goes past them, so that the next one does not come back empty.
+        if !self
+            .log
+            .iter()
+            .any(|change| change.cursor >= to_cursor && reaches(change.at_ms))
+        {
+            to_cursor = self.next_cursor.max(start);
+        }
         Changed {
             from_cursor: from,
             to_cursor,
