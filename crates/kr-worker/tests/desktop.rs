@@ -129,13 +129,13 @@ impl Host {
 
     /// The supervisor this host's daemon starts workers through.
     ///
-    /// On Windows, the environment's scheduled task, whose starter creates each worker: this
-    /// daemon runs inside `cargo test`'s job, which kills its members when it closes and forbids
-    /// breakaway, so a worker it created itself would die with the test or never start.
-    /// Elsewhere, a detached process of the daemon's own.
+    /// On Windows, the one the shipping daemon chooses: the environment's scheduled task, whose
+    /// starter creates each worker outside the job this daemon runs in, which kills its members
+    /// when it closes and forbids breakaway under `cargo test`. Elsewhere, a detached process of
+    /// the daemon's own.
     fn platform_supervisor(&self) -> Box<dyn kr_controller::supervision::WorkerSupervisor> {
         #[cfg(windows)]
-        return Box::new(self.task.supervisor(&self.paths()));
+        return self.task.product_supervisor(&self.paths());
         #[cfg(not(windows))]
         Box::new(DetachedSupervisor::new())
     }
@@ -1287,7 +1287,7 @@ async fn a_headless_session_inherits_no_graphical_access_and_logout_is_reported_
     // The launch context, not only the variables. A headless worker that was started inside the
     // graphical login would have that login's access however little of its environment it was
     // given, so the supervisor this host would use says which context each profile gets.
-    let supervisor = kr_controller::supervision::detect().describe();
+    let supervisor = kr_controller::supervision::detect(&host.paths(), &host.worker).describe();
     #[cfg(target_os = "macos")]
     if has_desktop() {
         assert!(
@@ -1972,7 +1972,9 @@ fn waking_from_a_suspension_does_not_revive_an_expired_action_window() {
 /// changes as a side effect.
 #[test]
 fn per_user_startup_uses_the_platform_service_mechanism_and_changes_no_sleep_policy() {
-    let supervisor = kr_controller::supervision::detect();
+    let temp = kr_ipc::testing::TempHost::create();
+    let supervisor =
+        kr_controller::supervision::detect(&temp.environment(), Path::new("kr-controller"));
     let described = supervisor.describe();
     assert!(
         !described.is_empty(),

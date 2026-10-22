@@ -633,13 +633,25 @@ impl Controller {
             None,
         ));
         checks.push(self.machine_check());
-        checks.push(DoctorCheck::new(
-            "supervisor",
-            "Workers outlive this daemon",
-            DoctorStatus::Ok,
-            Sentence::new().stated(self.supervisor.describe()),
-            None,
-        ));
+        // Asked of the platform, which on Windows is the Task Scheduler and can take seconds.
+        checks.push(
+            match crate::supervision::blocking_start(|| self.supervisor.readiness()) {
+                crate::supervision::Readiness::Ready => DoctorCheck::new(
+                    "supervisor",
+                    "Workers outlive this daemon",
+                    DoctorStatus::Ok,
+                    Sentence::new().stated(self.supervisor.describe()),
+                    None,
+                ),
+                crate::supervision::Readiness::Unavailable { found, remedy } => DoctorCheck::new(
+                    "supervisor",
+                    "Workers outlive this daemon",
+                    DoctorStatus::Failed,
+                    Sentence::new().stated(found),
+                    Some(remedy),
+                ),
+            },
+        );
         #[cfg(target_os = "linux")]
         checks.extend(self.control_group_check());
         let directory = self.directory.lock().await;

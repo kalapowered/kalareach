@@ -17,9 +17,9 @@ use std::sync::Arc;
 
 use kr_controller::registry::Registry;
 use kr_controller::service::{Controller, ControllerSetup};
-use kr_controller::supervision::{
-    DetachedSupervisor, LaunchOutcome, ServiceLaunch, WorkerLaunch, WorkerSupervisor,
-};
+#[cfg(unix)]
+use kr_controller::supervision::DetachedSupervisor;
+use kr_controller::supervision::{LaunchOutcome, ServiceLaunch, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
@@ -157,11 +157,11 @@ impl WorkerSupervisor for RecordingSupervisor {
 struct Host {
     /// The host tree, which ends every worker its daemon started before it goes.
     temp: teardown::Tree,
-    /// The environment's scheduled task, through which a Windows daemon here starts each worker,
-    /// when this run takes that path. Declared after the tree, so it is removed once the tree has
-    /// ended what was started; removing it would not end a running worker in any case.
+    /// The environment's scheduled task, through which a Windows daemon here starts each worker.
+    /// Declared after the tree, so it is removed once the tree has ended what was started;
+    /// removing it would not end a running worker in any case.
     #[cfg(windows)]
-    task: Option<kr_controller::supervision::windows::testing::TestTask>,
+    task: kr_controller::supervision::windows::testing::TestTask,
     worker: PathBuf,
     environment_id: EnvironmentId,
     /// Where this daemon looks for qualified shell packages, when a test gives it an installation.
@@ -171,7 +171,8 @@ struct Host {
     /// Everything the daemon asked its supervisor to start, when a test keeps the list.
     launched: Option<Arc<std::sync::Mutex<Vec<Launch>>>>,
     /// Whether the daemon starts its workers through the supervisor the shipping daemon chooses on
-    /// this platform, rather than as detached processes of its own.
+    /// this platform, rather than as detached processes of its own. Windows has one start only.
+    #[cfg(not(windows))]
     platform_service: bool,
 }
 
@@ -194,14 +195,12 @@ impl Host {
             &["--version"],
         );
         #[cfg(windows)]
-        let task = starts_through_the_task().then(|| {
-            kr_controller::supervision::windows::testing::TestTask::register(
-                &temp.environment(),
-                &kr_controller::supervision::windows::testing::built_binary("kr-controller")
-                    .unwrap_or_else(|missing| panic!("{missing}")),
-            )
-            .unwrap_or_else(|failure| panic!("the environment's task: {failure}"))
-        });
+        let task = kr_controller::supervision::windows::testing::TestTask::register(
+            &temp.environment(),
+            &kr_controller::supervision::windows::testing::built_binary("kr-controller")
+                .unwrap_or_else(|missing| panic!("{missing}")),
+        )
+        .unwrap_or_else(|failure| panic!("the environment's task: {failure}"));
         Self {
             #[cfg(windows)]
             task,
@@ -211,31 +210,43 @@ impl Host {
             shell_packages: None,
             worker_packages: None,
             launched: None,
+            #[cfg(not(windows))]
             platform_service: false,
         }
     }
 
     /// The supervisor this host's daemon starts workers through.
     ///
-    /// On Windows, the environment's scheduled task, whose starter creates each worker: this
-    /// daemon runs inside `cargo test`'s job, which kills its members when it closes and forbids
-    /// breakaway, so a worker it created itself would die with the test or never start. Elsewhere,
-    /// and on Windows when a run asks for the path the shipping daemon still takes, a detached
-    /// process of the daemon's own.
+    /// On Windows, the one the shipping daemon chooses: the environment's scheduled task, whose
+    /// starter creates each worker outside the jobs this daemon runs in, which under `cargo test`
+    /// are a job that kills its members when it closes and forbids breakaway. Where no user is
+    /// signed in, the same type over the task a host with no session registers. Elsewhere, a
+    /// detached process of the daemon's own, or the platform's service manager when a test asks.
     fn platform_supervisor(&self) -> Box<dyn WorkerSupervisor> {
         #[cfg(windows)]
-        if let Some(task) = &self.task {
-            return task.product_supervisor(&self.paths());
+        {
+            self.task.product_supervisor(&self.paths())
         }
-        if self.platform_service {
-            return kr_controller::supervision::detect();
+        #[cfg(not(windows))]
+        {
+            if self.platform_service {
+                kr_controller::supervision::detect(&self.paths(), &self.worker)
+            } else {
+                Box::new(DetachedSupervisor::new())
+            }
         }
-        Box::new(DetachedSupervisor::new())
     }
 
     /// Starts the daemon's workers through the supervisor the shipping daemon chooses here.
+    #[cfg(not(windows))]
     fn through_the_platform(mut self) -> Self {
         self.platform_service = true;
+        self
+    }
+
+    /// Windows has one start, the environment's task, which is what the shipping daemon chooses.
+    #[cfg(windows)]
+    fn through_the_platform(self) -> Self {
         self
     }
 
@@ -433,17 +444,6 @@ async fn start_daemon(
         serving,
         generation,
     })
-}
-
-/// Whether this run starts workers through the environment's scheduled task.
-///
-/// Every Windows run does, except one that asks for the path the shipping daemon still takes, a
-/// detached process of the daemon's own. The continuous-integration step that runs this suite's
-/// executable outside cargo asks for that with `KR_HOST_TEST_SUPERVISOR=detached`, so both paths
-/// stay tested until the task is the only one.
-#[cfg(windows)]
-fn starts_through_the_task() -> bool {
-    std::env::var_os("KR_HOST_TEST_SUPERVISOR").is_none_or(|value| value != "detached")
 }
 
 /// A control daemon that is running, and the tasks that are serving for it.
@@ -2021,52 +2021,6 @@ async fn close(client: &mut LocalClient, host: &Host, session_id: SessionId) -> 
     );
 }
 
-/// KR-REQ-07.58: a Windows worker must be a process independent of the daemon, outside the
-/// daemon's kill-on-close job, so the start asks to break away from that job. Inside a job that
-/// does not permit breakaway, such as the one `cargo` runs its tests in, the start is refused, and
-/// the daemon names the cause and the setup rather than the bare access denial, and fails at once
-/// rather than waiting.
-#[cfg(windows)]
-#[test]
-fn a_worker_start_that_must_break_away_is_refused_inside_a_job_that_forbids_it() {
-    use kr_ipc::starter::{BREAKAWAY_OK, KILL_ON_JOB_CLOSE, SILENT_BREAKAWAY_OK};
-
-    let flags = kr_ipc::paths::current_job_limit_flags().expect("this process's job");
-    if !flags.is_some_and(|flags| {
-        flags & KILL_ON_JOB_CLOSE != 0 && flags & (BREAKAWAY_OK | SILENT_BREAKAWAY_OK) == 0
-    }) {
-        eprintln!(
-            "skipped: this process is not in a job that kills on close and forbids breakaway \
-             (limit flags {flags:?}), as it is under cargo"
-        );
-        return;
-    }
-    let temp = teardown::Tree::create();
-    let jobs = temp.root().join("jobs");
-    std::fs::create_dir_all(&jobs).expect("a jobs directory");
-    let launch = ServiceLaunch {
-        label: "kr-breakaway-probe".to_owned(),
-        program: std::path::PathBuf::from(
-            std::env::var_os("COMSPEC").expect("a command shell on PATH"),
-        ),
-        // If the start were somehow admitted, this exits at once and leaves nothing behind.
-        arguments: vec!["/c".to_owned(), "exit".to_owned()],
-        jobs_directory: jobs,
-        working_directory: temp.root().to_path_buf(),
-    };
-    match DetachedSupervisor::new().start_service(&launch) {
-        LaunchOutcome::NotStarted { detail } => {
-            assert!(
-                detail.contains("breakaway") && detail.contains("per-user service"),
-                "the failure names the job that forbids breakaway and the setup: {detail}"
-            );
-        }
-        other => {
-            panic!("a start that must break away should be refused inside this job, got {other:?}")
-        }
-    }
-}
-
 /// What the helper below is told: the host tree's roots, the worker and the starter.
 #[cfg(windows)]
 const DAEMON_RUNTIME_ROOT: &str = "KR_HOST_TEST_DAEMON_RUNTIME_ROOT";
@@ -2077,7 +2031,8 @@ const DAEMON_WORKER: &str = "KR_HOST_TEST_DAEMON_WORKER";
 #[cfg(windows)]
 const DAEMON_STARTER: &str = "KR_HOST_TEST_DAEMON_STARTER";
 
-/// The supervisor the daemon in the nested jobs starts its worker through: the environment's task.
+/// The supervisor the daemon in the nested jobs starts its worker through: the one the shipping
+/// daemon chooses.
 #[cfg(windows)]
 fn nested_daemon_supervisor(
     environment: &kr_ipc::paths::EnvironmentPaths,
@@ -2134,18 +2089,8 @@ async fn a_worker_outlives_the_nested_jobs_its_daemon_ran_in() {
 
     use kr_ipc::starter::{BREAKAWAY_OK, Job, KILL_ON_JOB_CLOSE};
 
-    if !starts_through_the_task() {
-        eprintln!("skipped: this run starts workers the way the shipping daemon does");
-        return;
-    }
     let host = Host::create();
-    let starter = host
-        .task
-        .as_ref()
-        .expect("the environment's task")
-        .definition()
-        .starter
-        .clone();
+    let starter = host.task.definition().starter.clone();
     let hosts = host.temp.paths().clone();
     let mut daemon = std::process::Command::new(std::env::current_exe().expect("this test"))
         .args([
@@ -2245,21 +2190,12 @@ async fn a_worker_outlives_the_nested_jobs_its_daemon_ran_in() {
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn removing_the_environments_task_leaves_its_running_worker_running() {
-    if !starts_through_the_task() {
-        eprintln!("skipped: this run starts workers the way the shipping daemon does");
-        return;
-    }
     let host = Host::create();
     let daemon = host.start().await;
     let mut client = host.client().await;
     let created = create(&mut client, &host).await;
     let session_id = created.session.session_id;
-    let definition = host
-        .task
-        .as_ref()
-        .expect("the environment's task")
-        .definition()
-        .clone();
+    let definition = host.task.definition().clone();
     assert!(
         kr_controller::supervision::windows::remove(&definition).expect("removed"),
         "the task was there to remove"
@@ -2431,13 +2367,7 @@ async fn the_doctor_says_whether_the_environments_task_can_start_workers() {
         "the task is there to start workers"
     );
     assert!(
-        kr_controller::supervision::windows::remove(
-            host.task
-                .as_ref()
-                .expect("the environment's task")
-                .definition()
-        )
-        .expect("removed"),
+        kr_controller::supervision::windows::remove(host.task.definition()).expect("removed"),
         "the task was there to remove"
     );
     let (status, detail, remedy) = supervisor_check(doctor_of(&mut client).await);

@@ -168,21 +168,21 @@ mod platform {
 mod platform {
     use kr_protocol::desktop::LogoutPersistence;
 
-    /// Windows ends a per-user task when the user signs out.
+    /// Windows ends a session's processes when the user signs out.
     ///
-    /// A worker runs in the user's own logon session and is stopped when that session ends.
-    /// Running work across a sign-out needs a service under an account with the right to log on as
-    /// a service, which is an explicit installation choice and a different execution context from
-    /// the user's own.
+    /// A worker is created by the starter of the environment's scheduled task, which runs in the
+    /// user's own logon session, and it is stopped when that session ends. Running work across a
+    /// sign-out needs a service under an account with the right to log on as a service, which is
+    /// an explicit installation choice and a different execution context from the user's own.
     pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, &'static str) {
         (
             LogoutPersistence::EndsAtLogout,
-            "a detached process in the user's own logon session",
-            "A worker on this platform is a detached process in the user's own logon session, and \
-             Windows ends that session's processes when the user signs out, so a headless session \
-             here ends with the sign-out. Work that must outlive it needs a service installed \
-             under an account granted the right to log on as a service, which is a separate \
-             explicit choice.",
+            "a process the environment's scheduled task starts in the user's own logon session",
+            "A worker on this platform is created by the starter of the environment's scheduled \
+             task, in the user's own logon session, and Windows ends that session's processes when \
+             the user signs out, so a headless session here ends with the sign-out. Work that must \
+             outlive it needs a service installed under an account granted the right to log on as \
+             a service, which is a separate explicit choice.",
         )
     }
 }

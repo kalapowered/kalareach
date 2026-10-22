@@ -925,10 +925,9 @@ mod windows {
 
     /// The limit flags of the job this process runs in, or `None` when it runs in no job.
     ///
-    /// A daemon reads this to decide whether a worker it starts must break away from its job: a
-    /// worker outlives the daemon, so it must not be inside a job that kills its members when the
-    /// daemon closes. Where the job does not kill on close, or there is no job, the worker already
-    /// outlives the daemon and no breakaway is needed.
+    /// The environment's starter reads this to check the job the Task Scheduler runs it in: what
+    /// it creates is to outlive the starter, so it must not be left inside a job that kills its
+    /// members when that job closes.
     ///
     /// # Errors
     ///
