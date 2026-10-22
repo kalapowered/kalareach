@@ -20,7 +20,6 @@ use kr_protocol::receipt::{ActionReadResult, ReceiptState};
 use kr_protocol::rights::ActionRight;
 
 use net_support::environment::{Environment, from, read_by_id, resolved, yes};
-use net_support::worker::revoke;
 
 // ---------------------------------------------------------------------------------------------
 // The tests
@@ -281,7 +280,17 @@ async fn kr_req_23_24_a_duplicate_of_an_action_with_a_result_is_answered_with_it
         "the duplicate wrote nothing to the receipt"
     );
 
-    revoke(&environment.host, device._record.grant.grant_id).await;
+    let mut owner = environment.host.client().await;
+    let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+        environment.environment_id(),
+        &mut owner,
+        Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: device._record.device_id,
+        },
+    )
+    .await
+    .expect("the owner unpairs the device");
     let after = device
         .connection
         .try_mutate(
