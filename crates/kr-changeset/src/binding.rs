@@ -11,8 +11,9 @@
 //!
 //! For every file and directory beneath the copy, and the copy itself: what kind of object it is,
 //! the device and inode it is, its length, the time it was last modified and **the time its inode
-//! last changed**. The last is what binds a result to the run. A write, a truncation, a rename, a
-//! change of mode and a change of time all move it to the instant they happen, and no call a
+//! last changed**. The last is what binds a result to the run. A write, a truncation, a change of
+//! mode and a change of time all move it to the instant they happen, a rename moves it for the
+//! directories it changes (and on some filesystems for the renamed entry too), and no call a
 //! process can make sets it back, as `utimensat` sets the modification time. A run that restores
 //! a file's bytes and its modification time still leaves the change time later than it was.
 //!
@@ -33,10 +34,12 @@
 //! so that writing the output changes no recorded entry except the directory the output is in,
 //! the **parent**. A parent's own record cannot tell the output from anything else written beside
 //! it, so a parent is watched by name instead, from before the command starts to after it has
-//! ended: the platform reports each name created, removed, renamed, written or changed in it, and
-//! a name other than a declared output makes the result indeterminate, however briefly it
-//! existed. A watcher the host cannot start, or whose reports it cannot be sure it has all of,
-//! makes the result indeterminate too.
+//! ended: the platform reports each name created, removed, renamed or changed in it, and a name
+//! other than a declared output makes the result indeterminate, however briefly it existed. The
+//! parent itself is watched too, and so is the copy: a report that the directory was renamed,
+//! removed or changed (its mode, its owner, its attributes) is a write, because the record of a
+//! parent is the one thing the comparison leaves out. A watcher the host cannot start, or whose
+//! reports it cannot be sure it has all of, makes the result indeterminate too.
 //!
 //! # What this does not establish
 //!
@@ -69,6 +72,7 @@ pub enum Bound {
 /// the command runs has no binding to settle with, and records no result.
 #[derive(Debug)]
 pub struct RunBinding {
+    materialisation_id: MaterialisationId,
     reading: std::result::Result<unix::Reading, String>,
 }
 
@@ -84,18 +88,27 @@ pub fn bind_run(
     outputs: &Outputs,
 ) -> RunBinding {
     RunBinding {
+        materialisation_id,
         reading: unix::Reading::take(service, materialisation_id, outputs),
     }
 }
 
 impl RunBinding {
     /// Compares the copy now with the record taken before the command started.
+    ///
+    /// A binding speaks only for the copy it was taken of: asked about another, it establishes
+    /// nothing.
     #[must_use]
     pub fn settle(
         &self,
         service: &ChangeSetService,
         materialisation_id: MaterialisationId,
     ) -> Bound {
+        if materialisation_id != self.materialisation_id {
+            return Bound::Unestablished(
+                "the record was taken of another copy than the one the result is about".to_owned(),
+            );
+        }
         match &self.reading {
             Ok(reading) => reading.settle(service, materialisation_id),
             Err(why) => Bound::Unestablished(why.clone()),
@@ -305,7 +318,13 @@ mod unix {
 
     #[cfg(target_os = "linux")]
     fn known_filesystem(stat: &rustix::fs::StatFs) -> Result<(), String> {
-        /// ext2, ext3 and ext4, XFS, Btrfs, tmpfs, overlayfs, F2FS and ZFS.
+        known_type(u64::try_from(stat.f_type).unwrap_or(0) & 0xFFFF_FFFF)
+    }
+
+    /// Whether `kind`, a Linux filesystem's magic number, is one of the kept ones: ext2, ext3 and
+    /// ext4, XFS, Btrfs, tmpfs, overlayfs, F2FS and ZFS.
+    #[cfg(target_os = "linux")]
+    fn known_type(kind: u64) -> Result<(), String> {
         const KNOWN: [u64; 7] = [
             0xEF53,
             0x5846_5342,
@@ -316,7 +335,6 @@ mod unix {
             0x2FC1_2FC1,
         ];
         const NFS: u64 = 0x6969;
-        let kind = u64::try_from(stat.f_type).unwrap_or(0) & 0xFFFF_FFFF;
         if KNOWN.contains(&kind) {
             Ok(())
         } else if kind == NFS {
@@ -341,7 +359,13 @@ mod unix {
             .take_while(|byte| **byte != 0)
             .map(|byte| char::from(u8::try_from(*byte).unwrap_or(b'?')))
             .collect();
-        if name == "apfs" || name == "hfs" {
+        known_name(&name)
+    }
+
+    /// Whether `name`, a macOS filesystem's type name, is the kept one: APFS.
+    #[cfg(target_os = "macos")]
+    fn known_name(name: &str) -> Result<(), String> {
+        if name == "apfs" {
             Ok(())
         } else {
             Err(format!(
@@ -532,7 +556,7 @@ mod unix {
         use kr_transfer::{AuthorisedDirectory, RelativeName};
 
         /// A watch on the directories declared outputs are in, which reports each name created,
-        /// removed, renamed, written or changed there.
+        /// removed, renamed or changed there, and each change to the directories themselves.
         #[derive(Debug)]
         pub struct NameWatch {
             inotify: OwnedFd,
@@ -575,12 +599,10 @@ mod unix {
                             | WatchFlags::CREATE
                             | WatchFlags::DELETE
                             | WatchFlags::DELETE_SELF
-                            | WatchFlags::MODIFY
                             | WatchFlags::MOVE_SELF
                             | WatchFlags::MOVED_FROM
                             | WatchFlags::MOVED_TO
-                            | WatchFlags::ATTRIB
-                            | WatchFlags::CLOSE_WRITE,
+                            | WatchFlags::ATTRIB,
                     )
                     .map_err(|error| format!("a directory could not be watched: {error}"))?;
                     watched.insert(wd, parent.clone());
@@ -642,7 +664,7 @@ mod unix {
     mod names {
         use std::collections::{BTreeMap, BTreeSet};
         use std::path::{Path, PathBuf};
-        use std::sync::{Mutex, mpsc};
+        use std::sync::{Arc, Mutex, PoisonError, mpsc};
         use std::time::{Duration, Instant};
 
         use notify::{Event, RecursiveMode, Watcher as _};
@@ -660,17 +682,83 @@ mod unix {
         /// up to date.
         const MARK: &str = ".mark-";
 
+        /// How many written paths the watcher keeps. A run that has written this many beside its
+        /// outputs has been told enough for a result to name a few of them.
+        const KEPT: usize = 64;
+
+        /// What the platform said of the run, judged as each report arrived.
+        #[derive(Debug, Default)]
+        struct Heard {
+            /// Paths written beside a declared output, relative to the copy; the copy's own path
+            /// is the empty one.
+            written: BTreeSet<String>,
+            /// Why the reports cannot be taken as all there were, when they cannot.
+            lost: Option<String>,
+            /// The file the host is waiting to hear of.
+            awaited: Option<PathBuf>,
+        }
+
+        /// Where the watched places are, and what a report about each means.
+        #[derive(Debug)]
+        struct Places {
+            copy: PathBuf,
+            parents: BTreeMap<String, BTreeSet<String>>,
+        }
+
+        impl Places {
+            /// The path of the copy that a report about `path` shows to have been written, if it
+            /// does.
+            ///
+            /// A directory a declared output is in, and the copy itself, are judged by what is
+            /// reported about the directory: FSEvents says nothing of a directory when a name is
+            /// made in it, so a report that names the directory is a rename, a removal or a change
+            /// of its mode, owner or attributes, whichever name the command gave it meanwhile. A
+            /// name in such a directory is judged by whether it is a declared output.
+            fn written(&self, path: &Path) -> Option<String> {
+                let relative = path.strip_prefix(&self.copy).ok().map(|rest| {
+                    rest.components()
+                        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })?;
+                if relative.is_empty() || self.parents.contains_key(&relative) {
+                    return Some(relative);
+                }
+                let (parent, name) = relative.rsplit_once('/').unwrap_or(("", &relative));
+                let outputs = self.parents.get(parent)?;
+                (!outputs.contains(name)).then_some(relative)
+            }
+
+            /// Takes one report into `heard`.
+            fn hear(&self, heard: &mut Heard, event: &Event) {
+                // Reports of lost reports are not about any path: FSEvents gives them the path
+                // of the root of the volume.
+                if event.need_rescan() {
+                    heard.lost.get_or_insert_with(|| {
+                        "the watcher lost reports of changes to the copy".to_owned()
+                    });
+                }
+                for path in &event.paths {
+                    if heard.written.len() < KEPT
+                        && let Some(relative) = self.written(path)
+                    {
+                        heard.written.insert(relative);
+                    }
+                }
+            }
+        }
+
         /// A watch on the copy, which reports each name written in the directories declared
-        /// outputs are in.
+        /// outputs are in, and each change to those directories themselves.
         pub struct NameWatch {
             /// Held so that the stream is.
             _watcher: notify::RecommendedWatcher,
-            reports: Mutex<mpsc::Receiver<notify::Result<Event>>>,
+            heard: Arc<Mutex<Heard>>,
+            reported: Mutex<mpsc::Receiver<PathBuf>>,
             /// The directory the copy is in, where the host writes the files it marks time with.
             beside: AuthorisedDirectory,
             beside_path: PathBuf,
             copy_path: PathBuf,
-            parents: BTreeMap<String, BTreeSet<String>>,
         }
 
         impl std::fmt::Debug for NameWatch {
@@ -680,17 +768,6 @@ mod unix {
                     .field("copy", &self.copy_path)
                     .finish_non_exhaustive()
             }
-        }
-
-        /// What `path` is beneath `root`, as a relative path of names, or none when it is not
-        /// beneath it.
-        fn beneath(root: &Path, path: &Path) -> Option<String> {
-            path.strip_prefix(root).ok().map(|rest| {
-                rest.components()
-                    .map(|part| part.as_os_str().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join("/")
-            })
         }
 
         impl NameWatch {
@@ -727,59 +804,94 @@ mod unix {
                         return Err("the copy is no longer where it was opened".to_owned());
                     }
                 }
-                let (sender, reports) = mpsc::channel();
-                let mut watcher = notify::recommended_watcher(sender)
+                let places = Arc::new(Places {
+                    copy: copy_path.clone(),
+                    parents: parents.clone(),
+                });
+                let heard = Arc::new(Mutex::new(Heard::default()));
+                let (tell, reported) = mpsc::channel();
+                // Each report is judged here, as it arrives, so the host keeps what it needs of a
+                // run's reports and not the reports.
+                let handler = {
+                    let (places, heard) = (Arc::clone(&places), Arc::clone(&heard));
+                    move |report: notify::Result<Event>| {
+                        let mut heard = heard.lock().unwrap_or_else(PoisonError::into_inner);
+                        match report {
+                            Ok(event) => {
+                                places.hear(&mut heard, &event);
+                                let awaited = heard.awaited.as_ref();
+                                if let Some(path) =
+                                    event.paths.iter().find(|path| Some(*path) == awaited)
+                                {
+                                    let _ = tell.send(path.clone());
+                                }
+                            }
+                            Err(error) => {
+                                heard
+                                    .lost
+                                    .get_or_insert_with(|| format!("the watcher failed: {error}"));
+                            }
+                        }
+                    }
+                };
+                let mut watcher = notify::recommended_watcher(handler)
                     .map_err(|error| format!("no watcher could be started: {error}"))?;
+                // The root of the volume is watched as well, without descending into it: the
+                // backend drops a report whose path is not at or below a watched one, and
+                // FSEvents gives the report that it lost reports the path of the volume's root.
                 watcher
                     .watch(&copy_path, RecursiveMode::Recursive)
                     .and_then(|()| watcher.watch(&beside_path, RecursiveMode::NonRecursive))
+                    .and_then(|()| watcher.watch(Path::new("/"), RecursiveMode::NonRecursive))
                     .map_err(|error| format!("the copy could not be watched: {error}"))?;
                 let watch = Self {
                     _watcher: watcher,
-                    reports: Mutex::new(reports),
+                    heard,
+                    reported: Mutex::new(reported),
                     beside: beside.try_clone().map_err(|error| {
                         format!("the copy's place could not be reopened: {error}")
                     })?,
                     beside_path,
                     copy_path,
-                    parents: parents.clone(),
                 };
                 watch.up_to_date()?;
+                *watch.heard.lock().unwrap_or_else(PoisonError::into_inner) = Heard::default();
                 Ok(Some(watch))
             }
 
             /// Writes a file beside the copy and waits until the watcher has reported it, and so
-            /// every change made before it, handing back what was reported in the meantime.
-            fn up_to_date(&self) -> Result<Vec<Event>, String> {
+            /// every change made before it.
+            fn up_to_date(&self) -> Result<(), String> {
                 let mark = format!("{MARK}{}", kr_ipc::new_uuid());
                 let name = RelativeName::parse(&mark)
                     .map_err(|error| format!("a file to mark time with: {error}"))?;
-                self.beside
-                    .create_new(&name)
-                    .map_err(|error| format!("a file to mark time with: {error}"))?;
                 let marked = self.beside_path.join(&mark);
-                let outcome = self.until_reported(&marked);
+                self.heard
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .awaited = Some(marked.clone());
+                let outcome = self
+                    .beside
+                    .create_new(&name)
+                    .map_err(|error| format!("a file to mark time with: {error}"))
+                    .and_then(|_| self.until_reported(&marked));
+                self.heard
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .awaited = None;
                 let _ = self.beside.remove(&name);
                 outcome
             }
 
-            fn until_reported(&self, marked: &Path) -> Result<Vec<Event>, String> {
-                let reports = self
-                    .reports
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            fn until_reported(&self, marked: &Path) -> Result<(), String> {
+                let reported = self.reported.lock().unwrap_or_else(PoisonError::into_inner);
                 let deadline = Instant::now() + REPORT_WAIT;
-                let mut heard = Vec::new();
                 loop {
                     let left = deadline.saturating_duration_since(Instant::now());
-                    match reports.recv_timeout(left) {
-                        Ok(Ok(event)) => {
-                            if event.paths.iter().any(|path| path == marked) {
-                                return Ok(heard);
-                            }
-                            heard.push(event);
-                        }
-                        Ok(Err(error)) => return Err(format!("the watcher failed: {error}")),
+                    match reported.recv_timeout(left) {
+                        Ok(path) if path == marked => return Ok(()),
+                        // A report of an earlier file of the host's own.
+                        Ok(_) => {}
                         Err(_) => {
                             return Err("the watcher did not report a change the host made \
                                         itself, so it cannot be trusted to have reported the \
@@ -790,29 +902,15 @@ mod unix {
                 }
             }
 
-            /// The paths written beside a declared output since the watch started.
+            /// The paths written beside a declared output since the watch started, and the
+            /// directories themselves when something was done to them.
             pub fn drain(&self) -> Result<Vec<String>, String> {
-                let mut written = Vec::new();
-                for event in self.up_to_date()? {
-                    if event.need_rescan() {
-                        return Err("the watcher lost reports of changes to the copy".to_owned());
-                    }
-                    for path in &event.paths {
-                        let Some(relative) = beneath(&self.copy_path, path) else {
-                            continue;
-                        };
-                        let (parent, name) = relative.rsplit_once('/').unwrap_or(("", &relative));
-                        // The copy itself, and the directory a name is written in, say nothing
-                        // about the name; only a name beside a declared output is judged here.
-                        let Some(outputs) = self.parents.get(parent) else {
-                            continue;
-                        };
-                        if !name.is_empty() && !outputs.contains(name) {
-                            written.push(relative.clone());
-                        }
-                    }
+                self.up_to_date()?;
+                let heard = self.heard.lock().unwrap_or_else(PoisonError::into_inner);
+                match &heard.lost {
+                    Some(why) => Err(why.clone()),
+                    None => Ok(heard.written.iter().cloned().collect()),
                 }
-                Ok(written)
             }
         }
     }
@@ -849,6 +947,34 @@ mod unix {
             }
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        /// KR-REQ-14.34: a copy on a filesystem this host does not know to keep change times has
+        /// no record taken, so its result is indeterminate. Only a privileged mount can put a copy
+        /// on such a filesystem, so the list is read directly.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn only_the_filesystems_known_to_keep_change_times_are_trusted() {
+            for kept in [0xEF53, 0x0102_1994, 0x5846_5342, 0x9123_683E] {
+                assert!(super::known_type(kept).is_ok(), "{kept:#x}");
+            }
+            // NFS, FUSE, SMB and FAT.
+            for other in [0x6969, 0x6573_5546, 0xFE53_4D42, 0x4D44] {
+                assert!(super::known_type(other).is_err(), "{other:#x}");
+            }
+        }
+
+        /// As on Linux; only APFS is trusted.
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn only_the_filesystems_known_to_keep_change_times_are_trusted() {
+            assert!(super::known_name("apfs").is_ok());
+            for other in ["hfs", "nfs", "smbfs", "msdos", "exfat", "autofs"] {
+                assert!(super::known_name(other).is_err(), "{other}");
+            }
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -856,9 +982,9 @@ mod unix {
     use super::{Bound, MaterialisationId, Outputs};
     use crate::service::ChangeSetService;
 
-    /// This platform records no change times of a copy.
+    /// This platform records no change times of a copy, so no record is ever taken.
     #[derive(Debug)]
-    pub struct Reading;
+    pub enum Reading {}
 
     impl Reading {
         pub fn take(
@@ -870,7 +996,7 @@ mod unix {
         }
 
         pub fn settle(&self, _service: &ChangeSetService, _id: MaterialisationId) -> Bound {
-            Bound::Unestablished("this platform has no record of a copy's change times".to_owned())
+            match *self {}
         }
     }
 }
