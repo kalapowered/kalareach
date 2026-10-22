@@ -30,11 +30,12 @@ use kr_protocol::automation::{
     NodeStatus, WorkflowActionKind, WorkflowDeadlines, WorkflowDefinition, WorkflowEnableParams,
     WorkflowEnableResult, WorkflowInstallParams, WorkflowInstallResult, WorkflowNode,
     WorkflowPauseParams, WorkflowPauseResult, WorkflowReadParams, WorkflowReadResult,
-    WorkflowResourceScope, WorkflowRunParams, WorkflowRunResult, WorkflowRunStatus,
-    WorkflowTrigger,
+    WorkflowRearmParams, WorkflowRearmResult, WorkflowResourceScope, WorkflowRunParams,
+    WorkflowRunResult, WorkflowRunStatus, WorkflowTrigger,
 };
 use kr_protocol::changeset::{
-    ChangesetCaptureParams, ChangesetReadParams, ChangesetReadResult, FileGrant, TestedSource,
+    ChangesetCaptureParams, ChangesetMaterializeParams, ChangesetReadParams, ChangesetReadResult,
+    FileGrant, TestedSource,
 };
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -2448,9 +2449,9 @@ async fn device_mutation<P: serde::Serialize + ?Sized>(
 ///
 /// The registry is walked for the automation group, and every ingress it lists for a method is
 /// one this daemon serves: each method is called here from a paired device over the network, and
-/// the owner's own socket serves all five in the tests above. A device reaches only the workflows
+/// the owner's own socket serves the others in the tests above. A device reaches only the workflows
 /// that act under the grant it holds, so a workflow cannot give it rights its grant does not carry.
-/// Each of the five methods needs the workflow-management grant: a device that holds every other
+/// Each of the six methods needs the workflow-management grant: a device that holds every other
 /// right the workflow needs, and not that grant, is refused every one of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
@@ -2461,7 +2462,7 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
         .iter()
         .filter(|entry| entry.method.group() == MethodGroup::Automation)
         .collect();
-    assert_eq!(listed.len(), 5, "the group's five methods");
+    assert_eq!(listed.len(), 6, "the group's six methods");
     for entry in &listed {
         for ingress in entry.ingress {
             assert!(
@@ -2557,6 +2558,19 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
     // Nothing on this host carries out a test run, so the node fails; the run itself was served.
     assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
     served.insert(Method::WorkflowRun);
+    // The chain the device's run started has not run out of budget, so the rearm is decided and
+    // refused for that; it reached the service, which no other answer shows.
+    let live = device_mutation(
+        &session,
+        host.environment_id,
+        Method::WorkflowRearm,
+        &rearming(run.causal_root_id, own_grant, 0),
+    )
+    .await
+    .expect_err("a chain with budget left is not rearmed");
+    assert_eq!(live.code, ErrorCode::InvalidArgument, "{live:?}");
+    assert!(live.message.contains("has not run out"), "{live:?}");
+    served.insert(Method::WorkflowRearm);
     device_mutation(
         &session,
         host.environment_id,
@@ -2584,7 +2598,7 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
     );
 
     // The control: a device that holds every right the first device's workflow needs except the
-    // workflow-management grant is refused each of the five. It installs under its own grant, so
+    // workflow-management grant is refused each of the six. It installs under its own grant, so
     // the one thing it lacks is the management grant; enable, pause and run name the first
     // device's workflow, and read names none.
     let viewer = net_support::Device::create().await;
@@ -2686,6 +2700,18 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
             .code,
         ),
         (
+            Method::WorkflowRearm,
+            device_mutation(
+                &viewer_session,
+                host.environment_id,
+                Method::WorkflowRearm,
+                &rearming(run.causal_root_id, viewer_record.grant.grant_id, 0),
+            )
+            .await
+            .expect_err("rearm needs the management grant")
+            .code,
+        ),
+        (
             Method::WorkflowRead,
             viewer_session
                 .read::<_, WorkflowReadResult>(Method::WorkflowRead, &WorkflowReadParams::default())
@@ -2699,7 +2725,7 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
     }
     assert_eq!(
         refused_without_the_grant, served,
-        "each of the five methods needs the grant, and none was left out"
+        "each of the six methods needs the grant, and none was left out"
     );
 
     // A workflow under the owner's grant is not the device's: it cannot install one under that
@@ -2790,6 +2816,64 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
         read.definitions.len(),
         1,
         "the owner's workflow is not the device's to see"
+    );
+    // A device names the grant it holds in a rearm, and reaches only a chain under that grant: it
+    // cannot rearm under the owner's grant, and a chain the owner's grant started is a root it is
+    // told nothing of.
+    typed::<WorkflowEnableResult>(
+        &control
+            .mutate(
+                Method::WorkflowEnable,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &WorkflowEnableParams {
+                    workflow_id: borrowed.workflow_id,
+                    revision: borrowed.revision,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the owner enables its own workflow"),
+    );
+    let owners_run: WorkflowRunResult = typed(
+        &control
+            .mutate(
+                Method::WorkflowRun,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &WorkflowRunParams {
+                    workflow_id: borrowed.workflow_id,
+                    revision: borrowed.revision,
+                    event_id: "evt-owners-chain".to_owned(),
+                    event_type: "manual".to_owned(),
+                    event_payload: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the owner runs its own workflow"),
+    );
+    let borrowing = device_mutation(
+        &session,
+        host.environment_id,
+        Method::WorkflowRearm,
+        &rearming(run.causal_root_id, owners, 0),
+    )
+    .await
+    .expect_err("a device rearms under the grant it holds");
+    assert_eq!(borrowing.code, ErrorCode::PermissionDenied, "{borrowing:?}");
+    let foreign = device_mutation(
+        &session,
+        host.environment_id,
+        Method::WorkflowRearm,
+        &rearming(owners_run.causal_root_id, own_grant, 0),
+    )
+    .await
+    .expect_err("the chain is the owner's");
+    assert_eq!(foreign.code, ErrorCode::InvalidArgument, "{foreign:?}");
+    assert!(
+        foreign.message.contains("not found"),
+        "it learns nothing of the chain: {foreign:?}"
     );
     let refused = device_mutation(
         &session,
@@ -3951,6 +4035,379 @@ async fn held_at_the_gate(journal: &Path, root: kr_protocol::ids::CausalRootId, 
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+/// A chain's budget as the daemon answers it for a read of the chain's root, once there is one.
+async fn budget_of(
+    control: &mut LocalClient,
+    root: kr_protocol::ids::CausalRootId,
+) -> Option<kr_protocol::automation::CausalBudgetSummary> {
+    read_chain(control, root).await.0
+}
+
+/// A chain's budget and the runs the daemon holds for its root.
+async fn read_chain(
+    control: &mut LocalClient,
+    root: kr_protocol::ids::CausalRootId,
+) -> (
+    Option<kr_protocol::automation::CausalBudgetSummary>,
+    Vec<kr_protocol::automation::WorkflowRunSummary>,
+) {
+    let read: WorkflowReadResult = typed(
+        &control
+            .request(
+                Method::WorkflowRead,
+                &WorkflowReadParams {
+                    causal_root_id: Nullable::some(root),
+                    ..WorkflowReadParams::default()
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workflow.read succeeds"),
+    );
+    let runs = read
+        .runs
+        .into_iter()
+        .filter(|run| run.causal_root_id == root)
+        .collect();
+    (read.remaining_causal_budget.0, runs)
+}
+
+/// Waits, under one deadline, until the chain's budget satisfies `reached`, and returns it.
+async fn until_budget(
+    control: &mut LocalClient,
+    root: kr_protocol::ids::CausalRootId,
+    what: &str,
+    reached: impl Fn(&kr_protocol::automation::CausalBudgetSummary) -> bool,
+) -> kr_protocol::automation::CausalBudgetSummary {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut last = None;
+    let found = tokio::time::timeout_at(deadline, async {
+        loop {
+            if let Some(budget) = budget_of(control, root).await {
+                if reached(&budget) {
+                    return budget;
+                }
+                last = Some(budget);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    found.unwrap_or_else(|_| panic!("within two minutes: {what}; the chain stood at {last:?}"))
+}
+
+/// A `workflow.rearm` request of the chain `root` under `grant`, leaving `generation`.
+fn rearming(
+    root: kr_protocol::ids::CausalRootId,
+    grant: GrantId,
+    generation: u64,
+) -> WorkflowRearmParams {
+    WorkflowRearmParams {
+        causal_root_id: root,
+        grant_reference: grant,
+        generation: U64::new(generation),
+    }
+}
+
+/// Sets the trigger dispatcher's position in the journal back to the start, as a stream replayed
+/// from its first event would find it, and then decides every event again.
+///
+/// The events are still in the journal because a consumer of the test's own, which never reads,
+/// keeps the stream from being pruned.
+fn replay_the_stream(host: &Host) -> kr_automation::AdmittedTriggers {
+    let journal = host
+        ._temp
+        .environment()
+        .state_dir()
+        .join(kr_automation::store::WORKFLOW_DB_NAME);
+    let connection = rusqlite::Connection::open(&journal).expect("opens the workflow journal");
+    connection
+        .busy_timeout(std::time::Duration::from_secs(30))
+        .expect("waits for the daemon's writes");
+    let rewound = connection
+        .execute(
+            "UPDATE event_consumers SET position = 0 WHERE consumer = ?1",
+            rusqlite::params![kr_automation::TRIGGER_CONSUMER],
+        )
+        .expect("the position is set back");
+    assert_eq!(rewound, 1, "the dispatcher is a registered consumer");
+    drop(connection);
+    host.controller
+        .automation()
+        .service()
+        .admit_triggers(kr_ipc::now_ms().get())
+}
+
+/// KR-REQ-25.17: an exhausted chain stays paused with `CAUSAL_LIMIT` whatever replayed or late
+/// events arrive, and takes a new budget only through an authorised rearm, which it then goes on
+/// with.
+///
+/// Two workflows that are each acyclic trigger one another, and the chain they make runs into the
+/// depth ceiling. The stream is replayed, and the chain neither goes on nor changes its budget. A
+/// rearm under a grant without the management right, and under a grant the host does not hold,
+/// changes nothing. A rearm under a grant with the right gives the chain a new generation,
+/// continues it from the descendant the ceiling refused, and the chain runs a ceiling's depth
+/// further. The same request sent again, on a new connection, and a request that leaves the
+/// generation the chain has left, give it no second budget though it has run out again; and the
+/// events of the generation before the rearm, replayed, spend nothing of the new budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exhausted_chain_stays_paused_until_an_authorised_rearm_gives_it_a_new_budget() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    // The workflows act under grant 44; grant 45 is the management grant the rearm is made under,
+    // and grant 46 carries a right that is not the management right.
+    host.issue(
+        grant_id(44),
+        &[ActionRight::ChangesetCreate, ActionRight::WorkspaceManage],
+    );
+    host.issue(grant_id(45), &[ActionRight::AutomationManage]);
+    host.issue(grant_id(46), &[ActionRight::ChangesetCreate]);
+
+    let seed_params: ChangesetCaptureParams =
+        serde_json::from_str(&capture_node(workspace).action_params).expect("the parameters");
+    let seed: kr_protocol::changeset::ChangesetCaptureResult = typed(
+        &control
+            .mutate(
+                Method::ChangesetCapture,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &seed_params,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("changeset.capture succeeds"),
+    );
+    let mut captures = definition(
+        workflow_id(44),
+        grant_id(44),
+        "capture after a materialisation",
+        capture_node(workspace),
+    );
+    captures.trigger.event_type = "changeset.materialized".to_owned();
+    captures.explicit_recurrence = true;
+    let mut materialises = definition(
+        workflow_id(47),
+        grant_id(44),
+        "materialise after a capture",
+        WorkflowNode {
+            node_id: "materialise".to_owned(),
+            action_kind: WorkflowActionKind::MaterializeChangeset,
+            action_params: serde_json::to_string(&ChangesetMaterializeParams {
+                change_set_id: seed.version.change_set_id,
+                version: seed.version.version,
+                purpose: kr_protocol::changeset::MaterialisationPurpose::Test,
+                label: "the chain's copy".to_owned(),
+            })
+            .expect("the parameters"),
+            declared_environment: Nullable::null(),
+        },
+    );
+    materialises.trigger.event_type = "changeset.captured".to_owned();
+    materialises.explicit_recurrence = true;
+    for document in [&captures, &materialises] {
+        install(&mut control, &host, document).await;
+        enable(&mut control, &host, document).await;
+    }
+    // A consumer of the stream that never reads keeps every settled-node event in the journal, so
+    // that replaying the stream replays something.
+    host.controller
+        .automation()
+        .journal()
+        .register_consumer(
+            "a-test-that-keeps-the-stream",
+            &[kr_automation::store::EVENT_NODE_SETTLED],
+            kr_ipc::now_ms().get(),
+        )
+        .expect("the consumer registers");
+
+    let root_run: WorkflowRunResult = typed(
+        &start(&mut control, &host, &captures, "evt-rearm")
+            .await
+            .expect("the root run is admitted"),
+    );
+    let root = root_run.causal_root_id;
+    let limit = kr_protocol::automation::DEFAULT_CAUSAL_DEPTH_LIMIT;
+
+    // The chain runs into the depth ceiling and stops.
+    let stopped = until_budget(
+        &mut control,
+        root,
+        "the chain ran out of budget",
+        |budget| budget.exhausted,
+    )
+    .await;
+    assert!(
+        stopped.paused && stopped.generation.get() == 0,
+        "{stopped:?}"
+    );
+    let (_, runs) = read_chain(&mut control, root).await;
+    assert_eq!(
+        runs.len() as u64,
+        limit,
+        "one run at each depth to the ceiling"
+    );
+
+    // Replayed events cannot rearm it: every event of the stream is decided again, and the chain
+    // starts nothing and keeps the budget it ran out of.
+    let replayed = replay_the_stream(&host);
+    assert!(replayed.started.is_empty(), "{:?}", replayed.decisions);
+    assert!(replayed.stopped.is_none(), "{:?}", replayed.stopped);
+    assert!(
+        replayed
+            .decisions
+            .iter()
+            .all(|decision| decision.outcome.is_err()),
+        "{:?}",
+        replayed.decisions
+    );
+    let (kept, runs) = read_chain(&mut control, root).await;
+    let kept = kept.expect("the chain's budget");
+    assert_eq!(runs.len() as u64, limit, "no run was added");
+    assert!(
+        kept.exhausted && kept.paused && kept.generation.get() == 0,
+        "{kept:?}"
+    );
+
+    // A rearm under a grant without the management right, and under a grant the host does not
+    // hold, changes nothing.
+    let without_the_right = failure(
+        control
+            .mutate(
+                Method::WorkflowRearm,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &rearming(root, grant_id(46), 0),
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(
+        without_the_right.code,
+        ErrorCode::PermissionDenied,
+        "{without_the_right:?}"
+    );
+    assert!(
+        without_the_right.message.contains("automation.manage"),
+        "{without_the_right:?}"
+    );
+    let unheld = failure(
+        control
+            .mutate(
+                Method::WorkflowRearm,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &rearming(root, grant_id(99), 0),
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_ne!(unheld.code, ErrorCode::CausalLimit, "{unheld:?}");
+    let kept = budget_of(&mut control, root).await.expect("the budget");
+    assert!(kept.exhausted && kept.generation.get() == 0, "{kept:?}");
+
+    // An authorised rearm gives it a new budget, and the chain goes on from where it stopped.
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let target = ActionTarget::environment(host.environment_id);
+    let request = rearming(root, grant_id(45), 0);
+    let rearmed: WorkflowRearmResult = typed(
+        &control
+            .mutate(Method::WorkflowRearm, action, target.clone(), &request)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workflow.rearm succeeds"),
+    );
+    assert_eq!(
+        (rearmed.causal_root_id, rearmed.generation.get()),
+        (root, 1)
+    );
+    let again = until_budget(
+        &mut control,
+        root,
+        "the chain ran a ceiling's depth further and ran out again",
+        |budget| budget.generation.get() == 1 && budget.exhausted,
+    )
+    .await;
+    assert!(again.paused, "{again:?}");
+    let (_, runs) = read_chain(&mut control, root).await;
+    let deepest = runs.iter().map(|run| run.depth.get()).max();
+    assert_eq!(
+        deepest,
+        Some(2 * limit),
+        "the new budget added a ceiling's depth"
+    );
+    assert!(
+        runs.iter()
+            .all(|run| run.status == WorkflowRunStatus::Completed),
+        "{runs:?}"
+    );
+
+    // The same request sent again, on a new connection, is answered and gives no second budget,
+    // though the chain has run out again since.
+    let mut elsewhere = client(&host).await;
+    let repeated: WorkflowRearmResult = typed(
+        &elsewhere
+            .mutate(Method::WorkflowRearm, action, target.clone(), &request)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the repeat is answered"),
+    );
+    assert_eq!(repeated, rearmed);
+    // A request that leaves the generation the chain has left, under an action of its own, is
+    // told where the chain is and changes nothing.
+    let told: WorkflowRearmResult = typed(
+        &elsewhere
+            .mutate(
+                Method::WorkflowRearm,
+                ActionId::new(kr_ipc::new_uuid()),
+                target.clone(),
+                &request,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the request is answered"),
+    );
+    assert_eq!(told, rearmed);
+    // And one that names a generation the chain is not on is refused.
+    let wrong = failure(
+        elsewhere
+            .mutate(
+                Method::WorkflowRearm,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &rearming(root, grant_id(45), 7),
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(wrong.code, ErrorCode::DraftConflict, "{wrong:?}");
+    let kept = budget_of(&mut control, root).await.expect("the budget");
+    assert!(
+        kept.exhausted && kept.generation.get() == 1,
+        "no second budget: {kept:?}"
+    );
+
+    // The events of the generation before the rearm, replayed, spend nothing of the new budget.
+    let replayed = replay_the_stream(&host);
+    assert!(replayed.started.is_empty(), "{:?}", replayed.decisions);
+    assert!(
+        replayed
+            .decisions
+            .iter()
+            .all(|decision| decision.outcome.is_err()),
+        "{:?}",
+        replayed.decisions
+    );
+    let (kept, runs) = read_chain(&mut control, root).await;
+    let kept = kept.expect("the chain's budget");
+    assert_eq!(runs.len() as u64, 2 * limit, "no run was added");
+    assert!(
+        kept.exhausted && kept.paused && kept.generation.get() == 1,
+        "{kept:?}"
+    );
+    host.clients.abort();
 }
 
 /// KR-ACC-032 and KR-REQ-24.10 across a real restart of the daemon's process, not a reopened

@@ -360,6 +360,25 @@ pub struct Continuation {
     pub parent_node_id: String,
 }
 
+/// What a rearm came to.
+#[derive(Debug)]
+pub enum Rearm<T> {
+    /// The chain's budget moved to the next generation, and these are the continuations that were
+    /// admitted.
+    Rearmed {
+        /// The generation the chain's budget is on now.
+        generation: u64,
+        /// What each continuation became, in the order they were refused.
+        continued: Vec<T>,
+    },
+    /// The chain was already on the generation after the one the request named, so an earlier
+    /// copy of the request did this and nothing was changed.
+    Already {
+        /// The generation the chain's budget is on.
+        generation: u64,
+    },
+}
+
 /// A limit one run exceeded, and what the host did about the action it was waiting for.
 #[derive(Debug, Clone, Copy)]
 pub struct Breach<'a> {
@@ -1352,6 +1371,81 @@ impl<'c> Journal<'c> {
         )?;
 
         Ok(budget)
+    }
+
+    /// Rearms a chain's budget under an authorised administrative request, and continues the chain
+    /// from where its exhausted budget stopped it.
+    ///
+    /// `leaves` is the budget generation the request is made to leave. The rearm is a
+    /// compare-and-swap on it, which is what makes a repeat a repeat and not a second budget: a
+    /// chain already on the generation after `leaves` is answered as having been rearmed and is
+    /// not touched, and a chain on any other generation is refused. A chain whose budget has not
+    /// run out is refused too, because nothing about it is stopped.
+    ///
+    /// The budget moves to the next generation with fresh counters. Every descendant the budget of
+    /// the generation it leaves refused is handed to `continue_with` once, with the new
+    /// generation, and is gone from the journal whatever `continue_with` makes of it: a
+    /// continuation is single use. A continuation from any earlier generation is discarded
+    /// unread. What `continue_with` writes commits with the rearm, and an error from it undoes
+    /// both.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::InvalidArgument`] for a root this journal holds no budget for
+    /// and for a chain whose budget has not run out, [`AutomationError::GenerationMismatch`] for a
+    /// chain on another generation, a storage error, and whatever `continue_with` returns.
+    pub fn rearm_budget<T>(
+        &self,
+        root_id: CausalRootId,
+        leaves: u64,
+        now_ms: u64,
+        mut continue_with: impl FnMut(&Journal<'_>, &Continuation, u64) -> Result<Option<T>>,
+    ) -> Result<Rearm<T>> {
+        let mut budget = self
+            .load_budget(root_id)?
+            .ok_or_else(|| AutomationError::InvalidArgument("causal root not found".to_owned()))?;
+        if leaves != u64::MAX && budget.generation == leaves + 1 {
+            return Ok(Rearm::Already {
+                generation: budget.generation,
+            });
+        }
+        if budget.generation != leaves {
+            return Err(AutomationError::GenerationMismatch {
+                root: root_id,
+                named: leaves,
+                found: budget.generation,
+            });
+        }
+        if !budget.exhausted {
+            return Err(AutomationError::InvalidArgument(format!(
+                "the budget of chain {root_id} has not run out, so there is nothing to rearm"
+            )));
+        }
+        self.admit()?;
+        budget.rearm(now_ms);
+        self.save_budget(&budget)?;
+        let continuations = self.continuations(root_id, leaves)?;
+        self.conn.execute(
+            "DELETE FROM chain_continuations WHERE causal_root_id = ?1",
+            params![root_id.to_string()],
+        )?;
+        let mut continued = Vec::new();
+        for continuation in &continuations {
+            if let Some(value) = continue_with(self, continuation, budget.generation)? {
+                continued.push(value);
+            }
+        }
+        // A continuation the new budget refused would otherwise be kept again, under the new
+        // generation, for a later rearm to spend a second time. Nothing but these attempts
+        // writes to the chain inside this transaction, so the chain leaves it holding none.
+        self.conn.execute(
+            "DELETE FROM chain_continuations WHERE causal_root_id = ?1",
+            params![root_id.to_string()],
+        )?;
+        Ok(Rearm::Rearmed {
+            generation: budget.generation,
+            continued,
+        })
     }
 
     fn load_budget(&self, root_id: CausalRootId) -> Result<Option<CausalBudget>> {
@@ -2761,53 +2855,33 @@ impl WorkflowStore {
         })
     }
 
-    /// Rearms a chain's budget under an authorised administrative request, and continues the chain
-    /// from where its exhausted budget stopped it, in one transaction.
+    /// Runs `effect` inside one immediate transaction under the admission a caller was accepted
+    /// under, committing only when it succeeds, and records nothing about the caller's action.
     ///
-    /// The budget moves to a new generation with fresh counters. Every descendant the budget of
-    /// the generation it leaves refused is handed to `continue_with` once, with the new
-    /// generation, and is gone from the journal whatever `continue_with` makes of it: a
-    /// continuation is single use. A continuation from any earlier generation is discarded
-    /// unread. What `continue_with` writes commits with the rearm, and an error from it undoes
-    /// both.
+    /// The admission is asked inside the transaction, immediately before the first write, as it is
+    /// for an action ([`Self::act`]). What this leaves out is the record of the action: for a
+    /// request that carries its own natural key, a repeat is recognised by the state the effect
+    /// reads and not by an answer kept for it.
     ///
     /// # Errors
     ///
-    /// Returns [`AutomationError::InvalidArgument`] for a root this journal holds no budget for,
-    /// a storage error, and whatever `continue_with` returns.
-    pub fn rearm_budget<T>(
+    /// Returns whatever `effect` returns, and a storage error.
+    pub fn guarded<T>(
         &self,
-        root_id: CausalRootId,
-        now_ms: u64,
-        mut continue_with: impl FnMut(&Journal<'_>, &Continuation, u64) -> Result<Option<T>>,
-    ) -> Result<(CausalBudget, Vec<T>)> {
-        self.write(|journal| {
-            let mut budget = journal.load_budget(root_id)?.ok_or_else(|| {
-                AutomationError::InvalidArgument("causal root not found".to_owned())
-            })?;
-            let left = budget.generation;
-            budget.rearm(now_ms);
-            journal.save_budget(&budget)?;
-            let continuations = journal.continuations(root_id, left)?;
-            journal.conn.execute(
-                "DELETE FROM chain_continuations WHERE causal_root_id = ?1",
-                params![root_id.to_string()],
-            )?;
-            let mut continued = Vec::new();
-            for continuation in &continuations {
-                if let Some(value) = continue_with(journal, continuation, budget.generation)? {
-                    continued.push(value);
-                }
-            }
-            // A continuation the new budget refused would otherwise be kept again, under the new
-            // generation, for a later rearm to spend a second time. Nothing but these attempts
-            // writes to the chain inside this transaction, so the chain leaves it holding none.
-            journal.conn.execute(
-                "DELETE FROM chain_continuations WHERE causal_root_id = ?1",
-                params![root_id.to_string()],
-            )?;
-            Ok((budget, continued))
-        })
+        admission: &(dyn Fn() -> Result<()> + Send + Sync),
+        effect: impl FnOnce(&Journal<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let journal = Journal {
+            conn: &tx,
+            admission: Some(admission),
+            admitted: Cell::new(false),
+            actor: None,
+        };
+        let value = effect(&journal)?;
+        tx.commit()?;
+        Ok(value)
     }
 
     /// Retrieves the durable run record the host verifies causal ancestry against.
