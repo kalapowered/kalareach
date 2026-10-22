@@ -112,7 +112,9 @@ impl Refusal {
                 "{} at {} states an adapter list for these organisations: {}; {} lists no store of \
                  that name, so it would admit every adapter. `kr organisation withdraw <id>` ends \
                  an organisation's list, after `kr organisation exclusive off` on a host that is \
-                 exclusively organisation-managed",
+                 exclusively organisation-managed; an organisation that `kr organisation list` \
+                 does not show is dropped when the control daemon of that environment starts, and \
+                 then the rollback can be run again",
                 self.called(),
                 Shown::root(&self.place),
                 Shown::joined(
@@ -295,9 +297,10 @@ fn lifted_lists(target: &ReleaseManifest, state_dirs: &[(EnvironmentId, &Path)])
                     Why::AppliedLists(stating)
                 }
                 Err(_) => Why::Unreadable(Shown::said(
-                    "it is not a record of applied organisation policies that this release reads, \
-                     or another account owns it, or it is a link, so the adapter lists it states \
-                     are not known",
+                    "it is not a record of applied organisation policies that this release reads \
+                     (it is of another format, names an organisation twice, is larger than a \
+                     record may be, is wider than owner-only, is a link or not a regular file, or \
+                     could not be read), so the adapter lists it states are not known",
                 )),
             };
             Some(Refusal {
