@@ -202,8 +202,8 @@ release, is not offered again, so a rollback stands. `kr host rollback`, `kr hos
 package manager's `kr` where the default store has none), so a release that one refuses never holds
 them back, and a refusal of any other command names that copy.
 The store names the package manager in a file of its own, `installer`; the file only records who
-admitted the releases, and `current` says which one runs. A release before this one does not know
-the file and treats the install as its own. Removing the package removes the package manager's
+admitted the releases, and `current` says which one runs. A release from before the file does not
+know it and treats the install as its own. Removing the package removes the package manager's
 directory and never touches `versions/`. A Windows host keeps no store of releases, so the winget package's `kr`
 runs from the directory winget unpacked the release in. The winget manifest asks for that directory
 to go on the search path, because the programs of a release are found beside the one that starts

@@ -86,38 +86,7 @@ struct Same {
     reason: &'static str,
 }
 
-const SAME: &[Same] = &[
-    Same {
-        root: "ForwardedMutation",
-        digest: "816f1f1b55acd652534b671265079388d7976946935d4724ea2af1f838caeab0",
-        reason: "Two members that are absent from the wire. One is sent only in a workflow's close \
-                 of a session it started, to the worker the daemon started that session's command \
-                 on, never to a worker of the retained level. The other is sent only when the \
-                 daemon forwards a paired device's mutation to a worker at this release's own \
-                 level, which holds the dispatch to the lease; the daemon omits it on a link to a \
-                 worker of the retained level. Every other forwarded mutation is byte for byte \
-                 what that level reads, and what that level accepts is unchanged.",
-    },
-    Same {
-        root: "SessionSummary",
-        digest: "7fe58d83a5989335c94b5e105f5cbce3a42cda57d60510c18ba096a3e6bb6c19",
-        reason: "A member that is absent from the wire for the interactive shell every other \
-                 session has. A worker of the retained level never writes it, and this build \
-                 reads a summary without it as a session whose root is a shell, so what that \
-                 level writes is read as before.",
-    },
-    Same {
-        root: "WorkerLaunchSpec",
-        digest: "1dbe88292acb0c5093405c88fd4b6de5b953318737d9466ff8a23c569a8db469",
-        reason: "Three members that are absent from the wire unless a workflow started the \
-                 session. The specification of an ordinary session is byte for byte what a \
-                 worker of the retained level reads. The daemon starts the workers of its own \
-                 release, and a worker of the retained level reaches a specification that \
-                 carries one of the members only where a person names that worker program by \
-                 hand, and that worker refuses the specification as a frame it cannot read, so \
-                 what that level accepts is unchanged.",
-    },
-];
+const SAME: &[Same] = &[];
 
 /// The rules of the surface, as the roots the walker follows them from:
 ///
