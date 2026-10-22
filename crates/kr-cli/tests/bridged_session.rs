@@ -14,9 +14,8 @@
 
 #![cfg(unix)]
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kr_ipc::client::LocalClient;
@@ -29,6 +28,8 @@ use serde_json::Value;
 mod support;
 #[path = "../../kr-controller/tests/teardown/mod.rs"]
 mod teardown;
+
+use support::terminal::{self, Collected, Keys};
 
 /// How long a wait for something to happen is given. It fails when the thing never happens.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
@@ -745,8 +746,8 @@ struct Terminal {
     /// The modes the terminal was in before anything ran on it, which a command has to leave it in.
     before: rustix::termios::Termios,
     shell: Box<dyn portable_pty::Child + Send + Sync>,
-    seen: Arc<std::sync::Mutex<Vec<u8>>>,
-    writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
+    seen: Collected,
+    writer: Keys,
 }
 
 /// The descriptor a terminal's state is read through: a pseudo-terminal pair shares one line
@@ -773,14 +774,25 @@ impl Terminal {
     }
 
     fn text(&self) -> String {
-        String::from_utf8_lossy(
-            &self
-                .seen
-                .lock()
-                .map(|seen| seen.clone())
-                .unwrap_or_default(),
-        )
-        .into_owned()
+        String::from_utf8_lossy(&terminal::bytes(&self.seen)).into_owned()
+    }
+
+    /// Answers the command's questions about what this terminal is. The answer is typed by the
+    /// thread that collects what the terminal is sent, the moment the question that ends the
+    /// exchange has arrived: the exchange has one second in all.
+    fn answers_what_it_is(&self) {
+        let answering = terminal::reply_to(
+            &self.seen,
+            b"\x1b[c",
+            b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c",
+            &self.writer,
+        );
+        assert!(
+            answering.typed_within(LIVENESS_DEADLINE),
+            "the command asked this terminal what it is: the answer was not typed within \
+             {LIVENESS_DEADLINE:?}; the terminal was sent: {}",
+            self.text().escape_debug()
+        );
     }
 
     fn expect_within(&self, marker: &str, what: &str) {
@@ -891,23 +903,8 @@ impl World {
         }
         builder.cwd(directory);
         let shell = pty.slave.spawn_command(builder).expect("starts the shell");
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let collected = Arc::clone(&seen);
-        let mut reader = pty.master.try_clone_reader().expect("a reader");
-        std::thread::spawn(move || {
-            let mut buffer = [0_u8; 4096];
-            while let Ok(read) = reader.read(&mut buffer) {
-                if read == 0 {
-                    break;
-                }
-                if let Ok(mut seen) = collected.lock() {
-                    seen.extend_from_slice(&buffer[..read]);
-                }
-            }
-        });
-        let writer = Arc::new(std::sync::Mutex::new(
-            pty.master.take_writer().expect("a writer"),
-        ));
+        let seen = terminal::collect(pty.master.try_clone_reader().expect("a reader"));
+        let writer = terminal::keys(pty.master.take_writer().expect("a writer"));
         Terminal {
             before,
             pty,
@@ -926,8 +923,7 @@ impl World {
         ));
         // The command asks the terminal what it is before it changes anything, and a terminal
         // answers. Without the answer the bounded handshake fails and there is nothing to attach.
-        terminal.expect_within("\x1b[c", "the command asked this terminal what it is");
-        terminal.types("\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
+        terminal.answers_what_it_is();
         terminal
     }
 
@@ -938,8 +934,7 @@ impl World {
             "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
             support::kr().display()
         ));
-        terminal.expect_within("\x1b[c", "the command asked this terminal what it is");
-        terminal.types("\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
+        terminal.answers_what_it_is();
         terminal
     }
 }

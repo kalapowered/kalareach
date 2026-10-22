@@ -32,6 +32,7 @@ use rustix::termios::SpecialCodeIndex;
 
 mod support;
 
+use support::terminal::{self, Answering, Collected, Keys};
 use support::{command_binaries, kr, kr_attach_guard};
 
 /// A session this test hosts, with its descriptor published where `kr` will find it.
@@ -634,25 +635,19 @@ fn after_the_guard_wrote(
 /// happens somewhere else and the test only ever looks at what has arrived.
 #[derive(Clone)]
 struct TerminalOutput {
-    seen: Arc<std::sync::Mutex<Vec<u8>>>,
+    seen: Collected,
 }
 
 impl TerminalOutput {
-    fn collect(mut reader: Box<dyn Read + Send>) -> Self {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let collected = Arc::clone(&seen);
-        std::thread::spawn(move || {
-            let mut buffer = [0_u8; 4096];
-            while let Ok(read) = reader.read(&mut buffer) {
-                if read == 0 {
-                    break;
-                }
-                if let Ok(mut seen) = collected.lock() {
-                    seen.extend_from_slice(&buffer[..read]);
-                }
-            }
-        });
-        Self { seen }
+    fn collect(reader: Box<dyn Read + Send>) -> Self {
+        Self {
+            seen: terminal::collect(reader),
+        }
+    }
+
+    /// Types `reply` the moment `question` has arrived in what the terminal is sent.
+    fn reply_to(&self, question: &'static [u8], reply: &[u8], keys: &Keys) -> Answering {
+        terminal::reply_to(&self.seen, question, reply, keys)
     }
 
     /// Waits for the marker, and fails with how long it waited when it never arrives.
@@ -660,11 +655,9 @@ impl TerminalOutput {
     /// `what` says what the marker means to the caller, so a failure names both the wait and the
     /// thing waited for.
     ///
-    /// It looks every two milliseconds, because one of the things that waits here is the thread
-    /// that answers the command's handshake, and that handshake has one second in total. A real
-    /// terminal answers in microseconds; a test that noticed the question fifty milliseconds later
-    /// would be spending the command's own bound on its own polling, and on a busy machine it would
-    /// spend all of it.
+    /// It looks every two milliseconds. What it waits for is output the program is producing, and
+    /// the questions the command asks are answered where they arrive ([`Self::reply_to`]), not
+    /// here.
     fn expect_within(&self, marker: &[u8], within: Duration, what: &str) {
         let started = Instant::now();
         let deadline = started + within;
@@ -684,33 +677,26 @@ impl TerminalOutput {
     }
 
     fn contains(&self, marker: &[u8]) -> bool {
-        self.seen
-            .lock()
-            .is_ok_and(|seen| seen.windows(marker.len()).any(|window| window == marker))
+        self.bytes()
+            .windows(marker.len())
+            .any(|window| window == marker)
     }
 
     /// Every byte the terminal has been sent, as it was sent.
     fn bytes(&self) -> Vec<u8> {
-        self.seen
-            .lock()
-            .map(|seen| seen.clone())
-            .unwrap_or_default()
+        terminal::bytes(&self.seen)
     }
 
     /// How many times a sequence appears in what the terminal has been sent.
     fn count(&self, marker: &[u8]) -> usize {
-        self.seen.lock().map_or(0, |seen| {
-            seen.windows(marker.len())
-                .filter(|window| *window == marker)
-                .count()
-        })
+        self.bytes()
+            .windows(marker.len())
+            .filter(|window| *window == marker)
+            .count()
     }
 
     fn text(&self) -> String {
-        self.seen
-            .lock()
-            .map(|seen| String::from_utf8_lossy(&seen).into_owned())
-            .unwrap_or_default()
+        String::from_utf8_lossy(&self.bytes()).into_owned()
     }
 }
 
@@ -722,39 +708,34 @@ impl TerminalOutput {
 /// gives, followed by the device attributes that end the exchange.
 fn answer_keyboard_queries(
     output: &TerminalOutput,
-    mut writer: Box<dyn std::io::Write + Send>,
-) -> std::thread::JoinHandle<()> {
-    let output = output.clone();
-    std::thread::spawn(move || {
-        // The device-attributes request is the one question every profile asks, so it is what this
-        // waits for. The two keyboard answers are volunteered: this terminal implements both
-        // protocols and says so, and a reply a terminal gives unbidden is still the truth about
-        // itself, which is what the restoration puts back.
-        output.expect_within(b"\x1b[c", LIVENESS_DEADLINE, QUERY_EXPECTED);
-        writer
-            .write_all(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c")
-            .expect("answers the queries");
-        writer.flush().expect("and the answer reaches the command");
-    })
+    writer: Box<dyn std::io::Write + Send>,
+) -> Answering {
+    // The device-attributes request is the one question every profile asks, so it is what this
+    // waits for. The two keyboard answers are volunteered: this terminal implements both
+    // protocols and says so, and a reply a terminal gives unbidden is still the truth about
+    // itself, which is what the restoration puts back.
+    output.reply_to(
+        b"\x1b[c",
+        b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c",
+        &terminal::keys(writer),
+    )
 }
 
 /// What a terminal is waiting for when it answers the queries this command asks.
 const QUERY_EXPECTED: &str = "the command asked this terminal what it is";
 
-/// Waits for the thread that answers this terminal's queries, and gives the test what it found.
+/// Waits until the answer to this terminal's queries has been typed, and fails with what the
+/// terminal was sent when it was not.
 ///
 /// The query is a required wait: without it nothing is answered, the bounded handshake fails and
-/// there is no attachment to test. A thread whose panic nobody joins would leave that as a timeout
-/// somewhere else, so the failure is brought back here with its own message.
-fn answered(queries: std::thread::JoinHandle<()>) {
-    if let Err(panic) = queries.join() {
-        let detail = panic
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| panic.downcast_ref::<&str>().copied())
-            .unwrap_or("the thread answering this terminal's queries failed");
-        panic!("{detail}");
-    }
+/// there is no attachment to test.
+fn answered(output: &TerminalOutput, queries: Answering) {
+    assert!(
+        queries.typed_within(LIVENESS_DEADLINE),
+        "{QUERY_EXPECTED}: the answer was not typed within {LIVENESS_DEADLINE:?}; the terminal was \
+         sent: {}",
+        output.text().escape_debug()
+    );
 }
 
 /// Answers the keyboard queries and types something in the middle of the exchange.
@@ -764,20 +745,13 @@ fn answered(queries: std::thread::JoinHandle<()>) {
 /// a reply.
 fn answer_and_type(
     output: &TerminalOutput,
-    mut writer: Box<dyn std::io::Write + Send>,
+    writer: Box<dyn std::io::Write + Send>,
     typed: &'static [u8],
-) -> std::thread::JoinHandle<()> {
-    let output = output.clone();
-    std::thread::spawn(move || {
-        output.expect_within(b"\x1b[c", LIVENESS_DEADLINE, QUERY_EXPECTED);
-        let mut answer = Vec::from(b"\x1b[?5u".as_slice());
-        answer.extend_from_slice(typed);
-        answer.extend_from_slice(b"\x1b[>4;2m\x1b[?62;22c");
-        writer
-            .write_all(&answer)
-            .expect("answers the queries and types in the middle of the exchange");
-        writer.flush().expect("and the answer reaches the command");
-    })
+) -> Answering {
+    let mut answer = Vec::from(b"\x1b[?5u".as_slice());
+    answer.extend_from_slice(typed);
+    answer.extend_from_slice(b"\x1b[>4;2m\x1b[?62;22c");
+    output.reply_to(b"\x1b[c", &answer, &terminal::keys(writer))
 }
 
 /// Answers the keyboard queries and the mode reports, as a terminal with a state of its own would.
@@ -788,17 +762,14 @@ fn answer_and_type(
 /// nobody had touched.
 fn answer_keyboard_and_mode_queries(
     output: &TerminalOutput,
-    mut writer: Box<dyn std::io::Write + Send>,
-) -> std::thread::JoinHandle<()> {
-    let output = output.clone();
-    std::thread::spawn(move || {
-        output.expect_within(b"\x1b[c", LIVENESS_DEADLINE, QUERY_EXPECTED);
-        // DECRPM: one is set, two is reset.
-        let _ = writer.write_all(
-            b"\x1b[?5u\x1b[>4;2m\x1b[?25;2$y\x1b[?1000;1$y\x1b[?1002;2$y\x1b[?1003;2$y\x1b[?1006;2$y\x1b[?2004;1$y\x1b[?62;22c",
-        );
-        let _ = writer.flush();
-    })
+    writer: Box<dyn std::io::Write + Send>,
+) -> Answering {
+    // DECRPM: one is set, two is reset.
+    output.reply_to(
+        b"\x1b[c",
+        b"\x1b[?5u\x1b[>4;2m\x1b[?25;2$y\x1b[?1000;1$y\x1b[?1002;2$y\x1b[?1003;2$y\x1b[?1006;2$y\x1b[?2004;1$y\x1b[?62;22c",
+        &terminal::keys(writer),
+    )
 }
 
 /// What the terminal above reported, and therefore what it is owed back.
@@ -1049,7 +1020,7 @@ async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
         LIVENESS_DEADLINE,
         "the session's output reached the terminal",
     );
-    answered(queries);
+    answered(&output, queries);
 
     // Raw mode is on: the terminal no longer waits for a line and no longer echoes.
     let during = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
@@ -1158,7 +1129,7 @@ async fn a_terminal_that_reported_its_modes_is_put_back_into_them_after_a_kill()
         LIVENESS_DEADLINE,
         "the session's output reached the terminal",
     );
-    answered(queries);
+    answered(&output, queries);
 
     let during = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
     assert!(
@@ -1279,7 +1250,7 @@ async fn an_attach_that_fails_after_the_handshake_leaves_the_terminal_the_modes_
 
     // The status is read once its line is whole: the digit can arrive after the rest of the marker.
     let status = exit_status(&output, "attach-finished-");
-    answered(queries);
+    answered(&output, queries);
     assert_ne!(
         status,
         0,
@@ -1345,7 +1316,7 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
         LIVENESS_DEADLINE,
         "the session's output reached the terminal",
     );
-    answered(queries);
+    answered(&output, queries);
 
     // A second command, in another window, ends this attachment. Outside the attachment's own
     // context an explicit selector is required, so it names the one it is ending.
@@ -1472,7 +1443,7 @@ async fn an_application_that_empties_the_keyboard_stack_takes_nothing_of_the_ter
         LIVENESS_DEADLINE,
         "the session's output reached the terminal",
     );
-    answered(queries);
+    answered(&output, queries);
 
     // Now, with the attachment live and forwarding, the application empties the stack. The marker
     // after it is what says the sequence was written while there was an attachment to carry it.
@@ -1651,7 +1622,7 @@ async fn what_was_typed_during_the_handshake_reaches_the_application() {
         LIVENESS_DEADLINE,
         "the bytes typed during the handshake reached the application and came back",
     );
-    answered(queries);
+    answered(&output, queries);
     let _ = shell.kill();
     let _ = shell.wait();
 }
@@ -1710,7 +1681,7 @@ async fn an_attach_that_fails_before_it_forwards_leaves_the_keyboard_protocols_a
         LIVENESS_DEADLINE,
         "the attach ended because nothing was listening rather than because the handshake failed",
     );
-    answered(queries);
+    answered(&output, queries);
     assert!(
         output.contains(b"\x1b[c"),
         "the handshake did happen, so this terminal was asked what it was: {}",
@@ -1905,22 +1876,10 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
         ))
         .expect("starts the shell");
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    // A pseudo-terminal hands out its writer once, and two things need it here: the thread that
-    // answers the outer command's handshake, and this test typing afterwards.
-    let keyboard = Arc::new(std::sync::Mutex::new(
-        pty.master.take_writer().expect("a writer"),
-    ));
-    {
-        let output = output.clone();
-        let keyboard = Arc::clone(&keyboard);
-        std::thread::spawn(move || {
-            output.expect_within(b"\x1b[c", LIVENESS_DEADLINE, QUERY_EXPECTED);
-            if let Ok(mut writer) = keyboard.lock() {
-                let _ = writer.write_all(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
-                let _ = writer.flush();
-            }
-        });
-    }
+    // A pseudo-terminal hands out its writer once, and two things need it here: the answer to the
+    // outer command's handshake, and this test typing afterwards.
+    let keyboard = terminal::keys(pty.master.take_writer().expect("a writer"));
+    let _queries = output.reply_to(b"\x1b[c", b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c", &keyboard);
     let types = |bytes: &[u8]| {
         let mut writer = keyboard.lock().expect("the writer is not poisoned");
         writer.write_all(bytes).expect("types");
@@ -2398,17 +2357,11 @@ fn refuses_because_closing(payload: &[u8]) -> bool {
 /// writer so the test can type afterwards.
 fn answer_keyboard_queries_then_type(
     output: &TerminalOutput,
-    mut writer: Box<dyn std::io::Write + Send>,
-) -> std::thread::JoinHandle<Box<dyn std::io::Write + Send>> {
-    let output = output.clone();
-    std::thread::spawn(move || {
-        output.expect_within(b"\x1b[c", LIVENESS_DEADLINE, QUERY_EXPECTED);
-        writer
-            .write_all(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c")
-            .expect("answers the queries");
-        writer.flush().expect("and the answer reaches the command");
-        writer
-    })
+    writer: Box<dyn std::io::Write + Send>,
+) -> (Answering, Keys) {
+    let keys = terminal::keys(writer);
+    let answering = output.reply_to(b"\x1b[c", b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c", &keys);
+    (answering, keys)
 }
 
 /// KR-REQ-07.52: a session that refused an attachment's input because it was closing, and whose
@@ -2452,22 +2405,15 @@ async fn a_connection_lost_after_a_refusal_ends_the_attachment_as_a_lost_connect
         shell,
     };
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    let queries =
+    let (queries, keys) =
         answer_keyboard_queries_then_type(&output, pty.master.take_writer().expect("a writer"));
     output.expect_within(
         b"kr-ready",
         LIVENESS_DEADLINE,
         "the session's output reached the terminal through the relay",
     );
-    let mut keys = queries.join().unwrap_or_else(|panic| {
-        panic!(
-            "{}",
-            panic.downcast_ref::<String>().map_or(
-                "the thread answering the terminal's queries failed",
-                String::as_str
-            )
-        )
-    });
+    answered(&output, queries);
+    let mut keys = keys.lock().expect("the writer is not poisoned");
 
     // The session begins to close, and stays closing: its termination is never started, so the
     // application goes on running and the attachment goes on being served.

@@ -12,7 +12,6 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kr_ipc::client::LocalClient;
@@ -27,6 +26,7 @@ mod support;
 mod teardown;
 
 use support::kr;
+use support::terminal::{self, Answering, Collected, Keys};
 
 /// How long a wait for something to happen is given. It fails when the thing never happens.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
@@ -220,36 +220,23 @@ fn copy_into(source: &Path, directory: &Path) -> PathBuf {
 /// Everything a terminal has produced, collected off the test's own thread.
 #[derive(Clone)]
 struct TerminalOutput {
-    seen: Arc<std::sync::Mutex<Vec<u8>>>,
+    seen: Collected,
 }
 
 impl TerminalOutput {
-    fn collect(mut reader: Box<dyn Read + Send>) -> Self {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let collected = Arc::clone(&seen);
-        std::thread::spawn(move || {
-            let mut buffer = [0_u8; 4096];
-            while let Ok(read) = reader.read(&mut buffer) {
-                if read == 0 {
-                    break;
-                }
-                if let Ok(mut seen) = collected.lock() {
-                    seen.extend_from_slice(&buffer[..read]);
-                }
-            }
-        });
-        Self { seen }
+    fn collect(reader: Box<dyn Read + Send>) -> Self {
+        Self {
+            seen: terminal::collect(reader),
+        }
+    }
+
+    /// Types `reply` the moment `question` has arrived in what the terminal is sent.
+    fn reply_to(&self, question: &'static [u8], reply: &[u8], keys: &Keys) -> Answering {
+        terminal::reply_to(&self.seen, question, reply, keys)
     }
 
     fn text(&self) -> String {
-        String::from_utf8_lossy(
-            &self
-                .seen
-                .lock()
-                .map(|seen| seen.clone())
-                .unwrap_or_default(),
-        )
-        .into_owned()
+        String::from_utf8_lossy(&terminal::bytes(&self.seen)).into_owned()
     }
 
     /// Waits for `marker`, and fails with how long it waited when it never arrives.
@@ -262,8 +249,6 @@ impl TerminalOutput {
                 started.elapsed(),
                 self.text().escape_debug()
             );
-            // Short, because the command's capability handshake has a second in total and one of
-            // the things waiting here is the thread that answers it.
             std::thread::sleep(Duration::from_millis(2));
         }
     }
@@ -274,7 +259,7 @@ struct Attached {
     _pty: portable_pty::PtyPair,
     shell: Box<dyn portable_pty::Child + Send + Sync>,
     output: TerminalOutput,
-    writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
+    writer: Keys,
 }
 
 impl Attached {
@@ -307,24 +292,17 @@ impl Attached {
         builder.cwd("/");
         let shell = pty.slave.spawn_command(builder).expect("starts the shell");
         let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-        let writer = Arc::new(std::sync::Mutex::new(
-            pty.master.take_writer().expect("a writer"),
-        ));
+        let writer = terminal::keys(pty.master.take_writer().expect("a writer"));
         // The command asks the terminal what it is before it changes anything, and a terminal
         // answers. Without the answer the bounded handshake fails and there is nothing to attach.
-        let answering = {
-            let output = output.clone();
-            let writer = Arc::clone(&writer);
-            std::thread::spawn(move || {
-                output.expect_within("\x1b[c", "the command asked this terminal what it is");
-                let mut writer = writer.lock().expect("the writer");
-                writer
-                    .write_all(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c")
-                    .expect("answers");
-                writer.flush().expect("flushes");
-            })
-        };
-        answering.join().expect("the terminal answered the command");
+        assert!(
+            output
+                .reply_to(b"\x1b[c", b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c", &writer)
+                .typed_within(LIVENESS_DEADLINE),
+            "the command asked this terminal what it is: the answer was not typed within \
+             {LIVENESS_DEADLINE:?}; the terminal was sent: {}",
+            output.text().escape_debug()
+        );
         Self {
             _pty: pty,
             shell,

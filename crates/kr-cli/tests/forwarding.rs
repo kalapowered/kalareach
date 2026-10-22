@@ -32,6 +32,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 mod support;
 
+use support::terminal::{self, Answering, Collected, Keys};
 use support::{command_binaries, kr};
 
 /// A root program that echoes its input and nothing else.
@@ -201,40 +202,30 @@ fn shell_running(hosted: &Hosted, command_line: &str) -> CommandBuilder {
 /// Everything the terminal has produced, collected off the test's own thread.
 #[derive(Clone)]
 struct TerminalOutput {
-    seen: Arc<std::sync::Mutex<Vec<u8>>>,
+    seen: Collected,
 }
 
 impl TerminalOutput {
-    fn collect(mut reader: Box<dyn Read + Send>) -> Self {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let collected = Arc::clone(&seen);
-        std::thread::spawn(move || {
-            let mut buffer = [0_u8; 4096];
-            while let Ok(read) = reader.read(&mut buffer) {
-                if read == 0 {
-                    break;
-                }
-                if let Ok(mut seen) = collected.lock() {
-                    seen.extend_from_slice(&buffer[..read]);
-                }
-            }
-        });
-        Self { seen }
+    fn collect(reader: Box<dyn Read + Send>) -> Self {
+        Self {
+            seen: terminal::collect(reader),
+        }
+    }
+
+    /// Types `reply` the moment `question` has arrived in what the terminal is sent.
+    fn reply_to(&self, question: &'static [u8], reply: &[u8], keys: &Keys) -> Answering {
+        terminal::reply_to(&self.seen, question, reply, keys)
     }
 
     fn snapshot(&self) -> Vec<u8> {
-        self.seen
-            .lock()
-            .map(|seen| seen.clone())
-            .unwrap_or_default()
+        terminal::bytes(&self.seen)
     }
 
     /// Waits for the marker to appear, or for the deadline to pass.
     ///
-    /// Two milliseconds, because one of the things that waits here is the thread that answers the
-    /// command's handshake, and that handshake has one second in total. A real terminal answers in
-    /// microseconds; a test that noticed the question fifty milliseconds later would be spending
-    /// the command's own bound on its own polling, and on a busy machine it would spend all of it.
+    /// It looks every two milliseconds. What it waits for is output the program is producing, and
+    /// the questions the command asks are answered where they arrive ([`Self::reply_to`]), not
+    /// here.
     fn wait_for(&self, marker: &[u8], within: Duration) -> bool {
         let deadline = Instant::now() + within;
         while Instant::now() < deadline {
@@ -264,10 +255,6 @@ impl TerminalOutput {
                 String::from_utf8_lossy(marker),
                 self.text().escape_debug()
             );
-            // Two milliseconds, because one of the things that waits here is the thread that
-            // answers the command's handshake, and that handshake has one second in total. A real
-            // terminal answers in microseconds; a test that noticed the question twenty-five
-            // milliseconds later would be spending the command's own bound on its own polling.
             std::thread::sleep(Duration::from_millis(2));
         }
     }
@@ -290,19 +277,19 @@ fn count(haystack: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
-/// The one writer the terminal has, shared between the test and the thread that answers the probe.
+/// The one writer the terminal has, shared between the test and whatever types the probe's answer.
 ///
 /// A pseudo-terminal hands out its writer once, and two things need it: whatever answers the
 /// command's capability handshake, and the test typing afterwards.
 #[derive(Clone)]
 struct Keyboard {
-    writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
+    writer: Keys,
 }
 
 impl Keyboard {
     fn new(writer: Box<dyn Write + Send>) -> Self {
         Self {
-            writer: Arc::new(std::sync::Mutex::new(writer)),
+            writer: terminal::keys(writer),
         }
     }
 
@@ -316,39 +303,28 @@ impl Keyboard {
     ///
     /// The command asks the outer terminal what it has negotiated before it changes anything.
     /// Without an answer the bounded handshake fails and there is no attachment to test.
-    fn answers_the_probe(&self, output: &TerminalOutput) -> std::thread::JoinHandle<()> {
-        let output = output.clone();
-        let keyboard = self.clone();
-        std::thread::spawn(move || {
-            // The device-attributes request is the question every profile asks, and the last of
-            // them, so it is what this waits for: a terminal calling itself `xterm-256color` is
-            // asked no keyboard question at all. The keyboard answers are volunteered, and a reply
-            // a terminal gives unbidden is still the truth about itself, which is what a cleanup
-            // puts back.
-            output.expect_within(
-                b"\x1b[c",
-                LIVENESS_DEADLINE,
-                "the command asked this terminal what it is",
-            );
-            keyboard.types(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
-        })
+    fn answers_the_probe(&self, output: &TerminalOutput) -> Answering {
+        // The device-attributes request is the question every profile asks, and the last of
+        // them, so it is what this waits for: a terminal calling itself `xterm-256color` is
+        // asked no keyboard question at all. The keyboard answers are volunteered, and a reply
+        // a terminal gives unbidden is still the truth about itself, which is what a cleanup
+        // puts back.
+        output.reply_to(b"\x1b[c", b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c", &self.writer)
     }
 }
 
-/// Waits for the thread that answers this terminal's queries, and gives the test what it found.
+/// Waits until the answer to this terminal's queries has been typed, and fails with what the
+/// terminal was sent when it was not.
 ///
 /// Without an answer the bounded handshake fails and there is no attachment to test, so the query
-/// is a required wait. A thread whose panic nobody joins would leave that as a timeout somewhere
-/// else, so the failure is brought back here with its own message.
-fn answered(probe: std::thread::JoinHandle<()>) {
-    if let Err(panic) = probe.join() {
-        let detail = panic
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| panic.downcast_ref::<&str>().copied())
-            .unwrap_or("the thread answering this terminal's queries failed");
-        panic!("{detail}");
-    }
+/// is a required wait.
+fn answered(output: &TerminalOutput, probe: Answering) {
+    assert!(
+        probe.typed_within(LIVENESS_DEADLINE),
+        "the command asked this terminal what it is: the answer was not typed within \
+         {LIVENESS_DEADLINE:?}; the terminal was sent: {}",
+        output.text().escape_debug()
+    );
 }
 
 /// Reads everything the session has retained, which is what the application produced.
@@ -501,7 +477,7 @@ async fn raw_input_reaches_the_application_byte_for_byte() {
         LIVENESS_DEADLINE,
         "the session's screen reached the terminal",
     );
-    answered(probe);
+    answered(&output, probe);
     let mut previous = 0_usize;
     for sequence in SEQUENCES {
         keyboard.types(sequence.bytes);
@@ -624,7 +600,7 @@ async fn the_command_draws_what_the_host_sends_and_nothing_of_its_own() {
         LIVENESS_DEADLINE,
         "the session's screen reached the terminal",
     );
-    answered(probe);
+    answered(&output, probe);
     // Everything the terminal was sent while the attachment was being set up. What matters after
     // this point is what the command draws while output flows.
     let settled = output.snapshot();
@@ -750,7 +726,7 @@ async fn mouse_reports_pass_through_and_a_wheel_event_is_never_an_arrow_key() {
         LIVENESS_DEADLINE,
         "the session's screen reached the terminal",
     );
-    answered(probe);
+    answered(&output, probe);
 
     // Every mouse encoding an advertised protocol produces: the wheel, a press and release in SGR,
     // and the original X10 report whose coordinate bytes are not valid UTF-8.
@@ -938,7 +914,7 @@ fn attach_on_a_terminal(
         LIVENESS_DEADLINE,
         "the session was drawn in the terminal",
     );
-    answered(probe);
+    answered(&output, probe);
     (pty, shell, output)
 }
 
