@@ -28,6 +28,10 @@ use tauri::{AppHandle, Runtime};
 
 use crate::PlatformError;
 
+/// The scope the device's own keys are stored under, which the application's identity writes them
+/// in and a push receiver reads the authorisation key from.
+pub const DEVICE_SCOPE: &str = "device";
+
 /// The store's name: the desktop store's service and the iOS keychain items' service.
 ///
 /// The host's own store is `KalaReach`, so a companion and a host on one machine keep separate
@@ -171,6 +175,9 @@ fn stored_fault(error: &base64::DecodeError) -> String {
 }
 
 #[cfg(target_os = "ios")]
+pub(crate) use ios::KeychainStore;
+
+#[cfg(target_os = "ios")]
 mod ios {
     use apple_native_keyring_store::protected::{AccessPolicy, Cred};
     use kr_crypto::secret::SecretVec;
@@ -180,8 +187,16 @@ mod ios {
     use super::keychain_item;
 
     /// The protected keychain store, in the application's own group.
-    pub(super) struct KeychainStore {
+    pub(crate) struct KeychainStore {
         pub(super) group: String,
+    }
+
+    impl KeychainStore {
+        /// The store of the keychain group `group`, which a receiver names from the application's
+        /// own `Info.plist` and which the secure store opens the same items in.
+        pub(crate) const fn new(group: String) -> Self {
+            Self { group }
+        }
     }
 
     fn failed(error: impl std::fmt::Display) -> CryptoError {

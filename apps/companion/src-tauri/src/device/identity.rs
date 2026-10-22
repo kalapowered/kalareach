@@ -16,7 +16,7 @@ use kr_protocol::pairing::{DeviceName, DevicePlatform};
 use crate::error::{CommandError, Result};
 
 /// The scope this computer's keys, and its attempt budget's key, are stored under.
-pub const SCOPE: &str = "device";
+pub const SCOPE: &str = companion_platform::secrets::DEVICE_SCOPE;
 
 /// What this computer declares when it pairs, and the store its secrets live in.
 pub struct DeviceIdentity {
