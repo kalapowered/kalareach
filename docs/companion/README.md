@@ -822,9 +822,23 @@ answer never came back.
   were when the list cannot be removed. On Windows a new file has the permissions of the folder the
   person chose, and a file that already existed keeps its own. The page is sent none of its
   contents.
-- `Recovery::enable_writer` is how a backup writer is made recovery-enabled. It commits the bundle
-  with the writer named in it, and returns the evidence that the writer is enabled only after that
-  commit has landed.
+- Covering the host on this computer (`recovery_cover_host`, `Recovery::cover_host`) is how the
+  host's backup writer is made recovery-enabled. A kit opens the archives a host makes only if the
+  host was set up under that kit's recipient, so naming the writer in the bundle is not enough, and
+  the command does both. It reads the host's status over the connection to the host on this
+  computer, refuses to declare anything when the host cannot be covered as it stands, commits the
+  bundle naming the host's archive, producer and writer, and then sets the host up under this
+  computer's recovery with the very bytes that landed. The Recovery card says the host is covered
+  only after the host has said it is set up. The page names nothing but whether a replacement is
+  asked for. A host that selects no storage service or another than the bundle's, that holds no
+  usable sign-in, whose setup has not ended, or that was set up under another kit is left as it is,
+  and the card says which. A host set up under another kit keeps its archive and its recipient, so
+  the only way to put it under this recovery is a replacement: the card offers it as a second,
+  confirmed choice, and the host then starts a new archive under this recovery. What it backed up
+  before stays at the service and opens only with the earlier kit; the host stops adding to it and
+  does not remove its old backups. A refusal after the bundle was written leaves a bundle that names
+  an archive the host never made, which a restore lists as holding nothing. The card covers the
+  host on this computer only: a paired host cannot be asked for its status.
 
 The bundle is reached with this device's signature and the account's token, and the token goes only
 to the service the account is signed in to. When the sync service setting names another service,
