@@ -1142,27 +1142,42 @@ made": what bounds it is the emptiness rule, which means a release still takes a
 was there first. That window is a stated limitation rather than something this host establishes. Neither the repository nor the working
 copy the version came from is touched, so the agent whose tree was captured keeps working.
 
-Recording a result re-reads the materialisation and says what it establishes:
+Recording a result re-reads the materialisation, settles the record this host took of it before the
+command started, and says what they establish:
 
 * it still holds the version (the same paths, the same content, the same modes, and every file still
-  the object this host wrote, of the same length, last written at the same instant), and the result
-  attests that version;
+  the object this host wrote, of the same length, last written at the same instant) and nothing
+  outside the declared outputs was written in it while the command ran, and the result attests that
+  version;
+* it still holds the version, but something was written in it while the command ran and put back,
+  or this host could not establish that nothing was: the result is `indeterminate` and attests
+  nothing. A run that changed a file, tested the change and put the file back, bytes and
+  modification time included, leaves a directory that reads as the version, and only the record
+  shows it;
 * it holds something else: the result attests **no version at all**, and this host records a
   **derived version** with its own identity beside it, held against deletion for as long as the
   result is, which is what the directory held when the result was recorded rather than what the run
-  read. A run that changed a file, tested the change and put the file back leaves a directory that
-  reads as modified and a reading no command ever used, so naming that reading as the tested version
-  would be a claim this host cannot make;
+  read. Naming that reading as the tested version would be a claim this host cannot make;
 * it holds something this host cannot represent, cannot read, or would not have captured in the
   first place, or something was written into it after the run the caller reported had ended: the
   result is `indeterminate` and attests nothing at all.
 
-The limit is stated here rather than left to be discovered: this host reads the directory when the
-materialisation is made and again when the result is recorded. It does not watch it while the run is
-happening. What it records at each path when it writes it (the object, the length and the instant it
-was last written) is what tells a file nobody touched from one a run rewrote with the same bytes; a
-run that restored all three together is not something two readings would show. Binding a result to
-the bytes a command actually read needs a host that owns the execution.
+The record is what the platform says about the directory itself and about every file and directory
+beneath it, taken once before the command starts and once after it has ended: the kind of object,
+its device and inode, its length, when it was last modified and when its inode last changed. A run
+can put back a file's bytes and its modification time, and it cannot put back its change time. A
+name made and removed again moves the change time of the directory it was in. The host takes the
+record only on a filesystem it knows to keep change times, and waits until the filesystem's clock
+has passed the newest one before the command starts. A declared output of a test run is the one
+place a command may write, and the directory an output is in is watched by name instead: the
+automation reference has the rule. A platform that keeps no change times has no record, and a
+result there is `indeterminate`.
+
+The limit is stated here rather than left to be discovered. The record shows that nothing in the
+directory was written while the command ran. It does not show what the command read, which can be
+anything on the machine, and it does not show a write through a shared mapping that the platform has
+not yet recorded when the result is recorded, a write by a process that outlives the session, or a
+system clock set back by an account allowed to set it.
 
 An identical source promises nothing about network services, installed dependencies, secrets or
 graphical state. Every version and every materialisation carries that sentence.
