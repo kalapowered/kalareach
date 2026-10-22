@@ -904,6 +904,10 @@ mod tests {
         std::fs::remove_dir_all(&directory).expect("removes the test's directory");
     }
 
+    /// KR-REQ-03.26: selecting a desktop alone never reports screen capture or input injection as
+    /// available. Each is refused with a reason, whatever the platform's own facility is on this
+    /// host, while the display server is nameable and launching an application is the launcher's
+    /// own answer.
     #[test]
     fn selecting_a_desktop_never_reports_capture_or_injection_as_available() {
         let report = report(
@@ -1105,6 +1109,11 @@ mod tests {
         );
     }
 
+    /// KR-REQ-03.26: the Linux results distinguish X11, Wayland and the compositor and tool
+    /// combinations. X11 with a tool, a wlroots compositor with its tool, a compositor whose route
+    /// this host cannot name and Wayland with nothing installed each give a different answer, none
+    /// of them reports the capability as available, and each says why without naming the
+    /// compositor or the tool as itself.
     #[test]
     fn the_linux_answer_distinguishes_x11_wayland_and_the_compositor_and_tool_pair() {
         // X11 with a tool present: the display server grants this to any client that holds the
@@ -1238,6 +1247,10 @@ mod tests {
         );
     }
 
+    /// KR-REQ-03.26, the part about the compositor: the display-server record is a different
+    /// record for X11, for Wayland and for each Wayland compositor, so a host that changed any of
+    /// them is told the evidence changed; it names no binary, and no other record names the
+    /// compositor.
     #[test]
     fn the_display_server_record_names_no_binary_and_changes_with_its_compositor() {
         // A record in the form two reports are compared in: everything but the revision and the
