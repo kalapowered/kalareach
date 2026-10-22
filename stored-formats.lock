@@ -748,7 +748,7 @@
     {
       "scope": "environment",
       "path": "login-session",
-      "reason": "written only on Windows, which keeps no store of releases; a record that does not decode is an error that names it",
+      "reason": "an earlier release wrote it on Windows, which keeps no store of releases; nothing reads it",
       "children": [],
       "opaque": false,
       "databases": false

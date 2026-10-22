@@ -17,7 +17,6 @@
 //! | `PeerProcess`: the process at the other end of the pipe, its image, its login session and whether it runs as this user | each side, to check the other |
 //! | `start_child`: a child created suspended and checked before it runs | the starter |
 //! | [`StartClaim`]: a request to start the daemon, left by a cold start and taken once | the starter |
-//! | [`record_session`]: the login session this environment's work runs in | the daemon |
 //!
 //! # The starter's own job
 //!
@@ -137,7 +136,7 @@ impl TakenClaim {
     }
 }
 
-/// The largest claim or session record this host reads.
+/// The largest claim this host reads.
 const MAX_RECORD_LEN: u64 = 4096;
 
 /// The suffix of a claim: the request, as it was left.
@@ -317,65 +316,6 @@ fn decode<T: serde::de::DeserializeOwned + Serialize>(path: &Path, bytes: &[u8])
             std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()),
         )
     })
-}
-
-/// The login session an environment's work runs in, as its daemon recorded it.
-///
-/// Windows ends a login session's processes when the user signs out of it, so every worker one
-/// environment has must be in one session: a worker in another would outlive the sign-out that
-/// ends the rest, or end with the wrong one. The record outlives the daemon that wrote it, so the
-/// daemon that replaces it can refuse to take over work in another session.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecordedSession {
-    /// The login session's identifier.
-    pub session: u32,
-    /// The boot the session belongs to: a session identifier is reused after a restart.
-    pub boot: BootIdentity,
-}
-
-/// Records the login session this environment's work runs in, replacing any earlier record.
-///
-/// # Errors
-///
-/// Returns an error when the record cannot be written.
-pub fn record_session(environment: &EnvironmentPaths, recorded: &RecordedSession) -> Result<()> {
-    let path = environment.session_record();
-    let bytes = kr_cbor::to_canonical_vec(recorded).map_err(|error| {
-        IpcError::io(
-            "encode",
-            &path,
-            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()),
-        )
-    })?;
-    crate::paths::write_owner_only_file(&path, &bytes)
-}
-
-/// Reads the login session this environment's work runs in, when one is recorded.
-///
-/// # Errors
-///
-/// Returns an error when a record exists and cannot be read.
-pub fn recorded_session(environment: &EnvironmentPaths) -> Result<Option<RecordedSession>> {
-    let path = environment.session_record();
-    match crate::paths::read_owner_only_file(&path, MAX_RECORD_LEN)? {
-        Some(bytes) => decode(&path, &bytes).map(Some),
-        None => Ok(None),
-    }
-}
-
-/// Removes the record of the login session this environment's work runs in.
-///
-/// # Errors
-///
-/// Returns an error when a record exists and cannot be removed.
-pub fn clear_recorded_session(environment: &EnvironmentPaths) -> Result<()> {
-    let path = environment.session_record();
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(IpcError::io("remove", &path, error)),
-    }
 }
 
 #[cfg(windows)]
@@ -2602,39 +2542,6 @@ mod tests {
         }
         assert_eq!(taken.len(), 1, "one starter took the live claim");
         assert_eq!(taken[0].claim(), &live);
-    }
-
-    /// The recorded session survives being read back, is replaced by a later record, and goes when
-    /// it is cleared.
-    #[test]
-    fn the_recorded_session_is_read_back_replaced_and_cleared() {
-        let host = TempHost::create();
-        let environment = host.environment();
-        assert_eq!(
-            recorded_session(&environment).expect("nothing recorded"),
-            None
-        );
-        let first = RecordedSession {
-            session: 3,
-            boot: boot(1),
-        };
-        record_session(&environment, &first).expect("recorded");
-        assert_eq!(
-            recorded_session(&environment).expect("read back"),
-            Some(first)
-        );
-        let second = RecordedSession {
-            session: 5,
-            boot: boot(2),
-        };
-        record_session(&environment, &second).expect("replaced");
-        assert_eq!(
-            recorded_session(&environment).expect("read back"),
-            Some(second)
-        );
-        clear_recorded_session(&environment).expect("cleared");
-        clear_recorded_session(&environment).expect("clearing twice is not a failure");
-        assert_eq!(recorded_session(&environment).expect("gone"), None);
     }
 
     /// Whether a child that says whether it has a console has said it yet, and what: the line the
