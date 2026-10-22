@@ -128,9 +128,9 @@ async fn the_typed_result_reaches_the_page_and_a_share_is_accepted_and_taken_bac
 }
 
 /// The host's answer to an invitation is lost, and the application, which kept the request before
-/// it sent it, asks the host again with the same request on a connection opened for
-/// it. The host answers from the record it kept, so the invitation exists once, and the page reads
-/// the host's own result from the attempt. The record stays until the page removes it.
+/// it sent it, asks the host again with the same request on a connection opened for it. The host
+/// answers from the record it kept, so the invitation exists once, and the page reads the host's
+/// own result from the attempt. The record stays until the page removes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lost_reply_is_asked_about_again_and_answered_from_the_hosts_record() {
     let scene = Scene::start().await;
