@@ -39,6 +39,7 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{Bytes, DurationMs, TimestampMs, Uuid};
 
 use crate::error::ClientError;
+use crate::recovery::files::is_a_lost_answer;
 use crate::recovery::{BundleStore, RecoveryError, Result, WriterEnabled, kit_fingerprint};
 use crate::services::ServiceFuture;
 use crate::session::{Session, Settled};
@@ -92,6 +93,28 @@ impl ArchiveEntries {
         bundles
             .enable_writer(seed, bundle, self.writer.clone(), now)
             .await
+    }
+
+    /// Takes the archive's collection out of the bundle at the service, for an archive the host
+    /// declined to make. The writer and the producer stay: they are the host's own keys, which
+    /// name no archive, and a restore lists archives by their collections.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`BundleStore::fetch`] and [`BundleStore::commit`] return.
+    pub async fn withdraw(
+        &self,
+        bundles: &mut BundleStore,
+        seed: &RecoverySeed,
+        now: TimestampMs,
+    ) -> Result<()> {
+        let mut bundle = bundles.fetch(seed).await?;
+        let named = bundle.collections.len();
+        bundle.collections.retain(|held| held != &self.collection);
+        if bundle.collections.len() == named {
+            return Ok(());
+        }
+        bundles.commit(seed, &mut bundle, now).await.map(|_| ())
     }
 
     /// Whether `bundle` already names the archive, its producer and its writer.
@@ -258,10 +281,12 @@ crate::debug_as_name!(ArchiveEntries, HostCover, HostCovered, Left);
 ///
 /// # Errors
 ///
-/// Returns [`RecoveryError::Service`] when the host cannot be asked, whatever
+/// Returns [`RecoveryError::Service`] when the host cannot be asked or refuses the call, whatever
 /// [`BundleStore::enable_writer`] returns when the bundle cannot be written, and
 /// [`RecoveryError::HostOutcomeUnknown`] when the host's answer to the setup did not come back: a
-/// repeat reads the host's status again and finds the setup if it landed.
+/// repeat reads the host's status again and finds the setup if it landed. A host that declines or
+/// refuses has recorded nothing, and the archive the bundle was made to name is taken out of it
+/// again.
 pub async fn cover_host_archive(
     host: &dyn HostBackups,
     bundles: &mut BundleStore,
@@ -308,9 +333,10 @@ pub async fn cover_host_archive(
         BackupSetupState::Committed {
             archive_id,
             kit_fingerprint,
+            recovery_public_key,
             unusable,
             ..
-        } if *kit_fingerprint == ours => {
+        } if *recovery_public_key == recipient => {
             if let Some(why) = unusable.0
                 && !replace
             {
@@ -318,7 +344,11 @@ pub async fn cover_host_archive(
             }
             if unusable.0.is_none() {
                 // Set up under this computer's recovery already. The bundle is made to name it if
-                // it does not, and the host is sent nothing.
+                // it does not, and the host is sent nothing. Writing the bundle needs the host's
+                // sign-in as a setup does, and a host that has none is left as it is.
+                if status.sign_in != BackupSignIn::Usable {
+                    return Ok(HostCover::Left(Left::SignIn(status.sign_in)));
+                }
                 let entries = entries(*archive_id);
                 let mut bundle = bundles.fetch(seed).await?;
                 if !entries.carried_by(&bundle) {
@@ -394,14 +424,28 @@ pub async fn cover_host_archive(
         Ok(BackupEnableResult::Enabled { .. }) => Err(RecoveryError::HostOutcomeUnknown {
             retry_after_seconds: None,
         }),
-        Ok(BackupEnableResult::Declined { cause }) => Ok(HostCover::Left(Left::Declined(cause))),
+        // A decline says that nothing was recorded, so the bundle must not go on naming an archive
+        // the host never made: a restore would list it, and ask which archive to open. Taking it
+        // out is one more write, and if it cannot be made the entry stays and the decline is
+        // reported all the same.
+        Ok(BackupEnableResult::Declined { cause }) => {
+            let _ = entries.withdraw(bundles, seed, now).await;
+            Ok(HostCover::Left(Left::Declined(cause)))
+        }
+        // The host may have carried the setup out, so the entry stays: the repeat finds the setup
+        // by its status, or the host never made it and the entry is the one left to take out.
         Ok(BackupEnableResult::Unknown {
             retry_after_seconds,
         }) => Err(RecoveryError::HostOutcomeUnknown {
             retry_after_seconds: retry_after_seconds.0.map(|seconds| seconds.get()),
         }),
-        Err(_) => Err(RecoveryError::HostOutcomeUnknown {
+        Err(error) if is_a_lost_answer(&error) => Err(RecoveryError::HostOutcomeUnknown {
             retry_after_seconds: None,
         }),
+        // The host refused the call itself, in its own words, before it did anything.
+        Err(error) => {
+            let _ = entries.withdraw(bundles, seed, now).await;
+            Err(RecoveryError::Service(error))
+        }
     }
 }

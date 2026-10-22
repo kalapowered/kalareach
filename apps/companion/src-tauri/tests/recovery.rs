@@ -482,6 +482,11 @@ impl HostBackups for Host {
 }
 
 /// How many writes of the bundle reached the service, whether or not it acted on them.
+/// A recovery recipient's public key that is not this computer's.
+fn another_recipient() -> kr_protocol::scalars::StoredEnvelopeKey {
+    *StoredEnvelopeKeyPair::generate().expect("a key").public()
+}
+
 fn writes_sent(computer: &Computer) -> usize {
     computer
         .served
@@ -804,6 +809,14 @@ async fn a_host_that_cannot_be_covered_as_it_stands_is_left_alone_and_nothing_is
     assert_eq!(writes_sent(&computer), 0);
 
     page.call("recovery_turn_on", json!({})).expect("on");
+    let out = tempfile::tempdir().expect("a directory");
+    let (_, kit) = page.kit(out.path());
+    let recipient = *RecoverySeed::from_kit(&kit)
+        .expect("the kit's seed")
+        .recipient()
+        .expect("a recipient")
+        .public();
+    let ours = kr_client::recovery::kit_fingerprint(&recipient);
     let before = writes_sent(&computer);
     let left = |why: LeftView| HostCoverView::Left { why };
 
@@ -855,6 +868,49 @@ async fn a_host_that_cannot_be_covered_as_it_stands_is_left_alone_and_nothing_is
             },
         ),
         (
+            "set up under this computer's recovery, with a sign-in that is not renewed",
+            Box::new({
+                let ours = ours.clone();
+                move |host| {
+                    host.with_setup(BackupSetupState::Committed {
+                        archive_id: kr_protocol::ids::ArchiveId::new(
+                            kr_protocol::scalars::Uuid::from_bytes([8; 16]),
+                        ),
+                        kit_fingerprint: ours.clone(),
+                        recovery_public_key: recipient,
+                        enabled_at_ms: TimestampMs::new(1),
+                        unusable: kr_protocol::scalars::Nullable::null(),
+                    });
+                    host.status.lock().expect("status").sign_in = BackupSignIn::NotRenewed;
+                }
+            }),
+            LeftView::SignIn {
+                sign_in: BackupSignIn::NotRenewed,
+            },
+        ),
+        (
+            // A fingerprint is 40 bits of the recipient's key and tells a kit from another by
+            // eye; the key decides.
+            "another recipient under this computer's fingerprint",
+            Box::new({
+                let ours = ours.clone();
+                move |host| {
+                    host.with_setup(BackupSetupState::Committed {
+                        archive_id: kr_protocol::ids::ArchiveId::new(
+                            kr_protocol::scalars::Uuid::from_bytes([7; 16]),
+                        ),
+                        kit_fingerprint: ours.clone(),
+                        recovery_public_key: another_recipient(),
+                        enabled_at_ms: TimestampMs::new(1),
+                        unusable: kr_protocol::scalars::Nullable::null(),
+                    });
+                }
+            }),
+            LeftView::OtherKit {
+                host_fingerprint: ours.clone(),
+            },
+        ),
+        (
             "another kit",
             Box::new(|host| {
                 host.with_setup(BackupSetupState::Committed {
@@ -862,6 +918,7 @@ async fn a_host_that_cannot_be_covered_as_it_stands_is_left_alone_and_nothing_is
                         kr_protocol::scalars::Uuid::from_bytes([9; 16]),
                     ),
                     kit_fingerprint: "CCCC-DDDD".to_owned(),
+                    recovery_public_key: another_recipient(),
                     enabled_at_ms: TimestampMs::new(1),
                     unusable: kr_protocol::scalars::Nullable::null(),
                 });
@@ -900,6 +957,7 @@ async fn a_host_that_cannot_be_covered_as_it_stands_is_left_alone_and_nothing_is
     host.with_setup(BackupSetupState::Committed {
         archive_id: earlier,
         kit_fingerprint: "CCCC-DDDD".to_owned(),
+        recovery_public_key: another_recipient(),
         enabled_at_ms: TimestampMs::new(1),
         unusable: kr_protocol::scalars::Nullable::null(),
     });
@@ -917,7 +975,13 @@ async fn a_host_that_cannot_be_covered_as_it_stands_is_left_alone_and_nothing_is
     assert!(sent[0].0.replace);
     assert_ne!(sent[0].0.archive_id, earlier, "a new archive");
 
-    // A host that declines after the bundle is written is left as it is, and nothing is declared.
+    // A host that declines after the bundle is written is left as it is, nothing is declared, and
+    // the bundle goes back to naming the archives it named: a restore would list an archive the
+    // host never made, and ask which to open.
+    let archives_named = read_with_only_the_kit(&computer.served, &kit)
+        .await
+        .collections
+        .len();
     let host = Host::new(&computer, computer.served.origin());
     *host.answer.lock().expect("answer") = Some(BackupEnableResult::Declined {
         cause: kr_protocol::backup_setup::BackupEnableCause::BundleConflict {},
@@ -933,6 +997,15 @@ async fn a_host_that_cannot_be_covered_as_it_stands_is_left_alone_and_nothing_is
             why: LeftView::Declined { .. }
         }
     ));
+    assert_eq!(host.setups_sent().len(), 1, "the host was asked");
+    assert_eq!(
+        read_with_only_the_kit(&computer.served, &kit)
+            .await
+            .collections
+            .len(),
+        archives_named,
+        "no archive the host declined to make is named"
+    );
 }
 
 /// KR-REQ-20.15: a write of the bundle whose answer is lost declares nothing and keeps the host

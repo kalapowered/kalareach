@@ -4553,9 +4553,12 @@ async fn the_owners_setup_writes_the_bundle_then_enrols_the_writer_and_the_host_
             .contains(&(archive_id(), rig.writer.key_id()))
     );
     let after = rig.backup_status().await;
+    // The status names the recipient the setup was made with, by its key and not only by the
+    // fingerprint of it, so a caller can tell one recovery from another.
     assert!(matches!(
         after.setup,
-        BackupSetupState::Committed { unusable, .. } if unusable.0.is_none()
+        BackupSetupState::Committed { unusable, recovery_public_key, .. }
+            if unusable.0.is_none() && recovery_public_key == made.params.recovery_public_key
     ));
     let (_, detail) = rig.production_check().await;
     assert!(detail.contains(&made.kit_fingerprint), "{detail}");

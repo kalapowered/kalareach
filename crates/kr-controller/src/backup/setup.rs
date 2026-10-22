@@ -277,6 +277,7 @@ impl BackupSetup {
             BackupSetupState::Committed {
                 archive_id: record.archive_id,
                 kit_fingerprint: record.kit_fingerprint.clone(),
+                recovery_public_key: record.recovery_public_key,
                 enabled_at_ms: record.enabled_at_ms,
                 unusable: Nullable::from(standing(
                     record,

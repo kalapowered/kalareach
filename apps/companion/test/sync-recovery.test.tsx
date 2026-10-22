@@ -257,6 +257,24 @@ describe('recovery', () => {
     })
   })
 
+  it('says why a host declined to be set up under this recovery, and that its backups were not changed', async () => {
+    const { person, controls, sheet } = await openSheet()
+    act(() => {
+      controls.recovery.set({ state: 'on', kept_at: 'reach.kala.to' })
+      controls.account.set(SIGNED_IN)
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    controls.recovery.coverHostAnswers({
+      state: 'left',
+      why: { reason: 'declined', cause: { kind: 'no_allowance' } }
+    })
+    await person.click(await within(recovery).findByTestId('recovery-cover-host'))
+    const said = await within(recovery).findByTestId('recovery-host')
+    expect(said).toHaveAttribute('data-state', 'left')
+    expect(said).toHaveTextContent('no allowance for backup storage')
+    expect(said).toHaveTextContent('backups were not changed')
+  })
+
   it('draws the kit as a QR code and makes offline copies of the bundle and an archive, each where the dialog put it', async () => {
     const { person, controls, sheet, port } = await openSheet()
     act(() => {
