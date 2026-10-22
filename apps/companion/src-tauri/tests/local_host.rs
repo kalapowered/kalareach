@@ -219,6 +219,7 @@ impl Host {
                 companion_tauri::commands::review_acknowledge,
                 companion_tauri::commands::changeset_read,
                 companion_tauri::commands::device_list,
+                companion_tauri::commands::privacy_status,
                 companion_tauri::commands::grant_list,
                 companion_tauri::commands::grant_create,
                 companion_tauri::commands::plugin_list,
@@ -516,6 +517,20 @@ async fn the_connected_host_is_asked_which_devices_it_lists() {
         asked.lists[0].devices.is_empty(),
         "nothing is paired with a new host: {asked:?}"
     );
+}
+
+/// KR-REQ-24.29: the page reads what privacy mode reports from the host: whether it is on and the
+/// copies that have left the host, which it shows and does not erase. A new host has sent nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn what_privacy_mode_reports_is_read_from_the_host() {
+    let host = Host::start().await;
+    let report: kr_protocol::privacy::PrivacyReport = typed(
+        host.call("privacy_status", json!({ "params": {} }))
+            .await
+            .expect("the report"),
+    );
+    assert!(!report.enabled);
+    assert!(report.exported.is_empty(), "{report:?}");
 }
 
 /// KR-REQ-25.08: the devices an invitation can go to and the grants issued are read on the host,

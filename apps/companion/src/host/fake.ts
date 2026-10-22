@@ -29,6 +29,7 @@ import type {
   EnvironmentListResult,
   HostInfoResult,
   PresentationReason,
+  PrivacyReport,
   Receipt,
   SessionCreateParams,
   SessionCreateResult,
@@ -46,7 +47,7 @@ import type {
   VoiceStopResult
 } from '@kalareach/protocol'
 
-import type { LaunchSurface, RetainedArtefacts, ShellKind } from '../model/pending'
+import type { LaunchSurface, ShellKind } from '../model/pending'
 import type { AccountView, UsageView } from '../model/account'
 import type {
   ApprovedLink,
@@ -104,12 +105,7 @@ import { MAX_HANDED_BYTES, receivedConnection, viewMoveArguments, viewSizeArgume
 import { codeComplete } from '../pairing/words'
 import { openedMode } from '../theme-init'
 import { scriptedHostDrafts, type BindParams, type FakeHostDrafts } from './fake-host-drafts'
-import {
-  AGENT_DRAFT_ADD_ATTACHMENT_PARAMS,
-  DRAFT_CREATE_PARAMS,
-  decodeParams,
-  STORAGE_OBJECT_DELETE_PARAMS
-} from './fake-decode'
+import { AGENT_DRAFT_ADD_ATTACHMENT_PARAMS, DRAFT_CREATE_PARAMS, decodeParams } from './fake-decode'
 import { FakeDraftStore } from './fake-drafts'
 import { EVERY_RIGHT, ScriptedRecords } from './fake-state'
 import { ScriptedQuestions, type FakeQuestions } from './fake-questions'
@@ -223,21 +219,6 @@ let actionCounter = 0
 
 /** The action identifiers this host has issued, so a test can name one in a later receipt. */
 const issuedActions: string[] = []
-
-/**
- * One settled answer whose receipt and identity agree.
- *
- * Every mutation answers with the action it is about, because that identity is what the interface
- * matches a later receipt against.
- */
-function settledAs(method: string, state: Receipt['state']): {
-  receipt: Receipt
-  value: null
-  action_id: string
-} {
-  const actionId = nextActionId()
-  return { receipt: receipt(actionId, state, method), value: null, action_id: actionId }
-}
 
 /** The bounded thumbnail the host makes of an image: here a one-pixel PNG, as unpadded base64url. */
 const ONE_PIXEL_PREVIEW: AttachmentHandle['preview'] = {
@@ -836,7 +817,7 @@ export type HeldRead =
   | 'hostInfo'
   | 'environmentList'
   | 'changesetRead'
-  | 'storageStatus'
+  | 'privacyStatus'
   | 'pluginList'
   | 'catalogueList'
   | 'deviceList'
@@ -1056,7 +1037,6 @@ export function fakeHost(
   } = { presentation: 'viewport', reason: 'unqualified_terminal_profile' }
   let terminalWheel: TerminalWheel = 'reaches'
   let holdingTerminalControl = false
-  const deletedArtefacts = new Set<string>()
   const openedPanes: string[] = []
   let capabilityRevision = 4
   // The checks ran a while ago, in a session, and nothing has ended what they found.
@@ -2070,25 +2050,10 @@ export function fakeHost(
         return records.changesetRead(params)
       }),
 
-    storageStatus: () =>
-      reading('storageStatus', () => {
+    privacyStatus: () =>
+      reading('privacyStatus', () => {
         requireConnection()
-        return retained(deletedArtefacts)
-      }),
-    // Read as the request's own type is read, and answered as a rejection: a request that is not the
-    // artefact's identifier alone is refused by name, and nothing is deleted by it.
-    storageObjectDelete: (params) =>
-      Promise.resolve().then(() => {
-        const { object_id: id } = decodeParams<{ object_id: string }>(params, STORAGE_OBJECT_DELETE_PARAMS)
-        const artefact = retained(new Set()).artefacts.find((each) => each.object_id === id)
-        if (artefact?.held_by_other_party) {
-          refuse(
-            'PERMISSION_DENIED',
-            'A copy an authorised viewer holds is not reachable from this host.'
-          )
-        }
-        deletedArtefacts.add(id)
-        return settledAs('storage.object.delete', 'applied')
+        return privacyReport()
       }),
 
     // The command the page's port sends, read as native code reads it: its arguments decoded in
@@ -3748,40 +3713,41 @@ function createdSession(
   } as unknown as SessionSummaryOf
 }
 
-function retained(deleted: ReadonlySet<string>): RetainedArtefacts {
-  const artefacts = [
-    {
-      object_id: 'obj-1',
-      kind: 'archive' as const,
-      description: 'Encrypted history archive uploaded before privacy mode',
-      location: 'managed storage',
-      byte_len: 4_812_390,
-      created_at_ms: FAKE_NOW_MS - 172_800_000,
-      held_by_other_party: false
-    },
-    {
-      object_id: 'obj-2',
-      kind: 'notification' as const,
-      description: 'Push notification carrying a turn summary',
-      location: 'push service',
-      byte_len: 812,
-      created_at_ms: FAKE_NOW_MS - 90_000_000,
-      held_by_other_party: false
-    },
-    {
-      object_id: 'obj-3',
-      kind: 'viewer_copy' as const,
-      description: 'A copy an authorised viewer downloaded',
-      location: "that viewer's device",
-      byte_len: 22_118,
-      created_at_ms: FAKE_NOW_MS - 260_000_000,
-      held_by_other_party: true
-    }
-  ]
+/**
+ * What privacy mode reports once it has been on for three generations: an archive and a
+ * notification the host sent before then, a device that may hold a copy, and a subsystem that could
+ * not be listed. The host offers no way to ask for the removal of any of them.
+ */
+function privacyReport(): PrivacyReport {
   return {
-    privacy_mode: true,
-    privacy_generation: '3',
-    artefacts: artefacts.filter((artefact) => !deleted.has(artefact.object_id))
+    generation: '3',
+    enabled: true,
+    changed_at_ms: String(FAKE_NOW_MS - 86_400_000),
+    completion: { state: 'complete' },
+    sessions: [],
+    disabled: [],
+    kept: [],
+    exported: [
+      {
+        kind: 'backup archive',
+        reference: 'archive 4c1f0b5e generation 12',
+        left_at_ms: String(FAKE_NOW_MS - 172_800_000),
+        deletable: false
+      },
+      {
+        kind: 'notification',
+        reference: 'a turn summary, delivered through the push service',
+        left_at_ms: String(FAKE_NOW_MS - 90_000_000),
+        deletable: false
+      },
+      {
+        kind: "possible copy held by a viewer's device",
+        reference: 'device 0d5e1a7c-31aa-4f09-9c47-5f7a7d3f6a10',
+        left_at_ms: String(FAKE_NOW_MS - 260_000_000),
+        deletable: false
+      }
+    ],
+    unlisted: [{ subsystem: 'descriptions', reason: 'the description store could not be read' }]
   }
 }
 

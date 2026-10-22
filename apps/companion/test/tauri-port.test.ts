@@ -238,6 +238,7 @@ describe('the desktop port and the published methods', () => {
     await port.reviewRead({ session_id: null, subject: null, max_reviews: '200', after: null })
     await port.reviewAcknowledge(review)
     await port.deviceList({ include_revoked: false })
+    await port.privacyStatus()
     await port.grantNotices(selection)
     await port.grantCreate(grant, { sessionId: SESSION })
     await port.grantList({ session_id: SESSION, include_resolved: false })
@@ -265,6 +266,7 @@ describe('the desktop port and the published methods', () => {
       'review_read',
       'review_acknowledge',
       'device_list',
+      'privacy_status',
       'grant_notices',
       'grant_create',
       'grant_list',
@@ -291,8 +293,8 @@ describe('the desktop port and the published methods', () => {
       subject: {}
     })
     expect(shell.invoked[3]?.args).toEqual({ params: review, subject: {} })
-    expect(shell.invoked[5]?.args).toEqual({ selection })
-    expect(shell.invoked[6]?.args).toEqual({ params: grant, subject: { sessionId: SESSION } })
+    expect(shell.invoked[6]?.args).toEqual({ selection })
+    expect(shell.invoked[7]?.args).toEqual({ params: grant, subject: { sessionId: SESSION } })
     // A hand-over names its session and the references it is later asked about by; an attempt is
     // named by its action alone, and nothing here names a method.
     const named = (command: string) => shell.invoked.find((each) => each.command === command)?.args
