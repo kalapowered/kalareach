@@ -17360,6 +17360,7 @@ export interface HostDoctorResult {
    * read, word for word.
    */
   launch_probes: LaunchProbeReport[]
+  metrics?: Report
 }
 /**
  * One diagnostic check.
@@ -17589,6 +17590,109 @@ export interface LaunchProbeReport {
    * Its installed release.
    */
   version: string
+}
+/**
+ * What this host has measured about itself: how long its paired devices were without a
+ * connection, the faults its terminals' parsers met and the failures of its adapters.
+ *
+ * Local diagnostics, counted in memory from this daemon's start and sent nowhere. Every label
+ * is one of this build's own words, so the report carries no terminal content, key, prompt or
+ * filename and a support bundle takes it as it is.
+ */
+export interface Report {
+  /**
+   * Every adapter.failure series, in a fixed order.
+   */
+  adapter_failure?: AdapterFailure[]
+  /**
+   * Every reconnect.time series, in a fixed order.
+   */
+  reconnect_time?: ReconnectTime[]
+  /**
+   * Every terminal.parse_fault series, in a fixed order.
+   */
+  terminal_parse_fault?: ParseFault[]
+}
+/**
+ * One adapter.failure series.
+ */
+export interface AdapterFailure {
+  /**
+   * The adapter.
+   */
+  adapter:
+    | 'claude-code'
+    | 'codex'
+    | 'gemini-cli'
+    | 'kimi-cli'
+    | 'kimi-code-cli'
+    | 'opencode'
+    | 'opencode-attach'
+    | 'qoder-cli'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  count: string
+  /**
+   * Which environment measured it.
+   */
+  environment: 'development' | 'staging' | 'production'
+  /**
+   * How it ended.
+   */
+  outcome: 'ok' | 'refused' | 'timeout' | 'unavailable' | 'exhausted' | 'invalid'
+}
+/**
+ * One reconnect.time series: how long a paired device was without a connection, counted under the
+ * labels that say how the connection that ended the gap reached the host and how it ended.
+ */
+export interface ReconnectTime {
+  /**
+   * Which attempt, among the connections the host saw from the device since its last one ended,
+   * is the one reported.
+   */
+  attempt: '1' | '2-3' | '4-8' | '9+'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  count: string
+  /**
+   * Which environment measured it.
+   */
+  environment: 'development' | 'staging' | 'production'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  longest_ms: string
+  /**
+   * How that attempt ended.
+   */
+  outcome: 'ok' | 'refused' | 'timeout' | 'unavailable' | 'exhausted' | 'invalid'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  total_ms: string
+  /**
+   * How the connection that ended the gap reached the host.
+   */
+  transport: 'direct' | 'relay' | 'local'
+}
+/**
+ * One terminal.parse_fault series.
+ */
+export interface ParseFault {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  count: string
+  /**
+   * Which environment measured it.
+   */
+  environment: 'development' | 'staging' | 'production'
+  /**
+   * The class of fault.
+   */
+  fault: 'unterminated_sequence' | 'invalid_encoding' | 'oversized_frame' | 'unknown_control'
 }
 /**
  * The result of `host.info`.
@@ -29611,6 +29715,7 @@ export interface HostDoctorResult1 {
    * read, word for word.
    */
   launch_probes: LaunchProbeReport[]
+  metrics?: Report
 }
 /**
  * One error a support bundle carries, already redacted.
