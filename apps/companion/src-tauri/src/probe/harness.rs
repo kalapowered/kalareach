@@ -228,7 +228,11 @@ fn attempt(device: &crate::device::Device) -> (String, String) {
 
 /// Pairs with the host the invitation names. False when no pairing is made and the call cannot go
 /// on.
-async fn pair<R: Runtime>(app: &AppHandle<R>, invitation: &str, checks: &mut Checks<'_>) -> bool {
+pub(super) async fn pair<R: Runtime>(
+    app: &AppHandle<R>,
+    invitation: &str,
+    checks: &mut Checks<'_>,
+) -> bool {
     let state = app.state::<AppState>();
     let device = match state.device() {
         Ok(device) => device,
@@ -271,7 +275,7 @@ async fn pair<R: Runtime>(app: &AppHandle<R>, invitation: &str, checks: &mut Che
 }
 
 /// Waits for the connection to the paired host.
-async fn connect<R: Runtime>(app: &AppHandle<R>, checks: &mut Checks<'_>) -> bool {
+pub(super) async fn connect<R: Runtime>(app: &AppHandle<R>, checks: &mut Checks<'_>) -> bool {
     let connected = until(CONNECT_WITHIN, || async {
         app.state::<AppState>()
             .connection_state()

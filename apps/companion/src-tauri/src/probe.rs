@@ -59,6 +59,8 @@ impl Check {
 
 mod answer;
 pub mod harness;
+#[cfg(mobile)]
+pub mod notifications;
 
 pub use answer::answer_for;
 
