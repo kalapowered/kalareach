@@ -1091,7 +1091,7 @@ pub fn table() -> Vec<Store> {
             entry: entry(
                 "policy-mirror",
                 StoreScope::Environment,
-                "policy-mirror.json",
+                "policy-mirror.cbor",
                 cbor_member("version", 0),
                 kr_controller::grants::mirror::RECORD_VERSION,
                 kr_controller::grants::mirror::RECORD_VERSION,

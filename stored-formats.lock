@@ -398,7 +398,7 @@
       "entry": {
         "store": "policy-mirror",
         "scope": "environment",
-        "path": "policy-mirror.json",
+        "path": "policy-mirror.cbor",
         "recording": {
           "kind": "cbor_member",
           "member": "version",
