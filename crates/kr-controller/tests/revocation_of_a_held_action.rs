@@ -12,6 +12,12 @@
 //! while the worker goes on answering the daemon over the connections the daemon holds. That is a
 //! worker paused after durable acceptance with its control path live, which is what lets the
 //! revocation's barrier be reached while the intent is held.
+//!
+//! What this suite does not show is the daemon's own report of the barrier, which the cases in
+//! `barrier.rs` show. The daemon does not hold the worker here, so the test speaks to the worker as
+//! its daemon does, over connections of its own: it forwards the action and announces the revision.
+//!
+//! Not claimed: Windows, where a plugin host cannot be held with a stop signal.
 
 #![cfg(unix)]
 
@@ -25,6 +31,10 @@ mod plugin_world;
 use plugin_world::acting::{
     Acting, a_lease, a_paired_device, announce, signal, until_the_devices_receipt_is,
 };
+
+/// How far off the deadlines of the action and of its lease are: the case shows a revocation, so it
+/// must never reach an expiry first.
+const FAR_OFF_MS: u64 = 10 * 60 * 1000;
 
 /// A paired device's action, forwarded by the daemon and accepted by the worker, held while its
 /// component prepares it.
@@ -70,12 +80,12 @@ impl HeldDeviceAction {
                         .into_iter()
                         .collect(),
                     accepted_deadline_boot_ms: kr_protocol::scalars::U64::new(
-                        kr_ipc::clock::boot_elapsed_ms() + 60_000,
+                        kr_ipc::clock::boot_elapsed_ms() + FAR_OFF_MS,
                     ),
                     history: None,
                     screen_basis: None,
                     workflow_run_id: None,
-                    lease: Some(a_lease(&acting, 1, 60_000)),
+                    lease: Some(a_lease(&acting, 1, FAR_OFF_MS)),
                 },
             )))
             .await
