@@ -1834,6 +1834,11 @@ fn a_session_made_with_no_shell_mode_takes_the_hosts_default_in_the_order_sectio
 fn kr_host_shell_mode_chooses_and_clears_the_default_for_new_sessions() {
     let host = Standalone::create();
     host.select_standalone();
+    // The command asks the running daemon what is in force, so one is started the way a person's
+    // first `kr new` starts it.
+    let output = start(host.new_session()).finish("kr new");
+    let created = document(&output, "kr new");
+    assert!(output.status.success(), "{created}");
     let shell_mode = |arguments: &[&str]| {
         let mut command = vec!["--json", "host", "shell-mode"];
         command.extend_from_slice(arguments);
@@ -1877,6 +1882,7 @@ fn kr_host_shell_mode_chooses_and_clears_the_default_for_new_sessions() {
     let refused = document(&output, "kr host shell-mode");
     assert!(!output.status.success(), "{refused}");
     assert_eq!(refused["code"], "INVALID_ARGUMENT", "{refused}");
+    host.close(&created);
 }
 
 /// KR-REQ-08.02: `kr status` reports each terminal attachment's presentation and the reason for it.
@@ -3779,7 +3785,7 @@ impl Inside {
                 "#!/bin/sh\n\
                  {gate}\
                  ( env -i {environment}'{kr}' new --invisible --headless --cwd '{cwd}' \
-                 --shell /bin/sh --startup interactive \
+                 --shell /bin/sh --shell-mode native_compat --startup interactive \
                  < /dev/null > '{said}.out' 2> '{said}.err'; \
                  echo $? > '{said}.tmp' && mv '{said}.tmp' '{said}.status' ) &\n\
                  {waiting}\

@@ -467,7 +467,7 @@ impl Host {
             self,
             &format!(
                 "env 'PS1={PROMPT}' {} new --attach --headless --shell /bin/sh \
-                 --startup interactive --cwd {}; printf '\\nnew-%s-%s\\n' finished \"$?\"; {then}",
+                 --shell-mode native_compat --startup interactive --cwd {}; printf '\\nnew-%s-%s\\n' finished \"$?\"; {then}",
                 quoted(&kr()),
                 quoted(&self.work)
             ),
