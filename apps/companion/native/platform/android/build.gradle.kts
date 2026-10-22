@@ -39,8 +39,10 @@ dependencies {
     // own version.
     implementation("androidx.activity:activity:1.10.1")
     implementation("androidx.browser:browser:1.9.0")
-    // The camera behind the scanner that reads a pairing code. The library with the native code is
-    // pinned by version here and by bytes in the application's build.
+    // The camera behind the scanner that reads a pairing code. The application's Kotlin is 1.9, which
+    // reads library metadata up to 2.0, and CameraX 1.5 and later carry 2.1: this is the newest of
+    // the line that fits. The library with the native code is pinned by version here and by bytes in
+    // the application's build.
     implementation("androidx.camera:camera-core") { version { strictly("1.4.2") } }
     implementation("androidx.camera:camera-camera2:1.4.2")
     implementation("androidx.camera:camera-lifecycle:1.4.2")

@@ -49,5 +49,9 @@ object QrDecoder {
             null
         } catch (_: com.google.zxing.FormatException) {
             null
+        } catch (_: RuntimeException) {
+            // A frame the detector cannot make sense of is a frame with no code, and the next one is
+            // read: a camera frame must never end the process.
+            null
         }
 }

@@ -21,7 +21,9 @@
       chooser opens. It is asked for when the first of them is used.
     -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Declaring the camera permission makes the store read both of these as required. -->
     <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
 
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
