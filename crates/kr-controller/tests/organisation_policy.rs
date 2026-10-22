@@ -1071,8 +1071,14 @@ async fn a_failed_write_keeps_the_chain_and_the_policy_answered_for(earlier: Opt
         .expect("the earlier policy applies under the key in force");
         assert_eq!(applied_policies(&fixture).len(), 1);
     }
-    // What the host answered for before the request, as `organisation.list` says it.
+    // What the host answered for before the request, as `organisation.list` says it, and the list
+    // the catalogue admits under.
     let before = fixture.listed().await;
+    let in_force_before = list_in_force(&fixture).await;
+    assert_eq!(
+        in_force_before,
+        earlier.map_or_else(Nullable::null, allowed)
+    );
     assert_eq!(
         before.enrolments[0].organisation_policy_revision,
         earlier.map_or_else(Nullable::null, |_| Nullable::some(
@@ -1122,6 +1128,11 @@ async fn a_failed_write_keeps_the_chain_and_the_policy_answered_for(earlier: Opt
         listed.effective_adapter_allowlist, before.effective_adapter_allowlist,
         "and so is the list it states"
     );
+    assert_eq!(
+        listed.adapter_allowlist_in_force, in_force_before,
+        "and the catalogue keeps the list it admitted under"
+    );
+    assert!(is_admitted(&admission(&fixture).await));
 
     // The same policy with no chain beside it, and with the chain the host holds now, cannot be
     // written either, and neither says that a chain is recorded: none advanced.

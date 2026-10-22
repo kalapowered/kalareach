@@ -860,7 +860,9 @@ the pending decision visible.
 `fixtures/cbor/`, `fixtures/protocol/`, `fixtures/relay/`, `fixtures/accounts/`, `fixtures/service/`
 and `fixtures/push/` hold the vectors
 both languages run against. The Rust
-tests read them from `crates/*/tests/`, and the vitest suites read the same files.
+tests read them from `crates/*/tests/`, and the vitest suites read the same files. One file,
+`fixtures/accounts/rotated-policy.json`, is a record captured from the managed service's own signing
+code across a rotation of an organisation's policy-signing key, which only the daemon's test reads.
 
 Values use a small tagged grammar, so a fixture can express a byte string, a 64-bit integer and a
 deliberately unsorted map, none of which plain JSON can carry:

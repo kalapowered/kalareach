@@ -118,7 +118,7 @@ fn policy_refusal(refused: PolicyRefused) -> ControllerError {
 /// The policy the host answered for before the request stays in force in every case. The chain is
 /// said to be recorded only when the request's chain advanced the host's, and the file is said to
 /// hold the new policy only when it does: a write that failed after the rename leaves the new record
-/// in place, and a restart before the same policy is accepted then applies it.
+/// in place, and a restart before the same policy is accepted may then apply it.
 fn unwritten_policy(chain_recorded: bool, file_holds_it: bool, error: &ControllerError) -> String {
     let chain = if chain_recorded {
         ", and the newer chain the request carried is recorded"
@@ -127,7 +127,7 @@ fn unwritten_policy(chain_recorded: bool, file_holds_it: bool, error: &Controlle
     };
     let file = if file_holds_it {
         "; the new policy is already in its file, so a restart before the same policy is accepted \
-         applies it"
+         may apply it"
     } else {
         ""
     };

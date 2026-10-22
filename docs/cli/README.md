@@ -1951,7 +1951,8 @@ and the adapters it allows, or that none is applied. It shows the devices bound 
 of that organisation, and the lease last recorded for each. After the organisations, it shows the
 adapters their policies allow together and the adapters the host admits now. The two lists are the
 same once the host has put the first in force, and they differ while a change waits for a
-synchronisation that holds the catalogue, which the output then says. It also shows whether the host is exclusively
+synchronisation that holds the catalogue or for the admission revision to be written, which the
+output then says. It also shows whether the host is exclusively
 organisation-managed, and whether it trusts its clock. It shows each time exclusive management was
 turned off. It prints the device identifier, authorisation key and key identifier that a lease for the host's
 own local owner is signed for, and names each session whose worker cannot be told what that owner may do. A
