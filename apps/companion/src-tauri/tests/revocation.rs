@@ -2456,11 +2456,11 @@ async fn the_owner_at_the_machine_revokes_the_paired_device(rig: &Rig) {
     .expect("the owner at the machine revokes the device");
 }
 
-/// The host's rights ceiling is narrowed by one right in its configuration document, which the host
-/// puts in force as it does an edit made at its machine. The right left out is one these cases do
-/// not use: nobody loses anything, but a ceiling that moves is a revision of the whole host, which
-/// the revocation of one device is not. The host withdraws every connection it admitted before it,
-/// this computer's among them. Each call leaves out the last right the ceiling still names.
+/// The host's rights ceiling is narrowed in its configuration document by the right to use voice,
+/// which no case here uses, and the host puts the document in force as it does an edit made at its
+/// machine. Nobody loses anything, but a ceiling that moves is a revision of the whole host, which
+/// the revocation of one device is not: the host withdraws every connection it admitted before it,
+/// this computer's among them. A host's ceiling is narrowed so once.
 async fn the_host_narrows_its_rights_ceiling(rig: &Rig) {
     let path = kr_worker::config::document_path(&rig.host.tree().environment());
     let mut document = kr_protocol::hostinfo::configuration::load(Some(
@@ -2474,7 +2474,12 @@ async fn the_host_narrows_its_rights_ceiling(rig: &Rig) {
             .map(|right| right.as_str().to_owned())
             .collect()
     });
-    ceiling.pop();
+    let voice = ActionRight::VoiceUse.as_str();
+    assert!(
+        ceiling.iter().any(|right| right == voice),
+        "the ceiling still names the right it leaves out: {ceiling:?}"
+    );
+    ceiling.retain(|right| right != voice);
     document.revision += 1;
     document.ceilings.grant_rights = Nullable::some(ceiling);
     kr_ipc::paths::write_owner_only_file(
