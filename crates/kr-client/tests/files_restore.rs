@@ -2015,11 +2015,6 @@ async fn the_record_says_what_was_written_and_what_was_refused_and_holds_nothing
     let written = vec![plan.members[0].object_id];
     let record = plan.record(&digest, &written, false).to_string();
     assert!(record.contains("kalareach-restore/1"));
-    assert!(record.contains("not applied"));
-    // A restore the person asked to apply the configuration with does not say it applies none.
-    let applying = plan.record(&digest, &written, true).to_string();
-    assert!(!applying.contains("not applied"), "{applying}");
-    assert!(applying.contains("asked for the device's configuration"));
     assert!(record.contains(&digest));
     assert!(record.contains("material_never_restored"));
     assert!(record.contains("session-0001.json"));

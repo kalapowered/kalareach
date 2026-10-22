@@ -594,7 +594,7 @@ impl Recovery {
         let svg = {
             let _step = self.step().await?;
             let kit = self.kit()?;
-            let payload = qr_payload(&kit).map_err(said_of)?;
+            let payload = qr_payload(&kit).map_err(said)?;
             let code = qrcodegen::QrCode::encode_binary(&payload, qrcodegen::QrCodeEcc::Quartile)
                 .map_err(|_| {
                 CommandError::local_failure("the recovery kit is too large to print as a QR code")
@@ -689,7 +689,7 @@ impl Recovery {
                     )
                 }
             };
-            let bytes = export.to_canonical_bytes().map_err(said_of)?;
+            let bytes = export.to_canonical_bytes().map_err(said)?;
             (
                 bytes,
                 archive.map(|archive| archive.to_string()),
@@ -951,11 +951,6 @@ fn said(error: RecoveryError) -> CommandError {
     }
 }
 
-/// What a recovery failure that is not the service's is to the person.
-fn said_of(error: RecoveryError) -> CommandError {
-    said(error)
-}
-
 /// What a restore's failure is to the person: the service's own when it was the service, and words
 /// of this program's otherwise.
 fn said_by_restore(error: RestoreError) -> CommandError {
@@ -977,8 +972,9 @@ const MODULE_TENTHS_OF_A_MILLIMETRE: i32 = 6;
 /// a scanner needs and a physical size to print at.
 ///
 /// The file holds the kit's seed, so it is built once in a buffer sized beforehand, which never
-/// moves while it is written, and the buffer is cleared when it is dropped. The code the encoder
-/// holds (`qrcodegen::QrCode`) is a copy this program cannot clear.
+/// moves while it is written, and the buffer is cleared when it is dropped. The copies the encoder
+/// makes (the bit buffer and codewords it builds from the kit's text, and the `qrcodegen::QrCode`
+/// it returns) are ones this program cannot clear, and they are freed without being cleared.
 fn qr_svg(code: &qrcodegen::QrCode) -> Zeroizing<String> {
     use std::fmt::Write as _;
 
