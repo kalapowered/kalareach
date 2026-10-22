@@ -124,6 +124,65 @@ describe('creating a session (KR-REQ-07.21)', () => {
     expect(screen.queryByTestId('shell-mode')).toBeNull()
   })
 
+  it('starts on the shell the host says it creates by default, and says where that came from', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.withDefaultShell('native_compat', 'host_configuration')
+    open(port)
+    const sheet = await startCreating(person)
+
+    // The host's choice in its configuration, not the page's own default, is what the sheet starts on.
+    expect(within(sheet).getByRole('radio', { name: /Stock shell/ })).toBeChecked()
+    expect(within(sheet).getByRole('radio', { name: /Managed shell/ })).not.toBeChecked()
+    expect(within(sheet).getByTestId('shell-difference')).toHaveAttribute('data-chosen', 'native_compat')
+    const said = within(sheet).getByTestId('shell-default')
+    expect(said).toHaveTextContent('This host starts a stock shell unless a session asks for another')
+    expect(said).toHaveTextContent('chosen in its configuration')
+    expect(said).not.toHaveTextContent('for this session only')
+
+    await person.type(within(sheet).getByRole('textbox', { name: 'Directory' }), '/Users/rs/work/notes')
+    await person.click(within(sheet).getByRole('button', { name: 'Create session' }))
+    await waitFor(() => {
+      expect(controls.sessionCreates).toHaveLength(1)
+    })
+    expect(controls.sessionCreates[0]).toEqual(stockCreation('/Users/rs/work/notes'))
+  })
+
+  it('says the managed shell is the product default when the host’s configuration chose nothing', async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    open(port)
+    const sheet = await startCreating(person)
+    expect(within(sheet).getByRole('radio', { name: /Managed shell/ })).toBeChecked()
+    const said = within(sheet).getByTestId('shell-default')
+    expect(said).toHaveTextContent('This host starts the managed shell unless a session asks for another')
+    expect(said).toHaveTextContent('the product default')
+  })
+
+  it('keeps a choice made here to this session, and starts the next opening on the host’s answer again', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.withDefaultShell('native_compat', 'host_configuration')
+    open(port)
+    let sheet = await startCreating(person)
+
+    // The person asks for the managed shell for this session: the host's default stays what it is,
+    // and the sheet says the choice is for this session only.
+    await person.click(within(sheet).getByRole('radio', { name: /Managed shell/ }))
+    expect(within(sheet).getByTestId('shell-default')).toHaveTextContent(
+      'Your choice here is for this session only'
+    )
+    await person.click(within(sheet).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => {
+      expect(screen.queryByTestId('sheet')).toBeNull()
+    })
+
+    sheet = await startCreating(person)
+    expect(within(sheet).getByRole('radio', { name: /Stock shell/ })).toBeChecked()
+    expect(within(sheet).getByTestId('shell-default')).not.toHaveTextContent('for this session only')
+    expect(controls.sessionCreates).toHaveLength(0)
+  })
+
   it('says why the host refused a managed shell, and a stock shell is only ever the person’s choice', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()
