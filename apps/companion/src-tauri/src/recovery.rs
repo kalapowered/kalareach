@@ -60,6 +60,7 @@ use kr_protocol::ids::ArchiveId;
 use kr_protocol::scalars::{AuthorisationKey, Signature64, TimestampMs};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::account::Account;
 use crate::error::{CommandError, Result};
@@ -968,29 +969,56 @@ fn said_by_restore(error: RestoreError) -> CommandError {
     }
 }
 
+/// How wide one module of the printed code is, in tenths of a millimetre. A code of about a hundred
+/// modules is then a little over six centimetres across: a size a phone reads from a page.
+const MODULE_TENTHS_OF_A_MILLIMETRE: i32 = 6;
+
 /// The QR code as an SVG: one path of unit squares, dark on white, with the four-module quiet zone
-/// a scanner needs.
-fn qr_svg(code: &qrcodegen::QrCode) -> String {
+/// a scanner needs and a physical size to print at.
+///
+/// The file holds the kit's seed, so it is built once in a buffer sized beforehand, which never
+/// moves while it is written, and the buffer is cleared when it is dropped. The code the encoder
+/// holds (`qrcodegen::QrCode`) is a copy this program cannot clear.
+fn qr_svg(code: &qrcodegen::QrCode) -> Zeroizing<String> {
+    use std::fmt::Write as _;
+
     const BORDER: i32 = 4;
+    // The longest square is `M185,185h1v1h-1z ` and the rest of the file is well under 400 bytes.
+    const SQUARE: usize = 20;
+    const WRAPPER: usize = 400;
+
     let size = code.size() + BORDER * 2;
-    let mut squares = String::new();
+    let dark = (0..code.size())
+        .flat_map(|y| (0..code.size()).map(move |x| (x, y)))
+        .filter(|(x, y)| code.get_module(*x, *y))
+        .count();
+    let side = size * MODULE_TENTHS_OF_A_MILLIMETRE;
+    let mut svg = Zeroizing::new(String::with_capacity(WRAPPER + dark * SQUARE));
+    let _ = write!(
+        svg,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" viewBox=\"0 0 {size} {size}\" \
+         width=\"{}.{}mm\" height=\"{}.{}mm\" shape-rendering=\"crispEdges\">\
+         <rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/><path d=\"",
+        side / 10,
+        side % 10,
+        side / 10,
+        side % 10
+    );
+    let mut first = true;
     for y in 0..code.size() {
         for x in 0..code.size() {
             if code.get_module(x, y) {
-                if !squares.is_empty() {
-                    squares.push(' ');
+                if !first {
+                    svg.push(' ');
                 }
-                squares.push_str(&format!("M{},{}h1v1h-1z", x + BORDER, y + BORDER));
+                first = false;
+                let _ = write!(svg, "M{},{}h1v1h-1z", x + BORDER, y + BORDER);
             }
         }
     }
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" viewBox=\"0 0 {size} {size}\" \
-         width=\"{size}\" height=\"{size}\" shape-rendering=\"crispEdges\">\
-         <rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>\
-         <path d=\"{squares}\" fill=\"#000000\"/></svg>\n"
-    )
+    svg.push_str("\" fill=\"#000000\"/></svg>\n");
+    svg
 }
 
 /// Writes `body` as the whole of the file the person chose for the kit, readable by this user alone

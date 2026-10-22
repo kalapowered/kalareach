@@ -1103,42 +1103,39 @@ async fn a_write_whose_answer_was_lost_blocks_the_next_until_it_is_settled() {
     assert_eq!(silent.setups_sent().len(), 1, "the host was asked once");
 }
 
-/// The QR code a saved kit draws, read back by a decoder that shares nothing with the encoder: the
-/// squares the file draws are put on a bitmap and the bitmap is scanned.
-fn scanned(svg: &str) -> (rqrr::MetaData, String) {
-    let size: usize = svg
-        .split("viewBox=\"0 0 ")
-        .nth(1)
-        .and_then(|rest| rest.split(' ').next())
-        .and_then(|number| number.parse().ok())
-        .expect("a view box");
-    let path = svg
-        .split("<path d=\"")
-        .nth(1)
-        .and_then(|rest| rest.split('"').next())
-        .expect("a path");
-    let mut dark = vec![false; size * size];
-    for square in path.split(' ') {
-        let (x, y) = square
-            .strip_prefix('M')
-            .and_then(|rest| rest.strip_suffix("h1v1h-1z"))
-            .and_then(|at| at.split_once(','))
-            .expect("a unit square");
-        dark[y.parse::<usize>().expect("a row") * size + x.parse::<usize>().expect("a column")] =
-            true;
-    }
-    let scale = 8;
+/// The QR code a saved kit draws, as a viewer shows it and a scanner reads it: the whole file is
+/// rendered by an SVG renderer, and a QR decoder that shares nothing with the encoder reads the
+/// pixels. Returns what the decoder made of it, the kit text, and how wide the file draws, in
+/// pixels at 96 to the inch.
+fn scanned(svg: &str) -> (rqrr::MetaData, String, f32) {
+    let tree = resvg::usvg::Tree::from_str(svg, &resvg::usvg::Options::default())
+        .expect("a viewer opens the file");
+    let drawn = tree.size().width();
+    let scale = 1200.0 / drawn;
+    let width = (drawn * scale).ceil() as u32;
+    let height = (tree.size().height() * scale).ceil() as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).expect("a bitmap");
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
     let mut image =
-        rqrr::PreparedImage::prepare_from_greyscale(size * scale, size * scale, |x, y| {
-            if dark[(y / scale) * size + x / scale] {
-                0
-            } else {
-                255
-            }
+        rqrr::PreparedImage::prepare_from_greyscale(width as usize, height as usize, |x, y| {
+            let pixel = pixmap.pixel(x as u32, y as u32).expect("a pixel");
+            // The file draws an opaque page, so the colour is what a person would see.
+            u8::try_from(
+                (u32::from(pixel.red()) * 30
+                    + u32::from(pixel.green()) * 59
+                    + u32::from(pixel.blue()) * 11)
+                    / 100,
+            )
+            .expect("a grey")
         });
     let grids = image.detect_grids();
     assert_eq!(grids.len(), 1, "one code is drawn");
-    grids[0].decode().expect("the code decodes")
+    let (meta, text) = grids[0].decode().expect("the code decodes");
+    (meta, text, drawn)
 }
 
 /// KR-REQ-20.18: the kit saves as a QR code that scans back to the kit's own text, at the error
@@ -1169,8 +1166,13 @@ async fn the_kit_saved_as_a_qr_code_scans_back_to_the_kit_and_is_private() {
     )
     .expect("the QR code is saved");
     let svg = std::fs::read_to_string(&path).expect("the file");
-    let (meta, text) = scanned(&svg);
+    let (meta, text, drawn) = scanned(&svg);
     assert_eq!(meta.ecc_level, 3, "error correction level Q");
+    // A printed copy has a size to print at: more than two centimetres and less than a sheet.
+    assert!(
+        (76.0..=800.0).contains(&drawn),
+        "the file draws {drawn} pixels wide"
+    );
     assert_eq!(
         text,
         kr_client::recovery::render_kit(&kit)

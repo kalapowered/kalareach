@@ -178,6 +178,11 @@ proc-macro2 = "=1.0.107"
 # Draws an invitation's QR code in the terminal `kr pair invite` runs in. MIT licensed, with no
 # dependencies of its own.
 qrcodegen = "=1.8.0"
+# Read a saved QR code back in a test: `resvg` renders the SVG file as a viewer does, with none of its
+# optional text, font, image or compression features (the file holds a rectangle and one path), and
+# `rqrr` decodes the pixels, so the file is held to what a scanner reads and not to the encoder's
+# own account of it. Dev-dependencies of the companion crate only.
+resvg = { version = "=0.48.1", default-features = false }
 rqrr = "=0.11.0"
 # Reads the JUnit result files that Gradle writes for the Android application's unit tests, which
 # the conformance report keys to the requirement rows. Already in the tree through the property-list
