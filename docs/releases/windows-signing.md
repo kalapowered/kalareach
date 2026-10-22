@@ -163,8 +163,9 @@ both archives, hold them to what a host stages, and publish a release carrying t
 To sign a commit without releasing it, start the workflow by hand and give it a ref. The gate job
 settles that commit and records it in the Step Summary. The reviewer in the `release-signing`
 environment must check that exact commit SHA in the summary before approving. A run started that way
-signs and keeps the archives as a workflow artefact; it creates no release, because the step that
-publishes one runs on a tag push and on nothing else.
+signs the files of each tree and stops at the channel keys as any run does, so it keeps no archive;
+once the keys exist it keeps the archives as a workflow artefact and creates no release, because
+the step that publishes one runs on a tag push and on nothing else.
 
 One tag is one run at a time. A second run for a tag already being released waits for the first
 rather than running beside it, and the run under way is never cancelled for the one waiting. When the

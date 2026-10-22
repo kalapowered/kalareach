@@ -183,18 +183,25 @@ install and not at the first command. A family renders only when both of its arc
 None of them runs anything after it unpacks the release: Homebrew's `post_install` runs sandboxed,
 and a winget portable package has no hook. On macOS and Linux the `kr` that Homebrew puts on the
 search path admits its own release instead. Its first command checks the release against the
-channel's root as `kr host install` does, puts it in the user's store of releases, and runs as the
-store's copy, so the daemon, the workers and the helpers never run from the package manager's
-directory. When another release is current, the first command packs the new one as a release archive
-and hands it to the current release's `kr` as an update, which switches to it or waits for a live
-worker as any update does, and the command goes on with the release that is current. The current
-release may be one from before package managers, and it takes an archive as it takes any update. An
-update that waited leaves its release staged, and the next command offers it again. A release the
-store keeps already, and no update left staged, or one no newer than the current release, is not
-offered again, so a rollback stands. The store names the package manager in a file of its own,
-`installer`, which owns which release is current; a release before this one does not know the file
-and treats the install as its own. Removing the package removes the package manager's directory and
-never touches `versions/`. A Windows host keeps no store of releases, so the winget package's `kr`
+channel's root as `kr host install` does and puts it in the user's store of releases. Where the
+store holds no release yet, that root is the one the release carries, so the first install rests on
+the package manager's checksum of the archive; once a release is current, a new one is checked
+against the newer of that release's root and the one the host recorded at its last switch. The
+command then runs as the store's copy, so the daemon, the workers and the helpers never run from the package manager's directory.
+When another release is current, the first command packs the new one as a release archive and hands
+it to the current release's `kr` as an update, which switches to it or waits for a live worker as
+any update does, and the command goes on with the release that is current. The current release may
+be one from before package managers, and it takes an archive as it takes any update, since the
+manifest keeps the member that release requires of a shell package. An update that waited leaves its
+release staged, and the next command offers it again; one that failed after it staged the release
+is not offered again. A release the store keeps already, and no update left staged, or one no newer than the current
+release, is not offered again, so a rollback stands. `kr host rollback`, `kr host versions` and
+`kr doctor` admit nothing: they run as the store's copy of the release that is current, so a
+release that one refuses never holds them back, and a refusal of any other command names that copy.
+The store names the package manager in a file of its own, `installer`; the file only records who
+admitted the releases, and `current` says which one runs. A release before this one does not know
+the file and treats the install as its own. Removing the package removes the package manager's
+directory and never touches `versions/`. A Windows host keeps no store of releases, so the winget package's `kr`
 runs from the directory winget unpacked the release in. The winget manifest asks for that directory
 to go on the search path, because the programs of a release are found beside the one that starts
 them, and a link to `kr` in winget's links directory would hide them.
