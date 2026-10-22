@@ -111,16 +111,21 @@ fn usage(error: &clap::Error, json: bool) -> ExitCode {
 
 async fn run(cli: Cli) -> Result<Completion> {
     // A kr a package manager put on the search path runs as the store's own copy of its release,
-    // admitted there by its first command. Installing it by hand is a command of its own.
+    // admitted there by its first command. Installing it by hand is a command of its own. The
+    // commands that recover from a release the current one refuses admit nothing: they run as the
+    // store's copy of the release that is current.
     #[cfg(unix)]
-    if !matches!(
-        &cli.command,
-        Command::Host(kr_cli::cli::HostArguments {
-            command: HostCommand::Install(_)
-        })
-    ) && let Some((tree, installer)) = kr_cli::update::admit::unadmitted()
-    {
-        match kr_cli::update::admit::admit(&tree, installer).await? {}
+    if let Some((tree, installer)) = kr_cli::update::admit::unadmitted() {
+        match &cli.command {
+            Command::Host(kr_cli::cli::HostArguments {
+                command: HostCommand::Install(_),
+            }) => {}
+            Command::Host(kr_cli::cli::HostArguments {
+                command: HostCommand::Rollback(_) | HostCommand::Versions,
+            })
+            | Command::Doctor(_) => kr_cli::update::admit::run_as_current()?,
+            _ => match kr_cli::update::admit::admit(&tree, installer).await? {},
+        }
     }
     let paths = HostPaths::discover()?;
     match cli.command {

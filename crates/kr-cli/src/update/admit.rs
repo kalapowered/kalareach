@@ -14,7 +14,8 @@
 //!   current release may be one that knows nothing of package managers, so what it is offered is
 //!   what every release takes of an update. A wait is not a failure: the command goes on with the
 //!   release still current, and the release the update left staged is offered again at the next
-//!   command.
+//!   command. An update that fails after it staged the release is refused once, and the release is
+//!   not offered again.
 //! * A release that is the current one, one the store already keeps, and one no newer than the
 //!   current is not put in the store again, and the command goes on with the release that is
 //!   current. A release kept after a rollback is not switched back to by running its `kr`.
@@ -25,10 +26,14 @@
 //! does not run. Two first commands at once serialise on the store's own locks: the one that does
 //! not take them goes on with the release that is current.
 //!
-//! The store names the package manager in a file of its own, which owns which release is current.
+//! The store names the package manager in a file of its own, which only records who admitted the
+//! releases.
 //!
 //! A `kr` of a store, a build outside any package manager's prefix and the commands that read
-//! nothing of the host (`--help`, `--version`, a mistake in the arguments) do none of this.
+//! nothing of the host (`--help`, `--version`, a mistake in the arguments) do none of this. Nor do
+//! the commands a person reaches for when the release in the prefix is the trouble (`kr host
+//! rollback`, `kr host versions` and `kr doctor`): they run as the store's copy of the release that
+//! is current ([`run_as_current`]). A refusal names that copy, which takes every command.
 
 use std::convert::Infallible;
 use std::os::unix::process::CommandExt as _;
@@ -39,6 +44,7 @@ use std::time::{Duration, Instant};
 use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_ipc::install::{Program, Running, Store};
+use kr_protocol::update::ReleaseName;
 
 use super::{install, release, said};
 use crate::error::{CliError, Result};
@@ -73,13 +79,43 @@ fn installer_of(tree: &Path) -> Option<&'static str> {
     })
 }
 
+/// Runs this command again as the store's `kr` without admitting the release in the prefix: for
+/// the commands that recover from a release the current one refuses. It returns when the store has
+/// no current release, and the command then runs as this `kr`.
+///
+/// # Errors
+///
+/// Returns the failure to start the store's `kr`.
+pub fn run_as_current() -> Result<()> {
+    let Some(store) = Store::default_root().map(Store::at) else {
+        return Ok(());
+    };
+    if store.current().ok().flatten().is_none() {
+        return Ok(());
+    }
+    Err(start_stores_kr(&store))
+}
+
+/// Starts the store's `kr` on this command's arguments, in place of this process. It returns only
+/// the failure to do so.
+fn start_stores_kr(store: &Store) -> CliError {
+    let error = std::process::Command::new(store.stable(Program::Kr))
+        .args(std::env::args_os().skip(1))
+        .exec();
+    CliError::Other(shown!(
+        "the release this host keeps could not be started: {}",
+        Shown::io(&error)
+    ))
+}
+
 /// Admits the release in `tree`, and then runs this command again as the store's `kr`.
 ///
 /// # Errors
 ///
 /// Returns the reason the release was refused or could not be made current, and the failure to
-/// start the store's `kr` if that is what went wrong. It returns nothing otherwise, since the
-/// command then runs as another program.
+/// start the store's `kr` if that is what went wrong. A refusal names the store's own `kr`, which
+/// runs the release that is current. It returns nothing otherwise, since the command then runs as
+/// another program.
 pub async fn admit(tree: &Path, installer: &str) -> Result<Infallible> {
     let root = Store::default_root().ok_or_else(|| {
         CliError::HostUnavailable(Shown::said(
@@ -87,6 +123,30 @@ pub async fn admit(tree: &Path, installer: &str) -> Result<Infallible> {
         ))
     })?;
     let store = Store::at(root);
+    admit_to(&store, tree, installer)
+        .await
+        .map_err(|error| naming_the_stores_kr(error, &store))?;
+    Err(start_stores_kr(&store))
+}
+
+/// Adds to a refusal where the way out is: the store's own `kr`, which runs the release that is
+/// current and takes every command, `kr host rollback` among them. A store with no release current
+/// has no such `kr`, and the refusal stands as it is.
+fn naming_the_stores_kr(error: CliError, store: &Store) -> CliError {
+    match error {
+        CliError::Other(why) if store.current().ok().flatten().is_some() => {
+            CliError::Other(shown!(
+                "{}; the store's own kr, {}, runs the release that is current",
+                why,
+                Shown::root(&store.stable(Program::Kr))
+            ))
+        }
+        other => other,
+    }
+}
+
+/// Puts the release in `tree` where the command can run as the store's copy of it, or says why not.
+async fn admit_to(store: &Store, tree: &Path, installer: &str) -> Result<()> {
     let document = release::manifest_document(tree)?;
     let manifest = release::read_manifest(&document)?;
     if release::ChannelRoot::read(tree)?.is_none() {
@@ -115,15 +175,18 @@ pub async fn admit(tree: &Path, installer: &str) -> Result<Infallible> {
                         Shown::root(tree)
                     )));
                 }
-                super::write_installer(&store, installer)?;
+                super::write_installer(store, installer)?;
                 break;
             }
             Some(current) => {
-                if let Some(why) = not_to_admit(&store, &current, &manifest) {
-                    eprintln!("kr: {why}; this command runs as the release that is current");
+                if let Some(why) = not_to_admit(store, &current, &manifest) {
+                    crate::report::say(&shown!(
+                        "kr: {}; this command runs as the release that is current",
+                        why
+                    ));
                     break;
                 }
-                hand_to_current(&store, tree, &manifest.release, installer)?;
+                hand_to_current(store, tree, &manifest.release, installer)?;
                 break;
             }
             None => match install(Some(tree), None, Some(installer)).await {
@@ -140,31 +203,25 @@ pub async fn admit(tree: &Path, installer: &str) -> Result<Infallible> {
         }
     }
 
-    let error = std::process::Command::new(store.stable(Program::Kr))
-        .args(std::env::args_os().skip(1))
-        .exec();
-    Err(CliError::Other(shown!(
-        "the release this host keeps could not be started: {}",
-        Shown::io(&error)
-    )))
+    Ok(())
 }
 
 /// Why `release` is not offered to the current release as an update, when it is not: the store
 /// keeps it already and no update left it staged, or it is no newer than the current release.
 fn not_to_admit(
     store: &Store,
-    current: &kr_protocol::update::ReleaseName,
+    current: &ReleaseName,
     release: &kr_protocol::update::ReleaseManifest,
-) -> Option<String> {
+) -> Option<Shown> {
     if store.release_directory(&release.release).exists() {
         // An update that waited leaves its release in the store, staged for the next attempt, which
         // is this one; a release kept after a rollback is not staged.
         let staged = super::Record::read(store)
             .is_ok_and(|record| record.staged.as_ref() == Some(&release.release));
         if !staged {
-            return Some(format!(
+            return Some(shown!(
                 "release {} is in this host's store already",
-                release.release
+                crate::shown::release(&release.release)
             ));
         }
     }
@@ -173,9 +230,10 @@ fn not_to_admit(
         .map(|held| release.sequence.get() > held.sequence.get());
     match newer {
         Ok(true) => None,
-        Ok(false) => Some(format!(
-            "release {} is no newer than release {current}, which this host runs",
-            release.release
+        Ok(false) => Some(shown!(
+            "release {} is no newer than release {}, which this host runs",
+            crate::shown::release(&release.release),
+            crate::shown::release(current)
         )),
         // A current release whose manifest cannot be read is for the update to refuse by name.
         Err(_) => None,
@@ -187,7 +245,8 @@ fn not_to_admit(
 /// The tree is packed as the release archive that update takes, in a directory of the store's
 /// staging place that only this user reads, and the package manager is named once the release is
 /// current. An update that waits (exit 9) leaves the current release in place and is not a failure.
-/// The current `kr` says why on standard error; what it prints to standard output is its report of
+/// An update that fails is a refusal, and is not offered again. The current `kr` says why on
+/// standard error; what it prints to standard output is its report of
 /// the update, which the command that follows must not be preceded by. It reads nothing from
 /// standard input, which belongs to the command that follows.
 fn hand_to_current(
@@ -205,7 +264,10 @@ fn hand_to_current(
         // Another command's update may have switched to this release between the look and the
         // lock, which the current release's own refusal then reads as no update to make.
         _ if store.current().ok().flatten().as_ref() == Some(release) => {}
-        _ => {
+        code => {
+            if code.is_some() {
+                stop_offering(store, release);
+            }
             return Err(CliError::Other(shown!(
                 "the release at {} was not admitted to this host's store, and this command did not \
                  run",
@@ -213,11 +275,29 @@ fn hand_to_current(
             )));
         }
     }
-    // The package manager owns which release is current from here, once this one is.
+    // The store names the package manager once this release is current.
     if store.current().ok().flatten().as_ref() == Some(release) {
         super::write_installer(store, installer)?;
     }
     Ok(())
+}
+
+/// Stops offering `release` at each command after an update failed once it had staged it: the
+/// failure is refused to the person, and what asked for another offer, the mark that an update
+/// waits for it, comes off. An update that is still under way keeps the mark, as does one that
+/// another command holds.
+fn stop_offering(store: &Store, release: &ReleaseName) {
+    let Ok(Some(_update)) = store.try_lock_update() else {
+        return;
+    };
+    let Ok(mut record) = super::Record::read(store) else {
+        return;
+    };
+    if record.update.is_none() && record.staged.as_ref() == Some(release) {
+        record.staged = None;
+        // A record that cannot be written leaves the mark, and the next command offers again.
+        let _ = record.write(store);
+    }
 }
 
 /// Packs `tree` into `staging` and runs the current release's `kr` on the archive.

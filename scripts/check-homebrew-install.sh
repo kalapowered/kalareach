@@ -137,8 +137,10 @@ case "$(uname -s)" in
 esac
 
 # What `host versions` says, read as the check needs it: the current release, the releases kept,
-# and who put them there.
+# and who put them there. The first command is one that admits the release in Homebrew's directory:
+# `host versions` does not, and runs as the store's copy of the release that is current.
 inspect() {
+  kr_run --json host paths > /dev/null
   kr_run --json host versions > "$work/versions.json"
   python3 - "$work/versions.json" "$store/installer" "$@" <<'PY'
 import json, sys

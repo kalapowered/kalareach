@@ -123,22 +123,29 @@ With no release in the store, the release is installed as `kr host install` inst
 another release current, and this one newer and not in the store yet, the release is packed as a
 release archive and the current release's `kr` is asked to take it in as an update
 (`kr host update --archive <archive>`, which every release takes, one from before package managers
-included), so the release is checked against the update channel's root, the daemons are handed over
-and `current` is switched under the same rules. An update that waits for a live worker, exit 9, is
-not a failure: its reason is said on standard error and the command goes on with the release that
-is still current, and the release the update left staged is offered again at the next command. A
-release that is already in the store and not staged, as one is after a rollback, or that is no newer
-than the current one is not offered again: the command goes on with the release that is current,
-and a rollback stands. A release that carries no update channel root, or cannot be checked, is refused
+included, since the manifest keeps the member that release requires of a shell package), so the
+release is checked against the update channel's root, the daemons are handed over and `current` is
+switched under the same rules. An update that waits for a live worker, exit 9, is not a failure: its
+reason is said on standard error and the command goes on with the release that is still current,
+and the release the update left staged is offered again at the next command. An update that fails
+after it staged the release is refused once, with its reason, and the release is not offered again.
+A release that is already in the store and not staged, as one is after a rollback, or that is no
+newer than the current one is not offered again: the command goes on with the release that is
+current, and a rollback stands. A release that carries no update channel root, or cannot be checked, is refused
 with the reason, and the command does not run. Two first commands at once take the store's locks
 in turn, and the one that does not get them goes on with the release that is current.
 
-The store names the package manager in its `installer` file, and the package manager owns which
-release is current from then on. The file is not part of the store's record, so a release before
-this one, which a rollback may bring back, reads the record as it always has. It does not know the
-file, so a host rolled back to it treats the install as its own: nothing then reads the file, and
-the package manager's next release is admitted again by the first command of its `kr`, by the same
-rules. Removing the prefix leaves `versions/` as it is. `kr --help`, `kr --version`
+`kr host rollback`, `kr host versions` and `kr doctor` admit nothing. They run as the store's copy
+of the release that is current, so a release that the current one refuses cannot hold back the
+commands that recover from it. Any other command that stops because its release was refused names
+the store's own `kr`, which runs the release that is current.
+
+The store names the package manager in its `installer` file. The file only records who admitted
+the releases; `current` says which one runs. It is not part of the store's record, so a release
+before this one, which a rollback may bring back, reads the record as it always has. It does not
+know the file, so a host rolled back to it treats the install as its own: nothing then reads the
+file, and the package manager's next release is admitted again by the first command of its `kr`, by
+the same rules. Removing the prefix leaves `versions/` as it is. `kr --help`, `kr --version`
 and a mistake in the arguments read nothing of the host and admit nothing, and neither does a `kr`
 of the store, an unpacked release that no package manager keeps (which `kr host install` installs
 on request) or a build outside a release. The store keeps no release on Windows, so none of this
