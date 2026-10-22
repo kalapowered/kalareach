@@ -1494,19 +1494,20 @@ The chain is named by its causal root. The attention item for an exhausted chain
 `automation.causal_budget.` followed by the root's identifier, and the identifier is the argument.
 `--grant` names the grant the re-arm is made under, by the identifier `kr share list` shows or
 `grant.list` returns: a grant the host must hold as live, for this environment, with the right to
-manage automation. A paired device that runs the command names the grant it holds. The command reads the budget generation the chain
-is on, shown as `generation` beside the chain's budget in `workflow.read`, and asks to leave it. With
-`--generation <n>` it asks to leave the generation you name instead, which is what makes a repeat of
-the command safe: a chain already on the generation after it is told where it is and is given no
-second budget, whether or not it has run out again since. A chain whose budget has not run out, a
-generation the chain is neither on nor just past, a grant without the right, and a root the host
-holds no budget for are each refused, with the exit code of a refusal by the daemon.
+manage automation. The command reads the budget generation the chain is on, shown as `generation`
+beside the chain's budget in `workflow.read`, and asks to leave it. With `--generation <n>` it asks
+to leave the generation you name instead, which is what makes a repeat of the command safe: a chain
+already on the generation after it is told where it is and is given no second budget, whether or not
+it has run out again since. A chain whose budget has not run out, a generation the chain is neither
+on nor just past, a grant without the right, and a root the host holds no budget for are each
+refused, with the exit code of a refusal by the daemon.
 
 Before it sends the request, the command prints on standard error the generation it asks to leave,
-and how to repeat the request: `kr workflow rearm <causal-root> --grant <grant> --generation <n>`
-with that number. A reply that does not arrive leaves no other way to know it, and a repeat that
-names it is answered and gives no second budget. A run of the command without `--generation` can
-give a chain that has since run out again a second budget, because it reads the generation anew.
+and the command that repeats the request with that generation named:
+`kr workflow rearm <causal-root> --grant <grant> --generation <n>`, with the identifiers and the
+number filled in. A reply that does not arrive leaves no other way to know the number, and a repeat
+that names it is answered and gives no second budget. A run of the command without `--generation`
+can give a chain that has since run out again a second budget, because it reads the generation anew.
 When a failure is not the daemon's refusal, the command prints that line again.
 
 On success the command prints `Rearmed chain <root>: its budget is on generation <n>.` With `--json`
