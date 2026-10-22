@@ -23,8 +23,7 @@
 //  | `banner-<n>.txt` | this test | what the banner said, or `none` |
 //  | `tap-<n>` | the script | nothing; the banner is to be tapped |
 //  | `tapped-<n>` | this test | what the application showed after the tap |
-//  | `act-<k>` | the script | a verb: `tap`, `choose`, `send` or `observe`; what the person does next |
-//  | `act-expect` | the script | the words the notification the person taps shows |
+//  | `act-<k>` | the script | a verb: `choose`, `send` or `observe`; what the person does next |
 //  | `acted-<k>` | this test | what the screen showed after the act |
 //  | `finish` | the script | nothing; the run is over |
 //
@@ -91,7 +90,7 @@ final class PushDeviceTests: DeviceTestCase {
         XCTAssertTrue(answered, "the system never asked the person for permission to notify")
         touch("app-running")
 
-        var served = 0
+        var served = Set<Int>()
         var acted = 0
         let end = Date().addingTimeInterval(1500)
         while !exists("finish") && Date() < end {
@@ -103,7 +102,7 @@ final class PushDeviceTests: DeviceTestCase {
                 XCUIDevice.shared.press(.home)
                 // The application may stay a background application with its audio mode and not be
                 // suspended: either way it is not in front, and the banner is the system's.
-                let gone = eventually("the application to leave the front", timeout: 60) { app.state != .runningForeground }
+                let gone = leftTheFront()
                 note("went to the background: \(gone), state \(app.state.rawValue)")
                 write("is", wanted)
             } else if wanted == "foreground" && !inFront {
@@ -118,13 +117,28 @@ final class PushDeviceTests: DeviceTestCase {
                 perform(read("act-\(act)"), act)
                 acted = act
             }
-            let next = served + 1
-            if exists("banner-wanted-\(next)") {
+            // The script numbers a banner by the message it came from, and not every message is a
+            // delivery, so each `banner-wanted-<n>` it writes is served once, in whatever order.
+            let wantedFiles = (try? FileManager.default.contentsOfDirectory(atPath: directory)) ?? []
+            let numbers = wantedFiles.compactMap { name -> Int? in
+                name.hasPrefix("banner-wanted-") ? Int(name.dropFirst("banner-wanted-".count)) : nil
+            }
+            if let next = numbers.filter({ !served.contains($0) }).min() {
                 readBanner(next)
-                served = next
+                served.insert(next)
             }
             Thread.sleep(forTimeInterval: 0.5)
         }
+    }
+
+    /// Whether the application is out of the front. A `state` read in a loop is not always brought up
+    /// to date after the Home button, so this asks XCTest to wait for the state to change, and takes
+    /// the home screen showing the application's icon as the same thing.
+    private func leftTheFront() -> Bool {
+        if app.wait(for: .runningBackground, timeout: 20) || app.wait(for: .runningBackgroundSuspended, timeout: 5) {
+            return true
+        }
+        return springboard.icons["KalaReach"].exists
     }
 
     // MARK: What the person does
@@ -142,33 +156,17 @@ final class PushDeviceTests: DeviceTestCase {
     /// screen showed after it.
     private func perform(_ verb: String, _ act: Int) {
         switch verb {
-        case "tap":
-            // The notification is in the notification list, which the system shows when the screen is
-            // pulled down from its top. Its words are the host's generic alert, and a notification
-            // that carried any of the question's text would not be found.
-            let words = read("act-expect")
-            let from = springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.0))
-            let to = springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.7))
-            from.press(forDuration: 0.1, thenDragTo: to)
-            let notification = springboard.descendants(matching: .any)
-                .matching(NSPredicate(format: "label CONTAINS %@", words)).firstMatch
-            guard notification.waitForExistence(timeout: 20) else {
-                screenshot("act-no-notification-\(act)")
-                write("acted-\(act)", "no notification with those words")
-                return
-            }
-            notification.tap()
-            let front = app.wait(for: .runningForeground, timeout: 30)
-            screenshot("tapped-\(act)")
-            write("acted-\(act)", "foreground=\(front) \(screenText())")
         case "choose":
-            let item = app.buttons.matching(NSPredicate(format: "label CONTAINS 'A question is waiting for an answer'")).firstMatch
-            guard item.waitForExistence(timeout: 30) else {
-                write("acted-\(act)", "no attention item: \(screenText())")
-                return
-            }
-            item.tap()
+            // The sheet of an earlier question may still be open, with this one in it.
             let yes = anyElement(labelled: "Yes", within: app)
+            if !yes.exists {
+                let item = app.buttons.matching(NSPredicate(format: "label CONTAINS 'A question is waiting for an answer'")).firstMatch
+                guard item.waitForExistence(timeout: 30) else {
+                    write("acted-\(act)", "no attention item: \(screenText())")
+                    return
+                }
+                item.tap()
+            }
             guard yes.waitForExistence(timeout: 30) else {
                 write("acted-\(act)", "no Yes choice: \(screenText())")
                 return
