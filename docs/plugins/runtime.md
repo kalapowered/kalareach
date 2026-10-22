@@ -410,6 +410,11 @@ somebody's answer, and a frame without one is news.
 | `restore` | restore it |
 | `unbind` | remove the binding and its instance |
 | `health` | ask what the host is doing: live bindings, this connection's own and its bound, the compiled components the cache holds and what they cost, the notice bytes waiting and the documents dropped |
+| `decode` | ask the component to interpret one native request the broker retained |
+| `encode` | ask the component to encode a decision the broker validated as the bytes of a response |
+| `revise_facts` | replace the facts the component reads about its binding's bound execution |
+| `revise_attachments` | replace the attachments the component reads the current draft as holding |
+| `privacy` | tell the host whether privacy mode stands for the worker this connection serves |
 
 A binding belongs to the connection that registered it. Another connection that has the identifier
 finds no binding, which is the same answer it would get for one nobody ever registered, and a
@@ -427,20 +432,67 @@ push. Everything that can enter a component runs in a task of its own, so readin
 never waits for the last one to finish. A connection holds up to sixteen such calls at once and up
 to sixty-four bindings; past either, the next request is refused rather than queued.
 
-`prepare-action` is the one rich call this protocol carries. A worker sends the invocation's token
-(the actor, the grant record, which is empty for the local owner, the binding revision, the action
-and the hash of the parameters a person saw) and the arguments in the order the action declares
-them, and is given back the plan the component proposed, as plain data, or the fault it declared.
-`decode-request`, `encode-response`, and revising a binding's facts and attachments are in the
-runtime's own API, inside the plugin host, and are not in this protocol yet. A worker cannot make any
-of them in process: it may link `kr-plugin-service`, which holds the protocol, the client and the
-launcher and no engine, and never `kr-plugin-runtime`.
+`prepare-action`, `decode` and `encode` are the rich calls this protocol carries. Each is answered by
+what the component returned, as plain data, or by the fault it declared. A worker sends
+`prepare-action` the invocation's token (the actor, the grant record, which is empty for the local
+owner, the binding revision, the action and the hash of the parameters a person saw) and the arguments
+in the order the action declares them, and is given back the plan the component proposed. It sends
+`decode` the native request as the broker retained it, with the provenance it recorded and the
+identifier the upstream gave, and is given back the identifier the component says the request has, its
+class for the method, a one-line summary, the decisions it says are offered and the nodes that
+present the request. It sends `encode` the broker's own record of a pending request, the decision it
+validated and, where it still holds it, the request's source event, and is given back the bytes of a
+response with the identifier of the request the component says it answers. A component sends nothing
+in any of the three: the answer is a value, and the host has no way to put it anywhere but in the
+reply.
+
+`revise_facts` and `revise_attachments` do not enter a component. They are answered when the host has
+accepted them, on the task that read them, and a revision is what the binding's next call reads: one
+no call has yet seen is replaced by a later one, and a call already inside the component does not see
+it. The facts are the ones registration carries, and the plugin they name is the one the binding
+serves. A worker is not required to send either; the facts a binding is registered with are the ones
+its component reads until a revision replaces them.
+
+`privacy` is answered on the reading task as well, once the host holds what it was told (see "Privacy
+mode at the host").
 
 A worker and a host speak one protocol, which the host names in its `hello` answer and in its
 descriptor (`kr-plugin-host/3`; the request that prepares an action came with the second protocol,
-and the third has the requests the second has). A host of another protocol is refused at the
-handshake, by name, because a host ends the connection, and every binding on it, over a request it
-does not know.
+and the third has the requests the second has and the five that decode, encode, revise a binding's
+facts and attachments and tell the host about privacy mode). A host of another protocol is refused at
+the handshake, by name, because a host ends the connection, and every binding on it, over a request
+it does not know.
+
+### What is fixed with a protocol
+
+Every frame of `kr-plugin-host/3` is closed before its first release, because nothing records the
+frames of a released host protocol other than its name, and a request, a response or a notice
+variant, or a member added to a record of one, would meet a worker or a host of the release before
+that adopted it: it ends the connection, and every binding on it, over a frame it cannot read. A
+change to a frame, or to one of the rules a host reads a request under, takes a new protocol. The
+rules are these.
+
+- The reading task answers `hello`, `verify`, `event`, `health`, `revise_facts`, `revise_attachments`
+  and `privacy` without entering a component. The other requests that name a binding run in a task of
+  their own and take a place from the connection's sixteen. A connection holds sixty-four bindings,
+  and a request past either bound is refused and not queued.
+- A call's own deadline is from 1 to 30,000 ms. A `decode` or an `encode` event is at most the
+  largest document node a frame carries, has the provenance `native_protocol` and carries the
+  identifier the upstream gave: an event that is a scrape or names no request is refused before any
+  component runs. An `encode` names a decision among the request's offered decisions (at most 16, of
+  at most 256 bytes), and its event, where it has one, is the source of the request being answered,
+  with the same handle and identifier. A request, a method, an identifier or a decision is at most
+  256 bytes.
+- Facts have strings of at most 1 KiB, at most 64 held rights and the plugin identifier the binding
+  was registered with, and the facts of a registration are held to the same bounds. A draft's
+  attachments are at most 64, with an identifier and a media type of at most 256 bytes and a name of
+  at most 1 KiB.
+- An answer to `encode` that names another request than the one it was asked about is refused by the
+  host. The identifier a `decode` names is not: the host holds no record of requests, and the worker
+  checks it against the request it holds.
+- A refusal is `Refused` and disables no binding. An event offered to a binding the runtime has
+  disabled is refused as a disabled binding's, and the worker stops offering it anything.
+- A frame, an answer and a document node each fit one frame of a mebibyte, the envelope included.
 
 ### One host for each protocol
 
@@ -590,7 +642,40 @@ restore or an action, and its words can be made of what it was handed. So every 
 component on the connection is withheld, however many wait and however late each is read. A
 connection made while privacy mode is on is withheld from its start, and so is one that a component
 is handed something made in privacy mode on. The documents a component draws are read and dropped
-by the worker, in privacy mode as at any other time.
+by the worker, in privacy mode as at any other time, and the host does not send them in privacy mode
+(see "Privacy mode at the host").
+
+### Privacy mode at the host
+
+The worker tells the host whether privacy mode stands, with a `privacy` request, and tells it again
+each time that changes. It tells a new connection once, before it publishes the connection and before
+it registers anything on it, so that the first document `bind` draws is judged by privacy mode as it
+stands; after that one task of the link sends the changes, in the order they were made.
+
+While the host holds that privacy mode stands on a connection, it writes no document notice on it,
+and it sends the nodes that present a decoded request empty. A document is a component's drawing of
+what it was handed, and in privacy mode nothing that was made of the session's content crosses the
+boundary of the host's process or waits in its queue for a reader that may not come. The host
+answers a `privacy` request holding the connection's writer: it sets the flag, drops the documents
+its queue holds and writes the answer, and its notice writer checks the flag holding the same writer
+before it writes a document. So every document frame of a connection is before the answer in the
+stream or is never written, whichever of the two tasks reached the writer first.
+
+A document the host withholds is not one it lost for want of room, so nothing is owed for it while it
+is withheld. A withheld piece of a document that is not its last is remembered as a dropped one is, so
+that the rest of that document is dropped when it arrives after privacy mode has ended and a reader
+is never given the end of a document it did not receive the start of. When privacy mode ends, one
+loss of documents for each binding that had one withheld is reported as a gap, which tells a reader
+that holds the start of a document that it lost the rest, and makes the host ask the component to
+draw again. The component's drawing is then fresh and not a continuation.
+
+What the host withholds is documents and presentation. A fault's detail, a disabling's reason, a
+decoded request's summary and decisions, a declared fault's text and a checkpoint's state still cross,
+and the worker keeps none of them beyond what it uses: a summary is what a person is shown beside an
+approval and is kept in the approvals ledger; the rest it withholds by the rules above, because it
+has to for whatever was said before the host was told. The worker's state and the host's agree
+eventually and not at one instant: a document drawn before the host has answered is as it was, read
+and dropped by the worker, which keeps nothing.
 
 ## Where the broker fits
 
@@ -623,7 +708,8 @@ reach the runtime before a wait the daemon asked for or a backoff has passed, ho
 broker's set changes meanwhile, except that a link nothing wants the runtime of any more forgets
 the wait, and the next binding that wants a component asks at once; the daemon's bound on starts
 is what holds a runtime that keeps ending. The worker's report on its admissions says that this
-host calls none of the component's decode-request or encode-response exports.
+host never calls the component's encode-response export, because the connector's table writes every
+answer; it says so of every package that ships a component, whether or not the package decodes.
 
 ### An action a component prepares
 
@@ -677,20 +763,47 @@ the order is what counts:
 
 1. The broker records the opaque native request **before** it forwards it, and forwards it whether
    or not any component is healthy.
-2. A component's `decode-request` returns a projection. The broker checks the binding's
-   approval-interpreter grant, the decoding-trust record that names *this* package at *this*
-   digest, the method that record covers, the projection's schema version and decision count, the
-   source frame's generation, and that this source event has not already produced an
-   interpretation. Only then does the request become something a person can answer.
+2. A component's `decode-request` returns a proposal. Which decoder reads a request is decided once it
+   is recorded and forwarded, and never before: the connector's table interprets it at once when no
+   binding of the package whose table the connection reads, trusted to decode the method, ships a
+   component; when one does, the component decodes it and the table does not. A package that ships a
+   component and relies on its table for approvals therefore has opaque approvals unless its
+   component decodes, so a component that only draws must still return the request's identifier, the
+   table's decisions and no summary. The choice reads no component's state. The request is queued, at
+   most thirty-two for all bindings and eight for one, and a task of the link asks the components, at
+   most four at once and one for a binding. A request whose component is being registered waits for
+   it, which a session's first approval does when the component has to be compiled; one whose
+   component is unavailable, disabled or gone, and one the queue could not take, stays recorded and
+   opaque for the terminal to answer, and is not decoded later if the component registers later. The
+   terminal's own answer waits for none of this.
+   What comes back is believed no further than the broker can check. The identifier must be the
+   request's own, every decision must be one the connector's table maps for it and none twice, the
+   decisions carry the table's labels and never the component's, and the summary is carried whole or
+   the proposal is refused, since a shortened sentence can say something the component did not. The
+   component's class for the method and the nodes it presents the request with are carried and
+   unused: the table classifies a method, and a person answers an approval and not a component's
+   drawing of one. The broker then checks the binding's approval-interpreter grant, the
+   decoding-trust record that names *this* package at *this* digest, the method that record covers,
+   the projection's schema version and decision count, that the request is still pending (a native
+   answer given while the component decoded wins), the source frame's generation, and that this
+   source event has not already produced an interpretation. Only then does the request become
+   something a person can answer, with the decoder's package and the request's bytes in the ledger and
+   the component's summary, which an invitation to share the approval shows as what it asks, in place
+   of the request.
+   A component that faults, runs out its deadline, declines or answers what it was not asked leaves
+   the request as it was, and the binding's report counts it by kind and never in the component's
+   words.
 3. A component's `encode-response` returns bytes. The broker rechecks the resource's own state and
    deadline, the instance, the source generation and the decoder's right to answer, checks the
    decision against the ones the request actually offered, commits the dispatch marker, and only
    then may the answer go.
 
-What is not joined up yet is the hand-over in either direction: the plugin host invokes the
-component's exports, and passing the broker's action token into that invocation and its projection
-back out is the work that joins the two crates. Until it lands, the broker's own suites drive the
-checks and the plugin host's drive the calls.
+What is not joined up yet is the encode step: no answer a person gives is encoded by a component. The
+connector's table writes every answer, inside the admission that claims the resource, and the plugin
+host's `encode` request returns what a component would write without anything calling it for an
+answer. Calling it there means asking the component outside the broker's lock and rechecking, claiming
+and dispatching after it returns, a native answer given meanwhile winning, as the preparation of an
+action does.
 
 A component that is faulted, disabled or slow changes none of step 1. That is the whole of the
 separation: rich meaning is a thing the broker asks for, and the native path does not wait for the
