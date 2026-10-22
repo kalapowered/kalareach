@@ -216,6 +216,9 @@ mod tests {
     use super::*;
     use crate::boundary::OpenedDirectory;
 
+    /// How long a case waits for a child it started before it calls the child hung.
+    const LIVENESS: std::time::Duration = std::time::Duration::from_secs(60);
+
     fn opened(path: &Path) -> OpenedDirectory {
         OpenedDirectory::open(
             kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16])),
@@ -308,18 +311,34 @@ mod tests {
         };
         let mut spawned =
             crate::boundary::start(&invocation, &confinement).expect("the child starts");
-        let mut listing = String::new();
-        spawned
-            .stdout()
-            .expect("the child's output")
-            .read_to_string(&mut listing)
-            .expect("the child's listing");
+        // The child's listing is read where a hung child cannot hold this case: the case ends the
+        // child's group and fails when the child does not close its output or does not exit in
+        // time. A child that is not hung costs what it costs.
+        let mut output = spawned.stdout().expect("the child's output");
+        let (listed, reading) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut listing = String::new();
+            let read = output.read_to_string(&mut listing);
+            let _ = listed.send(read.map(|_| listing));
+        });
+        let listing = match reading.recv_timeout(LIVENESS) {
+            Ok(read) => read.expect("the child's listing"),
+            Err(_) => {
+                spawned.end();
+                panic!("the child kept its output open for {LIVENESS:?}");
+            }
+        };
+        let hung = std::time::Instant::now() + LIVENESS;
         while spawned
             .try_wait()
             .expect("the child is waited for")
             .is_none()
         {
-            std::thread::yield_now();
+            if std::time::Instant::now() >= hung {
+                spawned.end();
+                panic!("the child closed its output and was still running after {LIVENESS:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let open: Vec<i32> = listing
             .split_whitespace()
