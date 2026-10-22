@@ -41,6 +41,21 @@ use kr_worker::runtime::SessionRuntime;
 /// costs what it always did.
 pub const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 
+/// A program that keeps whatever it reads from the terminal in the file it is given, as it reads it
+/// and with nothing written back.
+///
+/// It stands for an application that reads late and is handed a backlog, which the system's `tee`
+/// is not safe for: the `tee` of a host whose core utilities are uutils' hands what a terminal
+/// gives it to a second pipe of its own and aborts when that pipe has less room than the read
+/// gave it. A pipe made while its user holds more pipe buffers than the kernel's soft limit has
+/// room for two pages (8 KiB), which is what a host has when many suites run on it at once, and
+/// one read of a backlog can be more.
+pub const KEEPS_WHAT_IT_READS: &str = "/usr/bin/perl -e 'open(KEPT, \">\", shift) or die; \
+     while (1) { \
+       my $n = sysread(STDIN, $chunk, 65536); defined $n or die \"read: $!\"; $n or last; \
+       for (my $at = 0; $at < $n; ) { \
+         my $w = syswrite(KEPT, $chunk, $n - $at, $at); defined $w or die \"write: $!\"; $at += $w } }'";
+
 /// Returns whether `haystack` carries `needle`.
 pub fn carries(haystack: &[u8], needle: &[u8]) -> bool {
     haystack

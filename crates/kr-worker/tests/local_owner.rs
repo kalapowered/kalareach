@@ -2934,8 +2934,9 @@ impl LateReader {
             .expect("mkfifo runs");
         assert!(made.success(), "the trigger is made");
         let script = format!(
-            "stty raw -echo; cat {} >/dev/null; exec tee {}",
+            "stty raw -echo; cat {} >/dev/null; exec {} {}",
             kr_worker::testing::shell_quoted(&trigger),
+            common::KEEPS_WHAT_IT_READS,
             kr_worker::testing::shell_quoted(&received)
         );
         let typing = Typing::start_with(&script).await;
