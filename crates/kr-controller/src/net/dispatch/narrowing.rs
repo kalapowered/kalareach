@@ -7,6 +7,7 @@ use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::hostinfo::HostDoctorResult;
 use kr_protocol::ids::{ActorId, RequestId};
 use kr_protocol::method::Method;
 use kr_protocol::session::SessionListResult;
@@ -410,6 +411,31 @@ pub(super) fn without_host_text(answer: ControlFrame) -> ControlFrame {
             ),
         ),
         other => other,
+    }
+}
+
+/// Leaves what the host measured about itself out of a `host.doctor` answer, for a device whose
+/// authority does not reach the host's own diagnostics.
+///
+/// The report that remains counts nothing, which says nothing about the host. An answer that is
+/// not a doctor's is not passed on as it is.
+pub(super) fn without_host_metrics(answer: ControlFrame) -> ControlFrame {
+    let ControlFrame::Response(Response {
+        request_id,
+        outcome: Outcome::Ok(value),
+    }) = answer
+    else {
+        return answer;
+    };
+    match value.to_typed::<HostDoctorResult>() {
+        Ok(result) => encoded(
+            request_id,
+            &result.with_metrics(kr_protocol::metrics::MetricsReport::default()),
+        ),
+        Err(error) => failure(
+            request_id,
+            ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()),
+        ),
     }
 }
 
