@@ -266,6 +266,7 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         | Method::EventsSnapshot
         | Method::AgentInstances
         | Method::HistoryPage
+        | Method::HistoryTimes
         | Method::ActionRead => None,
 
         Method::GrantCreate | Method::GrantRedeem | Method::GrantTransfer | Method::GrantHeld => {
