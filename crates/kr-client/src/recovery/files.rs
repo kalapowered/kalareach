@@ -1021,18 +1021,21 @@ impl PreparedRestore {
     /// again and the change made on what is there; a write whose answer was lost is treated the
     /// same way, because the next read either finds the checkpoint recorded or finds the bundle
     /// where the lost write compared, and a request that arrives late then compares against a
-    /// place the bundle has left and changes nothing. Between the attempts only the strongest
-    /// read is kept, the newest revision and every archive's highest checkpoint, and every read is
-    /// held to it, so that no attempt writes on a bundle older than one an attempt read or seals a
-    /// checkpoint below one an attempt read.
+    /// place the bundle has left and changes nothing. Between the attempts of one call the place
+    /// and the strongest read are kept, the newest revision and every archive's highest
+    /// checkpoint, and every read is held to them, so that no attempt writes on a bundle older than
+    /// one an attempt read or seals a checkpoint below one an attempt read.
     ///
     /// # Errors
     ///
     /// Returns [`RestoreError::Recovery`] when the bundle does not authenticate, is of another
-    /// history than the restore read, records the generation with another manifest, or would be
-    /// sealed past the bound a service keeps; [`RestoreError::ServiceAskedToWait`] when the service
-    /// asked to be left alone; [`RestoreError::BundleKeptMoving`] when it moved under every
-    /// attempt; and [`RestoreError::Read`] when the service cannot be reached.
+    /// history than the restore read, is an older revision than one read in this call or records a
+    /// lower checkpoint than one read in it ([`RecoveryError::BundleWentBackToAnOlderRevision`],
+    /// [`RecoveryError::CheckpointWentBack`]), records a generation with another manifest, would be
+    /// sealed past the bound a service keeps, or comes back from a write that did not move it on;
+    /// [`RestoreError::ServiceAskedToWait`] when the service asked to be left alone;
+    /// [`RestoreError::BundleKeptMoving`] when it moved under every attempt; and
+    /// [`RestoreError::Read`] when the service cannot be reached.
     pub async fn record_checkpoint(
         &self,
         writer: &dyn BundleWriter,
