@@ -9126,6 +9126,13 @@ export interface AdmittedPackage {
    */
   publisher_id: string
   /**
+   * The generation of its repository that this snapshot was made under: the one the enrolment
+   * it came through was on, or zero when that enrolment had none. A binding made from this
+   * package holds it as the generation its package was resolved against, which is not the
+   * admission revision the binding was decided at.
+   */
+  repository_generation: string
+  /**
    * The installed release.
    */
   version: string

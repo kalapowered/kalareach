@@ -4210,6 +4210,13 @@ async fn kr_req_11_13_only_an_enabled_installation_is_admitted() {
     assert_eq!(admissions.packages.len(), 1, "{admissions:?}");
     let admitted = &admissions.packages[0];
     assert_eq!(admitted.package_digest, generation.manifest_digest());
+    // KR-REQ-06.06: the generation of the repository the release came through is the one its
+    // enrolment is on.
+    assert_eq!(
+        admitted.repository_generation,
+        index.generation.get(),
+        "the admission carries the repository's generation"
+    );
     assert_eq!(
         admitted.package_dir,
         catalogue

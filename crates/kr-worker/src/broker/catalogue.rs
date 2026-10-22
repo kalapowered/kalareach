@@ -749,6 +749,7 @@ pub mod testing {
                 repository_id: "official".to_owned(),
                 enrolment_key: "0123456789abcdef0123456789abcdef".to_owned(),
             },
+            repository_generation: kr_protocol::ids::RepositoryGeneration::new(1),
             package_dir: source.package_dir.display().to_string(),
             grants: source
                 .granted
@@ -1011,6 +1012,7 @@ mod tests {
                 repository_id: "official".to_owned(),
                 enrolment_key: "key".to_owned(),
             },
+            repository_generation: kr_protocol::ids::RepositoryGeneration::new(1),
             package_dir: source.package_dir.display().to_string(),
             grants: source
                 .granted

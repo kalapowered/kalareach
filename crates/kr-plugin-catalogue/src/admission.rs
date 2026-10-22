@@ -117,6 +117,9 @@ pub struct AdmittedPackage {
     pub package_digest: PayloadDigest,
     /// Where it came from.
     pub origin: ReleaseOrigin,
+    /// The generation of its enrolment's repository that was current when this was computed, or
+    /// zero where the enrolment had none.
+    pub repository_generation: u64,
     /// The directory its checked, extracted copy is in.
     pub package_dir: PathBuf,
     /// What the installation may use: its effective grants.
@@ -317,6 +320,7 @@ pub struct AdmissionPlan {
 struct Pending {
     installation: Installation,
     origin: ReleaseOrigin,
+    repository_generation: u64,
     grants: BTreeSet<PluginCapability>,
     builds: Vec<QualifiedBuild>,
 }
@@ -356,6 +360,7 @@ impl AdmissionPlan {
         for Pending {
             installation,
             origin,
+            repository_generation,
             grants,
             builds,
         } in self.pending
@@ -407,6 +412,7 @@ impl AdmissionPlan {
                 version: installation.version.clone(),
                 package_digest: installation.package_digest,
                 origin,
+                repository_generation,
                 package_dir: store.package_dir(installation.package_digest),
                 grants,
                 builds,
@@ -530,6 +536,7 @@ pub(crate) fn plan(
         pending.push(Pending {
             installation: installation.clone(),
             origin,
+            repository_generation: indexes.generation(&installation.enrolment),
             grants,
             builds,
         });
@@ -606,7 +613,7 @@ pub(crate) fn current_entry(
 /// The current index of each enrolment one computation reads, each read once.
 struct Indexes<'a> {
     root: &'a Path,
-    read: BTreeMap<EnrolmentKey, Option<CatalogueIndex>>,
+    read: BTreeMap<EnrolmentKey, Option<(u64, CatalogueIndex)>>,
 }
 
 impl<'a> Indexes<'a> {
@@ -630,7 +637,10 @@ impl<'a> Indexes<'a> {
                     key,
                     active: Some(active),
                     ..
-                }) => Some(Store::at(self.root, &key).index(&active)?),
+                }) => Some((
+                    active.generation,
+                    Store::at(self.root, &key).index(&active)?,
+                )),
                 _ => None,
             };
             self.read.insert(key.clone(), index);
@@ -639,7 +649,7 @@ impl<'a> Indexes<'a> {
             .read
             .get(key)
             .and_then(Option::as_ref)
-            .and_then(|index| {
+            .and_then(|(_, index)| {
                 index
                     .entries
                     .iter()
@@ -648,5 +658,14 @@ impl<'a> Indexes<'a> {
                     })
                     .cloned()
             }))
+    }
+
+    /// The generation of the enrolment's index that was read for it, or zero where it had none.
+    /// Called after [`Self::entry`] has read that enrolment.
+    fn generation(&self, key: &EnrolmentKey) -> u64 {
+        self.read
+            .get(key)
+            .and_then(Option::as_ref)
+            .map_or(0, |(generation, _)| *generation)
     }
 }

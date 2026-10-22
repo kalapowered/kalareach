@@ -257,6 +257,9 @@ pub struct Binding {
     pub rich_disabled: Option<String>,
     /// The release this binding holds, where it was made from admissions.
     pub release: Option<kr_protocol::admission::LiveRelease>,
+    /// The generation of its package's repository that the admissions it was made from carried,
+    /// where it was made from admissions.
+    pub repository_generation: Option<kr_protocol::ids::RepositoryGeneration>,
     /// True once the binding is due to end at its next admission boundary.
     pub ending: bool,
     /// The admissions frame it was bound at, or last changed at, where it was made from them.
@@ -1558,6 +1561,7 @@ impl Broker {
             actions: BTreeMap::new(),
             rich_disabled: None,
             release: None,
+            repository_generation: None,
             ending: false,
             frame: None,
             executable: None,
