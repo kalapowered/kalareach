@@ -732,6 +732,13 @@ async fn a_chain_whose_budget_ran_out_is_rearmed_from_the_command_line() {
         said.contains(&root_text) && said.contains("generation 2"),
         "{said}"
     );
+    // The generation it left is said before the request goes out, which is all a person has to
+    // repeat it with when the reply is lost.
+    let before_the_request = String::from_utf8_lossy(&shown.stderr);
+    assert!(
+        before_the_request.contains("--generation 1"),
+        "{before_the_request}"
+    );
 
     // The chain has budget now, and a chain the daemon holds nothing for has none to rearm.
     let live = host.refused(&["workflow", "rearm", &root_text, "--grant", &grant_text]);
