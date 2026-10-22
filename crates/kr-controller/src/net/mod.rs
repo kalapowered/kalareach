@@ -2261,6 +2261,26 @@ pub(crate) mod tests {
         (continuous, wall, clocks)
     }
 
+    /// Clocks for a test that stops a daemon and starts another in the same boot, and moves
+    /// neither clock: the machine's continuous clock, and a wall clock that starts at the
+    /// machine's reading and passes as the machine's boot clock does.
+    ///
+    /// A daemon that starts again in the boot it recorded an anchor in adds the boot clock's time
+    /// since to the anchor, and compares the result with the wall clock. A wall clock held still
+    /// is behind that by however long the runner took between the two starts, and past the
+    /// tolerance is a rollback: on a loaded machine a restart takes that long. A wall clock that
+    /// passes with the boot clock is never behind it, whatever the runner takes.
+    pub(in crate::service) fn clocks_that_pass_with_the_boot() -> crate::service::Clocks {
+        let began = kr_ipc::clock::boot_elapsed_ms();
+        let start = kr_ipc::now_ms().get();
+        crate::service::Clocks {
+            wall: crate::service::WallClock::from_fn(move || {
+                start + kr_ipc::clock::boot_elapsed_ms().saturating_sub(began)
+            }),
+            ..crate::service::Clocks::system()
+        }
+    }
+
     /// What a test daemon is started with, in the boot `boot_identity` names.
     pub(crate) fn setup(
         temp: &kr_ipc::testing::TempHost,
