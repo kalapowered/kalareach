@@ -506,8 +506,8 @@ pub struct WorkflowRearmArguments {
     #[arg(long)]
     pub grant: String,
     /// The budget generation the rearm leaves. Without it, the generation the chain is on when the
-    /// command reads it. Naming it makes a repeat of the command safe: a chain already past that
-    /// generation is told so and given no second budget.
+    /// command reads it. Naming it makes a repeat of the command safe: a chain already on the
+    /// generation after it is told so and given no second budget.
     #[arg(long)]
     pub generation: Option<u64>,
     /// The environment.
