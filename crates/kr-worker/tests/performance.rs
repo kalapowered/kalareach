@@ -99,7 +99,7 @@ async fn host() -> Host {
     .unwrap_or_else(|failure| panic!("the environment's task: {failure}"));
     #[cfg(windows)]
     let platform_supervisor: Box<dyn kr_controller::supervision::WorkerSupervisor> =
-        Box::new(task.supervisor(&environment));
+        task.product_supervisor(&environment);
     #[cfg(not(windows))]
     let platform_supervisor: Box<dyn kr_controller::supervision::WorkerSupervisor> =
         Box::new(DetachedSupervisor::new());

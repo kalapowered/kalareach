@@ -16,6 +16,12 @@
 //! that reaches a removable volume asks the person at the machine for permission; a test suite must
 //! never do that.
 
+// The helpers here read the process table with `/bin/ps`, and the host is started through the
+// detached start, which only a Unix host has; Windows starts a service through the environment's
+// scheduled task, which `crates/kr-controller/tests/plugin_runtime_service.rs` runs a plugin host
+// through on Windows.
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;

@@ -242,6 +242,11 @@ async fn run(
         Ok(identity)
     };
 
+    // The program the environment's scheduled task runs, which the Windows supervisor expects the
+    // task to name: the one the setup step registered. For a release of a store that is the
+    // store's own stable path, so that an update does not leave it naming a release that has gone;
+    // otherwise it is the daemon beside the programs this one is. No other supervisor reads it.
+    let daemon_program = running.stable(kr_ipc::install::Program::Controller);
     let worker_program = arguments.worker.unwrap_or_else(default_worker_program);
     let release = running.stated_release(RELEASE);
     let build_id = BuildId::new(format!("kr-controller/{release}"))?;
@@ -256,7 +261,7 @@ async fn run(
             identity: Box::new(open_identity),
             secret_store: selection,
             boot_identity: kr_ipc::identity::boot_identity()?,
-            supervisor: kr_controller::supervision::detect(),
+            supervisor: kr_controller::supervision::detect(&environment, &daemon_program),
             worker_program,
             build_id,
             release: release.to_owned(),

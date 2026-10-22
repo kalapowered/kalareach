@@ -200,8 +200,10 @@ pub fn platform_supervisor(
     }
     #[cfg(not(windows))]
     {
-        let _ = environment;
-        (kr_controller::supervision::detect(), None)
+        (
+            kr_controller::supervision::detect(environment, Path::new("kr-controller")),
+            None,
+        )
     }
 }
 

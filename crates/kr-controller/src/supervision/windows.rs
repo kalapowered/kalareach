@@ -1630,7 +1630,7 @@ mod launching {
 
     use super::{Standing, TaskDefinition, run, standing};
     use crate::supervision::{
-        LaunchOutcome, RunFailure, ServiceLaunch, TASK_SCHEDULER_BOUND, WorkerLaunch,
+        LaunchOutcome, Readiness, RunFailure, ServiceLaunch, TASK_SCHEDULER_BOUND, WorkerLaunch,
         WorkerSupervisor,
     };
 
@@ -2016,6 +2016,34 @@ mod launching {
             "the environment's scheduled task, whose starter creates each worker outside this \
              daemon's jobs"
         }
+
+        fn readiness(&self) -> Readiness {
+            let found = match standing(&self.expected) {
+                Ok(Standing::Owned(differences)) if differences.is_empty() => {
+                    return Readiness::Ready;
+                }
+                Ok(Standing::Owned(_)) => {
+                    "the environment's scheduled task is not the one this installation registers, \
+                     so no worker can be started"
+                }
+                Ok(Standing::Absent) => {
+                    "the environment has no scheduled task to start workers, so none can be started"
+                }
+                Ok(Standing::Foreign(_)) => {
+                    "the scheduled task under this environment's name is not this installation's, \
+                     so no worker can be started"
+                }
+                Err(_) => {
+                    "the Task Scheduler could not be read, so whether a worker can be started is \
+                     not known"
+                }
+            };
+            Readiness::Unavailable {
+                found,
+                remedy: "Run kr host startup --set standalone, which registers or repairs the \
+                         environment's task.",
+            }
+        }
     }
 
     /// How long a starter looks for a waiting launch before it looks for a start claim.
@@ -2287,7 +2315,7 @@ pub mod testing {
             environment: &EnvironmentPaths,
         ) -> Box<dyn crate::supervision::WorkerSupervisor> {
             if self.definition.logon == LogonType::InteractiveToken {
-                crate::supervision::detect()
+                crate::supervision::detect(environment, &self.definition.starter)
             } else {
                 Box::new(self.supervisor(environment))
             }
@@ -2309,7 +2337,7 @@ pub mod testing {
     ) -> Result<Box<dyn crate::supervision::WorkerSupervisor>, String> {
         let expected = definition(environment, starter)?;
         Ok(if expected.logon == LogonType::InteractiveToken {
-            crate::supervision::detect()
+            crate::supervision::detect(environment, starter)
         } else {
             Box::new(TaskSupervisor::for_definition(
                 environment.clone(),
