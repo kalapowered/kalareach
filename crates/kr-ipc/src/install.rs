@@ -247,6 +247,18 @@ pub fn this_process() -> std::result::Result<&'static Running, &'static InstallE
         .as_ref()
 }
 
+/// Which environment this process's measurements are taken in: a released build, which runs from a
+/// release in the install store, or any other build. A host never reports a staging environment,
+/// which is a deployment of the service and not something a host is.
+#[must_use]
+pub fn measured_environment() -> kr_protocol::metrics::Environment {
+    if this_process().ok().and_then(Running::store).is_some() {
+        kr_protocol::metrics::Environment::Production
+    } else {
+        kr_protocol::metrics::Environment::Development
+    }
+}
+
 /// Returns the forwarder a package registers, by the path an update keeps current, where one is
 /// installed: the `kr-hook` of this process's installation through its store's `current` link, and
 /// beside this process's own program for a build outside a store.
