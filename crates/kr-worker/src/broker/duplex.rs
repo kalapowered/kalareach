@@ -41,6 +41,7 @@ use kr_protocol::gateway::{PendingState, ReverseOperation};
 use kr_protocol::ids::{
     ApplicationInstanceId, GatewayConnectionId, PendingResourceId, UpstreamRequestId,
 };
+use kr_protocol::metrics::{Adapter, Outcome};
 use kr_protocol::scalars::TimestampMs;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
@@ -1201,6 +1202,29 @@ pub struct Dispatch {
     params_field: String,
     request_id_field: String,
     method_field: String,
+    /// Where this connection's adapter failures are counted, when its package is a bundled one.
+    counted: Option<Counted>,
+}
+
+/// Where the failures of one connection's adapter are counted for the host's own metrics.
+#[derive(Clone, Debug)]
+struct Counted {
+    broker: Arc<Broker>,
+    adapter: Adapter,
+}
+
+impl Counted {
+    /// The adapter a connection's package is, where it is one the product bundles.
+    fn of(broker: &Arc<Broker>, connection: &crate::broker::gateway::Connection) -> Option<Self> {
+        Adapter::of_package(connection.table.plugin_id.as_str()).map(|adapter| Self {
+            broker: Arc::clone(broker),
+            adapter,
+        })
+    }
+
+    fn failed(&self, outcome: Outcome) {
+        self.broker.adapter_failed(self.adapter, outcome);
+    }
 }
 
 /// What a connection writes for one prepared request of the core's own.
@@ -1228,6 +1252,13 @@ fn class_rights(
 }
 
 impl Dispatch {
+    /// Counts one failure of this connection's adapter, where its package is a bundled one.
+    fn failed(&self, outcome: Outcome) {
+        if let Some(counted) = &self.counted {
+            counted.failed(outcome);
+        }
+    }
+
     /// Returns the connection this dispatch writes to.
     #[must_use]
     pub const fn connection(&self) -> GatewayConnectionId {
@@ -1561,15 +1592,26 @@ impl Dispatch {
         // The waiter is registered before the bytes are queued. Registering it afterwards would
         // leave a window in which the upstream's answer arrived and nothing was listening for it.
         let answered = self.outstanding.expect(&upstream_request_id);
-        let queued = self.upstream.queue(&body)?;
+        let queued = self
+            .upstream
+            .queue(&body)
+            .inspect_err(|_| self.failed(Outcome::Unavailable))?;
         let turn_id = request.turn_id.clone();
+        let counted = self.counted.clone();
+        let failed = move |outcome| {
+            if let Some(counted) = &counted {
+                counted.failed(outcome);
+            }
+        };
         Ok(PendingTransmission::carried(async move {
             if let Some(refusal) = queued.delivered().await.refusal() {
+                failed(Outcome::Unavailable);
                 return Err(refusal);
             }
             // The bytes went. What the upstream did with them is the upstream's to say, and until
             // it says so the operation is not one this host can record as applied.
             let Some(reply) = answered.within(ACKNOWLEDGEMENT_DEADLINE).await else {
+                failed(Outcome::Timeout);
                 return Err(BrokerError::UpstreamUnavailable {
                     detail: format!(
                         "the operation reached the upstream and it did not answer within {} \
@@ -1605,6 +1647,7 @@ impl Dispatch {
 impl UpstreamDispatch for Dispatch {
     fn admit(&self, request: &UpstreamRequest) -> Result<()> {
         if self.upstream.is_closed() {
+            self.failed(Outcome::Unavailable);
             return Err(BrokerError::UpstreamUnavailable {
                 detail: "this connection has stopped taking frames".to_owned(),
             });
@@ -1650,6 +1693,7 @@ impl UpstreamDispatch for Dispatch {
 
     fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission> {
         if self.upstream.is_closed() {
+            self.failed(Outcome::Unavailable);
             return Err(BrokerError::UpstreamUnavailable {
                 detail: "this connection has stopped taking frames".to_owned(),
             });
@@ -1892,6 +1936,8 @@ impl Duplex {
                 break;
             }
             for (id, client) in held.outstanding.expired() {
+                held.counted()
+                    .inspect(|counted| counted.failed(Outcome::Timeout));
                 held.refuse_to_client(&id, &client, "the upstream did not answer this request");
             }
             let stopping = Arc::clone(&held.stopping);
@@ -1952,6 +1998,12 @@ impl Duplex {
         self.connection
     }
 
+    /// Where this connection's adapter failures are counted, when its package is a bundled one.
+    fn counted(&self) -> Option<Counted> {
+        let connection = self.broker.connection(self.connection)?;
+        Counted::of(&self.broker, &connection)
+    }
+
     /// Returns what carries prepared operations to this connection's upstream.
     ///
     /// # Errors
@@ -1970,6 +2022,7 @@ impl Duplex {
             params_field: connection.table.params_field.clone(),
             request_id_field: connection.table.request_id_field.clone(),
             method_field: connection.table.method_field.clone(),
+            counted: Counted::of(&self.broker, &connection),
         }))
     }
 
@@ -3341,6 +3394,13 @@ mod tests {
     /// rich table. The second value keeps the transport's queue open while it is held.
     fn named_dispatch() -> (Dispatch, impl std::future::Future<Output = ()> + Send) {
         let (upstream, _client) = tokio::io::duplex(64 * 1024);
+        named_dispatch_over(upstream)
+    }
+
+    /// The same, over a stream the caller holds the other end of.
+    fn named_dispatch_over(
+        upstream: tokio::io::DuplexStream,
+    ) -> (Dispatch, impl std::future::Future<Output = ()> + Send) {
         let (sink, writes) = sink(
             Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
             upstream,
@@ -3357,6 +3417,7 @@ mod tests {
                 params_field: "params".to_owned(),
                 request_id_field: "id".to_owned(),
                 method_field: "method".to_owned(),
+                counted: None,
             },
             writes,
         )
@@ -3543,5 +3604,91 @@ mod tests {
             "and there is no validated plan to carry"
         );
         assert_eq!(dispatch.upstream.queued_bytes(), 0, "nothing was written");
+    }
+
+    /// A dispatch that counts its adapter's failures in a broker of its own, and the broker.
+    fn counting(mut dispatch: Dispatch) -> (Dispatch, Arc<Broker>) {
+        let broker = Arc::new(
+            Broker::open(
+                None,
+                kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+                crate::persistence::fault::JournalHealth::shared(),
+            )
+            .expect("the broker opens"),
+        );
+        dispatch.counted = Some(Counted {
+            broker: Arc::clone(&broker),
+            adapter: Adapter::Codex,
+        });
+        (dispatch, broker)
+    }
+
+    /// What the broker has counted of its adapters' failures, as adapter, outcome and count.
+    fn failures_counted(broker: &Broker) -> Vec<(Adapter, Outcome, u64)> {
+        broker
+            .metrics()
+            .adapter_failure
+            .iter()
+            .map(|series| (series.adapter, series.outcome, series.count.get()))
+            .collect()
+    }
+
+    /// KR-REQ-26.43: an operation refused because its adapter's connection has stopped taking
+    /// frames is one failure of that adapter, counted as unavailable.
+    #[test]
+    fn kr_req_26_43_a_connection_that_stopped_taking_frames_is_an_unavailable_adapter() {
+        use kr_protocol::broker::PreparedOperation;
+        let (dispatch, _writes) = named_dispatch();
+        let (dispatch, broker) = counting(dispatch);
+        dispatch.upstream.close();
+        dispatch
+            .admit(&named_action(
+                "turn.cancel",
+                Some(PreparedOperation::UpstreamCancel),
+            ))
+            .expect_err("a connection that has stopped taking frames carries nothing");
+        assert_eq!(
+            failures_counted(&broker),
+            vec![(Adapter::Codex, Outcome::Unavailable, 1)]
+        );
+    }
+
+    /// KR-REQ-26.43: a frame that could not reach the adapter at all is counted as unavailable,
+    /// and an adapter that took the request and never answered it as a timeout.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_26_43_a_request_that_does_not_reach_or_is_not_answered_by_its_adapter_is_counted()
+     {
+        use kr_protocol::broker::PreparedOperation;
+        let cancel = || named_action("turn.cancel", Some(PreparedOperation::UpstreamCancel));
+
+        // Nothing holds the other end, so the frame cannot be written.
+        let (gone, _) = tokio::io::duplex(64 * 1024);
+        let (dispatch, writes) = named_dispatch_over(gone);
+        let (dispatch, broker) = counting(dispatch);
+        let transmission = dispatch.submit(&cancel()).expect("the frame is queued");
+        tokio::spawn(writes);
+        transmission
+            .outcome()
+            .await
+            .expect_err("a frame nothing can read is not carried");
+        assert_eq!(
+            failures_counted(&broker),
+            vec![(Adapter::Codex, Outcome::Unavailable, 1)]
+        );
+
+        // The other end reads and never answers.
+        let (upstream, _peer) = tokio::io::duplex(64 * 1024);
+        let (dispatch, writes) = named_dispatch_over(upstream);
+        let (dispatch, broker) = counting(dispatch);
+        let transmission = dispatch.submit(&cancel()).expect("the frame is queued");
+        tokio::spawn(writes);
+        transmission
+            .outcome()
+            .await
+            .expect_err("an upstream that does not answer is not one that acted");
+        assert_eq!(
+            failures_counted(&broker),
+            vec![(Adapter::Codex, Outcome::Timeout, 1)]
+        );
     }
 }

@@ -887,6 +887,9 @@ pub struct Broker {
     component_calls: Arc<prepare::ComponentCalls>,
     /// What this worker asks the control daemon about drafts.
     drafts: Arc<crate::daemon_link::Drafts>,
+    /// How many times each bundled adapter has failed to answer, and how: the failures the host
+    /// reports about itself.
+    adapter_failures: kr_protocol::metrics::Recorder,
     /// Where the next recovery stops before it writes the gap, for this host's own tests.
     #[cfg(feature = "testing")]
     recovery_pause: Mutex<Option<RecoveryPause>>,
@@ -1027,6 +1030,9 @@ impl Broker {
             description_facts: std::sync::OnceLock::new(),
             component_calls: Arc::new(prepare::ComponentCalls::new()),
             drafts: Arc::new(crate::daemon_link::Drafts::new()),
+            adapter_failures: kr_protocol::metrics::Recorder::new(
+                kr_ipc::install::measured_environment(),
+            ),
             #[cfg(feature = "testing")]
             recovery_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
