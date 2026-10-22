@@ -37,7 +37,11 @@
 #   bash lead-scripts/with-slot.sh <label> bash lead-scripts/with-device.sh <label> \
 #     scripts/e2e-android-release.sh [--without-keep-rule]
 #
-# KR_RELEASE_APK names a signed package to install instead of making one.
+# KR_RELEASE_APK names a signed package to install instead of making one. KR_RELEASE_NO_DEPLOYED=1 leaves
+# out the attempt at the deployed service, for a run that is about the local control alone.
+# KR_RELEASE_PUBLIC_ORIGIN=https://example.com adds an attempt through that public origin, whose
+# certificate the system trusts and which offers no pairing: the phone says so only when its verifier
+# accepted the certificate, so it is a positive control for the verifier. Off by default.
 #
 # Exit codes: 0 every check passed, 2 bad usage or a failed check, 3 the device is not available.
 set -uo pipefail
@@ -55,6 +59,9 @@ esac
 . "$here/scripts/lib/android-avd.sh"
 
 artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/release-tls-android"
+# The packages (about 95 MB each) are kept on the internal disk, not with the run's records.
+cache="${HOME}/Library/Caches/kalareach-tests/release-tls"
+mkdir -p "${cache:?}"
 shots="${KR_PAIRING_SHOTS:-/tmp/kr-pair-phone}"
 mkdir -p "${artefacts:?}" "${shots:?}"
 app_id=to.kala.reach
@@ -133,8 +140,8 @@ if [ -z "$apk" ]; then
     [ -z "$rules_saved" ] || { cp "$rules_saved" "$rules"; rules_saved=""; }
     unsigned="$companion/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk"
     [ -f "$unsigned" ] || { say "there is no release package at $unsigned"; exit 2; }
-    aligned="$artefacts/aligned.apk"
-    apk="$artefacts/release-signed.apk"
+    aligned="$cache/aligned.apk"
+    apk="$cache/release-signed.apk"
     rm -f "${aligned:?}" "${apk:?}"
     # 16 KB pages: the native code is aligned to them in the package, as the build itself aligns it.
     "$tools/zipalign" -P 16 -f 4 "$unsigned" "$aligned" \
@@ -223,6 +230,9 @@ say "the server is up on port $port"
 
 # ---- The run ---------------------------------------------------------------------------------
 
+# What the emulator reaches the deployed service by, for whoever reads a failure.
+"$adb" -s "$serial" shell ping -c 1 -W 3 reach.kala.to >"$artefacts/network.txt" 2>&1
+
 say "driving the application"
 out="$artefacts/driver.log"
 status=0
@@ -230,6 +240,9 @@ python3 "$here/scripts/lib/pairing-android.py" release "$adb" "$serial" "$harnes
     >"$out" 2>&1 || status=$?
 sed 's/^/    /' "$out" | tee -a "$log"
 "$adb" -s "$serial" logcat -d -b crash >"$artefacts/crash.log" 2>&1
+"$adb" -s "$serial" logcat -d 2>/dev/null | grep -v -E 'CompositionEngine|AccessibilityNodeInfoDumper|nativeloader|FeatureFlagsImplExport|AconfigPackage' | tail -6000 >"$artefacts/logcat.log"
+# What the application's native half printed to its standard streams.
+"$adb" -s "$serial" logcat -d -s RustStdoutStderr 2>/dev/null >"$artefacts/application.log"
 
 # What the server saw: judged from its own record, never from what the phone's screen said.
 record="$harness/tls-control.json"
@@ -263,7 +276,9 @@ else
     say "check=the phone refused the untrusted issuer after the server's hello, and no request arrived ok=0 detail=$verdict"
     status=2
 fi
-for check in "the application admitted the attempt at the deployed service" "the application could not reach the local server"; do
+checks=("the application admitted the attempt at the deployed service" "the application could not reach the local server")
+[ "${KR_RELEASE_NO_DEPLOYED:-}" != 1 ] || checks=("the application could not reach the local server")
+for check in "${checks[@]}"; do
     if grep -q -F "RELEASE-TLS $check" "$out"; then
         say "check=$check ok=1"
     else
@@ -271,4 +286,12 @@ for check in "the application admitted the attempt at the deployed service" "the
         status=2
     fi
 done
+if [ -n "${KR_RELEASE_PUBLIC_ORIGIN:-}" ]; then
+    if grep -q -E "RELEASE-TLS public control .*: not_pairing" "$out"; then
+        say "check=the verifier accepted the certificate of ${KR_RELEASE_PUBLIC_ORIGIN} ok=1"
+    else
+        say "check=the verifier accepted the certificate of ${KR_RELEASE_PUBLIC_ORIGIN} ok=0 detail=$(grep 'public control' "$out" | head -1)"
+        status=2
+    fi
+fi
 [ "$status" = 0 ] || exit 2
