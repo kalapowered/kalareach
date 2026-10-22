@@ -179,6 +179,12 @@ fn decide(
     if gateway_origin != pending.gateway_origin {
         return Verdict::Refused("origin");
     }
+    // The challenge says when the gateway stops taking an answer to it. An answer after that is
+    // refused by the gateway, and a refusal ends the registration, so a challenge that has lapsed
+    // is left alone and the registration waits for a fresh one.
+    if now_ms >= expires_at_ms.get() {
+        return Verdict::Refused("expired");
+    }
     Verdict::Answer(Box::new(Challenge {
         challenge,
         expires_at_ms,
@@ -527,11 +533,17 @@ mod tests {
 
     /// The data a gateway sends for the vector's challenge, as a provider carries it: strings.
     fn challenge_data() -> BTreeMap<String, String> {
+        // The gateway's challenge lives five minutes from when it is sent.
+        challenge_data_expiring(now_ms() + 300_000)
+    }
+
+    /// As [`challenge_data`], for a challenge the gateway stops taking an answer to at `expires`.
+    fn challenge_data_expiring(expires: u64) -> BTreeMap<String, String> {
         let payload = serde_json::to_value(vector_answer().payload).expect("a payload");
         let text = |key: &str| payload[key].as_str().expect("a string").to_owned();
         BTreeMap::from([
             (CHALLENGE_KEY.to_owned(), text("challenge")),
-            (EXPIRES_KEY.to_owned(), text("expires_at_ms")),
+            (EXPIRES_KEY.to_owned(), expires.to_string()),
             (REGISTRATION_KEY.to_owned(), text("registration_id")),
             (TOKEN_DIGEST_KEY.to_owned(), text("token_digest")),
             (ORIGIN_KEY.to_owned(), text("gateway_origin")),
@@ -614,6 +626,7 @@ mod tests {
         // The statement is the vector's challenge, for this installation and the pending platform.
         let expected = PushRegistrationAnswerPayload {
             installation_id: installation_id(key.public()),
+            expires_at_ms: TimestampMs::new(data[EXPIRES_KEY].parse().expect("a time")),
             ..vector_answer().payload
         };
         assert_eq!(answer.payload, expected);
@@ -693,6 +706,8 @@ mod tests {
             ORIGIN_KEY.to_owned(),
             "https://elsewhere.example".to_owned(),
         );
+        let mut lapsed = data.clone();
+        lapsed.insert(EXPIRES_KEY.to_owned(), (now - 1).to_string());
         let mut malformed = data.clone();
         malformed.insert(CHALLENGE_KEY.to_owned(), "not a challenge".to_owned());
         let mut answered = pending.clone();
@@ -703,8 +718,9 @@ mod tests {
             &BTreeMap<String, String>,
             Option<&PendingRegistration>,
             u64,
-        ); 8] = [
+        ); 9] = [
             ("registration", &other_registration, Some(&pending), now),
+            ("expired", &lapsed, Some(&pending), now),
             ("token", &other_token, Some(&pending), now),
             ("origin", &other_origin, Some(&pending), now),
             ("malformed", &malformed, Some(&pending), now),
@@ -754,8 +770,8 @@ mod tests {
     fn a_clock_the_gateway_would_refuse_and_a_missing_key_leave_the_challenge_unanswered() {
         let keys = DeviceKeys::generate().expect("keys");
         let now = now_ms();
-        let data = challenge_data();
         let far_off = now + 10 * 60 * 1000;
+        let data = challenge_data_expiring(far_off + 60_000);
         let pending = pending(far_off + 60_000);
         let signed: Value = serde_json::from_str(&sign_with(
             &input(&data, Some(&pending), far_off),
