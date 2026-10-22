@@ -14,7 +14,7 @@
 //! | --- | --- |
 //! | KR-REQ-06.07 | an upstream frame the worker offers reaches the binding's component with its bytes, its provenance and the request identifier it carried, once and in order, and the handle is the broker's own for a request the upstream is waiting on |
 //! | KR-REQ-11.01 | the same run, through a vendor component that needed no core release; the binding's other bindings, a binding without the stream, another package's binding and a rich-disabled binding are offered nothing, a frame the table does not list and one it lists as a credential are offered to nobody |
-//! | KR-REQ-11.38 | a lane that is full loses the oldest observations it holds, counts them, takes a fresh snapshot of the component, and never loses the request the upstream is waiting on; an observation that never returns is stopped by its bound and named; three faults in a minute disable the binding while the native terminal goes on; a snapshot that never returns is stopped by its bound and named |
+//! | KR-REQ-11.38 | a lane that is full loses the oldest observations it holds, counts them, takes a fresh snapshot of the component, and never loses the request the upstream is waiting on; an observation that never returns is stopped by its bound and named; an observation that asks for more memory or produces more output than a call may is refused and named; three faults in a minute disable the binding while the native terminal goes on; a snapshot that never returns is stopped by its bound and named |
 //! | KR-REQ-11.39 | the terminal drains and its questions are answered while the worker's observation pump is held, and while the plugin runtime has stopped reading what is handed to it; the worker lets go of that runtime and takes the component up again when it reads |
 //! | KR-REQ-11.40 | an observation the component never returns from is stopped by fuel when its deadline cannot fire, and named so |
 //! | KR-REQ-11.41 | a component that was compiled when it was registered is observed without a fault, the compile outside the observation's deadline |
@@ -383,6 +383,44 @@ async fn kr_req_11_40_with_no_deadline_to_fire_fuel_stops_an_observation_that_ne
         !reason.contains("deadline"),
         "fuel is not reported as a deadline: {reason}"
     );
+}
+
+/// KR-REQ-11.38: an observation that asks for more linear memory than the call's bound allows is
+/// refused, the report names the memory as what ran out, and the binding goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_38_an_observation_that_asks_for_more_memory_than_its_bound_is_refused_and_named()
+{
+    let Some(world) = Observing::start(Options::with(vec![
+        Spec::semantic_only(1).shipping("memory-hog"),
+    ]))
+    .await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    world.send(&notification("one"));
+    let reason = world.until_reason(1, "last fault, in observe").await;
+    assert!(reason.contains("linear memory"), "{reason}");
+    assert!(world.broker().rich_disabled(binding(1)).is_none());
+}
+
+/// KR-REQ-11.38: an observation that produces more output than one call may is refused, the report
+/// names the output budget, and the binding goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_38_an_observation_that_produces_more_than_its_output_budget_is_refused_and_named()
+ {
+    let Some(world) = Observing::start(Options::with(vec![
+        Spec::semantic_only(1).shipping("oversized-output"),
+    ]))
+    .await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    world.send(&notification("one"));
+    let reason = world.until_reason(1, "last fault, in observe").await;
+    assert!(reason.contains("output budget"), "{reason}");
+    assert!(world.broker().rich_disabled(binding(1)).is_none());
 }
 
 /// KR-REQ-11.38 and KR-ACC-016: three faults in a minute disable the binding, with the last fault's
