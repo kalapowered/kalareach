@@ -5332,3 +5332,427 @@ async fn a_replacement_under_another_account_sends_nothing_for_the_earlier_archi
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The host's backups under another computer's own recovery.
+// ---------------------------------------------------------------------------------------------
+
+/// A computer of the owner's that keeps a recovery seed, and a bundle of its own at the service, as
+/// the companion does.
+struct Computer {
+    seed: kr_crypto::kdf::RecoverySeed,
+    context: kr_protocol::archive::RecoveryContext,
+    bundles: kr_client::recovery::BundleStore,
+    _records: tempfile::TempDir,
+}
+
+impl Computer {
+    /// Recovery turned on at the service the rig's host uses: a seed, and the first bundle.
+    async fn with_recovery_on(rig: &Rig) -> Self {
+        let seed = kr_crypto::kdf::RecoverySeed::generate().expect("a seed");
+        let context = kr_protocol::archive::RecoveryContext {
+            service_origin: rig.origin(),
+            bundle_locator: kr_client::recovery::fresh_locator().expect("a locator"),
+        };
+        let records = tempfile::tempdir().expect("a directory for the store's record");
+        let origin = GatewayOrigin::new(rig.served.origin()).expect("the service's origin");
+        let http = HttpService::with(
+            origin.clone(),
+            kr_client::services::HttpDeadlines::default(),
+            managed_response_limits(),
+        )
+        .expect("a transport");
+        let service = kr_client::services::ManagedSyncService::new(
+            origin,
+            Arc::new(http),
+            Arc::new(Owner {
+                key: AuthorisationKeyPair::generate().expect("a key"),
+            }),
+        )
+        .presenting(
+            Arc::new(Bearer(TOKEN.to_owned())),
+            kr_client::services::account::BACKUP_WRITE_SCOPE,
+        );
+        let mut bundles = kr_client::recovery::BundleStore::open(
+            Arc::new(service),
+            context.clone(),
+            records.path(),
+        )
+        .expect("a bundle store");
+        let now = kr_ipc::now_ms();
+        bundles
+            .commit(
+                &seed,
+                &mut kr_client::recovery::BundleStore::empty(now),
+                now,
+            )
+            .await
+            .expect("the first bundle");
+        Self {
+            seed,
+            context,
+            bundles,
+            _records: records,
+        }
+    }
+
+    /// The fingerprint of this computer's kit.
+    fn fingerprint(&self) -> String {
+        kr_client::recovery::kit_fingerprint(self.seed.recipient().expect("a recipient").public())
+    }
+
+    /// The bundle at the service, opened with this computer's kit and nothing else.
+    fn bundle_at(&self, rig: &Rig) -> kr_protocol::archive::RecoveryBundle {
+        let sealed = rig
+            .served
+            .web()
+            .bundle(&self.context.bundle_locator)
+            .expect("the service holds the bundle");
+        let key = self.seed.bundle_key_for(&self.context).expect("a key");
+        kr_crypto::archive::decrypt_recovery_bundle(&key, &sealed)
+            .expect("the kit opens the bundle")
+    }
+
+    /// What `generation` of `archive` holds, opened as a restore holding only this computer's kit
+    /// opens it: the writer and the producer are those the bundle names, and the key is the kit's.
+    fn opens(
+        &self,
+        rig: &Rig,
+        archive: ArchiveId,
+        generation: u64,
+    ) -> std::collections::BTreeMap<String, Vec<u8>> {
+        use kr_crypto::backup::{ArchiveExpectation, ArchiveReader, GenerationExpectation};
+
+        let bundle = self.bundle_at(rig);
+        assert!(
+            bundle
+                .collections
+                .iter()
+                .any(|collection| collection.archive_id == archive),
+            "the bundle names the archive"
+        );
+        let writers: Vec<TrustedWriter> = bundle.trusted_writers.iter().cloned().collect();
+        let producer = bundle
+            .trusted_producers
+            .iter()
+            .next()
+            .expect("the bundle names the host's producer")
+            .stored_envelope_key;
+        let recipient = self.seed.recipient().expect("a recipient");
+        let reader = ArchiveReader::Recovery(&recipient);
+        let record = rig
+            .controller
+            .backup()
+            .generation(archive, BackupGeneration::new(generation))
+            .expect("a read")
+            .expect("the generation");
+        let descriptor_bytes = record.descriptor.expect("a descriptor");
+        let descriptor =
+            kr_protocol::archive::ArchiveDescriptor::from_canonical_bytes(&descriptor_bytes)
+                .expect("a descriptor");
+        let web = rig.served.web();
+        let stored = |object: BackupObjectId| {
+            web.stored(&archive.to_string(), &object.to_string())
+                .expect("the service holds the object")
+        };
+        let opened = kr_crypto::backup::open_archive(
+            &reader,
+            &producer,
+            &writers,
+            &ArchiveExpectation {
+                archive_id: archive,
+                generation: GenerationExpectation::Unverified,
+            },
+            &descriptor_bytes,
+            &stored(descriptor.encrypted_manifest.object_id),
+        )
+        .expect("this computer's kit opens the generation");
+        opened
+            .objects()
+            .iter()
+            .map(|entry| {
+                let restored = opened
+                    .restore_object(
+                        &reader,
+                        &producer,
+                        entry.object.object_id,
+                        &stored(entry.object.object_id),
+                    )
+                    .expect("a member opens");
+                (entry.filename.clone(), restored.plaintext.expose().to_vec())
+            })
+            .collect()
+    }
+}
+
+/// The host on this machine, reached the way the owner's application reaches it.
+async fn the_host_as_the_application_reaches_it(rig: &Rig) -> kr_client::recovery::SessionHost {
+    let transport = kr_client::ipc::IpcTransport::connect_app(&rig.client_endpoint, build())
+        .await
+        .expect("the application connects");
+    let environment_id = transport.context().environment_id;
+    let session = kr_client::Session::start(transport.shared()).expect("a session");
+    kr_client::recovery::SessionHost::new(Arc::new(session), environment_id)
+}
+
+/// KR-REQ-20.15: a computer that covers the host's backups with its own recovery commits its bundle
+/// naming the host's archive, producer and writer, and then the host is set up under that
+/// computer's recovery: the generation the host makes afterwards opens with that computer's kit
+/// alone. A host already covered is sent nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_kit_of_a_computer_that_covers_the_host_opens_what_the_host_makes_after_it() {
+    use kr_client::recovery::{HostCover, cover_host_archive};
+
+    let timer = HeldTimer::held();
+    let (rig, session) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let mut computer = Computer::with_recovery_on(&rig).await;
+    let host = the_host_as_the_application_reaches_it(&rig).await;
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
+
+    let covered = cover_host_archive(
+        &host,
+        &mut computer.bundles,
+        &computer.seed,
+        false,
+        kr_ipc::now_ms(),
+    )
+    .await
+    .expect("the host is covered");
+    let HostCover::Covered(covered) = covered else {
+        panic!("the host was left: {covered:?}");
+    };
+    assert!(!covered.already);
+    assert_eq!(covered.replaced, None);
+    assert_eq!(covered.kit_fingerprint, computer.fingerprint());
+
+    // The host records the setup under this computer's recipient, for the archive the bundle names.
+    let row = rig
+        .controller
+        .backup()
+        .setup()
+        .expect("a read")
+        .expect("a setup");
+    assert_eq!(row.record.archive_id, covered.archive_id);
+    assert_eq!(row.record.kit_fingerprint, computer.fingerprint());
+    let bundle = computer.bundle_at(&rig);
+    assert_eq!(bundle.revision.get(), covered.bundle_revision);
+    assert!(
+        bundle
+            .trusted_writers
+            .iter()
+            .any(|writer| writer.writer_key_id == rig.writer.key_id())
+    );
+
+    // The host backs up, and this computer's kit alone opens it.
+    rig.until("the host's first generation is published", |rig| {
+        rig.published_of(covered.archive_id) > 0
+    })
+    .await;
+    let members = computer.opens(&rig, covered.archive_id, 1);
+    assert!(members.contains_key(&format!("sessions/{session}.json")));
+
+    // Covered already: the host is sent nothing, and the bundle is not written again.
+    rig.carrier_passes(2).await;
+    let asked = web.arrived().len();
+    let written = web.bundle_write(&computer.context.bundle_locator);
+    let again = cover_host_archive(
+        &host,
+        &mut computer.bundles,
+        &computer.seed,
+        false,
+        kr_ipc::now_ms(),
+    )
+    .await
+    .expect("the host is still covered");
+    let HostCover::Covered(again) = again else {
+        panic!("the host was left: {again:?}");
+    };
+    assert!(again.already);
+    assert_eq!(again.archive_id, covered.archive_id);
+    assert_eq!(
+        web.bundle_write(&computer.context.bundle_locator),
+        written,
+        "the bundle already names the archive"
+    );
+    assert!(
+        rig.requested_since(asked)
+            .iter()
+            .all(|path| path == STATUS || path == SYNC),
+        "the host's status reads what the account holds and this computer reads its bundle; no \
+         enrolment and no retention change follows"
+    );
+}
+
+/// KR-REQ-20.15: a host set up under another kit keeps its archive and its recipient, so nothing is
+/// declared and nothing is sent unless a replacement is asked for by name; a replacement starts a
+/// new archive under this computer's recovery, and the earlier archive keeps what it holds and
+/// stays readable with its own kit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_set_up_under_another_kit_is_covered_only_by_a_replacement_asked_for() {
+    use kr_client::recovery::{HostCover, Left, cover_host_archive};
+
+    let timer = HeldTimer::held();
+    let mut closed = None;
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        closed = Some(closed_session(host, b"before the cover\r\n", 9_000));
+    })
+    .await;
+    let session = closed.expect("a closed session");
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+    rig.until("the first generation is published", |rig| rig.published(1))
+        .await;
+    let earlier_kit = kr_client::recovery::kit_fingerprint(rig.device.public());
+
+    let mut computer = Computer::with_recovery_on(&rig).await;
+    let host = the_host_as_the_application_reaches_it(&rig).await;
+    let setup_before = rig.controller.backup().setup().expect("a read");
+    let written = web.bundle_write(&computer.context.bundle_locator);
+    rig.carrier_passes(2).await;
+    let asked = web.arrived().len();
+
+    // Not asked for: the host is left as it is, and the answer names the kit it is set up under.
+    let left = cover_host_archive(
+        &host,
+        &mut computer.bundles,
+        &computer.seed,
+        false,
+        kr_ipc::now_ms(),
+    )
+    .await
+    .expect("an answer");
+    assert_eq!(
+        left,
+        HostCover::Left(Left::OtherKit {
+            host_fingerprint: earlier_kit.clone()
+        })
+    );
+    assert_eq!(
+        rig.controller.backup().setup().expect("a read"),
+        setup_before
+    );
+    assert_eq!(web.bundle_write(&computer.context.bundle_locator), written);
+    assert!(
+        rig.requested_since(asked).iter().all(|path| path == STATUS),
+        "the host's status reads what the account holds and the host sends nothing else"
+    );
+
+    // Asked for: a new archive under this computer's recovery.
+    let covered = cover_host_archive(
+        &host,
+        &mut computer.bundles,
+        &computer.seed,
+        true,
+        kr_ipc::now_ms(),
+    )
+    .await
+    .expect("the host is covered");
+    let HostCover::Covered(covered) = covered else {
+        panic!("the host was left: {covered:?}");
+    };
+    assert_eq!(covered.replaced, Some(earlier_kit));
+    assert_ne!(covered.archive_id, archive_id());
+    rig.until("the new archive's first generation is published", |rig| {
+        rig.published_of(covered.archive_id) > 0
+    })
+    .await;
+    let members = computer.opens(&rig, covered.archive_id, 1);
+    assert!(members.contains_key(&format!("sessions/{session}.json")));
+
+    // The earlier archive keeps what it published, readable with its own kit, and this computer's
+    // bundle does not list it.
+    assert!(rig.published(1));
+    assert!(
+        opened_members_as(
+            &rig,
+            1,
+            &kr_crypto::backup::ArchiveReader::Device(&rig.device)
+        )
+        .contains_key(&format!("sessions/{session}.json"))
+    );
+    assert!(
+        computer
+            .bundle_at(&rig)
+            .collections
+            .iter()
+            .all(|collection| collection.archive_id != archive_id())
+    );
+}
+
+/// A host that carried the setup out and whose answer was lost is found set up on the next try,
+/// which sends it nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_setup_whose_answer_was_lost_is_found_by_the_next_try_which_sends_nothing() {
+    use kr_client::recovery::{
+        HostBackups, HostCover, RecoveryError, SessionHost, cover_host_archive,
+    };
+
+    /// A host that does what it is asked and then does not say so.
+    #[derive(Debug)]
+    struct Silent(SessionHost);
+
+    impl HostBackups for Silent {
+        fn status(&self) -> ServiceFuture<'_, BackupStatusResult> {
+            self.0.status()
+        }
+
+        fn enable<'a>(
+            &'a self,
+            params: &'a BackupEnableParams,
+        ) -> ServiceFuture<'a, BackupEnableResult> {
+            Box::pin(async move {
+                self.0.enable(params).await?;
+                Err(kr_client::ClientError::Host(ProtocolError::new(
+                    ErrorCode::OutcomeUnknown,
+                    "the answer did not arrive".to_owned(),
+                )))
+            })
+        }
+    }
+
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let mut computer = Computer::with_recovery_on(&rig).await;
+    let silent = Silent(the_host_as_the_application_reaches_it(&rig).await);
+
+    let lost = cover_host_archive(
+        &silent,
+        &mut computer.bundles,
+        &computer.seed,
+        false,
+        kr_ipc::now_ms(),
+    )
+    .await
+    .expect_err("no answer came");
+    assert!(matches!(lost, RecoveryError::HostOutcomeUnknown { .. }));
+    // It carried the setup out.
+    let row = rig
+        .controller
+        .backup()
+        .setup()
+        .expect("a read")
+        .expect("a setup");
+    assert_eq!(row.record.kit_fingerprint, computer.fingerprint());
+
+    rig.carrier_passes(2).await;
+    let written = web.bundle_write(&computer.context.bundle_locator);
+    let host = the_host_as_the_application_reaches_it(&rig).await;
+    let found = cover_host_archive(
+        &host,
+        &mut computer.bundles,
+        &computer.seed,
+        false,
+        kr_ipc::now_ms(),
+    )
+    .await
+    .expect("the setup is found");
+    let HostCover::Covered(found) = found else {
+        panic!("the host was left: {found:?}");
+    };
+    assert!(found.already);
+    assert_eq!(found.archive_id, row.record.archive_id);
+    assert_eq!(web.bundle_write(&computer.context.bundle_locator), written);
+}
