@@ -465,7 +465,11 @@ fn an_unusable_document_reports_descriptions_off_and_the_daemon_acts_on_that() {
             .iter()
             .find(|value| value.key == key)
             .unwrap_or_else(|| panic!("the report has a {key} row"));
-        assert_eq!(row.value(), "false", "{key} is off while the host fails closed");
+        assert_eq!(
+            row.value(),
+            "false",
+            "{key} is off while the host fails closed"
+        );
         assert_eq!(row.source, ValueSource::Default, "{key}");
         assert_eq!(row.effect, ValueEffect::Immediately, "{key}");
     }

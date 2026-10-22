@@ -815,6 +815,14 @@ its closure never reads complete, and the command route has no such profile`. An
 package names by their class and length. Every profile this host writes records `full`, so no edit
 to this section changes a launch on this host.
 
+`descriptions` holds the owner's two settings for session descriptions: `enabled`, on unless the
+document turns it off, and `on_battery`, off unless the document turns it on. `kr doctor` reports
+them as the values `descriptions.enabled` and `descriptions.on_battery`, each with its source (the
+host configuration where the document wrote the field, the product default where it did not, even
+when what was written is the default's value), and gives their effect as immediately: the daemon
+reads them through the same resolver the report does, and turning descriptions off stops the work
+in flight. A document this host cannot use turns both off.
+
 `environment_additions` is the preference that adds variables to a session started with the host's
 environment, described under *The environment a session starts with*.
 
