@@ -26,6 +26,14 @@ function by(ceremony: CeremonyKind): string | null {
       return 'with Touch ID'
     case 'password':
       return 'with your password'
+    case 'face_id':
+      return 'with Face ID'
+    case 'passcode':
+      return 'with your passcode'
+    case 'biometric':
+      return 'with your fingerprint or face'
+    case 'screen_lock':
+      return 'with your screen lock'
     case 'windows_hello':
       return 'with Windows Hello'
     case 'none':

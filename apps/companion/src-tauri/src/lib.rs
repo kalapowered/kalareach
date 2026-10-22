@@ -553,6 +553,7 @@ fn open_the_records(app: &tauri::AppHandle) -> Result<()> {
         app,
         &data,
         parts,
+        verify::pairing_ceremony(app),
         verify::platform_ceremony(app.get_webview_window("main")),
         Arc::new(pairing::NativeIntake::new(app.clone())),
     )
@@ -833,7 +834,8 @@ pub fn start_mailbox<R: tauri::Runtime>(
 }
 
 /// Opens this computer as a device that pairs, made of `parts` with its records under `data`, and
-/// as an owner device whose confirmations `ceremony` answers, taking invitations in through `intake`;
+/// as an owner device whose confirmations `ceremony` answers (a revocation is answered by
+/// `revocation_ceremony`, which a phone leaves without one), taking invitations in through `intake`;
 /// tells the page about both on [`pairing::PAIRING_EVENT`] and [`pairing::CONFIRMATIONS_EVENT`];
 /// and starts both.
 ///
@@ -845,6 +847,7 @@ pub fn start_pairing<R: tauri::Runtime>(
     data: &std::path::Path,
     parts: device::Parts,
     ceremony: std::sync::Arc<dyn kr_client::pairing::owner::Ceremony>,
+    revocation_ceremony: std::sync::Arc<dyn kr_client::pairing::owner::Ceremony>,
     intake: std::sync::Arc<dyn pairing::IntakePlatform>,
 ) -> Result<()> {
     use std::sync::Arc;
@@ -877,7 +880,7 @@ pub fn start_pairing<R: tauri::Runtime>(
             }
         }
     })?;
-    let revocations = revocation::Revocations::new(Arc::clone(&device), Arc::clone(&ceremony));
+    let revocations = revocation::Revocations::new(Arc::clone(&device), revocation_ceremony);
     let emitter = app.clone();
     let owner = owner::Owner::new(Arc::clone(&device), ceremony, move || {
         if let Ok(owner) = emitter.state::<AppState>().owner() {

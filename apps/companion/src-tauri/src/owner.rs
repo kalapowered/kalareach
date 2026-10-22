@@ -129,6 +129,9 @@ pub struct Owner {
     /// whole life: a request that leaves the list while its host is out of contact comes back
     /// under the same reference, so what the page did with it, such as setting it aside, holds.
     references: Mutex<BTreeMap<ConfirmationId, Shown>>,
+    /// The ceremony the page was last told of, so a ceremony the phone starts to offer (or stops
+    /// offering) reaches the page at the next visit, not only when a request comes or goes.
+    told: Mutex<CeremonyKind>,
     changed: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -155,12 +158,14 @@ impl Owner {
         ceremony: Arc<dyn Ceremony>,
         changed: impl Fn() + Send + Sync + 'static,
     ) -> Arc<Self> {
+        let told = Mutex::new(ceremony.kind());
         Arc::new(Self {
             device,
             ceremony,
             sessions: Mutex::new(BTreeMap::new()),
             entries: Mutex::new(Vec::new()),
             references: Mutex::new(BTreeMap::new()),
+            told,
             changed: Box::new(changed),
         })
     }
@@ -250,7 +255,9 @@ impl Owner {
         lock(&self.references).retain(|_, shown| shown.expires_at_ms > now);
         let before = lock(&self.entries).len();
         lock(&self.entries).retain(|entry| owns(&entry.host));
-        if lock(&self.entries).len() != before {
+        let kind = self.ceremony.kind();
+        let ceremony_changed = std::mem::replace(&mut *lock(&self.told), kind) != kind;
+        if lock(&self.entries).len() != before || ceremony_changed {
             (self.changed)();
         }
     }

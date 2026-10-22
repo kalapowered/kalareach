@@ -151,10 +151,20 @@ impl OwnerChannel for SessionChannel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CeremonyKind {
-    /// Touch ID, with the password as its fallback.
+    /// Touch ID, with the password or the passcode as its fallback.
     TouchId,
     /// The device password, on a Mac without Touch ID.
     Password,
+    /// Face ID, with the passcode as its fallback.
+    FaceId,
+    /// The passcode, on an iPhone or iPad without Touch ID or Face ID set up.
+    Passcode,
+    /// A strong biometric on an Android phone (a fingerprint, a face or an iris), with the screen
+    /// lock as its fallback where the system allows one.
+    Biometric,
+    /// The screen lock (a PIN, a pattern or a password) on an Android phone with no strong
+    /// biometric set up.
+    ScreenLock,
     /// Windows Hello.
     WindowsHello,
     /// None: this device cannot check that it is its owner in front of it.

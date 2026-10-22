@@ -37,6 +37,7 @@ import { VoiceRoute } from '../voice/VoiceRoute'
 import { useRebind } from '../app/drafts'
 import { KeptDrafts } from '../views/KeptDrafts'
 import type { Channel } from '../model/account'
+import { useConfirmations } from '../pairing/Confirmations'
 import { useReachedHost, useWaitingInvitations } from './model/held'
 import { useKeyboardInset, useLifecycle } from './useLifecycle'
 import { detectSurface, type Surface } from './platform'
@@ -183,7 +184,9 @@ export function MobileApp({
   // What waits for the person on Attention is what the host has raised and the invitations the
   // phone is offered, which the inbox shows above it.
   const invitations = useWaitingInvitations()
-  const waiting = actionable + invitations
+  // The host's own sensitive actions that wait for this phone's owner are on Attention too.
+  const owed = useConfirmations()?.requests.length ?? 0
+  const waiting = actionable + invitations + owed
   const destinations = useMemo<readonly Destination[]>(
     () => [
       { id: 'attention', label: 'Attention', glyph: <AttentionGlyph />, badge: waiting },

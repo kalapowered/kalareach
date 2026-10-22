@@ -7,6 +7,8 @@ import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
+import to.kala.reach.companion.mobile.OwnerAsk
+import to.kala.reach.companion.mobile.OwnerAuthenticators
 import to.kala.reach.companion.mobile.OwnerPresenceEvaluator
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
@@ -82,37 +84,33 @@ class BiometricOwnerPresence(
     }
 
     /**
-     * What this device can actually ask, or null when it can ask nothing strong enough.
-     *
-     * From Android 11 the authenticator set is a value: strong biometrics with the device credential
-     * as the fallback, or the credential alone. Before it, the only way to name the credential is a
-     * flag that also admits weak biometrics, so that flag is not used: those versions ask for strong
-     * biometrics alone, and a device without them is refused rather than asked something weaker.
+     * What this device can actually ask, or null when it can ask nothing strong enough. The rule is
+     * [OwnerAuthenticators]'s, which the ceremony that confirms a host's action follows too.
      */
     private fun promptInformation(reason: String): BiometricPrompt.PromptInfo? {
         val manager = BiometricManager.from(activity)
+        val sets = Build.VERSION.SDK_INT >= OwnerAuthenticators.FIRST_SDK_WITH_AUTHENTICATOR_SETS
+        val ask = OwnerAuthenticators.choose(
+            sdk = Build.VERSION.SDK_INT,
+            strongBiometric = manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG) ==
+                BiometricManager.BIOMETRIC_SUCCESS,
+            screenLock = sets &&
+                manager.canAuthenticate(BiometricManager.Authenticators.DEVICE_CREDENTIAL) ==
+                BiometricManager.BIOMETRIC_SUCCESS,
+            deviceSecure = activity.getSystemService(KeyguardManager::class.java)?.isDeviceSecure == true,
+        ) ?: return null
         val builder = BiometricPrompt.PromptInfo.Builder()
             .setTitle("Confirm on this device")
             .setSubtitle(reason)
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            for (candidate in listOf(AUTHENTICATORS, BiometricManager.Authenticators.DEVICE_CREDENTIAL)) {
-                if (manager.canAuthenticate(candidate) == BiometricManager.BIOMETRIC_SUCCESS) {
-                    return builder.setAllowedAuthenticators(candidate).build()
-                }
-            }
-            return null
-        }
-
-        val strong = BiometricManager.Authenticators.BIOMETRIC_STRONG
-        if (manager.canAuthenticate(strong) != BiometricManager.BIOMETRIC_SUCCESS) return null
-        // The device is locked by something, or a biometric would not be enrolled at all; a strong
-        // biometric on a device with no lock screen is not an unlocked-screen confirmation.
-        if (activity.getSystemService(KeyguardManager::class.java)?.isDeviceSecure != true) return null
-        return builder
-            .setAllowedAuthenticators(strong)
-            .setNegativeButtonText("Cancel")
-            .build()
+        return when (ask) {
+            OwnerAsk.STRONG_BIOMETRIC_OR_SCREEN_LOCK -> builder.setAllowedAuthenticators(AUTHENTICATORS)
+            OwnerAsk.SCREEN_LOCK_ONLY ->
+                builder.setAllowedAuthenticators(BiometricManager.Authenticators.DEVICE_CREDENTIAL)
+            OwnerAsk.STRONG_BIOMETRIC_ONLY ->
+                builder
+                    .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                    .setNegativeButtonText("Cancel")
+        }.build()
     }
 
     companion object {

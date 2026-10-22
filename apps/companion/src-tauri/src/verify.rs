@@ -5,8 +5,10 @@
 //! proof that a person was present. So the ceremony is never a dialog this application draws. On
 //! macOS it is `LAContext`, whose reason is the one-line description the dialog prints: Touch ID,
 //! or the password on a Mac without it. On Windows it is Windows Hello, through
-//! `UserConsentVerifier` for this application's window, whose message is the same line. Other
-//! platforms have none here, and a device without one signs nothing.
+//! `UserConsentVerifier` for this application's window, whose message is the same line. On a phone
+//! the platform plugin's native half runs it: Face ID, Touch ID or the passcode on an iPhone, and
+//! the biometric prompt on an Android phone. Other platforms have none here, and a device without
+//! one signs nothing.
 //!
 //! Every ceremony is bounded by the challenge's remaining lifetime: at the bound the platform's
 //! dialog is dismissed (`LAContext::invalidate`, `IAsyncOperation::Cancel`) and the answer is "not
@@ -44,6 +46,25 @@ pub fn platform_ceremony<R: tauri::Runtime>(
     }
 }
 
+/// The ceremony that answers the pairing owner's confirmations. On a phone it is the phone's own;
+/// elsewhere it is [`platform_ceremony`].
+///
+/// A phone's ceremony belongs to the confirmations screen and to nothing else: a revocation and a
+/// settings change keep [`NoCeremony`] there, since the phone draws no screen for either.
+#[must_use]
+pub fn pairing_ceremony<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Arc<dyn Ceremony> {
+    #[cfg(mobile)]
+    {
+        Arc::new(phone::Presence::start(app.clone()))
+    }
+    #[cfg(not(mobile))]
+    {
+        use tauri::Manager as _;
+
+        platform_ceremony(app.get_webview_window("main"))
+    }
+}
+
 /// A device with no ceremony: it confirms nothing and says so.
 #[derive(Debug)]
 pub struct NoCeremony;
@@ -55,6 +76,124 @@ impl Ceremony for NoCeremony {
 
     fn verify<'a>(&'a self, _reason: &'a str, _within: Duration) -> BoxFuture<'a, CeremonyOutcome> {
         Box::pin(async { CeremonyOutcome::Unavailable })
+    }
+}
+
+/// A phone's ceremony, run by the platform plugin's native half.
+#[cfg(mobile)]
+mod phone {
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::{Duration, Instant};
+
+    use companion_platform::presence::{self, Kind, Outcome};
+    use kr_client::pairing::BoxFuture;
+    use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome};
+    use tauri::{AppHandle, Runtime};
+
+    /// How long an answer about which ceremony the phone offers is trusted. The person can set up
+    /// or remove a face, a fingerprint or a screen lock in Settings while this runs.
+    const FRESH: Duration = Duration::from_secs(5);
+
+    /// What was last read about the ceremony, and whether another read is under way.
+    struct Cache {
+        kind: CeremonyKind,
+        read_at: Option<Instant>,
+        reading: bool,
+    }
+
+    /// The phone's own ceremony. Which one it is is asked of the native half, which answers on its
+    /// own time, so [`Ceremony::kind`] answers from what was read last and starts a new read once
+    /// that is stale.
+    pub struct Presence<R: Runtime> {
+        app: AppHandle<R>,
+        cache: Arc<Mutex<Cache>>,
+    }
+
+    impl<R: Runtime> Presence<R> {
+        /// The phone's ceremony, with the first read of which one it is already under way.
+        pub fn start(app: AppHandle<R>) -> Self {
+            let presence = Self {
+                app,
+                cache: Arc::new(Mutex::new(Cache {
+                    kind: CeremonyKind::None,
+                    read_at: None,
+                    reading: false,
+                })),
+            };
+            presence.refresh();
+            presence
+        }
+
+        /// Reads which ceremony the phone offers, unless a read is under way.
+        fn refresh(&self) {
+            {
+                let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+                if cache.reading {
+                    return;
+                }
+                cache.reading = true;
+            }
+            let app = self.app.clone();
+            let cache = Arc::clone(&self.cache);
+            tauri::async_runtime::spawn(async move {
+                let kind = ceremony_kind(presence::kind(&app).await);
+                let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+                cache.kind = kind;
+                cache.read_at = Some(Instant::now());
+                cache.reading = false;
+            });
+        }
+    }
+
+    impl<R: Runtime> std::fmt::Debug for Presence<R> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("Presence")
+        }
+    }
+
+    /// The kind the page and the interface name a ceremony by.
+    const fn ceremony_kind(kind: Kind) -> CeremonyKind {
+        match kind {
+            Kind::FaceId => CeremonyKind::FaceId,
+            Kind::TouchId => CeremonyKind::TouchId,
+            Kind::Passcode => CeremonyKind::Passcode,
+            Kind::Biometric => CeremonyKind::Biometric,
+            Kind::ScreenLock => CeremonyKind::ScreenLock,
+            Kind::None => CeremonyKind::None,
+        }
+    }
+
+    impl<R: Runtime> Ceremony for Presence<R> {
+        fn kind(&self) -> CeremonyKind {
+            let (kind, stale) = {
+                let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+                (
+                    cache.kind,
+                    cache.read_at.is_none_or(|at| at.elapsed() >= FRESH),
+                )
+            };
+            if stale {
+                self.refresh();
+            }
+            kind
+        }
+
+        fn verify<'a>(
+            &'a self,
+            reason: &'a str,
+            within: Duration,
+        ) -> BoxFuture<'a, CeremonyOutcome> {
+            Box::pin(async move {
+                let outcome = presence::verify(&self.app, reason, within).await;
+                // What the person did may have changed what the phone offers.
+                self.refresh();
+                match outcome {
+                    Outcome::Confirmed => CeremonyOutcome::Confirmed,
+                    Outcome::NotConfirmed => CeremonyOutcome::NotConfirmed,
+                    Outcome::Unavailable => CeremonyOutcome::Unavailable,
+                }
+            })
+        }
     }
 }
 

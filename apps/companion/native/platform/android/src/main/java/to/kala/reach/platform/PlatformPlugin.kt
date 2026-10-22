@@ -19,6 +19,7 @@ import android.webkit.WebView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.fragment.app.FragmentActivity
 import androidx.core.app.NotificationManagerCompat
 import androidx.browser.auth.AuthTabIntent
 import androidx.browser.customtabs.CustomTabsClient
@@ -41,6 +42,7 @@ import to.kala.reach.companion.mobile.CallNews
 import to.kala.reach.companion.mobile.CallOpenings
 import to.kala.reach.companion.mobile.CallRefused
 import to.kala.reach.companion.mobile.CallWire
+import to.kala.reach.companion.mobile.OwnerAuthenticators
 import to.kala.reach.companion.mobile.SecretFiles
 import to.kala.reach.companion.mobile.SignInSession
 
@@ -52,6 +54,12 @@ class SessionArguments {
     lateinit var httpsHost: String
     lateinit var httpsPath: String
     lateinit var scheme: String
+}
+
+@InvokeArg
+class PresenceArguments {
+    lateinit var reason: String
+    var withinMs: Long = 0
 }
 
 @InvokeArg
@@ -207,6 +215,39 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
                 window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             }
             invoke.resolve(done())
+        }
+    }
+
+    // The owner's presence. The system draws the prompt; one at a time, so a newer request ends the older.
+
+    private var ownerPrompt: OwnerPrompt? = null
+
+    /** Which ceremony this phone offers its owner: a strong biometric, the screen lock, or none. */
+    @Command
+    fun presenceKind(invoke: Invoke) {
+        val host = activity as? FragmentActivity
+        val kind = if (host == null) "none" else OwnerAuthenticators.kind(OwnerPrompt.ask(host))
+        invoke.resolve(JSObject().put("kind", kind))
+    }
+
+    /** Runs the ceremony for the words it is given, inside the time it is given, and answers once. */
+    @Command
+    fun presence(invoke: Invoke) {
+        val arguments = invoke.parseArgs(PresenceArguments::class.java)
+        activity.runOnUiThread {
+            ownerPrompt?.end()
+            val host = activity as? FragmentActivity
+            val ask = if (host == null) null else OwnerPrompt.ask(host)
+            if (host == null || ask == null) {
+                invoke.resolve(JSObject().put("outcome", "unavailable"))
+                return@runOnUiThread
+            }
+            val prompt = OwnerPrompt(host, ask, arguments.reason, arguments.withinMs) { outcome ->
+                ownerPrompt = null
+                invoke.resolve(JSObject().put("outcome", outcome))
+            }
+            ownerPrompt = prompt
+            prompt.show()
         }
     }
 
