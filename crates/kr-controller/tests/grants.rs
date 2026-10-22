@@ -4670,7 +4670,7 @@ async fn a_revocation_whose_revision_could_not_be_published_is_finished_by_the_n
         .await
         .expect("the daemon answers the call");
     assert!(
-        !matches!(refused, Ok(_)),
+        refused.is_err(),
         "a revocation whose revision cannot be published is not answered as done"
     );
     assert_eq!(controller.policy().authority_revision(), before);

@@ -1602,6 +1602,7 @@ impl Controller {
     }
 
     /// The close itself. `link` receives the link it opened, whichever way the close ended.
+    #[allow(clippy::too_many_arguments)]
     async fn close_through(
         self: &Arc<Self>,
         mutation: &kr_protocol::envelope::MutationRequest,
