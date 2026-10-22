@@ -1198,17 +1198,8 @@ async fn a_checkpoint_is_not_lowered_and_not_recorded_over_another_manifest_of_i
     // generation 8 reads it. A later read that finds an older authentic bundle in which that other
     // archive stands at 5 is not written on either: the write would lower a checkpoint of an
     // archive the restore was not about.
-    let other = ArchiveCheckpoint {
-        archive_id: ArchiveId::new(id(0x42)),
-        backup_generation: BackupGeneration::new(9),
-        encrypted_manifest_hash: Digest256::from_bytes([9; 32]),
-        verified_at_ms: TimestampMs::new(4_000),
-    };
-    let lower = ArchiveCheckpoint {
-        backup_generation: BackupGeneration::new(5),
-        encrypted_manifest_hash: Digest256::from_bytes([5; 32]),
-        ..other.clone()
-    };
+    let other = another_archive_at(9);
+    let lower = another_archive_at(5);
     let current = world.seal(8, &members);
     let source = Arc::new(
         Scripted::serving(
@@ -1302,12 +1293,14 @@ fn another_archive_at(generation: u64) -> ArchiveCheckpoint {
     }
 }
 
-/// A restore that read revision 5 of the bundle, which records another archive at generation 5,
-/// after which another device wrote revision 6, which records that archive at generation 9. It
-/// returns the restore, the service, the bytes of revision 5 as the service first served them, and
-/// a writer whose first write meets whatever the test puts in `meanwhile`.
+/// A restore that read revision 5 of the bundle, which records the checkpoints `read_first`, after
+/// which another device wrote revision 6, which records `then`. It returns the restore, the
+/// service, the bytes of revision 5 as the service first served them, and a writer whose first
+/// write meets whatever the test puts in `meanwhile`.
 async fn a_restore_that_revision_6_overtook(
     world: &World,
+    read_first: &[ArchiveCheckpoint],
+    then: &[ArchiveCheckpoint],
 ) -> (
     kr_client::recovery::PreparedRestore,
     Arc<Scripted>,
@@ -1317,7 +1310,7 @@ async fn a_restore_that_revision_6_overtook(
     let sealed = world.seal(4, &honest_members());
     let first = world.bundle(&Shape {
         revision: Some(5),
-        more_checkpoints: vec![another_archive_at(5)],
+        more_checkpoints: read_first.to_vec(),
         ..Shape::default()
     });
     let source = Arc::new(Scripted::serving(world, first).publishing(&sealed));
@@ -1325,7 +1318,7 @@ async fn a_restore_that_revision_6_overtook(
     let revision_5 = source.sealed_bundle();
     source.replace_bundle(world.bundle(&Shape {
         revision: Some(6),
-        more_checkpoints: vec![another_archive_at(9)],
+        more_checkpoints: then.to_vec(),
         ..Shape::default()
     }));
     let writer = Bundle::over(&source);
@@ -1339,7 +1332,12 @@ async fn a_restore_that_revision_6_overtook(
 #[tokio::test]
 async fn a_retry_does_not_write_on_a_bundle_older_than_one_an_attempt_read() {
     let world = World::new();
-    let (prepared, source, revision_5, writer) = a_restore_that_revision_6_overtook(&world).await;
+    let (prepared, source, revision_5, writer) = a_restore_that_revision_6_overtook(
+        &world,
+        &[another_archive_at(5)],
+        &[another_archive_at(9)],
+    )
+    .await;
     *writer.meanwhile.lock().expect("meanwhile") = Some(revision_5.clone());
     let refused = prepared
         .record_checkpoint(&writer, TimestampMs::new(9_000))
@@ -1368,7 +1366,12 @@ async fn a_retry_does_not_write_on_a_bundle_older_than_one_an_attempt_read() {
 #[tokio::test]
 async fn a_retry_does_not_seal_a_checkpoint_below_one_an_attempt_read() {
     let world = World::new();
-    let (prepared, source, _, writer) = a_restore_that_revision_6_overtook(&world).await;
+    let (prepared, source, _, writer) = a_restore_that_revision_6_overtook(
+        &world,
+        &[another_archive_at(5)],
+        &[another_archive_at(9)],
+    )
+    .await;
     let revision_7 = world.bundle(&Shape {
         revision: Some(7),
         more_checkpoints: vec![another_archive_at(5)],
@@ -1383,6 +1386,49 @@ async fn a_retry_does_not_seal_a_checkpoint_below_one_an_attempt_read() {
         refused,
         RestoreError::Recovery(ref cause)
             if matches!(**cause, RecoveryError::CheckpointWentBack { known: 9 })
+    ));
+    assert_eq!(
+        *writer.writes.lock().expect("writes"),
+        1,
+        "only the write that conflicted met the service"
+    );
+    assert_eq!(
+        source.sealed_bundle(),
+        revision_7,
+        "nothing was written over what the service holds"
+    );
+}
+
+/// KR-REQ-24.16: the manifest a checkpoint was read with at a generation is not replaced by
+/// another when a later read records two manifests for that generation. The retry that finds one
+/// of the two only is not written on, whichever of them it is.
+#[tokio::test]
+async fn a_retry_does_not_take_another_manifest_for_a_generation_an_attempt_read() {
+    let world = World::new();
+    let first = ArchiveCheckpoint {
+        encrypted_manifest_hash: Digest256::from_bytes([6; 32]),
+        ..another_archive_at(5)
+    };
+    let (prepared, source, _, writer) = a_restore_that_revision_6_overtook(
+        &world,
+        std::slice::from_ref(&first),
+        &[another_archive_at(5), first.clone()],
+    )
+    .await;
+    let revision_7 = world.bundle(&Shape {
+        revision: Some(7),
+        more_checkpoints: vec![another_archive_at(5)],
+        ..Shape::default()
+    });
+    *writer.meanwhile.lock().expect("meanwhile") = Some(revision_7.clone());
+    let refused = prepared
+        .record_checkpoint(&writer, TimestampMs::new(9_000))
+        .await
+        .expect_err("another manifest for generation 5");
+    assert!(matches!(
+        refused,
+        RestoreError::Recovery(ref cause)
+            if matches!(**cause, RecoveryError::CheckpointDisagrees { generation: 5 })
     ));
     assert_eq!(
         *writer.writes.lock().expect("writes"),
