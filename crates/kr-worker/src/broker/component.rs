@@ -66,6 +66,23 @@ pub struct ComponentWant {
     pub observing: bool,
     /// The generation of the instance's source: a new execution of the instance advances it.
     pub generation: u64,
+    /// What the instance's bound execution is, as a component is told it.
+    pub execution: Execution,
+}
+
+/// What a component is told about the execution its binding is bound to: the instance's binding
+/// revision, the conversation it has selected, and the turn it is running.
+///
+/// The broker knows no more than this of what the execution is doing, so a component is told it is
+/// running while a turn is and idle otherwise, and is never told it awaits a person.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Execution {
+    /// The instance's binding revision.
+    pub revision: u64,
+    /// The conversation the instance has selected, where it has one.
+    pub thread_id: Option<String>,
+    /// The turn the instance is running, where it is running one.
+    pub turn_id: Option<String>,
 }
 
 /// What a person is told about a binding's component beyond where it stands.
@@ -314,6 +331,27 @@ impl Broker {
                         .instances
                         .get(&binding.application_instance_id)
                         .map_or(0, |instance| instance.source_generation.get()),
+                    execution: state
+                        .instances
+                        .get(&binding.application_instance_id)
+                        .map_or_else(
+                            || Execution {
+                                revision: 1,
+                                thread_id: None,
+                                turn_id: None,
+                            },
+                            |instance| Execution {
+                                revision: instance.binding_revision.get(),
+                                thread_id: instance
+                                    .thread_id
+                                    .as_ref()
+                                    .map(|thread| thread.as_str().to_owned()),
+                                turn_id: instance
+                                    .turn_id
+                                    .as_ref()
+                                    .map(|turn| turn.as_str().to_owned()),
+                            },
+                        ),
                 })
             })
             .collect()

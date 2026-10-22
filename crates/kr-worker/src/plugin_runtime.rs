@@ -72,7 +72,7 @@ use kr_protocol::envelope::ControlFrame;
 use kr_protocol::ids::{BrokerBindingId, SessionId};
 
 use crate::broker::Broker;
-use crate::broker::component::{ComponentNote, ComponentWant, FaultNote};
+use crate::broker::component::{ComponentNote, ComponentWant, Execution, FaultNote};
 use crate::broker::observation::{Held, ObservationLane};
 use crate::plugin_observation::{CALL_WAIT, service_id};
 
@@ -143,6 +143,7 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
         client: None,
         registered: BTreeMap::new(),
         refused: BTreeMap::new(),
+        told_facts: BTreeMap::new(),
         pace: Pacing::default(),
         last_reason: None,
         lane,
@@ -240,6 +241,8 @@ struct Link {
     pace: Pacing,
     /// Why the runtime was last not reachable, which a binding made while the link waits is told.
     last_reason: Option<String>,
+    /// The execution each registered binding's component was last told it is bound to.
+    told_facts: BTreeMap<BrokerBindingId, Execution>,
     /// What the worker has to offer the components, what each has missed, and the state held for
     /// each.
     lane: Arc<ObservationLane>,
@@ -358,6 +361,7 @@ impl Link {
         );
         let registering = self.register_wanted(broker, &wants).await;
         let keeping = self.keep_up(broker, &wants).await;
+        self.revise_facts(broker, &wants).await;
         match (registering, keeping) {
             (Some(first), Some(second)) => Some(first.min(second)),
             (delay, None) | (None, delay) => delay,
@@ -391,6 +395,7 @@ impl Link {
             match client.unbind(service_id(binding_id)).await {
                 Ok(_) | Err(ServiceError::Protocol { .. } | ServiceError::Disabled { .. }) => {
                     self.registered.remove(&binding_id);
+                    self.told_facts.remove(&binding_id);
                     self.lane.forget(binding_id);
                     if let Some(broker) = broker.upgrade() {
                         broker.note_component(binding_id, ComponentNote::Clear);
@@ -491,7 +496,7 @@ impl Link {
                 .register(
                     service_id(want.binding_id),
                     &identity,
-                    &facts_of(want),
+                    &facts_of(want, kr_ipc::now_ms().get()),
                     &want.executable,
                     &ComponentSource {
                         path: want.component.path.clone(),
@@ -503,6 +508,8 @@ impl Link {
             match registered {
                 Ok(registration) => {
                     self.registered.insert(want.binding_id, want.generation);
+                    self.told_facts
+                        .insert(want.binding_id, want.execution.clone());
                     self.refused.remove(&want.binding_id);
                     if let Some(strong) = broker.upgrade() {
                         strong.note_component(
@@ -842,6 +849,46 @@ impl Link {
         Ok(())
     }
 
+    /// Tells each registered binding's component what its bound execution is now, where that is
+    /// not what it was last told.
+    ///
+    /// Read fresh from the broker's set each time round, so a change that came while a registration
+    /// was under way is told by the pass that follows it. A revision that was not acknowledged is
+    /// forgotten and told again, and one the runtime could not take for want of a connection is the
+    /// runtime lost.
+    async fn revise_facts(&mut self, broker: &Weak<Broker>, wants: &[ComponentWant]) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        for want in wants {
+            if !self.registered.contains_key(&want.binding_id)
+                || self.told_facts.get(&want.binding_id) == Some(&want.execution)
+            {
+                continue;
+            }
+            match client
+                .revise_facts(
+                    service_id(want.binding_id),
+                    &facts_of(want, kr_ipc::now_ms().get()),
+                )
+                .await
+            {
+                Ok(()) => {
+                    self.told_facts
+                        .insert(want.binding_id, want.execution.clone());
+                }
+                Err(ServiceError::Unavailable { detail }) => {
+                    self.lose(broker, &detail);
+                    return;
+                }
+                // Not taken, and not for the want of a runtime: told again by a later pass.
+                Err(_) => {
+                    self.told_facts.remove(&want.binding_id);
+                }
+            }
+        }
+    }
+
     /// Takes the state of the bindings that are due it, and asks the runtime what it is doing when
     /// it is time. Says how long to leave before either is due again.
     async fn keep_up(
@@ -923,6 +970,7 @@ impl Link {
         // Nothing is offered to a binding the runtime no longer holds, and what it held of the
         // component's state stays, for the registration that follows.
         self.lane.all_not_ready();
+        self.told_facts.clear();
         self.health_due = None;
         self.health_failures = 0;
         for binding_id in std::mem::take(&mut self.registered).into_keys() {
@@ -1002,15 +1050,24 @@ fn identity_of(want: &ComponentWant) -> Result<PluginIdentity, String> {
     ))
 }
 
-/// What the component may read about its binding when it is bound.
-fn facts_of(want: &ComponentWant) -> BindingFacts {
+/// What a component may read about its binding: the instance's execution as the broker holds it at
+/// `at_ms`, which is when it is told.
+///
+/// A turn that is running is `running`, and everything else is `idle`: the broker has no notion of
+/// an execution awaiting a person. The rights the current actor holds are not the worker's to say,
+/// since a document is drawn once for everyone who reads it.
+fn facts_of(want: &ComponentWant, at_ms: u64) -> BindingFacts {
     BindingFacts {
         plugin_id: want.plugin_id.to_string(),
-        binding_revision: 1,
-        activity: BindingActivity::Idle,
-        thread_id: None,
-        turn_id: None,
-        updated_at_ms: kr_ipc::now_ms().get(),
+        binding_revision: want.execution.revision,
+        activity: if want.execution.turn_id.is_some() {
+            BindingActivity::Running
+        } else {
+            BindingActivity::Idle
+        },
+        thread_id: want.execution.thread_id.clone(),
+        turn_id: want.execution.turn_id.clone(),
+        updated_at_ms: at_ms,
         held_rights: Vec::new(),
     }
 }

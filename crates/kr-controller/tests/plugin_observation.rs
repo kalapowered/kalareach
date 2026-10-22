@@ -19,6 +19,7 @@
 //! | KR-REQ-11.40 | an observation the component never returns from is stopped by fuel when its deadline cannot fire, and named so |
 //! | KR-REQ-11.41 | a component that was compiled when it was registered is observed without a fault, the compile outside the observation's deadline |
 //! | KR-REQ-24.06 | a plugin runtime killed with a receipt, a question and an approval live leaves all three as they were and answerable, and its component is registered again in the replacement and restored to the state the worker held |
+//! | KR-REQ-11.01 | a component reads the execution its binding is bound to as the broker holds it: the revision, the selected conversation and the running turn when it is registered, and each change of them in its next call, also on a runtime that replaces a lost one |
 //! | KR-REQ-24.27 | the plugin runtime is told whether privacy mode stands, each time it changes and before the first component is registered on a runtime that replaces another, and no document of the worker's connection reaches the worker once the runtime has said it holds privacy mode; turning privacy mode on drops the state held for a component and none is taken or held while it is on, observation for live use goes on, a component offered anything made in it has no state taken until it starts again, and then state is taken again; the runtime's words in a fault, and in the reason a component is disabled for, are never kept once privacy mode has stood on the connection that carries them, however many notices wait and however late the link reads them |
 
 #![cfg(unix)]
@@ -29,8 +30,8 @@ use kr_protocol::gateway::{PendingKind, PendingState};
 use kr_protocol::local::ControllerConnectionRole;
 use kr_worker::broker::observation::Audience;
 use plugin_world::observing::{
-    Observing, Options, Spec, answered, binding, credential, digest, highest_line, notification,
-    request, unlisted,
+    Observing, Options, Spec, answered, binding, credential, digest, highest_line, instance,
+    notification, request, unlisted,
 };
 use plugin_world::{Epoch, until};
 
@@ -1064,4 +1065,66 @@ async fn kr_req_24_27_the_runtime_is_told_privacy_mode_and_no_document_reaches_t
         lane.highest_document_read(binding(1)).map(|_| ())
     })
     .await;
+}
+
+/// KR-REQ-11.01: a component reads the execution its binding is bound to as the broker holds it, and
+/// reads each change of it in its next call.
+///
+/// The instance is at revision 1 with no conversation and no turn when the component is registered.
+/// The broker then moves the instance to a conversation, which is revision 2, starts a turn, and
+/// ends it. The component's own account says what it read each time. A runtime that replaces a
+/// killed one registers the component with the execution as it is by then, and not as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_01_a_component_reads_the_execution_its_binding_is_bound_to_and_each_change_of_it()
+ {
+    let Some(world) = Observing::start(Options::with(vec![Spec::semantic_only(1)])).await else {
+        return;
+    };
+    world.until_ready(1).await;
+    let reads = async |part: &str| {
+        until("the component to read the execution", || async {
+            world
+                .raw_account(1)
+                .await
+                .filter(|account| account.contains(part))
+        })
+        .await
+    };
+    reads("facts=1/idle/-/-/").await;
+
+    let broker = world.broker();
+    broker
+        .advance_binding(
+            instance(),
+            Some(kr_protocol::ids::AgentThreadId::new("thread-5").expect("a thread")),
+            kr_protocol::scalars::TimestampMs::new(5),
+        )
+        .expect("the instance moves to a conversation");
+    reads("facts=2/idle/thread-5/-/").await;
+    broker
+        .set_turn(
+            instance(),
+            Some(kr_protocol::ids::AgentTurnId::new("turn-9").expect("a turn")),
+        )
+        .expect("a turn starts");
+    reads("facts=2/running/thread-5/turn-9/").await;
+    broker.set_turn(instance(), None).expect("the turn ends");
+    reads("facts=2/idle/thread-5/-/").await;
+
+    // The replacement for a runtime that was killed is told what the execution is by then.
+    let host = world.hosted.published().expect("the runtime is published");
+    plugin_world::kill(&host);
+    until("a replacement runtime to be published", || async {
+        world
+            .hosted
+            .published()
+            .filter(|published| *published != host)
+    })
+    .await;
+    world
+        .until_account(1, "the component to be registered again", |account| {
+            account.binds >= 1
+        })
+        .await;
+    reads("facts=2/idle/thread-5/-/").await;
 }
