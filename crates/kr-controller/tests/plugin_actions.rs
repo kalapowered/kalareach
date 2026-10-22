@@ -13,6 +13,7 @@
 //! | --- | --- |
 //! | KR-REQ-23.30 | `plugin.action.invoke` runs the component registered for the binding, validates the plan it proposes against the action, the grant, the effect class and the arguments, transmits the plan that validates once, and rejects every other with a receipt that says it never dispatched |
 //! | KR-REQ-11.28, KR-REQ-23.30 | through a connector whose table spells a cancellation, the plan a component prepares for the cancellation it was invited to prepare is validated against the token the host issued and written from the table's template, naming the thread and the running turn; every plan that is not that one, and a component's prompt, which the table spells no source for, is refused before the marker and nothing is written |
+//! | KR-REQ-24.27 | the words a component declines an action with are made of what it was handed, so they are withheld from what a person is told once privacy mode has stood on the connection, and the binding is marked as handed something made in privacy mode |
 //! | KR-REQ-11.31 | a component that faults when asked to prepare an action disables its binding's rich capability, and the native terminal's requests and answers go on before, during and after, on the transport the production gateway uses (not through `kr-hook launch`, whose leg needs a real managed shell) |
 //!
 //! The scripted peer stands in for a vendor's agent. A test that needs a stopped plugin host stops
@@ -1044,5 +1045,86 @@ async fn kr_req_11_31_a_component_that_faults_disables_its_binding_and_the_nativ
             .filter(|frame| frame.contains("session/prompt"))
             .count(),
         native as usize
+    );
+}
+
+/// KR-REQ-24.27: what a component says when it declines an action it was handed arguments for is
+/// made of what it was handed, and in privacy mode, or once privacy mode has stood on the
+/// connection, a person is not told its words; the binding is marked as handed something made in
+/// privacy mode, so that no state is taken of it afterwards.
+///
+/// The control is first: outside privacy mode the refusal carries what the component said.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_27_the_words_a_component_declines_an_action_with_are_withheld_once_privacy_mode_has_stood()
+ {
+    let Some(acting) = Acting::start_linked().await else {
+        return;
+    };
+    let broker = acting.hosted._service.broker();
+    let lane = broker.observation();
+    let mut client = acting.client().await;
+    let mut request_id = 0_u64;
+    let mut declined = async |acting: &Acting, client: &mut LocalClient| {
+        request_id += 1;
+        let mut mutation = acting.invocation(client, "cancel.fault", b"{}");
+        mutation.request_id = RequestId::new(request_id);
+        match send(client, mutation).await {
+            Outcome::Error(refusal) => refusal,
+            Outcome::Ok(_) => panic!("an action its component declines was carried"),
+        }
+    };
+
+    // Until the component is registered the action cannot be asked of it, and can be asked again.
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let control = loop {
+        let refusal = declined(&acting, &mut client).await;
+        if refusal.code == ErrorCode::InvalidArgument {
+            break refusal;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "waited {PATIENCE:?} for the component to decline the action: {refusal:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        control.message.contains("is not something to do"),
+        "outside privacy mode the refusal carries the component's words: {}",
+        control.message
+    );
+    assert!(
+        !lane
+            .view(binding())
+            .expect("the component has a view")
+            .private_content
+    );
+
+    let mut authority = acting
+        .hosted
+        .daemon_connection(ControllerConnectionRole::Authority)
+        .await;
+    acting.hosted.tell_privacy(&mut authority, 1, true).await;
+    let private = declined(&acting, &mut client).await;
+    assert_eq!(private.code, ErrorCode::InvalidArgument, "{private:?}");
+    assert!(
+        !private.message.contains("is not something to do"),
+        "the component's words reached a person in privacy mode: {}",
+        private.message
+    );
+    assert!(private.message.contains("withheld"), "{}", private.message);
+    assert!(
+        lane.view(binding())
+            .expect("the component has a view")
+            .private_content,
+        "the component was handed arguments in privacy mode and is not marked"
+    );
+
+    // And after privacy mode ends, on the connection it stood on.
+    acting.hosted.tell_privacy(&mut authority, 2, false).await;
+    let after = declined(&acting, &mut client).await;
+    assert!(
+        !after.message.contains("is not something to do"),
+        "the component's words reached a person after privacy mode: {}",
+        after.message
     );
 }

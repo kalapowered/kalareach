@@ -420,6 +420,16 @@ pub struct ObservationLane {
     /// Wakes the link when a binding that was owed nothing is offered something, so that the time
     /// its state falls due is worked out again.
     checkpoint_wake: tokio::sync::Notify,
+    /// Wakes the task that tells the plugin runtime whether privacy mode is on when that changes.
+    privacy_wake: tokio::sync::Notify,
+    /// What the plugin runtime was last told and acknowledged on the connection the link holds:
+    /// nought for nothing, one for off, two for on.
+    runtime_told: std::sync::atomic::AtomicU8,
+    /// The highest document number the link has read from the plugin runtime for each binding on
+    /// the connection it holds, for this host's own tests: the worker reads a document and drops
+    /// it, so nothing else says whether one arrived.
+    #[cfg(feature = "testing")]
+    documents_read: Mutex<BTreeMap<BrokerBindingId, u64>>,
     #[cfg(feature = "testing")]
     hold: Mutex<Option<Arc<HoldState>>>,
 }
@@ -475,6 +485,10 @@ impl ObservationLane {
             private: AtomicBool::new(false),
             privacy_epoch: AtomicU64::new(0),
             checkpoint_wake: tokio::sync::Notify::new(),
+            privacy_wake: tokio::sync::Notify::new(),
+            runtime_told: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(feature = "testing")]
+            documents_read: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "testing")]
             hold: Mutex::new(None),
         }
@@ -1008,6 +1022,7 @@ impl ObservationLane {
         let mut inner = self.inner();
         if self.private.swap(private, Ordering::AcqRel) != private {
             self.privacy_epoch.fetch_add(1, Ordering::AcqRel);
+            self.privacy_wake.notify_one();
         }
         if private {
             inner.words_tainted = true;
@@ -1023,12 +1038,67 @@ impl ObservationLane {
         self.private.load(Ordering::Acquire)
     }
 
+    /// Waits until privacy mode may have been turned on or off since the last wait returned.
+    ///
+    /// A change that comes first is kept until it is waited for.
+    pub async fn privacy_changed(&self) {
+        self.privacy_wake.notified().await;
+    }
+
+    /// Records what the plugin runtime has acknowledged being told about privacy mode on the
+    /// connection the link holds, or that it has been told nothing.
+    pub fn runtime_was_told(&self, private: Option<bool>) {
+        self.runtime_told.store(
+            private.map_or(0, |private| if private { 2 } else { 1 }),
+            Ordering::Release,
+        );
+    }
+
+    /// Returns what the plugin runtime has acknowledged being told about privacy mode on the
+    /// connection the link holds, where it has acknowledged anything.
+    #[must_use]
+    pub fn runtime_told(&self) -> Option<bool> {
+        match self.runtime_told.load(Ordering::Acquire) {
+            0 => None,
+            told => Some(told == 2),
+        }
+    }
+
     /// Says that the link has made a connection to the plugin runtime. Nothing a connection before
     /// it said can be read from this one, so the words the runtime gives on it are withheld only if
     /// privacy mode is on now ([`Self::words_withheld`]).
     pub fn began_connection(&self) {
         let mut inner = self.inner();
         inner.words_tainted = self.private.load(Ordering::Acquire);
+        #[cfg(feature = "testing")]
+        self.documents_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Records that the link read a document of a binding from the runtime. For this host's own
+    /// tests.
+    #[cfg(feature = "testing")]
+    pub fn document_was_read(&self, binding: BrokerBindingId, document: u64) {
+        let mut read = self
+            .documents_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let highest = read.entry(binding).or_insert(0);
+        *highest = (*highest).max(document);
+    }
+
+    /// Returns the highest document number the link has read for a binding on the connection it
+    /// holds. For this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn highest_document_read(&self, binding: BrokerBindingId) -> Option<u64> {
+        self.documents_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&binding)
+            .copied()
     }
 
     /// Says whether the words the plugin runtime gives, in a fault and in the reason it disabled a

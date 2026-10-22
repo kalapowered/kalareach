@@ -63,6 +63,8 @@ pub const PREPARATION_DEADLINE: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 pub struct ComponentCalls {
     client: Mutex<Option<Arc<PluginClient>>>,
+    /// Woken when the connection is published, replaced or withdrawn.
+    changed: tokio::sync::Notify,
     /// The preparations inside a component now.
     running: Arc<tokio::sync::Semaphore>,
 }
@@ -71,6 +73,7 @@ impl ComponentCalls {
     pub(super) fn new() -> Self {
         Self {
             client: Mutex::new(None),
+            changed: tokio::sync::Notify::new(),
             running: Arc::new(tokio::sync::Semaphore::new(MAX_PREPARATIONS)),
         }
     }
@@ -81,6 +84,13 @@ impl ComponentCalls {
             .client
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = client;
+        self.changed.notify_one();
+    }
+
+    /// Waits until the connection may have been published, replaced or withdrawn since the last
+    /// wait returned. A change that comes first is kept until it is waited for.
+    pub async fn changed(&self) {
+        self.changed.notified().await;
     }
 
     /// Returns the runtime's connection, while there is one.
@@ -110,6 +120,9 @@ pub struct PreparationRequest {
     pub token: WireToken,
     /// What an action that offers an attachment to the agent needs besides.
     pub draft: Option<DraftNeeds>,
+    /// Whether privacy mode stood when the invocation was accepted: the arguments a component is
+    /// handed were made then, however long the preparation waits for a place.
+    pub private: bool,
 }
 
 /// What an action that offers an attachment from a draft needs to be prepared: the actor it is for,
@@ -345,6 +358,7 @@ impl Broker {
             argument_hash: hash,
             token,
             draft,
+            private: self.observation.is_private(),
         })
     }
 
@@ -589,6 +603,9 @@ impl Broker {
                     .to_owned(),
             });
         };
+        // Marked before the hand-over, not after the answer: a call that is written and then times
+        // out may still have been read, and arguments made in privacy mode stay made in it.
+        self.observation.expose(request.binding_id, request.private);
         let token = WireToken {
             expires_at_ms: kr_ipc::now_ms()
                 .get()
@@ -604,11 +621,26 @@ impl Broker {
             )
             .await;
         drop(place);
+        // What the runtime says of a component, and what a component says of itself, is made of what
+        // it was handed, and a component handed anything in privacy mode, or on a connection it
+        // stood on, has its words withheld from what a person is told.
+        let withheld = self.observation.words_withheld();
         let called = called.map_err(|error| match error {
             // What a person has to change: a component the runtime has disabled for the
             // binding's life.
+            ServiceError::Disabled { .. } if withheld => BrokerError::UnsupportedCapability {
+                detail: "the component is disabled; the runtime's words are withheld for privacy \
+                         mode"
+                    .to_owned(),
+            },
             ServiceError::Disabled { reason } => BrokerError::UnsupportedCapability {
                 detail: format!("the component is disabled: {reason}"),
+            },
+            // What the runtime refused, in words the component can have chosen.
+            ServiceError::Protocol { .. } if withheld => BrokerError::ResourceUnavailable {
+                detail: "the plugin runtime refused to ask the component to prepare the action; \
+                         its words are withheld for privacy mode"
+                    .to_owned(),
             },
             // What did not answer this time: a runtime that is gone or slow, and a component that
             // used its whole allowance. Asking again can succeed.
@@ -617,6 +649,11 @@ impl Broker {
             },
         })?;
         if let Some(fault) = called.fault {
+            let fault = if withheld {
+                "its words are withheld for privacy mode".to_owned()
+            } else {
+                fault
+            };
             return Err(BrokerError::InvalidArgument(format!(
                 "{}'s component declined to prepare it: {fault}",
                 request.params.action

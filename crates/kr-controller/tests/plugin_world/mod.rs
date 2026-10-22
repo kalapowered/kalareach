@@ -341,6 +341,39 @@ pub struct Hosted {
 }
 
 impl Hosted {
+    /// Tells the session its privacy generation on the daemon's authority connection, as the
+    /// daemon does, and returns once the worker has answered.
+    pub async fn tell_privacy(
+        &self,
+        authority: &mut kr_ipc::client::BoundLink,
+        generation: u64,
+        enabled: bool,
+    ) {
+        use kr_protocol::envelope::ControlFrame;
+        authority
+            .send(&ControlFrame::PrivacyGeneration(
+                kr_protocol::privacy::PrivacyGenerationNotice {
+                    environment_id: self.environment_id,
+                    generation: kr_protocol::scalars::U64::new(generation),
+                    enabled,
+                },
+            ))
+            .await
+            .expect("writes the notice");
+        let acknowledged = tokio::time::timeout(PATIENCE, async {
+            loop {
+                match authority.recv().await.expect("the worker answers") {
+                    ControlFrame::PrivacyGenerationAck(ack) => return ack,
+                    ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
+                    other => panic!("the worker answered {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the worker acknowledges the privacy generation in time");
+        assert_eq!(acknowledged.generation.get(), generation);
+    }
+
     pub fn environment(&self) -> EnvironmentPaths {
         self.tree.environment()
     }
