@@ -63,6 +63,7 @@ use serde::Serialize;
 
 use crate::error::ClientError;
 use crate::recovery::bundle::read_bundle;
+use crate::recovery::checkpoint::hold_to_known_checkpoint;
 use crate::recovery::{
     ExportedArchive, ExportedObject, FreshRestore, MAX_EXPORT_BYTES, OfflineExport, RecoveryError,
     RetrievalPolicy, ServiceAccess, TrustedMaterial, advance_checkpoint,
@@ -419,6 +420,21 @@ pub enum RestoreError {
     OlderThanTheCheckpoint {
         /// The generation the bundle's checkpoint records.
         checkpoint: u64,
+        /// The generation the service holds.
+        held: u64,
+    },
+    /// A generation was named to be accepted past the checkpoint, and the service holds another.
+    ///
+    /// The person's word covers the one older generation they named; a service that holds the
+    /// checkpoint's generation or a newer one needs no word, and restoring it under this one would
+    /// leave the person believing they had chosen it.
+    #[error(
+        "generation {named} was named to be accepted past the bundle's checkpoint, and the \
+         service holds generation {held}, which needs no such word"
+    )]
+    NamedGenerationNotHeld {
+        /// The generation the person named.
+        named: u64,
         /// The generation the service holds.
         held: u64,
     },
@@ -936,6 +952,9 @@ pub struct PreparedRestore {
     context: RecoveryContext,
     /// Where the first read found the bundle, which every later read is held to.
     first_place: SyncPosition,
+    /// The checkpoint the first read found for this archive, which every later read is held to:
+    /// the strongest this restore has seen authenticated.
+    known_checkpoint: Option<ArchiveCheckpoint>,
     /// The bundle as the service sealed it there, for an export.
     sealed_bundle: Vec<u8>,
     /// The publication this restore verified, for an export.
@@ -1025,6 +1044,9 @@ impl PreparedRestore {
             let read = read_bundle(&reader, &self.context, Some(seen), &self.seed)
                 .await
                 .map_err(from_recovery)?;
+            if let Some(known) = &self.known_checkpoint {
+                hold_to_known_checkpoint(&read.bundle, known).map_err(from_recovery)?;
+            }
             let Some(mut advanced) =
                 advance_checkpoint(&read.bundle, &verified).map_err(from_recovery)?
             else {
@@ -1245,6 +1267,15 @@ impl FilesRestore {
             },
             other => RestoreError::Publication(other),
         })?;
+        // The word covers the one older generation it names, and nothing else the service holds.
+        if let Some(named) = accept_older
+            && !matches!(verified.standing, GenerationStanding::OlderAccepted { .. })
+        {
+            return Err(RestoreError::NamedGenerationNotHeld {
+                named: named.get(),
+                held: verified.backup_generation.get(),
+            });
+        }
         let descriptor = &publication.payload.descriptor;
         let manifest_limit = stream::encrypted_len(MAX_MANIFEST_PAYLOAD_LEN) as u64;
         let declared = descriptor.encrypted_manifest.encrypted_len.get();
@@ -1329,6 +1360,7 @@ impl FilesRestore {
             seed,
             context,
             first_place,
+            known_checkpoint: checkpoint,
             sealed_bundle,
             publication,
             encrypted_manifest,
