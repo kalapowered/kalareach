@@ -38,6 +38,7 @@ mod archive;
 mod bundle;
 mod checkpoint;
 mod files;
+mod host_archive;
 mod kit;
 mod record;
 mod restore;
@@ -64,6 +65,9 @@ pub use crate::recovery::files::{
     MAX_RESTORED_BYTES, MAX_SESSION_MEMBER_BYTES, MemberRefusal, MemberRole, MemberVerdict,
     PlannedMember, PreparedRestore, PublicationRefusal, RESTORE_RECORD_FORMAT, RestoreError,
     RestorePlan, RestoreSource, SignInCause, SourceService, SourceSignIn,
+};
+pub use crate::recovery::host_archive::{
+    ArchiveEntries, HostBackups, HostCover, HostCovered, Left, SessionHost, cover_host_archive,
 };
 pub use crate::recovery::kit::{
     MAX_RECOVERY_KIT_BYTES, RECOVERY_KIT_FORMAT, parse_kit, qr_payload, render_kit,
@@ -180,6 +184,15 @@ pub enum RecoveryError {
     CheckpointDisagrees {
         /// The generation both name.
         generation: u64,
+    },
+    /// The host did not say how setting its backups up under this recovery ended.
+    ///
+    /// The bundle names the archive. Asking again reads the host's status again and finds the
+    /// setup if it landed; nothing is written a second time.
+    #[error("the host did not say how setting its backups up ended, so ask it again")]
+    HostOutcomeUnknown {
+        /// The seconds the storage service asked to be left alone for, when it named some.
+        retry_after_seconds: Option<u64>,
     },
     /// The bundle at the locator was written by somebody else since this device last read it.
     #[error("the recovery bundle has moved on since this device last read it; read it again")]
