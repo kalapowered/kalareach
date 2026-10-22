@@ -21,7 +21,7 @@ use super::workers::WORKER_EXCHANGE;
 /// The names are in the worker's journal, so there is no bound on how many a busy session can
 /// produce; what is bounded is how long one announcement spends collecting them. A worker with
 /// more than this many pages keeps the rest, the report says how many have not arrived, and the
-/// next announcement continues from where this one stopped.
+/// daemon asks for the rest again, from where this one stopped.
 const MAX_EVIDENCE_PAGES: usize = 64;
 
 /// How many times an announcement asks again for a page of evidence that a worker refused because
@@ -62,7 +62,9 @@ struct Retries {
     left: u32,
     pause: std::time::Duration,
     /// Whether the collection is the evidence pass's and not an announcement's, which this host's
-    /// own tests tell apart: a pass is not an announcement they count.
+    /// own tests tell apart: a pass is not an announcement they count. Compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
     by_the_pass: bool,
 }
 
@@ -72,6 +74,7 @@ impl Retries {
         Self {
             left: MAX_PAGE_RETRIES,
             pause: PAGE_RETRY_PAUSE,
+            #[cfg(feature = "testing")]
             by_the_pass: false,
         }
     }
@@ -79,6 +82,7 @@ impl Retries {
     /// What one run of the evidence pass may spend.
     fn for_the_pass() -> Self {
         Self {
+            #[cfg(feature = "testing")]
             by_the_pass: true,
             ..Self::for_an_announcement()
         }
