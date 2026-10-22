@@ -255,14 +255,8 @@ impl<'r> Host<'r> {
             .expect("the environment's identity");
         let environment = paths.environment(environment_id);
         environment.create().expect("the environment's directories");
-        let port = if preparation.stable_address {
-            // A port nothing holds now; the daemon binds it at each start, and the address a
-            // paired device holds stays the address the host answers on.
-            std::net::UdpSocket::bind("127.0.0.1:0")
-                .expect("a free loopback port")
-                .local_addr()
-                .expect("its address")
-                .port()
+        let mut port = if preparation.stable_address {
+            free_loopback_port()
         } else {
             0
         };
@@ -275,16 +269,48 @@ impl<'r> Host<'r> {
             shell_packages: options.shell_packages.clone(),
             daemon: Mutex::new(None),
         };
-        host.start_daemon();
-        host
+        // The port was free when it was chosen, and it is bound when the daemon starts: other legs
+        // choose theirs meanwhile, on this machine and on a shared one, and two can choose alike.
+        // A daemon that exited because its address was taken before it could bind it has started
+        // nothing, so another port is chosen and the daemon started again; nothing holds the old
+        // address yet, because no device has paired.
+        for attempt in 1..=PORT_ATTEMPTS {
+            match host.start_daemon_once() {
+                Ok(()) => return host,
+                Err(said)
+                    if preparation.stable_address
+                        && attempt < PORT_ATTEMPTS
+                        && address_was_taken(&said) =>
+                {
+                    port = free_loopback_port();
+                    write_configuration(&host.environment, &preparation.command_integrations, port);
+                }
+                Err(said) => panic!("the control daemon exited before it answered: {said}"),
+            }
+        }
+        unreachable!("the last attempt returns or panics")
     }
 
     /// Starts the daemon over the host tree.
     ///
     /// # Panics
     ///
-    /// Panics when it does not answer within [`LIVENESS`].
+    /// Panics when it does not answer within [`LIVENESS`], or exits before it does.
     pub fn start_daemon(&self) {
+        if let Err(said) = self.start_daemon_once() {
+            panic!("the control daemon exited before it answered: {said}");
+        }
+    }
+
+    /// Starts the daemon over the host tree once, and returns what it wrote when it exited before
+    /// it answered.
+    ///
+    /// # Panics
+    ///
+    /// Panics when it does not answer within [`LIVENESS`].
+    fn start_daemon_once(&self) -> Result<(), String> {
+        // What the log holds before this start is an earlier start's, and is not this one's to say.
+        let earlier = std::fs::metadata(self.daemon_log()).map_or(0, |log| log.len());
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -326,7 +352,7 @@ impl<'r> Host<'r> {
             Some(Daemon { child, identity });
         let answered = Deadline::after(LIVENESS).poll(CLEANUP_COMMAND, ASK_AGAIN, |bound| {
             let heard = match self.kr_within(&["list", "--json"], bound) {
-                Ok(output) if output.status.success() => return ControlFlow::Break(()),
+                Ok(output) if output.status.success() => return ControlFlow::Break(None),
                 Ok(output) => format!("kr list ended with {}", output.status),
                 Err(why) => format!("kr list {why}"),
             };
@@ -336,18 +362,18 @@ impl<'r> Host<'r> {
                 .unwrap_or_else(PoisonError::into_inner)
                 .as_mut()
                 .is_some_and(|daemon| daemon.child.try_wait().ok().flatten().is_some());
-            assert!(
-                !ended,
-                "the control daemon exited before it answered: {}",
-                self.daemon_said()
-            );
+            if ended {
+                return ControlFlow::Break(Some(self.daemon_said_since(earlier)));
+            }
             ControlFlow::Continue(heard)
         });
-        if let Err(heard) = answered {
-            panic!(
+        match answered {
+            Ok(None) => Ok(()),
+            Ok(Some(said)) => Err(said),
+            Err(heard) => panic!(
                 "the control daemon did not answer within {LIVENESS:?} ({heard}): {}",
                 self.daemon_said()
-            );
+            ),
         }
     }
 
@@ -387,6 +413,16 @@ impl<'r> Host<'r> {
 
     fn daemon_log(&self) -> PathBuf {
         self.run.root().join("controller.log")
+    }
+
+    /// What the daemon wrote after its log was `earlier` bytes long, the last forty lines of it.
+    fn daemon_said_since(&self, earlier: u64) -> String {
+        let bytes = std::fs::read(self.daemon_log()).unwrap_or_default();
+        let from = usize::try_from(earlier).map_or(bytes.len(), |earlier| earlier.min(bytes.len()));
+        let text = String::from_utf8_lossy(&bytes[from..]);
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines.len().saturating_sub(40);
+        lines[start..].join("\n")
     }
 
     /// The last of what the daemon wrote, for a failure message.
@@ -727,6 +763,25 @@ impl Drop for Host<'_> {
             let _ = self.stop_daemon();
         }
     }
+}
+
+/// How many times a host with a stable address is given a port before the daemon's refusal of it is
+/// reported. It ends a hang: each refusal is a port another leg chose at the same moment.
+const PORT_ATTEMPTS: usize = 5;
+
+/// A loopback port nothing holds now; the daemon binds it at each start, and the address a paired
+/// device holds stays the address the host answers on.
+fn free_loopback_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .expect("a free loopback port")
+        .local_addr()
+        .expect("its address")
+        .port()
+}
+
+/// Whether what a daemon wrote says it exited because its configured address was held by another.
+fn address_was_taken(said: &str) -> bool {
+    said.contains("network.bind_address") && said.contains("could not be bound")
 }
 
 /// Writes the environment's configuration document: this host joins the network on loopback, with
