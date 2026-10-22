@@ -73,8 +73,18 @@ impl Home {
         finish_within(child, Duration::from_secs(300))
     }
 
+    /// `kr host versions`, which answers only for a `kr` of a store.
     fn versions(&self, program: &Path) -> (Output, Value) {
         let output = self.run(program, &["--json", "host", "versions"]);
+        let said = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+        (output, said)
+    }
+
+    /// A command that reads nothing of the host and recovers nothing, so a package manager's `kr`
+    /// admits its release before it runs: what the first command of a person's day is. What it
+    /// printed is the runtime and state roots, when it ran.
+    fn first_command(&self, program: &Path) -> (Output, Value) {
+        let output = self.run(program, &["--json", "host", "paths"]);
         let said = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
         (output, said)
     }
@@ -124,8 +134,12 @@ fn the_first_command_of_a_package_managers_kr_admits_its_release() {
     assert!(!home.store.is_store(), "nothing was admitted");
 
     let tree = home.prefix("Cellar", &one);
-    let (admitted, listed) = home.versions(&kr(&tree));
+    let (admitted, shown) = home.first_command(&kr(&tree));
     assert!(admitted.status.success(), "{}", said(&admitted));
+    assert!(
+        shown.get("state_root").is_some(),
+        "the command ran: {shown}"
+    );
     assert_eq!(
         home.store.current().expect("reads"),
         Some(one.name().clone())
@@ -136,8 +150,8 @@ fn the_first_command_of_a_package_managers_kr_admits_its_release() {
             .as_deref(),
         Some("homebrew")
     );
-    // `host versions` answers only for a kr of a store, so the command ran as the store's copy.
-    assert_eq!(listed["releases"][0]["release"], one.name().as_str());
+    // `host versions` answers only for a kr of a store.
+    let (_, listed) = home.versions(&home.store.stable(Program::Kr));
     assert_eq!(listed["releases"][0]["current"], true);
 
     // The prefix is the package manager's, and its removal leaves the host as it is.
@@ -162,15 +176,15 @@ fn a_tree_that_cannot_be_checked_is_not_admitted_and_the_command_does_not_run() 
     let tree = home.prefix("Cellar", &one);
     std::fs::write(tree.join(module_tree()[0].0), "# something else\n").expect("changed");
 
-    let (refused, listed) = home.versions(&kr(&tree));
+    let (refused, shown) = home.first_command(&kr(&tree));
     assert!(!refused.status.success());
     assert!(
         said(&refused).contains("is not what its manifest says"),
         "{}",
         said(&refused)
     );
-    assert_eq!(listed["ok"], false, "{listed}");
-    assert!(listed.get("releases").is_none(), "the command did not run");
+    assert_eq!(shown["ok"], false, "{shown}");
+    assert!(shown.get("state_root").is_none(), "the command did not run");
     assert_eq!(home.store.current().ok().flatten(), None);
 }
 
@@ -182,13 +196,14 @@ fn an_upgrade_by_a_package_manager_leaves_the_release_before_it_in_the_store() {
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
     let first = home.prefix("Cellar", &one);
-    assert!(home.versions(&kr(&first)).0.status.success());
+    assert!(home.first_command(&kr(&first)).0.status.success());
 
     let second = home.prefix("Cellar", &two);
     // The upgrade removes the old keg, as Homebrew does, before the new release runs.
     std::fs::remove_dir_all(first.parent().expect("a keg")).expect("the old keg goes");
-    let (upgraded, listed) = home.versions(&kr(&second));
+    let (upgraded, _) = home.first_command(&kr(&second));
     assert!(upgraded.status.success(), "{}", said(&upgraded));
+    let (_, listed) = home.versions(&home.store.stable(Program::Kr));
     assert_eq!(
         home.store.current().expect("reads"),
         Some(two.name().clone())
@@ -223,7 +238,7 @@ fn an_update_that_waits_does_not_stop_the_command() {
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
     let first = home.prefix("Cellar", &one);
-    assert!(home.versions(&kr(&first)).0.status.success());
+    assert!(home.first_command(&kr(&first)).0.status.success());
 
     // Another update of the host is under way: it holds the update lock.
     let busy = home
@@ -232,14 +247,17 @@ fn an_update_that_waits_does_not_stop_the_command() {
         .expect("the lock")
         .expect("free");
     let second = home.prefix("Cellar", &two);
-    let (waited, listed) = home.versions(&kr(&second));
+    let (waited, shown) = home.first_command(&kr(&second));
     assert!(waited.status.success(), "{}", said(&waited));
     assert!(
         said(&waited).contains("another update of this host is running"),
         "{}",
         said(&waited)
     );
-    assert_eq!(listed["releases"][0]["release"], one.name().as_str());
+    assert!(
+        shown.get("state_root").is_some(),
+        "the command ran: {shown}"
+    );
     drop(busy);
     assert_eq!(
         home.store.current().expect("reads"),
@@ -255,7 +273,7 @@ fn two_first_commands_at_once_admit_one_release() {
     let tree = home.prefix("Cellar", &one);
     let children: Vec<_> = (0..2)
         .map(|_| {
-            home.command(&kr(&tree), &["--json", "host", "versions"])
+            home.command(&kr(&tree), &["--json", "host", "paths"])
                 .spawn()
                 .expect("kr starts")
         })
@@ -289,14 +307,14 @@ fn a_release_with_no_channel_root_is_not_admitted_and_the_command_does_not_run()
     files.retain(|file| file["path"] != kr_cli::update::release::CHANNEL_ROOT);
     std::fs::write(&path, document.to_string()).expect("written");
 
-    let (refused, listed) = home.versions(&kr(&tree));
+    let (refused, shown) = home.first_command(&kr(&tree));
     assert!(!refused.status.success(), "{}", said(&refused));
     assert!(
         said(&refused).contains("update channel root"),
         "{}",
         said(&refused)
     );
-    assert!(listed.get("releases").is_none(), "the command did not run");
+    assert!(shown.get("state_root").is_none(), "the command did not run");
     assert!(!home.store.is_store(), "nothing was admitted");
 }
 
@@ -309,11 +327,11 @@ fn a_package_managers_release_without_its_manifest_is_refused() {
     let tree = home.prefix("Cellar", &one);
     std::fs::remove_file(tree.join("release.json")).expect("removed");
 
-    let (refused, listed) = home.versions(&kr(&tree));
+    let (refused, shown) = home.first_command(&kr(&tree));
     assert!(!refused.status.success());
     assert!(said(&refused).contains("no manifest"), "{}", said(&refused));
-    assert_eq!(listed["ok"], false, "{listed}");
-    assert!(listed.get("releases").is_none(), "the command did not run");
+    assert_eq!(shown["ok"], false, "{shown}");
+    assert!(shown.get("state_root").is_none(), "the command did not run");
     assert!(!home.store.is_store(), "nothing was admitted");
 }
 
@@ -325,13 +343,16 @@ fn a_package_managers_older_release_leaves_the_current_one_running() {
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
     let newer = home.prefix("Cellar", &two);
-    assert!(home.versions(&kr(&newer)).0.status.success());
+    assert!(home.first_command(&kr(&newer)).0.status.success());
 
     let older = home.prefix("Cellar", &one);
-    let (ran, listed) = home.versions(&kr(&older));
+    let (ran, shown) = home.first_command(&kr(&older));
     assert!(ran.status.success(), "{}", said(&ran));
     assert!(said(&ran).contains("no newer"), "{}", said(&ran));
-    assert_eq!(listed["releases"][0]["release"], two.name().as_str());
+    assert!(
+        shown.get("state_root").is_some(),
+        "the command ran: {shown}"
+    );
     assert_eq!(
         home.store.current().expect("reads"),
         Some(two.name().clone())
@@ -350,9 +371,9 @@ fn a_release_kept_after_a_rollback_is_not_switched_back_to() {
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
     let first = home.prefix("Cellar", &one);
-    assert!(home.versions(&kr(&first)).0.status.success());
+    assert!(home.first_command(&kr(&first)).0.status.success());
     let second = home.prefix("Cellar", &two);
-    assert!(home.versions(&kr(&second)).0.status.success());
+    assert!(home.first_command(&kr(&second)).0.status.success());
     let store_kr = home.store.stable(Program::Kr);
     let rolled = home.run(&store_kr, &["host", "rollback"]);
     assert!(rolled.status.success(), "{}", said(&rolled));
@@ -361,7 +382,7 @@ fn a_release_kept_after_a_rollback_is_not_switched_back_to() {
         Some(one.name().clone())
     );
 
-    let (ran, _) = home.versions(&kr(&second));
+    let (ran, _) = home.first_command(&kr(&second));
     assert!(ran.status.success(), "{}", said(&ran));
     assert_eq!(
         home.store.current().expect("reads"),
@@ -379,7 +400,7 @@ fn a_release_an_update_left_staged_is_offered_again() {
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
     let first = home.prefix("Cellar", &one);
-    assert!(home.versions(&kr(&first)).0.status.success());
+    assert!(home.first_command(&kr(&first)).0.status.success());
 
     // An update that waited for a live worker left the new release in the store, staged for the
     // next attempt, and made nothing current.
@@ -398,12 +419,12 @@ fn a_release_an_update_left_staged_is_offered_again() {
     .expect("the record");
 
     let second = home.prefix("Cellar", &two);
-    let (taken, listed) = home.versions(&kr(&second));
+    let (taken, _) = home.first_command(&kr(&second));
     assert!(taken.status.success(), "{}", said(&taken));
     assert_eq!(
         home.store.current().expect("reads"),
         Some(two.name().clone()),
-        "the staged release is made current at the next command: {} {listed}",
+        "the staged release is made current at the next command: {}",
         said(&taken)
     );
 }
@@ -421,7 +442,7 @@ fn a_package_manager_takes_over_the_release_that_is_current_only_by_its_manifest
     assert_eq!(kr_cli::update::installer(&home.store).expect("reads"), None);
 
     let tree = home.prefix("Cellar", &one);
-    let (ran, _) = home.versions(&kr(&tree));
+    let (ran, _) = home.first_command(&kr(&tree));
     assert!(ran.status.success(), "{}", said(&ran));
     assert_eq!(
         kr_cli::update::installer(&home.store)
@@ -433,7 +454,99 @@ fn a_package_manager_takes_over_the_release_that_is_current_only_by_its_manifest
     // The control: a tree of the same name that is another release's manifest is not that release.
     let other = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 7);
     let forged = home.prefix("Caskroom", &other);
-    let (refused, listed) = home.versions(&kr(&forged));
+    let (refused, shown) = home.first_command(&kr(&forged));
     assert!(!refused.status.success(), "{}", said(&refused));
-    assert!(listed.get("releases").is_none(), "the command did not run");
+    assert!(shown.get("state_root").is_none(), "the command did not run");
+}
+
+/// KR-REQ-26.03: a release the current one refuses stops the commands that need it admitted, and the
+/// refusal names the store's own `kr`; `kr host versions` and `kr host rollback` do not need it
+/// admitted, and run as the store's copy of the release that is current.
+#[test]
+fn a_refused_release_does_not_hold_back_the_commands_that_recover() {
+    let home = Home::new();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    let first = home.prefix("Cellar", &one);
+    assert!(home.first_command(&kr(&first)).0.status.success());
+    let second = home.prefix("Cellar", &two);
+    std::fs::write(second.join(module_tree()[0].0), "# something else\n").expect("changed");
+
+    let (refused, shown) = home.first_command(&kr(&second));
+    assert!(!refused.status.success(), "{}", said(&refused));
+    assert!(shown.get("state_root").is_none(), "the command did not run");
+    let store_kr = home.store.stable(Program::Kr).display().to_string();
+    assert!(
+        said(&refused).contains(&store_kr),
+        "the refusal names the store's own kr: {}",
+        said(&refused)
+    );
+
+    let (listed, versions) = home.versions(&kr(&second));
+    assert!(listed.status.success(), "{}", said(&listed));
+    assert_eq!(versions["releases"][0]["release"], one.name().as_str());
+    // The store's copy answers a rollback, and has none to go back to: a `kr` of the prefix would
+    // say it is not of an installed release.
+    let rolled = home.run(&kr(&second), &["host", "rollback"]);
+    assert!(!rolled.status.success(), "{}", said(&rolled));
+    assert!(
+        said(&rolled).contains("no release it was on before"),
+        "{}",
+        said(&rolled)
+    );
+    assert_eq!(
+        home.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+}
+
+/// KR-REQ-26.03: an update that fails once it has staged the release is refused once. The release
+/// is not offered again at each command, which would repack it and fail again.
+#[test]
+fn an_update_that_fails_after_it_staged_the_release_is_not_offered_again() {
+    let home = Home::new();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let first = home.prefix("Cellar", &one);
+    assert!(home.first_command(&kr(&first)).0.status.success());
+
+    // A store listed in a way the current kr does not know: the update stages the release and then
+    // refuses the switch, before anything stops.
+    let mut stores = release_stores();
+    stores.push(ReleaseStore {
+        store: "ledgers".to_owned(),
+        scope: StoreScope::Unknown,
+        path: "ledgers.sqlite".to_owned(),
+        recording: Recording::SqliteUserVersion,
+        version: 1,
+        migrates_from: 1,
+    });
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).reading(stores);
+    let second = home.prefix("Cellar", &two);
+    let (refused, _) = home.first_command(&kr(&second));
+    assert!(!refused.status.success(), "{}", said(&refused));
+    assert!(
+        said(&refused).contains("was not admitted"),
+        "{}",
+        said(&refused)
+    );
+    assert!(
+        home.store.release_directory(two.name()).exists(),
+        "the update staged the release before it refused the switch"
+    );
+
+    let (again, shown) = home.first_command(&kr(&second));
+    assert!(again.status.success(), "{}", said(&again));
+    assert!(
+        said(&again).contains("is in this host's store already"),
+        "{}",
+        said(&again)
+    );
+    assert!(
+        shown.get("state_root").is_some(),
+        "the command ran: {shown}"
+    );
+    assert_eq!(
+        home.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
 }

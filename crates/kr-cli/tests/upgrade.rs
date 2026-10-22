@@ -784,7 +784,7 @@ async fn a_package_managers_first_command_updates_a_host_on_the_release_before()
     start_each_once(&tree);
     let mut command = host.command(
         &tree.join("bin").join(Program::Kr.file_name()),
-        &["--json", "host", "versions"],
+        &["--json", "host", "paths"],
     );
     command
         .env("HOME", &home)
