@@ -1030,31 +1030,41 @@ impl Environment {
     /// Starts as [`Self::start`] does, with the daemon delivering through the gateway only when
     /// `attached` says so: a daemon with no transport asks no gateway anything.
     async fn start_attached(attached: bool) -> Self {
-        Self::start_on(attached, None, None).await
+        Self::start_on(attached, None, None, None).await
     }
 
     /// Starts as [`Self::start`] does, on clocks the test moves by hand.
     async fn start_on_clocks(clocks: kr_controller::service::Clocks) -> Self {
-        Self::start_on(true, Some(clocks), None).await
+        Self::start_on(true, Some(clocks), None, None).await
     }
 
     /// Starts as [`Self::start`] does, with a configuration document that selects the mailbox
     /// service at the gateway's own origin.
     async fn start_selecting_a_mailbox() -> Self {
-        Self::start_on(true, None, Some(GATEWAY)).await
+        Self::start_on(true, None, Some(GATEWAY), None).await
+    }
+
+    /// Starts as [`Self::start`] does, with the managed service stood up at `origin`, which is
+    /// where this daemon takes a credential from and sends every request under it.
+    async fn start_with_the_service_at(origin: &str) -> Self {
+        Self::start_on(true, None, None, Some(origin)).await
     }
 
     async fn start_on(
         attached: bool,
         clocks: Option<kr_controller::service::Clocks>,
         mailbox: Option<&str>,
+        service: Option<&str>,
     ) -> Self {
         let owner = DeviceKeys::generate().expect("owner keys");
         let host = match clocks {
             Some(clocks) => Host::start_on_clocks(&owner, clocks).await,
             None => Host::start(&owner).await,
         };
-        let stopped = host.shut_down().await;
+        let mut stopped = host.shut_down().await;
+        if let Some(origin) = service {
+            stopped.account_service_stays_at(origin);
+        }
         if let Some(origin) = mailbox {
             let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
             document.revision = 1;
@@ -1658,6 +1668,46 @@ async fn a_paired_device_that_registers_is_told_of_the_next_question_and_still_i
     })
     .await;
     assert_eq!(environment.gateway.state().bearers_refused, 0);
+}
+
+/// KR-REQ-16.08: a daemon takes a credential only from the gateway its managed service stands at.
+/// Where a suite has stood that service up on this machine, a credential naming the official
+/// gateway is refused, as one naming any other origin is, and the same credential naming the
+/// service's origin is registered. The default (the official gateway) is every other case here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_daemon_takes_a_credential_only_from_the_gateway_its_service_stands_at() {
+    const SERVICE: &str = "http://127.0.0.1:9";
+    let environment = Environment::start_with_the_service_at(SERVICE).await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x52));
+    let issued =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    assert_eq!(issued.gateway_origin.as_str(), GATEWAY);
+
+    let refused = phone
+        .register(&environment, &issued)
+        .await
+        .expect_err("a credential naming the official gateway is not this daemon's");
+    assert_eq!(refused.code, kr_protocol::error::ErrorCode::InvalidArgument);
+    assert!(
+        environment.destination(phone.device_id()).is_none(),
+        "nothing was registered"
+    );
+    assert!(
+        environment.gateway.state().asked.is_empty(),
+        "and the gateway was not asked about it"
+    );
+
+    let mut named = issued;
+    named.gateway_origin = kr_protocol::service::GatewayOrigin::new(SERVICE).expect("an origin");
+    let registered = phone
+        .register(&environment, &named)
+        .await
+        .expect("a credential naming the service's origin is registered");
+    assert_eq!(registered.sender_record_id, sender);
+    assert!(environment.destination(phone.device_id()).is_some());
 }
 
 /// KR-REQ-09.07, KR-REQ-16.08: a device whose registration answer was lost on the way back repeats

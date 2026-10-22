@@ -1917,7 +1917,12 @@ impl Controller {
             ));
         }
         let offered = params.credential;
-        crate::push::check_offered_credential(&offered, &recorded.authorisation, now_ms)?;
+        crate::push::check_offered_credential(
+            &offered,
+            &recorded.authorisation,
+            now_ms,
+            &self.gateway_origin,
+        )?;
         let destination_id = kr_delivery::destination::DestinationId::new(device_id.to_string())
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         self.refuse_a_destination_held_by_another(&destination_id, &offered)?;
@@ -2026,7 +2031,7 @@ impl Controller {
             .filter(|old| *old != offered.sender_record_id);
         let owing_origin = replaced.map(|old| {
             credentials.held(old).map_or_else(
-                || crate::push::OFFICIAL_GATEWAY_ORIGIN.to_owned(),
+                || self.gateway_origin.clone(),
                 |held| held.gateway_origin.as_str().to_owned(),
             )
         });
@@ -2119,7 +2124,7 @@ impl Controller {
         credentials: &crate::push::credentials::HeldCredentials,
     ) -> Result<()> {
         let origin = credentials.held(sender_record_id).map_or_else(
-            || crate::push::OFFICIAL_GATEWAY_ORIGIN.to_owned(),
+            || self.gateway_origin.clone(),
             |held| held.gateway_origin.as_str().to_owned(),
         );
         let now_ms = self.settled_now_ms();
