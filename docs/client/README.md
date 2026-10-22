@@ -1427,6 +1427,21 @@ because the bundle is the only place a restore takes a writer key from and dropp
 every archive it had already signed unverifiable. `retire_writer` is the separate, deliberate step
 that drops a key once no retained archive needs it.
 
+**A host's backups are covered by the kit only if the host was set up under its recipient.**
+`recovery::cover_host_archive` is the one function that does both halves, in this order: it reads
+the host's status (`HostBackups`, implemented over a session by `SessionHost`); it leaves the host
+alone, with nothing sent to the service, when the host selects no service or another than the
+bundle's, holds no usable sign-in, has a setup that has not ended, or was set up under another kit
+and a replacement was not asked for; it commits the bundle naming the archive, the producer and the
+writer in one write (`ArchiveEntries`, which `SettingsArchive::enable` composes its bundle with as
+well); it reads the sealed bytes as the service now holds them (`BundleStore::sealed_as_committed`,
+a conflict if another device wrote since); and it sends the host this computer's recipient and
+those bytes, which the host accepts only if they are what is at the locator. `HostCover::Covered`
+comes back only after the host answered that it is set up. A host that did not say how the setup
+ended is `RecoveryError::HostOutcomeUnknown`, and a repeat reads the host's status and finds the
+setup if it landed. A replacement is a new archive under the new recipient; the earlier archive
+keeps what the host published and is not in the new bundle.
+
 **The bundle also names the producers.** A key wrap is a `crypto_box` between the producer's
 stored-envelope key and the recipient's, and opening one needs the producer's public key; the
 descriptor carries only an identifier, which is a hash. `enable_producer` puts it in the bundle, and
