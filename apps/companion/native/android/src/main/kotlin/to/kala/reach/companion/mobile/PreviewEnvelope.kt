@@ -1,5 +1,8 @@
 package to.kala.reach.companion.mobile
 
+import org.json.JSONException
+import org.json.JSONObject
+
 /**
  * The sealed preview a push message carries, and what can be decided about it before it is opened.
  *
@@ -40,32 +43,41 @@ class PreviewEnvelope(
         /**
          * Reads a sealed preview out of a message's data.
          *
-         * A push message's data is a flat map of strings, so the routing arrives as its own fields
-         * rather than as a nested object. Every failure is a reason to show the generic alert, so
-         * the parse is strict rather than forgiving.
+         * A push message's data is a flat map of strings, so the gateway sends the sealed envelope
+         * as the JSON text of an object under `preview`, with the routing nested in it, and that
+         * text is what is read here. Anything under that key that is not such text is not what the
+         * gateway sent.
+         *
+         * Every failure is a reason to show the generic alert, so the parse is strict rather than
+         * forgiving.
          */
         fun parse(data: Map<String, String>): ParsedPreview {
-            if (!data.containsKey("preview_ciphertext")) return ParsedPreview.Absent
-            val nonce = decode(data["preview_nonce"]) ?: return ParsedPreview.Malformed("nonce")
+            val text = data["preview"] ?: return ParsedPreview.Absent
+            val preview =
+                try {
+                    JSONObject(text)
+                } catch (failure: JSONException) {
+                    return ParsedPreview.Malformed("preview")
+                }
+            val routing = preview.optJSONObject("routing") ?: return ParsedPreview.Malformed("routing")
+            val nonce = decode(text(preview, "nonce")) ?: return ParsedPreview.Malformed("nonce")
             if (nonce.size != NONCE_LENGTH) return ParsedPreview.Malformed("nonce")
             val ciphertext =
-                decode(data["preview_ciphertext"]) ?: return ParsedPreview.Malformed("ciphertext")
+                decode(text(preview, "ciphertext")) ?: return ParsedPreview.Malformed("ciphertext")
             if (ciphertext.isEmpty()) return ParsedPreview.Malformed("ciphertext")
-            val envelopeId = data["envelope_id"]
+            val envelopeId = text(routing, "envelope_id")
             if (envelopeId.isNullOrEmpty()) return ParsedPreview.Malformed("envelope_id")
             val recipient =
-                decode(data["recipient_key_id"])
+                decode(text(routing, "recipient_key_id"))
                     ?: return ParsedPreview.Malformed("recipient_key_id")
             if (recipient.size != KEY_ID_LENGTH) return ParsedPreview.Malformed("recipient_key_id")
             val sender =
-                decode(data["sender_key_id"]) ?: return ParsedPreview.Malformed("sender_key_id")
+                decode(text(routing, "sender_key_id"))
+                    ?: return ParsedPreview.Malformed("sender_key_id")
             if (sender.size != KEY_ID_LENGTH) return ParsedPreview.Malformed("sender_key_id")
-            val expires =
-                data["expires_at_ms"]?.toLongOrNull()
-                    ?: return ParsedPreview.Malformed("expires_at_ms")
+            val expires = counter(routing, "expires_at_ms") ?: return ParsedPreview.Malformed("expires_at_ms")
             val bucket =
-                data["size_bucket_bytes"]?.toLongOrNull()
-                    ?: return ParsedPreview.Malformed("size_bucket_bytes")
+                counter(routing, "size_bucket_bytes") ?: return ParsedPreview.Malformed("size_bucket_bytes")
             return ParsedPreview.Sealed(
                 PreviewEnvelope(
                     PreviewRouting(envelopeId, recipient, sender, expires, bucket),
@@ -73,6 +85,19 @@ class PreviewEnvelope(
                     ciphertext
                 )
             )
+        }
+
+        /** A member that is text, and nothing else: a number or an object is not what was sent. */
+        private fun text(from: JSONObject, name: String): String? = from.opt(name) as? String
+
+        /**
+         * A counter, which the protocol sends as a string of decimal digits in JSON and nothing
+         * else.
+         */
+        private fun counter(from: JSONObject, name: String): Long? {
+            val digits = text(from, name) ?: return null
+            if (digits.isEmpty() || digits.any { it !in '0'..'9' }) return null
+            return digits.toLongOrNull()
         }
 
         /**

@@ -3,6 +3,7 @@ package to.kala.reach.platform
 import android.Manifest
 import android.app.Activity
 import android.content.ActivityNotFoundException
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.verify.domain.DomainVerificationManager
@@ -35,6 +36,7 @@ import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import java.io.File
+import org.json.JSONObject
 import java.util.concurrent.Executors
 import to.kala.reach.companion.mobile.CallBridge
 import to.kala.reach.companion.mobile.CallBridgeHolder
@@ -42,7 +44,9 @@ import to.kala.reach.companion.mobile.CallNews
 import to.kala.reach.companion.mobile.CallOpenings
 import to.kala.reach.companion.mobile.CallRefused
 import to.kala.reach.companion.mobile.CallWire
+import to.kala.reach.companion.mobile.NotificationRoute
 import to.kala.reach.companion.mobile.OwnerAuthenticators
+import to.kala.reach.companion.mobile.PushStores
 import to.kala.reach.companion.mobile.SecretFiles
 import to.kala.reach.companion.mobile.SignInSession
 
@@ -87,6 +91,12 @@ class NamedArguments {
 class WrittenArguments {
     lateinit var name: String
     lateinit var value: String
+}
+
+@InvokeArg
+class LimitedKeyArguments {
+    lateinit var recipient_key_id: String
+    lateinit var seed: String
 }
 
 /**
@@ -135,6 +145,12 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
     private val queued = ArrayDeque<JSObject>()
 
     override fun load(webView: WebView) {
+        // The screen a tap on a notification opened the application on, if it did: kept until the
+        // application asks, which is once.
+        activity.intent?.getStringExtra(NotificationRoute.EXTRA)?.let {
+            route = it
+            activity.intent.removeExtra(NotificationRoute.EXTRA)
+        }
         // Without its start the verifier refuses every certificate, so an HTTPS request fails and
         // says so; everything that needs no request keeps working, rather than the application
         // failing to start. The log says which happened.
@@ -267,6 +283,125 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
         } catch (failure: ActivityNotFoundException) {
             invoke.reject("the settings page could not be opened")
         }
+    }
+
+    // Notifications. What only the platform can say or do: whether the person allowed them, the
+    // token the provider gave this installation, the record of the registration being waited for
+    // (which the receiver reads without the application running), the limited key store, and the
+    // screen a tap on a notification opened the application on.
+
+    private var route: String? = null
+
+    private val noBackup: File
+        get() = activity.noBackupFilesDir
+
+    /** Where the person's answer stands: `granted`, `denied` or `unknown`, read without asking. */
+    private fun notificationState(): String {
+        val enabled = NotificationManagerCompat.from(activity).areNotificationsEnabled()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return if (enabled) "granted" else "denied"
+        }
+        return when (getPermissionState("notifications")) {
+            PermissionState.GRANTED -> if (enabled) "granted" else "denied"
+            PermissionState.DENIED -> "denied"
+            else -> "unknown"
+        }
+    }
+
+    @Command
+    fun pushPermission(invoke: Invoke) {
+        invoke.resolve(JSObject().put("state", notificationState()))
+    }
+
+    /** Asks the person when they have not answered, and answers once they have. */
+    @Command
+    fun pushAskPermission(invoke: Invoke) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && notificationState() == "unknown") {
+            requestPermissionForAlias("notifications", invoke, "notificationsAnswered")
+        } else {
+            invoke.resolve(JSObject().put("state", notificationState()))
+        }
+    }
+
+    @PermissionCallback
+    fun notificationsAnswered(invoke: Invoke) {
+        invoke.resolve(JSObject().put("state", notificationState()))
+    }
+
+    /** The registration token the provider gave this installation, when it has given one. */
+    @Command
+    fun pushToken(invoke: Invoke) {
+        val token = activity
+            .getSharedPreferences(PushStores.TOKEN_STORE, Context.MODE_PRIVATE)
+            .getString(PushStores.TOKEN_KEY, null)
+        invoke.resolve(JSObject().put("token", token ?: JSONObject.NULL))
+    }
+
+    /** Whether the token changed since the application last asked, and clears that. */
+    @Command
+    fun pushTokenChanged(invoke: Invoke) {
+        val preferences = activity.getSharedPreferences(PushStores.TOKEN_STORE, Context.MODE_PRIVATE)
+        val changed = preferences.getBoolean(PushStores.TOKEN_CHANGED_KEY, false)
+        if (changed) preferences.edit().putBoolean(PushStores.TOKEN_CHANGED_KEY, false).apply()
+        invoke.resolve(JSObject().put("changed", changed))
+    }
+
+    @Command
+    fun pushPendingSet(invoke: Invoke) {
+        val record = invoke.getArgs().optJSONObject("record")
+        if (record == null) {
+            invoke.reject("a pending registration is a record")
+            return
+        }
+        try {
+            PushStores.pending(noBackup).write(record.toString())
+            invoke.resolve(done())
+        } catch (failure: Exception) {
+            invoke.reject("the pending registration could not be kept")
+        }
+    }
+
+    @Command
+    fun pushPendingGet(invoke: Invoke) {
+        try {
+            val record = PushStores.pending(noBackup).read(System.currentTimeMillis())
+            invoke.resolve(JSObject().put("record", record?.let { JSObject(it) } ?: JSONObject.NULL))
+        } catch (failure: Exception) {
+            invoke.reject("the pending registration could not be read")
+        }
+    }
+
+    @Command
+    fun pushPendingClear(invoke: Invoke) {
+        try {
+            PushStores.pending(noBackup).clear()
+            invoke.resolve(done())
+        } catch (failure: Exception) {
+            invoke.reject("the pending registration could not be removed")
+        }
+    }
+
+    /** Files the notification-preview key in the limited store, by its recipient identifier. */
+    @Command
+    fun pushLimitedKey(invoke: Invoke) {
+        val arguments = invoke.parseArgs(LimitedKeyArguments::class.java)
+        try {
+            PushStores.limited(noBackup, KeystoreSealer()).write(
+                Base64.decode(arguments.recipient_key_id, Base64.NO_WRAP),
+                Base64.decode(arguments.seed, Base64.NO_WRAP)
+            )
+            invoke.resolve(done())
+        } catch (failure: Exception) {
+            invoke.reject("the preview key could not be filed")
+        }
+    }
+
+    /** The screen a tap on a notification opened the application on, once. */
+    @Command
+    fun pushRoute(invoke: Invoke) {
+        val taken = route
+        route = null
+        invoke.resolve(JSObject().put("route", taken ?: JSONObject.NULL))
     }
 
     private fun showScanner(invoke: Invoke) {
@@ -524,6 +659,10 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     override fun onNewIntent(intent: Intent) {
+        intent.getStringExtra(NotificationRoute.EXTRA)?.let {
+            route = it
+            intent.removeExtra(NotificationRoute.EXTRA)
+        }
         val data = intent.data ?: return
         if (intent.action != Intent.ACTION_VIEW || data.scheme != "https" ||
             data.host != CALLBACK_HOST || data.path != CALLBACK_PATH
