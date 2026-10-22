@@ -2,7 +2,8 @@
 //! and a paired device on an authorised iroh connection, asking the same daemon.
 //!
 //! Two groups are here. The host diagnostics are served at both doors, and what leaves for a
-//! device is the owner's own answer with every name and path held to its class and its length.
+//! device is the owner's own answer with every name and path held to its class and its length,
+//! and with what the host measured about itself only when the device manages the host.
 //! The skill setup group is served at the local door alone: a device whose grant manages the host
 //! is refused each of its methods, and nothing is written for it. So is `device.revoke`: a remote
 //! owner's revocation of a device reaches the host through the signed authority feed, never as a
@@ -132,10 +133,10 @@ async fn the_diagnostics_answer_both_doors_and_carry_no_credential_to_a_device()
 }
 
 /// KR-REQ-26.43: what the host measured about itself is read by its owner and by a paired device
-/// that manages the host, and a device that holds only the right to view a session is answered
-/// with none. The counts name a bundled connector that failed, which is a fact about the host and
-/// not about any session, so a grant over one session does not reach them; the rest of the
-/// diagnostics are the same for it as for the manager.
+/// whose grant holds `host.manage`, and a device without it is answered the diagnostics with no
+/// `metrics` member. The counts name a bundled connector that failed, which is a fact about the
+/// host and not about any session, so a right over one session does not reach them; the rest of
+/// the diagnostics are the same for that device as for the manager.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_26_43_the_hosts_metrics_reach_a_paired_device_only_under_host_management() {
     use kr_protocol::metrics::{Adapter, MetricOutcome};
@@ -168,12 +169,11 @@ async fn kr_req_26_43_the_hosts_metrics_reach_a_paired_device_only_under_host_ma
             .await
             .expect("host.doctor is served to a device that manages the host"),
     );
-    let by_the_viewer: HostDoctorResult = typed(
-        &viewing
-            .read(Method::HostDoctor, &())
-            .await
-            .expect("host.doctor is served to a device that views a session"),
-    );
+    let viewer_answer = viewing
+        .read(Method::HostDoctor, &())
+        .await
+        .expect("host.doctor is served to a device that views a session");
+    let by_the_viewer: HostDoctorResult = typed(&viewer_answer);
 
     for (who, answer) in [
         ("the owner at the machine", &at_the_machine),
@@ -186,9 +186,10 @@ async fn kr_req_26_43_the_hosts_metrics_reach_a_paired_device_only_under_host_ma
         assert_eq!(series.count.get(), 1, "{who}");
     }
     assert!(
-        by_the_viewer.metrics.is_empty(),
+        kr_worker::history_filter::retained::member(&viewer_answer, "metrics").is_none(),
         "a device that holds only session.view read the host's metrics: {by_the_viewer:?}"
     );
+    assert!(by_the_viewer.metrics.is_empty());
     // The metrics are all that is left out for it: the checks are the manager's own.
     let verdicts = |result: &HostDoctorResult| {
         result
