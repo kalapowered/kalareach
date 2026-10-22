@@ -149,29 +149,30 @@ async fn a_reboot_leaves_no_lease_of_the_boot_before_and_keeps_what_was_written_
     fixture.host.stop().await;
 }
 
-/// KR-REQ-24.15: an older copy of the policy, put back while the host is down, cannot lower the
-/// revision in force. The policy row an earlier moment wrote names a lower floor than the registry
-/// holds after the owner left the organisation; the host starts, and keeps the higher revision, as
-/// it does when a crash left the policy row behind the registry. A grant issued at the revision in
-/// force is not refused as one nothing here issued.
-///
-/// That is the whole of what this shows. The older row also brings back the enrolment the owner
-/// left, which is the part of the requirement that stays open.
+/// KR-REQ-24.15: a registry put back to an earlier state, while the host is down, revives nothing
+/// of the policy it held then. The policy an earlier moment wrote names a lower floor than the
+/// registry holds after the owner left the organisation, and it names the enrolment the owner
+/// left. The host starts on the last policy it wrote: it keeps the higher revision, as it does
+/// when a crash left the policy row behind the registry, and it does not hold the enrolment. A
+/// grant issued at the revision in force is not refused as one nothing here issued.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_older_policy_row_cannot_lower_the_revision_in_force() {
     let fixture = Fixture::start().await;
     let organisation_id = fixture.organisation.organisation_id;
-    let policy_row = |database: std::path::PathBuf| {
-        rusqlite::Connection::open(database)
-            .expect("the registry opens")
-            .query_row(
-                "SELECT value FROM host_authority WHERE key = 'policy'",
-                [],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .expect("the policy row")
+    // The registry's policy as it stands: the row and the sequence that every write raises.
+    let policy_rows = |database: std::path::PathBuf| {
+        let registry = rusqlite::Connection::open(database).expect("the registry opens");
+        ["policy", "policy_sequence"].map(|key| {
+            registry
+                .query_row(
+                    "SELECT value FROM host_authority WHERE key = ?1",
+                    [key],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .expect("the policy row")
+        })
     };
-    let older = policy_row(fixture.host.registry_database());
+    let older = policy_rows(fixture.host.registry_database());
     let lower = fixture.authority_revision();
 
     let mut client = fixture.host.client().await;
@@ -196,13 +197,17 @@ async fn an_older_policy_row_cannot_lower_the_revision_in_force() {
         moved,
     } = fixture;
     let stopped = host.shut_down().await;
-    rusqlite::Connection::open(stopped.tree().environment().registry_database())
-        .expect("the registry opens")
-        .execute(
-            "INSERT OR REPLACE INTO host_authority (key, value) VALUES ('policy', ?1)",
-            [older],
-        )
-        .expect("the older row is put back");
+    let registry = rusqlite::Connection::open(stopped.tree().environment().registry_database())
+        .expect("the registry opens");
+    for (key, value) in ["policy", "policy_sequence"].into_iter().zip(older) {
+        registry
+            .execute(
+                "INSERT OR REPLACE INTO host_authority (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, value],
+            )
+            .expect("the older row is put back");
+    }
+    drop(registry);
     let settings = stopped.settings().clone();
     let host = stopped.start(settings).await;
     let fixture = Fixture {
@@ -222,6 +227,15 @@ async fn an_older_policy_row_cannot_lower_the_revision_in_force() {
         fixture.host.controller().policy().accepted_floor(),
         higher,
         "or the floor"
+    );
+    assert!(
+        fixture
+            .host
+            .controller()
+            .policy()
+            .enrolment(organisation_id)
+            .is_none(),
+        "the enrolment the owner left is not held again"
     );
 
     // A device paired now holds a grant at the revision in force, and is served.

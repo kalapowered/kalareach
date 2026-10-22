@@ -37,6 +37,7 @@
 pub mod applied;
 pub mod durable;
 pub mod feed;
+pub mod mirror;
 pub mod organisation;
 pub mod policy;
 pub mod store;

@@ -1071,6 +1071,26 @@ pub fn table() -> Vec<Store> {
                 &["Record", "StoredAppliedPolicy"],
             )],
         },
+        // The last policy the host wrote, kept beside the registry so that a registry put back to an
+        // earlier state does not bring an older policy back. An earlier release does not name this
+        // store; the registry it reads holds the policy and a sequence beside it that it ignores.
+        Store {
+            levels: None,
+            writers: Writers::Daemon,
+            entry: entry(
+                "policy-mirror",
+                StoreScope::Environment,
+                "policy-mirror.json",
+                cbor_member("version", 0),
+                kr_controller::grants::mirror::RECORD_VERSION,
+                kr_controller::grants::mirror::RECORD_VERSION,
+            ),
+            owned: Vec::new(),
+            kept: vec![Kept::Source(
+                "crates/kr-controller/src/grants/mirror.rs",
+                &["Record"],
+            )],
+        },
         Store {
             levels: None,
             writers: Writers::Daemon,

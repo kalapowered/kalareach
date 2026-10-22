@@ -401,6 +401,12 @@ pub struct GrantDirectory {
     /// This host's clocks and every grant's anchor, once the daemon has bound them
     /// ([`Self::bind_host_clock`]).
     host_clock: std::sync::OnceLock<HostClock>,
+    /// Where the policy this host last wrote is kept beside the registry
+    /// ([`super::mirror`]), when the directory is a file's.
+    mirror: Option<std::path::PathBuf>,
+    /// The highest sequence the mirror holds, and the lock its writes are made under, so the two
+    /// of them that race leave the newer one.
+    mirrored: std::sync::Mutex<u64>,
     /// Where this host's own tests stop a delegation, a redemption or a transfer once it has
     /// anchored its grant and before it takes the store's transaction. Compiled away in every
     /// shipped build.
@@ -428,7 +434,9 @@ impl GrantDirectory {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let connection = kr_flush::release::open_connection(path.as_ref(), None)
             .map_err(|error| ControllerError::registry(kr_flush::release::describe(&error)))?;
-        Self::prepare(connection)
+        let mut directory = Self::prepare(connection)?;
+        directory.mirror = Some(super::mirror::file_beside(path.as_ref()));
+        Ok(directory)
     }
 
     /// Opens an in-memory directory, which is what a test uses.
@@ -542,6 +550,8 @@ impl GrantDirectory {
             live: Arc::new(LiveClaims::default()),
             closes: Arc::new(std::sync::Mutex::new(HeldCloses::default())),
             host_clock: std::sync::OnceLock::new(),
+            mirror: None,
+            mirrored: std::sync::Mutex::new(0),
             #[cfg(feature = "testing")]
             before_effect: crate::attention::Pause::default(),
         })
@@ -2380,7 +2390,34 @@ impl GrantDirectory {
     ///
     /// Returns a storage error when the row cannot be read or does not decode.
     pub fn stored_policy(&self) -> Result<Option<StoredPolicy>> {
-        self.stored("policy")
+        let row: Option<StoredPolicy> = self.stored("policy")?;
+        let Some(file) = &self.mirror else {
+            return Ok(row);
+        };
+        let sequence = self.with(policy_sequence)?;
+        match super::mirror::read(file) {
+            // The registry was put back to a state this host had written past: the last policy it
+            // wrote is the policy, and the older row revives nothing.
+            Ok(Some((mirrored, policy))) if mirrored > sequence => {
+                eprintln!(
+                    "kr-controller: the policy in the registry is older than the last one this \
+                     host wrote, so the host restores the last one it wrote"
+                );
+                let mut kept = self
+                    .mirrored
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *kept = (*kept).max(mirrored);
+                Ok(Some(policy))
+            }
+            Ok(_) => Ok(row),
+            // A copy that cannot be read protects nothing until the next write replaces it, and
+            // stops nothing: the registry's own row is the policy.
+            Err(error) => {
+                eprintln!("kr-controller: could not read the copy of this host's policy: {error}");
+                Ok(row)
+            }
+        }
     }
 
     /// Writes this host's policy.
@@ -2389,7 +2426,63 @@ impl GrantDirectory {
     ///
     /// Returns a storage error when the row cannot be written.
     pub fn store_policy(&self, policy: &StoredPolicy) -> Result<()> {
-        self.store("policy", policy)
+        let encoded = kr_cbor::to_canonical_vec(policy)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let sequence = self.in_transaction(|connection| self.put_policy(connection, &encoded))?;
+        self.keep_a_copy(sequence, policy);
+        Ok(())
+    }
+
+    /// Writes the policy row and raises the sequence beside it, in the transaction `connection`
+    /// is in, and returns the sequence the row now carries.
+    ///
+    /// The sequence is the highest of the registry's own and the mirror's, plus one, so it rises
+    /// past a mirror whose row was put back.
+    fn put_policy(&self, connection: &Connection, encoded: &[u8]) -> Result<u64> {
+        let held = policy_sequence(connection).map_err(ControllerError::registry)?;
+        let mirrored = *self
+            .mirrored
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = held.max(mirrored).saturating_add(1);
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO host_authority (key, value) VALUES ('policy', ?1)",
+                params![encoded],
+            )
+            .map_err(ControllerError::registry)?;
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO host_authority (key, value)
+                 VALUES ('policy_sequence', ?1)",
+                params![next.to_be_bytes().as_slice()],
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(next)
+    }
+
+    /// Keeps the policy a write has just committed in the mirror ([`super::mirror`]).
+    ///
+    /// After the commit, so a mirror is never ahead of the row it copies; a write that fails is
+    /// reported, and the host goes on with the mirror one write behind.
+    fn keep_a_copy(&self, sequence: u64, policy: &StoredPolicy) {
+        let Some(file) = &self.mirror else {
+            return;
+        };
+        let mut kept = self
+            .mirrored
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sequence <= *kept {
+            return;
+        }
+        match super::mirror::write(file, sequence, policy) {
+            Ok(()) => *kept = sequence,
+            Err(error) => eprintln!(
+                "kr-controller: could not copy this host's policy, so a registry put back to \
+                 an earlier state would not be noticed until the next write: {error}"
+            ),
+        }
     }
 
     /// Writes down the clock floor a decision was taken on, the floor of `policy`, and owes it its
@@ -2483,14 +2576,9 @@ impl GrantDirectory {
                 ))
             })
             .transpose()?;
-        self.in_transaction(|connection| {
+        let sequence = self.in_transaction(|connection| {
             still_admitted(connection)?;
-            connection
-                .execute(
-                    "INSERT OR REPLACE INTO host_authority (key, value) VALUES ('policy', ?1)",
-                    params![encoded],
-                )
-                .map_err(ControllerError::registry)?;
+            let sequence = self.put_policy(connection, &encoded)?;
             if let Some((channel, organisation_ids)) = &event {
                 connection
                     .execute(
@@ -2523,8 +2611,10 @@ impl GrantDirectory {
                         .to_owned(),
                 });
             }
-            Ok(())
-        })
+            Ok(sequence)
+        })?;
+        self.keep_a_copy(sequence, policy);
+        Ok(())
     }
 
     /// Every time exclusive management was turned off, oldest first.
@@ -2593,14 +2683,9 @@ impl GrantDirectory {
         // As the policy change for an action: the pause is before the store's locks.
         #[cfg(feature = "testing")]
         self.before_effect.wait();
-        self.in_transaction(|connection| {
+        let sequence = self.in_transaction(|connection| {
             still_admitted()?;
-            connection
-                .execute(
-                    "INSERT OR REPLACE INTO host_authority (key, value) VALUES ('policy', ?1)",
-                    params![encoded],
-                )
-                .map_err(ControllerError::registry)?;
+            let sequence = self.put_policy(connection, &encoded)?;
             if let Some(event) = event {
                 connection
                     .execute(
@@ -2619,8 +2704,10 @@ impl GrantDirectory {
                     )
                     .map_err(ControllerError::registry)?;
             }
-            Ok(())
-        })
+            Ok(sequence)
+        })?;
+        self.keep_a_copy(sequence, policy);
+        Ok(())
     }
 
     /// Every retained organisation event, oldest first.
@@ -3633,6 +3720,24 @@ fn migrate_fence_debt(connection: &Connection) -> Result<()> {
     transaction.commit().map_err(ControllerError::registry)
 }
 
+/// The sequence the registry's policy row carries, which every write of the row raises: none
+/// when no write has made one.
+///
+/// It is a row of its own beside the policy, written in the same transaction, because the policy's
+/// own type has no member for it and a member would change what the registry keeps.
+fn policy_sequence(connection: &Connection) -> rusqlite::Result<u64> {
+    let held: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT value FROM host_authority WHERE key = 'policy_sequence'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(held
+        .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_slice()).ok())
+        .map_or(0, u64::from_be_bytes))
+}
+
 /// Upgrades the stored policy row, once, from the shape earlier builds wrote.
 ///
 /// Earlier builds wrote each enrolment as two numbers, a pinned key revision and a pinned policy
@@ -3981,6 +4086,7 @@ fn uuid_of(bytes: &[u8]) -> Option<kr_protocol::scalars::Uuid> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::durable::StoredLeaseRecord;
     use super::*;
     use kr_protocol::ids::{AuthorityRevision, OrganisationId, PolicyKeyRevision};
     use kr_protocol::scalars::{DurationMs, Uuid};
@@ -4025,6 +4131,151 @@ mod tests {
                 params![bytes],
             )
             .expect("the row is written");
+    }
+
+    /// A policy that differs from `earlier` in every part an older row would bring back: the
+    /// floors, exclusive management, the offline bound, and the lease records.
+    fn later_policy() -> (StoredPolicy, StoredPolicy) {
+        let earlier = StoredPolicy {
+            accepted_floor: AuthorityRevision::new(3),
+            utc_floor_ms: TimestampMs::new(1_000),
+            exclusively_managed: false,
+            offline: Nullable::null(),
+            enrolments: Vec::new(),
+            lease_records: Vec::new(),
+        };
+        let later = StoredPolicy {
+            accepted_floor: AuthorityRevision::new(9),
+            utc_floor_ms: TimestampMs::new(2_000),
+            exclusively_managed: true,
+            offline: Nullable::some(OfflineValidityPolicy {
+                maximum_offline_ms: DurationMs::new(60_000),
+                last_synchronised_at_ms: Nullable::some(TimestampMs::new(1_500)),
+            }),
+            enrolments: Vec::new(),
+            lease_records: vec![StoredLeaseRecord {
+                organisation_id: OrganisationId::new(Uuid::from_bytes([0x21; 16])),
+                account_id: kr_protocol::ids::AccountId::new(
+                    "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61",
+                )
+                .expect("an account"),
+                device_key: kr_protocol::scalars::AuthorisationKey::from_bytes([7; 32]),
+                issued_at_ms: TimestampMs::new(1_900),
+                expires_at_ms: TimestampMs::new(2_800),
+                digest: kr_protocol::scalars::Digest256::from_bytes([5; 32]),
+                installed_in: kr_protocol::ids::ControllerGeneration::new(1),
+            }],
+        };
+        (earlier, later)
+    }
+
+    /// Puts the registry's policy back to the state it had: the row and the sequence beside it.
+    fn put_back(path: &Path, policy: &StoredPolicy, sequence: u64) {
+        let connection = Connection::open(path).expect("the store opens");
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO host_authority (key, value) VALUES ('policy', ?1)",
+                params![kr_cbor::to_canonical_vec(policy).expect("encodes")],
+            )
+            .expect("the row is written");
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO host_authority (key, value)
+                 VALUES ('policy_sequence', ?1)",
+                params![sequence.to_be_bytes().as_slice()],
+            )
+            .expect("the sequence is written");
+    }
+
+    /// KR-REQ-24.15: a registry put back to an earlier state, with the policy and the sequence it
+    /// had then, does not bring that policy back. The last policy the host wrote is the policy,
+    /// whatever the older row held, and the next write rises past it.
+    #[test]
+    fn a_registry_put_back_to_an_earlier_state_cannot_bring_an_older_policy_back() {
+        let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let path = directory.path().join("registry.db");
+        let (earlier, later) = later_policy();
+        let store = GrantDirectory::open(&path).expect("the store is created");
+        store.store_policy(&earlier).expect("the first policy");
+        store.store_policy(&later).expect("the second policy");
+        drop(store);
+
+        put_back(&path, &earlier, 1);
+        let store = GrantDirectory::open(&path).expect("the store opens");
+        assert_eq!(
+            store.stored_policy().expect("reads"),
+            Some(later.clone()),
+            "the older row revives no floor, no exclusive management, no bound and no lease record"
+        );
+        let third = StoredPolicy {
+            accepted_floor: AuthorityRevision::new(10),
+            ..later
+        };
+        store.store_policy(&third).expect("the next write");
+        drop(store);
+        let store = GrantDirectory::open(&path).expect("the store opens again");
+        assert_eq!(
+            store.stored_policy().expect("reads"),
+            Some(third),
+            "the write after the older row is the newest, as the registry says too"
+        );
+    }
+
+    /// The controls: a row the mirror has not caught up with is the policy, because a stop between
+    /// the row and its copy is the only way the copy is behind; and a row whose sequence equals the
+    /// copy's is the policy even when its content is not the copy's, which is what a registry an
+    /// earlier release wrote to without raising the sequence is.
+    #[test]
+    fn a_row_the_copy_has_not_caught_up_with_or_an_earlier_release_wrote_is_the_policy() {
+        let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let path = directory.path().join("registry.db");
+        let (earlier, later) = later_policy();
+        let store = GrantDirectory::open(&path).expect("the store is created");
+        store.store_policy(&earlier).expect("the first policy");
+        store.store_policy(&later).expect("the second policy");
+        drop(store);
+
+        // The copy one write behind: the stop came between the row and the copy.
+        super::super::mirror::write(&super::super::mirror::file_beside(&path), 1, &earlier)
+            .expect("the copy is put back");
+        let store = GrantDirectory::open(&path).expect("the store opens");
+        assert_eq!(store.stored_policy().expect("reads"), Some(later.clone()));
+        drop(store);
+
+        // The copy and the row at one sequence, the row's content another's.
+        put_back(&path, &earlier, 2);
+        super::super::mirror::write(&super::super::mirror::file_beside(&path), 2, &later)
+            .expect("the copy is put back");
+        let store = GrantDirectory::open(&path).expect("the store opens");
+        assert_eq!(
+            store.stored_policy().expect("reads"),
+            Some(earlier),
+            "an equal sequence leaves the row the policy"
+        );
+    }
+
+    /// A copy that cannot be read stops nothing: the registry's row is the policy, and the next
+    /// write replaces the copy.
+    #[test]
+    fn a_copy_that_cannot_be_read_leaves_the_registrys_row_the_policy() {
+        let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let path = directory.path().join("registry.db");
+        let (_, later) = later_policy();
+        let store = GrantDirectory::open(&path).expect("the store is created");
+        store.store_policy(&later).expect("the policy");
+        drop(store);
+        let copy = super::super::mirror::file_beside(&path);
+        kr_ipc::paths::write_owner_only_file(&copy, b"not a copy").expect("the copy is damaged");
+
+        let store = GrantDirectory::open(&path).expect("the store opens");
+        assert_eq!(store.stored_policy().expect("reads"), Some(later.clone()));
+        store.store_policy(&later).expect("the next write");
+        assert!(
+            super::super::mirror::read(&copy)
+                .expect("a copy again")
+                .is_some(),
+            "the write replaced the damaged copy"
+        );
     }
 
     /// KR-REQ-24.15: a policy row an earlier build wrote is upgraded once, when the store opens,
