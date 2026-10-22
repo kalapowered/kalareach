@@ -407,7 +407,7 @@
         "version": 1,
         "migrates_from": 1
       },
-      "digest": "31fb83faeed948bff8d9684f247a054a5a69359307774ccfc55c4a159fee018c",
+      "digest": "936b32b3aff06e6b0a8d8654c33272b9e11afc0abe099c014a56861a2c729d7f",
       "kept": [
         "Record (crates/kr-controller/src/grants/mirror.rs)",
         "StoredPolicy, StoredEnrolment, StoredBinding, StoredLeaseRecord (crates/kr-controller/src/grants/durable.rs)"
