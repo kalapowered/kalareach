@@ -518,6 +518,33 @@ impl Standalone {
         ])
     }
 
+    /// `kr new` as above, naming no shell mode: the host's default decides.
+    fn new_session_with_no_shell_mode(&self) -> Command {
+        let cwd = self.tree.root().display().to_string();
+        self.kr(&[
+            "--json",
+            "new",
+            "--invisible",
+            "--headless",
+            "--cwd",
+            &cwd,
+            "--shell",
+            "/bin/sh",
+            "--startup",
+            "interactive",
+        ])
+    }
+
+    /// The row of `kr doctor`'s effective configuration that names `key`.
+    fn doctor_row(&self, key: &str) -> Value {
+        let output = start(self.kr(&["--json", "doctor"])).finish("kr doctor");
+        let report = document(&output, "kr doctor");
+        report["configuration"]["values"]
+            .as_array()
+            .and_then(|values| values.iter().find(|value| value["key"] == key).cloned())
+            .unwrap_or_else(|| panic!("kr doctor reports {key}: {report}"))
+    }
+
     /// Closes a session this test created, through the daemon that holds it.
     fn close(&self, created: &Value) {
         let session = created["session_id"]
@@ -1733,6 +1760,69 @@ async fn terminal_attachment(
         .to_typed()
         .expect("decodes");
     (client, attached.attachment.attachment_id)
+}
+
+/// KR-REQ-26.13: a session made with no shell mode takes the mode this host defaults to, in the
+/// order section 26 gives an ordinary preference: the request, then the per-user host
+/// configuration, then the product default, which is the managed shell.
+///
+/// `/bin/sh` is no qualified shell, so a session this host makes as a managed one is refused by
+/// name, and one it makes as a stock shell is created: the outcome says which mode was chosen.
+/// `kr doctor` reports the mode in force with the rung it came from.
+#[test]
+fn a_session_made_with_no_shell_mode_takes_the_hosts_default_in_the_order_section_26_gives() {
+    let host = Standalone::create();
+    host.select_standalone();
+
+    // Nothing chosen: the product default, a managed shell, which `/bin/sh` cannot be.
+    let refused = start(host.new_session_with_no_shell_mode()).finish("kr new");
+    let failed = document(&refused, "kr new");
+    assert!(!refused.status.success(), "{failed}");
+    assert_eq!(failed["code"], "SHELL_INTEGRATION_UNSUPPORTED", "{failed}");
+    let row = host.doctor_row("shell.mode");
+    assert_eq!(row["value"], "managed", "{row}");
+    assert_eq!(row["source"], "default", "{row}");
+    assert_eq!(row["effect"], "new_sessions_only", "{row}");
+
+    // The owner chose a stock shell in the host's configuration, a section of level 6.
+    kr_ipc::paths::write_owner_only_file(
+        &host.document(),
+        br#"{"version": 3, "level": 6, "revision": 2, "startup": {"controller": "standalone"}, "shell": {"mode": "native_compat"}}"#,
+    )
+    .expect("writes the configuration document");
+    let row = host.doctor_row("shell.mode");
+    assert_eq!(row["value"], "native_compat", "{row}");
+    assert_eq!(row["source"], "host_configuration", "{row}");
+    assert_eq!(
+        row["origin"],
+        host.document().display().to_string(),
+        "{row}"
+    );
+    let output = start(host.new_session_with_no_shell_mode()).finish("kr new");
+    let created = document(&output, "kr new");
+    assert!(output.status.success(), "{created}");
+    assert_eq!(created["shell_mode"], "native_compat", "{created}");
+
+    // A request outranks the host's choice, in either direction.
+    let cwd = host.tree.root().display().to_string();
+    let output = start(host.kr(&[
+        "--json",
+        "new",
+        "--invisible",
+        "--headless",
+        "--cwd",
+        &cwd,
+        "--shell",
+        "/bin/sh",
+        "--startup",
+        "interactive",
+        "--shell-mode",
+        "managed",
+    ]))
+    .finish("kr new --shell-mode managed");
+    let failed = document(&output, "kr new --shell-mode managed");
+    assert_eq!(failed["code"], "SHELL_INTEGRATION_UNSUPPORTED", "{failed}");
+    host.close(&created);
 }
 
 /// KR-REQ-08.02: `kr status` reports each terminal attachment's presentation and the reason for it.
