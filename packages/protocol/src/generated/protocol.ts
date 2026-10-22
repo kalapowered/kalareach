@@ -17473,7 +17473,7 @@ export interface HostDoctorResult {
    * read, word for word.
    */
   launch_probes: LaunchProbeReport[]
-  metrics?: Report
+  metrics?: MetricsReport
 }
 /**
  * One diagnostic check.
@@ -17712,7 +17712,7 @@ export interface LaunchProbeReport {
  * is one of this build's own words, so the report carries no terminal content, key, prompt or
  * filename and a support bundle takes it as it is.
  */
-export interface Report {
+export interface MetricsReport {
   /**
    * Every adapter.failure series, in a fixed order.
    */
@@ -29830,7 +29830,7 @@ export interface HostDoctorResult1 {
    * read, word for word.
    */
   launch_probes: LaunchProbeReport[]
-  metrics?: Report
+  metrics?: MetricsReport
 }
 /**
  * One error a support bundle carries, already redacted.

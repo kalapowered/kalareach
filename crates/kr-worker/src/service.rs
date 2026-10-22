@@ -435,12 +435,12 @@ impl WorkerService {
     /// The totals are cumulative for the life of this worker, so a second read of the same state
     /// gives the same report.
     #[must_use]
-    pub fn metrics(&self) -> kr_protocol::metrics::Report {
+    pub fn metrics(&self) -> kr_protocol::metrics::MetricsReport {
         let faults = crate::metrics::parse_faults(
             &self.runtime.session().terminal_diagnostics(),
             kr_ipc::install::measured_environment(),
         );
-        kr_protocol::metrics::Report::joined([faults, self.broker.metrics()])
+        kr_protocol::metrics::MetricsReport::joined([faults, self.broker.metrics()])
     }
 
     /// Returns what this session's application is doing, as the worker publishes it.
