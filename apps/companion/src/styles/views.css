@@ -1599,11 +1599,6 @@
   margin-bottom: var(--gap-5);
 }
 
-/* At the largest text size on a narrow screen the heading's longest word is wider than the row. */
-.confirmations h2 {
-  overflow-wrap: anywhere;
-}
-
 .confirmation-list {
   display: flex;
   flex-direction: column;
@@ -1649,21 +1644,6 @@
   align-items: center;
   gap: var(--gap-2);
   margin-left: auto;
-  max-inline-size: 100%;
-}
-
-/* On a phone the words keep the whole width of the row and the actions go under them: beside them
-   the buttons would take most of the row, and the title would run a word to a line. The width is
-   the screen's, since a media query does not follow the text size the person chose. */
-@media (max-width: 30rem) {
-  .confirmation-row {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .confirmation-actions {
-    margin-left: 0;
-  }
 }
 
 .confirmations .warning-text {
@@ -1737,9 +1717,20 @@
   user-select: text;
 }
 
-/* A long unbroken token in a row's text may shrink the row's text and never widen the row. */
+/* A long unbroken token in a row's text may shrink the row's text and never widen the row. The
+   words ask for a basis of their own: where the row cannot give them that and the buttons too, the
+   buttons go under the words, and on a phone the words keep the whole width of the row. */
 .confirmation-row > .spacer {
   min-width: 0;
+  flex: 1 1 14rem;
+}
+
+/* Under the words, the buttons start where the words do. The width is the screen's: a media query
+   does not follow the text size the person chose. */
+@media (max-width: 30rem) {
+  .confirmation-actions {
+    margin-left: 0;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
