@@ -50,6 +50,7 @@ use crate::runtime::SessionRuntime;
 pub const QUESTION_RECHECK: Duration = Duration::from_secs(15);
 
 /// The longest name a program is given, in bytes.
+#[cfg(unix)]
 const NAME_BYTES: usize = 64;
 
 /// What the worker holds that says what the application is doing.
@@ -378,6 +379,7 @@ fn leader_of(foreground: &crate::broker::adoption::Foreground) -> Option<u32> {
 /// Returns the name a path ends in, held to what a person is shown: no directory, no marker the
 /// system appends to the image of a program whose file has gone, no control character, and at most
 /// [`NAME_BYTES`] bytes.
+#[cfg(unix)]
 fn name_of(path: &str) -> Option<String> {
     let file = std::path::Path::new(path).file_name()?.to_string_lossy();
     let file = file.strip_suffix(" (deleted)").unwrap_or(&file);
@@ -391,7 +393,7 @@ fn name_of(path: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
