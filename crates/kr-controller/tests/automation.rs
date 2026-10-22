@@ -6746,30 +6746,36 @@ async fn a_suite_that_changes_a_tested_path_and_restores_it_attests_nothing() {
         .expect("the suite's result is recorded");
     assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
 
+    // Each of the three is judged on its own, and every one that is attested is named, so that a
+    // build with no binding shows all three failing and not only the first.
+    let mut attested = Vec::new();
     for (number, suite) in [
         (82, "restores"),
         (83, "makes-and-removes"),
         (85, "scratches-beside-its-output"),
     ] {
         let (_, receipt, read) = tests_run(&mut control, &host, number, suite, version).await;
-        assert_eq!(receipt.status, NodeStatus::Unknown, "{suite}: {receipt:?}");
         let result = read
             .results
             .iter()
             .find(|result| result.command == suite)
             .expect("the suite's result is recorded");
         assert_eq!(
-            result.tested_source,
-            TestedSource::Indeterminate,
-            "{suite}: {result:?}"
-        );
-        assert_eq!(result.tested_version.0, None, "{suite} attests no version");
-        assert_eq!(
             result.receipt.exit_status.0,
             Some(U64::new(0)),
             "{suite} passed, and what it passed against is what is not established"
         );
+        if receipt.status != NodeStatus::Unknown
+            || result.tested_source != TestedSource::Indeterminate
+            || result.tested_version.0.is_some()
+        {
+            attested.push(format!("{suite}: {receipt:?} {result:?}"));
+        }
     }
+    assert!(
+        attested.is_empty(),
+        "a suite that wrote in its copy attested the version: {attested:#?}"
+    );
     host.clients.abort();
 }
 

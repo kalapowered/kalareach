@@ -1094,6 +1094,140 @@ fn a_name_written_beside_a_declared_output_is_a_write() {
     assert_eq!(nested_beside.tested_source, TestedSource::Indeterminate);
 }
 
+/// Changes the mode of `directory` to something else and puts it back.
+fn change_the_mode_and_put_it_back(directory: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let before = std::fs::metadata(directory)
+        .expect("the directory is there")
+        .permissions();
+    let mut other = before.clone();
+    other.set_mode(before.mode() & !0o077 | 0o050);
+    std::fs::set_permissions(directory, other).expect("the run changes the mode");
+    std::fs::set_permissions(directory, before).expect("and puts it back");
+}
+
+/// Moves `directory` to a name beside it, makes a file there and removes it, and moves it back.
+fn move_away_and_back(directory: &Path) {
+    let mut name = directory.file_name().expect("a name").to_owned();
+    name.push("-away");
+    let elsewhere = directory.with_file_name(name);
+    std::fs::rename(directory, &elsewhere).expect("the run moves the directory away");
+    std::fs::write(elsewhere.join("conftest.py"), b"x").expect("and makes a file in it");
+    std::fs::remove_file(elsewhere.join("conftest.py")).expect("and removes it");
+    std::fs::rename(&elsewhere, directory).expect("and moves it back");
+}
+
+/// KR-REQ-14.34: the record of a directory a declared output is in is the one thing the
+/// comparison leaves out, so what is done to the directory itself is reported by the platform and
+/// is a write. The control is a run that writes only its outputs, at the copy's root and beneath a
+/// directory.
+#[test]
+fn a_run_that_writes_only_its_outputs_in_two_directories_attests_the_version() {
+    let fixture = Fixture::create();
+    let result = a_run_in(
+        &fixture,
+        "builds-in-two-directories",
+        &["out", "target/debug"],
+        |directory| {
+            write(directory, "out/artefact", "built\n");
+            write(directory, "target/debug/artefact", "built\n");
+        },
+    );
+    assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
+}
+
+/// KR-REQ-14.34: the copy's own directory is a directory an output is in when the output is at
+/// its root, and a change of its mode that is put back is a write.
+#[test]
+fn a_mode_of_the_copy_changed_and_put_back_is_a_write() {
+    let fixture = Fixture::create();
+    let result = a_run_in(
+        &fixture,
+        "changes-the-mode-of-the-copy",
+        &["out"],
+        |directory| {
+            write(directory, "out/artefact", "built\n");
+            change_the_mode_and_put_it_back(directory);
+        },
+    );
+    assert_eq!(result.tested_source, TestedSource::Indeterminate);
+}
+
+/// KR-REQ-14.34: the same for a directory beneath the copy.
+#[test]
+fn a_mode_of_a_directory_an_output_is_in_changed_and_put_back_is_a_write() {
+    let fixture = Fixture::create();
+    let result = a_run_in(
+        &fixture,
+        "changes-the-mode-of-a-parent",
+        &["target/debug"],
+        |directory| {
+            write(directory, "target/debug/artefact", "built\n");
+            change_the_mode_and_put_it_back(&directory.join("target"));
+        },
+    );
+    assert_eq!(result.tested_source, TestedSource::Indeterminate);
+}
+
+/// KR-REQ-14.34: a run that moves its copy away, makes and removes a file in it, and moves it
+/// back leaves every recorded entry as it was, and the names it made were never beneath the path
+/// the copy has again.
+#[test]
+fn a_copy_moved_away_and_back_is_a_write() {
+    let fixture = Fixture::create();
+    let result = a_run_in(
+        &fixture,
+        "moves-the-copy-away-and-back",
+        &["out"],
+        |directory| {
+            write(directory, "out/artefact", "built\n");
+            move_away_and_back(directory);
+        },
+    );
+    assert_eq!(result.tested_source, TestedSource::Indeterminate);
+}
+
+/// KR-REQ-14.34: a directory an output is in that is removed and made again, with the output in
+/// it again, is a write.
+#[test]
+fn a_directory_an_output_is_in_removed_and_made_again_is_a_write() {
+    let fixture = Fixture::create();
+    let result = a_run_in(
+        &fixture,
+        "removes-a-parent-and-makes-it-again",
+        &["out", "target/debug"],
+        |directory| {
+            write(directory, "target/debug/artefact", "built\n");
+            std::fs::remove_dir_all(directory.join("target")).expect("the run removes the parent");
+            write(directory, "target/debug/artefact", "built again\n");
+        },
+    );
+    assert_eq!(result.tested_source, TestedSource::Indeterminate);
+}
+
+/// KR-REQ-14.34: a file beside a declared output is recorded like any other, so a run that
+/// changes it and puts it back is a write there too.
+#[test]
+fn a_file_changed_and_restored_beside_a_declared_output_attests_nothing() {
+    let fixture = Fixture::create();
+    let result = a_run_in(
+        &fixture,
+        "restores-beside-an-output",
+        &["out"],
+        |directory| {
+            write(directory, "out/artefact", "built\n");
+            change_and_restore(&directory.join("README.md"));
+        },
+    );
+    assert_eq!(result.tested_source, TestedSource::Indeterminate);
+    assert!(
+        result.attestation.contains("README.md"),
+        "{}",
+        result.attestation
+    );
+}
+
 /// KR-REQ-14.34: a result about a run that could not be bound attests nothing, whatever the copy
 /// holds.
 #[test]
