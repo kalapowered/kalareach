@@ -90,8 +90,9 @@ async fn until_answered(world: &Observing, id: u64) {
 /// connector's approval request reads it, and the request becomes an approval a person can answer.
 ///
 /// The binding's package ships the component and holds the decoding trust; the upstream sends a
-/// request it waits on. The component is not told to be registered first: the request waits for
-/// the registration, which is what a session's first approval does.
+/// request it waits on once the component is registered and ready: a request that finds its
+/// component unavailable stays opaque, and the world's link is unavailable for the first moments
+/// of the session, while the daemon learns of the worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_11_21_a_request_the_connector_leaves_to_its_component_becomes_the_approval_the_component_read()
  {
@@ -100,6 +101,7 @@ async fn kr_req_11_21_a_request_the_connector_leaves_to_its_component_becomes_th
     else {
         return;
     };
+    world.until_ready(1).await;
     let frame = request(7);
     world.send(&frame);
     let approval = approved(&world, "7").await;
@@ -166,6 +168,7 @@ async fn kr_acc_016_a_decoder_that_answers_what_it_was_not_asked_makes_no_approv
     else {
         return;
     };
+    world.until_ready(1).await;
     world.send(&request(100));
     approved(&world, "100").await;
 
@@ -225,6 +228,7 @@ async fn kr_req_11_26_a_request_answered_natively_while_its_decode_is_held_is_no
     else {
         return;
     };
+    world.until_ready(1).await;
     let queue = world.broker().decode_queue();
     let hold = queue.hold();
     world.send(&request(21));
@@ -269,6 +273,7 @@ async fn kr_req_24_27_a_request_made_in_privacy_mode_marks_the_component_wheneve
     else {
         return;
     };
+    world.until_ready(1).await;
     let lane = world.broker().observation();
     world.send(&request(31));
     approved(&world, "31").await;
@@ -312,6 +317,7 @@ async fn kr_req_11_26_a_binding_has_a_share_of_the_decode_queue_and_a_request_pa
     else {
         return;
     };
+    world.until_ready(1).await;
     let queue = world.broker().decode_queue();
     let hold = queue.hold();
     for number in 41..=49 {
