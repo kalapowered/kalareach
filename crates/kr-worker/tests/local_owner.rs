@@ -539,6 +539,27 @@ impl Wired {
         params: &T,
         action_id: ActionId,
     ) -> Result<ParamsValue, ProtocolError> {
+        // The daemon sends the scope of the grant an attach was decided under, and the worker
+        // draws the screen by it.
+        let history = (method == Method::SessionAttach && actor.ingress.is_remote())
+            .then(common::a_scope_with_the_live_screen);
+        self.forward_action_within(daemon, actor, rights, method, params, action_id, history)
+            .await
+    }
+
+    /// Forwards one mutation as [`Self::forward_action`] does, with the history scope given, or
+    /// none.
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_action_within<T: serde::Serialize>(
+        &self,
+        daemon: &mut Client<impl Codec>,
+        actor: &ActorEnvelope,
+        rights: &[ActionRight],
+        method: Method,
+        params: &T,
+        action_id: ActionId,
+        history: Option<kr_protocol::grant::HistoryScope>,
+    ) -> Result<ParamsValue, ProtocolError> {
         let mutation = MutationRequest {
             request_id: next_request(),
             method: method.into(),
@@ -562,16 +583,22 @@ impl Wired {
                     .map_or(0, |revision| revision.get()),
             )
         });
-        within(
-            "the worker's answer",
-            daemon.forward(
-                &mutation,
-                actor,
-                &rights.iter().copied().collect(),
-                U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000),
-                lease,
-            ),
-        )
+        let rights = rights.iter().copied().collect();
+        let deadline = U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000);
+        within("the worker's answer", async {
+            match history {
+                Some(history) => {
+                    daemon
+                        .forward_within(&mutation, actor, &rights, deadline, lease, history)
+                        .await
+                }
+                None => {
+                    daemon
+                        .forward(&mutation, actor, &rights, deadline, lease)
+                        .await
+                }
+            }
+        })
         .await
         .expect("the forward reaches the worker")
     }
@@ -2739,6 +2766,63 @@ async fn a_revision_takes_every_claim_it_names_and_the_size_goes_to_one_it_does_
     );
     drop(second);
     sized.close();
+}
+
+/// KR-REQ-10.50: a paired device is attached only under a grant whose history includes the live
+/// screen, and the worker decides that from the scope the daemon sent and no other.
+///
+/// An attach decided under a grant that does not include the screen, and one that comes with no
+/// scope for a worker to be sure of, are refused before the attachment is made. The same attach
+/// under a grant that includes the screen is admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_whose_grant_does_not_reach_the_live_screen_is_not_attached() {
+    let wired = wired("sleep 120").await;
+    let mut authority = wired.daemon(ControllerConnectionRole::Authority).await;
+    let mut phone = wired.daemon(ControllerConnectionRole::Proxy).await;
+    wired.revise(&mut authority, 2).await;
+    let before = wired.runtime.session().attachments().len();
+    let watching = [ActionRight::SessionView];
+    let observing = [AttachmentCapability::ObserveTerminal];
+
+    let mut no_screen = common::a_scope_with_the_live_screen();
+    no_screen.include_live_screen = false;
+    for (what, history) in [
+        (
+            "a grant whose history does not include the screen",
+            Some(no_screen),
+        ),
+        ("an attach that carries no scope", None),
+    ] {
+        let refused = wired
+            .forward_action_within(
+                &mut phone,
+                &device(2),
+                &watching,
+                Method::SessionAttach,
+                &wired.terminal(&observing),
+                ActionId::new(kr_ipc::new_uuid()),
+                history,
+            )
+            .await
+            .expect_err(what);
+        assert_eq!(
+            refused.code,
+            ErrorCode::PermissionDenied,
+            "{what}: {refused}"
+        );
+    }
+    assert_eq!(
+        wired.runtime.session().attachments().len(),
+        before,
+        "a refused attach made no attachment"
+    );
+
+    wired
+        .attach_for(&mut phone, &device(2), &watching, &observing)
+        .await;
+    assert_eq!(wired.runtime.session().attachments().len(), before + 1);
+    drop((authority, phone));
+    wired.close();
 }
 
 /// KR-REQ-10.45: a revision of the whole host takes the size from every caller under a grant, as
