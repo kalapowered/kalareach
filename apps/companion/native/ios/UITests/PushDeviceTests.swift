@@ -23,7 +23,7 @@
 //  | `banner-<n>.txt` | this test | what the banner said, or `none` |
 //  | `tap-<n>` | the script | nothing; the banner is to be tapped |
 //  | `tapped-<n>` | this test | what the application showed after the tap |
-//  | `act-<k>` | the script | a verb: `tap`, `choose` or `send`; what the person does next |
+//  | `act-<k>` | the script | a verb: `tap`, `choose`, `send` or `observe`; what the person does next |
 //  | `act-expect` | the script | the words the notification the person taps shows |
 //  | `acted-<k>` | this test | what the screen showed after the act |
 //  | `finish` | the script | nothing; the run is over |
@@ -193,6 +193,17 @@ final class PushDeviceTests: DeviceTestCase {
             }
             screenshot("sent-\(act)")
             write("acted-\(act)", "sent \(screenText())")
+        case "observe":
+            // The page stops offering a question that was answered at the host: the button goes and
+            // the screen says nothing is waiting or that the question is no longer waiting.
+            let send = anyElement(labelled: "Send answer", within: app)
+            let said = NSPredicate(format: "label BEGINSWITH 'No longer waiting' OR label BEGINSWITH 'Nothing needs you right now'")
+            let end = Date().addingTimeInterval(60)
+            while Date() < end, send.exists || !app.staticTexts.matching(said).firstMatch.exists {
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+            screenshot("ended-\(act)")
+            write("acted-\(act)", "\(send.exists ? "still offered" : "no longer offered") \(screenText())")
         default:
             write("acted-\(act)", "no such act")
         }
