@@ -3136,11 +3136,23 @@ this build reads (also when another account owns it, or it is a link), and when 
 names no enrolment the host holds cannot be removed from it: a host that came back without the
 restrictions it was left with would run every adapter. No list is in force until the owner has
 moved the file aside, started the daemon, and applied the policy again. A release before this one
-reads the registry and does not name the file, so it leaves the file alone and a rollback to it is
-not refused for it. That release applies no organisation policy, so a host rolled back to it
-admits every adapter it qualifies, a host that is exclusively organisation-managed included. A
-host that is brought forward again applies the policy once more, as long as the enrolment it was
-applied for is still held.
+reads the registry and does not name the file, so it leaves the file alone and applies no
+organisation policy: a host rolled back to it would admit every adapter it qualifies, a host that
+is exclusively organisation-managed included. `kr host rollback` therefore refuses, with nothing
+switched and every daemon it stopped started again, while the file states an adapter list for an
+organisation and the release it goes back to names no store of that name. The refusal names the
+environment, the file and each organisation whose list the rollback would lift. The way through is
+`kr organisation withdraw <id>` for each of them, after `kr organisation exclusive off` on a host
+that is exclusively organisation-managed. A withdrawal ends every grant that requires the
+organisation and every lease installed under the enrolment, and a later enrolment needs an owner
+device again. A policy that states no list lifts nothing and does not stop a rollback. The file is
+read from disk once the daemons have stopped, so no daemon has to run. It also names an entry of an
+enrolment that has ended, which `kr organisation list` does not show: starting the daemon of that
+environment drops it, and then the rollback goes on. A file that cannot be read refuses the
+rollback, because the lists it states are not known. An environment the update could not reach is
+not read, and a daemon that starts there later from the release the host went back to applies no
+list. A host that is brought forward again applies the policy once more, as long as the enrolment
+it was applied for is still held.
 
 The request writes the registry row first and the file second, so a request the registry refuses
 writes nothing to the file, and a policy the file cannot hold is refused before anything is

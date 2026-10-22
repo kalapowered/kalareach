@@ -6,7 +6,8 @@
 //! beside the registry and not in the registry's enrolment rows: an earlier release reads the
 //! registry and has no place for it, so a registry that held one could not be read when the host
 //! goes back to that release. That release does not name this file, so it leaves it alone, and it
-//! applied no policy.
+//! applied no policy. A switch to a release that names no such store would lift the adapter lists
+//! the entries state, so the updater refuses it, with nothing switched, while an entry states one.
 //!
 //! One record holds every enrolment's policy and is written in one write, owner only, so a reader
 //! sees the policies as they were or as they are. A host that has applied none has no file.
@@ -37,6 +38,10 @@ use kr_protocol::ids::{AuthorityRevision, OrganisationId, OrganisationPolicyRevi
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 
 use crate::error::{ControllerError, Result};
+
+/// The name this store has in a release's list of the stores it reads, which the updater looks for
+/// before it switches to a release.
+pub const STORE_NAME: &str = "organisation-policy";
 
 /// The format of the file this build writes, recorded in it as `version`. A file that records
 /// another is refused: an earlier one was never written, and a later one holds what this build

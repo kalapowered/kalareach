@@ -1058,7 +1058,7 @@ pub fn table() -> Vec<Store> {
             levels: None,
             writers: Writers::Daemon,
             entry: entry(
-                "organisation-policy",
+                kr_controller::grants::applied::STORE_NAME,
                 StoreScope::Environment,
                 "organisation-policy.json",
                 member("version", 0),
