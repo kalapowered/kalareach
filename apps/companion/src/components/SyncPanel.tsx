@@ -8,6 +8,11 @@
  * is told where recovery stands and what stops the next one; the seed, the locator and the token
  * never reach it, and the kit is written by the backend to a file the person chose.
  *
+ * Covering the host on this computer is a step of its own under recovery: the host's backups open
+ * only with the kit the host was set up under, so the card sets the host up under this
+ * recovery when it can, says plainly when it cannot, and offers a replacement (a new archive under
+ * this recovery) only as a second, confirmed choice.
+ *
  * Recovery is offered on a desktop. A phone shows the setting and no more: its save dialog cannot
  * write a file the person chooses.
  *
@@ -29,6 +34,7 @@ import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 
 import {
   failureCode,
   failureMessage,
+  type HostCoverView,
   type HostPort,
   type RecoveryView,
   type SettingsChoice,
@@ -38,13 +44,17 @@ import {
 import { minimumTarget, type Surface } from '../mobile/platform'
 import type { AccountView } from '../model/account'
 import {
+  HOST_COVER_HELP,
+  HOST_REPLACE_WARNING,
   KIT_FILE_NAME,
   RECOVERY_HELP,
   SETTLE_HELP,
   SYNC_SERVICE_HELP,
   describeBlocker,
+  describeHostCover,
   describeRecovery,
-  describeStaysAt
+  describeStaysAt,
+  offersReplacement
 } from '../model/recovery'
 import {
   DEVICES_START_OWN,
@@ -97,6 +107,8 @@ export function SyncPanel({
   const [choice, setChoice] = useState<SettingsChoice | null>(null)
   const [recovery, setRecovery] = useState<RecoveryView | null>(null)
   const [recoveryProblem, setRecoveryProblem] = useState<string | null>(null)
+  const [hostCover, setHostCover] = useState<HostCoverView | null>(null)
+  const [confirmingReplace, setConfirmingReplace] = useState(false)
   const [changing, setChanging] = useState(false)
   const [draft, setDraft] = useState('')
   const [said, setSaid] = useState<Said | null>(null)
@@ -638,6 +650,25 @@ export function SyncPanel({
                 {recovery?.state === 'off' ? (
                   <p className="account-note">{RECOVERY_HELP}</p>
                 ) : null}
+                {recovery?.state === 'on' && hostCover === null ? (
+                  <p className="account-note" data-testid="recovery-host-help">
+                    {HOST_COVER_HELP}
+                  </p>
+                ) : null}
+                {hostCover !== null ? (
+                  <p
+                    className="account-note"
+                    data-testid="recovery-host"
+                    data-state={hostCover.state}
+                  >
+                    {describeHostCover(hostCover)}
+                  </p>
+                ) : null}
+                {confirmingReplace ? (
+                  <p className="account-note" data-testid="recovery-replace-warning">
+                    {HOST_REPLACE_WARNING}
+                  </p>
+                ) : null}
                 {recoveryProblem !== null ? (
                   <p className="account-note" data-testid="recovery-problem">
                     {recoveryProblem}
@@ -699,6 +730,66 @@ export function SyncPanel({
                   >
                     Settle it
                   </Button>
+                ) : null}
+                {recovery?.state === 'on' && blocker === null && hostCover?.state !== 'covered' ? (
+                  <Button
+                    data-testid="recovery-cover-host"
+                    data-wraps
+                    disabled={busy}
+                    style={{ minBlockSize: target }}
+                    onClick={() => {
+                      setConfirmingReplace(false)
+                      step('recovery', async () => {
+                        setHostCover(await port.recoveryCoverHost(false))
+                        return null
+                      })
+                    }}
+                  >
+                    Cover the backups of this host
+                  </Button>
+                ) : null}
+                {recovery?.state === 'on' && offersReplacement(hostCover) && !confirmingReplace ? (
+                  <Button
+                    data-testid="recovery-replace-host"
+                    data-wraps
+                    disabled={busy}
+                    style={{ minBlockSize: target }}
+                    onClick={() => {
+                      setConfirmingReplace(true)
+                    }}
+                  >
+                    Start new backups under this recovery
+                  </Button>
+                ) : null}
+                {confirmingReplace ? (
+                  <>
+                    <Button
+                      tone="primary"
+                      data-testid="recovery-replace-confirm"
+                      data-wraps
+                      disabled={busy}
+                      style={{ minBlockSize: target }}
+                      onClick={() => {
+                        setConfirmingReplace(false)
+                        step('recovery', async () => {
+                          setHostCover(await port.recoveryCoverHost(true))
+                          return null
+                        })
+                      }}
+                    >
+                      Start new backups
+                    </Button>
+                    <Button
+                      data-testid="recovery-replace-cancel"
+                      disabled={busy}
+                      style={{ minBlockSize: target }}
+                      onClick={() => {
+                        setConfirmingReplace(false)
+                      }}
+                    >
+                      Leave them as they are
+                    </Button>
+                  </>
                 ) : null}
                 {recovery?.state === 'on' ? (
                   <Button
