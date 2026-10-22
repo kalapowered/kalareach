@@ -215,6 +215,17 @@ holding a newer archive back looks exactly like an owner who has not written one
 `RestoreGeneration::describe` says so in the sentence a restore displays, alongside the generation
 it is restoring.
 
+A service that was put back to an earlier state on purpose holds a genuine generation older than the
+checkpoint, and a restore would otherwise stop there for good. `GenerationExpectation::AcceptingOlder`
+carries the checkpoint and one generation the person named. That generation, and no other older one,
+stands as `GenerationStanding::OlderAccepted`, which `open_archive` admits; any other older
+generation is still a replay, the checkpoint's own generation with another manifest is still a
+substitution, and an equal or newer generation stands as it did. The checkpoint itself is not lowered
+by this: `kr_client::recovery::advance_checkpoint` keeps the higher generation, refuses the same
+generation with another manifest, and carries every other entry of the bundle through as it was. The
+restore keeps the seed for as long as the prepared restore lives, because recording a generation in
+the bundle needs the bundle key, and clears it when the restore is dropped.
+
 ### What a backup carries
 
 `may_back_up` and `may_restore` are one table, here rather than in each caller, so a device and a
