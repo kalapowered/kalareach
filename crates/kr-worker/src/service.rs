@@ -1560,7 +1560,7 @@ impl WorkerService {
 
     /// One pass of the host's maintenance. Returns whether the session has closed.
     fn maintain_once(&self) -> bool {
-        let closed = {
+        let (closed, times) = {
             // Maintenance passes through the same serial boundary a mutation does. Section 9
             // puts the revalidation a discontinuity owes *before* the host serves a mutation,
             // and this barrier is what "before" means here: a mutation either sees the
@@ -1577,7 +1577,7 @@ impl WorkerService {
             // One look at the session, and the lock released before anything else asks for
             // it. Collection records its own failure, so nothing here needs the lock a second
             // time to say that it failed.
-            let state = {
+            {
                 let mut session = self.runtime.session();
                 // A store that has started answering again is a store this host may call
                 // durable, and the interval it could not is written down before it says so.
@@ -1588,10 +1588,18 @@ impl WorkerService {
                 // tick: section 20 budgets the two stores apart, so history pressure never
                 // reaches a dispatch barrier or a de-duplication record.
                 session.collect_output();
-                session.state()
-            };
-            state == kr_protocol::session::SessionState::Closed
+                (
+                    session.state() == kr_protocol::session::SessionState::Closed,
+                    session.output_time_index(),
+                )
+            }
         };
+        // The times the output was produced at are written here, with neither the session's lock
+        // nor the dispatch barrier held: the write is a call to the disk, and the read loop that
+        // takes the output in waits for the lock. A write that fails is kept for the next pass.
+        if let Some(times) = times {
+            let _ = times.flush();
+        }
         // The broker's half of the same recovery, off the session's lock and the dispatch
         // barrier. It writes its gap while native work goes on, and nothing that serves the
         // terminal or a mutation waits on that write.
