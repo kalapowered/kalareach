@@ -65,6 +65,8 @@ describe('the attention inbox', () => {
     expect(entry.textContent).not.toMatch(/failed|stuck|crashed/i)
   })
 
+  // KR-REQ-10.42, the part about labels: an approval says the agent acts on what is allowed with
+  // its own permissions.
   it('shows what a decision is about, and what the agent sent, before it is allowed', async () => {
     start()
     const approval = await screen.findByTestId('approval')
