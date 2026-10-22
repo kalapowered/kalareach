@@ -1,8 +1,9 @@
 //! The KalaReach plugin-runtime service.
 //!
-//! One process per environment, started when a binding first needs a component and not before. It
-//! hosts component instances and nothing else: no journal, no ledger, no pending requests. Those
-//! live in the workers, which is why this process can die without destroying anything.
+//! One process for each protocol and environment (this program speaks one protocol, the one of its
+//! release), started when a binding first needs a component and not before. It hosts component
+//! instances and nothing else: no journal, no ledger, no pending requests. Those live in the
+//! workers, which is why this process can die without destroying anything.
 //!
 //! ```text
 //! kr-controller ──start job──▶ service manager ──▶ kr-plugin-host

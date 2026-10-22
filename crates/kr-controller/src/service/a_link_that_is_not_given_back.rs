@@ -693,6 +693,7 @@ impl Served {
         };
         let worker = crate::directory::KnownWorker {
             level: kr_protocol::retained::Level::this(),
+            release: None,
             descriptor: kr_protocol::worker::WorkerDescriptor {
                 session_id,
                 session_epoch: SessionEpoch::V1,

@@ -34,11 +34,51 @@ pub const RENDEZVOUS_DOMAIN: &str = "kr-plugin-host/1/rendezvous";
 /// The domain separating the plugin host's answer to a verification challenge.
 pub const VERIFY_DOMAIN: &str = "kr-plugin-host/1/verify";
 
-/// The file the plugin host's descriptor is published as, inside the environment runtime directory.
-pub const DESCRIPTOR_FILE: &str = "plugin-host.json";
+/// One plugin host protocol, and where a host that speaks it is found.
+///
+/// A host process speaks one protocol, fixed by the program it runs, and each protocol has an
+/// endpoint and a descriptor of its own inside the environment runtime directory, so a host of one
+/// protocol is never published over a host of another and a client of one never reaches the other.
+/// The first protocol keeps the names it has always had; a later protocol `/N` uses `p<N>.sock`
+/// and `plugin-host-<N>.json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostProtocol {
+    /// The protocol's name, as a host's `Hello` answers it and a descriptor records it.
+    pub name: &'static str,
+    /// The name of the host's endpoint inside the environment runtime directory.
+    pub endpoint: &'static str,
+    /// The file the host's descriptor is published as, inside the environment runtime directory.
+    pub descriptor: &'static str,
+}
 
-/// The name of the plugin host's endpoint inside the environment runtime directory.
-pub const ENDPOINT_NAME: &str = "p.sock";
+impl HostProtocol {
+    /// The protocol this build's plugin host and client speak.
+    pub const THIS: Self = Self {
+        name: kr_protocol::retained::PLUGIN_HOST_PROTOCOL,
+        endpoint: "p3.sock",
+        descriptor: "plugin-host-3.json",
+    };
+
+    /// The protocol of the plugin host a retained level's workers speak: a host of the release
+    /// before, adopted when it runs and otherwise started from that release's own program.
+    ///
+    /// The 0.78 cut removes this protocol, its route in the control daemon, `retained_host` and its
+    /// entry in [`kr_protocol::retained::RETAINED_PLUGIN_HOST_PROTOCOLS`].
+    pub const SECOND: Self = Self {
+        name: "kr-plugin-host/2",
+        endpoint: "p.sock",
+        descriptor: "plugin-host.json",
+    };
+
+    /// Every protocol a route exists for: this build's and each retained one.
+    pub const ALL: [Self; 2] = [Self::THIS, Self::SECOND];
+
+    /// The protocol a name stands for, where a route exists for it.
+    #[must_use]
+    pub fn named(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|protocol| protocol.name == name)
+    }
+}
 
 /// The prefix of the rendezvous endpoint a launcher listens on for one plugin host.
 ///
@@ -948,7 +988,62 @@ mod tests {
         assert_eq!(RENDEZVOUS_DOMAIN, "kr-plugin-host/1/rendezvous");
         assert_eq!(VERIFY_DOMAIN, "kr-plugin-host/1/verify");
         assert_ne!(RENDEZVOUS_DOMAIN, VERIFY_DOMAIN);
-        assert_eq!(ENDPOINT_NAME, "p.sock");
         assert_eq!(RENDEZVOUS_PREFIX, "pr-");
+    }
+
+    #[test]
+    fn each_protocol_has_a_name_an_endpoint_and_a_descriptor_no_other_shares() {
+        use std::collections::BTreeSet;
+
+        let protocols = HostProtocol::ALL;
+        for field in [
+            protocols.map(|protocol| protocol.name),
+            protocols.map(|protocol| protocol.endpoint),
+            protocols.map(|protocol| protocol.descriptor),
+        ] {
+            assert_eq!(
+                field.into_iter().collect::<BTreeSet<_>>().len(),
+                protocols.len(),
+                "{field:?}"
+            );
+        }
+        assert_eq!(HostProtocol::THIS.name, "kr-plugin-host/3");
+        // The first protocol keeps its names, which a host of the release before still publishes.
+        assert_eq!(HostProtocol::SECOND.endpoint, "p.sock");
+        assert_eq!(HostProtocol::SECOND.descriptor, "plugin-host.json");
+        assert_eq!(
+            HostProtocol::named("kr-plugin-host/2"),
+            Some(HostProtocol::SECOND)
+        );
+        assert_eq!(HostProtocol::named("kr-plugin-host/9"), None);
+    }
+
+    #[test]
+    fn every_retained_protocol_has_a_route_and_every_route_but_this_builds_is_retained() {
+        for level in &kr_protocol::retained::RETAINED {
+            let recorded = level.plugin_host.trim();
+            assert!(
+                recorded == HostProtocol::THIS.name || HostProtocol::named(recorded).is_some(),
+                "level {} recorded {recorded}, which has no route",
+                level.level
+            );
+        }
+        for protocol in HostProtocol::ALL {
+            if protocol == HostProtocol::THIS {
+                continue;
+            }
+            assert!(
+                kr_protocol::retained::RETAINED_PLUGIN_HOST_PROTOCOLS.contains(&protocol.name),
+                "{} is not listed as a retained protocol",
+                protocol.name
+            );
+            assert!(
+                kr_protocol::retained::RETAINED
+                    .iter()
+                    .any(|level| level.plugin_host.trim() == protocol.name),
+                "no retained level records {}: remove its route",
+                protocol.name
+            );
+        }
     }
 }
