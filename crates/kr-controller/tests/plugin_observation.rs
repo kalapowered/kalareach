@@ -15,7 +15,7 @@
 //! | KR-REQ-06.07 | an upstream frame the worker offers reaches the binding's component with its bytes, its provenance and the request identifier it carried, once and in order, and the handle is the broker's own for a request the upstream is waiting on |
 //! | KR-REQ-11.01 | the same run, through a vendor component that needed no core release; the binding's other bindings, a binding without the stream, another package's binding and a rich-disabled binding are offered nothing, a frame the table does not list and one it lists as a credential are offered to nobody |
 //! | KR-REQ-11.38 | a lane that is full loses the oldest observations it holds, counts them, takes a fresh snapshot of the component, and never loses the request the upstream is waiting on; an observation that never returns is stopped by its bound and named; three faults in a minute disable the binding while the native terminal goes on; a snapshot that never returns is stopped by its bound and named |
-//! | KR-REQ-11.39 | the terminal drains and its questions are answered while the worker's observation pump is held, and while the plugin runtime is stopped and refuses what is handed to it |
+//! | KR-REQ-11.39 | the terminal drains and its questions are answered while the worker's observation pump is held, and while the plugin runtime has stopped reading what is handed to it; the worker lets go of that runtime and takes the component up again when it reads |
 //! | KR-REQ-11.40 | an observation the component never returns from is stopped by fuel when its deadline cannot fire, and named so |
 //! | KR-REQ-11.41 | a component that was compiled when it was registered is observed without a fault, the compile outside the observation's deadline |
 //! | KR-REQ-24.06 | a plugin runtime killed with a receipt, a question and an approval live leaves all three as they were and answerable, and its component is registered again in the replacement and restored to the state the worker held |
@@ -249,15 +249,17 @@ async fn kr_req_11_38_a_full_lane_loses_the_oldest_observations_and_never_the_re
 }
 
 /// KR-REQ-11.39: the terminal goes on draining, and its questions go on being answered, while the
-/// plugin runtime is stopped and refuses what the worker hands it; and when the runtime goes on,
-/// the connection has not ended and the component is taken through a snapshot.
+/// plugin runtime has stopped reading what the worker hands it; the worker lets go of a runtime that
+/// does not read, and takes the component up again when the runtime does.
 ///
-/// The runtime is stopped (`SIGSTOP`), and the shell then prints eight megabytes, which the worker
-/// offers the component as terminal output until the hand-off to the runtime refuses it. The shell
-/// finishes, and asks and is answered after it, with the runtime still stopped.
+/// The runtime is stopped (`SIGSTOP`), and the shell then prints twelve megabytes, which the worker
+/// offers the component as terminal output. The shell finishes, and asks and is answered after it,
+/// with the runtime still stopped. A runtime that has not taken an event in ten seconds has stopped
+/// reading, and the client's writer gives up on it, so the link lets the connection go and the
+/// component is no longer ready. When the runtime goes on, the link reaches it again and the
+/// component is ready, and enabled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_11_39_the_terminal_drains_and_is_answered_while_the_runtime_refuses_what_it_is_handed()
- {
+async fn kr_req_11_39_the_terminal_drains_and_is_answered_while_the_runtime_has_stopped_reading() {
     let gate = std::env::temp_dir().join(format!("kr-observe-gate-{}", kr_ipc::new_uuid()));
     let ask = "printf '\\033[c'; answer=$(dd bs=1 count=9 2>/dev/null | tr -d '\\033')";
     let shell = format!(
@@ -284,42 +286,38 @@ async fn kr_req_11_39_the_terminal_drains_and_is_answered_while_the_runtime_refu
     let host = world.hosted.published().expect("the runtime is published");
     plugin_world::acting::signal(&host, rustix::process::Signal::STOP);
     std::fs::write(&gate, b"").expect("the gate opens");
-    let lane = world.broker().observation();
-    let refused = tokio::time::timeout(plugin_world::PATIENCE, async {
-        while !lane.view(binding(1)).is_some_and(|view| view.lost_seq > 0) {
+
+    // The terminal finishes printing and is answered, and the runtime is still stopped.
+    let drained = tokio::time::timeout(plugin_world::PATIENCE, async {
+        while !world.output().contains("kalareach-done") {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     })
     .await;
     assert!(
-        refused.is_ok(),
-        "the hand-off to the stopped runtime never refused: {}",
+        drained.is_ok(),
+        "the terminal did not drain while the runtime was stopped: {}",
         world.diagnostics(1)
     );
+    assert!(world.output().contains("answered-1-"));
 
-    // The terminal finished printing and was answered, and the runtime is still stopped.
-    until("the terminal to drain and be answered", || async {
-        world.output().contains("kalareach-done").then_some(())
+    // The worker lets go of a runtime that does not read.
+    let lane = world.broker().observation();
+    let let_go = tokio::time::timeout(plugin_world::PATIENCE, async {
+        while lane.is_ready(binding(1)) {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     })
     .await;
+    assert!(
+        let_go.is_ok(),
+        "the worker kept a runtime that does not read: {}",
+        world.diagnostics(1)
+    );
     plugin_world::acting::signal(&host, rustix::process::Signal::CONT);
 
-    // The connection did not end, the binding is still ready, and the component was taken through a
-    // snapshot for what it missed.
-    let client = world
-        .broker()
-        .component_calls()
-        .client()
-        .expect("the connection to the runtime is still held");
-    client.health().await.expect("the runtime answers");
-    world
-        .until_account(
-            1,
-            "the component to have been taken through a snapshot",
-            |account| account.snapshots >= 1,
-        )
-        .await;
-    assert!(lane.is_ready(binding(1)));
+    // And takes the component up again when the runtime reads.
+    world.until_ready(1).await;
     assert!(world.broker().rich_disabled(binding(1)).is_none());
     let _ = std::fs::remove_file(&gate);
 }
