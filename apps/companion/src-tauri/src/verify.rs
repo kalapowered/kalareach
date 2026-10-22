@@ -94,6 +94,11 @@ mod phone {
     /// or remove a face, a fingerprint or a screen lock in Settings while this runs.
     const FRESH: Duration = Duration::from_secs(5);
 
+    /// How long past the time a ceremony is given the native half is waited on. The native half
+    /// ends its prompt when the time is up and answers; if its answer is lost, the review would
+    /// keep the connection and leave every button disabled, so it ends here instead.
+    const NATIVE_MARGIN: Duration = Duration::from_secs(5);
+
     /// What was last read about the ceremony, and whether another read is under way.
     struct Cache {
         kind: CeremonyKind,
@@ -184,7 +189,12 @@ mod phone {
             within: Duration,
         ) -> BoxFuture<'a, CeremonyOutcome> {
             Box::pin(async move {
-                let outcome = presence::verify(&self.app, reason, within).await;
+                let outcome = tokio::time::timeout(
+                    within.saturating_add(NATIVE_MARGIN),
+                    presence::verify(&self.app, reason, within),
+                )
+                .await
+                .unwrap_or(Outcome::NotConfirmed);
                 // What the person did may have changed what the phone offers.
                 self.refresh();
                 match outcome {
