@@ -1,0 +1,5 @@
+Binary APK
+Package name=to.kala.reach id=7f
+  type xml id=14 entryCount=8
+    resource 0x7f140006 xml/network_security_config
+      () (file) res/8G.xml type=XML

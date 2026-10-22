@@ -1,0 +1,20 @@
+E: network-security-config (line=2)
+    E: base-config (line=3)
+      A: cleartextTrafficPermitted=false
+    E: domain-config (line=9)
+      A: cleartextTrafficPermitted=true
+        E: domain (line=10)
+          A: includeSubdomains=true
+            T: 'abitabdv.crl.certum.pl'
+        E: domain (line=13)
+          A: includeSubdomains=true
+            T: 'alpiro.crl.sectigo.com'
+        E: domain (line=21)
+          A: includeSubdomains=true
+            T: 'c.pki.goog'
+        E: domain (line=177)
+          A: includeSubdomains=true
+            T: 'crls.ssl.com'
+        E: domain (line=184)
+          A: includeSubdomains=true
+            T: 'e5.c.lencr.org'

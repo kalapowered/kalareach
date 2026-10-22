@@ -26,8 +26,9 @@ buildscript {
  * serves for the deployed service name a list and nothing else; the refused fetch was reported as a
  * revoked certificate, and a release build could reach no such service (a debug build allows
  * cleartext and was unaffected). 0.2.0 merges a network security configuration into the
- * application that permits cleartext only to the public authorities' revocation-list hosts and
- * leaves it off everywhere else. https://github.com/rustls/rustls-platform-verifier/issues/221
+ * application that permits cleartext only to the hosts the library lists (the hosts the public
+ * authorities publish their revocation lists on, some of them general web hosts) and leaves it off
+ * everywhere else. https://github.com/rustls/rustls-platform-verifier/issues/221
  */
 extra["rustlsPlatformVerifierKotlinVersion"] = run {
     val lines = file("../../../../../Cargo.lock").readLines()
