@@ -30,8 +30,9 @@ use crate::cli::{
 };
 use crate::daemon::Daemon;
 use crate::error::{CliError, Result};
-use crate::output;
+use crate::output::{self, Asked, Request};
 use crate::report::{self, Completion};
+use crate::stdout_line;
 
 use self::directory::Destination;
 use self::interrupt::Interrupt;
@@ -376,6 +377,22 @@ fn print(outcome: &Outcome, json: bool) {
                 output::say(&checkpoint_words);
                 if let Some(words) = &configuration_words {
                     output::say(words);
+                }
+                // The sets of preferences whose variables and command integrations stayed the
+                // host's own, by name, so that the person can add them again.
+                if let Some(left_out) = planned.left_out() {
+                    if left_out.preferences {
+                        output::say(&Shown::said(
+                            "Not applied: the variables and command integrations of the base \
+                             preferences.",
+                        ));
+                    }
+                    for name in &left_out.profiles {
+                        output::line(&stdout_line!(
+                            "Not applied: the variables and command integrations of the profile {}.",
+                            Asked::text(Request::Restore, name)
+                        ));
+                    }
                 }
             }
         }
