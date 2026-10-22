@@ -3387,31 +3387,6 @@
       ],
       "type": "object"
     },
-    "Attempt": {
-      "description": "Which attempt ended a reconnection, as a range rather than a number.",
-      "oneOf": [
-        {
-          "const": "1",
-          "description": "The first.",
-          "type": "string"
-        },
-        {
-          "const": "2-3",
-          "description": "The second or third.",
-          "type": "string"
-        },
-        {
-          "const": "4-8",
-          "description": "The fourth to the eighth.",
-          "type": "string"
-        },
-        {
-          "const": "9+",
-          "description": "The ninth or later.",
-          "type": "string"
-        }
-      ]
-    },
     "AttemptId": {
       "description": "One pairing attempt by one candidate: 128 random bits.",
       "format": "uuid",
@@ -18587,7 +18562,7 @@
           "type": "array"
         },
         "metrics": {
-          "$ref": "#/$defs/Report",
+          "$ref": "#/$defs/MetricsReport",
           "default": {
             "adapter_failure": [],
             "reconnect_time": [],
@@ -23177,6 +23152,37 @@
           "type": "string"
         }
       ]
+    },
+    "MetricsReport": {
+      "additionalProperties": false,
+      "description": "What a host reports of the metrics it measures about itself.\n\nClosed in every member: a report is made of this build's own words, so one that was read back\nfrom elsewhere naming anything else does not parse, and there is nowhere in it for a line of\noutput, a prompt or a filename to go.",
+      "properties": {
+        "adapter_failure": {
+          "default": [],
+          "description": "Every adapter.failure series, in a fixed order.",
+          "items": {
+            "$ref": "#/$defs/AdapterFailure"
+          },
+          "type": "array"
+        },
+        "reconnect_time": {
+          "default": [],
+          "description": "Every reconnect.time series, in a fixed order.",
+          "items": {
+            "$ref": "#/$defs/ReconnectTime"
+          },
+          "type": "array"
+        },
+        "terminal_parse_fault": {
+          "default": [],
+          "description": "Every terminal.parse_fault series, in a fixed order.",
+          "items": {
+            "$ref": "#/$defs/ParseFault"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
     },
     "MutationRequest": {
       "additionalProperties": false,
@@ -32208,12 +32214,37 @@
       ],
       "type": "object"
     },
+    "ReconnectAttempt": {
+      "description": "Which attempt ended a reconnection, as a range rather than a number.",
+      "oneOf": [
+        {
+          "const": "1",
+          "description": "The first.",
+          "type": "string"
+        },
+        {
+          "const": "2-3",
+          "description": "The second or third.",
+          "type": "string"
+        },
+        {
+          "const": "4-8",
+          "description": "The fourth to the eighth.",
+          "type": "string"
+        },
+        {
+          "const": "9+",
+          "description": "The ninth or later.",
+          "type": "string"
+        }
+      ]
+    },
     "ReconnectTime": {
       "additionalProperties": false,
       "description": "One reconnect.time series: how long a paired device was without a connection, counted under the\nlabels that say how the connection that ended the gap reached the host and how it ended.",
       "properties": {
         "attempt": {
-          "$ref": "#/$defs/Attempt",
+          "$ref": "#/$defs/ReconnectAttempt",
           "description": "Which attempt, among the connections the host saw from the device since its last one ended,\nis the one reported."
         },
         "count": {
@@ -33427,37 +33458,6 @@
       "maxLength": 128,
       "pattern": "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*|\\[[0-9a-f:]+\\])(:[1-9][0-9]{0,4})?$",
       "type": "string"
-    },
-    "Report": {
-      "additionalProperties": false,
-      "description": "What a host reports of the metrics it measures about itself.\n\nClosed in every member: a report is made of this build's own words, so one that was read back\nfrom elsewhere naming anything else does not parse, and there is nowhere in it for a line of\noutput, a prompt or a filename to go.",
-      "properties": {
-        "adapter_failure": {
-          "default": [],
-          "description": "Every adapter.failure series, in a fixed order.",
-          "items": {
-            "$ref": "#/$defs/AdapterFailure"
-          },
-          "type": "array"
-        },
-        "reconnect_time": {
-          "default": [],
-          "description": "Every reconnect.time series, in a fixed order.",
-          "items": {
-            "$ref": "#/$defs/ReconnectTime"
-          },
-          "type": "array"
-        },
-        "terminal_parse_fault": {
-          "default": [],
-          "description": "Every terminal.parse_fault series, in a fixed order.",
-          "items": {
-            "$ref": "#/$defs/ParseFault"
-          },
-          "type": "array"
-        }
-      },
-      "type": "object"
     },
     "ReportedLocation": {
       "additionalProperties": false,

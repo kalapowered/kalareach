@@ -227,7 +227,7 @@ impl Broker {
 
     /// Returns what this broker has counted of the host's own metrics.
     #[must_use]
-    pub fn metrics(&self) -> kr_protocol::metrics::Report {
+    pub fn metrics(&self) -> kr_protocol::metrics::MetricsReport {
         self.adapter_failures.report()
     }
 }

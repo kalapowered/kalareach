@@ -5,8 +5,9 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::{
-    Adapter, AdapterFailure, Attempt, Environment, Fault, HOST_METRICS, MetricOutcome, ParseFault,
-    ReconnectTime, Recorder, Report, Shape, Transport, VECTOR_FILE_NAME, vector,
+    Adapter, AdapterFailure, Environment, Fault, HOST_METRICS, MetricOutcome, MetricsReport,
+    ParseFault, ReconnectAttempt, ReconnectTime, Recorder, Shape, Transport, VECTOR_FILE_NAME,
+    vector,
 };
 use crate::scalars::U64;
 
@@ -77,7 +78,7 @@ fn the_vector_lists_each_metric_and_every_value_each_of_its_labels_may_take() {
             ],
         })
     );
-    assert_eq!(Attempt::SHAPE, Shape::Bucket);
+    assert_eq!(ReconnectAttempt::SHAPE, Shape::Bucket);
     assert_eq!(Transport::SHAPE, Shape::Enumerated);
 }
 
@@ -85,16 +86,16 @@ fn the_vector_lists_each_metric_and_every_value_each_of_its_labels_may_take() {
 #[test]
 fn an_attempt_falls_in_the_range_that_holds_it() {
     for (ordinal, bucket) in [
-        (0, Attempt::One),
-        (1, Attempt::One),
-        (2, Attempt::TwoToThree),
-        (3, Attempt::TwoToThree),
-        (4, Attempt::FourToEight),
-        (8, Attempt::FourToEight),
-        (9, Attempt::NineOrMore),
-        (u64::MAX, Attempt::NineOrMore),
+        (0, ReconnectAttempt::One),
+        (1, ReconnectAttempt::One),
+        (2, ReconnectAttempt::TwoToThree),
+        (3, ReconnectAttempt::TwoToThree),
+        (4, ReconnectAttempt::FourToEight),
+        (8, ReconnectAttempt::FourToEight),
+        (9, ReconnectAttempt::NineOrMore),
+        (u64::MAX, ReconnectAttempt::NineOrMore),
     ] {
-        assert_eq!(Attempt::of(ordinal), bucket, "attempt {ordinal}");
+        assert_eq!(ReconnectAttempt::of(ordinal), bucket, "attempt {ordinal}");
     }
 }
 
@@ -155,19 +156,19 @@ fn a_recorder_counts_each_series_and_reports_them_in_a_fixed_order() {
     let recorder = Recorder::new(Environment::Development);
     recorder.reconnected(
         Transport::Relay,
-        Attempt::One,
+        ReconnectAttempt::One,
         MetricOutcome::Ok,
         Duration::from_millis(1_500),
     );
     recorder.reconnected(
         Transport::Relay,
-        Attempt::One,
+        ReconnectAttempt::One,
         MetricOutcome::Ok,
         Duration::from_millis(4_000),
     );
     recorder.reconnected(
         Transport::Direct,
-        Attempt::TwoToThree,
+        ReconnectAttempt::TwoToThree,
         MetricOutcome::Refused,
         Duration::from_millis(10),
     );
@@ -182,7 +183,7 @@ fn a_recorder_counts_each_series_and_reports_them_in_a_fixed_order() {
         [
             ReconnectTime {
                 transport: Transport::Direct,
-                attempt: Attempt::TwoToThree,
+                attempt: ReconnectAttempt::TwoToThree,
                 outcome: MetricOutcome::Refused,
                 environment: Environment::Development,
                 count: U64::new(1),
@@ -191,7 +192,7 @@ fn a_recorder_counts_each_series_and_reports_them_in_a_fixed_order() {
             },
             ReconnectTime {
                 transport: Transport::Relay,
-                attempt: Attempt::One,
+                attempt: ReconnectAttempt::One,
                 outcome: MetricOutcome::Ok,
                 environment: Environment::Development,
                 count: U64::new(2),
@@ -236,7 +237,8 @@ fn a_report_naming_a_word_this_build_does_not_have_does_not_parse() {
         }],
         "adapter_failure": [],
     });
-    serde_json::from_value::<Report>(ok.clone()).expect("a report made of this build's words");
+    serde_json::from_value::<MetricsReport>(ok.clone())
+        .expect("a report made of this build's words");
     for (pointer, planted) in [
         (
             "/terminal_parse_fault/0/fault",
@@ -247,13 +249,13 @@ fn a_report_naming_a_word_this_build_does_not_have_does_not_parse() {
         let mut changed = ok.clone();
         *changed.pointer_mut(pointer).expect("a member") = json!(planted);
         assert!(
-            serde_json::from_value::<Report>(changed).is_err(),
+            serde_json::from_value::<MetricsReport>(changed).is_err(),
             "{pointer} = {planted}"
         );
     }
     let mut extra = ok;
     extra["terminal_parse_fault"][0]["note"] = json!("a member of nobody's");
-    assert!(serde_json::from_value::<Report>(extra).is_err());
+    assert!(serde_json::from_value::<MetricsReport>(extra).is_err());
 }
 
 /// Reports from several places join into one: the same series add up, the others stay apart, and
@@ -265,7 +267,7 @@ fn reports_from_several_places_join_into_one() {
     one.adapter_failed(Adapter::GeminiCli, MetricOutcome::Unavailable);
     one.reconnected(
         Transport::Relay,
-        Attempt::One,
+        ReconnectAttempt::One,
         MetricOutcome::Ok,
         Duration::from_millis(100),
     );
@@ -273,13 +275,16 @@ fn reports_from_several_places_join_into_one() {
     other.parse_faulted(Fault::OversizedFrame, 3);
     other.reconnected(
         Transport::Relay,
-        Attempt::One,
+        ReconnectAttempt::One,
         MetricOutcome::Ok,
         Duration::from_millis(900),
     );
 
-    let joined = Report::joined([one.report(), other.report()]);
-    assert_eq!(joined, Report::joined([other.report(), one.report()]));
+    let joined = MetricsReport::joined([one.report(), other.report()]);
+    assert_eq!(
+        joined,
+        MetricsReport::joined([other.report(), one.report()])
+    );
     assert_eq!(joined.terminal_parse_fault.len(), 1);
     assert_eq!(joined.terminal_parse_fault[0].count.get(), 5);
     assert_eq!(joined.adapter_failure.len(), 1);

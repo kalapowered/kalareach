@@ -507,12 +507,12 @@ fn the_doctor_shows_what_each_launch_probe_read() {
 /// adapter that did not answer.
 fn measured() -> HostDoctorResult {
     use kr_protocol::metrics::{
-        Adapter, Attempt, Environment, Fault, MetricOutcome, Recorder, Transport,
+        Adapter, Environment, Fault, MetricOutcome, ReconnectAttempt, Recorder, Transport,
     };
     let recorder = Recorder::new(Environment::Production);
     recorder.reconnected(
         Transport::Relay,
-        Attempt::TwoToThree,
+        ReconnectAttempt::TwoToThree,
         MetricOutcome::Ok,
         std::time::Duration::from_millis(4_250),
     );

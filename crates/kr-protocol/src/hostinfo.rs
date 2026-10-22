@@ -421,7 +421,7 @@ pub struct HostDoctorResult {
     /// is one of this build's own words, so the report carries no terminal content, key, prompt or
     /// filename and a support bundle takes it as it is.
     #[serde(default)]
-    pub metrics: crate::metrics::Report,
+    pub metrics: crate::metrics::MetricsReport,
 }
 
 impl HostDoctorResult {
@@ -440,7 +440,7 @@ impl HostDoctorResult {
             configuration,
             command_integrations: Vec::new(),
             launch_probes: Vec::new(),
-            metrics: crate::metrics::Report::default(),
+            metrics: crate::metrics::MetricsReport::default(),
         }
     }
 
@@ -456,7 +456,7 @@ impl HostDoctorResult {
 
     /// The same result, reporting `metrics`.
     #[must_use]
-    pub fn with_metrics(mut self, metrics: crate::metrics::Report) -> Self {
+    pub fn with_metrics(mut self, metrics: crate::metrics::MetricsReport) -> Self {
         self.metrics = metrics;
         self
     }
@@ -6157,9 +6157,13 @@ pub mod export {
         ),
         field("HostDoctorResult", "launch_probes", ContentClass::Structure),
         field("HostDoctorResult", "metrics", ContentClass::Structure),
-        field("Report", "reconnect_time", ContentClass::Structure),
-        field("Report", "terminal_parse_fault", ContentClass::Structure),
-        field("Report", "adapter_failure", ContentClass::Structure),
+        field("MetricsReport", "reconnect_time", ContentClass::Structure),
+        field(
+            "MetricsReport",
+            "terminal_parse_fault",
+            ContentClass::Structure,
+        ),
+        field("MetricsReport", "adapter_failure", ContentClass::Structure),
         field("ReconnectTime", "transport", ContentClass::Term),
         field("ReconnectTime", "attempt", ContentClass::Term),
         field("ReconnectTime", "outcome", ContentClass::Term),
