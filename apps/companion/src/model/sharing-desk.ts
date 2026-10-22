@@ -21,6 +21,8 @@ export interface Revoked {
   readonly grantId: string
   readonly name: string
   readonly atMs: number
+  /** The authority revision the host issued for the revocation. */
+  readonly revision: string
   readonly pending: number
 }
 
@@ -112,12 +114,15 @@ export class SharingDesk {
     return this.#meant.get(grantId)
   }
 
-  /** Keeps the line that says a revocation was made and how many workers have not confirmed it. */
-  keepRevocation(grantId: string, name: string, atMs: number, pending: number): void {
+  /**
+   * Keeps the line that says a revocation was made, at which authority revision, and how many
+   * workers have not confirmed it.
+   */
+  keepRevocation(grantId: string, name: string, atMs: number, revision: string, pending: number): void {
     this.#change({
       revoked: [
         ...this.#kept.revoked.filter((line) => line.grantId !== grantId),
-        { grantId, name, atMs, pending }
+        { grantId, name, atMs, revision, pending }
       ]
     })
   }

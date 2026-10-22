@@ -232,6 +232,30 @@ for (const size of SIZES) {
       await expect(page.getByRole('heading', { name: 'Sharing' })).toBeFocused()
     })
 
+    // KR-REQ-18.14: a revocation a session worker has not confirmed is not called done: the line
+    // the page keeps states the authority revision and the workers still owed, offers to check
+    // again, and is not pushed past its box at either text size.
+    test('states the revision and the workers a revocation still waits for', async ({ page }) => {
+      await openSharing(page)
+      await page.getByRole('radio', { name: /Sam's iPhone/ }).check()
+      await page.getByTestId('invite').click()
+      await page.evaluate(() => {
+        const [first] = window.krTestHost?.sharing.grants() ?? []
+        if (first !== undefined) window.krTestHost?.sharing.deviceAccepts(first.grant.grant_id)
+        window.krTestHost?.sharing.holdBarrier(true)
+      })
+      await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+      const active = page.locator('[data-testid="access"] [data-state="active"]')
+      await expect(active).toBeVisible()
+      await active.getByTestId('revoke').click()
+      const line = page.getByTestId('recently-revoked')
+      await expect(line).toContainText('authority revision 6')
+      await expect(line).toContainText('1 session worker has not confirmed yet')
+      await expect(line.getByTestId('check-again')).toBeVisible()
+      expect(await overflowsSideways(page, '[data-testid="recently-revoked"]')).toEqual([])
+      await photograph(page, `sharing-revoked-${size.name}`)
+    })
+
     // KR-REQ-18.14: an attempt whose answer was lost is on the page as unfinished, in words, with
     // the one thing that can be done about it.
     test('lists an unfinished invitation with what can be done about it', async ({ page }) => {

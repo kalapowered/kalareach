@@ -58,7 +58,7 @@ export function tookBack(
   nowMs: number
 ): void {
   const pending = pendingWorkers(result)
-  desk.keepRevocation(grantId, name, nowMs, pending)
+  desk.keepRevocation(grantId, name, nowMs, result.authority_revision, pending)
   desk.dismissNote(grantId)
   say(
     withdrawing
@@ -94,7 +94,7 @@ export function handedOver(
   nowMs: number
 ): void {
   const pending = pendingWorkers(done.revoked)
-  desk.keepRevocation(sourceGrantId, givingName, nowMs, pending)
+  desk.keepRevocation(sourceGrantId, givingName, nowMs, done.revoked.authority_revision, pending)
   say(
     pending === 0
       ? words

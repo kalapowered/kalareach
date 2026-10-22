@@ -274,6 +274,9 @@ describe('who has access', () => {
     expect(controls.sharing.grants().map((each) => each.state)).toEqual(['revoked'])
   })
 
+  // KR-REQ-18.14: a revocation a session worker has not confirmed is not called done. The line the
+  // page keeps for it states the authority revision the host issued and how many session workers
+  // have not confirmed, and offers to check again until none is left.
   it('keeps a line while a session worker has not confirmed a revocation, until it is checked again', async () => {
     const { controls, person } = await openSharing()
     await person.click(screen.getByRole('radio', { name: PHONE }))
@@ -293,11 +296,13 @@ describe('who has access', () => {
     controls.sharing.holdBarrier(true)
     await person.click(within(row).getByTestId('revoke'))
     const line = await screen.findByTestId('recently-revoked')
+    expect(line.textContent).toMatch(/authority revision 6/)
     expect(line.textContent).toMatch(/1 session worker has not confirmed yet/)
     await person.click(within(line).getByTestId('check-again'))
     await waitFor(() => {
       expect(screen.getByTestId('recently-revoked').textContent).not.toMatch(/not confirmed yet/)
     })
+    expect(screen.getByTestId('recently-revoked').textContent).toMatch(/authority revision 6/)
     expect(controls.sharing.sent().revoke).toBe(2)
   })
 })

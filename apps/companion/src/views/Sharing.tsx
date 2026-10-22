@@ -745,7 +745,8 @@ function SharingTab({
             tabIndex={-1}
           >
             <span>
-              Revoked {nameWords(line.name)} at {momentWords(line.atMs, now)}.
+              Revoked {nameWords(line.name)} at {momentWords(line.atMs, now)} (authority revision{' '}
+              {line.revision}).
               {line.pending > 0
                 ? ` ${String(line.pending)} session worker${line.pending === 1 ? ' has' : 's have'} not confirmed yet.`
                 : ''}

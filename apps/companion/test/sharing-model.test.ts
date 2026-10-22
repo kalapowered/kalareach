@@ -38,15 +38,17 @@ describe('text from a session or a device', () => {
 })
 
 describe('what the page keeps of a result', () => {
-  it('takes a result in once, and keeps the time of a revocation when it is checked again', () => {
+  it('takes a result in once, and keeps the time and the revision of a revocation when it is checked again', () => {
     const desk = new SharingDesk()
     expect(desk.firstTime('action-1')).toBe(true)
     expect(desk.firstTime('action-1')).toBe(false)
     expect(desk.firstTime('action-2')).toBe(true)
 
-    desk.keepRevocation('grant-1', 'Sam', 1_000, 2)
+    desk.keepRevocation('grant-1', 'Sam', 1_000, '7', 2)
     desk.checked('grant-1', 1)
-    expect(desk.snapshot().revoked).toEqual([{ grantId: 'grant-1', name: 'Sam', atMs: 1_000, pending: 1 }])
+    expect(desk.snapshot().revoked).toEqual([
+      { grantId: 'grant-1', name: 'Sam', atMs: 1_000, revision: '7', pending: 1 }
+    ])
   })
 
   it('tells a listener when something it draws changes', () => {
@@ -56,7 +58,7 @@ describe('what the page keeps of a result', () => {
       told += 1
     })
     const before = desk.snapshot()
-    desk.keepRevocation('grant-1', 'Sam', 1_000, 0)
+    desk.keepRevocation('grant-1', 'Sam', 1_000, '7', 0)
     expect(told).toBe(1)
     expect(desk.snapshot()).not.toBe(before)
     stop()
