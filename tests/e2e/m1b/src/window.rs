@@ -36,6 +36,8 @@ type Keys = Arc<Mutex<Box<dyn Write + Send>>>;
 struct Transcript {
     bytes: Vec<u8>,
     owed: Vec<Owed>,
+    /// Set when the terminal's output has ended, so that nothing more will be sent to it.
+    ended: bool,
 }
 
 impl Transcript {
@@ -110,11 +112,11 @@ impl Collected {
                     owed.type_into(&keys);
                 }
             }
-            // A question that never came is not going to: whoever waits for its reply is told so.
-            seen.lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .owed
-                .clear();
+            // Once the output has ended a question that has not come is not going to: whoever
+            // waits for its reply is told so, and so is whoever asks to wait after this.
+            let mut transcript = seen.lock().unwrap_or_else(PoisonError::into_inner);
+            transcript.ended = true;
+            transcript.owed.clear();
         });
         collected
     }
@@ -139,7 +141,7 @@ impl Collected {
         if owed.is_due(&transcript.bytes) {
             drop(transcript);
             owed.type_into(keys);
-        } else {
+        } else if !transcript.ended {
             transcript.owed.push(owed);
         }
         Answering(outcome)
@@ -434,8 +436,8 @@ pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 ///
 /// # Panics
 ///
-/// Panics with what the window was sent when `kr` never asked, the answer could not be typed, or
-/// the question did not come within [`LIVENESS`].
+/// Panics with what the window was sent when `kr` never asked, the answer could not be typed, the
+/// window's output ended without the question, or the question did not come within [`LIVENESS`].
 pub fn answered(window: &Window, queries: Answering) {
     assert!(
         queries.0.recv_timeout(LIVENESS).unwrap_or(false),
