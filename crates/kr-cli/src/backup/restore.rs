@@ -358,8 +358,8 @@ impl Planned {
                  the backup, is a file to read and not applied; --apply-configuration applies it.",
             )),
             Asked::NothingToApply => lines.push(Shown::said(
-                "No key, grant or device comes back. The backup holds no configuration, so none \
-                 is applied.",
+                "No key, grant or device comes back. The backup has no configuration this \
+                 restore writes, so none is applied; a member it refuses is listed above.",
             )),
             Asked::Yes(applying) => {
                 lines.push(Shown::said(

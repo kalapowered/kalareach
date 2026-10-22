@@ -6174,9 +6174,13 @@ impl kr_client::recovery::BundleWriter for RelayBundles {
 /// objects of the generation pushed out, which the Worker holds as tombstones that are still
 /// charged.
 ///
-/// The only part stood in is where the account's token comes from: the Worker's development-only
-/// sign-in wrote it, and the daemon is signed in with it before it starts. The carrier waits on a
-/// timer that runs by itself. Ignored unless it is asked for, so an ordinary run of this workspace
+/// Two parts are stood in. Where the account's token comes from: the Worker's development-only
+/// sign-in wrote it, and the daemon is signed in with it before it starts. And the generations after
+/// the first: the producer makes one a day, so the generations that push the first one out of two
+/// snapshots (the second and the third) are sealed by the test and admitted to the daemon's
+/// uploader directly; the daemon's carrier sends them and its uploader deletes what the chain no
+/// longer holds, which is the path the leg shows. The carrier waits on a timer that runs by itself.
+/// Ignored unless it is asked for, so an ordinary run of this workspace
 /// sends nothing anywhere; `scripts/e2e-backup.sh` starts the Worker and runs it:
 ///
 /// ```text
