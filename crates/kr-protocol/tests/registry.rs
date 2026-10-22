@@ -969,6 +969,46 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // Section 25 lets only an explicit authorised rearm give a causal chain whose budget ran out a
+    // new one, and section 23's automation row names no method that does it. This build adds the
+    // one effect. It is served on the local socket and to a paired device whose grant manages
+    // automation, it asks for that right and nothing else, it needs no owner confirmation because
+    // the right is the authorisation, and a repeat of it is answered from the chain's own state.
+    let automation = [("workflow.rearm", EffectClass::Write)];
+    for (name, effect) in automation {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(
+            entry.group,
+            MethodGroup::Automation,
+            "{name} is an automation method"
+        );
+        assert_eq!(
+            entry.ingress,
+            &[ActorIngress::LocalIpc, ActorIngress::PairedDevice],
+            "{name} is never reachable from a session, a plugin, a workflow or an unpaired peer"
+        );
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::right(ActionRight::AutomationManage)],
+            "{name} asks for the right to manage automation and nothing else"
+        );
+        assert_eq!(
+            entry.confirmation,
+            ConfirmationRequirement::None,
+            "{name} is authorised by the right and asks for no confirmation"
+        );
+        assert_eq!(
+            entry.freshness,
+            FreshnessRequirement::ActionWindow,
+            "{name} is a first admission under an action window"
+        );
+        assert!(
+            matches!(entry.idempotency, IdempotencyBehaviour::Keyed { .. }),
+            "a repeat of {name} is answered from the chain, not run again"
+        );
+    }
+
     // Section 11 ¶3 has the approval ledger retain the decoder and package hash, the original
     // source, the native request identifier, the offered decisions, the deadline and the resolution
     // state, and asks for the publisher and the original request details to be open to inspection.
@@ -1072,6 +1112,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + owner.len()
             + clock.len()
             + organisation.len()
+            + automation.len()
             + 1
             + inspection.len()
             + phone.len(),
