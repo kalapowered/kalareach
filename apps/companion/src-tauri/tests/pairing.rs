@@ -142,6 +142,41 @@ impl Ceremony for SlowCeremony {
     }
 }
 
+/// A ceremony whose person has not answered yet: each time it is asked it says so, and then waits
+/// until the test lets one answer through.
+struct GatedCeremony {
+    asked: AtomicUsize,
+    started: tokio::sync::Notify,
+    gate: tokio::sync::Semaphore,
+}
+
+impl GatedCeremony {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            asked: AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+            gate: tokio::sync::Semaphore::new(0),
+        })
+    }
+}
+
+impl Ceremony for GatedCeremony {
+    fn kind(&self) -> CeremonyKind {
+        CeremonyKind::FaceId
+    }
+
+    fn verify<'a>(&'a self, _reason: &'a str, _within: Duration) -> BoxFuture<'a, CeremonyOutcome> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        self.started.notify_one();
+        Box::pin(async move {
+            if let Ok(permit) = self.gate.acquire().await {
+                permit.forget();
+            }
+            CeremonyOutcome::Confirmed
+        })
+    }
+}
+
 /// What a host asks its owner to confirm: an invitation for a viewer, offered on its network.
 fn an_invitation() -> ConfirmationSubject {
     ConfirmationSubject::IssueInvitation {
@@ -719,6 +754,89 @@ async fn the_watcher_never_cuts_off_a_review_that_shares_its_relay() {
     // again under the reference it had, so whatever the page knew of it still holds.
     let again = support::listed(&watcher, |request| request.host_name == "the second host").await;
     assert_eq!(again.reference, waiting.reference);
+}
+
+/// KR-REQ-10.52: one request is confirmed at a time. While the person is being asked about one, a
+/// review of another is refused and asks them nothing, so what they answer is never taken for an
+/// answer to the other request; once the first is done, the second can be reviewed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_review_is_refused_while_the_person_is_asked_about_the_first() {
+    let owner_keys = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner_keys).await;
+    let data = tempfile::tempdir().expect("a directory");
+    let device = owner_device(&host, &owner_keys, data.path());
+    let ceremony = GatedCeremony::new();
+    let watcher = Owner::new(Arc::clone(&device), ceremony.clone(), || {});
+    watcher.start();
+
+    let mut client = host.client().await;
+    calls::request(host.environment_id, &mut client, an_invitation())
+        .await
+        .expect("the first request");
+    let later = calls::request(
+        host.environment_id,
+        &mut client,
+        ConfirmationSubject::IssueInvitation {
+            mode: InviteModeKind::Direct,
+            rendezvous_origin: Nullable::null(),
+            grant_kind: InviteGrantKind::SessionInvitation,
+            proposed_grant: proposal(&[ActionRight::SessionView, ActionRight::FilesRead]),
+        },
+    )
+    .await
+    .expect("the second request")
+    .request;
+    let reads_files = |request: &companion_tauri::owner::RequestView| {
+        request
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("read files"))
+    };
+    let first = support::listed(&watcher, |request| !reads_files(request)).await;
+    let second = support::listed(&watcher, reads_files).await;
+
+    let first_review = tokio::spawn({
+        let watcher = Arc::clone(&watcher);
+        async move { watcher.review(&first.reference).await }
+    });
+    tokio::time::timeout(WATCHDOG, ceremony.started.notified())
+        .await
+        .expect("the person is asked about the first request");
+
+    // The second review ends at once, without asking the person: if it did ask, the ceremony would
+    // say so before the review could end.
+    tokio::select! {
+        refused = watcher.review(&second.reference) => {
+            assert!(refused.is_err(), "a second review while one asks the person is refused");
+        }
+        () = ceremony.started.notified() => panic!("the person was asked about a second request"),
+    }
+    assert_eq!(ceremony.asked.load(Ordering::SeqCst), 1);
+
+    ceremony.gate.add_permits(1);
+    let outcome = tokio::time::timeout(WATCHDOG, first_review)
+        .await
+        .expect("the first review ends")
+        .expect("the first review ran")
+        .expect("reviewed");
+    assert_eq!(outcome, ReviewOutcome::Confirmed);
+    assert!(
+        host.network()
+            .pairing()
+            .rows()
+            .acceptance(later.confirmation_id)
+            .expect("readable")
+            .is_none(),
+        "the answer to the first request confirmed nothing else"
+    );
+
+    ceremony.gate.add_permits(1);
+    let outcome = tokio::time::timeout(WATCHDOG, watcher.review(&second.reference))
+        .await
+        .expect("the second review ends")
+        .expect("reviewed");
+    assert_eq!(outcome, ReviewOutcome::Confirmed);
+    assert_eq!(ceremony.asked.load(Ordering::SeqCst), 2);
 }
 
 /// KR-REQ-10.06: one of this computer's hosts takes each connection, completes the authorised

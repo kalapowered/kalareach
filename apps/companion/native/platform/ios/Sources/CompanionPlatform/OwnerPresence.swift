@@ -36,13 +36,15 @@ enum OwnerPresenceKind: String {
 /// starts nothing, because the alert is gone by then and the run has answered.
 ///
 /// Everything here runs on the main queue. The run answers once: with the outcome of the system's
-/// prompt, with "not confirmed" when the person cancels, the deadline passes, or a newer run ends
-/// it, and with "unavailable" when the device has no ceremony to run.
+/// prompt, with "not confirmed" when the person cancels, the deadline passes, or the application
+/// goes to the background, and with "unavailable" when the device has no ceremony to run. A person
+/// who leaves the application and comes back finds the request unanswered, and starts it again.
 final class OwnerPresenceRun {
   private var reply: ((String) -> Void)?
   private var alert: UIAlertController?
   private var context: LAContext?
   private var deadline: DispatchWorkItem?
+  private var background: NSObjectProtocol?
   private let reason: String
   private let within: TimeInterval
 
@@ -52,11 +54,19 @@ final class OwnerPresenceRun {
     self.reply = reply
   }
 
+  /// Whether the run is still waiting for the person: it has not answered.
+  var isRunning: Bool { reply != nil }
+
   /// Shows the alert over `presenter` and starts the clock.
   func begin(over presenter: UIViewController) {
     let expiry = DispatchWorkItem { [weak self] in self?.finish("not_confirmed") }
     deadline = expiry
     DispatchQueue.main.asyncAfter(deadline: .now() + max(0, within), execute: expiry)
+    // Before the system's prompt starts there is no context for the system to cancel when the
+    // application leaves, so the run watches for that itself, and ends with the alert.
+    background = NotificationCenter.default.addObserver(
+      forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+    ) { [weak self] _ in self?.finish("not_confirmed") }
 
     let alert = UIAlertController(
       title: "Confirm on this device", message: reason, preferredStyle: .alert)
@@ -71,9 +81,6 @@ final class OwnerPresenceRun {
     self.alert = alert
     presenter.present(alert, animated: true)
   }
-
-  /// Ends the run as not confirmed, when it has not ended already.
-  func end() { finish("not_confirmed") }
 
   private func evaluate() {
     // A "Continue" that arrives once the run has answered starts nothing.
@@ -96,6 +103,8 @@ final class OwnerPresenceRun {
     reply = nil
     deadline?.cancel()
     deadline = nil
+    if let watching = background { NotificationCenter.default.removeObserver(watching) }
+    background = nil
     // The system's prompt goes with the run: a late reply lands on an invalidated context.
     context?.invalidate()
     context = nil

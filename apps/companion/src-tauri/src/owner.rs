@@ -17,6 +17,7 @@
 //! closing the connection the answer goes over.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -132,7 +133,20 @@ pub struct Owner {
     /// The ceremony the page was last told of, so a ceremony the phone starts to offer (or stops
     /// offering) reaches the page at the next visit, not only when a request comes or goes.
     told: Mutex<CeremonyKind>,
+    /// Whether a review is under way. The person answers one request at a time: what they do at
+    /// the platform's prompt belongs to the request that prompt names, and a second review that
+    /// asked while the first is open could be given the first one's answer.
+    reviewing: AtomicBool,
     changed: Box<dyn Fn() + Send + Sync>,
+}
+
+/// The review under way, ended when it is dropped, however the review ends.
+struct Reviewing<'a>(&'a AtomicBool);
+
+impl Drop for Reviewing<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl std::fmt::Debug for Owner {
@@ -166,6 +180,7 @@ impl Owner {
             entries: Mutex::new(Vec::new()),
             references: Mutex::new(BTreeMap::new()),
             told,
+            reviewing: AtomicBool::new(false),
             changed: Box::new(changed),
         })
     }
@@ -201,9 +216,20 @@ impl Owner {
     ///
     /// # Errors
     ///
-    /// Returns a refusal for a reference this computer is not showing, and an unavailable answer
-    /// when its host cannot be reached in time.
+    /// Returns a refusal for a reference this computer is not showing and for a review that starts
+    /// while another is under way (the person is asked nothing), and an unavailable answer when its
+    /// host cannot be reached in time.
     pub async fn review(self: &Arc<Self>, reference: &str) -> Result<ReviewOutcome> {
+        if self
+            .reviewing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(CommandError::refused(
+                "another request is being confirmed; finish that one first",
+            ));
+        }
+        let _reviewing = Reviewing(&self.reviewing);
         let (host_id, listed) = {
             let entries = lock(&self.entries);
             let entry = entries

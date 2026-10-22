@@ -324,7 +324,9 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
 
   // MARK: The owner's presence
 
-  /// The ceremony that is running, when one is: one at a time, so a newer request ends the older one.
+  /// The ceremony that is running, when one is: one at a time. A request that comes while one runs
+  /// is not confirmed, and the one running is left alone, so what the person answers is never taken
+  /// for an answer to the other request.
   private var presenting: OwnerPresenceRun?
 
   /// Which ceremony this device offers its owner.
@@ -336,7 +338,10 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
   @objc public func presence(_ invoke: Invoke) throws {
     let arguments = try invoke.parseArgs(PresenceArguments.self)
     DispatchQueue.main.async {
-      self.presenting?.end()
+      if self.presenting?.isRunning == true {
+        invoke.resolve(["outcome": "not_confirmed"])
+        return
+      }
       guard OwnerPresenceKind.offered() != .none, let presenter = self.topViewController() else {
         invoke.resolve(["outcome": "unavailable"])
         return

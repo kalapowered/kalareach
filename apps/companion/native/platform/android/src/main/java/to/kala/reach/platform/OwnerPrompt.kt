@@ -22,8 +22,10 @@ import to.kala.reach.companion.mobile.OwnerAuthenticators
  * can ask nothing strong enough is refused, never asked for something weaker.
  *
  * The prompt is shown, answered and cancelled on the main thread. It answers once: with what the
- * system said, with "not confirmed" when the time given runs out (the prompt is withdrawn) or a
- * newer request ends it, and with "unavailable" when the phone has nothing to ask.
+ * system said, with "not confirmed" when the time given runs out (the prompt is withdrawn), and with
+ * "unavailable" when the phone has nothing to ask. One prompt is up at a time, since the library
+ * keeps one callback for every prompt of an activity: the plugin builds no second prompt while this
+ * one is, so what the person answers is never delivered to another request.
  */
 class OwnerPrompt(
     private val activity: FragmentActivity,
@@ -66,9 +68,6 @@ class OwnerPrompt(
         prompt = shown
         shown.authenticate(information(ask))
     }
-
-    /** Ends the request as not confirmed, when it has not ended already. */
-    fun end() = finish("not_confirmed", withdraw = true)
 
     private fun finish(outcome: String, withdraw: Boolean) {
         if (answered) return
