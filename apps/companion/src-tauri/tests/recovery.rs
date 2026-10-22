@@ -225,6 +225,7 @@ impl Computer {
                 companion_tauri::commands::recovery_turn_on,
                 companion_tauri::commands::recovery_settle,
                 companion_tauri::commands::recovery_save_kit,
+                companion_tauri::commands::recovery_cover_host,
             ])
             .build(mock_context(noop_assets()))
             .expect("an application on the mock runtime");
@@ -796,6 +797,13 @@ async fn a_host_that_cannot_be_covered_as_it_stands_is_left_alone_and_nothing_is
     page.call("recovery_turn_on", json!({})).expect("on");
     let before = writes_sent(&computer);
     let left = |why: LeftView| HostCoverView::Left { why };
+
+    // The page's command, with no host connected to this application: nothing is sent anywhere.
+    let unreachable = page
+        .call("recovery_cover_host", json!({ "replace": false }))
+        .expect_err("there is no host to cover");
+    assert_eq!(unreachable["code"], "HOST_NOT_CONFIGURED");
+    assert_eq!(writes_sent(&computer), before);
 
     // Each way the host cannot be covered as it stands.
     let ways: Vec<(&str, Box<dyn Fn(&Host)>, LeftView)> = vec![
