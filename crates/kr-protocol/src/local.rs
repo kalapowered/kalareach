@@ -202,6 +202,15 @@ pub struct LocalBuild {
 }
 
 impl LocalBuild {
+    /// The release a worker states it runs: its build identifier `kr-worker/<release>`.
+    ///
+    /// None for a build that is not a worker's and for one that states no release.
+    #[must_use]
+    pub fn worker_release(&self) -> Option<crate::update::ReleaseName> {
+        let release = self.build_id.as_str().strip_prefix("kr-worker/")?;
+        crate::update::ReleaseName::new(release).ok()
+    }
+
     /// This build, as the process whose build identifier is `build_id` states it.
     #[must_use]
     pub fn this(build_id: BuildId) -> Self {

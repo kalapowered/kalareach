@@ -119,7 +119,7 @@ impl Controller {
             // A worker that is already running asking for the plugin runtime: one request and
             // one answer, from the process this daemon recorded for the session.
             ControlFrame::PluginRuntimeWanted(wanted) => {
-                let answer = self.plugin_runtime_wanted(wanted, peer).await;
+                let answer = self.plugin_runtime_wanted(wanted, peer, level).await;
                 write_under(writer, level, &ControlFrame::PluginRuntimeState(answer)).await?;
                 return Ok(());
             }
@@ -610,6 +610,7 @@ impl Controller {
                 endpoint,
                 // A worker this daemon launched is of this daemon's own release.
                 level: kr_protocol::retained::Level::this(),
+                release: None,
             },
             Some(ready.session.as_ref().clone()),
             &held,
@@ -801,6 +802,7 @@ mod tests {
         controller.directory.lock().await.insert(
             KnownWorker {
                 level,
+                release: None,
                 ..silent.worker.clone()
             },
             None,

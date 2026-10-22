@@ -1,10 +1,10 @@
 //! The worker's link to the plugin runtime.
 //!
-//! A binding whose package ships a component is registered with the plugin runtime, the one
-//! process per environment that hosts component instances. The runtime is started when a worker
-//! first needs it, by the control daemon; this link asks the daemon for it, connects to it directly
-//! and registers the bindings, and the daemon is not in that path afterwards. A daemon that
-//! restarts leaves every registration where it is.
+//! A binding whose package ships a component is registered with the plugin runtime, the process of
+//! the worker's own protocol and environment that hosts component instances. The runtime is
+//! started when a worker first needs it, by the control daemon; this link asks the daemon for it,
+//! connects to it directly and registers the bindings, and the daemon is not in that path
+//! afterwards. A daemon that restarts leaves every registration where it is.
 //!
 //! # What the link holds
 //!

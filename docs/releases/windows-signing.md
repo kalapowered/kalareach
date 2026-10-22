@@ -77,8 +77,8 @@ The executables, and the crates they come from, are `kr` and `kr-attach-guard` f
 `kr-worker` from `kr-worker`, `kr-controller` from `kr-controller`, `kr-describe-inference` from
 `kr-describe-model`, `kr-hook` from `kr-hook` and `kr-plugin-host` from `kr-plugin-host`. `kr-hook`
 is the forwarder that an agent's hooks start and the relay a launched agent reaches its worker
-through, and `kr-plugin-host` runs plugin components, one process per environment. Without them a
-host installed from the archive cannot run agent hooks or plugins. The job checks against the
+through, and `kr-plugin-host` runs plugin components, one process for each protocol and
+environment. Without them a host installed from the archive cannot run agent hooks or plugins. The job checks against the
 workspace package metadata that these are all the binaries those crates declare (except for the
 model description test stub and the benchmark using real weights, which aren't included in the
 release). `scripts/build-release.sh` then copies them, by specific name, from the `target\release`

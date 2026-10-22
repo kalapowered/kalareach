@@ -34,8 +34,8 @@ use kr_protocol::scalars::Uuid;
 use kr_plugin_service::launcher::{HostIdentity, LaunchError, LaunchResult};
 use kr_plugin_service::notices::{NoticeSink, NoticeStream, Offered, node_bytes};
 use kr_plugin_service::protocol::{
-    BindingRegistration, CallValue, ComponentSource, Frame, HostHealth, Notice, PrepareActionCall,
-    Request, RequestBody, ResponseBody, WireNode,
+    BindingRegistration, CallValue, ComponentSource, Frame, HostHealth, HostProtocol, Notice,
+    PrepareActionCall, Request, RequestBody, ResponseBody, WireNode,
 };
 use kr_plugin_service::vocabulary::{
     Admission, BindingId, COMPILE_DEADLINE_MS, MAX_NODE_BYTES, event_of, facts_of,
@@ -456,17 +456,17 @@ impl PluginHost {
     ) -> Result<ResponseBody, (String, bool)> {
         match body {
             RequestBody::Hello { protocol } => {
-                if protocol != kr_protocol::retained::PLUGIN_HOST_PROTOCOL {
+                if protocol != HostProtocol::THIS.name {
                     return Err((
                         format!(
                             "this host speaks {} and the caller offered {protocol}",
-                            kr_protocol::retained::PLUGIN_HOST_PROTOCOL
+                            HostProtocol::THIS.name
                         ),
                         false,
                     ));
                 }
                 Ok(ResponseBody::Hello {
-                    protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
+                    protocol: HostProtocol::THIS.name.to_owned(),
                     descriptor: Box::new(self.descriptor()),
                 })
             }
@@ -736,7 +736,7 @@ impl PluginHost {
 
     fn descriptor(&self) -> kr_plugin_service::protocol::HostDescriptor {
         kr_plugin_service::protocol::HostDescriptor {
-            protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
+            protocol: HostProtocol::THIS.name.to_owned(),
             environment_id: self.identity.environment_id(),
             reservation_id: kr_protocol::worker::ReservationId::new(
                 kr_protocol::scalars::Uuid::from_bytes([0; 16]),
@@ -1460,7 +1460,7 @@ mod tests {
     #[cfg(unix)]
     fn config_over(packages: &Path, scratch: &Path) -> HostConfig {
         HostConfig {
-            endpoint: kr_ipc::paths::Endpoint::from_path(scratch.join("p.sock"))
+            endpoint: kr_ipc::paths::Endpoint::from_path(scratch.join(HostProtocol::THIS.endpoint))
                 .expect("an endpoint"),
             packages_root: packages.to_path_buf(),
             cache_root: scratch.join("cache"),
