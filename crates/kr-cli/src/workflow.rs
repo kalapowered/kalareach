@@ -5,7 +5,9 @@
 //! budget, and `kr workflow rearm` is that request: it names the chain, the grant it is made under
 //! and the budget generation it leaves, and the control daemon decides whether it is allowed.
 //! Without a generation the command reads the one the chain is on, and says so; it refuses a chain
-//! the daemon holds no budget for itself, and sends one request, whose answer it prints.
+//! the daemon holds no budget for itself, and sends one request, whose answer it prints. The answer
+//! to a repeat of a rearm is the answer to the first, so the command says that the rearm has been
+//! made and not which request made it.
 
 use kr_client::shown;
 use kr_client::shown::Shown;
@@ -84,9 +86,13 @@ async fn rearm(
     if json {
         output::document(&answer::workflow_rearm_result(&rearmed));
     } else {
+        // The answer to a repeat is the answer to the first request, so it cannot say which of
+        // them gave the budget; it says what holds after either.
         output::line(&stdout_line!(
-            "Rearmed chain {}: its budget is on generation {}.",
+            "Chain {}: the rearm that leaves budget generation {} has been made, and its budget \
+             is on generation {}. The same command sent again gives it no second budget.",
             closed_word(&rearmed.causal_root_id),
+            generation,
             rearmed.generation.get()
         ));
     }

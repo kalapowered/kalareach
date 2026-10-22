@@ -42134,7 +42134,7 @@
     },
     "WorkflowRearmParams": {
       "additionalProperties": false,
-      "description": "Parameters for `workflow.rearm`.\n\nA rearm is the explicit, authorised act that gives a causal chain a new budget after its\nbudget ran out. Nothing an event carries can make one: the request names the chain, the grant\nit is made under, and the budget generation it leaves.\n\nThe generation is what makes a repeat of the request a repeat and not a second budget. The\nfirst request moves the chain from that generation to the next. A request that names a\ngeneration the chain has already left, such as the same request sent again after its reply was\nlost, is answered with the generation the chain went to and establishes nothing.",
+      "description": "Parameters for `workflow.rearm`.\n\nA rearm is the explicit, authorised act that gives a causal chain a new budget after its\nbudget ran out. Nothing an event carries can make one: the request names the chain, the grant\nit is made under, and the budget generation it leaves.\n\nThe generation is what makes a repeat of the request a repeat and not a second budget. The\nfirst request moves the chain from that generation to the next. The same request sent again\nafter its reply was lost, while the chain is still on that next generation, is answered with it\nand establishes nothing. A request that names a generation the chain is neither on nor just\npast, which is what the same request becomes once the chain has been rearmed again, is refused.",
       "properties": {
         "causal_root_id": {
           "$ref": "#/$defs/CausalRootId",
