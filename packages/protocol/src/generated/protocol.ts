@@ -30342,9 +30342,9 @@ export interface VisitChangedParams {
    * carries a summary when one has been written for an interval that starts at the same first
    * cursor and ends at or before the head, and a client that asks again later is answered with
    * it once it is; asking again never restarts the work. A host that runs no model, or has not
-   * selected one, or is in privacy mode, answers none, and a paired device is answered none
-   * whatever its grant's history reaches: a summary is generated text, and the moments of the
-   * changes it is written from do not date the session text they name.
+   * selected one, or is in privacy mode, answers none, and a paired device whose grant has a
+   * history bound is answered none, however early the bound: a summary is generated text, and
+   * the moments of the changes it is written from do not date the session text they name.
    */
   summarise: boolean
 }

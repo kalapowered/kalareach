@@ -209,6 +209,23 @@ impl Caller {
         }
     }
 
+    /// Whether this caller's authority reaches back to every moment, so that nothing a record or a
+    /// summary was made from can lie outside what it may see: the owner's always does, and a paired
+    /// device's does when its grant's history starts at the beginning of time, as the grant of an
+    /// owner's own device does.
+    ///
+    /// A summary is generated text, written from every change in an interval and from the session
+    /// text those changes name. The moments the log keeps are when the host observed each change,
+    /// which does not date the text a change names, so a summary is served only to a caller for
+    /// whom no moment is outside its history.
+    #[must_use]
+    pub fn reaches_every_moment(&self) -> bool {
+        match self {
+            Self::Owner => true,
+            Self::Device { history, .. } => history.first_moment(Surface::Summary) == Some(0),
+        }
+    }
+
     /// How much of a session's content this caller is served.
     ///
     /// A paired device is served the host's own words and no session text: a grant's history
@@ -1408,10 +1425,11 @@ impl AttentionModule {
     /// wanted, the request for it.
     ///
     /// The answer does not wait for a model. It is the summary the description host has already
-    /// written, held under the profile it selected and the privacy generation in force, to the
-    /// owner, and nothing when there is none, when no model runs here, when privacy mode is on and
-    /// for every paired device. A request for one that is wanted is made only for the owner, so a
-    /// caller that is served none starts nothing.
+    /// written, held under the profile it selected and the privacy generation in force, to a
+    /// caller whose history reaches every moment, and nothing when there is none, when no model
+    /// runs here, when privacy mode is on and for a paired device whose grant has a bound. A
+    /// request for one that is wanted is made only for a caller that is served it, so a caller
+    /// that is served none starts nothing.
     async fn summary(
         &self,
         reach: &dyn Reach,
@@ -1425,12 +1443,11 @@ impl AttentionModule {
         ) else {
             return None;
         };
-        // A summary is generated text, written from every change in an interval and from the
-        // session text those changes name. The moments the log holds are when the host observed
-        // each change, which is not when the text it names was produced, so nothing here can say
-        // that a summary stays inside what a grant's history reaches. A paired device is served
-        // none until the source of a summary carries the moments its text was produced.
-        if !matches!(caller, Caller::Owner) {
+        // Nothing here can say that a summary stays inside what a grant's history reaches unless
+        // the grant reaches every moment ([`Caller::reaches_every_moment`]): a device whose grant
+        // has a bound is served none until the source of a summary carries the moments its text
+        // was produced.
+        if !caller.reaches_every_moment() {
             return None;
         }
         moments(&source.changes)?;
@@ -4395,24 +4412,25 @@ pub(crate) mod tests {
         }
     }
 
-    /// KR-REQ-18.02 and KR-REQ-10.49: a summary is generated text, so it is served to a paired device
-    /// under no grant's history, and asked for by none. A grant that starts before the earliest
-    /// change is not served one either, since the moments the log holds are when the host observed
-    /// the changes and not when the text they name was produced; the owner's is asked for the
-    /// interval, with the moments of its earliest and latest change.
+    /// KR-REQ-18.02 and KR-REQ-10.49: a summary is generated text, written from the session text
+    /// the changes name, and the moments the log holds are when the host observed the changes and
+    /// not when that text was produced. So a paired device whose grant has a history bound is
+    /// served none and asks for none, however early the bound; one whose grant reaches every
+    /// moment, as an owner's own device does, is asked for the interval as the owner is, with the
+    /// moments of its earliest and latest change.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_paired_device_is_served_no_summary_and_asks_for_none() {
+    async fn a_summary_is_for_a_device_that_reaches_every_moment_and_for_none_with_a_bound() {
         let mut world = Summarised::start();
         world.record_commands(&[2_000, 1_000, 1_500], false);
         let reader = ActorId::new("test:device").expect("an actor");
 
-        for bound in [1_500, 1_000, 0] {
+        for bound in [1_500, 1_000, 1] {
             let device = world.changed_for(&reader, &device_from(bound)).await;
             assert!(device.summary.0.is_none(), "a grant from {bound}");
         }
-        assert_eq!(world.asked(), Vec::new(), "nothing is asked for");
+        assert_eq!(world.asked(), Vec::new(), "a bound asks for nothing");
 
-        world.changed_for(&reader, &Caller::Owner).await;
+        world.changed_for(&reader, &device_from(0)).await;
         let asked = world.asked();
         assert_eq!(asked.len(), 1, "{asked:?}");
         assert_eq!(
@@ -4421,6 +4439,16 @@ pub(crate) mod tests {
             "the interval the log holds"
         );
         assert_eq!((asked[0].from_ms, asked[0].to_ms), (1_000, 2_000));
+    }
+
+    /// KR-REQ-18.02: the callers whose history reaches every moment are the owner and a device
+    /// whose grant starts at the beginning of time, and no device with a later bound.
+    #[test]
+    fn only_a_caller_with_no_bound_reaches_every_moment() {
+        assert!(Caller::Owner.reaches_every_moment());
+        assert!(device_from(0).reaches_every_moment());
+        assert!(!device_from(1).reaches_every_moment());
+        assert!(!device_from(1_000).reaches_every_moment());
     }
 
     /// KR-REQ-18.02: a summary is asked for from the page the answer carries it beside. A visit
