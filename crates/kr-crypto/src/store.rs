@@ -1391,6 +1391,26 @@ pub fn load_notification_preview_key(
     .map(Some)
 }
 
+/// Reads only the authorisation keypair.
+///
+/// A receiver that signs one fixed statement with the installation's key needs that one item and no
+/// other: [`load_device_keys`] reads all four and is for the host and the application's own core.
+///
+/// # Errors
+///
+/// Returns an error when the store fails or the stored seed is not 32 bytes.
+pub fn load_authorisation_key(
+    store: &dyn SecretStore,
+    scope: &str,
+) -> Result<Option<AuthorisationKeyPair>> {
+    let name = SecretName::device_key(scope, KeyPurpose::Authorisation)?;
+    let Some(stored) = store.get(&name)? else {
+        return Ok(None);
+    };
+    AuthorisationKeyPair::from_seed(AuthorisationSeed::from_stored_bytes(stored.expose())?)
+        .map(Some)
+}
+
 /// Reads the key a host signs its backup generations with, creating it on the first call.
 ///
 /// The key is the host's alone and stands for one purpose. An owner enrols its public half at the
