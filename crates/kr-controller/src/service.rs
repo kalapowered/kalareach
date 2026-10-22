@@ -670,6 +670,9 @@ pub struct Controller {
     pub delivery: Arc<crate::push::DeliveryModule>,
     /// The loop that drives it: recovery at start, then a pass on every tick.
     delivery_runtime: Arc<crate::push::runtime::DeliveryRuntime>,
+    /// The only gateway a paired device may name in the credential it hands this host, and the
+    /// origin an owed revocation is asked at when no credential is held for it. Read once at start.
+    gateway_origin: String,
     /// The paired devices, for the device method group.
     ///
     /// A view on this daemon's own registry database, which is the file the network half keeps its
