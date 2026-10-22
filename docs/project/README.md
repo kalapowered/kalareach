@@ -948,11 +948,11 @@ host made (a Git worktree or an independent clone) that is ready, whose recorded
 and Git directory are the ones the capture opened, and never for the user's own checkout, which
 the user's own tools write. It is granted only when no writer of this host is at work in the
 repository, no live session this host started is in a tree it records for it, and the host can
-look at every tree it records for the repository. The reservation is first granted over the
-working tree and its Git directory, and the other trees the host records for the repository are
-read and added once it stands, so a worktree being made at that moment either turns the
-reservation away as a writer at work or is counted. A tree adopted after the grant is not
-covered. The reservation never waits: a workspace it cannot hold at that moment is
+look at every tree it records for the repository (a recorded tree whose directory is gone stands
+for the directory it was in). The reservation is first granted over the working tree and its Git
+directory, and the other trees the host records for the repository are read and added once it
+stands, so a worktree being made at that moment either turns the reservation away as a writer at
+work or is counted. A tree adopted after the grant is not covered. The reservation never waits: a workspace it cannot hold at that moment is
 captured as the per-file class, or the capture is refused when it required the quiesced one, and
 the refusal says which of these applies. A reservation ends at its bound, five minutes, whatever
 its holder does.

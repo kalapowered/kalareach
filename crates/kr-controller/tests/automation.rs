@@ -7351,7 +7351,7 @@ async fn a_restarted_daemon_keeps_a_session_unplaced_whose_directory_fails_at_on
             .hold_workspace(tree, opened.work_tree, opened.git_dir)
             .expect("the records read")
             .is_ok(),
-        "the session started outside every tree never counted against this one"
+        "and not once the session has closed"
     );
     host.clients.abort();
 }
