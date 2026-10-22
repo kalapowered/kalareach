@@ -1922,8 +1922,10 @@ fn in_a_process_with_this_login_manager(case: &str, script: &str) -> Option<std:
     // The case ends when it is done. A case whose launch hold waited for the reading it was to be
     // shown not to wait for would not end for as long as the reading is given, which is an hour, so
     // the wait is bounded by a liveness deadline and a case that outlasts it is stopped and failed.
-    // The case's own bounds, taken one after another, come to less than this, so on a slow machine
-    // it is one of them that fails the case, with what it was waiting for.
+    // The case's own fixed bounds, taken one after another, come to less than this, so on a slow
+    // machine it is one of them that fails the case, with what it was waiting for. The waits that
+    // look through the frames the reader sends for one kind have no bound of their own beyond each
+    // receive, so this can still end a case that is only very slow.
     let deadline = std::time::Instant::now() + Duration::from_secs(300);
     let ended = loop {
         match case_process.try_wait().expect("the case can be waited for") {
@@ -2607,6 +2609,12 @@ async fn a_startup_prompt_takes_its_answer_through_the_worker_and_the_session_is
             ErrorCode::ShellIntegrationUnsupported,
             "{kind:?}"
         );
+        // The answer is the create's wait running out and not the session's end.
+        assert_eq!(
+            shell.runtime.state(),
+            kr_protocol::session::SessionState::Live,
+            "{kind:?}"
+        );
 
         let mut keys = shell.keys();
         keys.type_line(&shell, "the-answer");
@@ -2670,6 +2678,12 @@ async fn a_startup_prompt_nobody_answers_leaves_the_session_not_ready_and_it_sti
         assert_eq!(
             pending.code,
             ErrorCode::ShellIntegrationUnsupported,
+            "{kind:?}"
+        );
+        // The answer is the create's wait running out and not the session's end.
+        assert_eq!(
+            shell.runtime.state(),
+            kr_protocol::session::SessionState::Live,
             "{kind:?}"
         );
         assert!(
