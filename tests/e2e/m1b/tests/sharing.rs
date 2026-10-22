@@ -111,6 +111,11 @@ fn new_session(host: &Host<'_>) -> (SessionId, String) {
 /// the text on the screen until it has; it reads and watches under the share and is refused input
 /// as a viewer; and when the owner takes the share back it is served nothing more. A guest paired
 /// with no share reaches no session at all. KR-REQ-25.10, KR-REQ-19.01, KR-REQ-18.03.
+///
+/// KR-REQ-18.12, from `kr`: the owner names the device and the live view, is shown the screen's
+/// visible lines and what the live view includes before any invitation exists, and nothing is
+/// issued until the question is answered with `share`; a controller's share, which carries a
+/// consequence, is not issued by `--yes`.
 #[test]
 fn a_guest_is_shown_a_session_with_its_screen_and_loses_it_when_the_share_is_taken_back() {
     let runtime = runtime();
@@ -386,6 +391,142 @@ fn a_guest_is_shown_a_session_with_its_screen_and_loses_it_when_the_share_is_tak
         open_shares(&host, &display),
         shares_before,
         "and nothing was issued"
+    );
+
+    guest.close();
+    owner.close();
+    runtime.block_on(guest_device.close());
+    runtime.block_on(owner_device.close());
+    host.stop()
+        .unwrap_or_else(|problem| panic!("the host did not stop cleanly: {problem}"));
+    run.closing_check()
+        .unwrap_or_else(|left| panic!("the leg left processes running: {left}"));
+}
+
+/// A number the way a document says it: a JSON number, or the decimal string the protocol uses for
+/// an unsigned 64-bit counter.
+fn counter(value: &serde_json::Value) -> u64 {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        .unwrap_or_else(|| panic!("{value} is not a counter"))
+}
+
+/// The authority revision a command's lines state: the number after "authority revision".
+fn revision_stated(said: &str) -> u64 {
+    let after = said
+        .split("authority revision ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("the command states no authority revision: {said}"));
+    after
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or_else(|_| panic!("no number follows \"authority revision\": {said}"))
+}
+
+/// KR-REQ-18.14, from `kr`: the owner revokes an accepted share while the session's worker has
+/// not answered the revocation. The command does not call it done: it exits with a status other
+/// than zero, says the revocation is pending, states the authority revision the host issued for it
+/// and names the session whose worker has not fenced it, and prints no line that says it revoked.
+/// Once the worker runs again, asking again completes: the document states a revision no lower
+/// than the first and that every worker's barrier holds, and the guest is served nothing more. A
+/// real daemon, a real worker and the real command: the worker is stopped with a signal, which no
+/// reply can come from, so the pending answer is the host's own after its bound for the worker.
+#[test]
+fn a_revocation_a_session_worker_has_not_fenced_is_pending_in_kr_and_complete_once_it_has() {
+    let runtime = runtime();
+    let run = Run::start("sharing-revoke-pending");
+    let host = Host::start(&run, &HostOptions::default());
+    let owner_device = runtime.block_on(Device::create("owner", &run.root().join("o")));
+    let (_, owner) = ceremony::pair_first_owner(&host, &owner_device, &runtime);
+    let (session_id, display) = new_session(&host);
+    let guest_device = runtime.block_on(Device::create("guest", &run.root().join("g")));
+    let (guest_paired, guest) = ceremony::pair_guest(&host, &owner, &guest_device, &runtime, "60");
+
+    // The share is accepted, so it is a grant the session's worker has been told of.
+    let device_id = guest_paired.device_id.to_string();
+    let (_, issued) = ceremony::share_at_terminal(
+        &host,
+        &[&display, "--to", &device_id, "--for", "15m"],
+        b"share",
+    );
+    assert_eq!(issued.exit, 0, "the share: {}", issued.document);
+    let grant_id = issued.document["grant_id"]
+        .as_str()
+        .expect("a grant")
+        .to_owned();
+    let offer = held(&runtime, &guest).offers.remove(0);
+    let _: GrantRedeemResult = runtime
+        .block_on(guest.mutate_environment(
+            Method::GrantRedeem,
+            &GrantRedeemParams {
+                invitation_id: offer.invitation_id,
+            },
+        ))
+        .unwrap_or_else(|why| panic!("grant.redeem: {why}"));
+    let before = counter(&host.kr_json(&["device", "list"])["authority_revision"]);
+
+    // The worker does not answer: it is stopped, and says nothing until it is continued.
+    let worker = host.worker_of(&session_id.to_string());
+    kr_e2e_m1b::run::signal(&worker, rustix::process::Signal::STOP);
+    let started = std::time::Instant::now();
+    while kr_e2e_m1b::run::stopped(&worker) != Some(true) {
+        assert!(started.elapsed() < LIVENESS, "the worker never stopped");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let pending = host.kr(&["share", "revoke", &grant_id]);
+    assert!(
+        !pending.status.success(),
+        "a revocation a worker has not fenced is not a success: {}{}",
+        String::from_utf8_lossy(&pending.stdout),
+        String::from_utf8_lossy(&pending.stderr)
+    );
+    let said = String::from_utf8_lossy(&pending.stdout);
+    assert!(said.contains("is pending"), "{said}");
+    assert!(!said.contains("Revoked grant"), "{said}");
+    let stated = revision_stated(&said);
+    assert!(
+        stated > before,
+        "the revocation took the next authority revision, {before}: {said}"
+    );
+    assert!(
+        said.contains(&format!("session {session_id}: pending")),
+        "the worker that has not fenced it is named with its state: {said}"
+    );
+
+    // The worker answers again, and the same command now completes.
+    kr_e2e_m1b::run::signal(&worker, rustix::process::Signal::CONT);
+    let started = std::time::Instant::now();
+    let revoked = loop {
+        let again = host.kr(&["share", "revoke", &grant_id, "--json"]);
+        if again.status.success() {
+            break serde_json::from_slice::<serde_json::Value>(&again.stdout)
+                .unwrap_or_else(|why| panic!("no document ({why}): {:?}", again.stdout));
+        }
+        assert!(
+            started.elapsed() < LIVENESS,
+            "the revocation never completed: {}{}",
+            String::from_utf8_lossy(&again.stdout),
+            String::from_utf8_lossy(&again.stderr)
+        );
+    };
+    assert_eq!(revoked["ok"], true, "{revoked}");
+    assert_eq!(revoked["barrier_holds"], true, "{revoked}");
+    assert!(
+        counter(&revoked["authority_revision"]) >= stated,
+        "the completed revocation states the revision: {revoked}"
+    );
+    let guest = reconnected(&runtime, &guest_device, &guest_paired);
+    let after = runtime.block_on(guest.read::<_, kr_protocol::session::SessionReadResult>(
+        Method::SessionRead,
+        &SessionReadParams { session_id },
+    ));
+    assert_eq!(
+        refused_with(after, "a read after the share was taken back"),
+        ErrorCode::PermissionDenied
     );
 
     guest.close();
