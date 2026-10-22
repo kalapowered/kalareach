@@ -214,6 +214,9 @@ pub struct WorkerService {
     /// The workflow run this session was started for, when a workflow started it. A close under
     /// the workflow ingress is admitted for this run and no other.
     workflow_run: std::sync::OnceLock<kr_protocol::ids::WorkflowRunId>,
+    /// The receipts' revisions that `action.read` has shown each actor since this worker started,
+    /// which a later request that supersedes an uncertain outcome has to quote.
+    shown_receipts: std::sync::Mutex<crate::action::dedup::ShownReceipts>,
     /// The serial boundary every mutation and every authority change passes through.
     ///
     /// Checking authority and then acting on it are two operations, and between them a replacement
@@ -585,6 +588,7 @@ impl WorkerService {
             controller_public_key: binding.controller_public_key,
             gate,
             workflow_run: std::sync::OnceLock::new(),
+            shown_receipts: std::sync::Mutex::default(),
             authority: Mutex::new(Authority {
                 accepted_generation: Some(binding.controller_generation),
                 bound_connection: None,
@@ -5510,7 +5514,7 @@ impl WorkerService {
         // decides whether a fresh identifier would be taking an uncertain outcome's place.
         let subject = kr_protocol::action::subject_digest(mutation)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
-        self.check_admission_limits(&actor_id, state, mutation, method, subject)?;
+        self.check_admission_limits(caller, state, mutation, method, subject)?;
         // The deadline lives on the continuous clock. That is what admission, revalidation and
         // expiry all read, so a wall clock that moves cannot lengthen or shorten an action's life.
         let now = self.clock.now();
@@ -6372,12 +6376,13 @@ impl WorkerService {
     ///   the connection negotiated.
     fn check_admission_limits(
         &self,
-        actor_id: &ActorId,
+        caller: &Caller,
         state: &ConnectionState,
         mutation: &MutationRequest,
         method: Method,
         subject: kr_protocol::scalars::Digest256,
     ) -> Result<()> {
+        let actor_id = &caller.actor_id;
         let declared = MutationPreconditions::parse(&mutation.expected)?.supersedes;
         let mut session = self.runtime.session();
         let Some(journal) = session.journal_mut() else {
@@ -6405,7 +6410,23 @@ impl WorkerService {
             revision,
         });
         drop(session);
-        crate::action::dedup::check_supersession(uncertain, declared)?;
+        // A person is shown a result through the local owner's commands or a paired device. The
+        // workflow ingress serves one close of the session a run started and shows nobody
+        // anything, so a quote made through it has been shown to no one.
+        let shown = declared
+            .filter(|_| {
+                matches!(
+                    caller.ingress,
+                    ActorIngress::LocalIpc | ActorIngress::PairedDevice
+                )
+            })
+            .and_then(|declared| {
+                self.shown_receipts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .revision(actor_id, declared.action_id)
+            });
+        crate::action::dedup::check_supersession(uncertain, declared, shown)?;
         if !crate::action::dedup::bounded_by_outstanding(method) {
             return Ok(());
         }
@@ -7771,6 +7792,7 @@ impl WorkerService {
             .ok_or_else(|| {
                 WorkerError::InvalidArgument(format!("no receipt for action {}", params.action_id))
             })?;
+        let revision = receipt.revision.get();
         let retained = journal.read_result(actor_id, params.action_id)?;
         drop(session);
         // The daemon decided this read under `session.view` over the routed session.
@@ -7809,7 +7831,14 @@ impl WorkerService {
                 state.peer_limits.max_control_frame_len.get()
             )));
         }
-        encode(&answer)
+        let encoded = encode(&answer)?;
+        // Shown only now that the answer is built for this caller and fits its frame: a read that
+        // was refused, or that could not be encoded, showed the caller nothing.
+        self.shown_receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .show(actor_id, params.action_id, revision);
+        Ok(encoded)
     }
 
     /// Reads one question back to the source that created it.

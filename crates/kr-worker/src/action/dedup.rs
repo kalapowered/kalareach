@@ -9,12 +9,15 @@
 //!   must *show* the earlier unknown result. So a fresh action for a subject that already carries
 //!   an uncertain outcome is refused unless its preconditions name that action and the revision at
 //!   which the caller saw it. A service that wanted to hide the uncertainty would have to name the
-//!   receipt it was hiding.
+//!   receipt it was hiding. The caller has to have been shown that revision by `action.read`
+//!   ([`ShownReceipts`]); quoting a revision it has not read does not show it.
 //! * **Eight outstanding mutations per device and session.** A caller that keeps submitting
 //!   without waiting is holding durable admissions this host has to revalidate and settle. The
 //!   limit is section 9's, and the negotiated limit lowers it rather than raising it.
 
-use kr_protocol::ids::ActionId;
+use std::collections::{HashMap, VecDeque};
+
+use kr_protocol::ids::{ActionId, ActorId};
 use kr_protocol::limits::MAX_OUTSTANDING_MUTATIONS;
 
 use crate::error::{Result, WorkerError};
@@ -37,17 +40,61 @@ pub struct Uncertain {
     pub revision: u64,
 }
 
+/// How many receipts' revisions the worker remembers having shown, in all.
+const MAX_SHOWN_RECEIPTS: usize = 1024;
+
+/// The revision of an action's receipt that each actor has been shown by `action.read`, since this
+/// worker started.
+///
+/// A later request that supersedes an uncertain outcome has to quote the revision it was shown,
+/// and this is what the worker checks the quote against: the revision is a number anyone can
+/// write, and only a read of the receipt shows it. The record is kept in memory and bounded; a
+/// worker that restarted, or that let an entry go for room, has not shown it, and the caller reads
+/// the receipt again. Nothing here is a grant of anything: it says what was shown, and the request
+/// that quotes it is still admitted or refused on its own authority.
+#[derive(Debug, Default)]
+pub struct ShownReceipts {
+    shown: HashMap<(ActorId, ActionId), u64>,
+    oldest: VecDeque<(ActorId, ActionId)>,
+}
+
+impl ShownReceipts {
+    /// Notes that `actor` was shown `action`'s receipt at `revision`, in place of any revision it
+    /// was shown before.
+    pub fn show(&mut self, actor: &ActorId, action: ActionId, revision: u64) {
+        let key = (actor.clone(), action);
+        if self.shown.insert(key.clone(), revision).is_none() {
+            self.oldest.push_back(key);
+            while self.oldest.len() > MAX_SHOWN_RECEIPTS {
+                if let Some(oldest) = self.oldest.pop_front() {
+                    self.shown.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    /// Returns the revision of `action`'s receipt that `actor` was last shown, when it was.
+    #[must_use]
+    pub fn revision(&self, actor: &ActorId, action: ActionId) -> Option<u64> {
+        self.shown.get(&(actor.clone(), action)).copied()
+    }
+}
+
 /// Decides whether a fresh action may be admitted for a subject that already carries an uncertain
 /// outcome.
+///
+/// `shown` is the revision of the named action's receipt that the caller was shown by
+/// `action.read`, when it was shown one and its ingress is one that a person acts through.
 ///
 /// # Errors
 ///
 /// Returns [`WorkerError::PreconditionFailed`] when a fresh action would silently take the place
-/// of an uncertain one, and when it names the wrong action or a revision the caller cannot have
-/// seen.
+/// of an uncertain one, and when it names the wrong action, a revision the caller cannot have
+/// seen, or one it was not shown.
 pub fn check_supersession(
     uncertain: Option<Uncertain>,
     declared: Option<Supersession>,
+    shown: Option<u64>,
 ) -> Result<()> {
     match (uncertain, declared) {
         // Nothing uncertain stands in the way. A request that names one anyway is naming a fact
@@ -83,6 +130,15 @@ pub fn check_supersession(
                 detail: format!(
                     "action {} stands at revision {}, and this request was read at {}",
                     uncertain.action_id, uncertain.revision, declared.revision
+                ),
+            })
+        }
+        (Some(_), Some(declared)) if shown != Some(declared.revision) => {
+            Err(WorkerError::PreconditionFailed {
+                detail: format!(
+                    "this caller was not shown action {} at revision {} by action.read, so its \
+                     result is not shown by naming it",
+                    declared.action_id, declared.revision
                 ),
             })
         }
@@ -147,7 +203,7 @@ mod tests {
 
     #[test]
     fn a_subject_with_no_uncertain_outcome_admits_a_fresh_action() {
-        assert!(check_supersession(None, None).is_ok());
+        assert!(check_supersession(None, None, None).is_ok());
     }
 
     #[test]
@@ -156,7 +212,7 @@ mod tests {
             action_id: action(1),
             revision: 3,
         };
-        let refused = check_supersession(Some(uncertain), None);
+        let refused = check_supersession(Some(uncertain), None, None);
         assert!(matches!(
             refused,
             Err(WorkerError::PreconditionFailed { ref detail })
@@ -174,7 +230,7 @@ mod tests {
             action_id: action(1),
             revision: 3,
         };
-        assert!(check_supersession(Some(uncertain), Some(shown)).is_ok());
+        assert!(check_supersession(Some(uncertain), Some(shown), Some(3)).is_ok());
     }
 
     #[test]
@@ -187,7 +243,7 @@ mod tests {
             action_id: action(2),
             revision: 3,
         };
-        assert!(check_supersession(Some(uncertain), Some(wrong)).is_err());
+        assert!(check_supersession(Some(uncertain), Some(wrong), Some(3)).is_err());
     }
 
     #[test]
@@ -202,7 +258,7 @@ mod tests {
                 revision,
             };
             assert!(
-                check_supersession(Some(uncertain), Some(stale)).is_err(),
+                check_supersession(Some(uncertain), Some(stale), Some(revision)).is_err(),
                 "{revision}"
             );
         }
@@ -214,7 +270,7 @@ mod tests {
             action_id: action(1),
             revision: 3,
         };
-        assert!(check_supersession(None, Some(invented)).is_err());
+        assert!(check_supersession(None, Some(invented), Some(3)).is_err());
     }
 
     #[test]

@@ -1529,6 +1529,162 @@ async fn a_replacement_identifier_after_an_uncertain_result_is_rejected_until_it
     assert_eq!(error.code, ErrorCode::DraftConflict);
 }
 
+/// The preconditions of a request that supersedes the uncertain outcome of `action_id`, read at
+/// `revision`.
+fn superseding(action_id: ActionId, revision: u64) -> ParamsValue {
+    let mut expected = kr_cbor::CanonicalMap::new();
+    expected
+        .insert(
+            kr_protocol::action::SUPERSEDES_ACTION_KEY.to_owned(),
+            kr_cbor::to_canonical_value(&action_id).expect("encodes"),
+        )
+        .expect("one key");
+    expected
+        .insert(
+            kr_protocol::action::SUPERSEDES_REVISION_KEY.to_owned(),
+            kr_cbor::CanonicalValue::integer(i128::from(revision)).expect("a revision"),
+        )
+        .expect("a second key");
+    ParamsValue::new(kr_cbor::CanonicalValue::Map(expected))
+}
+
+/// Puts an action of `actor_id` with an uncertain outcome on the subject of `mutation` into the
+/// journal, and returns the revision its receipt stands at, as the store holds it.
+fn an_uncertain_outcome_for(
+    host: &Host,
+    actor_id: &ActorId,
+    action_id: ActionId,
+    mutation: &MutationRequest,
+) -> u64 {
+    let subject = kr_protocol::action::subject_digest(mutation).expect("a subject digest");
+    let mut session = host.service.runtime().session();
+    let journal = session.journal_mut().expect("a journal");
+    let mut earlier = fresh(0, 50, 50);
+    earlier.actor_id = actor_id.clone();
+    earlier.action_id = action_id;
+    earlier.subject_digest = subject;
+    earlier.method = mutation.method.clone();
+    journal.accept(&earlier).expect("the earlier intent");
+    journal
+        .mark_dispatching(actor_id.clone(), action_id, kr_ipc::now_ms())
+        .expect("a marker");
+    journal
+        .settle(
+            actor_id.clone(),
+            action_id,
+            ReceiptState::Unknown,
+            None,
+            None,
+            kr_ipc::now_ms(),
+        )
+        .expect("an uncertain outcome");
+    journal
+        .read(actor_id.clone(), action_id)
+        .expect("readable")
+        .expect("the receipt")
+        .revision
+        .get()
+}
+
+/// KR-REQ-23.24: a later request that supersedes an uncertain outcome is admitted for the revision
+/// its caller was shown by `action.read`, and for no revision it only knows the number of.
+///
+/// The revision is a number anyone can write into a request. The caller quotes the right one
+/// without having read the receipt and is refused, then reads it over the wire and quotes it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quote_of_a_revision_the_caller_was_not_shown_is_refused_until_it_has_read_it() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+    let first = close_mutation(
+        &client,
+        &host,
+        DEFAULT_MUTATION_TTL.get(),
+        ParamsValue::empty(),
+    );
+    let revision = an_uncertain_outcome_for(&host, &caller, action(51), &first);
+
+    let unread = MutationRequest {
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        expected: superseding(action(51), revision),
+        ..first.clone()
+    };
+    let Outcome::Error(error) = send_mutation(&mut client, unread).await else {
+        panic!("the revision is the right number, and the caller was shown nothing");
+    };
+    assert_eq!(error.code, ErrorCode::DraftConflict);
+    assert_eq!(host.service.runtime().state().as_str(), "live");
+
+    let read = send_request(
+        &mut client,
+        Request {
+            request_id: RequestId::new(4),
+            method: Method::ActionRead.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(&kr_protocol::receipt::ActionReadParams {
+                action_id: action(51),
+                session_id: None,
+            })
+            .expect("encodes"),
+        },
+    )
+    .await;
+    assert!(matches!(read, Outcome::Ok(_)), "{read:?}");
+    let shown = MutationRequest {
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        expected: superseding(action(51), revision),
+        ..first
+    };
+    let admitted = send_mutation(&mut client, shown).await;
+    assert!(
+        matches!(admitted, Outcome::Ok(_)),
+        "a caller that has read the receipt may quote its revision: {admitted:?}"
+    );
+}
+
+/// KR-REQ-23.24: a workflow's close cannot supersede an uncertain outcome. No person is shown the
+/// earlier result through that ingress, so the revision it quotes shows nothing, whatever it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workflow_close_cannot_supersede_an_uncertain_outcome() {
+    let host = host().await;
+    let run = kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([0x21; 16]));
+    host.service.started_for_workflow(run);
+    let mut authority = controller_client(&host).await;
+    let first = close_mutation(
+        &authority,
+        &host,
+        DEFAULT_MUTATION_TTL.get(),
+        ParamsValue::empty(),
+    );
+    let revision = an_uncertain_outcome_for(&host, &actor("workflow:grant"), action(52), &first);
+
+    let quoting = MutationRequest {
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        expected: superseding(action(52), revision),
+        ..first
+    };
+    assert_eq!(
+        refused_with(
+            answer_to(
+                &mut authority,
+                workflow_close(
+                    &quoting,
+                    kr_protocol::actor::ActorIngress::Workflow,
+                    Some(run),
+                    None
+                )
+            )
+            .await
+        ),
+        ErrorCode::DraftConflict,
+        "a workflow's close that quotes the right revision of an uncertain outcome"
+    );
+    assert!(
+        host.service.runtime().session().closure().is_none(),
+        "the refused close closed nothing"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-02.08, 23.23: what a caller may assert
 // ---------------------------------------------------------------------------------------------
