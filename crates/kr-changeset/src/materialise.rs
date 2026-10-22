@@ -10,23 +10,30 @@
 //!
 //! A result must not attest that the unmodified version passed when the tested source was changed
 //! or cannot be established. So recording one **re-reads the materialisation** and compares it with
-//! the version:
+//! the version, and settles the record [`crate::binding`] took of it before the command started:
 //!
-//! * identical — the result attests the input version;
-//! * different — this host records a **derived version** with its own identity and the result
-//!   attests that, naming the input version beside it;
+//! * identical, and nothing outside the declared outputs was written while the command ran — the
+//!   result attests the input version;
+//! * identical, but something was written while the command ran and put back, or this host could
+//!   not establish that nothing was — the result says [`TestedSource::Indeterminate`] and attests
+//!   nothing;
+//! * different — the result says [`TestedSource::Indeterminate`] too, since what the directory
+//!   holds now is not what the command read, and this host records what it holds as a **derived
+//!   version** with its own identity beside it, naming the input version;
 //! * unreadable, or holding something this host cannot represent — the result says
 //!   [`TestedSource::Indeterminate`] and attests nothing.
 //!
-//! Every one of the three is recorded as evidence against the input version **and** against the
-//! version it attests, so retention accounts for it before anything is deleted.
+//! A result is recorded against the input version, and a derived version is held against deletion
+//! for as long as the result that names it is, so retention accounts for both before anything is
+//! deleted.
 //!
-//! What this establishes, said plainly because the difference matters: this host reads the
-//! directory when the materialisation is made and again when the result is recorded. It does not
-//! watch it while the run is happening. A run that changed a file, tested the change and put the
-//! file back reads as unmodified from here, and one that finished its tests and then changed a
-//! file reads as modified. Every attestation says so in its own words. Binding a result to the
-//! bytes a command actually read needs a host that owns the execution, which this one does not.
+//! What this establishes, said plainly because the difference matters: the content of the copy
+//! when the result is recorded is compared with the version, and the copy is bound to the run by
+//! the record [`crate::binding`] takes of it before the command starts and after it ends. A run
+//! that changed a file, tested the change and put the file back leaves a change time later than
+//! the one recorded, and its result attests nothing. What is still not established is what the
+//! command read: a command can read anything on the machine, and the copy holds the version's
+//! source and nothing else.
 //!
 //! The grant and the secret rules apply to the re-read as well as to the capture: a run that wrote
 //! a credential into its own copy does not get it stored in a derived version.
@@ -44,6 +51,7 @@ use kr_protocol::scalars::{Nullable, U64};
 use kr_transfer::authority::ObjectKind;
 use kr_transfer::{AuthorisedDirectory, ObjectPolicy, RelativeName};
 
+use crate::binding::{Bound, RunBinding};
 use crate::error::{ChangeSetError, Result};
 use crate::grant::{self, GrantDecision};
 use crate::service::{ChangeSetService, MATERIALISATIONS_DIRECTORY, decode_stored, encode_stored};
@@ -58,8 +66,10 @@ pub fn limitations() -> Vec<String> {
          services, installed dependencies, secrets and graphical state are external inputs, so an \
          identical source does not promise an identical run"
             .to_owned(),
-        "a run that changes this directory changes what a result about it can attest; this host \
-         re-reads the directory when a result is recorded and says so"
+        "a run that writes in this directory outside the paths its suite declares as output \
+         changes what a result about it can attest: this host records the change time of every \
+         file and directory before the command starts and again when it has ended, and a result \
+         attests the version only when nothing was written in between"
             .to_owned(),
     ]
 }
@@ -592,6 +602,11 @@ impl Outputs {
 
     fn declares(&self, path: &str) -> bool {
         self.declared.contains(path)
+    }
+
+    /// The declared paths, relative and normalised.
+    pub(crate) const fn declared(&self) -> &std::collections::BTreeSet<String> {
+        &self.declared
     }
 
     fn reaches(&self, path: &str) -> bool {
@@ -1168,6 +1183,12 @@ pub struct RunReport {
 
 /// Records one result against one materialisation, after establishing what was tested.
 ///
+/// The run is declared to write `outputs`: those paths are left out of the comparison with the
+/// version, and the result records a reference to each beside the outputs the report names.
+/// `binding` is the record of the copy taken before the command started ([`crate::binding`]): a
+/// result attests the version only when the copy still holds exactly the version **and** nothing
+/// outside the outputs was written while the command ran.
+///
 /// # Errors
 ///
 /// Returns [`ChangeSetError::UnknownMaterialisation`] when there is no such materialisation.
@@ -1175,24 +1196,11 @@ pub fn record_result(
     service: &ChangeSetService,
     materialisation_id: MaterialisationId,
     report: &RunReport,
-) -> Result<MaterialisationResult> {
-    record_result_with(service, materialisation_id, report, &Outputs::none())
-}
-
-/// Records one result like [`record_result`] for a run that is declared to write `outputs`: those
-/// paths are left out of the comparison with the version, and the result records a reference to
-/// each beside the outputs the report names.
-///
-/// # Errors
-///
-/// As [`record_result`].
-pub fn record_result_with(
-    service: &ChangeSetService,
-    materialisation_id: MaterialisationId,
-    report: &RunReport,
     outputs: &Outputs,
+    binding: &RunBinding,
 ) -> Result<MaterialisationResult> {
     let (row, state, observed, found) = reread_with(service, materialisation_id, outputs)?;
+    let bound = binding.settle(service, materialisation_id);
     let input_version = VersionRef {
         change_set_id: row.change_set_id,
         version: row.version,
@@ -1212,18 +1220,41 @@ pub fn record_result_with(
              version"
                 .to_owned(),
         ),
-        Reread::Unmodified => (
-            TestedSource::UnmodifiedVersion,
-            Some(input_version),
-            None,
-            "this materialisation still held exactly the version that was written into it: the \
-             same paths, the same content, the same modes, and every file still the object this \
-             host wrote, of the same length, last written at the same instant. What this host \
-             read is the directory at two instants, when it was made and now; it did not watch it \
-             while the run was happening, so a run that restored the object, the length and the \
-             instant together is not something it would show"
-                .to_owned(),
-        ),
+        Reread::Unmodified => match bound {
+            Bound::Undisturbed => (
+                TestedSource::UnmodifiedVersion,
+                Some(input_version),
+                None,
+                "this materialisation still held exactly the version that was written into it: the \
+                 same paths, the same content, the same modes, and every file still the object this \
+                 host wrote, of the same length, last written at the same instant. This host also \
+                 recorded the change time of every file and directory of it before the command \
+                 started and again when it had ended, and nothing outside the declared outputs was \
+                 written in between. That binds the result to the run; it does not say what the \
+                 command read, which can be anything on the machine"
+                    .to_owned(),
+            ),
+            Bound::Disturbed(what) => (
+                TestedSource::Indeterminate,
+                None,
+                None,
+                format!(
+                    "this materialisation holds exactly the version now, but something was written \
+                     in it while the command ran ({what}) and put back, so this result attests no \
+                     version: the command may have read what was written"
+                ),
+            ),
+            Bound::Unestablished(why) => (
+                TestedSource::Indeterminate,
+                None,
+                None,
+                format!(
+                    "this materialisation holds exactly the version now, but this host could not \
+                     establish that nothing was written in it while the command ran, so this \
+                     result attests no version: {why}"
+                ),
+            ),
+        },
         Reread::Modified(found) => {
             let derived = derive_from(service, &record, &found, materialisation_id)?;
             (
@@ -1243,8 +1274,7 @@ pub fn record_result_with(
                      no version at all: it says nothing about version {}, and it does not say \
                      that version {} is what the run read either. Version {} is what the \
                      directory held when the result was recorded, read and stored then, and \
-                     establishing which of them a command actually read needs a host that owns \
-                     the execution",
+                     which of them a command actually read is not something this host can show",
                     row.version.get(),
                     derived.version.get(),
                     derived.version.get()

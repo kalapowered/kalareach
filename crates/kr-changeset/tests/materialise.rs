@@ -11,6 +11,7 @@ mod support;
 
 use std::path::Path;
 
+use kr_changeset::binding;
 use kr_changeset::materialise::{self, RunReport};
 use kr_protocol::changeset::{
     EvidenceKind, ExecutionReceipt, MaterialisationPurpose, OutputReference, TestedSource,
@@ -50,6 +51,21 @@ fn report() -> RunReport {
             kind: "log".to_owned(),
         }],
     }
+}
+
+/// Binds the run to its copy as it is now, and records the result.
+///
+/// A test that has changed the copy already has bound it as changed, so the binding says nothing
+/// is disturbed and the content decides, as it did before a run was bound. A test of the binding
+/// binds first, runs, and records with [`materialise::record_result`] itself.
+fn record_a_run(
+    fixture: &Fixture,
+    id: kr_protocol::ids::MaterialisationId,
+    report: &RunReport,
+    outputs: &materialise::Outputs,
+) -> kr_changeset::Result<kr_protocol::changeset::MaterialisationResult> {
+    let binding = binding::bind_run(fixture.service(), id, outputs);
+    materialise::record_result(fixture.service(), id, report, outputs, &binding)
 }
 
 /// KR-REQ-14.34: a materialisation is an independent copy of one exact version, and the agent
@@ -147,8 +163,13 @@ fn a_result_about_an_unmodified_materialisation_attests_that_version() {
     )
     .expect("the version is materialised");
 
-    let result = materialise::record_result(fixture.service(), made.materialisation_id, &report())
-        .expect("the result is recorded");
+    let result = record_a_run(
+        &fixture,
+        made.materialisation_id,
+        &report(),
+        &materialise::Outputs::none(),
+    )
+    .expect("the result is recorded");
     assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
     assert_eq!(result.tested_version, Nullable(Some(reference(&record))));
     assert_eq!(result.input_version, reference(&record));
@@ -193,8 +214,13 @@ fn a_changed_materialisation_is_recorded_as_a_derived_version() {
     .expect("the run edits its copy");
     std::fs::write(directory.join("extra.txt"), b"and adds a file\n").expect("the run adds a file");
 
-    let result = materialise::record_result(fixture.service(), made.materialisation_id, &report())
-        .expect("the result is recorded");
+    let result = record_a_run(
+        &fixture,
+        made.materialisation_id,
+        &report(),
+        &materialise::Outputs::none(),
+    )
+    .expect("the result is recorded");
     assert_eq!(result.tested_source, TestedSource::Indeterminate);
     assert_eq!(
         result.tested_version,
@@ -286,8 +312,13 @@ fn a_result_whose_source_cannot_be_established_attests_nothing() {
     // Whatever ran took its own directory away, so what it ran against cannot be established.
     std::fs::remove_dir_all(&made.directory_path).expect("the run removes its copy");
 
-    let result = materialise::record_result(fixture.service(), made.materialisation_id, &report())
-        .expect("the result is recorded anyway");
+    let result = record_a_run(
+        &fixture,
+        made.materialisation_id,
+        &report(),
+        &materialise::Outputs::none(),
+    )
+    .expect("the result is recorded anyway");
     assert_eq!(result.tested_source, TestedSource::Indeterminate);
     assert_eq!(result.tested_version, Nullable(None));
     assert!(
@@ -476,8 +507,13 @@ fn a_secret_a_run_left_behind_is_neither_stored_nor_attested() {
     std::fs::write(directory.join("README.md"), b"and changes a file\n")
         .expect("the run changes a file");
 
-    let result = materialise::record_result(fixture.service(), made.materialisation_id, &report())
-        .expect("the result is recorded");
+    let result = record_a_run(
+        &fixture,
+        made.materialisation_id,
+        &report(),
+        &materialise::Outputs::none(),
+    )
+    .expect("the result is recorded");
     assert_eq!(
         result.tested_source,
         TestedSource::Indeterminate,
@@ -524,8 +560,13 @@ fn a_link_a_run_added_makes_the_tested_source_indeterminate() {
     )
     .expect("the run adds a link");
 
-    let result = materialise::record_result(fixture.service(), made.materialisation_id, &report())
-        .expect("the result is recorded");
+    let result = record_a_run(
+        &fixture,
+        made.materialisation_id,
+        &report(),
+        &materialise::Outputs::none(),
+    )
+    .expect("the result is recorded");
     assert_eq!(result.tested_source, TestedSource::Indeterminate);
     assert_eq!(result.tested_version, Nullable(None));
     assert!(
@@ -570,8 +611,13 @@ fn a_derived_version_describes_itself_rather_than_its_parent() {
     std::fs::remove_file(directory.join("src/lib.rs")).expect("the run removes a file");
     std::fs::write(directory.join("added.txt"), b"and adds one\n").expect("the run adds a file");
 
-    let result = materialise::record_result(fixture.service(), made.materialisation_id, &report())
-        .expect("the result is recorded");
+    let result = record_a_run(
+        &fixture,
+        made.materialisation_id,
+        &report(),
+        &materialise::Outputs::none(),
+    )
+    .expect("the result is recorded");
     let Nullable(Some(observed)) = result.derived_output_version else {
         panic!("a changed materialisation records the version the directory held");
     };
@@ -647,8 +693,13 @@ fn an_indeterminate_result_still_holds_the_version_it_ran_against() {
     )
     .expect("the version is materialised");
     std::fs::remove_dir_all(&made.directory_path).expect("the run removes its copy");
-    let result = materialise::record_result(fixture.service(), made.materialisation_id, &report())
-        .expect("the result is recorded");
+    let result = record_a_run(
+        &fixture,
+        made.materialisation_id,
+        &report(),
+        &materialise::Outputs::none(),
+    )
+    .expect("the result is recorded");
     assert_eq!(result.tested_source, TestedSource::Indeterminate);
     // The materialisation is released, so it no longer holds the version; the result still does.
     materialise::release(fixture.service(), made.materialisation_id)
@@ -829,13 +880,8 @@ fn a_run_that_wrote_only_its_declared_output_attests_the_version() {
         .expect("a link in the output");
 
     let outputs = declared(&fixture, &record, &["build/output"]).expect("the declaration is fine");
-    let result = materialise::record_result_with(
-        fixture.service(),
-        made.materialisation_id,
-        &report(),
-        &outputs,
-    )
-    .expect("the result is recorded");
+    let result = record_a_run(&fixture, made.materialisation_id, &report(), &outputs)
+        .expect("the result is recorded");
     assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
     assert_eq!(result.tested_version, Nullable(Some(reference(&record))));
     let listing = result
@@ -871,9 +917,13 @@ fn a_run_that_wrote_only_its_declared_output_attests_the_version() {
     let (_, undeclared) = a_copy_to_run_in(&fixture, "built-undeclared");
     let directory = Path::new(&undeclared.directory_path);
     write(directory, "build/output/artefact.bin", "built things\n");
-    let result =
-        materialise::record_result(fixture.service(), undeclared.materialisation_id, &report())
-            .expect("the result is recorded");
+    let result = record_a_run(
+        &fixture,
+        undeclared.materialisation_id,
+        &report(),
+        &materialise::Outputs::none(),
+    )
+    .expect("the result is recorded");
     assert_eq!(result.tested_source, TestedSource::Indeterminate);
 }
 
@@ -889,13 +939,8 @@ fn a_path_beside_a_declared_output_still_changes_the_source() {
     write(directory, "build/output/artefact.bin", "built things\n");
     write(directory, "build/input", "the run added this\n");
     let outputs = declared(&fixture, &record, &["build/output"]).expect("the declaration is fine");
-    let result = materialise::record_result_with(
-        fixture.service(),
-        made.materialisation_id,
-        &report(),
-        &outputs,
-    )
-    .expect("the result is recorded");
+    let result = record_a_run(&fixture, made.materialisation_id, &report(), &outputs)
+        .expect("the result is recorded");
     assert_eq!(result.tested_source, TestedSource::Indeterminate);
     assert!(
         result.derived_output_version.0.is_some(),
@@ -907,13 +952,8 @@ fn a_path_beside_a_declared_output_still_changes_the_source() {
     std::os::unix::fs::symlink("/no/such/place", directory.join("report"))
         .expect("an output that is a link");
     let outputs = declared(&fixture, &record, &["report"]).expect("the declaration is fine");
-    let result = materialise::record_result_with(
-        fixture.service(),
-        made.materialisation_id,
-        &report(),
-        &outputs,
-    )
-    .expect("the result is recorded");
+    let result = record_a_run(&fixture, made.materialisation_id, &report(), &outputs)
+        .expect("the result is recorded");
     assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
     assert!(
         result
@@ -923,6 +963,160 @@ fn a_path_beside_a_declared_output_still_changes_the_source() {
         "a link as an output is recorded as one: {:?}",
         result.outputs
     );
+}
+
+/// A run, as the test plays it: the copy is bound before it, then written in, then recorded.
+///
+/// `run` is what the command does to the copy. Nothing else happens in between, so the only
+/// thing that can tell this from a run that touched nothing is the binding.
+fn a_run_in(
+    fixture: &Fixture,
+    name: &str,
+    declared_paths: &[&str],
+    run: impl FnOnce(&Path),
+) -> kr_protocol::changeset::MaterialisationResult {
+    let (record, made) = a_copy_to_run_in(fixture, name);
+    let outputs = declared(fixture, &record, declared_paths).expect("the declaration is fine");
+    let binding = binding::bind_run(fixture.service(), made.materialisation_id, &outputs);
+    run(Path::new(&made.directory_path));
+    materialise::record_result(
+        fixture.service(),
+        made.materialisation_id,
+        &report(),
+        &outputs,
+        &binding,
+    )
+    .expect("the result is recorded")
+}
+
+/// Changes a file to something else and puts back its bytes and the instant it was last modified,
+/// as a command can, which leaves a file nothing about is different but its change time.
+fn change_and_restore(file: &Path) {
+    let before = std::fs::metadata(file).expect("the file is there");
+    let bytes = std::fs::read(file).expect("the file reads");
+    std::fs::write(file, b"the run's own idea of this file\n").expect("the run changes it");
+    std::fs::write(file, &bytes).expect("the run puts it back");
+    std::fs::File::options()
+        .write(true)
+        .open(file)
+        .and_then(|handle| handle.set_modified(before.modified().expect("an instant")))
+        .expect("the run puts back when it was written");
+}
+
+/// KR-REQ-14.34: a result is bound to the run it describes. A run that changed a tested path and
+/// restored it, in bytes and in the instant it was last written, leaves a copy that reads as the
+/// version, and its result attests nothing; a run that did not touch the copy is attested. A name
+/// made and removed again leaves no trace in the content, and is a write too.
+#[test]
+fn a_run_that_changed_a_tested_path_and_restored_it_attests_nothing() {
+    let fixture = Fixture::create();
+
+    // The control: the same run without the change.
+    let untouched = a_run_in(&fixture, "untouched", &[], |directory| {
+        std::fs::read(directory.join("README.md")).expect("the run reads the file");
+    });
+    assert_eq!(untouched.tested_source, TestedSource::UnmodifiedVersion);
+    assert!(untouched.tested_version.0.is_some());
+
+    let restored = a_run_in(&fixture, "restored", &[], |directory| {
+        change_and_restore(&directory.join("README.md"));
+    });
+    assert_eq!(restored.tested_source, TestedSource::Indeterminate);
+    assert!(restored.tested_version.0.is_none(), "it attests no version");
+    assert!(
+        restored.derived_output_version.0.is_none(),
+        "the copy holds the version, so there is nothing to derive"
+    );
+    assert!(
+        restored.attestation.contains("README.md"),
+        "it says what was written: {}",
+        restored.attestation
+    );
+
+    // A name made and removed leaves the content as it was, in the root and beneath it.
+    for (name, path) in [
+        ("stray-root", "stray.tmp"),
+        ("stray-nested", "src/stray.tmp"),
+    ] {
+        let result = a_run_in(&fixture, name, &[], |directory| {
+            std::fs::write(directory.join(path), b"x").expect("the run makes a file");
+            std::fs::remove_file(directory.join(path)).expect("and removes it");
+        });
+        assert_eq!(result.tested_source, TestedSource::Indeterminate, "{path}");
+    }
+}
+
+/// KR-REQ-14.34 and KR-REQ-25.20: a declared output is the one place a run may write. The
+/// directory an output is in cannot tell the output from a name written beside it, so it is
+/// watched by name: a file made beside the output and removed again is a write, at the root and
+/// beneath it, and the output itself is not.
+#[test]
+fn a_name_written_beside_a_declared_output_is_a_write() {
+    let fixture = Fixture::create();
+
+    let built = a_run_in(&fixture, "builds-at-the-root", &["out"], |directory| {
+        write(directory, "out/artefact", "built\n");
+    });
+    assert_eq!(built.tested_source, TestedSource::UnmodifiedVersion);
+
+    let beside = a_run_in(&fixture, "beside-at-the-root", &["out"], |directory| {
+        write(directory, "out/artefact", "built\n");
+        std::fs::write(directory.join("conftest.py"), b"x").expect("the run makes a file");
+        std::fs::remove_file(directory.join("conftest.py")).expect("and removes it");
+    });
+    assert_eq!(beside.tested_source, TestedSource::Indeterminate);
+    assert!(
+        beside.attestation.contains("conftest.py"),
+        "{}",
+        beside.attestation
+    );
+
+    let nested = a_run_in(
+        &fixture,
+        "builds-beneath-a-directory",
+        &["target/debug"],
+        |directory| {
+            write(directory, "target/debug/artefact", "built\n");
+        },
+    );
+    assert_eq!(nested.tested_source, TestedSource::UnmodifiedVersion);
+
+    let nested_beside = a_run_in(
+        &fixture,
+        "beside-beneath-a-directory",
+        &["target/debug"],
+        |directory| {
+            write(directory, "target/debug/artefact", "built\n");
+            std::fs::write(directory.join("target/scratch"), b"x").expect("the run makes a file");
+            std::fs::remove_file(directory.join("target/scratch")).expect("and removes it");
+        },
+    );
+    assert_eq!(nested_beside.tested_source, TestedSource::Indeterminate);
+}
+
+/// KR-REQ-14.34: a result about a run that could not be bound attests nothing, whatever the copy
+/// holds.
+#[test]
+fn a_result_without_a_binding_it_could_establish_attests_nothing() {
+    let fixture = Fixture::create();
+    let (record, made) = a_copy_to_run_in(&fixture, "unbound");
+    let outputs = declared(&fixture, &record, &[]).expect("the declaration is fine");
+    // A record of a copy this host does not hold.
+    let nowhere = binding::bind_run(
+        fixture.service(),
+        kr_protocol::ids::MaterialisationId::new(kr_ipc::new_uuid()),
+        &outputs,
+    );
+    let result = materialise::record_result(
+        fixture.service(),
+        made.materialisation_id,
+        &report(),
+        &outputs,
+        &nowhere,
+    )
+    .expect("the result is recorded");
+    assert_eq!(result.tested_source, TestedSource::Indeterminate);
+    assert!(result.tested_version.0.is_none());
 }
 
 /// KR-REQ-25.20: a declared output over a bound is a reference and never a reason to doubt the
@@ -944,13 +1138,8 @@ fn an_output_over_a_bound_is_a_reference_and_never_a_reason_to_doubt_the_source(
 
     let outputs =
         declared(&fixture, &record, &["big.bin", "many"]).expect("the declaration is fine");
-    let result = materialise::record_result_with(
-        fixture.service(),
-        made.materialisation_id,
-        &report(),
-        &outputs,
-    )
-    .expect("the result is recorded");
+    let result = record_a_run(&fixture, made.materialisation_id, &report(), &outputs)
+        .expect("the result is recorded");
     assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
     let big = result
         .outputs
@@ -994,13 +1183,8 @@ fn names_that_read_alike_as_text_are_listed_as_the_directories_they_are() {
     std::fs::write(replacement.join("bb"), b"bb").expect("two bytes in it");
 
     let outputs = declared(&fixture, &record, &["output"]).expect("the declaration is fine");
-    let result = materialise::record_result_with(
-        fixture.service(),
-        made.materialisation_id,
-        &report(),
-        &outputs,
-    )
-    .expect("the result is recorded");
+    let result = record_a_run(&fixture, made.materialisation_id, &report(), &outputs)
+        .expect("the result is recorded");
     let listing = result
         .outputs
         .iter()
@@ -1053,13 +1237,8 @@ fn an_unreadable_entry_at_the_bound_makes_a_truncated_listing() {
     }
 
     let outputs = declared(&fixture, &record, &["out"]).expect("the declaration is fine");
-    let result = materialise::record_result_with(
-        fixture.service(),
-        made.materialisation_id,
-        &report(),
-        &outputs,
-    )
-    .expect("the result is recorded");
+    let result = record_a_run(&fixture, made.materialisation_id, &report(), &outputs)
+        .expect("the result is recorded");
     assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
     let listing = result
         .outputs
@@ -1098,13 +1277,8 @@ fn an_output_whose_paths_fill_the_listing_is_a_truncated_listing() {
     }
 
     let outputs = declared(&fixture, &record, &["out"]).expect("the declaration is fine");
-    let result = materialise::record_result_with(
-        fixture.service(),
-        made.materialisation_id,
-        &report(),
-        &outputs,
-    )
-    .expect("the result is recorded");
+    let result = record_a_run(&fixture, made.materialisation_id, &report(), &outputs)
+        .expect("the result is recorded");
     assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
     let listing = result
         .outputs
@@ -1148,13 +1322,8 @@ fn an_output_below_a_directory_the_grant_keeps_out_is_reached_and_its_neighbours
         "target/debug/artefact",
         "built\n",
     );
-    let result = materialise::record_result_with(
-        fixture.service(),
-        made.materialisation_id,
-        &report(),
-        &outputs,
-    )
-    .expect("the result is recorded");
+    let result = record_a_run(&fixture, made.materialisation_id, &report(), &outputs)
+        .expect("the result is recorded");
     assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
 
     let made = copy("a neighbour of the output");
@@ -1168,13 +1337,8 @@ fn an_output_below_a_directory_the_grant_keeps_out_is_reached_and_its_neighbours
         "target/other/file",
         "not an output\n",
     );
-    let result = materialise::record_result_with(
-        fixture.service(),
-        made.materialisation_id,
-        &report(),
-        &outputs,
-    )
-    .expect("the result is recorded");
+    let result = record_a_run(&fixture, made.materialisation_id, &report(), &outputs)
+        .expect("the result is recorded");
     assert_eq!(result.tested_source, TestedSource::Indeterminate);
 }
 
