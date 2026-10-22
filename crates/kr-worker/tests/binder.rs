@@ -969,8 +969,7 @@ fn kr_req_11_24_a_binding_is_offered_the_streams_its_installation_granted() {
 /// KR-REQ-11.24 and KR-REQ-06.07: a stream the installation withdraws is withdrawn from the binding
 /// at once, though the binding still holds the `Observation` grant through another capability, and
 /// one the installation grants again is in force once the change is recorded. The grants a
-/// withdrawal of one stream leaves alone are left alone, and the binding's row is unchanged, since
-/// no decision reads a stream back from it.
+/// withdrawal of one stream leaves alone are left alone.
 #[test]
 fn kr_req_11_24_a_withdrawn_stream_is_withdrawn_though_the_observation_grant_stays() {
     let worker = Worker::open();
@@ -2073,7 +2072,7 @@ fn kr_req_11_13_a_package_with_a_component_binds_its_declarative_parts_and_repor
     let details = reported(&worker, source.package_digest);
     assert_eq!(details.len(), 1, "{details:?}");
     assert!(
-        details[0].contains("beyond registering it for a binding and preparing an action"),
+        details[0].contains("decode-request or encode-response exports"),
         "{}",
         details[0]
     );
