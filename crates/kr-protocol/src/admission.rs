@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{
     ApplicationInstanceId, BrokerBindingId, ControllerGeneration, EnvironmentId, PluginId,
-    PublisherId, SessionId,
+    PublisherId, RepositoryGeneration, SessionId,
 };
 use crate::scalars::{Digest256, Nullable, TimestampMs, U64};
 
@@ -125,6 +125,11 @@ pub struct AdmittedPackage {
     pub package_digest: Digest256,
     /// Where it came from.
     pub origin: ReleaseOrigin,
+    /// The generation of its repository that this snapshot was made under: the one the enrolment
+    /// it came through was on, or zero when that enrolment had none. A binding made from this
+    /// package holds it as the generation its package was resolved against, which is not the
+    /// admission revision the binding was decided at.
+    pub repository_generation: RepositoryGeneration,
     /// The absolute directory its checked, extracted copy is in.
     pub package_dir: String,
     /// What the installation may use, by capability wire name.
