@@ -1621,7 +1621,8 @@ withdrawn or expired, or when the program that asked has gone. An agent counts a
 that its connector's table names the start and the end of; a program with no turn routes in its
 table, such as one whose hooks give no turn boundary, is never reported as at work, because the
 worker does not know that it is. A program that holds the terminal, with none of these, has no state
-of its own, and the shell at its prompt is ready. The program's name is the file name of the command
+of its own, and the shell at its prompt is ready; where the foreground is not read, which is on
+Windows, the shell is taken to hold the terminal. The program's name is the file name of the command
 the shell integration answered for when it answered for exactly one and the foreground process
 group's leader is running it (the image itself, or the script an interpreter was given), and
 otherwise of the executable the leader runs, once two looks in a row have found the same group. A
