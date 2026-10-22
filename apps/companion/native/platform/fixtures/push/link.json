@@ -1,0 +1,21 @@
+{
+  "class": "KRPushAdapter",
+  "shared": "krShared",
+  "call": "krCall:",
+  "keys": {
+    "command": "command",
+    "arguments": "arguments",
+    "reply": "reply"
+  },
+  "commands": [
+    "pushPermission",
+    "pushAskPermission",
+    "pushToken",
+    "pushTokenChanged",
+    "pushPendingSet",
+    "pushPendingGet",
+    "pushPendingClear",
+    "pushLimitedKey",
+    "pushRoute"
+  ]
+}
