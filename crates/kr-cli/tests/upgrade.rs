@@ -50,6 +50,9 @@ mod terminal;
 // The plugin hosts an environment publishes, one for each protocol, seen from outside.
 #[path = "upgrade/plugin_hosts.rs"]
 mod plugin_hosts;
+// The frames of a plugin host of the release before, taken from a real one.
+#[path = "upgrade/plugin_host_frames.rs"]
+mod plugin_host_frames;
 use plugin_hosts::Wire;
 
 include!("support/update_harness.rs");

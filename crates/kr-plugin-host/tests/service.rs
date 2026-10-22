@@ -33,7 +33,7 @@ use kr_plugin_service::client::{PluginClient, new_binding_id};
 use kr_plugin_service::launcher::{
     self, HostJobRetirement, HostLaunchPlan, HostStartOutcome, HostSupervisor,
 };
-use kr_plugin_service::protocol::{ComponentSource, HostDescriptor};
+use kr_plugin_service::protocol::{ComponentSource, HostDescriptor, HostProtocol};
 use kr_plugin_service::vocabulary::{
     BindingActivity, BindingFacts, BindingId, ScopedSourceEvent, SourceProvenance,
 };
@@ -160,6 +160,7 @@ impl Host {
         });
         let outcome = launcher::start(
             &self.environment(),
+            HostProtocol::THIS,
             &self.plugin_host,
             &self.packages,
             &supervisor,
@@ -761,7 +762,7 @@ async fn a_plugin_host_runs_in_a_directory_of_its_own_and_is_given_no_secret() {
     }
 
     started.kill();
-    let _ = launcher::retire_descriptor(&environment);
+    let _ = launcher::retire_descriptor(&environment, &HostProtocol::THIS);
 }
 
 // A component that never returns costs its own binding and nothing else: the worker's terminal goes
@@ -838,7 +839,7 @@ async fn a_component_that_never_returns_costs_its_own_binding_and_not_the_termin
     assert!(snapshot.answered());
 
     started.kill();
-    let _ = launcher::retire_descriptor(&environment);
+    let _ = launcher::retire_descriptor(&environment, &HostProtocol::THIS);
 }
 
 // KR-REQ-11.39: the terminal path is never behind a component.
@@ -1042,7 +1043,7 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
     drop(stopped);
 
     started.kill();
-    let _ = launcher::retire_descriptor(&environment);
+    let _ = launcher::retire_descriptor(&environment, &HostProtocol::THIS);
 }
 
 /// How long a window of a case in which a component works may go on before it is taken for hung.

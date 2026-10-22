@@ -1,5 +1,5 @@
-//! The plugin runtime: one `kr-plugin-host` process per environment, started when a worker first
-//! asks for it.
+//! The plugin runtime: one `kr-plugin-host` process for each protocol and environment, started when
+//! a worker first asks for it.
 //!
 //! The daemon does not start the runtime when it starts, and it does not start it for an idle
 //! session. A worker whose binding holds a package that ships a component sends
@@ -15,6 +15,19 @@
 //! | starting | one attempt is under way and every request waits for it | the attempt ends: running or failed |
 //! | running | a runtime this daemon started or adopted | the kernel says its process has ended: idle |
 //! | failed | the last attempt, or the last look at a silent runtime, failed | [`FAILURE_MEMORY`] passes: idle |
+//!
+//! # One runtime for each protocol
+//!
+//! A plugin host speaks one protocol and has an endpoint and a descriptor of its own
+//! ([`HostProtocol`]), so the hosts of two protocols run side by side. This daemon holds one
+//! [`PluginRuntime`] for the protocol of its own release and one for each protocol a retained
+//! level recorded ([`PluginRuntimes`]), and answers a worker's request with the one of the level
+//! the worker is at. The holder of a retained protocol adopts a host of that protocol that runs,
+//! which a daemon of the release before started and which outlived the update, and otherwise
+//! starts the `kr-plugin-host` of the release the asking worker runs, from the release store this
+//! daemon runs from ([`StoreReleases`]). Where the host keeps no store, or the release is not in
+//! it, nothing is started and the answer is that the runtime cannot be reached, with the reason.
+//! A rich binding of such a worker is unavailable; its terminal and everything else go on.
 //!
 //! # Starting is bounded
 //!
@@ -36,12 +49,13 @@
 //! daemon holds as running is answered running whenever its process is, and a worker that cannot
 //! reach it says so itself, in its report of the binding.
 //!
-//! A runtime of another release that answers is kept whatever started it. A descriptor whose
-//! content this build refuses (another protocol, another environment, not a descriptor) is taken
-//! away, and a runtime still behind it holds its endpoint, so the new one cannot report itself and
-//! the start fails after the wait the launcher gives it. A descriptor that cannot be read at all, a
-//! link or a file another account could write, is left in place, and the answer is that the
-//! runtime cannot be reached.
+//! A runtime of another release that speaks the protocol and answers is kept whatever started it.
+//! A descriptor whose content this build refuses (another protocol, another environment, not a
+//! descriptor) is taken away, and a runtime still behind it holds its endpoint, so the new one
+//! cannot report itself and the start fails after the wait the launcher gives it. A descriptor of
+//! another protocol is never met, because each protocol publishes in a file of its own. A
+//! descriptor that cannot be read at all, a link or a file another account could write, is left in
+//! place, and the answer is that the runtime cannot be reached.
 //!
 //! # Which requests are answered
 //!
@@ -50,7 +64,7 @@
 //! the start allowance, so another process of the same user does not get to spend it.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,10 +74,14 @@ use kr_plugin_service::client::PluginClient;
 use kr_plugin_service::launcher::{
     self, HostJobRetirement, HostLaunchPlan, HostStartOutcome, HostSupervisor, LaunchError,
 };
+use kr_plugin_service::protocol::HostProtocol;
+use kr_plugin_service::retained_host;
 use kr_protocol::admission::{PluginRuntimeState, PluginRuntimeUnavailable, PluginRuntimeWanted};
 use kr_protocol::ids::SessionId;
 use kr_protocol::limits::MAX_REPORT_DETAIL_BYTES;
+use kr_protocol::retained::Level;
 use kr_protocol::scalars::U64;
+use kr_protocol::update::{CompatibilityLevel, ReleaseName};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -145,11 +163,154 @@ enum Found {
     Silent(String),
 }
 
-/// The environment's plugin runtime, as this daemon holds it.
+/// Who asks for a plugin runtime: the level of the worker, and the release it runs where it stated
+/// one, which is the release a retained protocol's host is started from.
+#[derive(Clone, Debug)]
+pub struct Asking {
+    /// The level the worker is at.
+    pub level: CompatibilityLevel,
+    /// The release the worker stated it runs.
+    pub release: Option<ReleaseName>,
+}
+
+impl Asking {
+    /// A worker of this daemon's own release, whose host is the program beside the daemon.
+    #[must_use]
+    pub const fn this() -> Self {
+        Self {
+            level: kr_protocol::update::THIS_LEVEL,
+            release: None,
+        }
+    }
+}
+
+/// Where a holder takes the program it starts a host from.
+pub enum HostProgram {
+    /// The program beside the daemon, of the daemon's own release.
+    Fixed(PathBuf),
+    /// The program of the release the asking worker runs, from the release store the daemon runs
+    /// from. The 0.78 cut removes it with the route of the protocol it serves.
+    Stored(Arc<StoreReleases>),
+}
+
+/// A plugin host program of a release in the release store, and the hold that keeps the release
+/// there until the host has reported in. The 0.78 cut removes it with [`StoreReleases`].
+struct StoredHost {
+    /// The program.
+    program: PathBuf,
+    /// Dropped when the start ends.
+    #[cfg(unix)]
+    _pin: kr_ipc::install::Pin,
+}
+
+/// The release store this daemon runs from, where it runs from one, as far as the plugin hosts of
+/// retained releases are concerned. A tree outside a store, and every Windows host, has none. The
+/// 0.78 cut removes it with the route of the protocol it serves.
+pub struct StoreReleases {
+    #[cfg(unix)]
+    store: Option<kr_ipc::install::Store>,
+}
+
+impl StoreReleases {
+    /// The store the running daemon's release is in.
+    #[must_use]
+    pub fn of_this_process() -> Self {
+        Self {
+            #[cfg(unix)]
+            store: kr_ipc::install::this_process()
+                .ok()
+                .and_then(|running| running.store())
+                .map(|store| kr_ipc::install::Store::at(store.root())),
+        }
+    }
+
+    /// A store at a directory, for a test that makes one.
+    #[cfg(all(unix, test))]
+    #[must_use]
+    pub fn at(store: kr_ipc::install::Store) -> Self {
+        Self { store: Some(store) }
+    }
+
+    /// The `kr-plugin-host` of `release`, held, when `release` is in the store at `level`.
+    ///
+    /// # Errors
+    ///
+    /// Returns why no program can be taken, in words for the asker.
+    fn plugin_host_of(
+        &self,
+        release: Option<&ReleaseName>,
+        level: CompatibilityLevel,
+    ) -> std::result::Result<StoredHost, String> {
+        let Some(release) = release else {
+            return Err("the worker states no release to take a plugin host of".to_owned());
+        };
+        #[cfg(unix)]
+        {
+            let none = || {
+                format!(
+                    "no plugin host of the release before runs, and none can be started: the \
+                     release {release} is not in this host's release store"
+                )
+            };
+            let Some(store) = &self.store else {
+                return Err(format!(
+                    "no plugin host of the release before runs, and none can be started: this \
+                     host keeps no release store (the worker runs {release})"
+                ));
+            };
+            let pin = store
+                .pin(release)
+                .map_err(|error| format!("the release {release} could not be held: {error}"))?
+                .ok_or_else(none)?;
+            if CompatibilityLevel::of(pin.manifest().protocol_version) != level {
+                return Err(format!(
+                    "the release {release} is not at the level {level} of the worker that asks"
+                ));
+            }
+            let program = store
+                .release_directory(release)
+                .join("bin")
+                .join(format!("kr-plugin-host{}", std::env::consts::EXE_SUFFIX));
+            if !program.is_file() {
+                return Err(format!(
+                    "the release {release} holds no plugin host program"
+                ));
+            }
+            Ok(StoredHost { program, _pin: pin })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = level;
+            Err(format!(
+                "no plugin host of the release before runs, and none can be started: this host \
+                 keeps no release store (the worker runs {release})"
+            ))
+        }
+    }
+}
+
+/// What a start has resolved before it spends the budget: the program, and the hold on its release
+/// where it comes from the store, kept until the host has reported in.
+enum Resolved {
+    Beside(PathBuf),
+    Stored(Box<StoredHost>),
+}
+
+impl Resolved {
+    fn program(&self) -> PathBuf {
+        match self {
+            Self::Beside(program) => program.clone(),
+            Self::Stored(stored) => stored.program.clone(),
+        }
+    }
+}
+
+/// The environment's plugin runtime of one protocol, as this daemon holds it.
 pub struct PluginRuntime {
     paths: EnvironmentPaths,
     starter: Arc<dyn HostSupervisor>,
-    program: PathBuf,
+    protocol: HostProtocol,
+    program: HostProgram,
     packages: PathBuf,
     state: tokio::sync::Mutex<State>,
     budget: std::sync::Mutex<StartBudget>,
@@ -161,26 +322,28 @@ impl std::fmt::Debug for PluginRuntime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PluginRuntime")
-            .field("program", &self.program)
+            .field("protocol", &self.protocol.name)
             .field("packages", &self.packages)
             .finish_non_exhaustive()
     }
 }
 
 impl PluginRuntime {
-    /// Builds the holder for an environment: nothing is started.
+    /// Builds the holder of one protocol for an environment: nothing is started.
     ///
-    /// `program` is the runtime's executable and `packages` the directory its components are read
-    /// from, which is the catalogue's own.
+    /// `program` says where the runtime's executable comes from and `packages` is the directory its
+    /// components are read from, which is the catalogue's own.
     pub fn new(
         paths: EnvironmentPaths,
         supervisor: Arc<dyn WorkerSupervisor>,
-        program: PathBuf,
+        protocol: HostProtocol,
+        program: HostProgram,
         packages: PathBuf,
     ) -> Self {
         Self {
             paths,
             starter: Arc::new(ServiceStarter { supervisor }),
+            protocol,
             program,
             packages,
             state: tokio::sync::Mutex::new(State::Idle),
@@ -197,8 +360,19 @@ impl PluginRuntime {
         self
     }
 
+    /// Where the program of a start comes from, resolved before the start budget is spent: a start
+    /// that cannot happen is not a start.
+    fn resolve(&self, asking: &Asking) -> std::result::Result<Resolved, String> {
+        match &self.program {
+            HostProgram::Fixed(program) => Ok(Resolved::Beside(program.clone())),
+            HostProgram::Stored(releases) => releases
+                .plugin_host_of(asking.release.as_ref(), asking.level)
+                .map(|stored| Resolved::Stored(Box::new(stored))),
+        }
+    }
+
     /// Answers one worker's request: the runtime is running, or why it cannot be reached.
-    pub async fn request(self: &Arc<Self>) -> PluginRuntimeState {
+    pub async fn request(self: &Arc<Self>, asking: &Asking) -> PluginRuntimeState {
         loop {
             let mut state = self.state.lock().await;
             match &*state {
@@ -212,7 +386,7 @@ impl PluginRuntime {
                     }
                     // Its job goes with it the next time a runtime is started; the descriptor
                     // goes now, so no worker connects to the address of a process that is gone.
-                    let _ = launcher::retire_descriptor(&self.paths);
+                    let _ = launcher::retire_descriptor(&self.paths, &self.protocol);
                     *state = State::Idle;
                 }
                 State::Starting(attempt) => {
@@ -239,6 +413,17 @@ impl PluginRuntime {
                         return unavailable(&reason, self.failure_memory);
                     }
                     Found::Nothing => {
+                        let resolved = match self.resolve(asking) {
+                            Ok(resolved) => resolved,
+                            Err(reason) => {
+                                let reason = cut(&reason);
+                                *state = State::Failed {
+                                    reason: reason.clone(),
+                                    until: Instant::now() + self.failure_memory,
+                                };
+                                return unavailable(&reason, self.failure_memory);
+                            }
+                        };
                         let spent = self
                             .budget
                             .lock()
@@ -260,7 +445,7 @@ impl PluginRuntime {
                         // The attempt is a task of its own, so a requester that stops waiting
                         // leaves it to finish: the runtime it was starting is not abandoned
                         // half way.
-                        let started = tokio::spawn(Arc::clone(self).attempt(finished));
+                        let started = tokio::spawn(Arc::clone(self).attempt(finished, resolved));
                         // And one that ends abnormally leaves a failure behind, not a start that
                         // never finishes: every later request would be told it was lost.
                         tokio::spawn({
@@ -302,15 +487,21 @@ impl PluginRuntime {
     }
 
     /// Starts the runtime and settles the state, whoever is still waiting for it.
-    async fn attempt(self: Arc<Self>, finished: watch::Sender<Option<PluginRuntimeState>>) {
+    async fn attempt(
+        self: Arc<Self>,
+        finished: watch::Sender<Option<PluginRuntimeState>>,
+        resolved: Resolved,
+    ) {
         let started = launcher::start(
             &self.paths,
-            self.program.clone(),
+            self.protocol,
+            resolved.program(),
             &self.packages,
             &self.starter,
             START_DEADLINE,
         )
         .await;
+        drop(resolved);
         let mut state = self.state.lock().await;
         let answer = match started {
             Ok((descriptor, fence)) => {
@@ -339,7 +530,7 @@ impl PluginRuntime {
 
     /// Looks for a runtime a previous daemon started.
     async fn look(&self) -> Found {
-        let descriptor = match launcher::read_descriptor(&self.paths) {
+        let descriptor = match launcher::read_descriptor(&self.paths, &self.protocol) {
             Ok(Some(descriptor)) => descriptor,
             Ok(None) => return Found::Nothing,
             // A descriptor whose content this build refuses (another protocol, another
@@ -347,7 +538,7 @@ impl PluginRuntime {
             // is what lets a runtime be started; if one is in fact running behind it, it holds its
             // endpoint and the new one fails to report itself.
             Err(LaunchError::Refused { .. }) => {
-                let _ = launcher::retire_descriptor(&self.paths);
+                let _ = launcher::retire_descriptor(&self.paths, &self.protocol);
                 return Found::Nothing;
             }
             // A descriptor that could not be read at all may be a runtime's, and taking it away
@@ -362,13 +553,23 @@ impl PluginRuntime {
             kr_ipc::identity::process_state(&descriptor.process_start_identity),
             kr_ipc::identity::ProcessState::Ended
         ) {
-            let _ = launcher::retire_descriptor(&self.paths);
+            let _ = launcher::retire_descriptor(&self.paths, &self.protocol);
             return Found::Nothing;
         }
         let paths = self.paths.clone();
-        let probe = tokio::time::timeout(ADOPTION_PROBE, PluginClient::connect(&paths)).await;
+        let protocol = self.protocol;
+        let probe = tokio::time::timeout(ADOPTION_PROBE, async move {
+            // This protocol is looked at the way a worker connects to it; a retained one, which
+            // this build has no client for, only by the handshake.
+            if protocol == HostProtocol::THIS {
+                PluginClient::connect(&paths).await.map(|_client| ())
+            } else {
+                retained_host::probe(&paths, &protocol).await.map(|_| ())
+            }
+        })
+        .await;
         match probe {
-            Ok(Ok(_client)) => Found::Alive(Running {
+            Ok(Ok(())) => Found::Alive(Running {
                 descriptor,
                 _fence: None,
             }),
@@ -382,6 +583,67 @@ impl PluginRuntime {
                 ADOPTION_PROBE.as_secs()
             )),
         }
+    }
+}
+
+/// The plugin runtimes of an environment, one for each protocol this daemon serves: its own
+/// release's, and each protocol a retained level recorded.
+pub struct PluginRuntimes {
+    this: Arc<PluginRuntime>,
+    retained: Vec<(&'static str, Arc<PluginRuntime>)>,
+}
+
+impl PluginRuntimes {
+    /// Builds the holders: nothing is started.
+    ///
+    /// `program` is this release's plugin host and `releases` the store a retained level's host is
+    /// taken from. Each distinct protocol a retained level recorded gets one holder, and a level
+    /// that recorded this release's protocol is served by this release's holder.
+    pub fn new(
+        paths: &EnvironmentPaths,
+        supervisor: &Arc<dyn WorkerSupervisor>,
+        program: PathBuf,
+        packages: &Path,
+        releases: &Arc<StoreReleases>,
+    ) -> Self {
+        let holder = |protocol, program| {
+            Arc::new(PluginRuntime::new(
+                paths.clone(),
+                Arc::clone(supervisor),
+                protocol,
+                program,
+                packages.to_path_buf(),
+            ))
+        };
+        let this = holder(HostProtocol::THIS, HostProgram::Fixed(program));
+        let mut retained: Vec<(&'static str, Arc<PluginRuntime>)> = Vec::new();
+        for level in &kr_protocol::retained::RETAINED {
+            let name = level.plugin_host.trim();
+            if name == HostProtocol::THIS.name || retained.iter().any(|(held, _)| *held == name) {
+                continue;
+            }
+            let Some(protocol) = HostProtocol::named(name) else {
+                continue;
+            };
+            retained.push((
+                name,
+                holder(protocol, HostProgram::Stored(Arc::clone(releases))),
+            ));
+        }
+        Self { this, retained }
+    }
+
+    /// The runtime that serves the workers at `level`, where this daemon has one.
+    #[must_use]
+    pub fn of(&self, level: Level) -> Option<&Arc<PluginRuntime>> {
+        let name = level.plugin_host();
+        if name == HostProtocol::THIS.name {
+            return Some(&self.this);
+        }
+        self.retained
+            .iter()
+            .find(|(held, _)| *held == name)
+            .map(|(_, runtime)| runtime)
     }
 }
 
@@ -505,15 +767,40 @@ impl Controller {
     }
 
     /// Answers a worker's request for the plugin runtime, from the process this daemon recorded
-    /// for the session and from no other.
+    /// for the session and from no other, with the runtime of the protocol the worker's level
+    /// speaks.
     pub(super) async fn plugin_runtime_wanted(
         &self,
         wanted: PluginRuntimeWanted,
         peer: &PeerIdentity,
+        level: Level,
     ) -> PluginRuntimeState {
         match self.recorded_worker(wanted.session_id, peer).await {
             Err(refusal) => unavailable(refusal.reason(), NOT_RECORDED_RETRY),
-            Ok(()) => self.plugin_runtime.request().await,
+            Ok(()) => {
+                let Some(runtime) = self.plugin_runtimes.of(level) else {
+                    return unavailable(
+                        &format!(
+                            "this daemon has no plugin runtime for the protocol {} that the \
+                             worker's level speaks",
+                            level.plugin_host()
+                        ),
+                        NOT_RECORDED_RETRY,
+                    );
+                };
+                let release = self
+                    .directory
+                    .lock()
+                    .await
+                    .get(wanted.session_id)
+                    .and_then(|worker| worker.release.clone());
+                runtime
+                    .request(&Asking {
+                        level: level.level(),
+                        release,
+                    })
+                    .await
+            }
         }
     }
 }
@@ -590,7 +877,8 @@ mod tests {
         PluginRuntime::new(
             host.environment(),
             supervisor,
-            host.root().join("kr-plugin-host"),
+            HostProtocol::THIS,
+            HostProgram::Fixed(host.root().join("kr-plugin-host")),
             host.root().join("repositories"),
         )
     }
@@ -606,14 +894,14 @@ mod tests {
 
         let first = tokio::spawn({
             let runtime = Arc::clone(&runtime);
-            async move { runtime.request().await }
+            async move { runtime.request(&Asking::this()).await }
         });
         while supervisor.asked.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
         }
         let second = tokio::spawn({
             let runtime = Arc::clone(&runtime);
-            async move { runtime.request().await }
+            async move { runtime.request(&Asking::this()).await }
         });
         supervisor.let_go();
 
@@ -642,7 +930,7 @@ mod tests {
         let memory = Duration::from_secs(3600);
         let runtime = Arc::new(runtime_over(&host, &supervisor).remembering_for(memory));
 
-        let first = runtime.request().await;
+        let first = runtime.request(&Asking::this()).await;
         let PluginRuntimeState::Unavailable(told) = &first else {
             panic!("a start that failed was answered {first:?}");
         };
@@ -653,7 +941,7 @@ mod tests {
             u64::try_from(memory.as_millis()).expect("a figure")
         );
 
-        let again = runtime.request().await;
+        let again = runtime.request(&Asking::this()).await;
         let PluginRuntimeState::Unavailable(told) = &again else {
             panic!("a failure was answered {again:?}");
         };
@@ -691,7 +979,8 @@ mod tests {
             PluginRuntime::new(
                 host.environment(),
                 Arc::new(Panicking),
-                host.root().join("kr-plugin-host"),
+                HostProtocol::THIS,
+                HostProgram::Fixed(host.root().join("kr-plugin-host")),
                 host.root().join("repositories"),
             )
             .remembering_for(Duration::from_secs(3600)),
@@ -701,13 +990,14 @@ mod tests {
         // the watcher left. Without the watcher the state stays `Starting` and no request is ever
         // told the failure, so a bound on the wait is what makes that a failure of this test and
         // not a test that turns for ever.
-        let PluginRuntimeState::Unavailable(first) = runtime.request().await else {
+        let PluginRuntimeState::Unavailable(first) = runtime.request(&Asking::this()).await else {
             panic!("an attempt that failed was answered that the runtime is running");
         };
         assert!(first.reason.contains("was lost"), "{}", first.reason);
         tokio::time::timeout(Duration::from_secs(60), async {
             loop {
-                let PluginRuntimeState::Unavailable(told) = runtime.request().await else {
+                let PluginRuntimeState::Unavailable(told) = runtime.request(&Asking::this()).await
+                else {
                     panic!("an attempt that failed was answered that the runtime is running");
                 };
                 if told.reason.contains("ended abnormally") {
@@ -719,7 +1009,7 @@ mod tests {
         .await
         .expect("the attempt that ended abnormally was left as a failure");
         // And the failure stays the answer.
-        let PluginRuntimeState::Unavailable(again) = runtime.request().await else {
+        let PluginRuntimeState::Unavailable(again) = runtime.request(&Asking::this()).await else {
             panic!("a failure was answered that the runtime is running");
         };
         assert!(
@@ -742,11 +1032,12 @@ mod tests {
             launcher::HostIdentity::generate(host.environment_id()).expect("an identity");
         launcher::publish_descriptor(
             &environment,
+            &HostProtocol::THIS,
             &kr_plugin_service::protocol::HostDescriptor {
-                protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
+                protocol: HostProtocol::THIS.name.to_owned(),
                 environment_id: host.environment_id(),
                 reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
-                endpoint: launcher::host_endpoint(&environment)
+                endpoint: launcher::host_endpoint(&environment, &HostProtocol::THIS)
                     .expect("an endpoint")
                     .as_text(),
                 boot_identity: identity.boot_identity().clone(),
@@ -759,7 +1050,7 @@ mod tests {
         supervisor.let_go();
         let runtime = Arc::new(runtime_over(&host, &supervisor));
 
-        let answer = runtime.request().await;
+        let answer = runtime.request(&Asking::this()).await;
         let PluginRuntimeState::Unavailable(told) = &answer else {
             panic!("a runtime that does not answer was answered {answer:?}");
         };
@@ -769,5 +1060,338 @@ mod tests {
             told.reason
         );
         assert_eq!(supervisor.asked.load(Ordering::SeqCst), 0);
+    }
+
+    /// A plugin host standing in for a running one of `protocol`: it is published as one and
+    /// answers the handshake, so a holder adopts it.
+    struct StandIn {
+        _listener: tokio::task::JoinHandle<()>,
+        descriptor: kr_plugin_service::protocol::HostDescriptor,
+    }
+
+    impl StandIn {
+        async fn publish(host: &kr_ipc::testing::TempHost, protocol: &HostProtocol) -> Self {
+            use kr_plugin_service::protocol::{Frame, Request, RequestBody, ResponseBody};
+
+            let environment = host.environment();
+            let identity =
+                launcher::HostIdentity::generate(host.environment_id()).expect("an identity");
+            let endpoint = launcher::host_endpoint(&environment, protocol).expect("an endpoint");
+            let listener =
+                kr_ipc::endpoint::Listener::bind(&endpoint).expect("the stand-in listens");
+            let descriptor = kr_plugin_service::protocol::HostDescriptor {
+                protocol: protocol.name.to_owned(),
+                environment_id: host.environment_id(),
+                reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
+                endpoint: endpoint.as_text(),
+                boot_identity: identity.boot_identity().clone(),
+                process_start_identity: identity.process_start_identity().clone(),
+                host_public_key: *identity.public_key(),
+            };
+            launcher::publish_descriptor(&environment, protocol, &descriptor)
+                .expect("a descriptor");
+            let served = descriptor.clone();
+            let name = protocol.name;
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((connection, _peer)) = listener.accept().await else {
+                        return;
+                    };
+                    let (mut reader, mut writer) =
+                        kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+                    while let Ok(request) = reader.read_message_without_schema::<Request>().await {
+                        let body = match request.body {
+                            RequestBody::Hello { .. } => ResponseBody::Hello {
+                                protocol: name.to_owned(),
+                                descriptor: Box::new(served.clone()),
+                            },
+                            RequestBody::Verify { nonce } => ResponseBody::Verified(Box::new(
+                                identity
+                                    .answer(&nonce, &served.endpoint)
+                                    .expect("an answer"),
+                            )),
+                            _ => return,
+                        };
+                        let frame = Frame::Response {
+                            reply_to: request.request_id,
+                            body,
+                        };
+                        if writer.write_message(&frame).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+            Self {
+                _listener: task,
+                descriptor,
+            }
+        }
+    }
+
+    fn runtimes_over(host: &kr_ipc::testing::TempHost, supervisor: &Arc<Gated>) -> PluginRuntimes {
+        let supervisor: Arc<dyn WorkerSupervisor> = Arc::clone(supervisor) as _;
+        PluginRuntimes::new(
+            &host.environment(),
+            &supervisor,
+            host.root().join("kr-plugin-host"),
+            &host.root().join("repositories"),
+            &Arc::new(StoreReleases::of_this_process()),
+        )
+    }
+
+    fn the_retained_level() -> Level {
+        Level::retained(&kr_protocol::retained::RETAINED[0])
+    }
+
+    /// Every level this daemon serves has a runtime of the protocol it speaks. A level shares this
+    /// release's holder when it speaks this release's protocol, and no other level does.
+    #[test]
+    fn every_retained_level_has_a_runtime_of_its_own_protocol() {
+        let host = kr_ipc::testing::TempHost::create();
+        let runtimes = runtimes_over(&host, &Arc::new(Gated::default()));
+        let this = runtimes
+            .of(Level::this())
+            .expect("a runtime for this level");
+        for retained in &kr_protocol::retained::RETAINED {
+            let held = runtimes
+                .of(Level::retained(retained))
+                .unwrap_or_else(|| panic!("level {} has no runtime", retained.level));
+            assert_eq!(
+                held.protocol.name,
+                retained.plugin_host.trim(),
+                "level {}",
+                retained.level
+            );
+            assert_eq!(
+                Arc::ptr_eq(held, this),
+                retained.plugin_host.trim() == HostProtocol::THIS.name,
+                "level {}: it shares this release's runtime when, and only when, it speaks this \
+                 release's protocol",
+                retained.level
+            );
+        }
+    }
+
+    /// A host of each protocol that runs is adopted by the holder of that protocol and by no other,
+    /// and a worker of each level is answered that its own runtime runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_host_of_each_protocol_is_adopted_by_the_holder_of_its_own() {
+        let host = kr_ipc::testing::TempHost::create();
+        let supervisor = Arc::new(Gated::default());
+        supervisor.let_go();
+        let runtimes = runtimes_over(&host, &supervisor);
+        let retained = the_retained_level();
+        let retained_host = StandIn::publish(
+            &host,
+            &HostProtocol::named(retained.plugin_host()).expect("a route"),
+        )
+        .await;
+        let this_host = StandIn::publish(&host, &HostProtocol::THIS).await;
+        assert_ne!(
+            retained_host.descriptor.endpoint,
+            this_host.descriptor.endpoint
+        );
+
+        let retained_asks = Asking {
+            level: retained.level(),
+            release: None,
+        };
+        assert_eq!(
+            runtimes
+                .of(retained)
+                .expect("a runtime")
+                .request(&retained_asks)
+                .await,
+            PluginRuntimeState::Running
+        );
+        assert_eq!(
+            runtimes
+                .of(Level::this())
+                .expect("a runtime")
+                .request(&Asking::this())
+                .await,
+            PluginRuntimeState::Running
+        );
+        // Both adopted, and nothing started.
+        assert_eq!(supervisor.asked.load(Ordering::SeqCst), 0);
+    }
+
+    /// Where the host keeps no release store and no host of the retained protocol runs, a retained
+    /// worker is answered that the runtime cannot be reached, with the reason and the failure
+    /// memory as the time to ask again, however often it asks, and the answer spends none of the
+    /// start allowance: asked more often than [`START_ATTEMPTS`] times, each ask a fresh look, it is
+    /// told the same reason each time and never that the runtime was started too often. A worker of
+    /// this level, with a host that runs, is answered as before.
+    #[tokio::test(start_paused = true)]
+    async fn a_retained_worker_is_told_why_when_there_is_no_store_and_no_host() {
+        let host = kr_ipc::testing::TempHost::create();
+        let runtimes = runtimes_over(&host, &Arc::new(Gated::default()));
+        let retained = the_retained_level();
+        let retained_runtime = runtimes.of(retained).expect("a runtime");
+        let asks = Asking {
+            level: retained.level(),
+            release: kr_protocol::update::ReleaseName::new("0.76.0+aaaaaaaaaaaa").ok(),
+        };
+        let mut told = Vec::new();
+        for _ in 0..START_ATTEMPTS + 3 {
+            let PluginRuntimeState::Unavailable(unavailable) =
+                retained_runtime.request(&asks).await
+            else {
+                panic!("a worker with no host to take was answered that its runtime runs");
+            };
+            assert_eq!(
+                unavailable.retry_after_ms.get(),
+                u64::try_from(FAILURE_MEMORY.as_millis()).expect("a figure"),
+                "the worker is told to ask again when the failure is no longer remembered"
+            );
+            told.push(unavailable.reason);
+            // The failure is forgotten, so the next ask looks again.
+            tokio::time::advance(FAILURE_MEMORY).await;
+        }
+        assert!(
+            told[0].contains("no plugin host of the release before runs"),
+            "{}",
+            told[0]
+        );
+        assert!(told.iter().all(|reason| *reason == told[0]), "{told:?}");
+
+        // The clock runs again for the handshake with a host that answers.
+        tokio::time::resume();
+        let _this_host = StandIn::publish(&host, &HostProtocol::THIS).await;
+        assert_eq!(
+            runtimes
+                .of(Level::this())
+                .expect("a runtime")
+                .request(&Asking::this())
+                .await,
+            PluginRuntimeState::Running
+        );
+    }
+
+    /// A release store of a test, with releases put in it.
+    #[cfg(unix)]
+    struct Store {
+        store: kr_ipc::install::Store,
+        _root: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Drop for Store {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self._root);
+        }
+    }
+
+    #[cfg(unix)]
+    impl Store {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("kr-releases-{}", kr_ipc::new_uuid()));
+            let store = kr_ipc::install::Store::at(root.join("host"));
+            store.create_directories().expect("the store's directories");
+            kr_ipc::paths::write_owner_only_file(&store.record(), b"{}\n").expect("a record");
+            Self { store, _root: root }
+        }
+
+        /// Puts a release in the store at `version`, with a plugin host program when `host`.
+        fn release(&self, name: &str, version: (u16, u16, u16), host: bool) -> ReleaseName {
+            use kr_protocol::update::{
+                CommitId, FloorSystem, FloorVersion, ManifestKind, OsFloor, ReleaseManifest,
+            };
+
+            let release = ReleaseName::new(name).expect("a release name");
+            let directory = self.store.release_directory(&release);
+            std::fs::create_dir_all(directory.join("bin")).expect("the release's bin");
+            let manifest = ReleaseManifest {
+                kind: ManifestKind::Release,
+                release: release.clone(),
+                sequence: U64::new(1),
+                commit: CommitId::new("4254aa6e62e585478ff8dcff5518f23c7263f4ce")
+                    .expect("a commit"),
+                target: "aarch64-apple-darwin".to_owned(),
+                os_floor: OsFloor {
+                    system: FloorSystem::Macos,
+                    version: FloorVersion {
+                        major: 14,
+                        minor: 0,
+                    },
+                },
+                protocol_version: kr_protocol::hello::PackageVersion::new(
+                    version.0, version.1, version.2,
+                ),
+                public_majors: vec![1],
+                retained_levels: Vec::new(),
+                shells: Vec::new(),
+                agents: Vec::new(),
+                dependencies: Some(kr_protocol::update::ReleaseDependencies {
+                    lock_sha256: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
+                    pinned: Vec::new(),
+                    vectors: Vec::new(),
+                }),
+                stores: vec![kr_protocol::update::ReleaseStore {
+                    store: "registry".to_owned(),
+                    scope: kr_protocol::update::StoreScope::Environment,
+                    path: "registry.sqlite".to_owned(),
+                    recording: kr_protocol::update::Recording::SqliteTable {
+                        table: "schema_version".to_owned(),
+                    },
+                    version: 7,
+                    migrates_from: 1,
+                }],
+                files: Vec::new(),
+            };
+            std::fs::write(
+                self.store.manifest(&release),
+                serde_json::json!({ "signed": manifest, "signatures": [] }).to_string(),
+            )
+            .expect("the manifest");
+            if host {
+                std::fs::write(directory.join("bin").join("kr-plugin-host"), b"#!/bin/sh\n")
+                    .expect("a program");
+            }
+            release
+        }
+    }
+
+    /// The program a retained protocol's host is started from is the asking worker's own release's
+    /// among the releases of the store at its level, and none when that release is not in the
+    /// store, is at another level, or holds no host program.
+    #[cfg(unix)]
+    #[test]
+    fn the_host_a_retained_worker_is_given_is_that_of_the_release_it_runs() {
+        let store = Store::new();
+        let level = CompatibilityLevel::of(kr_protocol::hello::PackageVersion::new(0, 76, 0));
+        let earlier = store.release("0.76.0+aaaaaaaaaaaa", (0, 76, 0), true);
+        let later = store.release("0.76.0+bbbbbbbbbbbb", (0, 76, 0), true);
+        let other_level = store.release("0.75.0+cccccccccccc", (0, 75, 0), true);
+        let without = store.release("0.76.0+dddddddddddd", (0, 76, 0), false);
+        let absent = ReleaseName::new("0.76.0+eeeeeeeeeeee").expect("a release name");
+        let releases = StoreReleases::at(kr_ipc::install::Store::at(store.store.root()));
+
+        for (asker, chosen) in [(&earlier, &earlier), (&later, &later)] {
+            let found = releases
+                .plugin_host_of(Some(asker), level)
+                .unwrap_or_else(|error| panic!("{asker}: {error}"));
+            assert_eq!(
+                found.program,
+                store
+                    .store
+                    .release_directory(chosen)
+                    .join("bin")
+                    .join("kr-plugin-host"),
+                "a worker of {asker} takes the host of {chosen}"
+            );
+        }
+        for (asker, why) in [
+            (Some(&absent), "is not in this host's release store"),
+            (Some(&other_level), "is not at the level"),
+            (Some(&without), "holds no plugin host program"),
+            (None, "states no release"),
+        ] {
+            let Err(error) = releases.plugin_host_of(asker, level) else {
+                panic!("{asker:?} was given a host");
+            };
+            assert!(error.contains(why), "{asker:?}: {error}");
+        }
     }
 }
