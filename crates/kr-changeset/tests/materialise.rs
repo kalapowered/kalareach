@@ -1258,11 +1258,12 @@ fn a_result_without_a_binding_it_could_establish_attests_nothing() {
     assert!(result.tested_version.0.is_none());
 }
 
-/// What a result about a run that wrote tens of thousands of files in one burst must say about the
-/// source: that it is the version. FSEvents drops reports when a burst is more than it can
-/// deliver, and falls behind by more than the host waits for, and the host then says its watcher
-/// cannot be trusted, with the result attesting nothing. That is right, and it is not what these
-/// cases are about, so on macOS it is the one other answer that is accepted.
+/// What a result about a run that left tens of thousands of files in its output must say about the
+/// source: that it is the version. FSEvents delivers the reports of such a burst late, by more than
+/// the host waits for the marker it writes, or drops them, and the cases run side by side, so on
+/// macOS the host may say that its watcher cannot be trusted, with the result attesting nothing.
+/// That is right, and it is not what these cases are about, so there it is the one other answer
+/// that is accepted.
 fn assert_the_source_is_not_in_doubt(result: &kr_protocol::changeset::MaterialisationResult) {
     if cfg!(target_os = "macos")
         && result.tested_source == TestedSource::Indeterminate
