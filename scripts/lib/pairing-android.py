@@ -207,14 +207,25 @@ def say(text: str) -> None:
     print(f"PAIRING {text}", flush=True)
 
 
-def scan(phone: Phone, directory: Path, picture: str, port: str, wanted, what: str) -> None:
-    """Has the camera see `picture`, presses Scan code, and waits for what a scan of it opens.
+def scan(
+    phone: Phone,
+    directory: Path,
+    picture: str,
+    port: str,
+    wanted,
+    what: str,
+    stale=lambda each: False,
+    opener: str = "Scan code",
+) -> None:
+    """Has the camera see `picture`, presses `opener`, and waits for what a scan of it opens.
 
     The first scan asks to use the camera, and the answer a person gives is given. When a view of the
-    picture is not read in its time, the phone is moved to the next one.
+    picture is not read in its time, the phone is moved to the next one. The emulator's wall takes a
+    moment to show a new picture, so the scanner may read the one before it: a person who sees the
+    wrong code put it away and scans again, and so does this, for what `stale` says is the wrong one.
     """
     wait_for_file(directory, f"{picture}.png.added")
-    phone.press("Scan code")
+    phone.press(opener)
     for view in VIEWS:
         look(port, view)
         end = time.monotonic() + VIEW_SECONDS
@@ -224,11 +235,31 @@ def scan(phone: Phone, directory: Path, picture: str, port: str, wanted, what: s
             if asking:
                 phone.tap(asking[0])
                 continue
-            for node in nodes:
-                if node["label"] and wanted(node["label"]):
-                    return
+            labels = [node["label"] for node in nodes if node["label"]]
+            if any(wanted(each) for each in labels):
+                return
+            if any(stale(each) for each in labels):
+                phone.press("Cancel")
+                phone.wait(lambda each: each == "Pair with a host", "the pairing screen after the wrong code was put away")
+                phone.press("Scan code")
+                end = time.monotonic() + VIEW_SECONDS
+                continue
             time.sleep(0.3)
     phone.give_up(f"timed out waiting for {what}: the scanner read the picture at none of {len(VIEWS)} views")
+
+
+# What the card for the host's own invitation says: it grants the phone an owner's rights, which the
+# fixture's invitation, the picture the emulator's wall starts with, does not.
+def owner_card(each: str) -> bool:
+    return each.startswith("Invitation from a host") and "manage the host as an owner" in each
+
+
+def another_card(each: str) -> bool:
+    return each.startswith("Invitation from a host") and "manage the host as an owner" not in each
+
+
+def any_card(each: str) -> bool:
+    return each.startswith("Invitation from a host")
 
 
 def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> None:
@@ -241,7 +272,7 @@ def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> Non
 
     # A QR code whose secret has one bit changed opens nothing.
     touch(directory, "go-control")
-    scan(phone, directory, "control", port, lambda each: each.startswith("Invitation from a host"), "the scanned invitation")
+    scan(phone, directory, "control", port, owner_card, "the scanned invitation", stale=another_card)
     phone.press("Pair")
     phone.wait(lambda each: each.startswith("The invitation did not work"), "the refusal")
     touch(directory, "control-done")
@@ -268,9 +299,21 @@ def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> Non
 
     # The host's invitation: the phone shows the value the host shows, and is paired once approved.
     touch(directory, "go-direct")
-    scan(phone, directory, "direct", port, lambda each: each.startswith("Invitation from a host"), "the scanned invitation")
-    phone.shot("scanned-summary")
-    phone.press("Pair")
+    opener = "Scan code"
+    for _ in range(3):
+        scan(phone, directory, "direct", port, owner_card, "the scanned invitation", opener=opener)
+        phone.shot("scanned-summary")
+        phone.press("Pair")
+        outcome = phone.wait(
+            lambda each: each == "Check this value on the host" or each.startswith("The invitation did not work"),
+            "the value or a refusal",
+            90,
+        )
+        if outcome["label"] == "Check this value on the host":
+            break
+        # The scanner read the picture of the changed secret that was on the wall before this one,
+        # which the host refuses: a person scans again.
+        opener = "Scan again"
     phone.wait(lambda each: each == "Check this value on the host", "the value", 90)
     wait_for_file(directory, "host-value.txt")
     host = read(directory, "host-value.txt").replace(" ", "")
@@ -290,7 +333,7 @@ def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> Non
     phone.press("Done")
     phone.wait(lambda each: each == "Pair with a host", "the pairing screen")
     asks = lambda each: each == "Use another pairing service?"
-    scan(phone, directory, "code", port, asks, "the alert naming the other service")
+    scan(phone, directory, "code", port, asks, "the alert naming the other service", stale=any_card)
     # The alert names the service the code names: the host's other service, on the port the host says.
     service = f"https://127.0.0.1:{json.loads(read(directory, 'ready.json'))['service_port']}"
     named = phone.find(lambda each: each.startswith(f"This code belongs to {service}."))
@@ -302,7 +345,7 @@ def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> Non
     if read(directory, "connections.txt") != "0":
         raise SystemExit("a service was contacted before the person agreed")
     say("cancelled: no connection")
-    scan(phone, directory, "code", port, asks, "the alert the second time")
+    scan(phone, directory, "code", port, asks, "the alert the second time", stale=any_card)
     # The button that accepts is "Use <the service>", and the alert's title is a question that starts
     # with the same word.
     accepts = lambda each: each.lower().startswith("use ") and not each.endswith("?")
