@@ -213,7 +213,7 @@ export function VoiceRoute({
           const choice = choiceFromPreparation(preparation)
           // The host's own names for the sessions, where it gives them. A name it does not give
           // is shown as the identifier rather than guessed at.
-          const named = await ask(() => port.sessionList({})).then(
+          const named = await ask(() => port.sessionList({ environment_id: null, include_closed: false })).then(
             (list) =>
               Object.fromEntries(
                 list.sessions

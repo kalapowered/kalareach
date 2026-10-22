@@ -76,10 +76,10 @@ describe('the harness control strip', () => {
     const host = open()
     await person.click(screen.getByRole('button', { name: 'Controls' }))
     await person.click(screen.getByRole('button', { name: 'Lose contact' }))
-    await expect(host.port.sessionList({})).rejects.toBeDefined()
+    await expect(host.port.sessionList({ environment_id: null, include_closed: false })).rejects.toBeDefined()
     await person.click(screen.getByRole('button', { name: 'Controls' }))
     await person.click(screen.getByRole('button', { name: 'Restore contact' }))
-    await expect(host.port.sessionList({})).resolves.toBeDefined()
+    await expect(host.port.sessionList({ environment_id: null, include_closed: false })).resolves.toBeDefined()
   })
 
   it('holds sends and releases them, and says how many the host has received', async () => {
