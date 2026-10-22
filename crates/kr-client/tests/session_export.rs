@@ -495,10 +495,8 @@ async fn a_recording_plays_the_output_at_the_times_it_was_written() {
     let composed = run(&mut source, cast_bounds()).await;
     let (header, events) = cast(&composed.document);
     assert_eq!(header["version"], 2);
-    assert_eq!(
-        (header["width"].clone(), header["height"].clone()),
-        (100.into(), 30.into())
-    );
+    assert_eq!(header["width"], 100);
+    assert_eq!(header["height"], 30);
     assert_eq!(header["timestamp"], 10);
     assert!(
         header["kalareach"]["omissions"]
