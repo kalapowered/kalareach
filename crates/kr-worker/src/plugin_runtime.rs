@@ -30,11 +30,13 @@
 //!
 //! A binding is reported `Registered` as soon as the runtime has its component, and is offered
 //! observations (`crate::plugin_observation`) only once the link has made it ready: its held
-//! checkpoint restored where there was one, and the snapshot after the restore answered. The link
-//! takes a checkpoint of a ready binding when it has been offered events and has been quiet for two
-//! seconds (or its last attempt is a minute old), holds it in memory, and restores it when the
-//! binding is registered again after the runtime was lost. Held checkpoints are never persisted, and
-//! privacy mode drops them. Every thirty seconds it asks the runtime what it is doing; a runtime
+//! checkpoint restored where there was one. What was observed between the checkpoint and the
+//! registration is not replayed, so a restore is a loss, and the pump takes the snapshot it owes
+//! before it offers the binding anything. The link takes a checkpoint of a ready binding when it
+//! has been offered events and has been quiet for two seconds (or its last attempt is a minute old,
+//! or it has never been asked), holds it in memory under the source generation the component was
+//! registered in, and restores it when the binding is registered again after the runtime was lost.
+//! Held checkpoints are never persisted, and privacy mode drops them. Every thirty seconds it asks the runtime what it is doing; a runtime
 //! that does not answer twice running is treated as lost.
 //!
 //! # When the runtime is lost
@@ -70,7 +72,7 @@ use kr_protocol::envelope::ControlFrame;
 use kr_protocol::ids::{BrokerBindingId, SessionId};
 
 use crate::broker::Broker;
-use crate::broker::component::{ComponentNote, ComponentWant};
+use crate::broker::component::{ComponentNote, ComponentWant, FaultNote};
 use crate::broker::observation::{Held, ObservationLane};
 use crate::plugin_observation::{CALL_WAIT, service_id};
 
@@ -133,7 +135,7 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
     let mut link = Link {
         request,
         client: None,
-        registered: BTreeSet::new(),
+        registered: BTreeMap::new(),
         refused: BTreeMap::new(),
         pace: Pacing::default(),
         last_reason: None,
@@ -162,8 +164,10 @@ impl Drop for AbortOnDrop {
 struct Link {
     request: RuntimeRequest,
     client: Option<Arc<PluginClient>>,
-    /// The bindings registered on `client`.
-    registered: BTreeSet<BrokerBindingId>,
+    /// The bindings registered on `client`, each with the source generation of its instance when it
+    /// was registered: the component holds what it was offered since, whichever generation the
+    /// instance has reached.
+    registered: BTreeMap<BrokerBindingId, u64>,
     /// The bindings the runtime refused on `client`, and when each may be offered again.
     refused: BTreeMap<BrokerBindingId, Refusal>,
     /// When the runtime may next be reached for.
@@ -304,7 +308,15 @@ impl Link {
 
         // What is registered and no longer wanted is unbound: its binding ended, was forgotten or
         // lost its rich capabilities, and the instance it holds in the runtime goes with it.
-        let gone: Vec<BrokerBindingId> = self.registered.difference(&wanted).copied().collect();
+        let gone: Vec<BrokerBindingId> = self
+            .registered
+            .keys()
+            .filter(|binding| !wanted.contains(binding))
+            .copied()
+            .collect();
+        // A binding that ended while the runtime was lost has no registration to unbind, and its
+        // view and held state are forgotten here.
+        self.lane.forget_unwanted(&wanted);
         for binding_id in gone {
             let Some(client) = self.client.as_ref() else {
                 self.registered.clear();
@@ -341,7 +353,7 @@ impl Link {
         let pending: Vec<&ComponentWant> = wants
             .iter()
             .filter(|want| {
-                !self.registered.contains(&want.binding_id)
+                !self.registered.contains_key(&want.binding_id)
                     && self
                         .refused
                         .get(&want.binding_id)
@@ -410,7 +422,7 @@ impl Link {
                 .await;
             match registered {
                 Ok(registration) => {
-                    self.registered.insert(want.binding_id);
+                    self.registered.insert(want.binding_id, want.generation);
                     self.refused.remove(&want.binding_id);
                     if let Some(strong) = broker.upgrade() {
                         strong.note_component(
@@ -637,10 +649,12 @@ impl Link {
                 if let Some(broker) = broker.upgrade() {
                     broker.note_component(
                         BrokerBindingId::new(binding_id),
-                        ComponentNote::Fault(format!(
-                            "last fault, in {call}: {detail} ({faults_in_window} in the last \
-                             minute)"
-                        )),
+                        ComponentNote::Fault(FaultNote {
+                            call: call.to_string(),
+                            detail,
+                            faults_in_window,
+                            in_privacy: self.lane.is_private(),
+                        }),
                     );
                 }
             }
@@ -657,7 +671,7 @@ impl Link {
                         BrokerBindingId::new(binding_id),
                         ComponentNote::Loss(format!(
                             "the plugin runtime's queue dropped {events} observations ({bytes} \
-                             bytes) and the component took a fresh snapshot"
+                             bytes) and asked the component for a fresh snapshot"
                         )),
                     );
                 }
@@ -668,12 +682,13 @@ impl Link {
     }
 
     /// Makes a binding ready to be offered observations: its held checkpoint restored where it has
-    /// one, and the snapshot after the restore answered.
+    /// one.
     ///
     /// The observations between the checkpoint and this registration were not replayed, so a
-    /// restore is a loss, and the component is taken through a snapshot before it is offered
-    /// anything. A restore the component refuses leaves it as the registration made it, started
-    /// again from the live point.
+    /// restore is a loss: it is numbered, and the pump takes the snapshot it owes before it offers
+    /// the component anything. A restore the component does not answer is a loss too, since the
+    /// component may hold some of the state it was given, and the snapshot rebuilds its view from
+    /// whatever it holds.
     ///
     /// # Errors
     ///
@@ -691,41 +706,28 @@ impl Link {
             .lane
             .take_held(binding, want.package_digest, want.generation);
         if let Some(held) = held {
-            let what =
-                "the component's state was restored from a checkpoint, and the observations \
-                 since it was taken were not replayed"
-                    .to_owned();
-            let owed = self.lane.lose_unready(binding, what.clone());
             let restored = client
                 .restore(service_id(binding), held.state, CALL_WAIT)
                 .await;
-            match restored {
+            let note = match restored {
                 Ok(called) if called.answered() => {
-                    match client.snapshot(service_id(binding), CALL_WAIT).await {
-                        Ok(_) => {
-                            self.lane.snapshot_answered(binding, owed);
-                        }
-                        Err(ServiceError::Unavailable { detail }) => {
-                            return Err(ServiceError::Unavailable { detail });
-                        }
-                        // The pump asks again before it offers anything.
-                        Err(_) => {}
-                    }
-                    if let Some(strong) = broker.upgrade() {
-                        strong.note_component(
-                            binding,
-                            ComponentNote::Loss(format!("{what}; a fresh snapshot was taken")),
-                        );
-                    }
+                    "the component's state was restored from a checkpoint, and the observations \
+                     since it was taken were not replayed"
                 }
                 Err(ServiceError::Unavailable { detail }) => {
                     return Err(ServiceError::Unavailable { detail });
                 }
-                // Refused, faulted or not reached in time: the component is as the registration
-                // made it, and has nothing of the earlier state to be taken through a snapshot.
                 Ok(_) | Err(_) => {
-                    self.lane.snapshot_answered(binding, owed);
+                    "the component's state could not be restored from a checkpoint, and the \
+                     observations since it was taken were not replayed"
                 }
+            };
+            self.lane.lose_unready(binding, note.to_owned());
+            if let Some(strong) = broker.upgrade() {
+                strong.note_component(
+                    binding,
+                    ComponentNote::Loss(format!("{note}; a fresh snapshot is owed")),
+                );
             }
         }
         self.lane.set_ready(binding, true);
@@ -768,16 +770,21 @@ impl Link {
         if let Some(binding) = self.lane.checkpoint_due(now).into_iter().next() {
             self.lane.checkpoint_attempted(binding, now);
             let want = wants.iter().find(|want| want.binding_id == binding);
+            let generation = self.registered.get(&binding).copied();
+            let epoch = self.lane.privacy_epoch();
             match client.checkpoint(service_id(binding), CALL_WAIT).await {
                 Ok(called) => {
-                    if let (Some(state), Some(want)) = (called.state, want) {
+                    if let (Some(state), Some(want), Some(generation)) =
+                        (called.state, want, generation)
+                    {
                         self.lane.hold(
                             binding,
                             Held {
                                 package_digest: want.package_digest,
-                                generation: want.generation,
+                                generation,
                                 state,
                             },
+                            epoch,
                         );
                     }
                 }
@@ -806,7 +813,7 @@ impl Link {
         self.lane.all_not_ready();
         self.health_due = None;
         self.health_failures = 0;
-        for binding_id in std::mem::take(&mut self.registered) {
+        for binding_id in std::mem::take(&mut self.registered).into_keys() {
             report(
                 broker,
                 binding_id,

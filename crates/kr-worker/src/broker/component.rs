@@ -79,15 +79,52 @@ pub struct ComponentNotes {
     /// What the component has missed.
     pub loss: Option<String>,
     /// The last time a call into it faulted.
-    pub fault: Option<String>,
+    pub fault: Option<FaultNote>,
+}
+
+/// A fault in a call into a component, as the runtime reported it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FaultNote {
+    /// Which call faulted.
+    pub call: String,
+    /// The runtime's words, which the component chose in part.
+    pub detail: String,
+    /// How many faults the binding has had in the last minute.
+    pub faults_in_window: u32,
+    /// Whether privacy mode was on when it happened.
+    pub in_privacy: bool,
+}
+
+impl FaultNote {
+    fn text(&self, private: bool) -> String {
+        if self.in_privacy || private {
+            // What a component says in a fault can be made of what it was offered, so while privacy
+            // mode is on, and for a fault that happened in it, only the metadata is told.
+            format!(
+                "last fault, in {} ({} in the last minute); the runtime's words are withheld for \
+                 privacy mode",
+                self.call, self.faults_in_window
+            )
+        } else {
+            format!(
+                "last fault, in {}: {} ({} in the last minute)",
+                self.call, self.detail, self.faults_in_window
+            )
+        }
+    }
 }
 
 impl ComponentNotes {
-    fn text(&self) -> Option<String> {
-        let parts: Vec<&str> = [&self.registration, &self.loss, &self.fault]
-            .into_iter()
-            .filter_map(|part| part.as_deref())
-            .collect();
+    fn text(&self, private: bool) -> Option<String> {
+        let fault = self.fault.as_ref().map(|fault| fault.text(private));
+        let parts: Vec<&str> = [
+            self.registration.as_deref(),
+            self.loss.as_deref(),
+            fault.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         (!parts.is_empty()).then(|| parts.join("; "))
     }
 }
@@ -100,7 +137,7 @@ pub enum ComponentNote {
     /// What the component has missed.
     Loss(String),
     /// A fault in a call into the component.
-    Fault(String),
+    Fault(FaultNote),
     /// None of them: the binding is registered again, or gone.
     Clear,
 }
@@ -168,9 +205,10 @@ pub(super) fn report_of(
     binding: &Binding,
     reported: Option<&(ComponentState, Option<String>)>,
     notes: Option<&ComponentNotes>,
+    private: bool,
 ) -> Option<ComponentReport> {
     let component = binding.component.as_ref()?;
-    let noted = notes.and_then(ComponentNotes::text);
+    let noted = notes.and_then(|notes| notes.text(private));
     let (state, reason) = if let Some(refusal) = component.refusal.as_ref() {
         (ComponentState::Unavailable, Some(refusal.clone()))
     } else if let Some(why) = binding.rich_disabled.as_ref() {
