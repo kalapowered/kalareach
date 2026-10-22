@@ -90,6 +90,8 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     expect(offers.compareDocumentPosition(filters) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   })
 
+  // KR-REQ-10.42, the part about labels: the card says terminal input runs as the owner’s account
+  // and that what the person sends the agent is input it may act on under its own permissions.
   it('is opened as a card that says what accepting lets the phone do, show and until when', async () => {
     start({ before: (c) => c.sharing.offer({ role: 'controller', live: true }) })
     await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
