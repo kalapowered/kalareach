@@ -6,7 +6,7 @@ use kr_protocol::envelope::{ControlFrame, ParamsValue, Request};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::{ActorId, EnvironmentId, SessionId};
-use kr_protocol::scalars::{Nullable, U64};
+use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 use kr_protocol::session::{
     ClosureRecord, SessionListParams, SessionListResult, SessionReadParams, SessionReadResult,
     SessionState, SessionSummary,
@@ -217,6 +217,56 @@ impl Controller {
             params.max_bytes.get(),
         )?;
         encode(&page)
+    }
+
+    /// Serves when a closed session's retained output was produced, between two cursors.
+    ///
+    /// The index is a file the session's worker left, read like the spool: a session whose worker
+    /// is alive is refused, and nothing is created. A session with no index, or one this host
+    /// cannot read, is answered with no intervals and the reason, so that a reader says its output
+    /// carries no time rather than giving it one.
+    pub(super) async fn archive_history_times(
+        self: &Arc<Self>,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::recovery::HistoryTimesParams = parse(params)?;
+        self.refuse_if_live(params.session_id).await?;
+        let archive = self.archive();
+        let (from, to) = (params.from_cursor.get(), params.to_cursor.get());
+        let read = tokio::task::spawn_blocking(move || {
+            archive.history_times(
+                params.session_id,
+                from,
+                to,
+                usize::try_from(kr_protocol::recovery::MAX_HISTORY_TIMES).unwrap_or(usize::MAX),
+            )
+        })
+        .await
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let answer = match read {
+            Ok(times) => kr_protocol::recovery::HistoryTimesResult {
+                intervals: times
+                    .marks
+                    .iter()
+                    .map(|mark| kr_protocol::recovery::OutputTime {
+                        from_cursor: U64::new(mark.from),
+                        to_cursor: U64::new(mark.to),
+                        at_ms: TimestampMs::new(mark.at_ms),
+                        proven: mark.proven,
+                    })
+                    .collect(),
+                next_cursor: U64::new(times.next_cursor),
+                complete: times.complete,
+                unavailable: Nullable::null(),
+            },
+            Err(why) => kr_protocol::recovery::HistoryTimesResult {
+                intervals: Vec::new(),
+                next_cursor: U64::new(to),
+                complete: true,
+                unavailable: Nullable::some(why.describe()),
+            },
+        };
+        encode(&answer)
     }
 
     /// Answers `action.read` for a catalogue action this actor performed, where there is one.

@@ -277,6 +277,7 @@ impl Controller {
             // them with no worker. A live session's are its worker's, and this daemon says which
             // endpoint to ask rather than reading another process's journal behind its back.
             Method::HistoryPage => self.archive_history_page(&request.params).await,
+            Method::HistoryTimes => self.archive_history_times(&request.params).await,
             Method::ActionRead => {
                 // A receipt of an action this host performed itself names no session and is kept
                 // by the service that performed it. The catalogue's are answered from there, for
