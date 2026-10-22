@@ -200,6 +200,10 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("recovery_turn_on", None),
     ("recovery_settle", None),
     ("recovery_save_kit", None),
+    // Covering the host on this computer with this computer's recovery. The page supplies nothing
+    // but whether a replacement is asked for; native code reads the host's status, builds the call
+    // from this computer's own seed and bundle, and sends it to the host.
+    ("recovery_cover_host", None),
     // The person's settings: the colour mode now, and keeping it in step with their other devices.
     // None is a host method. The page names a mode from a closed set and is told where things
     // stand; it holds no copy of its own and is given no key, identity or token.
@@ -265,6 +269,12 @@ pub const SESSION_BOUND_COMMANDS: &[&str] = &[
 /// `owner.confirmation.complete` appears only under `owner_confirmation_review`, and `pair.finish`
 /// and `pair.redeem` only under the two starts.
 pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
+    // Covering the host on this computer with this computer's recovery: the host's status is read,
+    // and the host is set up under this computer's recovery with a bundle this computer sealed.
+    (
+        "recovery_cover_host",
+        &[Method::BackupStatus, Method::BackupEnable],
+    ),
     (
         "pairing_start_code",
         &[
@@ -595,6 +605,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         recovery_turn_on,
         recovery_settle,
         recovery_save_kit,
+        recovery_cover_host,
         settings_view,
         settings_colour_mode_set,
         settings_sync_turn_on,
@@ -3427,6 +3438,7 @@ mod tests {
         "recovery_turn_on",
         "recovery_settle",
         "recovery_save_kit",
+        "recovery_cover_host",
         "settings_view",
         "settings_colour_mode_set",
         "settings_sync_turn_on",
@@ -3565,11 +3577,14 @@ mod tests {
                 "account_sign_out",
                 "account_status",
                 "account_usage",
-                // The sync service setting's two and recovery's four. The setting is one origin
+                // The sync service setting's two and recovery's five. The setting is one origin
                 // kept on this computer; recovery's seed is made, kept and written by native code,
-                // and a kit is written only where a save dialog put it.
+                // and a kit is written only where a save dialog put it. The fifth covers the host
+                // on this computer: it performs methods of its own (see `NATIVE_METHODS`) and the
+                // page names only whether a replacement is asked for.
                 "sync_service_set",
                 "sync_service_view",
+                "recovery_cover_host",
                 "recovery_save_kit",
                 "recovery_settle",
                 "recovery_turn_on",
@@ -3677,6 +3692,7 @@ mod tests {
             Method::OwnerConfirmationRequest,
             Method::GrantTransfer,
             Method::DeviceRevoke,
+            Method::BackupEnable,
         ] {
             assert!(!page.contains(&method), "{method} is a page method");
         }
@@ -4382,6 +4398,33 @@ pub async fn recovery_settle(
     account: State<'_, crate::account::AccountSlot>,
 ) -> Result<crate::recovery::RecoveryView> {
     state.recovery()?.settle(account.get().await?).await
+}
+
+/// Covers the host on this computer with this computer's recovery, or says why it cannot.
+///
+/// The page says only whether a replacement is asked for. The host's status is read over the
+/// connection to the host on this computer, the bundle is committed naming the host's archive, and
+/// the host is set up under this computer's recovery with the bytes that landed; nothing the kit
+/// opens, no key and no locator reaches the page.
+#[tauri::command]
+pub async fn recovery_cover_host(
+    state: State<'_, AppState>,
+    account: State<'_, crate::account::AccountSlot>,
+    replace: bool,
+) -> Result<crate::recovery::HostCoverView> {
+    let connection = state.connection()?;
+    if !matches!(connection.standing(), crate::connection::Standing::Owner) {
+        return Err(CommandError::refused(
+            "recovery covers the host on this computer, and this application is connected to \
+             another host",
+        ));
+    }
+    let host =
+        kr_client::recovery::SessionHost::new(connection.session(), connection.environment_id());
+    state
+        .recovery()?
+        .cover_host(account.get().await?, &host, replace)
+        .await
 }
 
 /// Writes the recovery kit to the file the person chose.
