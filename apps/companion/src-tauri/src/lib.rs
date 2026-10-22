@@ -354,8 +354,8 @@ fn build_account(
 
 /// Lets go of what a phone read and has not used when the application stops being in front: the
 /// invitation held for the person, and an intake that waits for the answer to the alert. The event
-/// is the platform's (`applicationWillResignActive`, `onPause`); nothing in the page can produce it.
-#[cfg(mobile)]
+/// is the platform's (`onPause` on Android); nothing in the page can produce it.
+#[cfg(target_os = "android")]
 fn watch_suspension(app: &tauri::AppHandle) {
     use tauri::Manager as _;
 
@@ -368,6 +368,25 @@ fn watch_suspension(app: &tauri::AppHandle) {
                 device.suspend();
             }
         });
+    }
+}
+
+/// The same on iOS, where the window's `Suspended` event is raised at `applicationWillResignActive`,
+/// which iOS also sends for the Control Center, the Notification Center and the system's own
+/// questions: a person who turns on Wi-Fi in the middle of pairing has not left, and the invitation
+/// they scanned stays. The platform plugin says when the application goes to the background.
+#[cfg(target_os = "ios")]
+fn watch_suspension(app: &tauri::AppHandle) {
+    use tauri::Manager as _;
+
+    let handle = app.clone();
+    let watching = companion_platform::scan::on_background(app, move || {
+        if let Ok(device) = handle.state::<AppState>().device() {
+            device.suspend();
+        }
+    });
+    if let Err(error) = watching {
+        tracing::warn!(%error, "the application's going to the background cannot be heard, so what a phone read stays until it is used");
     }
 }
 
