@@ -1215,3 +1215,101 @@ pub fn supersede(mutation: &mut MutationRequest, earlier: &Receipt) {
         .expect("another key");
     mutation.expected = ParamsValue::new(kr_cbor::CanonicalValue::Map(expected));
 }
+
+/// A paired device, as the daemon vouches for it to a worker whose daemon is of `generation`, with
+/// a grant it checked at authority revision 1.
+pub fn a_paired_device(
+    generation: kr_protocol::ids::ControllerGeneration,
+) -> kr_protocol::actor::ActorEnvelope {
+    kr_protocol::actor::ActorEnvelope {
+        actor_id: kr_protocol::ids::ActorId::new("device:a-test-phone").expect("an actor"),
+        ingress: kr_protocol::actor::ActorIngress::PairedDevice,
+        device_id: Nullable::some(kr_protocol::ids::DeviceId::new(Uuid::from_bytes([9; 16]))),
+        grant_id: Nullable::some(kr_protocol::ids::GrantId::new(Uuid::from_bytes([8; 16]))),
+        grant_revision: Nullable::some(kr_protocol::ids::AuthorityRevision::new(1)),
+        controller_generation: generation,
+        connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([7; 16])),
+    }
+}
+
+/// The daemon's announcement to the worker of authority revision `revision`, over its authority
+/// connection, which the worker acknowledges.
+pub async fn announce(authority: &mut kr_ipc::client::BoundLink, acting: &Acting, revision: u64) {
+    authority
+        .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
+            environment_id: acting.hosted.environment_id,
+            revision: kr_protocol::ids::AuthorityRevision::new(revision),
+            reach: kr_protocol::worker::RevisionReach::Host,
+            evidence_from: 0,
+        })
+        .await
+        .expect("the worker installs the revision");
+}
+
+/// A remote dispatch lease of the worker's generation for revision `revision` that ends `ms` from
+/// now on the machine's clock.
+pub fn a_lease(acting: &Acting, revision: u64, ms: u64) -> kr_protocol::local::ForwardedLease {
+    kr_protocol::local::ForwardedLease {
+        lease_id: kr_protocol::ids::RemoteDispatchLeaseId::new(kr_ipc::new_uuid()),
+        controller_generation: acting.hosted.controller_generation,
+        authority_revision: kr_protocol::ids::AuthorityRevision::new(revision),
+        deadline_boot_ms: kr_protocol::scalars::U64::new(kr_ipc::clock::boot_elapsed_ms() + ms),
+    }
+}
+
+/// Reads `action_id`'s receipt for the device over its proxy, as the daemon reads it for the
+/// device, or nothing where the worker has none to show.
+pub async fn the_devices_receipt(
+    proxy: &mut kr_ipc::client::BoundLink,
+    device: &kr_protocol::actor::ActorEnvelope,
+    action_id: ActionId,
+) -> Option<Receipt> {
+    proxy
+        .send(&ControlFrame::ForwardedRead(Box::new(
+            kr_protocol::local::ForwardedRequest {
+                request: kr_protocol::envelope::Request {
+                    request_id: RequestId::new(900),
+                    method: Method::ActionRead.into(),
+                    method_version: MethodVersion::V1,
+                    params: ParamsValue::from_typed(&ActionReadParams {
+                        action_id,
+                        session_id: None,
+                    })
+                    .expect("encodes"),
+                },
+                actor: device.clone(),
+                authority_deadline_boot_ms: Nullable::null(),
+                history: None,
+            },
+        )))
+        .await
+        .expect("writes the read");
+    match answer(proxy, Some(900)).await {
+        Outcome::Ok(value) => Some(
+            value
+                .to_typed::<ActionReadResult>()
+                .expect("decodes")
+                .receipt,
+        ),
+        Outcome::Error(_) => None,
+    }
+}
+
+/// Reads `action_id`'s receipt for the device over its proxy until it is in `state`, which for
+/// `accepted` is when the daemon's action is waiting for its component.
+pub async fn until_the_devices_receipt_is(
+    proxy: &mut kr_ipc::client::BoundLink,
+    device: &kr_protocol::actor::ActorEnvelope,
+    action_id: ActionId,
+    state: ReceiptState,
+) -> Receipt {
+    for _ in 0..2_400 {
+        if let Some(receipt) = the_devices_receipt(proxy, device, action_id).await
+            && receipt.state == state
+        {
+            return receipt;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the forwarded action's receipt never read {state:?}");
+}

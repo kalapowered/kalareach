@@ -37,8 +37,8 @@ use kr_protocol::scalars::{DurationMs, Nullable, Uuid};
 mod plugin_world;
 
 use plugin_world::acting::{
-    ACTIONS, Acting, Change, answer, binding, read_receipt, send, signal, until_receipt,
-    until_settled,
+    ACTIONS, Acting, Change, a_lease, a_paired_device, announce, answer, binding, read_receipt,
+    send, signal, until_receipt, until_settled, until_the_devices_receipt_is,
 };
 use plugin_world::{PATIENCE, kill};
 
@@ -487,77 +487,6 @@ async fn kr_req_23_30_an_authority_revision_announced_while_the_component_prepar
     );
 }
 
-/// A paired device, as the daemon vouches for it to a worker whose daemon is of `generation`, with
-/// a grant it checked at authority revision 1.
-fn a_paired_device(generation: ControllerGeneration) -> kr_protocol::actor::ActorEnvelope {
-    kr_protocol::actor::ActorEnvelope {
-        actor_id: kr_protocol::ids::ActorId::new("device:a-test-phone").expect("an actor"),
-        ingress: kr_protocol::actor::ActorIngress::PairedDevice,
-        device_id: Nullable::some(kr_protocol::ids::DeviceId::new(Uuid::from_bytes([9; 16]))),
-        grant_id: Nullable::some(kr_protocol::ids::GrantId::new(Uuid::from_bytes([8; 16]))),
-        grant_revision: Nullable::some(kr_protocol::ids::AuthorityRevision::new(1)),
-        controller_generation: generation,
-        connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([7; 16])),
-    }
-}
-
-/// The daemon's announcement to the worker of authority revision `revision`, over its authority
-/// connection, which the worker acknowledges.
-async fn announce(authority: &mut kr_ipc::client::BoundLink, acting: &Acting, revision: u64) {
-    authority
-        .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
-            environment_id: acting.hosted.environment_id,
-            revision: kr_protocol::ids::AuthorityRevision::new(revision),
-            reach: kr_protocol::worker::RevisionReach::Host,
-            evidence_from: 0,
-        })
-        .await
-        .expect("the worker installs the revision");
-}
-
-/// Reads `action_id`'s receipt for the device over its proxy until it is `accepted`, which is
-/// when the daemon's action is waiting for its component.
-async fn until_the_devices_action_is_accepted(
-    proxy: &mut kr_ipc::client::BoundLink,
-    device: &kr_protocol::actor::ActorEnvelope,
-    action_id: ActionId,
-) {
-    for _ in 0..2_400 {
-        proxy
-            .send(&ControlFrame::ForwardedRead(Box::new(
-                kr_protocol::local::ForwardedRequest {
-                    request: kr_protocol::envelope::Request {
-                        request_id: RequestId::new(900),
-                        method: Method::ActionRead.into(),
-                        method_version: MethodVersion::V1,
-                        params: ParamsValue::from_typed(&ActionReadParams {
-                            action_id,
-                            session_id: None,
-                        })
-                        .expect("encodes"),
-                    },
-                    actor: device.clone(),
-                    authority_deadline_boot_ms: Nullable::null(),
-                    history: None,
-                },
-            )))
-            .await
-            .expect("writes the read");
-        if let Outcome::Ok(value) = answer(proxy, Some(900)).await
-            && value
-                .to_typed::<ActionReadResult>()
-                .expect("decodes")
-                .receipt
-                .state
-                == ReceiptState::Accepted
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("the forwarded action was never accepted");
-}
-
 /// KR-REQ-23.30 and KR-REQ-09.12: an action the daemon forwarded for a paired device, revoked
 /// while its component prepares it, is answered to the daemon with the rejected receipt, and
 /// nothing is written to the upstream.
@@ -607,7 +536,7 @@ async fn kr_req_23_30_a_forwarded_action_revoked_while_the_component_prepared_is
     // The action is accepted and being prepared when the daemon revokes what its device held: it
     // announces the next authority revision over the connection it holds the worker's authority
     // by. The device reads its own receipt through the daemon to know.
-    until_the_devices_action_is_accepted(&mut proxy, &device, action_id).await;
+    until_the_devices_receipt_is(&mut proxy, &device, action_id, ReceiptState::Accepted).await;
     announce(&mut authority, &acting, 2).await;
     signal(&host, rustix::process::Signal::CONT);
     // A retained answer, which the daemon holds back from a device whose authority has moved: a
@@ -635,17 +564,6 @@ async fn kr_req_23_30_a_forwarded_action_revoked_while_the_component_prepared_is
         "nothing was written to the upstream: {:?}",
         acting.frames()
     );
-}
-
-/// A remote dispatch lease of the worker's generation for revision `revision` that ends `ms` from
-/// now on the machine's clock.
-fn a_lease(acting: &Acting, revision: u64, ms: u64) -> kr_protocol::local::ForwardedLease {
-    kr_protocol::local::ForwardedLease {
-        lease_id: kr_protocol::ids::RemoteDispatchLeaseId::new(kr_ipc::new_uuid()),
-        controller_generation: acting.hosted.controller_generation,
-        authority_revision: kr_protocol::ids::AuthorityRevision::new(revision),
-        deadline_boot_ms: kr_protocol::scalars::U64::new(kr_ipc::clock::boot_elapsed_ms() + ms),
-    }
 }
 
 /// KR-REQ-09.10: the lease a paired device's action was accepted under is checked again when it
@@ -696,7 +614,7 @@ async fn kr_req_09_10_a_lease_that_ends_while_the_component_prepared_rejects_the
         .await
         .expect("writes the forwarded mutation");
     // The action is accepted, and its lease is good: it waits for its component.
-    until_the_devices_action_is_accepted(&mut proxy, &device, action_id).await;
+    until_the_devices_receipt_is(&mut proxy, &device, action_id, ReceiptState::Accepted).await;
     // Only the lease ends: the clock passes it, and the accepted deadline has twenty-six seconds.
     clock.advance(Duration::from_secs(4));
     signal(&host, rustix::process::Signal::CONT);
