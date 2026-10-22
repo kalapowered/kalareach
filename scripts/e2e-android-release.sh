@@ -8,13 +8,17 @@
 #
 #   an issuer the system does not trust   The application is pointed at a local TLS server whose
 #                          certificate a private authority issued, and attempts a code. The server
-#                          records the TCP connection, the ClientHello, the fatal alert the phone
-#                          sent and the requests that reached it: the phone sends the alert after the
-#                          server's hello and no request arrives. This is the refusal of an issuer
-#                          the system does not trust, not of a name that does not match: the emulator's
-#                          Play image has no root, and a release build trusts no authority a person
-#                          adds. The name check is the shared Rust code the client library's own
-#                          case holds on the desktop.
+#                          records the TCP connection, the ClientHello, how the phone ended the
+#                          handshake (a TLS alert, or a closed connection: either is a refusal, and
+#                          neither says why) and the requests that reached it: the phone ends the
+#                          handshake after the server's hello and no request arrives. This is the
+#                          refusal of an issuer the system does not trust, not of a name that does
+#                          not match: the emulator's Play image has no root, and a release build
+#                          trusts no authority a person adds. The name check is the shared Rust code
+#                          the client library's own case holds on the desktop. A build that lost
+#                          the verifier ends the handshake the same way, so what tells the two apart
+#                          is the public origin below, whose certificate only a working verifier
+#                          accepts.
 #   the deployed room      One attempt with a code no host holds (an unknown locator) at the deployed
 #                          service. The room admits a socket for any locator and gives an unknown
 #                          one the same timeout and error shape as a known one, so the attempt
@@ -159,7 +163,7 @@ say "the package defines $retained entries of the platform verifier"
 # What the package carries for the verifier's revocation check (a release build allows no cleartext
 # traffic): its network security configuration.
 package_status=0
-"$here/scripts/check-android-release-package.sh" "$apk" | tee -a "$log" || package_status=$?
+python3 "$here/scripts/lib/android-network-config.py" release "$apk" | tee -a "$log" || package_status=$?
 
 # ---- The host --------------------------------------------------------------------------------
 
@@ -266,19 +270,24 @@ if seen["accepted"] < 1:
     problems.append("the phone never connected")
 if seen["client_hellos"] < 1:
     problems.append("the server read no ClientHello")
-if not seen["alerts"]:
-    problems.append("the phone sent no fatal alert")
+ended = seen["alerts"] + seen["closed"]
+if not ended:
+    problems.append("the phone did not end the handshake")
 if seen["handshakes"] != 0:
     problems.append("a handshake completed")
 if seen["request_bytes"] != 0:
     problems.append("a request reached the server")
-print("; ".join(problems) if problems else "ok " + ",".join(seen["alerts"]))
+print(
+    "; ".join(problems)
+    if problems
+    else "ok " + ", ".join([f"alert {each}" for each in seen["alerts"]] + [f"closed {each}" for each in seen["closed"]])
+)
 PY
 )"
 if [ "${verdict%% *}" = ok ]; then
-    say "check=the phone refused the untrusted issuer after the server's hello, and no request arrived ok=1 detail=${verdict#ok }"
+    say "check=the phone ended the handshake with the untrusted issuer after the server's hello, and no request arrived ok=1 detail=${verdict#ok }"
 else
-    say "check=the phone refused the untrusted issuer after the server's hello, and no request arrived ok=0 detail=$verdict"
+    say "check=the phone ended the handshake with the untrusted issuer after the server's hello, and no request arrived ok=0 detail=$verdict"
     status=2
 fi
 checks=("the application admitted the attempt at the deployed service" "the application could not reach the local server")

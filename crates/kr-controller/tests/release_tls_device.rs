@@ -4,10 +4,12 @@
 //! (`scripts/e2e-android-release.sh`) beside the installed, minified release build, so it is ignored
 //! in an ordinary run. The server speaks TLS on the loopback interface with a certificate that a
 //! private authority issued, and the emulator's system trusts no such authority. A phone whose
-//! platform verifier works refuses the certificate: it sends a fatal alert after the server's
-//! hello and before anything else, and no request of any kind reaches the server. A phone whose
-//! verifier was lost to the build's shrinking could not refuse it for that reason, and the
-//! application would not get as far as asking.
+//! platform verifier works refuses the certificate: it ends the handshake after the server's hello
+//! and before anything else, and no request of any kind reaches the server. Whether the end came as
+//! a TLS alert or as a closed connection is recorded apart, and either is a refusal here; neither
+//! says why the phone refused. A phone whose verifier was lost to the build's shrinking ends the
+//! handshake the same way, so this case does not tell the two apart: the public origin the run also
+//! attempts does, since only a working verifier accepts its certificate.
 //!
 //! What this shows, and what it does not. The emulator's Play image has no root, and a release build
 //! trusts no authority a person adds, so a certificate for another host cannot be made to chain to a
@@ -19,8 +21,9 @@
 //! The script talks to this suite through files in `KR_HARNESS_DIR`: the suite writes
 //! `tls-listening.json` with the port, and writes `tls-control.json` again after every connection;
 //! the script ends the suite by creating `finish`. The record holds the TCP connections accepted,
-//! the ClientHellos read (with the name each asked for), the fatal alerts the client sent, the
-//! handshakes that completed, and the bytes of application data that arrived after one: a request.
+//! the ClientHellos read (with the name each asked for), the handshakes the client ended (a TLS
+//! alert it sent, or a connection it closed), the handshakes that completed, and the bytes of
+//! application data that arrived after one: a request.
 
 #![cfg(unix)]
 
@@ -40,8 +43,11 @@ struct Seen {
     /// ClientHellos read, and the name each one asked for (empty for an address).
     client_hellos: usize,
     server_names: Vec<String>,
-    /// The fatal alerts the client sent, by name, in the order they came.
+    /// The TLS alerts the client sent while it ended a handshake, by name, in the order they came.
     alerts: Vec<String>,
+    /// How each other handshake the client ended was seen from here (a closed connection, an
+    /// I/O error), in the order they came: the client said nothing a TLS alert would carry.
+    closed: Vec<String>,
     /// Handshakes that completed.
     handshakes: usize,
     /// Bytes of application data the client sent after a handshake: any is a request.
@@ -151,12 +157,19 @@ async fn serve(
             }
         }
         Err(error) => {
-            // The client's alert reaches the server as a TLS error wrapped in an I/O error.
-            let alert = error
+            // A client's alert reaches the server as a TLS error wrapped in an I/O error; a client
+            // that closes the connection instead reaches it as an end of file.
+            let mut record = seen.lock().expect("the record");
+            match error
                 .get_ref()
                 .and_then(|inner| inner.downcast_ref::<rustls::Error>())
-                .map_or_else(|| format!("{error}"), |error| format!("{error:?}"));
-            seen.lock().expect("the record").alerts.push(alert);
+            {
+                Some(rustls::Error::AlertReceived(alert)) => {
+                    record.alerts.push(format!("{alert:?}"))
+                }
+                Some(other) => record.closed.push(format!("{other:?}")),
+                None => record.closed.push(format!("{error}")),
+            }
         }
     }
     publish(&seen.lock().expect("the record").clone());
