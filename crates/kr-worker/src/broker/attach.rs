@@ -1294,7 +1294,7 @@ mod tests {
     /// are the recording's own, so the case holds what each has to be and not its value.
     #[test]
     fn the_hello_a_forwarder_of_the_release_before_wrote_is_read_as_it_always_was() {
-        const RECORDED: &[u8] = include_bytes!("../../tests/fixtures/bridge-hello-0.75.json");
+        const RECORDED: &[u8] = include_bytes!("../../tests/fixtures/bridge-hello-0.76.json");
 
         let frame: FirstFrameWire = serde_json::from_slice(RECORDED.trim_ascii_end())
             .expect("the recorded hello is a first frame");

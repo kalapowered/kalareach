@@ -1,0 +1,8 @@
+endpoint=/tmp/kr-t-level-2-neutral-k/kr-700390c7/launch/a-3b3b67aa8600.sock
+profile=lp-1792671331675-52ab4ce7-b800-4829-80bd-f47bc7cae52c
+instance=8be0ab2c-6808-4d77-b960-96952a5b1f67
+pid=2459443
+start=257308659
+credential=/tmp/kr-t-level-2-neutral-k/kr-700390c7/launch/credential
+release=0.76.0+000d659e7683
+framing=json_lines

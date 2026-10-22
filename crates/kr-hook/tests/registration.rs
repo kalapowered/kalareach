@@ -398,7 +398,7 @@ fn wait(relay: &mut std::process::Child) -> std::process::ExitStatus {
 #[cfg(unix)]
 #[test]
 fn the_registration_a_worker_of_the_release_before_wrote_is_read_whole_and_names_its_release() {
-    const RECORDED: &str = include_str!("fixtures/registration-0.75.txt");
+    const RECORDED: &str = include_str!("fixtures/registration-0.76.txt");
 
     assert!(
         kr_hook::registration::whole(RECORDED),
@@ -443,7 +443,7 @@ fn the_registration_a_worker_of_the_release_before_wrote_is_read_whole_and_names
 #[cfg(unix)]
 #[test]
 fn the_hello_this_forwarder_writes_has_the_members_of_the_one_the_release_before_wrote() {
-    const RECORDED: &str = include_str!("../../kr-worker/tests/fixtures/bridge-hello-0.75.json");
+    const RECORDED: &str = include_str!("../../kr-worker/tests/fixtures/bridge-hello-0.76.json");
 
     let launch = Launch::new();
     launch.publish(&launch.whole("/run/kr/e/p.sock"));
