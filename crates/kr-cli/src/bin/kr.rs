@@ -1989,6 +1989,7 @@ fn read_result(
                 launch_profile: Nullable::null(),
                 last_command_block: Nullable::null(),
                 outstanding_launches: Nullable::null(),
+                metrics: None,
             }),
             Err(_) => Err(CliError::Other(shown!(
                 "the host's answer could not be read: {}",

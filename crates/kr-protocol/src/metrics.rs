@@ -12,10 +12,11 @@
 //!
 //! # Why a label cannot carry content
 //!
-//! Every label is a closed enumeration. There is no type here that holds a string a caller chose,
-//! so there is nowhere for a line of output, a prompt or a filename to go: a report that tried to
-//! carry one would not parse. Adding a value is a change to this file, to the vector, and to the
-//! service's declaration.
+//! Every label of a report is a closed enumeration, so there is nowhere in one for a line of output,
+//! a prompt or a filename to go: a report that tried to carry one would not parse. The one open
+//! form is [`WorkerMetrics`], the words a worker says its counts in, which the daemon reads against
+//! these lists and leaves out any word they do not have. Adding a value is a change to this file,
+//! to the vector, and to the service's declaration.
 //!
 //! # What these are not
 //!
@@ -71,6 +72,12 @@ macro_rules! closed_label {
                 match self {
                     $(Self::$variant => $text),+
                 }
+            }
+
+            /// Returns the value spelled `text`, where this build has one.
+            #[must_use]
+            pub fn from_wire(text: &str) -> Option<Self> {
+                Self::ALL.iter().copied().find(|value| value.as_str() == text)
             }
         }
     };
@@ -525,6 +532,112 @@ impl MetricsReport {
             reconnect_time: reconnects.into_values().collect(),
             terminal_parse_fault: faults.into_values().collect(),
             adapter_failure: failures.into_values().collect(),
+        }
+    }
+}
+
+/// How many sequences of one class of fault a session's terminal parser has met, as a worker says
+/// it: the class is the word it spells it, which the daemon reads against its own list.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerFaultCount {
+    /// The class of fault.
+    pub fault: String,
+    /// How many.
+    pub count: U64,
+}
+
+/// How many times one adapter has failed in one way, as a worker says it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerAdapterCount {
+    /// The adapter.
+    pub adapter: String,
+    /// How it ended.
+    pub outcome: String,
+    /// How many times.
+    pub count: U64,
+}
+
+/// What a worker tells the daemon that reads it of the host's own metrics, in an open form.
+///
+/// The worker and the daemon are two programs that may be two releases. A label here is a word the
+/// worker spells, and the daemon keeps it only where this build has the word in its own closed
+/// list ([`WorkerMetrics::read`]): a connector the product bundles later, or a class of fault added
+/// later, is a word an older daemon leaves out and an older worker never says, and neither changes
+/// what the two can exchange. The environment a count was made in is the daemon's, not the
+/// worker's to say.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerMetrics {
+    /// Every terminal.parse_fault series.
+    #[serde(default)]
+    pub terminal_parse_fault: Vec<WorkerFaultCount>,
+    /// Every adapter.failure series.
+    #[serde(default)]
+    pub adapter_failure: Vec<WorkerAdapterCount>,
+}
+
+impl WorkerMetrics {
+    /// What a worker says of what it has counted.
+    #[must_use]
+    pub fn of(report: &MetricsReport) -> Self {
+        Self {
+            terminal_parse_fault: report
+                .terminal_parse_fault
+                .iter()
+                .map(|series| WorkerFaultCount {
+                    fault: series.fault.as_str().to_owned(),
+                    count: series.count,
+                })
+                .collect(),
+            adapter_failure: report
+                .adapter_failure
+                .iter()
+                .map(|series| WorkerAdapterCount {
+                    adapter: series.adapter.as_str().to_owned(),
+                    outcome: series.outcome.as_str().to_owned(),
+                    count: series.count,
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether the worker has counted nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.terminal_parse_fault.is_empty() && self.adapter_failure.is_empty()
+    }
+
+    /// What the daemon makes of what a worker said, as counts made in `environment`: every series
+    /// whose words this build has, and none whose words it does not.
+    #[must_use]
+    pub fn read(&self, environment: Environment) -> MetricsReport {
+        MetricsReport {
+            reconnect_time: Vec::new(),
+            terminal_parse_fault: self
+                .terminal_parse_fault
+                .iter()
+                .filter_map(|series| {
+                    Some(ParseFault {
+                        fault: Fault::from_wire(&series.fault)?,
+                        environment,
+                        count: series.count,
+                    })
+                })
+                .collect(),
+            adapter_failure: self
+                .adapter_failure
+                .iter()
+                .filter_map(|series| {
+                    Some(AdapterFailure {
+                        adapter: Adapter::from_wire(&series.adapter)?,
+                        outcome: MetricOutcome::from_wire(&series.outcome)?,
+                        environment,
+                        count: series.count,
+                    })
+                })
+                .collect(),
         }
     }
 }

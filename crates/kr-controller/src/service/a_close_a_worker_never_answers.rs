@@ -234,6 +234,7 @@ pub(super) fn read_result(session_id: SessionId) -> kr_protocol::session::Sessio
         launch_profile: Nullable::null(),
         last_command_block: Nullable::null(),
         outstanding_launches: Nullable::null(),
+        metrics: None,
     }
 }
 
