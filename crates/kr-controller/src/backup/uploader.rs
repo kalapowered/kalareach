@@ -148,9 +148,9 @@ use crate::error::{ControllerError, Result};
 use crate::quiet::{Owed, Quiet};
 
 /// How many descriptors the storage service's manifest keeps for one archive, which is the longest
-/// chain of generations a restore can be offered. The service's own figure; a host keeps no more
-/// than the service names.
-pub const SERVICE_CHAIN_LENGTH: u64 = 16;
+/// chain of generations a restore can be offered: the thirty daily snapshots section 20 keeps. The
+/// service's own figure; a host keeps no more than the service names.
+pub const SERVICE_CHAIN_LENGTH: u64 = 30;
 
 /// How many published generations of its archive this host keeps, from the daily snapshots the
 /// account records: the figure, held between the least a host keeps and the service's chain.
