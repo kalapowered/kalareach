@@ -2503,6 +2503,9 @@ async fn a_lost_lease_ends_control_and_says_so() {
 /// Any other refusal of a write ends control too, whether the stream took the write's number or
 /// not: the view gives its epoch back, and what it wrote is never written again. Control taken again
 /// is a new epoch from the stream's first number.
+/// KR-REQ-09.20, the part about a write that was not delivered: what a refused write carried is
+/// never sent again, and the next take is a new lease epoch with a new sequence, which carries only
+/// what the person types after it.
 #[tokio::test(flavor = "multi_thread")]
 async fn another_refusal_ends_control_and_gives_the_epoch_back() {
     for consumes in [false, true] {
