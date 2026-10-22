@@ -370,24 +370,38 @@ impl Broker {
     ) {
         let mut held = self.state();
         let Some(binding) = held.bindings.get(&binding_id) else {
+            drop(held);
+            // A request waiting for the component of a binding that went may now be given up on.
+            self.decoding.wake();
             return;
         };
         let package = binding.plugin_id.clone();
-        let before = held
-            .component_states
+        held.component_states
             .insert(binding_id, (state, reason.map(str::to_owned)));
+        // The runtime asks again after each refusal, and each asking reports a step on the way
+        // (asking, connecting, registering) before it reports the failure again. What is counted
+        // is the component's failure, once, from the first report of it until the component runs.
+        let began_failing = match state {
+            ComponentState::Unavailable => held.failing_components.insert(binding_id),
+            ComponentState::Registered => {
+                held.failing_components.remove(&binding_id);
+                false
+            }
+            ComponentState::Pending | ComponentState::Disabled => false,
+        };
         drop(held);
-        // The runtime says again and again that a component it cannot run is unavailable; the
-        // failure is the step into that state, not each saying of it.
-        if state == ComponentState::Unavailable
-            && before.is_none_or(|(was, _)| was != ComponentState::Unavailable)
-            && let Some(adapter) = Adapter::of_package(package.as_str())
-        {
-            self.adapter_failed(adapter, MetricOutcome::Unavailable);
+        if began_failing {
+            self.component_failed(&package);
         }
-        drop(held);
         // A request waiting for this component's registration may now be asked, or given up on.
         self.decoding.wake();
+    }
+
+    /// Counts the failure of a component of `package`, where the package is a bundled adapter.
+    pub(super) fn component_failed(&self, package: &PluginId) {
+        if let Some(adapter) = Adapter::of_package(package.as_str()) {
+            self.adapter_failed(adapter, MetricOutcome::Unavailable);
+        }
     }
 
     /// Returns the source generation the binding's instance has reached now, where the broker holds
