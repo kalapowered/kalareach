@@ -652,7 +652,11 @@ def release(adb: str, serial: str, directory: Path, shots: Path, port: str, atte
     phone.wait(lambda each: "127.0.0.1" in each, "the local service as the one codes go through", 30)
     type_into_field(phone, a_code_no_host_holds())
     phone.press("Pair")
-    phone.wait(lambda each: "could not be reached" in each, "the words for a service that could not be reached", 120)
+    phone.wait(
+        lambda each: "could not be reached" in each or "does not offer pairing" in each,
+        "the words for a service that could not be used",
+        120,
+    )
     phone.shot("release-local")
     print("RELEASE-TLS the application could not reach the local server", flush=True)
     if failed:
