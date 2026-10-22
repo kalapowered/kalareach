@@ -19,9 +19,11 @@ use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Digest256, Nullable, U64, Uuid};
 use kr_protocol::update::{
-    CommitId, CompatibilityLevel, FileMode, FloorSystem, FloorVersion, HandoverStep,
-    HostUpdateHandoverParams, ManifestKind, OsFloor, Recording, ReleaseFile, ReleaseManifest,
-    ReleaseName, ReleasePath, ReleaseStore, SignedMembers, StoreScope,
+    CommitId, CompatibilityLevel, EntryPlacement, FileMode, FloorSystem, FloorVersion,
+    HandoverStep, HostUpdateHandoverParams, LaunchMode, ManifestKind, OsFloor, ProfileEntry,
+    ProfileLaunch, Recording, ReleaseFile, ReleaseManifest, ReleaseModule, ReleaseName,
+    ReleasePatch, ReleasePath, ReleaseShell, ReleaseSource, ReleaseStore, ShellUpstream,
+    SignedMembers, StoreScope,
 };
 use serde_json::Value;
 
@@ -166,7 +168,11 @@ fn the_root() -> &'static str {
 
 /// A manifest's document, signed by `signer` with the signer a release is built with.
 fn signed_document(manifest: &ReleaseManifest, signer: &Ed25519KeyPair) -> String {
-    let members = SignedMembers::of(manifest).expect("members");
+    signed_members(&SignedMembers::of(manifest).expect("members"), signer)
+}
+
+/// The document that `members` make, signed by `signer` with the signer a release is built with.
+fn signed_members(members: &SignedMembers, signer: &Ed25519KeyPair) -> String {
     // On a thread of its own, since a test that calls this may be inside a runtime already.
     std::thread::scope(|scope| {
         scope
@@ -174,7 +180,7 @@ fn signed_document(manifest: &ReleaseManifest, signer: &Ed25519KeyPair) -> Strin
                 tokio::runtime::Builder::new_current_thread()
                     .build()
                     .expect("a runtime")
-                    .block_on(kr_release::sign_manifest(&members, &[signer]))
+                    .block_on(kr_release::sign_manifest(members, &[signer]))
                     .expect("signed")
             })
             .join()
@@ -424,6 +430,107 @@ fn module_tree() -> [(&'static str, &'static str); 2] {
     ]
 }
 
+/// The shell packages a release for a Unix target lists, as `kr-release` writes them: Bash, Fish
+/// and Zsh, each stating the upstream release it is built from, its reader patches, the sources of
+/// its bridge, the module trees it loads and how a host starts it. The files of a package are not
+/// among the release's files here, since no host reads them.
+fn shells_a_release_lists() -> Vec<ReleaseShell> {
+    // One package: the shell, its upstream release, the revisions of its patches (the last of the
+    // Zsh's is taken from an upstream commit), the module trees it loads, and the arguments and
+    // startup file of its login mode.
+    fn package(
+        shell: &str,
+        upstream: (&str, &str),
+        patches: &[&str],
+        modules: &[&str],
+        startup: (&[&str], &str),
+    ) -> ReleaseShell {
+        let (version, archive) = upstream;
+        let identity = format!(
+            "{:016x}",
+            u64::from_be_bytes(
+                kr_cbor::sha256(format!("{shell} {version}").as_bytes())[..8]
+                    .try_into()
+                    .expect("eight bytes")
+            )
+        );
+        let (arguments, location) = startup;
+        ReleaseShell {
+            shell: shell.to_owned(),
+            upstream: ShellUpstream {
+                version: version.to_owned(),
+                revision: format!("{shell}-{version}"),
+                archive: archive.to_owned(),
+                sha256: Digest256::from_bytes(kr_cbor::sha256(archive.as_bytes())),
+            },
+            patches: patches
+                .iter()
+                .map(|name| ReleasePatch {
+                    name: (*name).to_owned(),
+                    revision: "1".to_owned(),
+                    base_revision: format!("{shell}-{version}"),
+                    source_commit: (*name == "terminfo-variable-checks")
+                        .then(|| "4c89849c98172c951a9def3690e8647dae76308f".to_owned()),
+                    sha256: Digest256::from_bytes(kr_cbor::sha256(name.as_bytes())),
+                })
+                .collect(),
+            sources: vec![ReleaseSource {
+                file: format!("src/kr_{shell}_bridge.c"),
+                sha256: Digest256::from_bytes(kr_cbor::sha256(shell.as_bytes())),
+            }],
+            modules: modules
+                .iter()
+                .map(|name| ReleaseModule {
+                    name: (*name).to_owned(),
+                    search_path: ReleasePath::new(format!(
+                        "shells/{shell}/{identity}/lib/{shell}/{version}"
+                    ))
+                    .expect("a path"),
+                    editor_abi: format!("{shell}-editor-{version}"),
+                })
+                .collect(),
+            profile_order: vec![ProfileLaunch {
+                mode: LaunchMode::Login,
+                arguments: arguments.iter().map(|argument| (*argument).to_owned()).collect(),
+                entries: vec![ProfileEntry {
+                    location: location.to_owned(),
+                    placement: EntryPlacement::End,
+                    begin: "# >>> KalaReach shell integration >>>".to_owned(),
+                    end: "# <<< KalaReach shell integration <<<".to_owned(),
+                }],
+            }],
+            identity,
+        }
+    }
+    vec![
+        package(
+            "bash",
+            ("5.2.37", "bash-5.2.37.tar.gz"),
+            &["readline-reader-mailbox", "readline-reader-state"],
+            &[],
+            (&["-l", "-i"], "$HOME/.bash_profile"),
+        ),
+        package(
+            "fish",
+            ("4.9.3", "fish-4.9.3.tar.xz"),
+            &["fish-reader-event-bridge", "fish-reader-state"],
+            &[],
+            (&["-l", "-i"], "$XDG_CONFIG_HOME/fish/config.fish"),
+        ),
+        package(
+            "zsh",
+            ("5.9", "zsh-5.9.tar.xz"),
+            &[
+                "zle-reader-mailbox",
+                "zle-reader-state",
+                "terminfo-variable-checks",
+            ],
+            &["zsh/zle"],
+            (&["-l", "-i"], "$ZDOTDIR/.zshrc"),
+        ),
+    ]
+}
+
 /// The stores a release assembled here declares it reads: every store this build declares, at the
 /// versions it writes and migrates from.
 fn release_stores() -> Vec<ReleaseStore> {
@@ -447,6 +554,9 @@ struct Assembled {
     /// Programs of the release written from these bytes in place of the workspace's own, by the name
     /// they have in `bin/`.
     written: Vec<(String, Vec<u8>)>,
+    /// Whether the manifest is written as a build before this one wrote it, which states no agent
+    /// builds and no pinned libraries, and lists a shell package by its revisions of patches alone.
+    earlier: bool,
 }
 
 impl Assembled {
@@ -520,10 +630,7 @@ impl Assembled {
                     .map(|row| row.major)
                     .collect(),
                 retained_levels: vec![retained],
-                // Older builds of the upgrade suite require the members a shell entry had before the
-                // manifest named its patches, so a release assembled here lists no shell package;
-                // its shell packages are the module tree the files list.
-                shells: Vec::new(),
+                shells: shells_a_release_lists(),
                 agents: Vec::new(),
                 dependencies: kr_protocol::update::ReleaseDependencies {
                     lock_sha256: Digest256::from_bytes([0; 32]),
@@ -536,6 +643,7 @@ impl Assembled {
             root: root.to_owned(),
             programs,
             written: Vec::new(),
+            earlier: false,
         }
     }
 
@@ -548,6 +656,45 @@ impl Assembled {
             CompatibilityLevel::of(PACKAGE_VERSION),
             the_root(),
         )
+    }
+
+    /// This release as a build before this one wrote it, which the release before this one is: its
+    /// manifest has no `agents` and no `dependencies`, and each shell package it lists states its
+    /// identity and the revisions of its patches, which is all that build had to say of one.
+    fn as_an_earlier_build_wrote_it(mut self) -> Self {
+        self.earlier = true;
+        self
+    }
+
+    /// The members the manifest is signed over: what this build serialises, or with `earlier` what
+    /// the build before it wrote.
+    fn members(&self) -> SignedMembers {
+        let members = SignedMembers::of(&self.manifest).expect("members");
+        if !self.earlier {
+            return members;
+        }
+        let mut document = serde_json::to_value(&members).expect("a document");
+        let object = document.as_object_mut().expect("a manifest is an object");
+        object.remove("agents");
+        object.remove("dependencies");
+        let earlier_shells: Vec<Value> = self
+            .manifest
+            .shells
+            .iter()
+            .map(|shell| {
+                serde_json::json!({
+                    "shell": shell.shell,
+                    "identity": shell.identity,
+                    "patch_revisions": shell
+                        .patches
+                        .iter()
+                        .map(|patch| patch.revision.as_str())
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        object.insert("shells".to_owned(), Value::Array(earlier_shells));
+        serde_json::from_value(document).expect("members again")
     }
 
     /// This release as one whose table of public majors lists `majors` and no other.
@@ -719,7 +866,7 @@ impl Assembled {
         write(kr_cli::update::release::CHANNEL_ROOT, self.root.as_bytes());
         write(
             kr_protocol::update::MANIFEST_FILE,
-            signed_document(&self.manifest, signer).as_bytes(),
+            signed_members(&self.members(), signer).as_bytes(),
         );
     }
 
@@ -743,7 +890,7 @@ impl Assembled {
         static PACKED: OnceLock<Mutex<HashMap<String, Arc<OnceLock<PathBuf>>>>> = OnceLock::new();
         // Two releases that are signed alike are packed alike: the signature covers every file's
         // digest, and the channel root is one of the files.
-        let identity = format!("{}\n{}", signed_document(&self.manifest, signer), self.root);
+        let identity = format!("{}\n{}", signed_members(&self.members(), signer), self.root);
         let packed = Arc::clone(
             PACKED
                 .get_or_init(Mutex::default)

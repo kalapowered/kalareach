@@ -1878,6 +1878,46 @@ mod tests {
         assert_eq!(patches[1]["base_revision"], "zsh-5.9");
     }
 
+    /// The release before this one reads each shell entry of a manifest by `patch_revisions`, which
+    /// it requires, so an entry keeps it beside the members that say more.
+    #[test]
+    fn a_shell_package_keeps_the_member_the_release_before_requires() {
+        let mut written = manifest(vec![file("bin/kr")]);
+        written.shells = vec![zsh_package()];
+        let value = serde_json::to_value(&written).expect("encodes");
+        assert_eq!(
+            value["shells"][0]["patch_revisions"],
+            serde_json::json!(["1", "1"])
+        );
+        assert!(value["shells"][0]["patches"].is_array());
+    }
+
+    /// A rollback reads the manifest of a release a build wrote before the agent builds, the pinned
+    /// libraries and what a shell package is made of were stated: no `agents`, no `dependencies`,
+    /// and shell entries of an identity and the revisions of their patches.
+    #[test]
+    fn a_manifest_an_earlier_build_wrote_is_read() {
+        let mut written = manifest(vec![file("bin/kr")]);
+        written.shells = vec![zsh_package()];
+        let mut value = serde_json::to_value(&written).expect("encodes");
+        let object = value.as_object_mut().expect("an object");
+        object.remove("agents");
+        object.remove("dependencies");
+        object.insert(
+            "shells".to_owned(),
+            serde_json::json!([
+                {"shell": "zsh", "identity": "0b26110c784907c9", "patch_revisions": ["1", "1"]}
+            ]),
+        );
+        let members: SignedMembers = serde_json::from_value(value).expect("reads");
+        let read = members
+            .manifest()
+            .expect("an earlier build's manifest is read");
+        assert_eq!(read.shells.len(), 1);
+        assert_eq!(read.shells[0].identity, "0b26110c784907c9");
+        assert!(read.agents.is_empty());
+    }
+
     /// A release retains the levels it names and no others.
     #[test]
     fn a_release_retains_the_levels_it_names() {
