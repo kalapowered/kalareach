@@ -323,6 +323,10 @@ async fn kr_req_10_45_a_device_cannot_delegate_past_the_limit_of_a_tree() {
 /// than what it holds, and revokes nothing that does not descend from a grant it holds. Each
 /// refusal writes nothing, and the one that exceeds the parent is decided before the session is
 /// asked for any text of it.
+/// KR-REQ-10.40, the part about narrowing delegation: a delegation cannot outlive its parent or
+/// name more of the session than its parent does.
+/// KR-REQ-19.02: a device cannot delegate a right it does not hold: not from a grant it does not
+/// hold, not from nothing, not from a pairing grant, and not more than the grant it holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_18_03_a_device_delegates_nothing_wider_than_it_holds_and_revokes_only_its_own() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -582,6 +586,9 @@ async fn kr_req_18_03_a_device_delegates_nothing_wider_than_it_holds_and_revokes
 /// KR-REQ-23.49 and 26.15: a delegation hands on no right this host's configuration removes from
 /// the grant it is made from. A delegation of viewing from a share whose viewing the configuration
 /// removed is refused; the same delegation under a ceiling that keeps viewing is written.
+/// KR-REQ-10.40 and KR-REQ-19.02, the part about the host's current policy: a delegation is
+/// decided against the policy in force when it is asked for, so a right the delegating device no
+/// longer holds under it is not handed on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_23_49_a_delegation_hands_on_no_right_the_configuration_removed() {
     let owner = DeviceKeys::generate().expect("owner keys");

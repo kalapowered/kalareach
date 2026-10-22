@@ -789,6 +789,9 @@ const DEVICE_LIST: kr_protocol::sharing::DeviceListParams =
 ///
 /// The device is paired after the ceiling was put in force, so its grant is issued at the
 /// revision the ceiling's fence advanced to: the same decision serves it everything else.
+/// KR-REQ-10.40, the part about the policy intersection on the request a paired device makes: the
+/// host decides every request by the grant intersected with the configuration, so a right the
+/// configuration removed is refused though the grant carries it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_right_the_configuration_removed_is_refused_by_name_although_the_grant_carries_it() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -826,6 +829,8 @@ async fn a_right_the_configuration_removed_is_refused_by_name_although_the_grant
 }
 
 /// KR-REQ-26.15: a ceiling naming a right the device's grant lacks adds nothing to that grant.
+/// KR-REQ-10.40, the part about the policy intersection: the intersection never gives a grant more
+/// than the grant holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_ceiling_naming_a_right_the_grant_lacks_adds_nothing() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -860,6 +865,8 @@ async fn a_ceiling_naming_a_right_the_grant_lacks_adds_nothing() {
 
 /// KR-REQ-26.15: an edit that narrows the ceiling fences a paired device's dispatch before it is
 /// acknowledged, and the device's next connection is decided under the narrower ceiling.
+/// KR-REQ-10.40, the part about the policy intersection on every request: the policy in force when
+/// a request arrives decides it, for a connection already open and for the next one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_narrowed_ceiling_fences_a_device_before_the_edit_is_acknowledged() {
     let owner = DeviceKeys::generate().expect("owner keys");
