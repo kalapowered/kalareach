@@ -188,13 +188,13 @@ async fn kr_req_12_18_a_relayed_approval_is_recorded_and_its_views_are_told() {
 /// `agent.approval.respond` goes out on the channel as the application's own verdict, once.
 ///
 /// The approval is the one the forwarder of the release before this one relayed, and the verdict
-/// is the one that release's worker wrote, both as recorded in `channel-frames-0.75.json`: the
+/// is the one that release's worker wrote, both as recorded in `channel-frames-0.76.json`: the
 /// forwarder and the worker of two releases read each other's frames, so neither frame changes
 /// without a release that retains the older one.
 #[tokio::test]
 async fn kr_req_12_18_an_answer_goes_out_on_the_channel_as_the_applications_verdict() {
     let recorded: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/channel-frames-0.75.json"))
+        serde_json::from_str(include_str!("fixtures/channel-frames-0.76.json"))
             .expect("the recorded frames are JSON");
     let broker = memory_broker();
     register(&broker, 2);
@@ -1523,7 +1523,7 @@ async fn kr_req_12_18_only_the_channels_own_package_interprets_what_it_relays() 
 #[tokio::test]
 async fn kr_req_12_18_closing_under_a_channels_identifier_leaves_the_channel_served() {
     let recorded: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/channel-frames-0.75.json"))
+        serde_json::from_str(include_str!("fixtures/channel-frames-0.76.json"))
             .expect("the recorded frames are JSON");
     let broker = memory_broker();
     register(&broker, 2);

@@ -254,7 +254,7 @@ async fn kr_req_12_18_the_channel_negotiates_and_carries_frames_both_ways_and_no
 }
 
 /// KR-REQ-12.18: the Channels frames cross as the worker of the release before this one wrote and
-/// read them, recorded in `channel-frames-0.75.json` (a file, not frames this build wrote): the
+/// read them, recorded in `channel-frames-0.76.json` (a file, not frames this build wrote): the
 /// approval this forwarder relays is the one that worker reads, and the verdict that worker wrote,
 /// which carries no `jsonrpc` member, reaches Claude Code as a notification of the same method and
 /// parameters. This forwarder reaches a worker of that release directly only when it cannot hand
@@ -265,7 +265,7 @@ async fn kr_req_12_18_the_channel_negotiates_and_carries_frames_both_ways_and_no
 async fn kr_req_12_18_the_frames_of_a_worker_of_the_release_before_cross_as_it_wrote_and_read_them()
 {
     let recorded: serde_json::Value = serde_json::from_str(include_str!(
-        "../../kr-worker/tests/fixtures/channel-frames-0.75.json"
+        "../../kr-worker/tests/fixtures/channel-frames-0.76.json"
     ))
     .expect("the recorded frames are JSON");
     let placed = Placed::new();
