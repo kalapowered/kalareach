@@ -590,8 +590,9 @@ async fn kr_req_11_41_a_component_compiled_at_registration_is_observed_inside_it
 /// question is in its ledger, and the upstream's permission request was read into an approval, by
 /// the connector table's own decision response, for a binding trusted to decode it, and is in its
 /// broker with the decoder's record. Neither the runtime nor its component holds any of them. (The
-/// component does not decode the request: that call waits for the plugin host's decode request.) The runtime is killed with `SIGKILL` after the worker has taken its component's
-/// state, and the daemon starts another on the worker's asking. The three are read again, and are
+/// binding that decodes ships no component, so the connector's table reads the request, as it does
+/// for every package whose bindings ship none.) The runtime is killed with `SIGKILL` after the
+/// worker has taken its component's state, and the daemon starts another on the worker's asking. The three are read again, and are
 /// equal; the person's answer to the approval goes to the upstream once, through the native
 /// terminal, and the person's answer to the question is taken. The component in the replacement
 /// has been restored, so it has the count it had and not a new one.

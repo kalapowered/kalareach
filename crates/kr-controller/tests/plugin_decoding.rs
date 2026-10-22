@@ -12,13 +12,14 @@
 //! | --- | --- |
 //! | KR-REQ-11.21 | a request the upstream waits on is read by the binding's component into an approval whose summary is the component's and whose decisions carry the connector table's labels; the ledger names the decoding package and keeps the request's bytes; the component sent nothing |
 //! | KR-REQ-06.07 | the component was given the request's own bytes under the provenance the broker recorded them with, and the identifier the upstream gave |
-//! | KR-ACC-016 | a decoder that names another request, offers a decision the table does not map or one twice, offers none, writes a summary over the bound, declines, or traps makes no approval and no ledger entry, the terminal answers the request, and the binding's report names the kind and none of the component's words |
+//! | KR-ACC-016 | a decoder that names another request, offers a decision the table does not map or one twice, offers none, writes a summary over the bound, declines, or traps makes no approval and no ledger entry, the terminal answers the request, and the binding's report names the kind and none of the component's words; a request that waits for its decode is not given to a component whose binding loses the trust to decode it meanwhile |
 //! | KR-REQ-11.26 | a request answered natively while its decode is held is not interpreted afterwards; a request made in privacy mode marks the component's view as made in it whenever it is decoded; one binding's flood is refused past its share of the queue and counted |
 
 #![cfg(unix)]
 
 mod plugin_world;
 
+use kr_protocol::broker::BrokerGrant;
 use kr_protocol::gateway::{PendingResource, PendingState};
 use kr_protocol::local::ControllerConnectionRole;
 use kr_worker::broker::decoding::NotDecoded;
@@ -211,6 +212,47 @@ async fn kr_acc_016_a_decoder_that_answers_what_it_was_not_asked_makes_no_approv
         assert!(!reason.contains(chosen), "{reason}");
     }
     assert!(reason.contains("7 requests were not decoded"), "{reason}");
+}
+
+/// KR-ACC-016: a request that waits for its decode is not given to a component whose binding loses
+/// the grant and the trust to decode it meanwhile, and the terminal's answer reaches the upstream
+/// as it would have.
+///
+/// The task that asks components is held, the request is queued, the interpreter grant is
+/// withdrawn, and the hold is released. The binding's report says why the request was refused, and
+/// the component's account shows that it was never asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_acc_016_a_request_waiting_for_its_decode_is_not_given_to_a_component_whose_trust_was_withdrawn()
+ {
+    let Some(world) =
+        Observing::start(Options::with(vec![Spec::decoder(1, "hostile-decoder")])).await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    let queue = world.broker().decode_queue();
+    let hold = queue.hold();
+    world.send(&request(61));
+    until("the request to be queued for its decode", || async {
+        (queue.len() == 1).then_some(())
+    })
+    .await;
+    world
+        .broker()
+        .withdraw_grant(binding(1), BrokerGrant::ApprovalInterpreter)
+        .expect("the grant is withdrawn");
+    hold.release();
+
+    world.until_reason(1, NotDecoded::Refused.words()).await;
+    let account = world.raw_account(1).await.expect("the component answers");
+    assert!(
+        account.starts_with("decode=0;"),
+        "the component was given a request after its trust was withdrawn: {account}"
+    );
+    let resource = resource_for(&world, "61").expect("the request is recorded");
+    assert!(!resource.interpretation_verified);
+    world.terminal.write(&answer(61)).await;
+    until_answered(&world, 61).await;
 }
 
 /// KR-REQ-11.26: a request that the terminal answered while its decode was held is not interpreted

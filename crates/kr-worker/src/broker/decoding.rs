@@ -215,8 +215,9 @@ impl NotDecoded {
             Self::NoDecisions => "its answer offered no decision",
             Self::SummaryTooLong => "its summary was over the bound",
             Self::Refused => {
-                "the request was refused when the answer came, because it had been answered, its \
-                 source had moved on or the decoder's trust was gone"
+                "the request was refused when the component was to be asked or its answer came, \
+                 because it had been answered, its source had moved on, the decoder's trust was \
+                 gone or the interpretation could not be recorded"
             }
         }
     }
@@ -523,24 +524,40 @@ impl Broker {
     /// Returns the request a job is about as a component is given it: the retained frame's bytes
     /// and the provenance the broker recorded them with, under the handle they were retained as.
     ///
-    /// Nothing where the request is no longer one to decode: it was answered or interpreted, its
-    /// frame is gone or from a generation the instance has left, or it is larger than a request is
-    /// retained whole.
-    #[must_use]
-    pub fn decode_event(&self, job: &DecodeJob) -> Option<ScopedSourceEvent> {
+    /// # Errors
+    ///
+    /// Returns nothing where the request is no longer one to decode: it was answered or
+    /// interpreted, its frame is gone or from a generation the instance has left, or it is larger
+    /// than a request is retained whole. Returns [`NotDecoded::Refused`] where the binding no longer
+    /// holds the grant and the trust to decode the request's method: a component is given a request
+    /// only under the trust held when it is given it, however long the request waited.
+    pub fn decode_event(
+        &self,
+        job: &DecodeJob,
+    ) -> std::result::Result<ScopedSourceEvent, Option<NotDecoded>> {
         let state = self.state();
-        let pending = &state.arbitration.get(job.resource_id)?.resource;
-        if pending.state != PendingState::Pending || pending.interpretation_verified {
-            return None;
+        let trusted = state
+            .bindings
+            .get(&job.binding_id)
+            .is_some_and(|binding| !binding.ending && binding.may_decode(&job.method));
+        if !trusted {
+            return Err(Some(NotDecoded::Refused));
         }
-        let instance = state.instances.get(&pending.application_instance_id)?;
-        let held = instance.frames.get(&job.handle)?;
+        let pending = &state.arbitration.get(job.resource_id).ok_or(None)?.resource;
+        if pending.state != PendingState::Pending || pending.interpretation_verified {
+            return Err(None);
+        }
+        let instance = state
+            .instances
+            .get(&pending.application_instance_id)
+            .ok_or(None)?;
+        let held = instance.frames.get(&job.handle).ok_or(None)?;
         if held.frame.generation != instance.source_generation
             || held.frame.bytes().len() > MAX_RETAINED_SOURCE_BYTES
         {
-            return None;
+            return Err(None);
         }
-        Some(ScopedSourceEvent::new(
+        Ok(ScopedSourceEvent::new(
             job.handle.clone(),
             SourceProvenance::NativeProtocol,
             held.frame.received_at.get(),

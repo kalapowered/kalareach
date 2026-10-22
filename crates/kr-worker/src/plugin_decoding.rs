@@ -100,7 +100,10 @@ fn judge(
         Some(Readiness::Ready) if in_flight.contains(&job.binding_id) => Verdict::Wait,
         Some(Readiness::Ready) => Verdict::Take,
         Some(Readiness::Waiting) => Verdict::Wait,
-        Some(Readiness::Never) | None => Verdict::Drop(NotDecoded::NotRegistered),
+        Some(Readiness::Never) => Verdict::Drop(NotDecoded::NotRegistered),
+        // Queued after the bindings were read: the push that queued it left a wake, and it is
+        // judged with the next reading.
+        None => Verdict::Wait,
     }
 }
 
@@ -139,9 +142,7 @@ async fn attempt(broker: &Broker, job: &DecodeJob) -> Result<(), Option<NotDecod
     let Some(client) = broker.component_calls().client() else {
         return Err(Some(NotDecoded::NotConnected));
     };
-    let Some(event) = broker.decode_event(job) else {
-        return Err(None);
-    };
+    let event = broker.decode_event(job)?;
     // Marked before the hand-over, not after the answer: a call that is written and then times out
     // may still have been read, and a request made in privacy mode stays made in it.
     broker.observation().expose(job.binding_id, job.private);
@@ -169,4 +170,35 @@ async fn attempt(broker: &Broker, job: &DecodeJob) -> Result<(), Option<NotDecod
         .interpret_decoded(job, &decoded, kr_ipc::now_ms())
         .map(|_approval| ())
         .map_err(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kr_protocol::scalars::Uuid;
+
+    /// KR-REQ-11.26: a job queued after the task read where the bindings stand is left for the next
+    /// reading, not dropped as one whose component is gone. A burst of approvals queues requests
+    /// while the task reads the broker, and the reading cannot be held open by a running worker.
+    #[test]
+    fn kr_req_11_26_a_job_queued_after_the_readiness_was_read_waits_for_the_next_reading() {
+        use kr_protocol::ids::{PendingResourceId, SourceEventHandle, UpstreamMethod};
+        let binding = BrokerBindingId::new(Uuid::from_bytes([1; 16]));
+        let job = DecodeJob {
+            resource_id: PendingResourceId::new(Uuid::from_bytes([2; 16])),
+            binding_id: binding,
+            method: UpstreamMethod::new("session/request_permission").expect("a method"),
+            upstream_id: "1".to_owned(),
+            handle: SourceEventHandle::new("src-1").expect("a handle"),
+            table: Vec::new(),
+            private: false,
+        };
+        let nothing = BTreeMap::new();
+        assert_eq!(judge(&nothing, &BTreeSet::new(), &job), Verdict::Wait);
+        let gone = BTreeMap::from([(binding, Readiness::Never)]);
+        assert_eq!(
+            judge(&gone, &BTreeSet::new(), &job),
+            Verdict::Drop(NotDecoded::NotRegistered)
+        );
+    }
 }

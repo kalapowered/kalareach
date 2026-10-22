@@ -2182,6 +2182,8 @@ fn kr_req_11_13_a_package_with_a_component_binds_its_declarative_parts_and_repor
     let details = reported(&worker, source.package_digest);
     assert_eq!(details.len(), 1, "{details:?}");
     assert!(details[0].contains("encode-response"), "{}", details[0]);
+    // The host decodes through a component now, so the report no longer says it never does.
+    assert!(!details[0].contains("decode-request"), "{}", details[0]);
 
     let worker = Worker::open();
     let source = worker.claude_code();
