@@ -46,6 +46,7 @@ sandboxed=(
     memory-hog
     oversized-output
     preparing
+    recording
     slow-compile
     slow-observe
     well-behaved

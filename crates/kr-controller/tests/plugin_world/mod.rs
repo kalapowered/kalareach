@@ -16,6 +16,8 @@
 
 #[cfg(unix)]
 pub mod acting;
+#[cfg(unix)]
+pub mod observing;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -571,6 +573,16 @@ pub async fn hosted_on(
     epoch: Epoch,
     clock: Option<Arc<dyn kr_transport::clock::ContinuousClock>>,
 ) -> Hosted {
+    hosted_running(epoch, clock, "exec cat").await
+}
+
+/// [`hosted_on`], with the shell command the session runs: a case about what the terminal does
+/// beside a component needs a shell that does something.
+pub async fn hosted_running(
+    epoch: Epoch,
+    clock: Option<Arc<dyn kr_transport::clock::ContinuousClock>>,
+    shell: &str,
+) -> Hosted {
     let tree = kr_ipc::testing::TempHost::create();
     let environment = tree.environment();
     let environment_id = tree.environment_id();
@@ -722,7 +734,7 @@ pub async fn hosted_on(
         session_epoch: SessionEpoch::V1,
         environment_id,
         display_number: specification.display_number,
-        shell: kr_worker::testing::posix_script("exec cat"),
+        shell: kr_worker::testing::posix_script(shell),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),
