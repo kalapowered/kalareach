@@ -62,28 +62,44 @@ pub const PREPARATION_DEADLINE: Duration = Duration::from_secs(5);
 /// withdraws it when the connection ends. Nothing in the broker holds the connection itself.
 #[derive(Debug)]
 pub struct ComponentCalls {
-    client: Mutex<Option<Arc<PluginClient>>>,
+    client: Mutex<Published>,
     /// Woken when the connection is published, replaced or withdrawn.
     changed: tokio::sync::Notify,
     /// The preparations inside a component now.
     running: Arc<tokio::sync::Semaphore>,
 }
 
+/// The connection and how many times one has been published or withdrawn.
+#[derive(Debug, Default)]
+struct Published {
+    client: Option<Arc<PluginClient>>,
+    /// Changes with every publication and withdrawal, so that a call can tell that the connection
+    /// it was made on has been replaced since.
+    epoch: u64,
+}
+
 impl ComponentCalls {
     pub(super) fn new() -> Self {
         Self {
-            client: Mutex::new(None),
+            client: Mutex::new(Published::default()),
             changed: tokio::sync::Notify::new(),
             running: Arc::new(tokio::sync::Semaphore::new(MAX_PREPARATIONS)),
         }
     }
 
+    fn published(&self) -> std::sync::MutexGuard<'_, Published> {
+        self.client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Publishes the runtime's connection, or withdraws it.
     pub fn set(&self, client: Option<Arc<PluginClient>>) {
-        *self
-            .client
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = client;
+        {
+            let mut published = self.published();
+            published.client = client;
+            published.epoch += 1;
+        }
         self.changed.notify_one();
     }
 
@@ -96,10 +112,23 @@ impl ComponentCalls {
     /// Returns the runtime's connection, while there is one.
     #[must_use]
     pub fn client(&self) -> Option<Arc<PluginClient>> {
-        self.client
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.published().client.clone()
+    }
+
+    /// Returns the runtime's connection with the epoch it was published in, while there is one.
+    #[must_use]
+    fn stamped(&self) -> Option<(Arc<PluginClient>, u64)> {
+        let published = self.published();
+        published
+            .client
             .clone()
+            .map(|client| (client, published.epoch))
+    }
+
+    /// Returns true while no connection has been published or withdrawn since `epoch`.
+    #[must_use]
+    fn unchanged_since(&self, epoch: u64) -> bool {
+        self.published().epoch == epoch
     }
 }
 
@@ -569,9 +598,9 @@ impl Broker {
         request: &PreparationRequest,
         until: tokio::time::Instant,
     ) -> Result<PreparedEffect> {
-        let client =
+        let (client, epoch) =
             self.component_calls
-                .client()
+                .stamped()
                 .ok_or_else(|| BrokerError::ResourceUnavailable {
                     detail: "the plugin runtime is not connected".to_owned(),
                 })?;
@@ -623,8 +652,11 @@ impl Broker {
         drop(place);
         // What the runtime says of a component, and what a component says of itself, is made of what
         // it was handed, and a component handed anything in privacy mode, or on a connection it
-        // stood on, has its words withheld from what a person is told.
-        let withheld = self.observation.words_withheld();
+        // stood on, has its words withheld from what a person is told. A reply that was written on
+        // a connection since replaced is judged as withheld: what the lane holds now is the next
+        // connection's, and cannot say what this one was handed.
+        let withheld =
+            self.observation.words_withheld() || !self.component_calls.unchanged_since(epoch);
         let called = called.map_err(|error| not_asked(error, withheld))?;
         if let Some(fault) = called.fault {
             return Err(declined(&request.params.action, fault, withheld));
@@ -635,7 +667,7 @@ impl Broker {
                 request.params.action
             ))
         })?;
-        effect_of(&plan, request)
+        effect_of(&plan, request, withheld)
     }
 }
 
@@ -907,12 +939,25 @@ fn check_declared_attachment(
 /// the component was given, and that its operation is the one the action declared. The broker
 /// compares the operation again, against the declaration in force when the plan comes back, and
 /// decides whether the binding holds the grant it needs, when the effect is validated.
-fn effect_of(plan: &WirePlan, request: &PreparationRequest) -> Result<PreparedEffect> {
+fn effect_of(
+    plan: &WirePlan,
+    request: &PreparationRequest,
+    withheld: bool,
+) -> Result<PreparedEffect> {
     let action = &request.params.action;
+    // A name the component chose is made of what it was handed, so it is not repeated once its
+    // words are withheld.
+    let named = |chosen: &str| {
+        if withheld {
+            "a name withheld for privacy mode".to_owned()
+        } else {
+            chosen.to_owned()
+        }
+    };
     if plan.action_id != action.as_str() {
         return Err(BrokerError::invalid(format!(
             "the component prepared {} and {action} was invoked",
-            plan.action_id
+            named(&plan.action_id)
         )));
     }
     let expected = request.declared.operation.map(class_of);
@@ -938,23 +983,24 @@ fn effect_of(plan: &WirePlan, request: &PreparationRequest) -> Result<PreparedEf
             }
             if method != action.as_str() {
                 return Err(BrokerError::invalid(format!(
-                    "the component's plan for {action} names the method {method}, and the action \
-                     goes out as {action}"
+                    "the component's plan for {action} names the method {}, and the action \
+                     goes out as {action}",
+                    named(method)
                 )));
             }
             PreparedOperation::UpstreamSubmit
         }
         WireOperation::UpstreamCancel => PreparedOperation::UpstreamCancel,
         WireOperation::UpstreamAttachment { attachment_id } => {
-            let named = request
+            let named_attachment = request
                 .draft
                 .as_ref()
                 .map(|needs| needs.transfer_id.to_string());
-            if named.as_deref() != Some(attachment_id.as_str()) {
+            if named_attachment.as_deref() != Some(attachment_id.as_str()) {
                 return Err(BrokerError::invalid(format!(
-                    "the component's plan for {action} offers {attachment_id}, and the \
-                     invocation names {}",
-                    named.as_deref().unwrap_or("no attachment")
+                    "the component's plan for {action} offers {}, and the invocation names {}",
+                    named(attachment_id),
+                    named_attachment.as_deref().unwrap_or("no attachment")
                 )));
             }
             PreparedOperation::UpstreamAttachment
@@ -999,20 +1045,33 @@ const fn class_of(operation: PreparedOperation) -> DeclaredClass {
 mod tests {
     use super::*;
 
-    /// KR-REQ-24.27: what the runtime says when it will not ask a component to prepare an action,
-    /// and what the component says when it declines, are made of what the component was handed,
-    /// so once privacy mode has stood on the connection a person is told neither. The words are
-    /// told when it has not. The window in which the runtime has disabled a component and the
-    /// worker has not yet heard of it cannot be held open by a running worker, so the mapping is
-    /// decided here.
+    /// KR-REQ-24.27: a call can tell that the connection it was made on has been replaced or
+    /// withdrawn since, so that what the lane says of the connection it holds now is not taken for
+    /// what the old one was handed. A reply that arrives on a connection that ended while the next
+    /// was published cannot be held open by a running worker.
     #[test]
-    fn kr_req_24_27_the_words_a_refusal_or_a_decline_carries_are_withheld_once_privacy_mode_has_stood()
-     {
+    fn kr_req_24_27_a_call_can_tell_that_its_connection_was_replaced_since() {
+        let calls = ComponentCalls::new();
+        let epoch = calls.published().epoch;
+        assert!(calls.unchanged_since(epoch));
+        calls.set(None);
+        assert!(!calls.unchanged_since(epoch));
+        assert!(calls.unchanged_since(calls.published().epoch));
+    }
+
+    /// KR-REQ-24.27: what the runtime says when it will not ask a component to prepare an action
+    /// (a refusal, or the reason it disabled the component for) is made of what the component was
+    /// handed, so once privacy mode has stood on the connection a person is not told it. The words
+    /// are told when it has not. The window in which the runtime has disabled a component and the
+    /// worker has not yet heard of it cannot be held open by a running worker, so the mapping is
+    /// decided here; the words a component declines with are shown through the product in
+    /// kr-controller's `plugin_actions`.
+    #[test]
+    fn kr_req_24_27_the_words_a_refusal_carries_are_withheld_once_privacy_mode_has_stood() {
         let words = "an account number the component was handed";
         let told = |error: BrokerError| match error {
             BrokerError::UnsupportedCapability { detail }
-            | BrokerError::ResourceUnavailable { detail }
-            | BrokerError::InvalidArgument(detail) => detail,
+            | BrokerError::ResourceUnavailable { detail } => detail,
             other => panic!("unexpected {other:?}"),
         };
         for error in [
@@ -1028,10 +1087,6 @@ mod tests {
             assert!(!withheld.contains(words), "{withheld}");
             assert!(withheld.contains("withheld"), "{withheld}");
         }
-        assert!(told(declined(&"cancel", words.to_owned(), false)).contains(words));
-        let withheld = told(declined(&"cancel", words.to_owned(), true));
-        assert!(!withheld.contains(words), "{withheld}");
-        assert!(withheld.contains("withheld"), "{withheld}");
     }
     use kr_protocol::ids::{DraftId, DraftRevision, EnvironmentId, GrantId};
     use kr_protocol::insertion::{BindingFacts, InsertionClaim};

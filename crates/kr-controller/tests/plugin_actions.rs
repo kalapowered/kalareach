@@ -13,7 +13,7 @@
 //! | --- | --- |
 //! | KR-REQ-23.30 | `plugin.action.invoke` runs the component registered for the binding, validates the plan it proposes against the action, the grant, the effect class and the arguments, transmits the plan that validates once, and rejects every other with a receipt that says it never dispatched |
 //! | KR-REQ-11.28, KR-REQ-23.30 | through a connector whose table spells a cancellation, the plan a component prepares for the cancellation it was invited to prepare is validated against the token the host issued and written from the table's template, naming the thread and the running turn; every plan that is not that one, and a component's prompt, which the table spells no source for, is refused before the marker and nothing is written |
-//! | KR-REQ-24.27 | the words a component declines an action with are made of what it was handed, so they are withheld from what a person is told once privacy mode has stood on the connection, and the binding is marked as handed something made in privacy mode |
+//! | KR-REQ-24.27 | the words a component declines an action with, and the names its plan chooses, are made of what it was handed, so they are withheld from what a person is told once privacy mode has stood on the connection, and the binding is marked as handed something made in privacy mode |
 //! | KR-REQ-11.31 | a component that faults when asked to prepare an action disables its binding's rich capability, and the native terminal's requests and answers go on before, during and after, on the transport the production gateway uses (not through `kr-hook launch`, whose leg needs a real managed shell) |
 //!
 //! The scripted peer stands in for a vendor's agent. A test that needs a stopped plugin host stops
@@ -986,20 +986,20 @@ async fn kr_req_24_27_the_words_a_component_declines_an_action_with_are_withheld
     let lane = broker.observation();
     let mut client = acting.client().await;
     let mut request_id = 0_u64;
-    let mut declined = async |acting: &Acting, client: &mut LocalClient| {
+    let mut refused = async |acting: &Acting, client: &mut LocalClient, action: &str| {
         request_id += 1;
-        let mut mutation = acting.invocation(client, "cancel.fault", b"{}");
+        let mut mutation = acting.invocation(client, action, b"{}");
         mutation.request_id = RequestId::new(request_id);
         match send(client, mutation).await {
             Outcome::Error(refusal) => refusal,
-            Outcome::Ok(_) => panic!("an action its component declines was carried"),
+            Outcome::Ok(_) => panic!("{action}: an action its component refuses was carried"),
         }
     };
 
     // Until the component is registered the action cannot be asked of it, and can be asked again.
     let deadline = tokio::time::Instant::now() + PATIENCE;
     let control = loop {
-        let refusal = declined(&acting, &mut client).await;
+        let refusal = refused(&acting, &mut client, "cancel.fault").await;
         if refusal.code == ErrorCode::InvalidArgument {
             break refusal;
         }
@@ -1020,13 +1020,20 @@ async fn kr_req_24_27_the_words_a_component_declines_an_action_with_are_withheld
             .expect("the component has a view")
             .private_content
     );
+    // A plan for another action is refused in words that name the action the component chose.
+    let other = refused(&acting, &mut client, "cancel.other.action").await;
+    assert!(
+        other.message.contains("turn.cancel"),
+        "outside privacy mode the refusal names what the component prepared: {}",
+        other.message
+    );
 
     let mut authority = acting
         .hosted
         .daemon_connection(ControllerConnectionRole::Authority)
         .await;
     acting.hosted.tell_privacy(&mut authority, 1, true).await;
-    let private = declined(&acting, &mut client).await;
+    let private = refused(&acting, &mut client, "cancel.fault").await;
     assert_eq!(private.code, ErrorCode::InvalidArgument, "{private:?}");
     assert!(
         !private.message.contains("is not something to do"),
@@ -1041,12 +1048,26 @@ async fn kr_req_24_27_the_words_a_component_declines_an_action_with_are_withheld
         "the component was handed arguments in privacy mode and is not marked"
     );
 
+    let other = refused(&acting, &mut client, "cancel.other.action").await;
+    assert_eq!(other.code, ErrorCode::InvalidArgument, "{other:?}");
+    assert!(
+        !other.message.contains("turn.cancel"),
+        "a name the component chose reached a person in privacy mode: {}",
+        other.message
+    );
+
     // And after privacy mode ends, on the connection it stood on.
     acting.hosted.tell_privacy(&mut authority, 2, false).await;
-    let after = declined(&acting, &mut client).await;
+    let after = refused(&acting, &mut client, "cancel.fault").await;
     assert!(
         !after.message.contains("is not something to do"),
         "the component's words reached a person after privacy mode: {}",
         after.message
+    );
+    let other = refused(&acting, &mut client, "cancel.other.action").await;
+    assert!(
+        !other.message.contains("turn.cancel"),
+        "a name the component chose reached a person after privacy mode: {}",
+        other.message
     );
 }
