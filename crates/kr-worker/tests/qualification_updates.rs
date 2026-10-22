@@ -15,7 +15,7 @@ use kr_protocol::ids::{ApplicationInstanceId, BrokerBindingId, SessionId};
 use kr_protocol::scalars::{Digest256, Uuid};
 use kr_worker::broker::binder::MatchedExecutable;
 use kr_worker::broker::catalogue::Admissions;
-use kr_worker::broker::catalogue::testing::{self, Snapshot};
+use kr_worker::broker::catalogue::testing;
 use kr_worker::broker::connectors::{
     ConnectorSource, ConnectorSources, QualifiedExecutable, fixture,
 };
