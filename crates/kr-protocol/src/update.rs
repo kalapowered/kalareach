@@ -776,6 +776,13 @@ pub struct ReleaseStore {
     pub version: u32,
     /// The oldest version of the store this release brings forward when it opens it.
     pub migrates_from: u32,
+    /// The newest version above `version` that this release reads without writing it: it opens a
+    /// store at any version up to this one as it finds it and migrates nothing. A release reads no
+    /// store above the version it writes unless it says so here, and says so only for the next
+    /// version of a store that a change already defines, so that the release after it, which
+    /// writes that version, can be rolled back to this one. Absent for a store that has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reads_through: Option<u32>,
 }
 
 /// The extension of a last part of a store's path that names every record of one extension in a
@@ -1199,6 +1206,15 @@ impl ReleaseManifest {
                     "migrates from a version above the one it writes",
                 ));
             }
+            if store
+                .reads_through
+                .is_some_and(|through| through <= store.version)
+            {
+                return Err(refuse(
+                    name,
+                    "reads through a version that is not above the one it writes",
+                ));
+            }
             if store.path.is_empty() || store.path.len() > 256 {
                 return Err(refuse(
                     name,
@@ -1562,6 +1578,7 @@ mod tests {
             },
             version,
             migrates_from,
+            reads_through: None,
         }
     }
 
@@ -1717,6 +1734,13 @@ mod tests {
                 vec![store("registry", 7, 1), store("registry", 7, 1)],
             ),
             ("backwards", vec![store("registry", 1, 7)]),
+            (
+                "reading through a version it writes",
+                vec![ReleaseStore {
+                    reads_through: Some(7),
+                    ..store("registry", 7, 1)
+                }],
+            ),
             ("an empty name", vec![store("", 1, 1)]),
             ("a name in capitals", vec![store("Registry", 1, 1)]),
         ];

@@ -637,14 +637,17 @@ fn look(listed: &ReleaseStore, file: &Path, carries: bool) -> Option<Why> {
             .contains(&i64::from(found)))
     .then(|| u32::try_from(kr_controller::registry::SCHEMA_VERSION).unwrap_or(u32::MAX));
     let met = brought_to.unwrap_or(found);
-    if (listed.migrates_from..=listed.version).contains(&met) {
+    // A release reads a store up to the version it writes, and, for one it says so of, as far as it
+    // reads through without writing it.
+    let highest = listed.reads_through.unwrap_or(listed.version);
+    if (listed.migrates_from..=highest).contains(&met) {
         None
     } else {
         Some(Why::Version {
             found,
             brought_to,
             lowest: listed.migrates_from,
-            highest: listed.version,
+            highest,
             schema: matches!(
                 listed.recording,
                 Recording::SqliteTable { .. } | Recording::SqliteUserVersion
@@ -1076,6 +1079,7 @@ mod tests {
             },
             version: 1,
             migrates_from: 0,
+            reads_through: None,
         };
         let directory = tempfile::tempdir().expect("a directory");
         let records = directory.path().join("records");
@@ -1222,5 +1226,51 @@ mod tests {
 
     fn rusqlite_open(path: &Path) -> rusqlite::Connection {
         rusqlite::Connection::open(path).expect("opens")
+    }
+
+    /// A release reads a store up to the version it writes and, for a store it says so of, the one
+    /// version above that it reads through without writing it; a version above either is refused
+    /// and names the highest the release reads.
+    #[test]
+    fn a_store_one_version_above_what_a_release_writes_is_read_when_it_reads_through_and_not_otherwise()
+     {
+        let directory = tempfile::tempdir().expect("a directory");
+        let file = directory.path().join("delivery.sqlite3");
+        let connection = rusqlite_open(&file);
+        connection
+            .execute_batch(
+                "CREATE TABLE delivery_schema (version INTEGER NOT NULL);
+                 INSERT INTO delivery_schema (version) VALUES (11);",
+            )
+            .expect("a database");
+        drop(connection);
+        let listed = |reads_through| ReleaseStore {
+            store: "delivery".to_owned(),
+            scope: StoreScope::Environment,
+            path: "delivery.sqlite3".to_owned(),
+            recording: Recording::SqliteTable {
+                table: "delivery_schema".to_owned(),
+            },
+            version: 10,
+            migrates_from: 6,
+            reads_through,
+        };
+        // Not read by a release that writes 10 and says nothing of 11.
+        let Some(Why::Version { found, highest, .. }) = look(&listed(None), &file, false) else {
+            panic!("a store above the release's version was accepted");
+        };
+        assert_eq!((found, highest), (11, 10));
+        // Read by one that reads through 11, and the version above that is not.
+        assert!(look(&listed(Some(11)), &file, false).is_none());
+        let connection = rusqlite_open(&file);
+        connection
+            .execute("UPDATE delivery_schema SET version = 12", [])
+            .expect("a newer version");
+        drop(connection);
+        let Some(Why::Version { found, highest, .. }) = look(&listed(Some(11)), &file, false)
+        else {
+            panic!("a store above what the release reads through was accepted");
+        };
+        assert_eq!((found, highest), (12, 11));
     }
 }
