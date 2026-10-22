@@ -556,10 +556,10 @@ async fn a_hand_over_asks_an_owner_device_and_sends_only_what_it_confirmed() {
     let still_waiting = scene
         .issuer
         .call("transfer_answered", json!({ "reference": reference }))
-        .await
-        .expect("read");
+        .await;
     assert_eq!(
-        still_waiting["state"], "waiting",
+        still_waiting.map(|answer| answer["state"].clone()).ok(),
+        Some(json!("waiting")),
         "the early finish sent nothing, so the hand-over still waits for its answer"
     );
     assert_eq!(

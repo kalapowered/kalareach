@@ -1024,8 +1024,8 @@ mod tests {
         );
     }
 
-    /// KR-REQ-07.17, the part about what is recorded: every path in one record, the module search
-    /// paths included, is taken from the one installation, even where a module directory is named
+    /// KR-REQ-07.17, the part about what is recorded: the module search paths and the startup entry
+    /// of one record are taken from the one installation, even where a module directory is named
     /// like the identity or is the package itself.
     #[cfg(unix)]
     #[test]
@@ -1243,9 +1243,10 @@ mod tests {
         assert!(matches!(fault, PackageFault::Unqualified { .. }), "{fault}");
     }
 
-    /// KR-REQ-07.17, the part about what is recorded: a package is the exact binary it was built as,
-    /// and the identity it reports carries its kind, its editor ABI, how many patches it holds and
-    /// its module search paths, resolved to the installation.
+    /// KR-REQ-07.17, the part about what is recorded: the executable a package reports is the binary
+    /// its record names in the installation, and the identity it reports carries its kind, its
+    /// editor ABI, how many patches it holds and its module search paths, resolved to the
+    /// installation.
     #[test]
     fn a_package_is_launched_as_the_exact_binary_it_was_built_as() {
         let root = tempfile::tempdir().expect("a directory");
