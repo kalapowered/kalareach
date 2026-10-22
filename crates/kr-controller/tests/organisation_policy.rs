@@ -1212,7 +1212,8 @@ async fn an_earlier_policy_stays_in_force_when_the_file_of_applied_policies_cann
 
 /// A write that renames the file into place and fails when it flushes the directory leaves the new
 /// policy in its file. The host keeps the policy it answered for in force, and the answer says
-/// that the file holds the new one, so that a restart before the same policy is accepted applies it.
+/// that the file holds the new one, so that a restart before the same policy is accepted may apply
+/// it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_policy_whose_file_was_renamed_into_place_and_not_flushed_is_told_so() {
     let fixture = Fixture::start().await;
@@ -1241,7 +1242,7 @@ async fn a_policy_whose_file_was_renamed_into_place_and_not_flushed_is_told_so()
     assert_eq!(
         fixture.listed().await.enrolments[0].organisation_policy_revision,
         Nullable::some(OrganisationPolicyRevision::new(1)),
-        "a restart applies the policy the file holds, as the answer said it would"
+        "a restart applies the policy the file holds, as the answer said it may"
     );
     assert!(is_left_out_by_the_allowlist(&admission(&fixture).await));
     fixture.host.stop().await;

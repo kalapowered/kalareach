@@ -24267,7 +24267,7 @@
               "type": "null"
             }
           ],
-          "description": "The adapters the catalogue admits under now: the list the host has put in force, or null\nwhile it admits every adapter the host qualifies. It is the list in\n`effective_adapter_allowlist` once the host has put that in force, and it differs from it\nonly until then, while a change waits for a synchronisation that holds the catalogue or for\nthe admission revision to be written. It is\nwhat the catalogue holds when the answer is made; it does not show that every session's\nworker has finished the round that follows a change, and it is read beside the other list,\nnot with it, so a change made at that moment can show in one alone."
+          "description": "The adapters the catalogue admits under now: the list the host has put in force, or null\nwhile it admits every adapter the host qualifies. It is the list in\n`effective_adapter_allowlist` once the host has put that in force, and it differs from it\nonly until then, while a change waits for a synchronisation that holds the catalogue or for\nthe admission revision to be written. It is what the catalogue holds when the answer is\nmade; it does not show that every session's worker has finished the round that follows a\nchange, and it is read beside the other list, not with it, so a change made at that moment\ncan show in one alone."
         },
         "clock_trusted": {
           "description": "Whether this host trusts its own clock. While it does not, it installs no lease and\nfollows no chain, and the owner trusts the clock again with `host.clock.establish`.",
