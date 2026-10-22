@@ -40,9 +40,10 @@ mod teardown;
 
 /// Starts the worker through this host's own supervisor, and names its package root.
 ///
-/// The daemon passes its own environment on to the process it starts, so a test that wants the
-/// worker to look somewhere else has to say so on the child: the variable is added to what the
-/// launch sets for the worker, which every supervisor here gives the process it starts.
+/// A test that wants the worker to look somewhere else has to say so in the launch: the variable
+/// is added to what the launch sets for the worker, which every supervisor here gives the process
+/// it starts (on Windows with the environment the Task Scheduler builds for the user, and not the
+/// daemon's).
 #[derive(Debug)]
 struct WorkerWithPackageRoot {
     packages: PathBuf,
