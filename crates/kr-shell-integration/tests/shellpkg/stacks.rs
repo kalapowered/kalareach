@@ -1617,9 +1617,18 @@ impl Session {
             })?;
         let left = format!("the teardown left {}", typing.describe());
         if dialect(self.package_kind).late_interrupt_waits_for_a_line {
+            // A return runs whatever is on the line, so it is only an empty line's when the line
+            // is empty.
+            if !typing.buffer_empty {
+                return Err(format!(
+                    "the teardown left text on the line, so a return would run it and no command \
+                     was typed; {left}"
+                ));
+            }
             self.give_a_kept_interrupt_a_line().map_err(|why| {
                 format!(
-                    "an empty line did not come back to a reader, so no command was typed: {why}"
+                    "an empty line did not come back to a reader, so no command was typed: {why}; \
+                     {left}"
                 )
             })?;
         }
@@ -1631,11 +1640,13 @@ impl Session {
     /// Gives an interrupt the shell has kept a line to be acted on at, and waits for the reader to
     /// come back from it.
     ///
-    /// The key before it has been read, so an interrupt it raised has reached the shell: it was
-    /// delivered before the shell could read what was typed after it. The shell has either acted
-    /// on it or keeps it for the next line it accepts, and nothing the reader reports says which.
-    /// An empty line costs nothing in the second case, and in the first it is an empty command. The
-    /// command that proves the shell works goes to a shell that holds no interrupt.
+    /// An interrupt that a key of the teardown raised, or that arrived while the reader served a
+    /// request of the host's, reached the shell when the terminal took the key that raised it, and
+    /// this line is typed after: the terminal hands the shell its bytes in order, so the shell has
+    /// the interrupt before it reads the line. It has either acted on it or keeps it for the next
+    /// line it accepts, and nothing the reader reports says which. An empty line costs nothing in
+    /// the second case, and in the first it is an empty command. The command that proves the shell
+    /// works goes to a shell that holds no interrupt.
     ///
     /// # Errors
     ///
