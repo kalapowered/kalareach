@@ -10,7 +10,7 @@ worker directly for what a session owns.
 | `kr new` | `kr n` | Create one worker, pseudo-terminal and root shell under an idempotent create token |
 | `kr attach <id>` | `kr a` | Attach to an existing session. It never resumes or creates a replacement |
 | `kr detach [--attachment <id>]` | `kr d` | Remove an attachment |
-| `kr export <id> --output <file>` | — | Write a closed session's retained output to a file you name, in this environment or an enrolled one |
+| `kr export <id> --output <file>` | — | Write a closed session's retained output to a file you name, as a JSON document or an asciicast recording, in this environment or an enrolled one |
 | `kr backup setup [--replace]` | — | Set this host's backups up: show a recovery kit once and turn on a backup of closed sessions and the host's configuration, made at most once a day |
 | `kr backup restore --into <folder>` | — | Open a backup of this host's data with the recovery kit and write it as readable files into a folder you made; it records the generation it verified in the recovery bundle and, only when asked, applies the backup's device configuration to this host |
 | `kr close [id]` | `kr c` | Close a session and terminate the processes it owns |
@@ -689,6 +689,7 @@ or identifier.
 
 ```text
 kr export <session> --output <file> [--environment <id|label>] [--max-bytes <bytes>]
+          [--format json|asciicast]
 ```
 
 A session that has not closed is refused, because its worker still owns its output. Export it after
@@ -727,26 +728,45 @@ part of what it holds. Output with no such point after a gap is not read, and ev
 counted under `output_resumed_mid_stream`. A gap the archive reports on every page without skipping
 anything is listed once.
 
-The file is one JSON document of the format `kalareach-session-export/1`. It names the session and
-its environment, and carries the session's summary, its closure record and the last size the session
-had. The output is a list of chunks, each with the cursor it starts at and its bytes as unpadded
-base64url. Beside it are the cursor the read began at, the next cursor, the oldest cursor the
-archive still retains, and under `gaps` every range the archive no longer holds, each with its
-cause. Every 64-bit value in the file, such as a cursor, a time, a count or a display number, is a
-decimal string, as the protocol writes it, so a reader that holds numbers as floating point loses no
-digits.
+By default the file is one JSON document of the format `kalareach-session-export/2`. It names the
+session and its environment, and carries the session's summary, its closure record and the last
+size the session had. The output is a list of chunks, each with the cursor it starts at, the
+wall-clock reading of when its first byte was written (`at_ms`, null for a chunk the host recorded
+no time for) and its bytes as unpadded base64url. A chunk never spans two stretches of output that
+were timed apart, so each has one time. Beside it are the cursor the read began at, the next
+cursor, the oldest cursor the archive still retains, and under `gaps` every range the archive no
+longer holds, each with its cause. Every 64-bit value in the file, such as a cursor, a time, a
+count or a display number, is a decimal string, as the protocol writes it, so a reader that holds
+numbers as floating point loses no digits.
 
-The file says what it does not hold. The archive keeps no time for any piece of output, so the file
-carries none, and an asciicast recording cannot be made from it. The archive keeps the session's
-last size and not the sizes before it, and it does not report whether it lost output beyond the gaps
-it lists. Each of these is declared under `omissions`. A session whose own record is gone is
-exported with its shell, working directory, execution context, shell mode, creation time and size
-set to null, and `omissions` says they are not known.
+With `--format asciicast` the file is an asciicast v2 recording of the same output, read through the
+same terminal engine, so it holds the same spans and no more. Its header gives the session's last
+size, the time of the first timed piece in whole seconds, and, under `kalareach`, the omissions the
+file declares; its events are the pieces as text, each at the number of seconds since that first
+piece. An event is never earlier than the one before it, so a wall clock that stepped back is not
+played backwards, and a piece with no recorded time plays with the one before it. A piece cut in
+the middle of a character carries its start into the next piece when the two are adjacent, and
+bytes that are not text are not written; they are counted with the bytes not carried. A recording
+needs at least one timed piece: for a session whose host recorded none (it closed before the host
+kept times, or its record is lost), or an environment whose daemon is of a release that does not
+record them, the recording is refused with the reason and the JSON document can still be made. A
+session with no retained output gives a recording with no events.
+
+The file says what it does not hold. The host records when output was written in stretches and not
+byte by byte: each time is the reading when the first byte of its stretch was written, so a byte
+was written at or after it. Bytes with no recorded time are counted under `output_timestamps`, and
+bytes whose time was read from a wall clock the host could not prove under
+`output_clock_unproven`. The archive keeps the session's last size and not the sizes before it, and
+it does not report whether it lost output beyond the gaps it lists. Each of these is declared
+under `omissions`. A session whose own record is gone is exported with its shell, working
+directory, execution context, shell mode, creation time and size set to null, and `omissions` says
+they are not known.
 
 `--max-bytes` bounds how much retained output is read, 16 MiB by default, and must be at least one.
-The start of what is retained is kept, and when output is left behind the file says `truncated`. The
-file holds at most 192 MiB. A read that would take it near that size stops at a page, keeps the
-start of the output and says `truncated`, whatever `--max-bytes` is. The
+The start of what is retained is kept, and when output is left behind the file says `truncated`.
+A session keeps at most 128 MiB, so `--max-bytes 134217728` reads all of it. The file holds at
+most 192 MiB. A read that would take it near that size stops at a page, keeps the start of the
+output and says `truncated`, whatever `--max-bytes` is. The
 file is created new. Something already at the name, a link included, is refused before the output is
 read and again where the file is made, and is left as it was. The bytes go into a file beside the
 final name, which is given its name without replacing anything, so a failed export leaves no partial
@@ -757,7 +777,8 @@ no such limit. Nothing is uploaded, and no destination
 is chosen for you.
 
 With `--json` the command prints one document: `ok`, `session_id`, `display_number`, `path`,
-`format`, `bytes_read`, `bytes_carried`, `gaps`, `truncated`, and `omissions`, the kinds the file
+`format` (`kalareach-session-export/2` or `kalareach-session-recording/1`), `bytes_read`,
+`bytes_carried`, `bytes_untimed`, `gaps`, `truncated`, and `omissions`, the kinds the file
 declares. As in every other command, its counts are numbers.
 
 ## `kr backup setup`
