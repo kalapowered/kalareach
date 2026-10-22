@@ -84,11 +84,11 @@ final class PushRegistration: NSObject {
     /// earlier only for the same APNs token.
     private(set) var tokenHandedToFirebase = false
 
-    /// Asks for permission and, if it is given, for a token.
+    /// Asks for permission and, if it is given, for a token; `then` is told where the answer stands.
     ///
     /// Not called by the application's own launch: asking belongs where the person can see why.
     /// What it records, it records on the main thread, where the system's token callbacks arrive.
-    func start(center: UNUserNotificationCenter = .current()) {
+    func start(center: UNUserNotificationCenter = .current(), then: @escaping (PushPermission) -> Void = { _ in }) {
         state = .awaitingPermission
         center.requestAuthorization(options: [.alert, .sound, .badge]) { [weak self] granted, _ in
             DispatchQueue.main.async {
@@ -96,9 +96,11 @@ final class PushRegistration: NSObject {
                 self.permissionKnown(granted ? .granted : .refused)
                 guard granted else {
                     self.state = .refused
+                    then(.refused)
                     return
                 }
                 UIApplication.shared.registerForRemoteNotifications()
+                then(.granted)
             }
         }
     }

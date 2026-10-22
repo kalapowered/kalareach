@@ -24,7 +24,8 @@ final class LaunchPlanTests: XCTestCase {
                 plan,
                 [
                     .configureFirebase,
-                    .addTokenMethods,
+                    .addDelegateMethods,
+                    .hearNotificationTaps,
                     .registerForRemoteNotifications,
                     .setAutoInit(permission == .granted),
                 ],
@@ -53,14 +54,21 @@ final class LaunchPlanTests: XCTestCase {
     func testAConfigurationFirebaseCannotStartFromLeavesFirebaseAloneAndSaysWhy() {
         for reason in ["API_KEY is not 39 characters", "this build holds no GoogleService-Info.plist"] {
             let plan = LaunchPlan.decide(debugMode: nil, firebase: .unusable(reason), permission: .granted)
-            XCTAssertEqual(plan, [.skipFirebase(reason)])
+            XCTAssertEqual(plan.first, .skipFirebase(reason))
+            XCTAssertFalse(plan.contains(.configureFirebase))
         }
     }
 
-    func testABuildWithoutConfigurationLeavesFirebaseAlone() {
+    /// A registration challenge and a tap on a notification do not depend on Firebase: a build that
+    /// leaves Firebase alone is still given the methods a push reaches the application by.
+    func testABuildWithoutConfigurationLeavesFirebaseAloneAndStillHearsPush() {
         for permission in everyPermission {
             let plan = LaunchPlan.decide(debugMode: nil, firebase: .unusable("no file"), permission: permission)
-            XCTAssertEqual(plan, [.skipFirebase("no file")], "permission \(permission)")
+            XCTAssertEqual(
+                plan,
+                [.skipFirebase("no file"), .addDelegateMethods, .hearNotificationTaps],
+                "permission \(permission)"
+            )
         }
     }
 
@@ -84,7 +92,10 @@ final class LaunchPlanTests: XCTestCase {
         XCTAssertEqual(configured.last, .runDebugMode("push"))
         XCTAssertEqual(configured.first, .configureFirebase)
         let bare = LaunchPlan.decide(debugMode: "keychain", firebase: .unusable("no file"), permission: .refused)
-        XCTAssertEqual(bare, [.skipFirebase("no file"), .runDebugMode("keychain")])
+        XCTAssertEqual(
+            bare,
+            [.skipFirebase("no file"), .addDelegateMethods, .hearNotificationTaps, .runDebugMode("keychain")]
+        )
     }
 
     func testNoPlanEverAsksForAPermission() {
