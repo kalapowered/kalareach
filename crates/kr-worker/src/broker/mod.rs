@@ -1266,6 +1266,8 @@ impl Broker {
             .get_mut(&application_instance_id)
             .ok_or_else(|| unknown_instance(application_instance_id))?;
         instance.turn_id = turn_id;
+        // What a component is told about its bound execution may have changed.
+        state.component_changes.notify_one();
         Ok(())
     }
 
@@ -3916,6 +3918,8 @@ impl BrokerState {
         instance.turn_id = None;
         instance.advance_generation();
         let revision = instance.binding_revision;
+        // What a component is told about its bound execution has changed.
+        self.component_changes.notify_one();
         self.tokens.withdraw(application_instance_id);
         self.capabilities.invalidate_instance(
             application_instance_id,
