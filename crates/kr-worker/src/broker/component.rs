@@ -214,10 +214,9 @@ impl Broker {
         // failure is the step into that state, not each saying of it.
         if state == ComponentState::Unavailable
             && before.is_none_or(|(was, _)| was != ComponentState::Unavailable)
+            && let Some(adapter) = Adapter::of_package(package.as_str())
         {
-            if let Some(adapter) = Adapter::of_package(package.as_str()) {
-                self.adapter_failed(adapter, Outcome::Unavailable);
-            }
+            self.adapter_failed(adapter, Outcome::Unavailable);
         }
     }
 
