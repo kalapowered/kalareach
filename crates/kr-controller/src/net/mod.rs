@@ -2427,7 +2427,7 @@ pub(crate) mod tests {
     }
 
     /// A redeemed grant to one device, carrying viewing.
-    pub(super) fn granted(
+    pub(crate) fn granted(
         expiry: GrantExpiry,
         authority_revision: AuthorityRevision,
     ) -> (Grant, GrantRecord) {
