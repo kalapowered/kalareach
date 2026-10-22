@@ -5671,8 +5671,12 @@
               "description": "When the setup was made, in UTC milliseconds."
             },
             "kit_fingerprint": {
-              "description": "The fingerprint that matches the kit to this host.",
+              "description": "The fingerprint that matches the kit to this host. It is 40 bits, which is enough to\ntell a kit from another by eye and not to prove two recipients are one.",
               "type": "string"
+            },
+            "recovery_public_key": {
+              "$ref": "#/$defs/StoredEnvelopeKey",
+              "description": "The recovery recipient's public key the setup was made with, which is what tells a\nsetup under one recovery from a setup under another."
             },
             "state": {
               "const": "committed",
@@ -5694,6 +5698,7 @@
             "state",
             "archive_id",
             "kit_fingerprint",
+            "recovery_public_key",
             "enabled_at_ms",
             "unusable"
           ],

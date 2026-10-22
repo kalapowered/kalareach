@@ -1164,7 +1164,7 @@ fn from_recovery(error: RecoveryError) -> RestoreError {
 
 /// Whether a failed write may have reached the service: its answer was lost, or the service could
 /// not be reached for it. Any other failure is a refusal, and writing again would meet it again.
-fn is_a_lost_answer(error: &ClientError) -> bool {
+pub(crate) fn is_a_lost_answer(error: &ClientError) -> bool {
     matches!(
         error.code(),
         ErrorCode::OutcomeUnknown
