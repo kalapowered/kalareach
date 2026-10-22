@@ -479,7 +479,7 @@ in its ledger with its source frame.
 One task of the link, the pump, takes entries in the order they were pushed. An upstream frame goes
 as an `event` the pump waits to have answered, so the answer says whether the binding's queue took
 it, and the wait is bounded by the client's five seconds. Terminal output goes as an `event` the pump
-does not wait for: the client holds at most 256 of them and 4 MiB, a task of the client writes them,
+does not wait for: the client queues at most 256 of them and 4 MiB, a task of the client writes them,
 and a full hand-off refuses the span at once. A runtime that does not answer is passed over for ten
 seconds, then for twice as long after each failure up to two minutes, and each entry passed over is
 counted. The two sources have no order between them, and each keeps the order it was pushed in.
