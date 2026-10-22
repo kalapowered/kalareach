@@ -1,6 +1,6 @@
 //! The companion's native platform services, shared by every feature that needs them.
 //!
-//! Nine services, each a mechanism with no feature's policy in it:
+//! Ten services, each a mechanism with no feature's policy in it:
 //!
 //! * [`secrets`]: the one secure store the companion keeps secrets in. The Keychain on macOS and
 //!   iOS, the Credential Manager on Windows, the Secret Service on Linux, and on Android files
@@ -17,6 +17,9 @@
 //!   invitation's secret goes no further than native code.
 //! * [`browser`]: the browser-backed session a sign-in hands its ceremony to on a phone: iOS's
 //!   authentication session, and Android's Auth Tab or a Custom Tab with a verified link.
+//! * [`notify`]: what only the platform can say or do about notifications: whether the person
+//!   allowed them, the provider's registration token, the record of the registration being waited
+//!   for, the limited key store a receiver reads, and a tap on a notification.
 //! * [`push`]: a push receiver's answer to a registration challenge, decided and signed by one
 //!   function over the installation's own key, so that the receiver runs with no interface and no
 //!   JavaScript and signs nothing but that answer.
@@ -36,6 +39,7 @@ use tauri::{Manager as _, Runtime};
 pub mod backup;
 pub mod browser;
 pub mod call;
+pub mod notify;
 pub mod presence;
 pub mod protection;
 pub mod push;
