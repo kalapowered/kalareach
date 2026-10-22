@@ -17708,9 +17708,10 @@ export interface LaunchProbeReport {
  * What this host has measured about itself: how long its paired devices were without a
  * connection, the faults its terminals' parsers met and the failures of its adapters.
  *
- * Local diagnostics, counted in memory from this daemon's start and sent nowhere. Every label
- * is one of this build's own words, so the report carries no terminal content, key, prompt or
- * filename and a support bundle takes it as it is.
+ * Local diagnostics, counted in memory from the start of the process that counted them and
+ * sent to no service. A paired device that asks for the host's diagnostics reads them as a
+ * support bundle holds them. Every label is one of this build's own words, so the report
+ * carries no terminal content, key, prompt or filename.
  */
 export interface MetricsReport {
   /**

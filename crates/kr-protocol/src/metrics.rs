@@ -19,9 +19,10 @@
 //!
 //! # What these are not
 //!
-//! Local diagnostics. A host keeps its totals in memory for the life of the process, reports them
-//! to its owner and into a support bundle the owner chooses to write, and sends them nowhere. A
-//! total starts again when the process that counted it does.
+//! Local diagnostics. A host keeps its totals in memory for the life of the process and reports
+//! them to its owner, into a support bundle the owner chooses to write, and to a paired device that
+//! asks for the host's diagnostics, which is answered as a bundle is written. No service receives
+//! them from the host. A total starts again when the process that counted it does.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
