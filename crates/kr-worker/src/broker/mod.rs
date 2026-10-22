@@ -1618,6 +1618,7 @@ impl Broker {
                             binding,
                             state.component_states.get(&binding.binding_id),
                             state.component_notes.get(&binding.binding_id),
+                            self.observation.is_private(),
                         )),
                     })
             })
@@ -1676,6 +1677,7 @@ impl Broker {
         // Observation withdrawn is every stream withdrawn with it.
         if grant == BrokerGrant::Observation {
             binding.streams = binder::Streams::default();
+            state.component_changes.notify_one();
         }
         state.renew_every_gateway_evidence(kr_ipc::now_ms());
         Ok(())

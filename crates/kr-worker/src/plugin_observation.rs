@@ -27,7 +27,7 @@
 //! order produced, and a snapshot is asked for after a loss and before any later entry is handed to
 //! the binding, once the client has written what it already held.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -40,7 +40,7 @@ use tokio::time::Instant;
 use crate::broker::Broker;
 use crate::broker::component::ComponentNote;
 use crate::broker::observation::{
-    Audience, Entry, NativeFrame, ObservationLane, PIECE_BYTES, Source,
+    Audience, Entry, NativeFrame, ObservationLane, PIECE_BYTES, Source, Tally,
 };
 
 /// How long a snapshot is given to reach its component.
@@ -81,6 +81,11 @@ pub async fn pump(broker: Weak<Broker>) {
                 lane.finish(&entry);
             }
             None => {
+                // The lane refuses to hand over an entry while it has lost something the pump has
+                // not applied, so a loss is the reason for a miss as often as an empty lane is.
+                if lane.loss_pending() {
+                    continue;
+                }
                 let wait = lane.next_due(Instant::now());
                 drop(strong);
                 lane.idle(wait).await;
@@ -90,32 +95,41 @@ pub async fn pump(broker: Weak<Broker>) {
 }
 
 /// Turns what the lane lost into a loss for each binding that would have been offered it.
+///
+/// A binding is told what it would have been offered and nothing else: the terminal's output if it
+/// takes the terminal, and the frames of the one package whose table read them if it is that
+/// package's binding.
 fn apply_loss(broker: &Broker, lane: &ObservationLane) {
     let Some(loss) = lane.take_loss() else {
         return;
     };
-    let mut affected: BTreeSet<BrokerBindingId> = BTreeSet::new();
-    let mut events = loss.terminal.events;
-    let mut bytes = loss.terminal.bytes;
+    let mut owed: BTreeMap<BrokerBindingId, Tally> = BTreeMap::new();
+    let mut add = |binding: BrokerBindingId, tally: Tally| {
+        let total = owed.entry(binding).or_default();
+        total.events = total.events.saturating_add(tally.events);
+        total.bytes = total.bytes.saturating_add(tally.bytes);
+    };
     if loss.terminal.events > 0 {
-        affected.extend(broker.observing(Audience::Terminal));
+        for binding in broker.observing(Audience::Terminal) {
+            add(binding, loss.terminal);
+        }
     }
-    for (instance, tally) in &loss.native {
-        events = events.saturating_add(tally.events);
-        bytes = bytes.saturating_add(tally.bytes);
-        affected.extend(broker.observing(Audience::Native {
-            instance: *instance,
-            package: None,
-        }));
+    for native in &loss.native {
+        for binding in broker.observing(Audience::Native {
+            instance: native.instance,
+            package: Some(&native.package),
+        }) {
+            add(binding, native.tally);
+        }
     }
-    for binding in affected {
+    for (binding, tally) in owed {
         lost(
             broker,
             lane,
             binding,
             format!(
-                "{events} observations ({bytes} bytes) were dropped for want of room in the \
-                 worker's queue"
+                "{} observations ({} bytes) were dropped for want of room in the worker's queue",
+                tally.events, tally.bytes
             ),
         );
     }
@@ -137,11 +151,18 @@ async fn snapshots(broker: &Broker, lane: &ObservationLane) {
     if owing.is_empty() {
         return;
     }
-    let Some(client) = broker.component_calls().client() else {
-        return;
-    };
     for (binding, through) in owing {
-        written(&client).await;
+        let Some(client) = broker.component_calls().client() else {
+            return;
+        };
+        // A snapshot is asked for after what the client already holds has been written, so that the
+        // component is not asked to rebuild its view before it has read what is older than the loss.
+        // A client that has not written it all is asked again soon, and the binding is passed over
+        // until then.
+        if !written(&client).await {
+            lane.snapshot_failed(binding, Instant::now());
+            continue;
+        }
         match client.snapshot(service_id(binding), CALL_WAIT).await {
             Ok(_) => {
                 lane.answered(binding);
@@ -158,29 +179,37 @@ async fn snapshots(broker: &Broker, lane: &ObservationLane) {
     }
 }
 
-/// Waits, for a bounded time, until the client has written what it already holds.
-///
-/// A snapshot is asked for after a loss and before anything later is handed over. Events the client
-/// accepted before the loss was noticed are older than the loss, so they go first.
-async fn written(client: &PluginClient) {
+/// Waits, for a bounded time, until the client has written what it already holds, and says whether
+/// it has.
+async fn written(client: &PluginClient) -> bool {
     let until = Instant::now() + HAND_OFF_BARRIER;
-    while client.offered_bytes() > 0 && Instant::now() < until {
+    while client.offered_bytes() > 0 {
+        if Instant::now() >= until {
+            return false;
+        }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    true
 }
 
 /// Offers one entry to every binding that may be offered it.
+///
+/// Whether a binding may be offered it is read again before each hand-over, and so is the
+/// connection to the runtime: a call that waited for an answer may have been made while a grant was
+/// withdrawn or the runtime was lost.
 async fn offer(broker: &Broker, lane: &ObservationLane, entry: &Entry) {
-    let observers = broker.observing(entry.audience());
-    if observers.is_empty() {
-        return;
-    }
-    let Some(client) = broker.component_calls().client() else {
-        return;
-    };
-    for binding in observers {
-        let Some(view) = lane.view(binding).filter(|view| view.ready) else {
+    for binding in broker.observing(entry.audience()) {
+        let Some(view) = lane
+            .view(binding)
+            .filter(|view| view.ready && entry.seq() >= view.ready_from)
+        else {
             continue;
+        };
+        if !broker.observing(entry.audience()).contains(&binding) {
+            continue;
+        }
+        let Some(client) = broker.component_calls().client() else {
+            return;
         };
         if view.is_silent(Instant::now()) {
             lost(
@@ -192,12 +221,23 @@ async fn offer(broker: &Broker, lane: &ObservationLane, entry: &Entry) {
             );
             continue;
         }
+        // A component that is owed a snapshot is offered nothing until it has had it; what it was
+        // going to be offered is one more thing it missed.
+        if view.owes().is_some() {
+            lost(
+                broker,
+                lane,
+                binding,
+                "an observation was passed over while a fresh snapshot was owed".to_owned(),
+            );
+            continue;
+        }
         match &entry.source {
             Source::Native(frame) => {
-                deliver_frame(broker, lane, &client, binding, frame, entry.at_ms).await;
+                deliver_frame(broker, lane, &client, binding, frame, entry).await;
             }
             Source::Terminal(bytes) => {
-                offer_terminal(broker, lane, &client, binding, bytes, entry.at_ms);
+                offer_terminal(broker, lane, &client, binding, bytes, entry);
             }
         }
     }
@@ -214,7 +254,7 @@ async fn deliver_frame(
     client: &PluginClient,
     binding: BrokerBindingId,
     frame: &NativeFrame,
-    at_ms: u64,
+    entry: &Entry,
 ) {
     let named = frame
         .request_id
@@ -238,13 +278,13 @@ async fn deliver_frame(
     let event = ScopedSourceEvent::new(
         handle,
         SourceProvenance::NativeProtocol,
-        at_ms,
+        entry.at_ms,
         frame.request_id.clone(),
         Arc::clone(&frame.bytes),
     );
     match client.deliver(service_id(binding), &event).await {
         Ok(Admission::Queued | Admission::QueuedWithGap { .. }) => {
-            lane.offered(binding, Instant::now());
+            lane.offered(binding, Instant::now(), entry.private);
             lane.answered(binding);
         }
         Ok(Admission::Refused { .. }) => lost(
@@ -279,7 +319,7 @@ fn offer_terminal(
     client: &PluginClient,
     binding: BrokerBindingId,
     bytes: &[u8],
-    at_ms: u64,
+    entry: &Entry,
 ) {
     for piece in bytes.chunks(PIECE_BYTES) {
         let Some(handle) = fresh_handle() else {
@@ -288,13 +328,13 @@ fn offer_terminal(
         let event = ScopedSourceEvent::new(
             handle,
             SourceProvenance::TerminalScrape,
-            at_ms,
+            entry.at_ms,
             None,
             piece.to_vec(),
         );
         match client.offer(service_id(binding), &event) {
             Handoff::Accepted => {
-                lane.offered(binding, Instant::now());
+                lane.offered(binding, Instant::now(), entry.private);
             }
             Handoff::Refused { .. } => {
                 lost(
