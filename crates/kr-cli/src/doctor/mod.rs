@@ -321,7 +321,7 @@ pub fn doctor(result: &HostDoctorResult) -> Document {
 /// Every label is one of this build's own words and every figure a number, so nothing here is a
 /// value an export has to withhold.
 #[must_use]
-pub fn metrics(report: &kr_protocol::metrics::Report) -> Document {
+pub fn metrics(report: &kr_protocol::metrics::MetricsReport) -> Document {
     Document::new()
         .with(
             "reconnect_time",
@@ -374,7 +374,7 @@ pub fn metrics(report: &kr_protocol::metrics::Report) -> Document {
 /// A host that has counted nothing says nothing: a line that says there is nothing to say is noise
 /// in a report that runs to dozens of lines.
 #[must_use]
-pub fn metric_lines(report: &kr_protocol::metrics::Report) -> Vec<Shown> {
+pub fn metric_lines(report: &kr_protocol::metrics::MetricsReport) -> Vec<Shown> {
     let mut lines = Vec::new();
     for series in &report.reconnect_time {
         lines.push(shown!(
