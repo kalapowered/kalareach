@@ -5310,15 +5310,53 @@ fn run_from_another_task(
     })
 }
 
+/// How many times the scenario of the case below is shown before a machine on which it keeps being
+/// lost is reported. It only ends a hang: a showing that is not lost decides the case at once.
+const SCENARIO_ATTEMPTS: usize = 5;
+
+/// Another writer holding the registry's write lock, and how long the registry's own writes wait
+/// for a lock before they give up.
+struct HeldRegistry {
+    connection: rusqlite::Connection,
+    /// The registry's wait for a lock another connection holds. It is the product's figure, read
+    /// from a connection opened as the registry opens its own, and nothing here changes it.
+    bound: std::time::Duration,
+}
+
+impl HeldRegistry {
+    /// Lets the other writer finish, and says when, with how long the registry's writes wait for a
+    /// lock.
+    fn release(self) -> Freed {
+        self.connection
+            .execute_batch("COMMIT")
+            .expect("the other writer finishes");
+        Freed {
+            at: std::time::Instant::now(),
+            waits: self.bound,
+        }
+    }
+}
+
+/// The moment the registry was freed, and how long its writes wait for a lock.
+struct Freed {
+    at: std::time::Instant,
+    waits: std::time::Duration,
+}
+
 /// Holds the registry's write lock, as another writer would, so that a create that has passed
 /// every check the engine and the runner make waits for it.
-fn hold_the_registry(host: &Host) -> rusqlite::Connection {
-    let registry = rusqlite::Connection::open(host._temp.environment().registry_database())
-        .expect("opens the registry");
-    registry
+fn hold_the_registry(host: &Host) -> HeldRegistry {
+    let connection =
+        kr_flush::release::open_connection(&host._temp.environment().registry_database(), None)
+            .expect("opens the registry");
+    let bound = connection
+        .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+        .map(|millis| std::time::Duration::from_millis(u64::try_from(millis).unwrap_or(0)))
+        .expect("reads how long a write waits");
+    connection
         .execute_batch("BEGIN IMMEDIATE")
         .expect("another writer holds the registry");
-    registry
+    HeldRegistry { connection, bound }
 }
 
 /// KR-REQ-25.14: the moment the engine stops waiting for a node is asked where
@@ -5328,80 +5366,148 @@ fn hold_the_registry(host: &Host) -> rusqlite::Connection {
 /// against the session limit. No session is made for a `create_session` node, and no command runs
 /// for a `shell_command` node. The control is the same node with the registry free, which makes
 /// its session (the cases above).
+///
+/// The scenario needs the create to be waiting at the registry when the node's wait ends, and it
+/// needs that write still to be waiting when the registry is freed. A machine whose disk is slow
+/// enough can lose either: the engine writes to its journal before it starts the create, and may
+/// reach the end of the wait first, and the create's write waits for a lock only as long as every
+/// write of the registry does, which is the product's figure. Neither is an outcome of the clause.
+/// The case therefore looks at what happened before it judges anything. The node must have been
+/// settled as cancelled, which is what the engine records for a dispatch that was live, and the
+/// create must reserve once the registry is free. A showing in which nothing was reserved is
+/// dropped with its host and the node shown again in a new one; a node settled as unknown that
+/// went on to reserve is a failure of the product, and so is any status but those two.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_wait_that_ends_before_the_session_comes_into_being_makes_no_session() {
+    for number in [30_u8, 31] {
+        let mut lost = String::new();
+        let mut shown = false;
+        for attempt in 1..=SCENARIO_ATTEMPTS {
+            match the_wait_ends_while_the_create_waits_for_the_registry(number).await {
+                Ok(()) => {
+                    shown = true;
+                    break;
+                }
+                Err(reason) => {
+                    eprintln!(
+                        "node {number} was not shown (attempt {attempt} of {SCENARIO_ATTEMPTS}): \
+                         {reason}"
+                    );
+                    lost = reason;
+                }
+            }
+        }
+        assert!(
+            shown,
+            "node {number} could not be shown in {SCENARIO_ATTEMPTS} attempts; the last: {lost}"
+        );
+    }
+}
+
+/// One showing of [`a_wait_that_ends_before_the_session_comes_into_being_makes_no_session`] for
+/// the node numbered `number`, in a host of its own: a `create_session` node for 30 and a
+/// `shell_command` node for 31. Returns what was seen, with nothing judged, when the create
+/// reserved nothing after the registry was freed.
+async fn the_wait_ends_while_the_create_waits_for_the_registry(
+    number: u8,
+) -> std::result::Result<(), String> {
     // The door is open: it only counts the launches that reach the supervisor.
     let door = Door::shut();
     door.let_through();
     let host = door.host().await;
     let mut control = client(&host).await;
     let marker = host.work().join("a-command-ran");
-    for (number, grant, node) in [
+    let (grant, node) = if number == 30 {
         (
-            30_u8,
             vec![ActionRight::SessionCreate],
             create_session_node(&host, None),
-        ),
+        )
+    } else {
         (
-            31,
             COMMAND_RIGHTS.to_vec(),
             command_node(&host, "command", &format!("touch {}", marker.display())),
-        ),
-    ] {
-        host.issue(grant_id(number), &grant);
-        let mut document = definition(workflow_id(number), grant_id(number), "a node", node);
-        document.deadlines = WorkflowDeadlines {
-            run_deadline_ms: U64::new(60_000),
-            action_wait_ms: U64::new(1_500),
-        };
-        install(&mut control, &host, &document).await;
-        enable(&mut control, &host, &document).await;
+        )
+    };
+    host.issue(grant_id(number), &grant);
+    let mut document = definition(workflow_id(number), grant_id(number), "a node", node);
+    document.deadlines = WorkflowDeadlines {
+        run_deadline_ms: U64::new(60_000),
+        action_wait_ms: U64::new(1_500),
+    };
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
 
-        // Another writer holds the registry. The run passes every check the engine and the runner
-        // make, and the create waits for it until the node's wait has ended.
-        let settled_before = node_statuses(&host).len();
-        let registry = hold_the_registry(&host);
-        let running = run_from_another_task(&host, &document, "evt-too-late");
-        // A node that has not begun is `pending` and one waiting for its action is `running`: the
-        // wait has ended once the engine has settled the node, and only then is the registry freed.
-        until("the engine to stop waiting for the node", || {
-            node_statuses(&host).len() > settled_before
-                && node_statuses(&host).last().is_some_and(|status| {
-                    status != NodeStatus::Pending.as_str() && status != NodeStatus::Running.as_str()
-                })
-        })
-        .await;
-        registry
-            .execute_batch("COMMIT")
-            .expect("the other writer finishes");
-        let run: WorkflowRunResult = typed(
-            &running
-                .await
-                .expect("the run answers")
-                .expect("the run is answered"),
-        );
-        assert_eq!(run.status, WorkflowRunStatus::Cancelled, "{run:?}");
+    // Another writer holds the registry. The run passes every check the engine and the runner
+    // make, and the create waits for it until the node's wait has ended.
+    let settled_before = node_statuses(&host).len();
+    let registry = hold_the_registry(&host);
+    let running = run_from_another_task(&host, &document, "evt-too-late");
+    // A node that has not begun is `pending` and one waiting for its action is `running`: the
+    // wait has ended once the engine has settled the node, and only then is the registry freed.
+    until("the engine to stop waiting for the node", || {
+        node_statuses(&host).len() > settled_before
+            && node_statuses(&host).last().is_some_and(|status| {
+                status != NodeStatus::Pending.as_str() && status != NodeStatus::Running.as_str()
+            })
+    })
+    .await;
+    let freed = registry.release();
+    let run: WorkflowRunResult = typed(
+        &running
+            .await
+            .expect("the run answers")
+            .expect("the run is answered"),
+    );
+    assert_eq!(run.status, WorkflowRunStatus::Cancelled, "{run:?}");
 
-        // The create reaches its launch once the registry is free, is refused there, and leaves
-        // a reservation that failed and nothing else.
-        until("the refused create to have failed its reservation", || {
-            reservation_phases(&host, grant_id(number)) == ["failed"]
-        })
-        .await;
-        assert_eq!(
-            node_statuses(&host).last().map(String::as_str),
-            Some(NodeStatus::Cancelled.as_str())
-        );
-        let receipts = receipts_of(&mut control, &document, run.run_id).await;
-        assert!(
-            !receipts.is_empty() && receipts.iter().all(|receipt| receipt.output.0.is_none()),
-            "the node produced nothing: {receipts:?}"
-        );
+    // The engine asks a dispatch that is live to stop, and records the node as cancelled; a
+    // dispatch that was not live it records as unknown, which is what a create the engine never
+    // started is, and what one that had ended is. The engine reaches the end of the wait before
+    // the create when its own writes to the journal outlast the wait.
+    let status = node_statuses(&host).last().cloned().unwrap_or_default();
+    assert!(
+        status == NodeStatus::Cancelled.as_str() || status == NodeStatus::Unknown.as_str(),
+        "the node was settled as {status:?}"
+    );
+    // A create whose write was still waiting takes the registry at its next look, which is a
+    // hundred milliseconds away at most, and commits one transaction; a write that had given up
+    // reserved nothing and never will. The registry's own wait is what the product gives a write
+    // to get its lock, so it is the time a reservation is looked for in, from the moment the
+    // registry was freed. With nothing reserved by then the scenario was lost, and is not judged.
+    while reservation_phases(&host, grant_id(number)).is_empty() {
+        if freed.at.elapsed() > freed.waits {
+            end(host);
+            return Err(format!(
+                "the node was settled as {status:?} and nothing was reserved in the {:?} after the \
+                 registry was freed",
+                freed.waits
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
+    // A create that went on to reserve was live, and a live one is stopped and recorded as
+    // cancelled: unknown here is the host losing track of a dispatch that was running.
+    assert_eq!(
+        status,
+        NodeStatus::Cancelled.as_str(),
+        "the node was settled as {status:?} although its create went on to reserve"
+    );
+
+    // The create reaches its launch, is refused there, and leaves a reservation that failed and
+    // nothing else.
+    until("the refused create to have failed its reservation", || {
+        reservation_phases(&host, grant_id(number)) == ["failed"]
+    })
+    .await;
+    let receipts = receipts_of(&mut control, &document, run.run_id).await;
+    assert!(
+        !receipts.is_empty() && receipts.iter().all(|receipt| receipt.output.0.is_none()),
+        "the node produced nothing: {receipts:?}"
+    );
     let sessions = all_sessions(&mut control).await;
     assert!(
         sessions.iter().all(|session| session.closure.0.is_some()),
-        "no session is live for either node: {sessions:?}"
+        "no session is live for the node: {sessions:?}"
     );
     assert_eq!(
         door.launches(),
@@ -5413,7 +5519,17 @@ async fn a_wait_that_ends_before_the_session_comes_into_being_makes_no_session()
         owed_rows(&host) == 0
     })
     .await;
+    end(host);
+    Ok(())
+}
+
+/// Ends the tasks that serve a host's clients and its workers' rendezvous, so a showing that is
+/// dropped leaves nothing serving.
+fn end(host: Host) {
     host.clients.abort();
+    if let Some(rendezvous) = &host._rendezvous {
+        rendezvous.abort();
+    }
 }
 
 /// A grant is withdrawn while a node's launch waits at the supervisor's door, after the launch
