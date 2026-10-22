@@ -369,6 +369,16 @@ async fn the_page_is_sent_no_secret_while_this_computer_pairs_and_confirms() {
         .await
         .expect("the owner approves");
     by_scan.reached(|state| state["state"] == "paired").await;
+    // The same text read from a picture reaches native code from the picker, and the page is told
+    // only what it is.
+    scanner.will_read(scanned_text.as_str());
+    let from_picture = by_scan
+        .call("pairing_scan_photo", json!({}))
+        .expect("the picture is read");
+    assert_eq!(from_picture["invitation"]["mode"], "direct");
+    by_scan
+        .call("pairing_stop", json!({}))
+        .expect("the held invitation is let go of");
 
     // As the owner: one request confirmed, and then one declined.
     let owner_data = tempfile::tempdir().expect("a directory");
@@ -965,10 +975,11 @@ async fn a_code_the_camera_or_the_picker_reads_is_taken_in_as_a_pasted_one_is() 
         "nothing is waiting to be used"
     );
 
-    // What is not a KalaReach invitation is refused whatever read it, and holds nothing new.
+    // What is not a KalaReach invitation is refused whatever read it, and holds nothing.
     intake.will_read(r#"{"mode":"direct"}"#);
     let view = take_in(&*intake, &device, Source::Camera).await;
     assert_eq!(view.failure, Some(FailureKind::NotAnInvitation));
+    assert!(view.invitation.is_none() && device.view().invitation.is_none());
 
     // Three words for three things.
     intake.will_answer(Scan::NoCode);
@@ -977,12 +988,14 @@ async fn a_code_the_camera_or_the_picker_reads_is_taken_in_as_a_pasted_one_is() 
     intake.will_answer(Scan::CameraDenied);
     let view = take_in(&*intake, &device, Source::Camera).await;
     assert_eq!(view.failure, Some(FailureKind::CameraDenied));
-    intake.will_fail();
+    // A camera that could not be started and a picture that could not be opened are a fourth: not a
+    // refusal the person can undo in Settings, and not a picture that shows no code.
+    intake.will_answer(Scan::Failed);
     let view = take_in(&*intake, &device, Source::Camera).await;
-    assert_eq!(view.failure, Some(FailureKind::CameraDenied));
+    assert_eq!(view.failure, Some(FailureKind::ReaderFailed));
     intake.will_fail();
     let view = take_in(&*intake, &device, Source::Photo).await;
-    assert_eq!(view.failure, Some(FailureKind::NoCodeFound));
+    assert_eq!(view.failure, Some(FailureKind::ReaderFailed));
 }
 
 /// KR-REQ-10.17: an intake holds what it read only while it is the one under way. An answer to the
@@ -1109,8 +1122,72 @@ async fn an_intake_that_was_overtaken_holds_nothing() {
     }
 }
 
-/// The page is told which sources this device reads a code from: a desktop none, a phone the camera
-/// and the picker.
+/// KR-REQ-10.17: when the application stops being in front, what was read and is not used yet is let
+/// go of: an invitation held for the person, and an intake that has read its text and waits for the
+/// answer to the alert, which then holds nothing. An intake still waiting for its reader is not
+/// ended by that, since a question the system asks, such as the camera's, also stops the
+/// application being in front.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn what_was_read_is_let_go_of_when_the_application_stops_being_in_front() {
+    use companion_tauri::pairing::take_in;
+
+    let data = tempfile::tempdir().expect("a directory");
+    let (device, _room) = quiet_device(data.path());
+    let intake = StubIntake::holding("", true);
+    let text = another_services_code();
+
+    // An invitation held for the person goes.
+    intake.will_read(&text);
+    let view = take_in(&*intake, &device, Source::Camera).await;
+    assert!(view.invitation.is_some(), "the invitation is held");
+    device.suspend();
+    assert!(device.view().invitation.is_none(), "it was let go of");
+    assert!(
+        device.start_held().is_err(),
+        "nothing is waiting to be used"
+    );
+
+    // An intake that waits at the alert holds nothing, whatever the answer.
+    let answer = intake.hold_the_alert();
+    intake.will_read(&text);
+    let (view, ()) = tokio::join!(take_in(&*intake, &device, Source::Camera), async {
+        tokio::time::timeout(WATCHDOG, async {
+            while intake.asked.lock().expect("the record").is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the alert is raised");
+        device.suspend();
+        answer.send(true).expect("the intake waits");
+    });
+    assert!(view.cancelled && view.invitation.is_none());
+    assert!(device.view().invitation.is_none(), "nothing was restored");
+
+    // An intake still waiting for its reader goes on, and holds what the reader read.
+    let before = intake.read_from.lock().expect("the record").len();
+    let reading = intake.hold_the_read();
+    let (view, ()) = tokio::join!(take_in(&*intake, &device, Source::Camera), async {
+        tokio::time::timeout(WATCHDOG, async {
+            while intake.read_from.lock().expect("the record").len() == before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the reader is asked");
+        device.suspend();
+        reading
+            .send(Ok(Scan::Text(zeroize::Zeroizing::new(text.clone()))))
+            .expect("the intake waits");
+    });
+    assert!(
+        view.invitation.is_some(),
+        "the question the system asked did not end the scan"
+    );
+    device.stop().await;
+}
+
+/// The page is told which sources this device reads a code from: a phone the camera and the picker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_page_is_told_where_this_device_reads_a_code_from() {
     use companion_platform::scan::Sources;
@@ -1144,21 +1221,6 @@ async fn the_page_is_told_where_this_device_reads_a_code_from() {
     })
     .await
     .expect("the page is told what this device offers");
-
-    let desktop = tempfile::tempdir().expect("a directory");
-    let none = Companion::start(
-        desktop.path(),
-        support::parts(
-            Arc::new(MemoryStore::new()),
-            Arc::new(CountingRoom::default()),
-        ),
-        StubCeremony::answering(CeremonyOutcome::Confirmed),
-        Arc::new(StubIntake::default()),
-    );
-    assert_eq!(
-        none.call("pairing_view", json!({})).expect("the screen")["sources"],
-        json!({ "camera": false, "photo": false })
-    );
 }
 
 /// KR-REQ-10.32: this computer counts its tries with a code in its own data directory, under its

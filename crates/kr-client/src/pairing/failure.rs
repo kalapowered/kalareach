@@ -68,6 +68,8 @@ pub enum FailureKind {
     CameraDenied,
     /// The picture the person chose shows no QR code.
     NoCodeFound,
+    /// The camera could not be started, or the picture could not be opened.
+    ReaderFailed,
     /// This device could not keep its pairing records safely, so it stopped.
     StoreFailed,
     /// The host may have approved this device while it could not ask, and that cannot be
@@ -101,6 +103,7 @@ impl Said for FailureKind {
             Self::NothingToPaste => "NothingToPaste",
             Self::CameraDenied => "CameraDenied",
             Self::NoCodeFound => "NoCodeFound",
+            Self::ReaderFailed => "ReaderFailed",
             Self::StoreFailed => "StoreFailed",
             Self::ApprovalUnknown => "ApprovalUnknown",
         })

@@ -7,8 +7,9 @@
 //! picture the person chose.
 //!
 //! Both decode with the platform's own detector (Vision on iOS, ZXing on Android) and answer one of
-//! four things: the text of the code, that the person closed the scanner or the picker, that the
-//! picture shows no code, or that the camera is not allowed.
+//! five things: the text of the code, that the person closed the scanner or the picker, that the
+//! picture shows no code, that the camera is not allowed, or that the camera could not be started or
+//! the picture opened.
 //!
 //! Only phones read a code. A desktop answers that it offers neither source.
 
@@ -21,7 +22,8 @@ use crate::PlatformError;
 /// What reading a code came to.
 #[derive(PartialEq, Eq)]
 pub enum Scan {
-    /// The text of the code. It clears itself when it is dropped.
+    /// The text of the code. This copy clears itself when it is dropped; the copies the platform
+    /// and the serialiser made on the way to it do not.
     Text(Zeroizing<String>),
     /// The person closed the scanner or the picker without choosing.
     Cancelled,
@@ -29,9 +31,11 @@ pub enum Scan {
     NoCode,
     /// The camera is not allowed to this application.
     CameraDenied,
+    /// The camera could not be started, or the picture could not be opened.
+    Failed,
 }
 
-/// What a reading says of itself when something prints it: which of the four it is, and never the
+/// What a reading says of itself when something prints it: which reading it is, and never the
 /// text of a code, which holds an invitation's secret.
 impl std::fmt::Debug for Scan {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -40,6 +44,7 @@ impl std::fmt::Debug for Scan {
             Self::Cancelled => "Cancelled",
             Self::NoCode => "NoCode",
             Self::CameraDenied => "CameraDenied",
+            Self::Failed => "Failed",
         })
     }
 }
@@ -61,6 +66,7 @@ enum Answer {
     Cancelled,
     NoCode,
     CameraDenied,
+    Failed,
 }
 
 impl From<Answer> for Scan {
@@ -70,6 +76,7 @@ impl From<Answer> for Scan {
             Answer::Cancelled => Self::Cancelled,
             Answer::NoCode => Self::NoCode,
             Answer::CameraDenied => Self::CameraDenied,
+            Answer::Failed => Self::Failed,
         }
     }
 }
@@ -186,9 +193,9 @@ async fn ask<R: Runtime>(_app: &AppHandle<R>, _method: &str) -> Result<Scan, Pla
 mod tests {
     use super::*;
 
-    /// What the native halves send is what this module reads: the four answers and nothing else.
+    /// What the native halves send is what this module reads: the five answers and nothing else.
     #[test]
-    fn the_four_answers_the_native_halves_send_are_read() {
+    fn the_five_answers_the_native_halves_send_are_read() {
         let read = |text: &str| -> Scan {
             serde_json::from_str::<Answer>(text)
                 .expect("an answer")
@@ -201,6 +208,7 @@ mod tests {
         assert_eq!(read(r#"{"outcome":"cancelled"}"#), Scan::Cancelled);
         assert_eq!(read(r#"{"outcome":"no_code"}"#), Scan::NoCode);
         assert_eq!(read(r#"{"outcome":"camera_denied"}"#), Scan::CameraDenied);
+        assert_eq!(read(r#"{"outcome":"failed"}"#), Scan::Failed);
         assert!(serde_json::from_str::<Answer>(r#"{"outcome":"text"}"#).is_err());
         assert!(serde_json::from_str::<Answer>(r#"{"outcome":"other"}"#).is_err());
     }

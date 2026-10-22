@@ -424,8 +424,8 @@ impl AppState {
         }
     }
 
-    /// Records this computer as a device that pairs, once it has been opened, and where it takes invitations in from
-    /// invitations from.
+    /// Records this computer as a device that pairs, once it has been opened, and the platform it
+    /// takes invitations in from.
     pub fn opened(
         &self,
         device: Arc<Device>,

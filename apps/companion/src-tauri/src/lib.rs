@@ -147,6 +147,8 @@ pub fn run() {
             });
             app.manage(voice_calls(app.handle()));
             watch_drops(app.handle());
+            #[cfg(mobile)]
+            watch_suspension(app.handle());
             open_sync_service(app.handle());
             open_pairing(app.handle());
             #[cfg(all(debug_assertions, mobile))]
@@ -348,6 +350,25 @@ fn build_account(
             let _ = emitter.emit(account::ACCOUNT_EVENT, view);
         }),
     )))
+}
+
+/// Lets go of what a phone read and has not used when the application stops being in front: the
+/// invitation held for the person, and an intake that waits for the answer to the alert. The event
+/// is the platform's (`applicationWillResignActive`, `onPause`); nothing in the page can produce it.
+#[cfg(mobile)]
+fn watch_suspension(app: &tauri::AppHandle) {
+    use tauri::Manager as _;
+
+    for (_, window) in app.webview_windows() {
+        let handle = app.clone();
+        window.on_window_event(move |event| {
+            if matches!(event, tauri::WindowEvent::Suspended)
+                && let Ok(device) = handle.state::<AppState>().device()
+            {
+                device.suspend();
+            }
+        });
+    }
 }
 
 /// Records what the platform drops on this window, and tells the interface about it.

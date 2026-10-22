@@ -198,16 +198,15 @@ pub async fn take_in(
                 Ok(Scan::Cancelled) => return IntakeView::cancelled(),
                 Ok(Scan::NoCode) => return nothing(FailureKind::NoCodeFound),
                 Ok(Scan::CameraDenied) => return nothing(FailureKind::CameraDenied),
+                Ok(Scan::Failed) => return nothing(FailureKind::ReaderFailed),
                 Err(error) => {
                     tracing::warn!(%error, ?source, "the platform could not read a code");
-                    return nothing(match source {
-                        Source::Photo => FailureKind::NoCodeFound,
-                        Source::Camera | Source::Pasteboard => FailureKind::CameraDenied,
-                    });
+                    return nothing(FailureKind::ReaderFailed);
                 }
             }
         }
     };
+    device.mark_read(intake);
     let invitation = match device.read(&text) {
         Ok(invitation) => invitation,
         Err(failure) => return nothing(failure.kind),
