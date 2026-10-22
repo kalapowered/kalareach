@@ -704,6 +704,14 @@ async fn explain<P: Privacy>(
             checkpoint,
             held
         )),
+        RestoreError::NamedGenerationNotHeld { named, held } => CliError::Usage(shown!(
+            "--accept-older {} was given, and the service holds generation {} of this archive, \
+             which the recovery bundle's checkpoint accepts without it, so nothing is restored: \
+             restore without --accept-older, or name the older generation the service holds when \
+             the checkpoint refuses it",
+            named,
+            held
+        )),
         RestoreError::NoCheckpointToAcceptPast => CliError::Usage(Shown::said(
             "--accept-older names a generation older than the one the recovery bundle last \
              verified, and this bundle records none for that archive, so there is nothing to \

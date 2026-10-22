@@ -24,6 +24,41 @@ use kr_protocol::archive::{ArchiveCheckpoint, RecoveryBundle};
 
 use crate::recovery::{RecoveryError, Result};
 
+/// Holds a bundle read later to the checkpoint this restore already read in the bundle: a service
+/// that answers with an older authentic bundle is not recorded into, because writing on it would
+/// lower the checkpoint it replaced.
+///
+/// # Errors
+///
+/// Returns [`RecoveryError::CheckpointWentBack`] when `bundle` records an older generation of the
+/// archive than `known`, or none, and [`RecoveryError::CheckpointDisagrees`] when it records the
+/// same generation with another encrypted manifest.
+pub(crate) fn hold_to_known_checkpoint(
+    bundle: &RecoveryBundle,
+    known: &ArchiveCheckpoint,
+) -> Result<()> {
+    let held = bundle
+        .checkpoints
+        .iter()
+        .filter(|held| held.archive_id == known.archive_id)
+        .max_by_key(|held| held.backup_generation);
+    match held {
+        Some(held) if held.backup_generation > known.backup_generation => Ok(()),
+        Some(held) if held.backup_generation == known.backup_generation => {
+            if held.encrypted_manifest_hash == known.encrypted_manifest_hash {
+                Ok(())
+            } else {
+                Err(RecoveryError::CheckpointDisagrees {
+                    generation: known.backup_generation.get(),
+                })
+            }
+        }
+        _ => Err(RecoveryError::CheckpointWentBack {
+            known: known.backup_generation.get(),
+        }),
+    }
+}
+
 /// The bundle that records `verified`, or nothing when the bundle already records it or a newer
 /// generation of the same archive.
 ///
