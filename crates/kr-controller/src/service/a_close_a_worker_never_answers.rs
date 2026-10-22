@@ -228,6 +228,7 @@ pub(super) fn read_result(session_id: SessionId) -> kr_protocol::session::Sessio
             closure: Nullable::null(),
             environment_sources: None,
             root: None,
+            application: None,
         },
         endpoint: Nullable::null(),
         launch_profile: Nullable::null(),

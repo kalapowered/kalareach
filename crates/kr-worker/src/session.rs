@@ -391,6 +391,8 @@ pub struct Session {
     /// What the root process is, where it is not an interactive shell: a command the host
     /// started the session to run.
     root: Option<kr_protocol::session::SessionRoot>,
+    /// The name of the application in the session's foreground, where the worker was told one.
+    application: Option<String>,
     /// What a session a workflow started is held to at the moment its process is created.
     start_terms: StartTerms,
     owned: Option<OwnedProcesses>,
@@ -676,6 +678,7 @@ impl Session {
             created_at_ms: kr_ipc::now_ms(),
             environment_sources: None,
             root: None,
+            application: None,
             start_terms: StartTerms::default(),
             owned: None,
             owned_writer: None,
@@ -1543,6 +1546,26 @@ impl Session {
         input.end_lease()
     }
 
+    /// Sets the name of the application in the session's foreground, or clears it when the
+    /// foreground is no application, and writes the session's record again when it changed.
+    ///
+    /// The name is the one a person recognises, as the foreground-application producer of
+    /// KR-REQ-03.27 learns it. That producer calls this; until it lands no caller does, and a
+    /// session shows no application. It stays as the producer's entry point: the summary's member
+    /// and the journal's row for it are what the cut carries.
+    pub fn set_application(&mut self, application: Option<String>) {
+        if self.application == application {
+            return;
+        }
+        self.application = application;
+        let summary = self.summary();
+        if let Some(journal) = self.journal.as_mut()
+            && let Err(error) = journal.record_session(&summary)
+        {
+            self.note_journal_failure(error);
+        }
+    }
+
     /// Renders the session for the wire.
     #[must_use]
     pub fn summary(&self) -> SessionSummary {
@@ -1565,6 +1588,7 @@ impl Session {
             closure: Nullable(self.closure.clone()),
             environment_sources: self.environment_sources,
             root: self.root,
+            application: self.application.clone(),
         }
     }
 

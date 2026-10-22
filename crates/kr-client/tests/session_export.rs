@@ -121,6 +121,7 @@ fn session() -> SessionSummary {
         }),
         environment_sources: None,
         root: None,
+        application: None,
     }
 }
 

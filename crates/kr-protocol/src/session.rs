@@ -727,6 +727,14 @@ pub struct SessionSummary {
     /// command makes its session's root that command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<SessionRoot>,
+    /// The name of the application in the session's foreground, as a person recognises it.
+    ///
+    /// Absent from the wire when the worker knows no application, which is every session at a
+    /// prompt and every session of a worker of a release that wrote no such member, so a summary
+    /// of one is byte for byte what that release reads. A session of such a worker shows no
+    /// application. A closed session shows the application its worker last recorded for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application: Option<String>,
 }
 
 /// What a session's root process is, where it is not an interactive shell.
@@ -1478,6 +1486,7 @@ mod tests {
             closure: Nullable::null(),
             environment_sources: None,
             root: None,
+            application: None,
         }
     }
 
