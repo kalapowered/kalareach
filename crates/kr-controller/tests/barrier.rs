@@ -3715,6 +3715,97 @@ async fn an_announcement_names_a_grant_that_holds_only_the_size_of_the_session()
     );
 }
 
+/// KR-REQ-10.45: revoking a grant that holds only the size of the session takes the size from the
+/// attachment made under it, in the worker, before the revocation's barrier holds.
+///
+/// The grant carries `terminal.geometry` and no input right, so the lease the fence takes back is
+/// not what it holds. The attachment claimed the size at a size of its own, and the session has
+/// no other claim to hand it to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_revocation_takes_the_size_of_the_session_from_a_grant_that_holds_only_the_size() {
+    use kr_controller::grants::GrantRecord;
+    use kr_controller::service::Audience;
+    use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
+    use kr_protocol::ids::{AttachmentId, GrantId};
+    use kr_protocol::rights::ActionRight;
+
+    let hosted = hosted_worker().await;
+    let sizing = a_grant_of(
+        GrantId::new(Uuid::from_bytes([0x43; 16])),
+        None,
+        &[ActionRight::SessionView, ActionRight::TerminalGeometry],
+    );
+    hosted
+        .controller
+        .sharing()
+        .grants()
+        .issue(
+            &GrantRecord {
+                grant: sizing.clone(),
+                session_id: None,
+                issued_at_ms: 1_000,
+                activated_at_ms: Some(1_000),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("the grant is written");
+    let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
+    {
+        let mut requested = kr_protocol::scalars::CanonicalSet::new();
+        requested.insert(AttachmentCapability::ObserveTerminal);
+        requested.insert(AttachmentCapability::Geometry);
+        let mut session = hosted.runtime.session();
+        session
+            .attach(
+                &SessionAttachParams {
+                    session_id: hosted.session_id,
+                    mode: AttachMode::Terminal,
+                    claim_geometry: true,
+                    dimensions: Nullable::some(Dimensions::new(100, 40)),
+                    terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                    requested: requested.clone(),
+                },
+                requested,
+                attachment_id,
+            )
+            .expect("the attachment is made");
+        session.note_granted_attachment(
+            attachment_id,
+            kr_worker::session::GrantedBy {
+                grant_id: Some(sizing.grant_id),
+                device_id: None,
+            },
+        );
+        assert_eq!(
+            session.geometry().owner.0,
+            Some(attachment_id),
+            "the attachment holds the size before the revocation"
+        );
+    }
+
+    let answered = tokio::time::timeout(
+        Duration::from_secs(60),
+        hosted
+            .controller
+            .revoke_grant(sizing.grant_id, Audience::Host, None, None),
+    )
+    .await
+    .expect("the revocation completes")
+    .expect("it succeeds");
+    let barrier = announced_until(&hosted.controller, answered.barrier, |barrier| {
+        barrier.holds()
+    })
+    .await;
+    assert!(barrier.holds(), "{barrier:?}");
+    assert_ne!(
+        hosted.runtime.session().geometry().owner.0,
+        Some(attachment_id),
+        "the size is not held under a grant that was withdrawn"
+    );
+}
+
 /// A grant that lets its holder watch the terminal and type into it, under `parent`.
 fn a_typists_grant(
     id: kr_protocol::ids::GrantId,
