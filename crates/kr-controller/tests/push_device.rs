@@ -66,6 +66,10 @@ const REGISTRATION_WAIT: Duration = Duration::from_secs(150);
 /// How long the script is given to put a message on the phone and see what it did.
 const INJECTION_WAIT: Duration = Duration::from_secs(120);
 
+/// How long the script is given to tap a notification, open the question it leads to and answer it
+/// on the phone's screen, which reads the screen again whenever it has not drawn what it waits for.
+const SCREEN_STEP_WAIT: Duration = Duration::from_secs(240);
+
 /// How long a delivery is given to reach the stand-in.
 const DELIVERY_WAIT: Duration = Duration::from_secs(90);
 
@@ -251,42 +255,75 @@ fn deliveries_of(host: &Host) -> Vec<kr_delivery::journal::DeliveryRecord> {
         .expect("the daemon's journal")
 }
 
-/// Waits until every one of the `questions` the worker asked has been raised in the attention
-/// store (`answered` of them have since been answered and no longer pend) and the daemon has taken
-/// every one of them into its journal and produced from them.
-async fn settled(host: &Host, questions: usize, answered: usize, within: Duration) -> bool {
-    until(within, || {
-        let taken = host
-            .controller()
-            .attention()
-            .take_for_delivery(|store, _| {
-                let raised = store
-                    .engine()
-                    .map(|engine| {
-                        engine
-                            .items()
-                            .filter(|item| {
-                                item.rule == kr_protocol::attention::AttentionRule::PendingInput
-                            })
-                            .count()
-                    })
-                    .unwrap_or(0);
-                raised + answered >= questions && store.awaiting_delivery().ok() == Some(0)
-            })
-            .unwrap_or(false);
-        taken
-            && host
-                .controller()
-                .delivery()
-                .with(|producer| {
-                    Ok(producer
-                        .journal()
-                        .pending_events(0, 1)
-                        .is_ok_and(|pending| pending.is_empty()))
+/// What the daemon has done with the questions the worker asked: how many the attention store
+/// holds as pending input, how many of its announcements wait to be taken, and whether the
+/// delivery journal holds an event no producer has finished with.
+fn settling(host: &Host) -> (usize, Option<usize>, bool) {
+    let (raised, awaiting) = host
+        .controller()
+        .attention()
+        .take_for_delivery(|store, _| {
+            let raised = store
+                .engine()
+                .map(|engine| {
+                    engine
+                        .items()
+                        .filter(|item| {
+                            item.rule == kr_protocol::attention::AttentionRule::PendingInput
+                        })
+                        .count()
                 })
-                .unwrap_or(false)
+                .unwrap_or(0);
+            (raised, store.awaiting_delivery().ok())
+        })
+        .unwrap_or((0, None));
+    let journal_has_pending = host
+        .controller()
+        .delivery()
+        .with(|producer| {
+            Ok(producer
+                .journal()
+                .pending_events(0, 1)
+                .map_or(true, |pending| !pending.is_empty()))
+        })
+        .unwrap_or(true);
+    (raised, awaiting, journal_has_pending)
+}
+
+/// Waits until every question in `asked` has been raised in the attention store (the ones the
+/// worker's ledger holds as answered no longer pend there) and the daemon has taken every one of
+/// them into its journal and produced from them. What it saw last is written to the run's output
+/// when it gives up.
+async fn settled(
+    host: &Host,
+    worker: &Worker,
+    asked: &[kr_protocol::question::Question],
+    within: Duration,
+) -> bool {
+    let answered = || {
+        asked
+            .iter()
+            .filter(|question| {
+                worker.held(question).state != kr_protocol::question::QuestionState::Pending
+            })
+            .count()
+    };
+    let reached = until(within, || {
+        let (raised, awaiting, journal_has_pending) = settling(host);
+        raised + answered() >= asked.len() && awaiting == Some(0) && !journal_has_pending
     })
-    .await
+    .await;
+    if !reached {
+        let (raised, awaiting, journal_has_pending) = settling(host);
+        eprintln!(
+            "settled gave up: {} asked, {} no longer pending, {raised} pending in the store, \
+             {awaiting:?} announcements awaiting delivery, journal has pending events: \
+             {journal_has_pending}",
+            asked.len(),
+            answered(),
+        );
+    }
+    reached
 }
 
 /// Every file under `directory` that holds `needle`.
@@ -545,8 +582,9 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
         report.insert("destination_enabled".to_owned(), json!(record.enabled));
         held_destination = Some(record);
     }
-    let mut asked_total = 0_usize;
-    let mut answered_total = 0_usize;
+    // Every question the worker asked, so that what the daemon has to settle is counted from the
+    // worker's own ledger and not from what this run remembers answering.
+    let mut asked_questions: Vec<kr_protocol::question::Question> = Vec::new();
 
     // ---- A delivery (16.12, 16.13) ----------------------------------------------------------
     // A question the worker asks becomes a notification for the phone. Its text carries a marker
@@ -554,7 +592,7 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
     let before = fcm.sent().len();
     let asked = Instant::now();
     let question = worker.ask_with_context(&format!("run-{MARKER}"), &format!("context {MARKER}"));
-    asked_total += 1;
+    asked_questions.push(question.clone());
     report.insert(
         "question_id".to_owned(),
         json!(question.question_id.to_string()),
@@ -655,13 +693,12 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
     // notification is tapped, the application opens on the Attention screen, the person answers
     // there, and the worker's ledger records the answer as the paired device's.
     run.ask_step("tap");
-    let tap_report = run.step_done("tap", INJECTION_WAIT).await;
+    let tap_report = run.step_done("tap", SCREEN_STEP_WAIT).await;
     report.insert("tap_step".to_owned(), json!(tap_report));
     let answered_by_the_phone = until(DELIVERY_WAIT.min(run.left()), || {
         worker.held(&question).state == kr_protocol::question::QuestionState::Answered
     })
     .await;
-    answered_total += usize::from(answered_by_the_phone);
     let record = worker.held(&question).answer.0;
     report.insert(
         "question_answered_from_the_notification".to_owned(),
@@ -676,12 +713,12 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
         ),
     );
 
-    // A second question is answered at the host while its notification is still on the phone. The
-    // phone's answer, made from that notification, is refused, and the application says the answer
-    // did not run; the worker keeps the host's answer.
+    // A second question is answered at the host while its notification is still on the phone and
+    // the person has chosen an answer to it and not yet sent it. The phone no longer offers it to
+    // send, and the worker keeps the host's answer.
     let before = fcm.sent().len();
     let second = worker.ask_with_context("late-1", "the host answers this one first");
-    asked_total += 1;
+    asked_questions.push(second.clone());
     let second_delivered = until(DELIVERY_WAIT.min(run.left()), || {
         fcm.sent()
             .iter()
@@ -709,7 +746,7 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
         );
         // The form is open on the phone, with the answer chosen and not sent.
         run.ask_step("late");
-        let opened = run.step_done("late", INJECTION_WAIT).await;
+        let opened = run.step_done("late", SCREEN_STEP_WAIT).await;
         report.insert("late_step".to_owned(), json!(opened));
         let resolved_at_the_host = worker.service.questions().answer(
             &kr_protocol::ids::ActorId::new("local:501").expect("an actor"),
@@ -725,14 +762,13 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
                 boot_ms: kr_ipc::clock::boot_elapsed_ms(),
             },
         );
-        answered_total += usize::from(resolved_at_the_host.is_ok());
         report.insert(
             "second_resolved_at_the_host".to_owned(),
             json!(resolved_at_the_host.is_ok()),
         );
-        run.ask_step("late-send");
-        let sent = run.step_done("late-send", INJECTION_WAIT).await;
-        report.insert("late_send_step".to_owned(), json!(sent));
+        run.ask_step("late-observe");
+        let observed = run.step_done("late-observe", SCREEN_STEP_WAIT).await;
+        report.insert("late_observe_step".to_owned(), json!(observed));
         let held = worker.held(&second);
         report.insert(
             "host_answer_kept".to_owned(),
@@ -759,8 +795,8 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
     let phone_state = run.step_done("reissue", INJECTION_WAIT).await;
     report.insert("reissue_step".to_owned(), json!(phone_state));
     let before = fcm.sent().len();
-    worker.ask_with_context("renew-1", "the host holds a bearer the gateway replaced");
-    asked_total += 1;
+    asked_questions
+        .push(worker.ask_with_context("renew-1", "the host holds a bearer the gateway replaced"));
     let renewed = until(RENEWAL_WAIT.min(run.left()), || {
         fcm.sent()
             .iter()
@@ -800,8 +836,7 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
     // registration, with a new token, answered through the same challenge, resumes delivery.
     fcm.forget(&token);
     let before = fcm.sent().len();
-    worker.ask_with_context("gone-1", "the provider does not know the token");
-    asked_total += 1;
+    asked_questions.push(worker.ask_with_context("gone-1", "the provider does not know the token"));
     let unregistered = until(DELIVERY_WAIT.min(run.left()), || {
         fcm.sent()
             .iter()
@@ -819,12 +854,12 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
     .await;
     report.insert("destination_out_of_service".to_owned(), json!(disabled));
     let sent_so_far = fcm.sent().len();
-    worker.ask_with_context("gone-2", "nothing may reach a destination out of service");
-    asked_total += 1;
+    asked_questions
+        .push(worker.ask_with_context("gone-2", "nothing may reach a destination out of service"));
     let settled_out = settled(
         &host,
-        asked_total,
-        answered_total,
+        &worker,
+        &asked_questions,
         DELIVERY_WAIT.min(run.left()),
     )
     .await;
@@ -869,8 +904,7 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
     .await;
     report.insert("destination_back_in_service".to_owned(), json!(resumed));
     let before = fcm.sent().len();
-    worker.ask_with_context("back-1", "the replacement token is known");
-    asked_total += 1;
+    asked_questions.push(worker.ask_with_context("back-1", "the replacement token is known"));
     let back = until(DELIVERY_WAIT.min(run.left()), || {
         fcm.sent()
             .iter()
@@ -897,13 +931,12 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
         .filter(|sent| is_delivery(sent, &replacement))
         .count();
     for number in 1..=burst {
-        worker.ask_with_context(&format!("burst-{number}"), "one of a burst");
+        asked_questions.push(worker.ask_with_context(&format!("burst-{number}"), "one of a burst"));
     }
-    asked_total += burst;
     let burst_settled = settled(
         &host,
-        asked_total,
-        answered_total,
+        &worker,
+        &asked_questions,
         REGISTRATION_WAIT.min(run.left()),
     )
     .await;
@@ -1044,12 +1077,11 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
         json!(revocation_settled),
     );
     let sent_end = fcm.sent().len();
-    worker.ask_with_context("after-unpair", "nobody is left to tell");
-    asked_total += 1;
+    asked_questions.push(worker.ask_with_context("after-unpair", "nobody is left to tell"));
     let settled_end = settled(
         &host,
-        asked_total,
-        answered_total,
+        &worker,
+        &asked_questions,
         DELIVERY_WAIT.min(run.left()),
     )
     .await;
