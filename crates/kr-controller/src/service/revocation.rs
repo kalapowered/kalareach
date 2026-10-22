@@ -111,11 +111,15 @@ impl Controller {
         .await
     }
 
-    /// A revocation's debt, when it wrote one, as one that reaches every connection.
-    fn host_wide(
+    /// A device record's debt, when it wrote one, as one that reaches the connections of that
+    /// device and what it holds at a worker, and no others.
+    fn for_the_device(
+        device_id: kr_protocol::ids::DeviceId,
         debt: Option<crate::grants::store::DebtId>,
     ) -> Vec<(crate::grants::store::DebtId, Reach)> {
-        debt.into_iter().map(|debt| (debt, Reach::Host)).collect()
+        debt.into_iter()
+            .map(|debt| (debt, Reach::Device(device_id)))
+            .collect()
     }
 
     /// A revocation's debt, when it wrote one, as one that reaches the connections acting under
@@ -145,13 +149,14 @@ impl Controller {
 
     /// Revokes every grant one device holds, then revokes the device itself.
     ///
-    /// The grants go first for the same reason as above. What this does **not** do is withdraw
-    /// that one device's network registration selectively: that is `net::Network::revoke_device`,
-    /// which owns the in-memory registrations, and this daemon reaches it through the network
-    /// entry point rather than from here. What happens instead is the daemon-wide fence, which is
-    /// stricter rather than weaker: every registration is withdrawn and re-admitted at the
-    /// revision now in force, and the revoked device's record is already marked so it cannot be
-    /// re-admitted at all.
+    /// The grants go first for the same reason as above. The in-memory registrations belong to
+    /// `net::Network::revoke_device`, which the network entry point calls, and this daemon reaches
+    /// them through the barrier its debts raise: the barrier withdraws the registrations of the
+    /// device and of the connections acting under the grants it withdrew, admits every other
+    /// connection again at the revision now in force, and the revoked device's record is already
+    /// marked so it cannot be re-admitted at all. The workers are told the device and the grants,
+    /// so what they take is the input lease and the size claim of the device's attachments and of
+    /// those made under the grants withdrawn, and not those of any other device.
     ///
     /// `carried` and `claim` are as [`Self::revoke_grant`]: the admission of the mutation this is
     /// performing, and its hold on its action, which the withdrawn rows are written beside.
@@ -192,7 +197,7 @@ impl Controller {
                 claim,
             )?;
             // The transaction that revoked is the restriction, and it has committed.
-            let own = self.publish_debts(&Self::host_wide(revocation.debt));
+            let own = self.publish_debts(&Self::under_the_grants(&revocation));
             // The device record is marked revoked before the revision advances, so nothing can be
             // authorised against it in between. The directory is a view on this daemon's own
             // registry database, which is the file the network half keeps its device records in.
@@ -229,7 +234,7 @@ impl Controller {
                 }
                 Some(self.owe_debt(
                     &format!("the revocation of device {device_id}'s record"),
-                    Reach::Host,
+                    Reach::Device(device_id),
                 )?)
             } else {
                 None
@@ -253,7 +258,7 @@ impl Controller {
             // a restriction that did not land withdraws nothing more, and a debt left pending would
             // never be retired. A record that could not be marked answers with its error, and what
             // it published is left to the debt pass.
-            let own = own.and(self.publish_debts(&Self::host_wide(record_debt)));
+            let own = own.and(self.publish_debts(&Self::for_the_device(device_id, record_debt)));
             if recorded.is_ok() && lapsed.is_none() {
                 self.unbind_device(device_id);
             }
