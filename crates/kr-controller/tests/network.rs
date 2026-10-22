@@ -5393,9 +5393,6 @@ fn asked_ids(
 /// preview, as the text itself. The device it is shared with, whose own pairing grant reaches no
 /// session, attaches and subscribes only once it has redeemed the invitation, is sent what the
 /// session prints from then on, and is cut off when the owner withdraws the share.
-/// KR-REQ-25.28, the part about a device paired with no session: a device paired under a grant that
-/// reaches no session is refused its attach until the invitation it is given is redeemed, reaches
-/// the session after, and is served nothing once the owner withdraws the share.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_25_10_a_device_given_the_screen_is_shown_it_and_follows_it_until_the_share_is_withdrawn()
