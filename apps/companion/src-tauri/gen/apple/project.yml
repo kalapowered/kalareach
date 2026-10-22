@@ -191,10 +191,10 @@ targets:
         # camera is also the scanner that reads a pairing code.
         NSCameraUsageDescription:
           Scan a pairing code, or take a photo to attach it to a session on one of your hosts.
-        # A host on the same network is reached directly, which iOS asks the person about once.
         # Confirming a sensitive action of a host this phone owns uses Face ID.
         NSFaceIDUsageDescription:
           Confirm that it is you before a host you own does something that needs your say-so.
+        # A host on the same network is reached directly, which iOS asks the person about once.
         NSLocalNetworkUsageDescription:
           Reach a host on your local network, to pair with it and to use it.
         NSPhotoLibraryUsageDescription:

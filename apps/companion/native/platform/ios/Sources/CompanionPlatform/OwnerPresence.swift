@@ -49,7 +49,8 @@ final class OwnerPresenceRun {
   private let within: TimeInterval
 
   init(reason: String, within: TimeInterval, reply: @escaping (String) -> Void) {
-    self.reason = reason
+    // The request's own line is written to follow a verb, and here it begins a sentence.
+    self.reason = reason.prefix(1).uppercased() + reason.dropFirst()
     self.within = within
     self.reply = reply
   }
