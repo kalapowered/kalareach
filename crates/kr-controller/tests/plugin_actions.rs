@@ -476,8 +476,8 @@ async fn kr_req_23_30_a_binding_that_moved_while_the_component_prepared_rejects_
     );
 }
 
-/// KR-REQ-23.30 and KR-REQ-09.12: an authority revision the daemon announces while an action's
-/// component prepares it revokes the action, which never dispatches.
+/// KR-REQ-23.30: an authority revision the daemon announces while an action's component prepares
+/// it revokes the action, which never dispatches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_an_authority_revision_announced_while_the_component_prepared_revokes_the_action()
  {
@@ -491,9 +491,9 @@ async fn kr_req_23_30_an_authority_revision_announced_while_the_component_prepar
     );
 }
 
-/// KR-REQ-23.30 and KR-REQ-09.12: an action the daemon forwarded for a paired device, revoked
-/// while its component prepares it, is answered to the daemon with the rejected receipt, and
-/// nothing is written to the upstream.
+/// KR-REQ-23.30: an action the daemon forwarded for a paired device, revoked while its component
+/// prepares it, is answered to the daemon with the rejected receipt, and nothing is written to the
+/// upstream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_a_forwarded_action_revoked_while_the_component_prepared_is_answered_with_its_receipt()
  {

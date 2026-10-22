@@ -2755,12 +2755,20 @@ async fn a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(
 /// The worker is killed without a chance to say anything (`SIGKILL`, or `taskkill /F` on Windows,
 /// where core-ci's windows job runs this case), and the closure the daemon writes names the crash,
 /// the processes of the session's tree it ended and whether it could account for all of them.
+///
+/// KR-REQ-27.05, the part about an independent kill of the worker: the worker dies with the daemon
+/// running, the session's own tree is stopped before the closure that names the crash is recorded,
+/// and the crash starts no second worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crashed_workers_tree_is_stopped_before_its_closure_is_recorded() {
     a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(Start::Plain, false).await;
 }
 
 /// The same when it is the start of a daemon that finds the worker dead.
+///
+/// KR-REQ-27.05, the part about independent kills: the worker dies while the daemon is stopped, and
+/// the daemon that starts after finds the dead worker, stops its session's tree and records the
+/// crash, starting no second worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crashed_workers_tree_is_stopped_by_the_daemon_that_starts_after_it() {
     a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(Start::Plain, true).await;
