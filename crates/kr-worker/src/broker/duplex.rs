@@ -2085,10 +2085,11 @@ impl Duplex {
         self.ends.client.queue(frame)?;
         let resource_id = resource.map(|resource| resource.resource_id);
         // Interpreted after it was recorded and forwarded, never before: the terminal's own
-        // answer does not wait for a meaning. A request the connector's table does not answer, or
-        // one nothing may decode, stays opaque and the terminal answers it.
+        // answer does not wait for a meaning, and a component that decodes it is asked later. A
+        // request the connector's table does not answer, or one nothing may decode, stays opaque
+        // and the terminal answers it.
         if let Some(resource_id) = resource_id {
-            let _ = self.broker.interpret_native(resource_id, now);
+            let _ = self.broker.interpret_request(resource_id, now);
         }
         self.broker
             .read_upstream_frame(self.connection, &forwarded.method, frame, now);

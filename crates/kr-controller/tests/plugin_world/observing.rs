@@ -114,6 +114,15 @@ impl Spec {
         }
     }
 
+    /// A binding of the connection's own package that reads the connector's approval request
+    /// through the component it ships, and observes nothing.
+    pub fn decoder(number: u8, component: &'static str) -> Self {
+        Self {
+            component: Some(component),
+            ..Self::interpreter(number)
+        }
+    }
+
     /// The same, granted the connector's own frames only.
     pub fn semantic_only(number: u8) -> Self {
         Self {
@@ -386,9 +395,16 @@ impl Observing {
                 methods: [UpstreamMethod::new("session/request_permission").expect("a method")]
                     .into_iter()
                     .collect(),
-                schema_versions: [kr_worker::broker::connectors::DECISION_SCHEMA.to_owned()]
-                    .into_iter()
-                    .collect(),
+                // The schemas the installation's trust covers: the connector table's, and the
+                // plugin contract's where the package ships a component.
+                schema_versions: std::iter::once(
+                    kr_worker::broker::connectors::DECISION_SCHEMA.to_owned(),
+                )
+                .chain(
+                    spec.component
+                        .map(|_| kr_worker::broker::connectors::component_schema()),
+                )
+                .collect(),
                 max_decisions: U64::new(4),
                 may_encode_response: true,
                 granted_at: TimestampMs::new(1),
@@ -576,6 +592,16 @@ impl Observing {
             .ok()?;
         let state = called.state?;
         Some(Account::parse(&String::from_utf8_lossy(&state)))
+    }
+
+    /// Asks a component for its checkpoint, as text, through the link's own connection.
+    pub async fn raw_account(&self, number: u8) -> Option<String> {
+        let client = self.broker().component_calls().client()?;
+        let called = client
+            .checkpoint(service_id(number), Duration::from_secs(5))
+            .await
+            .ok()?;
+        Some(String::from_utf8_lossy(&called.state?).into_owned())
     }
 
     /// Waits until a component's account satisfies `wanted`, and returns it.
@@ -1050,6 +1076,16 @@ pub fn request(id: u64) -> serde_json::Value {
         "id": id,
         "method": "session/request_permission",
         "params": { "tool": "write" }
+    })
+}
+
+/// The frame of a request the table lists, which the upstream is waiting on, with a note in its
+/// parameters that a component can be made to act on.
+pub fn request_noting(id: u64, note: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "method": "session/request_permission",
+        "params": { "tool": "write", "note": note }
     })
 }
 

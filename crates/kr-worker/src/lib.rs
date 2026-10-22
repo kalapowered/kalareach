@@ -60,6 +60,7 @@ pub mod output;
 pub mod owned_writer;
 pub mod ownership;
 pub mod persistence;
+pub mod plugin_decoding;
 pub mod plugin_observation;
 pub mod plugin_runtime;
 pub mod privacy;

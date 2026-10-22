@@ -1602,16 +1602,12 @@ fn managed(number: u8) -> ManagedProcess {
     )
 }
 
-/// Opens instance 2's channel for `connector`, relays one tool approval on it, has the channel's
-/// package interpret it, and equips the instance to answer it: the evidence the answer is checked
-/// against and the transport it goes out on. Returns the resource and the transport.
-fn relayed_approval(
+/// Opens instance 2's channel for `connector` and relays one tool approval on it. Returns the
+/// channel's connection and the request as it was recorded.
+fn relay_approval(
     broker: &Broker,
     connector: &InstalledConnector,
-) -> (
-    kr_protocol::gateway::PendingResource,
-    Arc<RecordingUpstream>,
-) {
+) -> (GatewayConnectionId, kr_protocol::gateway::PendingResource) {
     let connection = broker
         .open_bridge_channel(
             instance(2),
@@ -1652,6 +1648,20 @@ fn relayed_approval(
     else {
         panic!("the relayed approval is recorded");
     };
+    (connection, relayed)
+}
+
+/// Opens instance 2's channel for `connector`, relays one tool approval on it, has the channel's
+/// package interpret it, and equips the instance to answer it: the evidence the answer is checked
+/// against and the transport it goes out on. Returns the resource and the transport.
+fn relayed_approval(
+    broker: &Broker,
+    connector: &InstalledConnector,
+) -> (
+    kr_protocol::gateway::PendingResource,
+    Arc<RecordingUpstream>,
+) {
+    let (connection, relayed) = relay_approval(broker, connector);
     broker
         .interpret_declared(relayed.resource_id, kr_ipc::now_ms())
         .expect("interpreted")
@@ -1677,6 +1687,106 @@ fn relayed_approval(
     broker.bind_connection_dispatch(connection, Arc::clone(&upstream) as _);
     let _: GatewayConnectionId = connection;
     (relayed, upstream)
+}
+
+/// KR-REQ-11.26: a request a channel relayed is queued for the component of the package's binding
+/// that ships one, and what the component proposes is projected against the decisions the channel's
+/// own table maps, in the table's words. The table's interpretation does not stand in for the
+/// component, and a proposal that names a decision the channel does not map is refused.
+///
+/// The component's proposal is supplied as data here, since there is no plugin runtime in this
+/// suite; the controller suite runs a real component through the gateway's transport.
+#[test]
+fn kr_req_11_26_a_request_a_channel_relayed_is_queued_for_the_packages_component_and_read_with_the_channels_decisions()
+ {
+    use kr_worker::broker::decoding::{ComponentDecoded, NotDecoded, Verdict};
+
+    let worker = Worker::open();
+    let source = worker.package(&fixture::Shape {
+        component: true,
+        ..fixture::Shape::claude_code()
+    });
+    let frame = worker.admit(1, vec![testing::admitted(&source)]);
+    worker
+        .broker
+        .register_instance(
+            instance(2),
+            IntegrationMode::NativeBridge,
+            None,
+            Some(managed(2)),
+        )
+        .expect("the launched instance is registered");
+    worker
+        .bind(1, 2, source.package_digest, frame)
+        .expect("the package binds");
+    let connector = worker
+        .sources
+        .for_command(fixture::COMMAND)
+        .expect("the admitted connector");
+    let (_connection, relayed) = relay_approval(&worker.broker, &connector);
+
+    // Nothing interprets it now: the package ships a component, which is asked later.
+    let now = worker
+        .broker
+        .interpret_request(relayed.resource_id, kr_ipc::now_ms())
+        .expect("the choice is made");
+    assert!(
+        now.is_none(),
+        "the table interpreted a request left to a component"
+    );
+    let queue = worker.broker.decode_queue();
+    assert_eq!(queue.len(), 1);
+    let (job, _) = queue.take(|_| Verdict::Take);
+    let job = job.expect("the request is queued for its component");
+    assert_eq!(job.binding_id, binding(1));
+    let table: Vec<&str> = job
+        .table
+        .iter()
+        .map(|decision| decision.option_id.as_str())
+        .collect();
+    assert!(!table.is_empty(), "the channel maps no decision");
+
+    // The component names a decision the channel does not map, and the request stays opaque.
+    let hostile = ComponentDecoded {
+        request_id: job.upstream_id.clone(),
+        summary: "a request".to_owned(),
+        decisions: vec!["root-access".to_owned()],
+    };
+    assert_eq!(
+        worker
+            .broker
+            .interpret_decoded(&job, &hostile, kr_ipc::now_ms())
+            .expect_err("a decision the table does not map is refused"),
+        NotDecoded::UnmappedDecision
+    );
+    assert!(
+        worker
+            .broker
+            .decoding(relayed.resource_id)
+            .expect("the ledger reads")
+            .is_none()
+    );
+
+    // And it reads the channel's own decisions when it offers them.
+    let honest = ComponentDecoded {
+        request_id: job.upstream_id.clone(),
+        summary: "a request".to_owned(),
+        decisions: table.iter().map(|id| (*id).to_owned()).collect(),
+    };
+    worker
+        .broker
+        .interpret_decoded(&job, &honest, kr_ipc::now_ms())
+        .expect("the channel's own decisions are accepted");
+    let entry = worker
+        .broker
+        .decoding(relayed.resource_id)
+        .expect("the ledger reads")
+        .expect("the interpretation is recorded");
+    assert_eq!(entry.projection.decisions, job.table);
+    assert_eq!(
+        entry.projection.schema_version,
+        kr_worker::broker::connectors::component_schema()
+    );
 }
 
 /// KR-REQ-25.22: under the policy that disables at once, a binding on a revoked release admits
@@ -2071,11 +2181,7 @@ fn kr_req_11_13_a_package_with_a_component_binds_its_declarative_parts_and_repor
         .expect("a declared action is admitted");
     let details = reported(&worker, source.package_digest);
     assert_eq!(details.len(), 1, "{details:?}");
-    assert!(
-        details[0].contains("decode-request or encode-response exports"),
-        "{}",
-        details[0]
-    );
+    assert!(details[0].contains("encode-response"), "{}", details[0]);
 
     let worker = Worker::open();
     let source = worker.claude_code();

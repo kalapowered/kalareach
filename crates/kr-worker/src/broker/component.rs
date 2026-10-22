@@ -25,6 +25,7 @@ use kr_protocol::ids::{BrokerBindingId, PluginId};
 use kr_protocol::limits::MAX_REPORT_DETAIL_BYTES;
 use kr_protocol::scalars::{Digest256, Nullable};
 
+use super::decoding::NotDecoded;
 use super::{Binding, Broker};
 
 /// The component a binding's package ships, as the admissions named it when the binding was made.
@@ -80,6 +81,29 @@ pub struct ComponentNotes {
     pub loss: Option<String>,
     /// The last time a call into it faulted.
     pub fault: Option<FaultNote>,
+    /// The requests it was not asked to decode, or whose decoding was not taken.
+    pub decoding: Option<DecodingNote>,
+}
+
+/// The requests a binding's component did not turn into approvals, as a person is told of them:
+/// how many, and why the last was not. Never a word the component chose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodingNote {
+    /// How many requests were not decoded since the binding was registered.
+    pub count: u64,
+    /// Why the last was not.
+    pub last: NotDecoded,
+}
+
+impl DecodingNote {
+    fn text(self) -> String {
+        format!(
+            "{} request{} not decoded; the last: {}",
+            self.count,
+            if self.count == 1 { " was" } else { "s were" },
+            self.last.words()
+        )
+    }
 }
 
 /// A fault in a call into a component, as the runtime reported it.
@@ -116,10 +140,12 @@ impl FaultNote {
 impl ComponentNotes {
     fn text(&self, private: bool) -> Option<String> {
         let fault = self.fault.as_ref().map(|fault| fault.text(private));
+        let decoding = self.decoding.map(DecodingNote::text);
         let parts: Vec<&str> = [
             self.registration.as_deref(),
             self.loss.as_deref(),
             fault.as_deref(),
+            decoding.as_deref(),
         ]
         .into_iter()
         .flatten()
@@ -137,6 +163,8 @@ pub enum ComponentNote {
     Loss(String),
     /// A fault in a call into the component.
     Fault(FaultNote),
+    /// A request that was not decoded.
+    Decoding(NotDecoded),
     /// None of them: the binding is registered again, or gone.
     Clear,
 }
@@ -306,6 +334,9 @@ impl Broker {
             held.component_states
                 .insert(binding_id, (state, reason.map(str::to_owned)));
         }
+        drop(held);
+        // A request waiting for this component's registration may now be asked, or given up on.
+        self.decoding.wake();
     }
 
     /// Returns the source generation the binding's instance has reached now, where the broker holds
@@ -332,6 +363,13 @@ impl Broker {
             ComponentNote::Registration(text) => notes.registration = Some(text),
             ComponentNote::Loss(text) => notes.loss = Some(text),
             ComponentNote::Fault(text) => notes.fault = Some(text),
+            ComponentNote::Decoding(last) => {
+                let count = notes
+                    .decoding
+                    .map_or(0, |held| held.count)
+                    .saturating_add(1);
+                notes.decoding = Some(DecodingNote { count, last });
+            }
             ComponentNote::Clear => {
                 held.component_notes.remove(&binding_id);
             }

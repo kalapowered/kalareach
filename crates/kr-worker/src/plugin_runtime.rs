@@ -132,6 +132,10 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
     let _pump = AbortOnDrop(tokio::spawn(crate::plugin_observation::pump(Weak::clone(
         &broker,
     ))));
+    // The task that asks components to decode the requests they are trusted to decode likewise.
+    let _decoder = AbortOnDrop(tokio::spawn(crate::plugin_decoding::decoder(Weak::clone(
+        &broker,
+    ))));
     let mut link = Link {
         request,
         client: None,

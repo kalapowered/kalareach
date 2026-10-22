@@ -528,6 +528,13 @@ impl SourceFrame {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    /// Returns the frame's bytes as they are shared, so that whoever reads them holds the frame's
+    /// own copy and not another.
+    #[must_use]
+    pub fn shared(&self) -> std::sync::Arc<[u8]> {
+        std::sync::Arc::clone(&self.bytes)
+    }
 }
 
 /// Why a Windows machine runs no command backend: the kernel's record of when a process started is
