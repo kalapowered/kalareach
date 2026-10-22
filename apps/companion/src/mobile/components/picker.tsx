@@ -40,12 +40,14 @@ export function AttachmentPicker({
   readonly camera?: CameraControl
 }): ReactNode {
   const target = minimumTarget(surface)
-  const offered = camera?.offer.offered ?? true
-  const notice = camera?.offer.notice ?? null
+  // A picker that offers nothing (no file goes over this connection) has no camera to refuse, so what
+  // the system says of the camera is left unsaid until it offers one.
+  const offered = disabled === true || (camera?.offer.offered ?? true)
+  const notice = disabled === true ? null : (camera?.offer.notice ?? null)
   // The button that was pressed may have just gone, since it would do nothing now: the next thing
   // to do is its replacement, so the focus goes there rather than to the page.
   const settings = useRef<HTMLButtonElement | null>(null)
-  const refusedJustNow = camera?.refusedJustNow === true
+  const refusedJustNow = disabled !== true && camera?.refusedJustNow === true
   useEffect(() => {
     if (refusedJustNow) settings.current?.focus()
   }, [refusedJustNow])

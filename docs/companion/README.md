@@ -422,8 +422,9 @@ on the loopback interface, and it holds one session. The run shows a changed sec
 the value the phone shows equal to the host's, the phone paired once the host approves it, and the
 alert a code for another service raises, with Cancel contacting nothing and accepting contacting
 that service once. On the emulator it also shows the scanner kept out of screenshots and fitted to
-the largest text size, and the attachment picker telling the person that the camera is not allowed
-after the system has refused it. It searches the phone's log for the invitation's text and secret.
+the largest text size, and the attachment picker on a phone whose camera the system has refused for
+good: a host this phone is paired with takes no file from it, so every source is disabled and the
+screen says nothing of the camera. It searches the phone's log for the invitation's text and secret.
 
 ## An owner's confirmations
 

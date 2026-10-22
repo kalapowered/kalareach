@@ -119,6 +119,7 @@ class Phone:
                         "id": node.get("resource-id", ""),
                         "class": node.get("class", ""),
                         "box": bounds,
+                        "enabled": node.get("enabled") == "true",
                     }
                 )
         return nodes
@@ -317,13 +318,17 @@ def scanner_fits_the_largest_text(phone: Phone, port: str) -> None:
     say("the scanner fits the largest text size")
 
 
-def picker_after_a_refusal(phone: Phone) -> None:
-    """The attachment picker's camera, once the system has been told never to let this application
-    use it, tells the person so and says where to allow it, and never does nothing.
+def picker_on_a_paired_phone(phone: Phone) -> None:
+    """The attachment picker on a phone paired with a host, with the camera refused for good.
 
-    The permission is withdrawn the way "Don't allow" with "Don't ask again" leaves it. The system
-    ends the application's process when a permission is taken from it, so the application is started
-    again and the host's one session is opened from its Sessions tab, where the picker is.
+    A host this phone is paired with takes no file from it, so the picker is drawn and offers
+    nothing: every source is disabled, and the screen says nothing about the camera, which nothing
+    can use. The camera's permission is taken away the way "Don't allow" with "Don't ask again"
+    leaves it, and the application is started again (the system ends a process that loses a
+    permission), so the session screen reads the permission through the platform plugin and decides
+    from it. The decision from the permission to what the picker offers and says is the page's own
+    case, over every state of it, with the picker offering files; this shows what the real phone does
+    with the same permission and a host that takes none.
     """
     camera = "android.permission.CAMERA"
     phone.run("shell", "pm", "revoke", APP, camera)
@@ -333,37 +338,20 @@ def picker_after_a_refusal(phone: Phone) -> None:
     phone.press("Sessions")
     tabs = ("Attention", "Sessions", "Hosts", "Account")
     row = phone.wait(
-        lambda each: not each.startswith(tabs) and each not in ("Sessions",) and "session" in each.lower(),
+        lambda each: not each.startswith(tabs) and each != "Sessions" and "session" in each.lower(),
         "the host's session in the list",
         90,
     )
     phone.tap(row)
     phone.wait(lambda each: each == "Photo library", "the attachment picker", 60)
-    # The camera is offered until the system has been asked and has said no, and then it is told.
-    phone.press("Take a photo")
-    phone.wait(
-        lambda each: each.startswith("KalaReach cannot use the camera"),
-        "the words that say the camera is not allowed",
-        30,
-    )
-    phone.shot("camera-refused")
-    if phone.find(lambda each: each == "Open Settings") is None:
-        phone.give_up("the picker does not offer the settings page")
-    # The settings page is this application's own: the system's page for it opens, over the application.
-    phone.press("Open Settings")
-    end = time.monotonic() + 30
-    while time.monotonic() < end:
-        focus = phone.run("shell", "dumpsys", "window").stdout.decode("utf-8", "replace")
-        if "mCurrentFocus" in focus and "settings" in next(
-            (line for line in focus.splitlines() if "mCurrentFocus" in line), ""
-        ).lower():
-            break
-        time.sleep(0.5)
-    else:
-        phone.give_up("the settings page did not open")
-    phone.shot("camera-settings")
-    phone.run("shell", "input", "keyevent", "KEYCODE_BACK")
-    say("the camera's refusal is told in the attachment picker")
+    for name in ("Take a photo", "Photo library", "Files"):
+        source = phone.find(lambda each, name=name: each == name)
+        if source is None or source["enabled"]:
+            phone.give_up(f"the picker offers {name} on a phone paired with a host")
+    if phone.find(lambda each: each.startswith("KalaReach cannot use the camera")) is not None:
+        phone.give_up("the picker tells the camera's refusal where it offers no file")
+    phone.shot("picker-paired")
+    say("the attachment picker offers no file on a paired phone, and says nothing of the camera")
 
 
 def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> None:
@@ -471,7 +459,7 @@ def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> Non
     say("accepted: one connection")
     touch(directory, "code-done")
     wait_for_file(directory, "done-code")
-    picker_after_a_refusal(phone)
+    picker_on_a_paired_phone(phone)
 
 
 def main() -> None:

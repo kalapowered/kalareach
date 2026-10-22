@@ -135,7 +135,9 @@ elapsed time.
   picture while the system does not allow it is told the same way. In both cases the screen says
   that KalaReach cannot use the camera and offers "Open Settings", which opens only this
   application's page in the system's settings; a camera that is allowed and closed by the person
-  says nothing. A picked file is uploaded, not held in the screen: the page hands its bytes to
+  says nothing. Android tells a refusal for good only after a request the plugin made itself, so a
+  refusal the web view's own request met shows when the camera closes with no picture. None of this
+  is drawn while the picker offers no file: a host this phone is paired with takes none. A picked file is uploaded, not held in the screen: the page hands its bytes to
   native code, which sends them through the transfer service, and the file stays on the draft,
   uploading, uploaded or failed, until the person removes it. The phone takes a picked file of up to
   1,020 KB, what its connection carries in one chunk; a larger one is refused with that reason. A
