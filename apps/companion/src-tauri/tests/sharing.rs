@@ -8,23 +8,7 @@
 //! the host answers to one mutation, or the mutation before it leaves: the daemon, its store and
 //! its answers are the product's.
 //!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-18.12 | `the_typed_result_reaches_the_page_and_a_share_is_accepted_and_taken_back` |
-//! | KR-REQ-18.14 | `a_lost_reply_is_asked_about_again_and_answered_from_the_hosts_record` |
-//! | KR-REQ-18.13 | `an_accepted_invitation_whose_reply_was_lost_is_found_accepted` |
-//! | KR-REQ-18.15 | `a_hand_over_asks_an_owner_device_and_sends_only_what_it_confirmed` |
-//! | KR-REQ-18.15 | `a_hand_over_whose_challenge_the_host_lost_is_ended_and_can_be_asked_again` |
-//! | KR-REQ-23.49 | `an_application_restarted_after_the_host_committed_asks_the_host_and_is_answered` |
-//! | KR-REQ-23.49 | `a_second_invitation_is_not_started_while_the_first_can_still_happen` |
-//! | KR-REQ-23.49 | `an_action_the_host_never_saw_is_not_done_only_after_the_bound` |
-//! | KR-REQ-25.10 | `the_screen_preview_is_read_from_a_real_worker_through_the_command` |
-//! | KR-REQ-18.13 | `a_list_of_offers_and_shares_longer_than_a_page_is_read_whole` |
-//! | KR-REQ-18.13 | `a_read_that_fails_between_pages_answers_nothing_and_the_next_answers_all` |
-//! | KR-REQ-18.13 | `an_offer_to_a_guest_tells_what_it_carries_and_none_of_the_screen_the_issuer_was_shown` |
-//! | KR-REQ-25.28 | `an_offer_to_a_guest_tells_what_it_carries_and_none_of_the_screen_the_issuer_was_shown` |
-//! | KR-REQ-18.14 | `a_share_taken_back_ends_nothing_on_the_main_connection` |
-//! | KR-REQ-18.13 | `a_refusal_of_the_first_send_of_an_acceptance_is_the_hosts_sentence_and_the_rows_decide` |
+//! Each case carries, in a comment of its own, the requirement rows its assertions show.
 
 #![cfg(unix)]
 
@@ -33,10 +17,11 @@ mod net_support;
 
 include!("support/sharing_harness.rs");
 
-/// KR-REQ-18.12, KR-REQ-18.13, KR-REQ-18.14: the invitation, its acceptance and its withdrawal reach
-/// the page as the methods' own results, in shapes the protocol defines, and the device sees only
-/// what the host tells it. An invitation the host answers at once leaves no record behind. The
-/// person's computer issues and the device holds, and neither does the other's part.
+/// KR-REQ-18.12, KR-REQ-18.13: the owner's invitation, naming a device and a role, its acceptance
+/// and its withdrawal reach the page as the methods' own results, in shapes the protocol defines,
+/// and the device sees only what the host tells it. An invitation the host answers at once leaves
+/// no record behind. The person's computer issues and the device holds, and neither does the
+/// other's part.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_typed_result_reaches_the_page_and_a_share_is_accepted_and_taken_back() {
     let scene = Scene::start().await;
@@ -142,7 +127,7 @@ async fn the_typed_result_reaches_the_page_and_a_share_is_accepted_and_taken_bac
     scene.stop().await;
 }
 
-/// KR-REQ-18.14: the host's answer to an invitation is lost, and the application, which kept the
+/// KR-REQ-23.49: the host's answer to an invitation is lost, and the application, which kept the
 /// request before it sent it, asks the host again with the same request on a connection opened for
 /// it. The host answers from the record it kept, so the invitation exists once, and the page reads
 /// the host's own result from the attempt. The record stays until the page removes it.
@@ -973,8 +958,8 @@ async fn an_invitation_found_by_a_read_closes_as_happened_without_the_hosts_resu
     scene.stop().await;
 }
 
-/// KR-REQ-23.49: the attention read of a device paired as a guest is refused by the host as it
-/// refuses everything a guest has no right to, so a page can treat it as nothing of its own.
+/// The attention read of a device paired as a guest is refused by the host as it refuses
+/// everything a guest has no right to, so a page can treat it as nothing of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_guests_attention_read_is_the_hosts_refusal() {
     let scene = Scene::start().await;
@@ -1442,9 +1427,11 @@ async fn a_read_that_fails_between_pages_answers_nothing_and_the_next_answers_al
 /// The marker the session's terminal is made to show.
 const MARKER: &str = "kalareach-on-the-screen";
 
-/// KR-REQ-25.10: the screen the person is shown before an invitation exists is the session's own,
-/// read by the session's worker for the command. The command is sent a well-formed request, as the
-/// Sharing tab sends it, against the real daemon and a real worker whose terminal shows a line.
+/// KR-REQ-25.10, KR-REQ-18.12: the screen the person is shown before an invitation exists is the
+/// session's own, read by the session's worker for the command, and shown whole when it fits. The
+/// command is sent a well-formed request, as the Sharing tab sends it, against the real daemon and
+/// a real worker whose terminal shows a line; asked for an invitation without the live view it
+/// reads no screen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn the_screen_preview_is_read_from_a_real_worker_through_the_command() {
     let adopted = Adopted::start(1).await;
@@ -1695,8 +1682,7 @@ async fn an_offer_to_a_guest_tells_what_it_carries_and_none_of_the_screen_the_is
     adopted.stop().await;
 }
 
-/// KR-REQ-18.14: a share taken back by the person at the host leaves the device's main connection as
-/// it was. What the device is told it holds is read on that connection under its pairing and never
+/// A share taken back by the person at the host leaves the device's main connection as it was. What the device is told it holds is read on that connection under its pairing and never
 /// under the share, so the host has nothing of the share to withdraw the connection with: the same
 /// connection reads the list again, without the share, and no connection was taken up in between.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
