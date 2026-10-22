@@ -55,6 +55,7 @@ fn summary(session_id: SessionId) -> kr_protocol::session::SessionSummary {
         closure: Nullable::null(),
         environment_sources: None,
         root: None,
+        application: None,
     }
 }
 

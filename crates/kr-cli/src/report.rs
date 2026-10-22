@@ -893,6 +893,7 @@ mod tests {
             closure: kr_protocol::scalars::Nullable::null(),
             environment_sources: None,
             root: None,
+            application: None,
         }
     }
 
