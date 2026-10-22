@@ -13,9 +13,10 @@ use std::sync::{Arc, Mutex};
 
 use kr_client::ClientError;
 use kr_client::recovery::{
-    BundleWrite, BundleWriter, BundleWritten, CandidateState, CheckpointRecorded, FilesRestore,
-    MemberRefusal, MemberRole, MemberVerdict, PublicationRefusal, RecoveryError, RestoreError,
-    RestoreSource, SignInCause, SourceService, SourceSignIn, fresh_locator,
+    BundleWrite, BundleWriter, BundleWritten, CandidateState, CheckpointRecorded, ExportSource,
+    FilesRestore, MemberRefusal, MemberRole, MemberVerdict, OfflineExport, PublicationRefusal,
+    RecoveryError, RestoreError, RestoreSource, SignInCause, SourceService, SourceSignIn,
+    fresh_locator,
 };
 use kr_client::services::{ServiceFuture, SyncFetched, SyncPosition};
 use kr_crypto::backup::{
@@ -1154,6 +1155,176 @@ async fn a_checkpoint_is_not_lowered_and_not_recorded_over_another_manifest_of_i
             .collect::<Vec<_>>(),
         [checkpoint_of(&second)],
         "the bundle is left as the other restore wrote it"
+    );
+}
+
+/// An export read back as a source, in bytes, as a file would hold it.
+fn reread(export: &OfflineExport) -> Arc<ExportSource> {
+    let bytes = export.to_canonical_bytes().expect("canonical bytes");
+    Arc::new(ExportSource::new(
+        OfflineExport::from_canonical_slice(&bytes).expect("the export reads back"),
+    ))
+}
+
+/// KR-REQ-20.18: an archive exports as one file of ciphertext, and a host that holds nothing but the
+/// kit and that file restores the same members as one that asks the service. The file holds no
+/// member name or content in the clear, and everything about it is checked on the way back: the
+/// kit's checksum, the bundle under the kit's key, the publication's signature and the manifest.
+#[tokio::test]
+async fn an_archive_exports_as_one_file_that_restores_with_only_the_kit() {
+    let world = World::new();
+    let members = honest_members();
+    let sealed = world.seal(4, &members);
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
+    let prepared = restore(&world, &source, None).await.expect("a restore");
+    let export = prepared.export().await.expect("an export");
+    let bytes = export.to_canonical_bytes().expect("canonical bytes");
+    for clear in [
+        b"what the session did".as_slice(),
+        b"host/configuration.json",
+        b"sessions/",
+    ] {
+        assert!(
+            !bytes.windows(clear.len()).any(|window| window == clear),
+            "an offline export carries no member name or content in the clear"
+        );
+    }
+
+    // The file is the whole source: with no service in reach, the kit restores the same members.
+    let file = reread(&export);
+    let from_file = FilesRestore::prepare(world.kit(), Arc::clone(&file) as _, None, None)
+        .await
+        .expect("a restore from the file");
+    assert_eq!(from_file.plan().generation.get(), 4);
+    assert_eq!(
+        from_file.plan().members.len(),
+        prepared.plan().members.len()
+    );
+    for planned in &prepared.plan().members {
+        let asked = prepared.member(planned.object_id).await.expect("a member");
+        let held = from_file.member(planned.object_id).await.expect("a member");
+        assert_eq!(held.expose(), asked.expose());
+    }
+    assert!(!from_file.plan().standing.checkpoint_available());
+}
+
+/// KR-REQ-20.18: a file that is not what its reader trusts is refused by name, and restores
+/// nothing: another format, a bundle sealed for another kit, an archive the bundle does not name, an
+/// object whose bytes were changed, and an archive too large to be one file.
+#[tokio::test]
+async fn an_export_that_is_not_what_it_claims_is_refused_by_name() {
+    let world = World::new();
+    let sealed = world.seal(4, &honest_members());
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
+    let export = restore(&world, &source, None)
+        .await
+        .expect("a restore")
+        .export()
+        .await
+        .expect("an export");
+
+    // Another format.
+    let mut other = export.clone();
+    other.format = "kalareach-offline-export/2".to_owned();
+    let bytes = other.to_canonical_bytes().expect("canonical bytes");
+    assert!(matches!(
+        OfflineExport::from_canonical_slice(&bytes),
+        Err(RecoveryError::UnsupportedExport)
+    ));
+    // Not an export at all.
+    assert!(OfflineExport::from_canonical_slice(b"not an export").is_err());
+
+    // A bundle sealed for another kit does not authenticate under this one.
+    let stranger = World::new();
+    let refused = FilesRestore::prepare(stranger.kit(), reread(&export) as _, None, None)
+        .await
+        .expect_err("another kit");
+    assert!(matches!(
+        refused,
+        RestoreError::Recovery(ref cause) if matches!(**cause, RecoveryError::BundleNotAuthentic)
+    ));
+
+    // An archive the bundle does not name.
+    let unlisted = ArchiveId::new(id(0x99));
+    assert!(matches!(
+        FilesRestore::prepare(world.kit(), reread(&export) as _, Some(unlisted), None)
+            .await
+            .expect_err("not listed"),
+        RestoreError::ArchiveNotListed
+    ));
+
+    // An object whose bytes were changed in the file is not a file.
+    let mut changed = export.clone();
+    let archive = changed.archive.0.as_mut().expect("an archive");
+    let first = &mut archive.objects[0];
+    let mut bytes = first.bytes.as_slice().to_vec();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x01;
+    first.bytes = kr_protocol::scalars::Bytes::new(bytes);
+    let object = first.object_id;
+    let prepared = FilesRestore::prepare(world.kit(), reread(&changed) as _, None, None)
+        .await
+        .expect("the plan reads the manifest, which is whole");
+    assert!(matches!(
+        prepared.member(object).await,
+        Err(RestoreError::Member(_))
+    ));
+
+    // An archive too large to be one file is said so, and nothing is read.
+    let large = world.seal_declared(
+        4,
+        &[(
+            "sessions/0a1b2c3d-0000-4000-8000-000000000001.json",
+            300 << 20,
+        )],
+    );
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&large));
+    let prepared = restore(&world, &source, None).await.expect("a plan");
+    assert!(matches!(
+        prepared.export().await,
+        Err(RestoreError::TooLargeToExport { .. })
+    ));
+    assert_eq!(source.object_reads(), 1, "only the manifest was read");
+}
+
+/// KR-REQ-20.18: the bundle alone exports too, after it has authenticated under the kit; a restore
+/// from it has no archive to open and says so, and the archives it names are listed with the newest
+/// generation of each.
+#[tokio::test]
+async fn the_bundle_exports_alone_and_the_archives_it_names_are_listed() {
+    let world = World::new();
+    let sealed = world.seal(4, &honest_members());
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
+
+    let listed = FilesRestore::archives(world.kit(), Arc::clone(&source) as _)
+        .await
+        .expect("the archives");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].archive_id, archive());
+    assert!(matches!(
+        &listed[0].newest,
+        CandidateState::Newest(newest) if newest.generation.get() == 4
+    ));
+
+    let export = FilesRestore::export_bundle(world.kit(), Arc::clone(&source) as _)
+        .await
+        .expect("the bundle exports");
+    assert!(export.archive.0.is_none());
+    assert!(matches!(
+        FilesRestore::prepare(world.kit(), reread(&export) as _, None, None)
+            .await
+            .expect_err("no archive in the file"),
+        RestoreError::NoGeneration
+    ));
+    // Not a kit this bundle opens for: the export is refused at the bundle.
+    assert!(
+        FilesRestore::export_bundle(World::new().kit(), source as _)
+            .await
+            .is_err()
     );
 }
 
