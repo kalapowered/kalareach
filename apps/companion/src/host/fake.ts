@@ -3535,12 +3535,7 @@ function endedBy(cause: string, words: string, host: VoiceEnded['host']): VoiceE
 }
 
 /** The content classes section 15 ¶12 leaves out of the default context. */
-const VOICE_EXCLUDED_CLASSES = [
-  'attachment_bytes',
-  'environment_variables',
-  'file_contents',
-  'terminal_scrollback'
-] as const
+const VOICE_EXCLUDED_CLASSES = ['environment_variables', 'terminal_scrollback'] as const
 
 /**
  * What this host answers before a call exists, apart from the managed service's terms.

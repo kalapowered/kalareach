@@ -84,8 +84,6 @@ const NO_VOICE_SERVICE: &str = "this host has no voice service configured. A pro
 /// A start and the preparation that describes one are planned by the same function, so the scope
 /// a person is shown before a call is the scope a start would be given.
 struct PlannedCall {
-    /// The device's ordinary grant.
-    device_grant: Grant,
     /// The standing voice grant the call's own grant would be delegated from.
     standing: Grant,
     /// The session-bound grant a start would write.
@@ -775,24 +773,13 @@ impl Coordinator {
                 .unwrap_or_default(),
         )?;
         let PlannedCall {
-            device_grant,
             planned,
             session_ids,
             ..
         } = call;
-        // What a person selected and the host's context filter would let through. Selecting a
-        // class is not authority to read it, and a class the grant cannot read is left out here
-        // for the same reason the filter would leave it out of the call.
-        let selected: CanonicalSet<VoiceContextClass> = params
-            .selected
-            .iter()
-            .copied()
-            .filter(|class| {
-                class
-                    .required_right()
-                    .is_none_or(|right| device_grant.permits(right))
-            })
-            .collect();
+        // What a person selected. A class that needs no right of its own is carried as selected;
+        // the history bound each item is held to applies when the call gathers it.
+        let selected = params.selected.clone();
 
         let (managed, managed_unavailable) = match provider {
             None => (None, Some(capitalised(NO_VOICE_SERVICE))),
@@ -907,7 +894,6 @@ impl Coordinator {
             },
         )?;
         Ok(PlannedCall {
-            device_grant,
             standing,
             planned,
             session_ids,

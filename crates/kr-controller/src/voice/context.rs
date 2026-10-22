@@ -263,23 +263,10 @@ pub fn filtered(snapshot: SessionSnapshot, grant: &Grant) -> GatheredContext {
     let filter = HistoryFilter::new(scope_of(grant));
     let mut withheld = snapshot.unavailable.clone();
 
-    // Selecting a class is a person saying they want it, not authority to read it. File contents
-    // and attachment bytes need the grant's own file right on top of the history bound, which is
-    // the filter's `admit_attachment_bytes` question rather than its timestamp one. The class says
-    // which right it needs, and the preparation that describes a call asks the class the same
-    // question.
+    // Selecting a class is a person saying they want it, not authority to read it: each selected
+    // item is held to the history bound like any other.
     let mut selected: Vec<SelectedItem> = Vec::new();
     for entry in snapshot.selected {
-        let needs_file_right = entry.class.required_right().is_some();
-        if needs_file_right
-            && let Err(reason) = filter.admit_attachment_bytes(entry.item.produced_at_ms)
-        {
-            withheld.push(WithheldRun {
-                reason: format!("{}: {reason}", entry.class),
-                count: 1,
-            });
-            continue;
-        }
         if let Some(item) = admit_one(&filter, Some(entry.item), &mut withheld) {
             selected.push(SelectedItem {
                 class: entry.class,
