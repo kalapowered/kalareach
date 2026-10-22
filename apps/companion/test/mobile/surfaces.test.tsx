@@ -288,6 +288,22 @@ describe('the camera of the attachment picker, when the system refuses it (KR-RE
     })
   })
 
+  it('says nothing about the camera while the picker offers no file at all', async () => {
+    const person = userEvent.setup()
+    const { controls } = start('android')
+    controls.setCameraAccess('denied')
+    // A host this phone is paired with takes no file from it: the picker is drawn and offers nothing.
+    controls.reachAsPairedDevice()
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    const group = await screen.findByRole('group', { name: 'Add an attachment' })
+    await waitFor(() => {
+      expect(controls.cameraAsked.count).toBeGreaterThan(0)
+    })
+    for (const button of within(group).getAllByRole('button')) expect(button).toBeDisabled()
+    expect(screen.getByTestId('camera-notice')).toBeEmptyDOMElement()
+  })
+
   it('says nothing when the person closes an allowed camera', async () => {
     const { controls } = await open('granted')
     const camera = await screen.findByRole('button', { name: 'Take a photo' })
