@@ -2447,24 +2447,46 @@ fn startup_question(kind: ShellKind) -> &'static str {
         ShellKind::Zsh => {
             "kr_answer=\nvared -p 'ASK> ' kr_answer\nprint -r -- \"kr-answer-<${kr_answer}>\"\n"
         }
-        _ => "read -r -p 'ASK> ' kr_answer\nprintf 'kr-answer-<%s>\\n' \"$kr_answer\"\n",
+        ShellKind::Bash => {
+            "read -r -p 'ASK> ' kr_answer\nprintf 'kr-answer-<%s>\\n' \"$kr_answer\"\n"
+        }
+        ShellKind::Fish => "read -P 'ASK> ' kr_answer\nprintf 'kr-answer-<%s>\\n' $kr_answer\n",
+        ShellKind::PowerShell => {
+            "$kr_answer = Read-Host 'ASK>'\nWrite-Host \"kr-answer-<$kr_answer>\"\n"
+        }
     }
 }
+
+/// The shells whose packages a startup prompt is put to.
+#[cfg(unix)]
+const STARTUP_PROMPT_SHELLS: [ShellKind; 4] = [
+    ShellKind::Zsh,
+    ShellKind::Bash,
+    ShellKind::Fish,
+    ShellKind::PowerShell,
+];
 
 /// KR-REQ-07.23: a startup prompt takes its answer through the worker while the session is
 /// authenticated, and the session is ready, and a launch is possible, only after the profile that
 /// asked has finished.
 ///
 /// The person's startup asks before the package's entry has run, in a real qualified package
-/// launched by a real worker session. The worker takes the keystrokes because the bridge is
-/// authenticated: a session that refused input until it was ready would leave the profile asking
-/// a question nobody could answer.
+/// launched by a real worker session, for each of the four shells section 7 packages: Zsh and Bash
+/// with their built shells, Fish with its built shell, whose entry waits for the first prompt, and
+/// PowerShell with the qualified host, whose profile asks with `Read-Host` between the entry that
+/// opens the bridge and the entry that goes live after the profile. The worker takes the
+/// keystrokes because the bridge is authenticated: a session that refused input until it was ready
+/// would leave the profile asking a question nobody could answer.
+///
+/// What the phase says is read from the worker's own driver for the session, which `session.create`
+/// and `shell.launch` consult: this suite starts no service on it, so the create and launch
+/// refusals themselves are the cases keyed to those methods.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
 async fn a_startup_prompt_takes_its_answer_through_the_worker_and_the_session_is_ready_after_the_profile()
  {
-    for kind in [ShellKind::Zsh, ShellKind::Bash] {
+    for kind in STARTUP_PROMPT_SHELLS {
         let package = installed_package_of(kind);
         let shell = RealShell::start_with_profile(
             &package,
@@ -2523,7 +2545,7 @@ async fn a_startup_prompt_takes_its_answer_through_the_worker_and_the_session_is
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
 async fn a_startup_prompt_nobody_answers_leaves_the_session_not_ready_and_it_still_closes() {
-    for kind in [ShellKind::Zsh, ShellKind::Bash] {
+    for kind in STARTUP_PROMPT_SHELLS {
         let package = installed_package_of(kind);
         let shell = RealShell::start_with_profile(
             &package,
@@ -2546,10 +2568,8 @@ async fn a_startup_prompt_nobody_answers_leaves_the_session_not_ready_and_it_sti
             );
             assert!(!phase.permits_launch(), "{kind:?}");
         }
-        let closed = std::time::Instant::now();
-        shell.close().await;
         assert!(
-            closed.elapsed() < Duration::from_secs(30),
+            shell.close().await,
             "{kind:?}: the session waiting for its profile did not close within its bound"
         );
     }
@@ -2563,6 +2583,10 @@ struct RealShell {
     _home: tempfile::TempDir,
     runtime: Arc<SessionRuntime>,
     bridge_task: tokio::task::JoinHandle<()>,
+    /// The shell of the package this session launched, which is what its keyboard and startup file
+    /// are chosen by.
+    kind: ShellKind,
+    /// The shell the session qualified as, once it has: not yet while a profile is still asking.
     qualified: Option<ShellKind>,
 }
 
@@ -2624,6 +2648,47 @@ impl RealShell {
                 entry,
             )
             .expect("the startup entry");
+        } else if package.kind() == ShellKind::PowerShell {
+            // The entries go in as `kr shell install` puts them: the one that opens the bridge is
+            // the first thing in the profile every host reads, and the one that goes live after
+            // the person's own profile is the last thing in the profile this host reads. What the
+            // person's profile asks for sits between them.
+            let configuration = home.path().join(".config").join("powershell");
+            std::fs::create_dir_all(&configuration).expect("a configuration directory");
+            let all_hosts = configuration.join("profile.ps1");
+            let current_host = configuration.join("Microsoft.PowerShell_profile.ps1");
+            std::fs::write(&all_hosts, "").expect("the startup file");
+            std::fs::write(
+                &current_host,
+                format!(
+                    "$global:KR_TEST_USER_CONFIGURATION = 1\nSet-PSReadLineOption -HistorySaveStyle \
+                     SaveNothing\n\n{after_configuration}"
+                ),
+            )
+            .expect("the startup file");
+            // The installation's own record keeps its locks, beside the home and not in it.
+            let state = temp.root().join("install-state");
+            let record =
+                kr_shell_integration::host::startup::EntryRecord::in_state_directory(&state);
+            for target in kr_shell_integration::host::startup::powershell_targets(
+                &package.executable(),
+                all_hosts,
+                current_host,
+            ) {
+                let body = kr_shell_integration::host::startup::entry(
+                    &target,
+                    &package.startup_entry(),
+                    false,
+                )
+                .expect("the package's entry is text");
+                kr_shell_integration::host::startup::install(
+                    &target.path,
+                    &body,
+                    &target.placement,
+                    &record,
+                )
+                .expect("the entry goes into the profile");
+            }
         } else {
             let startup = match package.kind() {
                 ShellKind::Zsh => home.path().join(".zshrc"),
@@ -2660,6 +2725,12 @@ impl RealShell {
                 session_id.to_string(),
             ),
         ];
+        if package.kind() == ShellKind::PowerShell {
+            variables.push((
+                "XDG_CONFIG_HOME".to_owned(),
+                home.path().join(".config").display().to_string(),
+            ));
+        }
         variables.extend(extra);
         variables.extend(
             bootstrap
@@ -2757,6 +2828,7 @@ impl RealShell {
             _home: home,
             runtime,
             bridge_task,
+            kind: package.kind(),
             qualified,
         }
     }
@@ -2774,7 +2846,7 @@ impl RealShell {
     fn keys(&self) -> RealKeys {
         let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
         let mut params = terminal(self.runtime.session().config().session_id);
-        if self.qualified == Some(ShellKind::Fish) {
+        if self.kind == ShellKind::Fish {
             // This shell turns the Kitty keyboard protocol on, and the keys go to a terminal that
             // can supply the encoding the application reads.
             params.terminal_profile_id = Nullable::some("xterm-kitty".to_owned());
@@ -2819,14 +2891,18 @@ impl RealShell {
         }
     }
 
-    /// Closes the session and waits for it, so the reader on the terminal ends with it.
-    async fn close(self) {
+    /// Closes the session and waits for it, so the reader on the terminal ends with it, and says
+    /// whether it had closed within its bound.
+    async fn close(self) -> bool {
         self.runtime
             .close(ClosureReason::CloseRequested)
             .1
             .release();
-        let _ = tokio::time::timeout(Duration::from_secs(30), self.runtime.wait_closed()).await;
+        let closed = tokio::time::timeout(Duration::from_secs(30), self.runtime.wait_closed())
+            .await
+            .is_ok();
         self.bridge_task.abort();
+        closed
     }
 }
 
