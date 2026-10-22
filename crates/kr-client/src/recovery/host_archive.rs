@@ -48,7 +48,7 @@ const ENABLE_TTL: DurationMs = DurationMs::new(60_000);
 
 /// The entries one archive needs in a recovery bundle so that a restore can find it and verify
 /// what the host made of it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ArchiveEntries {
     /// Where the archive is.
     pub collection: CollectionLocator,
@@ -192,7 +192,7 @@ impl HostBackups for SessionHost {
 }
 
 /// How a host's backups stand against this computer's recovery.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum HostCover {
     /// The host's backups are set up under this computer's recovery, and the bundle names them.
     Covered(HostCovered),
@@ -201,7 +201,7 @@ pub enum HostCover {
 }
 
 /// A host whose archives this computer's kit opens.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HostCovered {
     /// The archive the host makes its backups in.
     pub archive_id: ArchiveId,
@@ -217,7 +217,7 @@ pub struct HostCovered {
 }
 
 /// Why a host was left as it was.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Left {
     /// The host's configuration selects no storage service.
     NoService,
@@ -246,6 +246,9 @@ pub enum Left {
     /// The host declined, after the bundle was written, for this cause.
     Declined(BackupEnableCause),
 }
+
+// What these hold is a service's origin and kit fingerprints, text a diagnostic does not repeat.
+crate::debug_as_name!(ArchiveEntries, HostCover, HostCovered, Left);
 
 /// Covers the host's backups with this computer's recovery, where that can be done, and says so
 /// only when it has been.
