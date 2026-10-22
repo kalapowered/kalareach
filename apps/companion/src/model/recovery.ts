@@ -137,11 +137,28 @@ function describeLeft(why: HostLeft): string {
         'now. Nothing was changed.'
       )
     case 'declined':
-      return why.cause.kind === 'bundle_conflict'
-        ? 'Another device changed the recovery bundle meanwhile. Try again. The host\'s backups were not changed.'
-        : 'The host did not set its backups up under this recovery. Its backups were not changed.'
+      return `${DECLINED_BECAUSE[why.cause.kind] ?? DECLINED_BY_DEFAULT} The host's backups were not changed.`
   }
 }
+
+/** What the host said when it declined to set its backups up under this recovery, by its cause. */
+const DECLINED_BECAUSE: Readonly<Record<string, string>> = {
+  no_service: 'The host uses no storage service.',
+  sign_in: 'The host is not signed in in a way that lets it keep backups.',
+  another_account:
+    'The host is signed in as another account than the one this recovery is kept under.',
+  keys_changed: 'A key the host holds is not the one this setup named. Cover its backups again.',
+  bundle_too_large: 'The recovery bundle is larger than the service keeps.',
+  already_set_up:
+    'The host is set up for another archive, and replacing it was not asked for.',
+  archive_in_use: 'The host already holds generations of that archive.',
+  no_allowance: 'The account has no allowance for backup storage.',
+  token_not_accepted: 'The service did not accept the account\'s sign-in.',
+  bundle_conflict: 'Another device changed the recovery bundle meanwhile. Try again.',
+  service_refused: 'The service refused the host\'s setup.'
+}
+
+const DECLINED_BY_DEFAULT = 'The host did not set its backups up under this recovery.'
 
 /** The sentence that says where covering the host's backups ended. */
 export function describeHostCover(view: HostCoverView): string {
