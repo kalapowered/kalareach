@@ -694,9 +694,6 @@ pub struct VoicePrepareResult {
     /// Classes the default context leaves out unless the person selects them (section 15 ¶12).
     pub excluded: CanonicalSet<VoiceContextClass>,
     /// Classes from the request that would actually be carried.
-    ///
-    /// A selection the grant does not reach is absent here rather than refused, because this read
-    /// exists to show a person what a call would be before they make one.
     pub selected: CanonicalSet<VoiceContextClass>,
     /// The host's cap on selected context, in text tokens.
     pub token_cap: u32,
@@ -1325,60 +1322,37 @@ pub struct VoiceContextParams {
     pub session_id: SessionId,
     /// Content classes the person has selected on top of the default.
     ///
-    /// Section 15 ¶12 excludes file contents, environment variables, raw terminal scrollback and
-    /// attachment bytes unless the user selects them, so selecting one is a field rather than a
-    /// setting somewhere else.
+    /// Section 15 ¶12 excludes environment variables and raw terminal scrollback unless the user
+    /// selects them, so selecting one is a field rather than a setting somewhere else. File
+    /// contents and attachment bytes are excluded and not offered.
     pub selected: CanonicalSet<VoiceContextClass>,
     /// The delegation this context belongs to, or null for context that belongs to the call.
     pub delegation_id: Nullable<VoiceDelegationId>,
 }
 
-/// A class of content the default context excludes.
+/// A class of content the default context excludes and a person may select.
+///
+/// File contents and attachment bytes are excluded from every call and cannot be selected: nothing
+/// on a host reads them for a call, so they are not classes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum VoiceContextClass {
-    /// The contents of files.
-    FileContents,
     /// Environment variables.
     EnvironmentVariables,
     /// Raw terminal scrollback.
     TerminalScrollback,
-    /// The bytes of an attachment.
-    AttachmentBytes,
 }
 
 impl VoiceContextClass {
     /// Every excluded class, in declaration order.
-    pub const ALL: &'static [Self] = &[
-        Self::FileContents,
-        Self::EnvironmentVariables,
-        Self::TerminalScrollback,
-        Self::AttachmentBytes,
-    ];
+    pub const ALL: &'static [Self] = &[Self::EnvironmentVariables, Self::TerminalScrollback];
 
     /// Returns the stable wire string.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::FileContents => "file_contents",
             Self::EnvironmentVariables => "environment_variables",
             Self::TerminalScrollback => "terminal_scrollback",
-            Self::AttachmentBytes => "attachment_bytes",
-        }
-    }
-
-    /// The right a grant needs before content of this class is read at all, on top of the history
-    /// bound every item is held to.
-    ///
-    /// Selecting a class is a person saying they want it, not authority to read it. File contents
-    /// and attachment bytes are file reads, so they need the grant's own file right. The host's
-    /// context filter and the preparation that describes a call both ask this, so what a person is
-    /// told a call would carry is what the filter would let it carry.
-    #[must_use]
-    pub const fn required_right(self) -> Option<ActionRight> {
-        match self {
-            Self::FileContents | Self::AttachmentBytes => Some(ActionRight::FilesRead),
-            Self::EnvironmentVariables | Self::TerminalScrollback => None,
         }
     }
 }
@@ -1659,7 +1633,9 @@ mod tests {
                 .collect(),
             statement: VoiceGrantStatement::of(&VoiceAction::default_scope()),
             excluded: VoiceContextClass::ALL.iter().copied().collect(),
-            selected: [VoiceContextClass::FileContents].into_iter().collect(),
+            selected: [VoiceContextClass::TerminalScrollback]
+                .into_iter()
+                .collect(),
             token_cap: VOICE_CONTEXT_TOKEN_CAP,
             message_count: VOICE_CONTEXT_MESSAGE_COUNT,
             broker_origin: "https://reach.example".to_owned(),

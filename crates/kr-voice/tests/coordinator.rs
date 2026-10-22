@@ -1155,8 +1155,8 @@ fn gathered() -> GatheredContext {
             ContextItem::new("after the bound", 2_200),
         ],
         selected: vec![SelectedItem {
-            class: VoiceContextClass::FileContents,
-            item: ContextItem::new("sk-abcdefghijklmnopqrstuvwxyz01 in a file", 2_300),
+            class: VoiceContextClass::EnvironmentVariables,
+            item: ContextItem::new("sk-abcdefghijklmnopqrstuvwxyz01 in a variable", 2_300),
         }],
         resources: vec!["session:a1".to_owned()],
         withheld: vec![WithheldRun {
@@ -4128,7 +4128,9 @@ async fn context_selection_uses_the_requesting_devices_scope_and_nothing_wider()
             &VoiceContextParams {
                 voice_session_id,
                 session_id: session(SESSION_A),
-                selected: [VoiceContextClass::FileContents].into_iter().collect(),
+                selected: [VoiceContextClass::EnvironmentVariables]
+                    .into_iter()
+                    .collect(),
                 delegation_id: Nullable::null(),
             },
         )
@@ -4201,7 +4203,7 @@ async fn the_terms_a_person_reads_before_a_call_are_the_services_own() {
         .prepare(
             device(PHONE),
             &prepare_params(&[
-                VoiceContextClass::FileContents,
+                VoiceContextClass::EnvironmentVariables,
                 VoiceContextClass::TerminalScrollback,
             ]),
         )
@@ -4225,13 +4227,15 @@ async fn the_terms_a_person_reads_before_a_call_are_the_services_own() {
         [session(SESSION_A)].into_iter().collect()
     );
     assert_eq!(prepared.broker_origin, "https://reach.example");
-    // This device's grant carries no file right, so file contents would not be carried whatever
-    // the person selected; scrollback needs none and would be.
+    // Both classes the person selected would be carried.
     assert_eq!(
         prepared.selected,
-        [VoiceContextClass::TerminalScrollback]
-            .into_iter()
-            .collect()
+        [
+            VoiceContextClass::EnvironmentVariables,
+            VoiceContextClass::TerminalScrollback
+        ]
+        .into_iter()
+        .collect()
     );
     assert_eq!(prepared.excluded.len(), VoiceContextClass::ALL.len());
 
