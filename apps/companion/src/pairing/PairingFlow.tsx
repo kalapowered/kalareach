@@ -27,6 +27,7 @@ import {
   type PairingFailure,
   type PairingView
 } from '../host/port'
+import type { Notifications } from '../mobile/model/push'
 import { VerificationValue } from './VerificationValue'
 import {
   actionLabel,
@@ -101,11 +102,14 @@ function capitalised(words: string): string {
 export function PairingFlow({
   chooseHost,
   forgetHost,
+  notifications,
   focusTheField = true,
   device = 'computer'
 }: {
   readonly chooseHost?: (reference: string) => Promise<void>
   readonly forgetHost?: (reference: string) => Promise<void>
+  /** Where each host's notifications stand, and how to turn them on: a phone has them. */
+  readonly notifications?: Notifications
   /**
    * Whether the code field takes focus when the column is at its start. The desktop's pairing view
    * is a screen of its own and starts typing. On a phone the column is one place among four, and
@@ -627,6 +631,7 @@ export function PairingFlow({
         <PairedHosts
           hosts={view.hosts}
           chooseHost={chooseHost}
+          notifications={notifications}
           forgetHost={
             forgetHost === undefined
               ? undefined
@@ -751,14 +756,90 @@ function Pasted({
   )
 }
 
+/**
+ * One host's notifications: where they stand in words, and the one thing the person can do about it.
+ *
+ * Off asks for them to be turned on. While the steps run the words say which one, announced politely
+ * and never as an alert: nothing is wrong. A stop says what is, and offers another go, and the
+ * system's settings when that is where the person has to act. On says so and asks for nothing: only
+ * the host ends a destination, and the system's setting stops the notifications on this phone.
+ */
+function HostNotifications({
+  host,
+  notifications
+}: {
+  readonly host: HostRow
+  readonly notifications: Notifications
+}): ReactNode {
+  const { view, enable, openSettings } = notifications
+  const [failure, setFailure] = useState<string | null>(null)
+  if (view === null || !view.available) return null
+  const row = view.hosts.find((each) => each.reference === host.reference)
+  const state = row?.state ?? 'off'
+  const words =
+    state === 'off'
+      ? 'Notifications are off.'
+      : state === 'on'
+        ? 'Notifications are on.'
+        : (row?.words ?? '')
+  return (
+    <div className="host-notifications" data-testid="host-notifications" data-state={state}>
+      <p
+        className="small muted"
+        data-testid="notifications-words"
+        role={state === 'needs_attention' ? undefined : 'status'}
+      >
+        {words}
+      </p>
+      {state === 'off' || state === 'needs_attention' ? (
+        <div className="row wrap">
+          <Button
+            data-wraps
+            data-testid="notifications-enable"
+            onClick={() => {
+              setFailure(null)
+              enable(host.reference).catch((error: unknown) => {
+                setFailure(failureMessage(error))
+              })
+            }}
+          >
+            {state === 'off' ? 'Turn on notifications' : 'Try again'}
+          </Button>
+          {row?.settings === true ? (
+            <Button
+              data-wraps
+              tone="quiet"
+              data-testid="notifications-settings"
+              onClick={() => {
+                openSettings().catch((error: unknown) => {
+                  setFailure(failureMessage(error))
+                })
+              }}
+            >
+              Open settings
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
+      {failure === null ? null : (
+        <p role="alert" className="small" data-testid="notifications-failure">
+          {failure}
+        </p>
+      )}
+    </div>
+  )
+}
+
 /** The hosts this computer is paired with, newest first. */
 function PairedHosts({
   hosts,
   chooseHost,
+  notifications,
   forgetHost
 }: {
   readonly hosts: readonly HostRow[]
   readonly chooseHost: ((reference: string) => Promise<void>) | undefined
+  readonly notifications: Notifications | undefined
   readonly forgetHost: ((host: HostRow) => Promise<void>) | undefined
 }): ReactNode {
   const [using, setUsing] = useState<string | null>(null)
@@ -798,6 +879,9 @@ function PairedHosts({
                   ? 'Owner'
                   : `Can ${host.authority}${until(host.grant_expires_at_ms)}`}
               </p>
+              {notifications === undefined ? null : (
+                <HostNotifications host={host} notifications={notifications} />
+              )}
             </div>
             {host.in_contact === null ? null : (
               <span className="small muted">
