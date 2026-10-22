@@ -23,7 +23,7 @@ use kr_plugin_sdk::plugin::{PayloadRole, PluginManifest};
 use kr_protocol::admission::{AdmittedComponent, ComponentReport, ComponentState};
 use kr_protocol::ids::{BrokerBindingId, PluginId};
 use kr_protocol::limits::MAX_REPORT_DETAIL_BYTES;
-use kr_protocol::metrics::{Adapter, Outcome};
+use kr_protocol::metrics::{Adapter, MetricOutcome};
 use kr_protocol::scalars::{Digest256, Nullable};
 
 use super::{Binding, Broker};
@@ -216,12 +216,12 @@ impl Broker {
             && before.is_none_or(|(was, _)| was != ComponentState::Unavailable)
             && let Some(adapter) = Adapter::of_package(package.as_str())
         {
-            self.adapter_failed(adapter, Outcome::Unavailable);
+            self.adapter_failed(adapter, MetricOutcome::Unavailable);
         }
     }
 
     /// Counts one failure of a bundled adapter, for the metrics this host reports about itself.
-    pub(crate) fn adapter_failed(&self, adapter: Adapter, outcome: Outcome) {
+    pub(crate) fn adapter_failed(&self, adapter: Adapter, outcome: MetricOutcome) {
         self.adapter_failures.adapter_failed(adapter, outcome);
     }
 
