@@ -3430,6 +3430,10 @@ fn kr_req_11_26_a_components_decoding_becomes_an_approval_in_the_tables_own_word
     assert_eq!(recorded.binding_id, binding(9));
     assert_eq!(recorded.package_digest, connector.package().package_digest);
     assert_eq!(recorded.projection, projection);
+    let source: serde_json::Value =
+        serde_json::from_slice(recorded.source_bytes.as_slice()).expect("the source is the frame");
+    assert_eq!(source["params"]["request_id"], "abcde");
+    assert_eq!(source["method"], channel_permission_method().as_str());
     let _ = std::fs::remove_dir_all(&root);
 }
 
