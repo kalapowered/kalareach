@@ -2224,7 +2224,6 @@ async fn removing_the_environments_task_leaves_its_running_worker_running() {
 
 /// What `whoami` says of a process: its account, the integrity level it runs at, and whether it
 /// holds the Administrators group in force.
-#[cfg(windows)]
 #[derive(Debug, PartialEq, Eq)]
 struct Standing {
     account: String,
@@ -2232,7 +2231,6 @@ struct Standing {
     administrators: Option<bool>,
 }
 
-#[cfg(windows)]
 impl Standing {
     /// Reads the output of `whoami /user /fo csv /nh` and of `whoami /groups /fo csv /nh`.
     fn read(user: &str, groups: &str) -> Self {
@@ -2269,6 +2267,7 @@ impl Standing {
     }
 
     /// What this process, which is the daemon's, runs as.
+    #[cfg(windows)]
     fn of_this_process() -> Self {
         let whoami = |argument: &str| {
             let output = std::process::Command::new("whoami.exe")
@@ -2336,6 +2335,54 @@ async fn the_root_shell_runs_as_the_hosts_own_account_and_level() {
     );
     close(&mut client, &host, created.session.session_id).await;
     daemon.stop().await;
+}
+
+/// KR-REQ-06.12: the comparison above decides only if the reading of `whoami` tells one principal
+/// from another, and the machine it runs on cannot show that by itself: an administrator's token
+/// there is the full one, the same whether a task asks for the least privilege or the highest, so a
+/// shell raised above its host would read the same as one that was not. Here the reading is held to
+/// what `whoami` printed for the principals a shell could run as: the full administrator the
+/// daemon runs as on that machine, the same administrator under a restricted token, and the system
+/// account. Each of the others differs from the administrator in the field a shell run above or
+/// below its host would differ in.
+#[test]
+fn the_reading_of_whoami_tells_the_principals_a_shell_could_run_as_apart() {
+    fn printed(name: &str) -> Standing {
+        let read = |kind: &str| {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/whoami")
+                .join(format!("{name}-{kind}.csv"));
+            std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{path:?}: {error}"))
+        };
+        Standing::read(&read("user"), &read("groups"))
+    }
+    const HIGH: &str = "S-1-16-12288";
+    let administrator = printed("administrator");
+    assert!(
+        administrator.account.ends_with("-500"),
+        "the administrator is the built-in account: {administrator:?}"
+    );
+    assert_eq!(administrator.integrity, HIGH);
+    assert_eq!(
+        administrator.administrators,
+        Some(true),
+        "the full token holds the Administrators group in force"
+    );
+
+    // The same account with the Administrators group present only to deny, which is how a token
+    // that is not the full one holds it.
+    let restricted = printed("restricted");
+    assert_eq!(restricted.account, administrator.account);
+    assert_eq!(restricted.integrity, administrator.integrity);
+    assert_eq!(restricted.administrators, Some(false));
+    assert_ne!(restricted, administrator);
+
+    // A shell run by the system account: another account, at the highest level there is.
+    let system = printed("system");
+    assert_eq!(system.account, "S-1-5-18");
+    assert_eq!(system.integrity, "S-1-16-16384");
+    assert_ne!(system.account, administrator.account);
+    assert_ne!(system.integrity, administrator.integrity);
 }
 
 /// What the daemon's `host.doctor` says.
