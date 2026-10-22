@@ -181,6 +181,23 @@ fn device(revision: u64) -> ActorEnvelope {
     }
 }
 
+/// A second phone, paired and granted apart from [`device`].
+fn another_device(revision: u64) -> ActorEnvelope {
+    ActorEnvelope {
+        actor_id: ActorId::new("device:another-test-phone").expect("an actor"),
+        ingress: ActorIngress::PairedDevice,
+        device_id: Nullable::some(DeviceId::new(Uuid::from_bytes([0x14; 16]))),
+        grant_id: Nullable::some(another_devices_grant()),
+        grant_revision: Nullable::some(AuthorityRevision::new(revision)),
+        controller_generation: ControllerGeneration::new(1),
+        connection_id: ConnectionId::new(Uuid::from_bytes([0x16; 16])),
+    }
+}
+
+fn another_devices_grant() -> GrantId {
+    GrantId::new(Uuid::from_bytes([0x15; 16]))
+}
+
 fn detaching(attachment_id: AttachmentId) -> SessionDetachParams {
     SessionDetachParams {
         attachment_id: Nullable::some(attachment_id),
@@ -2622,6 +2639,105 @@ async fn a_revision_takes_the_size_from_the_callers_it_names_and_from_no_other()
     // The owner's own window is nobody's grant: a revision of the whole host leaves it the size.
     sized.wired.revise(&mut sized.authority, 6).await;
     assert_eq!(sized.wired.size().0, Some(sized.windows));
+    sized.close();
+}
+
+/// The reach of the revisions after `since` when they withdrew these grants and no device.
+fn grants_reach(since: u64, grants: &[GrantId]) -> RevisionReach {
+    RevisionReach::Within {
+        since: AuthorityRevision::new(since),
+        grants: grants.iter().copied().collect(),
+        devices: CanonicalSet::new(),
+    }
+}
+
+/// Whether the attachment still claims the size of the session.
+fn claims_the_size(sized: &Resizing, attachment_id: AttachmentId) -> bool {
+    sized
+        .wired
+        .runtime
+        .session()
+        .attachments()
+        .iter()
+        .find(|summary| summary.attachment_id == attachment_id)
+        .is_some_and(|summary| summary.claim_geometry)
+}
+
+/// A second phone that claims the size under a grant of its own, after the owner's window.
+async fn a_second_phone_claiming(sized: &Resizing) -> (BoundLink, AttachmentId) {
+    let mut phone = sized.wired.daemon(ControllerConnectionRole::Proxy).await;
+    let attachment_id = sized
+        .wired
+        .attach_claiming_for(
+            &mut phone,
+            &another_device(2),
+            WATCH_AND_SIZE,
+            &OBSERVE_AND_SIZE,
+            Dimensions::new(90, 30),
+        )
+        .await
+        .attachment
+        .attachment_id;
+    (phone, attachment_id)
+}
+
+/// KR-REQ-10.45: a revision takes the size from the claim of the grant it names and leaves the
+/// claims of the others, the owner's among them.
+///
+/// Two phones and the owner's window claim the size, the first phone first. A revision that names
+/// the second phone's grant takes its claim, which does not own the size, and the first phone
+/// keeps the size at its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revision_takes_the_claim_it_names_and_leaves_the_owner_the_size() {
+    let mut sized = Resizing::start().await;
+    let (second, seconds) = a_second_phone_claiming(&sized).await;
+
+    sized
+        .wired
+        .revise_within(
+            &mut sized.authority,
+            3,
+            grants_reach(2, &[another_devices_grant()]),
+        )
+        .await;
+    assert!(
+        !claims_the_size(&sized, seconds),
+        "the grant of the second phone was named"
+    );
+    assert!(claims_the_size(&sized, sized.phones));
+    assert!(claims_the_size(&sized, sized.windows));
+    assert_eq!(
+        sized.wired.size(),
+        (Some(sized.phones), Dimensions::new(100, 40)),
+        "the first phone keeps the size: its grant was not named"
+    );
+    drop(second);
+    sized.close();
+}
+
+/// KR-REQ-10.45: a revision that names the grants of several claims takes all of them, the owner's
+/// too, and the size goes to the owner's own window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revision_takes_every_claim_it_names_and_the_size_goes_to_one_it_does_not() {
+    let mut sized = Resizing::start().await;
+    let (second, seconds) = a_second_phone_claiming(&sized).await;
+
+    sized
+        .wired
+        .revise_within(
+            &mut sized.authority,
+            3,
+            grants_reach(2, &[devices_grant(), another_devices_grant()]),
+        )
+        .await;
+    assert!(!claims_the_size(&sized, sized.phones));
+    assert!(!claims_the_size(&sized, seconds));
+    assert_eq!(
+        sized.wired.size(),
+        (Some(sized.windows), Dimensions::new(120, 30)),
+        "both grants were named, so the size is the owner's window's"
+    );
+    drop(second);
     sized.close();
 }
 

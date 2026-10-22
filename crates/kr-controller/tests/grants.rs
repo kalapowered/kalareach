@@ -4625,6 +4625,101 @@ async fn an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answ
     );
 }
 
+/// KR-REQ-10.45: a revocation whose rows were withdrawn but whose revision could not be published
+/// is finished by the next start, which advances the revision once and holds the fence the
+/// revocation owed.
+///
+/// The registry refuses the revision's update after the revocation's transaction has committed the
+/// withdrawal and the fence it owes, together. The daemon stops there, with the fence debt on disk:
+/// the debt is what a start reads, so the revision is not the only record that a fence is owed. The
+/// retry is answered with a barrier that holds, at the revision the start advanced to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_whose_revision_could_not_be_published_is_finished_by_the_next_start() {
+    let host = Serving::start().await;
+    let controller = &host.controller;
+    let held = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    controller
+        .sharing()
+        .grants()
+        .issue(&record(held.clone()), || Ok(()))
+        .expect("written");
+    let before = controller.policy().authority_revision();
+    let mut client = host.client().await;
+    let mutation = client
+        .compose(
+            Method::GrantRevoke,
+            kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x68; 16])),
+            kr_protocol::envelope::ActionTarget::environment(host.temp.environment_id()),
+            &kr_protocol::sharing::GrantRevokeParams {
+                grant_id: held.grant_id,
+            },
+        )
+        .await
+        .expect("the revocation is composed");
+    let registry = rusqlite::Connection::open(host.temp.environment().registry_database())
+        .expect("the registry opens");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_revision BEFORE UPDATE OF authority_revision ON environment
+                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+
+    let refused = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers the call");
+    assert!(
+        !matches!(refused, Ok(_)),
+        "a revocation whose revision cannot be published is not answered as done"
+    );
+    assert_eq!(controller.policy().authority_revision(), before);
+    assert!(
+        !controller
+            .sharing()
+            .grants()
+            .fence_owed()
+            .expect("readable")
+            .is_empty(),
+        "the withdrawal committed with the fence it owes"
+    );
+    registry
+        .execute_batch("DROP TRIGGER refuse_revision;")
+        .expect("the fault is cleared");
+    drop((client, registry));
+
+    let host = host.restart().await;
+    let controller = &host.controller;
+    assert_eq!(
+        controller.policy().authority_revision().get(),
+        before.get() + 1,
+        "the start advanced the revision once"
+    );
+    assert!(
+        controller
+            .sharing()
+            .grants()
+            .fence_owed()
+            .expect("readable")
+            .is_empty()
+    );
+    let mut client = host.client().await;
+    let answered: kr_protocol::sharing::RevocationResult = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect("the revocation is answered from the rows")
+        .to_typed()
+        .expect("a revocation result");
+    assert!(answered.revoked_grants.contains(&held.grant_id));
+    assert_eq!(answered.authority_revision.get(), before.get() + 1);
+    assert_eq!(
+        answered.barrier.authority_revision, answered.authority_revision,
+        "the answer and its barrier are one moment"
+    );
+    assert!(answered.barrier.holds(), "{answered:?}");
+}
+
 /// KR-REQ-09.08: a revocation whose attempt ended before it withdrew anything is not performed
 /// again: the grant it names still stands, and its retry is told the outcome is not known.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
