@@ -428,6 +428,7 @@ fn live_session(
             closure: Nullable::null(),
             environment_sources: None,
             root: None,
+            application: None,
         },
         endpoint: Nullable::null(),
         launch_profile: Nullable::null(),

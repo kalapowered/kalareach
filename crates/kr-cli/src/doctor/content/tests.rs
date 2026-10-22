@@ -33,6 +33,7 @@ fn listed(token: u8) -> SessionSummary {
         closure: Nullable::null(),
         environment_sources: None,
         root: None,
+        application: None,
     }
 }
 

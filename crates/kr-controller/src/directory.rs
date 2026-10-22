@@ -472,6 +472,7 @@ mod tests {
             closure: Nullable::null(),
             environment_sources: None,
             root: None,
+            application: None,
         }
     }
 
