@@ -102,6 +102,26 @@ jobs:
           ssh -V
           test -x /usr/sbin/sshd
 
+      # Five checks mount a user-space filesystem on a directory and look at it from the code under
+      # test: three removals and a daemon start that meet a mount whose server never answers, and a
+      # daemon start that meets one whose server has stopped. The mount is made through the setuid
+      # helper the distribution installs, which opens the control device as root. Each check stands
+      # down with a printed reason where this account cannot place a mount, which would let a runner
+      # without the helper or the device pass it without running it. The runner image carries the
+      # helper; it is installed when it does not, and the step fails if the helper is still not
+      # setuid or the device is not there, so the Test step below can require them.
+      - name: Install the user-space filesystem helper
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          if ! command -v fusermount3 > /dev/null; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends --yes fuse3
+          fi
+          ls -l "$(command -v fusermount3)" /dev/fuse
+          test -u "$(command -v fusermount3)"
+          test -c /dev/fuse
+
       # The test components are compiled to wasm32-wasip2 and are not committed: Rust embeds build
       # paths in a component's custom sections, so two machines produce different bytes for the same
       # source and a committed artefact could not be checked.
@@ -163,6 +183,9 @@ jobs:
           # which would let a runner without one pass them without running them. Here a missing
           # sshd, ssh or ssh-keygen fails them.
           KR_REQUIRE_SSHD: "1"
+          # The checks that mount a user-space filesystem stand down with a printed reason where
+          # this account cannot place one. Here a mount that cannot be placed fails them.
+          KR_REQUIRE_FUSE: "1"
         run: cargo test --locked --workspace
 
       # Documentation is built with warnings refused, so a link that resolves to nothing, or to an
