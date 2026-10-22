@@ -370,15 +370,19 @@ pub fn provider_payload_bytes(request: &PushDeliveryRequest) -> Result<u64> {
         data.insert("preview".to_owned(), encoded.into());
     }
     let ttl = format!("{MAX_EXPIRY_AHEAD_SECONDS}s");
+    // Android is sent a data message alone: its own receiver shows the notification, so the alert
+    // and the collapse identifier travel in `data`, and there is no notification block.
+    let mut android_data = data.clone();
+    android_data.insert("alert".to_owned(), alert.into());
+    android_data.insert("collapse_id".to_owned(), collapse_id.clone().into());
     let android = serde_json::json!({
         "message": {
             "token": token,
-            "data": serde_json::Value::Object(data.clone()),
+            "data": serde_json::Value::Object(android_data),
             "android": {
                 "priority": request.hints.urgency.fcm_priority(),
                 "collapse_key": collapse_id,
                 "ttl": ttl,
-                "notification": { "body": alert, "tag": collapse_id },
             },
         }
     });
