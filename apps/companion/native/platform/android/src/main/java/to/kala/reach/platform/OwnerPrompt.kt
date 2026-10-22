@@ -78,10 +78,14 @@ class OwnerPrompt(
         reply(outcome)
     }
 
+    /** The words begin a sentence here: the request's own line is written to follow a verb. */
+    private fun sentence(text: String): String = text.replaceFirstChar { it.uppercase() }
+
     private fun information(ask: OwnerAsk): BiometricPrompt.PromptInfo {
         val builder = BiometricPrompt.PromptInfo.Builder()
             .setTitle("Confirm on this phone")
-            .setSubtitle(reason)
+            // The description wraps; a subtitle can sit on one scrolling line.
+            .setDescription(sentence(reason))
             // A face the system sees on its own is not enough: the person presses to confirm.
             .setConfirmationRequired(true)
         return when (ask) {
@@ -111,11 +115,12 @@ class OwnerPrompt(
 
         /**
          * What the system's error says of the ceremony: that the phone had nothing to ask, or that
-         * the person did not confirm it (cancelled it, ran it out, or lost it to another screen).
+         * the person did not confirm it (cancelled it, ran it out, or lost it to another screen). A
+         * sensor that is unavailable for now is the second: it often passes, and the person can try
+         * again.
          */
         fun outcomeOf(code: Int): String = when (code) {
             BiometricPrompt.ERROR_HW_NOT_PRESENT,
-            BiometricPrompt.ERROR_HW_UNAVAILABLE,
             BiometricPrompt.ERROR_NO_BIOMETRICS,
             BiometricPrompt.ERROR_NO_DEVICE_CREDENTIAL -> "unavailable"
             else -> "not_confirmed"
