@@ -61,7 +61,7 @@ pub use surface::{
 /// Every entry has a directory `crates/kr-protocol/retained/<level>/` and a [`RetainedLevel`] in
 /// [`RETAINED`]; `kr-protocol-gen --check` fails when the three disagree.
 pub const RETAINED_WORKER_LEVELS: [CompatibilityLevel; 1] = [CompatibilityLevel::of(
-    crate::hello::PackageVersion::new(0, 75, 0),
+    crate::hello::PackageVersion::new(0, 76, 0),
 )];
 
 /// The roots of the surface a retained level keeps: the frames, the descriptor, and the parameters
@@ -302,89 +302,13 @@ impl RetainedLevel {
 /// The levels this release retains, in the order of [`RETAINED_WORKER_LEVELS`].
 pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
     RETAINED_WORKER_LEVELS[0],
-    include_str!("../retained/0.75/surface.schema.json"),
-    include_str!("../retained/0.75/RELEASE"),
-    include_str!("../retained/0.75/PLUGIN_HOST"),
+    include_str!("../retained/0.76/surface.schema.json"),
+    include_str!("../retained/0.76/RELEASE"),
+    include_str!("../retained/0.76/PLUGIN_HOST"),
     &[],
-    &[
-        Compatible {
-            at: "ControllerConnectionRole#const:checks",
-            reason: "the control daemon declares this role only to a worker at its own level, which \
-                     it chooses by level for the disclosed checks, so a worker of the retained \
-                     level is never asked for one",
-        },
-        Compatible {
-            at: "ControlFrame#key:desktop_checks",
-            reason: "the control daemon writes this request only on a checks connection to a \
-                     worker at its own level, and a worker of the retained level never receives \
-                     it",
-        },
-        Compatible {
-            at: "ControlFrame#key:desktop_checks_answer",
-            reason: "only a worker at the daemon's own level answers the request, so a worker of \
-                     the retained level never writes this frame",
-        },
-        Compatible {
-            at: "WorkerLaunchSpec.root_command",
-            reason: "A member that is absent from the wire unless the daemon starts a session to run \
-                     a command. The specification of an ordinary session is byte for byte what a \
-                     worker of the retained level reads, and a worker of that level that is sent \
-                     one with a command refuses the specification as a frame it cannot read, so \
-                     it starts no shell in place of the command.",
-        },
-        Compatible {
-            at: "WorkerLaunchSpec.workflow",
-            reason: "A member that is absent from the wire unless a workflow started the session, \
-                     and sent only together with a root command, so a worker of the retained \
-                     level never meets it without also refusing the specification for the command.",
-        },
-        Compatible {
-            at: "WorkerLaunchSpec.start_not_after_boot_ms",
-            reason: "A member that is absent from the wire unless a workflow started the session, \
-                     and sent only to the worker the daemon started that session with. The \
-                     specification of an ordinary session is byte for byte what a worker of the \
-                     retained level reads, and a worker of that level that is sent one with the \
-                     member refuses the specification as a frame it cannot read, so it starts \
-                     nothing the daemon bounded.",
-        },
-        Compatible {
-            at: "ForwardedMutation.workflow_run_id",
-            reason: "A member that is absent from the wire except in a workflow's close of a session \
-                     it started, which the daemon sends only to the worker it started that \
-                     session's command on, never to a worker of the retained level. Every other \
-                     forwarded mutation is byte for byte what that level reads.",
-        },
-        Compatible {
-            at: "SessionSummary.root",
-            reason: "A member that is absent from the wire for the interactive shell every other \
-                     session has. Summaries travel from a worker to the daemon, and a worker of \
-                     the retained level never writes this member, so this build's daemon reads \
-                     what it writes as a session whose root is a shell. A summary that carries \
-                     the member is written only by a worker of this build, for a session it was \
-                     started to run a command in. The daemon hands summaries on to callers \
-                     through `session.list` and `session.read`, and an earlier release's reader, \
-                     whose summary is a closed object, cannot read one that carries the member. \
-                     No client was released, so there is no shim: the public contract may change \
-                     with a level move until public 1.0 freezes at the first client release \
-                     (`docs/releases/packages.md`).",
-        },
-        Compatible {
-            at: "ForwardedMutation.lease",
-            reason: "A member that is absent from the wire unless the daemon forwards a paired \
-                     device's mutation to a worker at this release's own level, which holds the \
-                     dispatch to the lease. The daemon omits it on a link to a worker of the \
-                     retained level, which refuses the frame that carries it, so every forwarded \
-                     mutation that level reads is byte for byte what it read before. Such a worker \
-                     enforces the generation fence, the authority revision the grant was validated \
-                     at and the deadline the lease bounds, and the daemon alone holds the lease for \
-                     it. The member belongs to the level this release is at. Two releases of that \
-                     level were made before it and are excluded (`retained/EXCLUDED`); a change to \
-                     a level's surface after its first release moves the level in the train that \
-                     makes it, with its cut.",
-        },
-    ],
+    &[],
 )
-.with_public_majors(include_str!("../retained/0.75/PUBLIC_MAJORS"))];
+.with_public_majors(include_str!("../retained/0.76/PUBLIC_MAJORS"))];
 
 /// A level of a test's own: the surface this release retains besides its own, with its definitions
 /// changed by `edit`, and `declared` as the entries that cover what it differs by.

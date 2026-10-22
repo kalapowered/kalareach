@@ -254,6 +254,22 @@
         "kr_protocol crates/kr-protocol/src/ids.rs: validate_opaque_id"
       ]
     },
+    "CapabilityRevision": {
+      "digest": "c38d8d7e8804431f2c166846ce1878a69b7bd6b9ab3170f7ed974194189ab482",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: Generated",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: HostIdentifier",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: impl CapabilityRevision",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: sealed",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
     "ConnectionId": {
       "digest": "a4dd466e465aae9d62102cb9cc9a3f666703b47f7a525daa48a63a2c10bbeff7",
       "followed": [
@@ -461,7 +477,7 @@
       ]
     },
     "ForwardedMutation": {
-      "digest": "c0401e75f2a0ec7b12a5bf84575208ff3ffd8b8c5720fda47c10c362eec9754d",
+      "digest": "816f1f1b55acd652534b671265079388d7976946935d4724ea2af1f838caeab0",
       "followed": [
         "kr_protocol crates/kr-protocol/src/local.rs: ForwardedMutation",
         "kr_protocol crates/kr-protocol/src/local.rs: REFUSED",
@@ -728,6 +744,24 @@
         "kr_protocol crates/kr-protocol/src/receipt.rs: impl Receipt"
       ]
     },
+    "RemoteDispatchLeaseId": {
+      "digest": "02d1dc69ae90b496464a510ac5ffe2154d59f355bbe832551a04a088ba15dd92",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UUID_LEN",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UuidParseError",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: hex_nibble",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
+      ]
+    },
     "RequestId": {
       "digest": "02aa4228efc77bd978a88c2be8ba1021561b8170c72c3847843c7f81fd2a0bf5",
       "followed": [
@@ -760,6 +794,25 @@
         "kr_protocol crates/kr-protocol/src/scalars.rs: impl SecretBytesVisitor",
         "kr_protocol crates/kr-protocol/src/scalars.rs: impl SecretTextOrBytesVisitor",
         "kr_protocol crates/kr-protocol/src/scalars.rs: to_base64url"
+      ]
+    },
+    "Sentence": {
+      "digest": "fded400e683eed4ff0f233a9578d38e67bfab3c3c18050bdd41b09a7a4c16ef7",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: Composed",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: ContentClass",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: EXPORTED",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: ExportedField",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: Provenance",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: Sentence",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: class",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: class_of",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: field",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: impl ContentClass",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: impl Sentence",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: sealed",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: stated",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: withheld"
       ]
     },
     "SessionCloseResult": {
@@ -804,7 +857,7 @@
       ]
     },
     "SessionSummary": {
-      "digest": "cdf061cf71bd576df6406553bcb45bf89d1402a6e789cbb0dcd4a75415f38c32",
+      "digest": "7fe58d83a5989335c94b5e105f5cbce3a42cda57d60510c18ba096a3e6bb6c19",
       "followed": [
         "kr_protocol crates/kr-protocol/src/session.rs: SessionSummary"
       ]
@@ -929,9 +982,27 @@
       ]
     },
     "WorkerLaunchSpec": {
-      "digest": "fab6729ff31883fdb497b2d1cce040036cfdcfe9ece66a700648a31ea30f166d",
+      "digest": "1dbe88292acb0c5093405c88fd4b6de5b953318737d9466ff8a23c569a8db469",
       "followed": [
         "kr_protocol crates/kr-protocol/src/worker.rs: WorkerLaunchSpec"
+      ]
+    },
+    "WorkflowRunId": {
+      "digest": "25fc69b772d532ce3d5175a72bcea8134a9ca244073cfab0325b882b8bc71d79",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UUID_LEN",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UuidParseError",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: hex_nibble",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
       ]
     },
     "macro action_rights": {
@@ -1061,6 +1132,16 @@
       "followed": [
         "kr_protocol crates/kr-protocol/src/attention.rs: wire_enum",
         "kr_protocol crates/kr-protocol/src/automation.rs: wire_enum"
+      ]
+    },
+    "macro worker_events": {
+      "digest": "8e455c062cd1ac4114ea0cfa1ac0661fdb00d922dded8e21cddb04e213f0509c",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/worker_surface.rs: EventRow",
+        "kr_protocol crates/kr-protocol/src/worker_surface.rs: WorkerEvent",
+        "kr_protocol crates/kr-protocol/src/worker_surface.rs: event",
+        "kr_protocol crates/kr-protocol/src/worker_surface.rs: impl WorkerEvent",
+        "kr_protocol crates/kr-protocol/src/worker_surface.rs: worker_events"
       ]
     },
     "the attention text a worker serves": {
