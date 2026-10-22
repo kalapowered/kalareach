@@ -2407,9 +2407,9 @@ suspend-aware continuous clock (`kr_transport::clock`).
   marker. What the worker has acknowledged belongs to a generation, so a replacement daemon cannot
   send on what the one before it queued: the old envelope and lease name the old generation, and the
   worker acknowledges no revision to the new one until the new daemon announces it. A local caller's
-  action and a paired device's `session.close` need no lease. A worker of the release before is sent
-  no lease, because it cannot read one: it holds the deadline and the revision its grant was checked
-  at, and only the daemon holds the lease for it.
+  action and a paired device's `session.close` need no lease. A worker of the release before reads
+  the lease and is sent it as a worker of this release is; a worker of an excluded early release of
+  that level cannot read it (see the support window).
 
 ### The admission a mutation carries
 
