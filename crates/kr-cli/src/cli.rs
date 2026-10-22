@@ -163,6 +163,12 @@ pub struct BackupRestoreArguments {
     /// The archive to restore, by identifier, when the recovery bundle names more than one.
     #[arg(long)]
     pub archive: Option<String>,
+    /// Restore from an offline export file instead of from the storage service: no service is
+    /// reached and no sign-in is needed. The file holds the recovery bundle and one archive as
+    /// ciphertext, and the kit opens it as it opens them at the service. The recovery bundle at the
+    /// service is not changed.
+    #[arg(long, value_name = "PATH")]
+    pub from_export: Option<PathBuf>,
     /// Print what would be restored and the digest of that, and write nothing.
     #[arg(long, conflicts_with = "confirm_plan")]
     pub preview: bool,

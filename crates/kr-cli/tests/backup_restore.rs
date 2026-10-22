@@ -1289,6 +1289,261 @@ async fn a_service_that_offers_a_generation_older_than_the_bundles_checkpoint_is
     );
 }
 
+/// An offline export of `sealed` and the bundle for `world`, as the companion would write it: the
+/// ciphertext the service holds and nothing else.
+fn export_of(world: &World, origin: &str, sealed: &Sealed) -> kr_client::recovery::OfflineExport {
+    use kr_client::recovery::{ExportedArchive, ExportedObject, OfflineExport};
+    use kr_protocol::scalars::Bytes;
+
+    let manifest = sealed
+        .publication
+        .payload
+        .descriptor
+        .encrypted_manifest
+        .object_id;
+    OfflineExport::new(
+        origin.to_owned(),
+        bundle(world, origin, None, &[archive()]),
+        Some(ExportedArchive {
+            archive_id: archive(),
+            publication: sealed.publication.clone(),
+            encrypted_manifest: Bytes::new(sealed.objects[&manifest].clone()),
+            objects: sealed
+                .objects
+                .iter()
+                .filter(|(object, _)| **object != manifest)
+                .map(|(object, bytes)| ExportedObject {
+                    object_id: *object,
+                    bytes: Bytes::new(bytes.clone()),
+                })
+                .collect(),
+        }),
+    )
+}
+
+/// KR-REQ-20.18: a host that is signed in to nothing restores from an export file and the kit
+/// alone: no service is reached, the files are the ones a restore from the service writes, and the
+/// output says the recovery bundle at the service was left as it is. A file that is not an export,
+/// in another format, or sealed for another kit restores nothing and is refused by name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_from_an_export_file_needs_no_service_and_no_sign_in() {
+    let world = World::new();
+    let rig = Rig::start(SignIn::Nobody).await;
+    let held = members();
+    let sealed = seal(&world, 1, &borrowed(&held));
+    let kit = rig.work.join("kit.txt");
+    std::fs::write(&kit, world.kit_text(&[rig.origin()])).expect("the kit file");
+    let kit_arg = kit.display().to_string();
+    let file = rig.work.join("backup.krexport");
+    std::fs::write(
+        &file,
+        export_of(&world, rig.origin(), &sealed)
+            .to_canonical_bytes()
+            .expect("canonical bytes"),
+    )
+    .expect("the export file");
+    let file_arg = file.display().to_string();
+    let into = folder(&rig, "restored");
+    let into_arg = into.display().to_string();
+    let asked = rig.served.web().arrived().len();
+
+    // Without the file the host has no sign-in to ask the service with.
+    let unsigned = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--preview",
+            ],
+            None,
+        )
+        .await;
+    assert!(!unsigned.status.success());
+    assert!(names(&into).is_empty());
+
+    let preview = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--from-export",
+                &file_arg,
+                "--preview",
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    assert!(preview.status.success(), "{}", text(&preview.stderr));
+    let digest = digest_of(&preview);
+    let restored = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--from-export",
+                &file_arg,
+                "--confirm-plan",
+                &digest,
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    assert!(restored.status.success(), "{}", text(&restored.stderr));
+    let report: Value = serde_json::from_slice(&restored.stdout).expect("a document");
+    assert_eq!(report["checkpoint_recorded"], false, "{report}");
+    assert!(
+        report["checkpoint"]
+            .as_str()
+            .is_some_and(|words| words.contains("reached no service")),
+        "{report}"
+    );
+    let written = names(&into);
+    assert!(
+        written.contains(&"session-0001.json".to_owned()),
+        "{written:?}"
+    );
+    assert!(
+        written.contains(&"configuration.json".to_owned()),
+        "{written:?}"
+    );
+    assert_eq!(
+        std::fs::read(into.join("session-0001.json")).expect("a session"),
+        held[0].1,
+        "the file gives back the member as the service would"
+    );
+    assert_eq!(
+        rig.served.web().arrived().len(),
+        asked,
+        "no request left for the service"
+    );
+
+    // Refused by name, each writing nothing.
+    let refused = |name: &str, bytes: Vec<u8>, kit_arg: &str| {
+        let path = rig.work.join(name);
+        std::fs::write(&path, bytes).expect("a file");
+        let path = path.display().to_string();
+        let into = folder(&rig, name);
+        let into_arg = into.display().to_string();
+        let kit_arg = kit_arg.to_owned();
+        let name = name.to_owned();
+        let rig = &rig;
+        async move {
+            let output = rig
+                .run(
+                    &[
+                        "backup",
+                        "restore",
+                        "--into",
+                        &into_arg,
+                        "--kit-file",
+                        &kit_arg,
+                        "--from-export",
+                        &path,
+                        "--preview",
+                    ],
+                    None,
+                )
+                .await;
+            assert!(!output.status.success(), "{name}");
+            assert!(names(&into).is_empty(), "{name}");
+            text(&output.stderr)
+        }
+    };
+    let said = refused("not-an-export", b"not an export".to_vec(), &kit_arg).await;
+    assert!(said.contains("not an offline export"), "{said}");
+    let mut other = export_of(&world, rig.origin(), &sealed);
+    other.format = "kalareach-offline-export/2".to_owned();
+    let said = refused(
+        "another-format",
+        other.to_canonical_bytes().expect("canonical bytes"),
+        &kit_arg,
+    )
+    .await;
+    assert!(said.contains("format this release does not read"), "{said}");
+    // Sealed for a kit other than the one given.
+    let stranger = World::new();
+    let stranger_kit = rig.work.join("stranger.txt");
+    std::fs::write(&stranger_kit, stranger.kit_text(&[rig.origin()])).expect("a kit");
+    let said = refused(
+        "another-kit",
+        export_of(&world, rig.origin(), &sealed)
+            .to_canonical_bytes()
+            .expect("canonical bytes"),
+        &stranger_kit.display().to_string(),
+    )
+    .await;
+    assert!(said.contains("did not authenticate"), "{said}");
+}
+
+/// KR-REQ-20.18: a kit that names several services restores from the one this host is configured
+/// for, whichever of them is first, and does not reach the others.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kit_that_names_several_services_restores_from_the_one_this_host_is_configured_for() {
+    let world = World::new();
+    let rig = Rig::start(SignIn::Usable).await;
+    let held = members();
+    let sealed = seal(&world, 1, &borrowed(&held));
+    rig.put(&world, &sealed, None).await;
+    let kit = rig.work.join("kit.txt");
+    // The first service is not this host's and cannot be reached; the kit names it all the same.
+    std::fs::write(
+        &kit,
+        world.kit_text(&["https://storage.unreachable.invalid", rig.origin()]),
+    )
+    .expect("the kit file");
+    let kit_arg = kit.display().to_string();
+    let into = folder(&rig, "restored");
+    let into_arg = into.display().to_string();
+    let preview = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--preview",
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    assert!(preview.status.success(), "{}", text(&preview.stderr));
+    let digest = digest_of(&preview);
+    let restored = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--confirm-plan",
+                &digest,
+            ],
+            None,
+        )
+        .await;
+    assert!(restored.status.success(), "{}", text(&restored.stderr));
+    assert!(names(&into).contains(&"session-0001.json".to_owned()));
+}
+
 /// A configuration document for a backup to carry: the device's settings an owner chose, and the
 /// things a restore must not take, which this host's own document does not have.
 fn backed_up_configuration() -> Vec<u8> {
@@ -2238,7 +2493,7 @@ async fn restore_through_the_library_pausing(
     let environment = fixture.rig.temp.environment_id().to_string();
     let run = |decision| Run {
         source: Arc::clone(&source) as _,
-        bundles: &bundles,
+        bundles: Some(&bundles),
         accept_older: None,
         configuration: None,
         began: &began,
