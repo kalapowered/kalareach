@@ -1815,6 +1815,18 @@ methods! {
     freshness: ActionWindow, confirmation: None, idempotency: ACTION,
     doc: "Start a run, recording the trigger event, definition version and causal parent.";
 
+    WorkflowRearm = "workflow.rearm", Automation,
+    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(AutomationManage)],
+    selectors: [Workflow],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: keyed("causal root + the budget generation it leaves"),
+    doc: "Give a causal chain whose budget ran out a new one, under a grant this host holds with \
+          the right to manage automation, and continue the chain from the descendants the \
+          exhausted budget refused. A chain whose budget has not run out is refused. The request \
+          names the generation it leaves, so a repeat of it after a lost reply is answered with \
+          the generation the chain went to and gives no second budget. Nothing an event carries \
+          can rearm a chain.";
+
     WorkflowRead = "workflow.read", Automation,
     effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(AutomationManage)],
     selectors: [Workflow],

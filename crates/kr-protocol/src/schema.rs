@@ -53,8 +53,9 @@ use crate::automation::{
     WorkflowAlert, WorkflowAlertKind, WorkflowDeadlines, WorkflowDefinition,
     WorkflowDefinitionSummary, WorkflowEdge, WorkflowEnableParams, WorkflowEnableResult,
     WorkflowInstallParams, WorkflowInstallResult, WorkflowNode, WorkflowPauseParams,
-    WorkflowPauseResult, WorkflowReadParams, WorkflowReadResult, WorkflowResourceScope,
-    WorkflowRunParams, WorkflowRunResult, WorkflowRunStatus, WorkflowRunSummary, WorkflowTrigger,
+    WorkflowPauseResult, WorkflowReadParams, WorkflowReadResult, WorkflowRearmParams,
+    WorkflowRearmResult, WorkflowResourceScope, WorkflowRunParams, WorkflowRunResult,
+    WorkflowRunStatus, WorkflowRunSummary, WorkflowTrigger,
 };
 use crate::backup_bundle::{BackupBundlePlace, BackupBundleWriteParams, BackupBundleWriteResult};
 use crate::backup_read::{BackupBundle, BackupReadParams, BackupReadResult, BackupSignIn};
@@ -802,6 +803,8 @@ pub fn protocol_schema() -> Value {
         "workflow_pause_result" => WorkflowPauseResult,
         "workflow_read_params" => WorkflowReadParams,
         "workflow_read_result" => WorkflowReadResult,
+        "workflow_rearm_params" => WorkflowRearmParams,
+        "workflow_rearm_result" => WorkflowRearmResult,
         "workflow_resource_scope" => WorkflowResourceScope,
         "workflow_run_params" => WorkflowRunParams,
         "workflow_run_result" => WorkflowRunResult,

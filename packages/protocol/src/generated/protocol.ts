@@ -3284,6 +3284,8 @@ export interface KalaReachProtocol {
   workflow_pause_result?: WorkflowPauseResult
   workflow_read_params?: WorkflowReadParams
   workflow_read_result?: WorkflowReadResult
+  workflow_rearm_params?: WorkflowRearmParams
+  workflow_rearm_result?: WorkflowRearmResult
   workflow_resource_scope?: WorkflowResourceScope1
   workflow_run_params?: WorkflowRunParams
   workflow_run_result?: WorkflowRunResult
@@ -11011,6 +11013,10 @@ export interface CausalBudgetSummary {
    * Whether any limit was exhausted.
    */
   exhausted: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  generation: string
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -19194,6 +19200,7 @@ export interface MethodEntry {
     | 'workflow.enable'
     | 'workflow.pause'
     | 'workflow.run'
+    | 'workflow.rearm'
     | 'workflow.read'
   /**
    * The stable wire name.
@@ -28212,6 +28219,7 @@ export interface ServiceRequestPayload {
     | 'workflow.enable'
     | 'workflow.pause'
     | 'workflow.run'
+    | 'workflow.rearm'
     | 'workflow.read'
   /**
    * A fresh 32-byte nonce, from the caller's random generator.
@@ -32411,6 +32419,45 @@ export interface WorkflowRunSummary {
    * One automation definition.
    */
   workflow_id: string
+}
+/**
+ * Parameters for `workflow.rearm`.
+ *
+ * A rearm is the explicit, authorised act that gives a causal chain a new budget after its
+ * budget ran out. Nothing an event carries can make one: the request names the chain, the grant
+ * it is made under, and the budget generation it leaves.
+ *
+ * The generation is what makes a repeat of the request a repeat and not a second budget. The
+ * first request moves the chain from that generation to the next. A request that names a
+ * generation the chain has already left, such as the same request sent again after its reply was
+ * lost, is answered with the generation the chain went to and establishes nothing.
+ */
+export interface WorkflowRearmParams {
+  /**
+   * The root of a bounded cross-run causal chain.
+   */
+  causal_root_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  generation: string
+  /**
+   * One host-issued authority object.
+   */
+  grant_reference: string
+}
+/**
+ * Result of `workflow.rearm`.
+ */
+export interface WorkflowRearmResult {
+  /**
+   * The root of a bounded cross-run causal chain.
+   */
+  causal_root_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  generation: string
 }
 /**
  * Resource scope binding for a workflow.
