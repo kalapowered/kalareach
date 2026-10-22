@@ -2245,7 +2245,7 @@ impl Standing {
         let account = user
             .lines()
             .find_map(|line| fields(line).get(1).map(|sid| (*sid).to_owned()))
-            .expect("whoami names the account's identifier");
+            .unwrap_or_else(|| panic!("whoami names the account's identifier: {user:?}"));
         let mut integrity = None;
         let mut administrators = None;
         for line in groups.lines() {
@@ -2262,7 +2262,8 @@ impl Standing {
         }
         Self {
             account,
-            integrity: integrity.expect("whoami names the integrity level"),
+            integrity: integrity
+                .unwrap_or_else(|| panic!("whoami names the integrity level: {groups:?}")),
             administrators,
         }
     }
@@ -2296,11 +2297,20 @@ async fn the_root_shell_runs_as_the_hosts_own_account_and_level() {
     // directory the session was given. `whoami`'s switches are not paths, so the shell is told
     // not to turn them into ones.
     let startup = host.temp.root().join("kr-who.sh");
+    // The program is named in full: the shell's own search path finds the coreutils `whoami` of
+    // the POSIX tools first, which takes none of these switches.
+    let whoami = kr_worker::testing::shell_quoted(
+        &PathBuf::from(std::env::var_os("SystemRoot").expect("the system directory"))
+            .join("System32")
+            .join("whoami.exe"),
+    );
     std::fs::write(
         &startup,
-        "MSYS_NO_PATHCONV=1 whoami /user /fo csv /nh > kr-user\n\
-         MSYS_NO_PATHCONV=1 whoami /groups /fo csv /nh > kr-groups\n\
-         : > kr-who-done\n",
+        format!(
+            "MSYS_NO_PATHCONV=1 {whoami} /user /fo csv /nh > kr-user 2>&1\n\
+             MSYS_NO_PATHCONV=1 {whoami} /groups /fo csv /nh > kr-groups 2>&1\n\
+             : > kr-who-done\n"
+        ),
     )
     .expect("writes the shell's startup file");
     let created = create_with(

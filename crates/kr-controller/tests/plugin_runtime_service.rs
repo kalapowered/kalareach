@@ -175,6 +175,8 @@ async fn a_daemon_and_its_plugin_host_for_its_parent() {
         .read_line(&mut word)
         .expect("the parent's word that the jobs are in place");
     let hosted = hosted().await;
+    // The host reads the packages directory before it reports in, so there has to be one.
+    install(&hosted.environment(), &well_behaved().unwrap_or_default());
     let _runtime = hosted.runtime().await;
     let host = hosted.published().expect("the host is published");
     println!(
