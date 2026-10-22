@@ -768,9 +768,15 @@ export type BackupSetupState =
        */
       enabled_at_ms: string
       /**
-       * The fingerprint that matches the kit to this host.
+       * The fingerprint that matches the kit to this host. It is 40 bits, which is enough to
+       * tell a kit from another by eye and not to prove two recipients are one.
        */
       kit_fingerprint: string
+      /**
+       * The recovery recipient's public key the setup was made with, which is what tells a
+       * setup under one recovery from a setup under another.
+       */
+      recovery_public_key: string
       state: 'committed'
       /**
        * Why this host cannot make backups now, or null when it can.
@@ -7342,9 +7348,15 @@ export interface BackupStatusResult {
          */
         enabled_at_ms: string
         /**
-         * The fingerprint that matches the kit to this host.
+         * The fingerprint that matches the kit to this host. It is 40 bits, which is enough to
+         * tell a kit from another by eye and not to prove two recipients are one.
          */
         kit_fingerprint: string
+        /**
+         * The recovery recipient's public key the setup was made with, which is what tells a
+         * setup under one recovery from a setup under another.
+         */
+        recovery_public_key: string
         state: 'committed'
         /**
          * Why this host cannot make backups now, or null when it can.
