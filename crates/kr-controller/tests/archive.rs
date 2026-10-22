@@ -803,6 +803,12 @@ fn ownership_is_refused_when_the_workers_endpoint_cannot_be_fenced() {
     let (_temp, archive) = host();
     let session_id = session();
     let endpoint = PublishedEndpoint::of(&archive, DisplayNumber::new(1));
+    // The lock is made before the directory is made unwritable, which is the one thing under test.
+    drop(
+        archive
+            .own_closed(session_id, || Ok(false))
+            .expect("the lock is made"),
+    );
     let directory = endpoint.0.parent().expect("a directory").to_path_buf();
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
         .expect("makes the directory unwritable");

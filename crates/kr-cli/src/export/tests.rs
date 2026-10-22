@@ -1274,10 +1274,6 @@ async fn the_document_is_the_same_bytes_for_the_same_session() {
     let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
         .await
         .expect("exports");
-    eprintln!(
-        "GOLDEN-BEGIN{}GOLDEN-END",
-        String::from_utf8_lossy(&exported.document)
-    );
     assert_eq!(
         exported.document,
         include_bytes!("golden/session-export.json"),

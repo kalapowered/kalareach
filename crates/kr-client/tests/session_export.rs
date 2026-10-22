@@ -251,12 +251,15 @@ async fn a_document_that_would_pass_its_size_stops_the_read_and_says_so() {
         "the cursor names where the kept output ends"
     );
 
-    let whole = composed(output.clone(), bounds(16 * MIB, 6 * MIB)).await;
+    // The read leaves room for the most a page can add, so a document that fills its limit to the
+    // last page is cut a page short; a session at the per-session cap makes a document well inside
+    // the file's bound, and so does this one inside a bound twice its size.
+    let whole = composed(output.clone(), bounds(16 * MIB, 8 * MIB)).await;
     assert!(!whole.truncated);
     assert!(!whole.omissions.contains(&"output_truncated"));
     let (everything, _) = carried(&whole.document);
     assert_eq!(everything, output);
-    assert!(whole.document.len() as u64 <= 6 * MIB);
+    assert!(whole.document.len() as u64 <= 8 * MIB);
 }
 
 /// Output that makes a piece for every other byte is held to the limit on pieces and to the size of
@@ -289,8 +292,8 @@ async fn output_that_makes_a_piece_for_every_other_byte_is_held_to_the_limits() 
     assert!(kept.iter().all(|&byte| byte == b'a'));
     assert_eq!(
         next_cursor(&few.document),
-        2 * pieces as u64,
-        "the cursor is where the next piece would begin"
+        few.bytes_read,
+        "the cursor is where the read stopped, so a reader that goes on from it misses nothing"
     );
 
     let mut source = Memory::of(output);
@@ -326,17 +329,17 @@ async fn a_source_that_ignores_the_size_asked_for_does_not_pass_the_limits() {
     let by_pieces = run(
         &mut greedy(),
         Bounds {
-            max_chunks: 5_000,
+            max_chunks: 20_000,
             ..bounds(16 * MIB, 192 * MIB)
         },
     )
     .await;
     let (_, pieces) = carried(&by_pieces.document);
-    assert_eq!(pieces, 5_000);
+    assert_eq!(pieces, 20_000);
     assert!(by_pieces.truncated);
     assert_eq!(
         next_cursor(&by_pieces.document),
-        10_000,
+        40_000,
         "the cursor is where the first dropped piece began"
     );
 

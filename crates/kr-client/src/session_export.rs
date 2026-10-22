@@ -204,8 +204,18 @@ pub enum Stop<E> {
 }
 
 impl<E> core::fmt::Debug for Stop<E> {
+    /// Names what stopped it and nothing the source said, which may be a path or a person's text.
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.debug_struct("Stop").finish_non_exhaustive()
+        let why = match self {
+            Self::Source(_) => "Source",
+            Self::Engine => "Engine",
+            Self::Document => "Document",
+            Self::Untimed(_) => "Untimed",
+        };
+        formatter
+            .debug_struct("Stop")
+            .field("why", &why)
+            .finish_non_exhaustive()
     }
 }
 

@@ -422,6 +422,19 @@ pub static STORES: &[StoreDescriptor] = &[
         served_by_archive: true,
     },
     StoreDescriptor {
+        name: "output times",
+        holds: "when each part of the retained output was produced: intervals of its cursors, each with the wall-clock reading of its first byte and whether the clock could be proved",
+        durability: Durability::BestEffortFile,
+        retention: Retention::PeriodOrByteCap(crate::persistence::retention::OUTPUT_RETENTION),
+        // Instants and cursors; none of the output's own bytes.
+        content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::WorkerThenArchive,
+        reconciliation: Reconciliation::RebuiltWithGaps,
+        evictable_under_history_cap: true,
+        served_by_archive: true,
+    },
+    StoreDescriptor {
         name: "resident history",
         holds: "the most recent output, in memory, ahead of the spool",
         durability: Durability::ProcessMemory,

@@ -392,6 +392,48 @@ async fn output_bytes_write_no_row_to_the_journal_at_all() {
     );
 }
 
+/// KR-REQ-25.25: the time each part of a session's output was produced is kept beside its spool by
+/// the worker, written by the maintenance pass with the session let go of, and finished by the
+/// session's closure, so a reader that finds the closure finds the times of the output up to it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_sessions_output_has_times_that_are_written_by_maintenance_and_finished_by_the_closure() {
+    let host = host().await;
+    let index = kr_ipc::paths::output_times_beside(
+        &host._temp.environment().session_spool(host.session_id),
+    )
+    .expect("an index beside the spool");
+    let before = kr_ipc::now_ms().get();
+    host.runtime.session().ingest_output(b"first\r\n");
+    host.service.maintain_now();
+    let read = kr_worker::output_times::read(&index, 0, 64, 16).expect("the pass wrote the times");
+    let first = read.marks.first().expect("an interval");
+    assert_eq!(
+        (first.from, first.to),
+        (0, 7),
+        "the interval ends where the output had got to"
+    );
+    assert!(first.at_ms >= before && first.at_ms <= kr_ipc::now_ms().get());
+
+    // Output after the pass is not in the file until something writes it: the closure does.
+    host.runtime.session().ingest_output(b"last\r\n");
+    let unfinished = kr_worker::output_times::read(&index, 0, 64, 16).expect("reads");
+    assert!(
+        unfinished.marks.iter().all(|mark| mark.to <= 7),
+        "the maintenance pass has not run again: {:?}",
+        unfinished.marks
+    );
+    let mut client = cli(&host).await;
+    close(&mut client, &host).await;
+    let finished = kr_worker::output_times::read(&index, 0, 64, 16).expect("reads");
+    assert_eq!(
+        finished.marks.last().map(|mark| mark.to),
+        Some(13),
+        "the closure wrote the rest: {:?}",
+        finished.marks
+    );
+}
+
 #[test]
 fn no_commit_point_shares_a_flush_and_the_writes_that_may_are_named() {
     // KR-REQ-24.03, second half, as a policy: grouped commits share a flush without moving the
@@ -740,7 +782,12 @@ fn authority_and_dispatch_data_is_never_evicted_under_a_history_cap() {
         .collect();
     assert_eq!(
         evictable,
-        vec!["host_events", "output spool", "resident history"]
+        vec![
+            "host_events",
+            "output spool",
+            "output times",
+            "resident history"
+        ]
     );
 }
 

@@ -1131,9 +1131,14 @@ impl OutputHistory {
 /// the host figure and therefore evicts less rather than more. Output still in a session's
 /// resident window has not reached a spool and is not counted.
 ///
-/// Each file is sized by asking the file itself. A directory entry's size is what the file system
-/// last wrote into the directory, which Windows does not bring up to date while a handle to the
-/// file is open, so a segment still being written would read shorter than it is, and the host
+/// What is counted is the output: the segment files, which are what [`Spool`] holds against its own
+/// cap. The file that records where a spool's output got to is a few bytes about the output, and
+/// counting it would hold a host that has given up every byte of a session over its cap by the
+/// size of the record.
+///
+/// Each segment is sized by asking the file itself. A directory entry's size is what the file
+/// system last wrote into the directory, which Windows does not bring up to date while a handle to
+/// the file is open, so a segment still being written would read shorter than it is, and the host
 /// would hold more than its cap.
 #[must_use]
 pub fn retained_bytes_under(root: &Path) -> u64 {
@@ -1142,22 +1147,20 @@ pub fn retained_bytes_under(root: &Path) -> u64 {
     };
     let mut total = 0;
     for entry in entries.flatten() {
-        let path = entry.path();
         let Ok(kind) = entry.file_type() else {
             continue;
         };
-        if kind.is_file() {
-            total += std::fs::metadata(&path).map_or(0, |data| data.len());
-            continue;
-        }
         if !kind.is_dir() {
             continue;
         }
-        let Ok(files) = std::fs::read_dir(&path) else {
+        let Ok(files) = std::fs::read_dir(entry.path()) else {
             continue;
         };
         for file in files.flatten() {
-            total += std::fs::metadata(file.path()).map_or(0, |data| data.len());
+            let path = file.path();
+            if path.extension().is_some_and(|extension| extension == "out") {
+                total += std::fs::metadata(&path).map_or(0, |data| data.len());
+            }
         }
     }
     total

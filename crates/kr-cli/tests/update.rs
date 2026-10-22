@@ -8793,7 +8793,25 @@ fn observed_stores(host: &Host) -> Vec<stored_formats::Observed> {
         .map(|store| {
             let ddl = match store.entry.recording {
                 Recording::SqliteTable { .. } | Recording::SqliteUserVersion => {
-                    let file = environment.state_dir().join(&store.entry.path);
+                    // A store of records is one database for each record, and any of them holds
+                    // the tables every one of them has.
+                    let file = match store.entry.records() {
+                        Some((directory, extension)) => {
+                            std::fs::read_dir(environment.state_dir().join(directory))
+                                .ok()
+                                .into_iter()
+                                .flatten()
+                                .flatten()
+                                .map(|entry| entry.path())
+                                .find(|path| {
+                                    path.extension().is_some_and(|found| found == extension)
+                                })
+                                .unwrap_or_else(|| {
+                                    panic!("no record of the store {} was made", store.entry.store)
+                                })
+                        }
+                        None => environment.state_dir().join(&store.entry.path),
+                    };
                     assert!(
                         file.is_file(),
                         "the daemon made the store {} at {}",
