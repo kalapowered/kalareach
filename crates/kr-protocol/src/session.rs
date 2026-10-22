@@ -1100,6 +1100,16 @@ pub struct SessionReadResult {
     /// is from a build that did not report a count. Zero is a session that could have one and has
     /// none.
     pub outstanding_launches: Nullable<U64>,
+    /// What this worker has counted of the host's own metrics: the faults its session's terminal
+    /// parser met and the failures of the adapters it brokers.
+    ///
+    /// Absent from the wire when the worker has counted nothing, and from a worker of a release
+    /// that wrote no such member, so a result of one is byte for byte what that release reads. The
+    /// totals are cumulative for the life of the worker, which is the life of the session. The
+    /// labels are words the worker spells and the daemon reads against its own lists, so a word
+    /// added to those lists later changes nothing in this member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<crate::metrics::WorkerMetrics>,
 }
 
 /// Parameters of `session.close`.

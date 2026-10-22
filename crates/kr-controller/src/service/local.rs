@@ -700,7 +700,7 @@ impl Controller {
                         Ok(_) => match self.read_refused(&request) {
                             Some(refused) => refused,
                             None => {
-                                let answer = self.read_method(&actor_id, &request).await;
+                                let answer = self.read_method(&actor_id, &request, false).await;
                                 // Checked again now the read has finished. A read that passed its
                                 // check and then waited for the registry can complete after the
                                 // authority behind it was withdrawn, and what the contract forbids

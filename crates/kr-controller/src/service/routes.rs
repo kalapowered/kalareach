@@ -201,10 +201,16 @@ impl Controller {
             .await
     }
 
+    /// Serves one read of the daemon's own.
+    ///
+    /// `device_manages_host` is whether the decision a paired device's read was taken under holds
+    /// `host.manage`; the owner at the machine is known by its socket and every other caller says
+    /// no. `host.doctor` reads the workers' counts only for a caller that is given them.
     pub(super) async fn read_method(
         self: &Arc<Self>,
         actor_id: &ActorId,
         request: &Request,
+        device_manages_host: bool,
     ) -> ControlFrame {
         let Some(method) = request.method.method() else {
             return error_reply(
@@ -270,7 +276,7 @@ impl Controller {
                 .and_then(|answer| host_read(answer, owner)),
             Method::EnvironmentInventory => self.environment_inventory(&request.params).await,
             Method::HostDoctor => self
-                .host_doctor()
+                .host_doctor(owner || device_manages_host)
                 .await
                 .and_then(|answer| host_read(answer, owner)),
             Method::SessionList => self.session_list(&request.params).await,
