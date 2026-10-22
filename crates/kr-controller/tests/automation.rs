@@ -2349,7 +2349,7 @@ async fn a_fence_owed_after_admission_stops_the_workflow_write() {
     let (arrived, go) = host.controller.pause_after_the_automation_admission();
     let installing = document.clone();
     let environment_id = host.environment_id;
-    let pending = tokio::spawn(async move {
+    let mut pending = tokio::spawn(async move {
         control
             .mutate(
                 Method::WorkflowInstall,
@@ -2365,10 +2365,16 @@ async fn a_fence_owed_after_admission_stops_the_workflow_write() {
             .await
             .expect("the call reaches the daemon")
     });
-    tokio::time::timeout(LIVENESS, arrived)
-        .await
-        .expect("the install reached the daemon's first check within the liveness bound")
-        .expect("the install is stopped after its first check");
+    tokio::select! {
+        reached = tokio::time::timeout(LIVENESS, arrived) => {
+            reached
+                .expect("the install reached the daemon's first check within the liveness bound")
+                .expect("the install is stopped after its first check");
+        }
+        answered = &mut pending => {
+            panic!("the install was answered before it was stopped after its first check: {answered:?}");
+        }
+    }
 
     // The configuration narrows the grants' rights, and the fence that owes cannot be raised.
     let registry = refuse_fences(&environment);
@@ -2962,27 +2968,6 @@ async fn a_workflow_under_a_paired_devices_grant_captures_under_that_grant() {
     host.stop().await;
 }
 
-/// How many objects the environment's change-set store has stored: the contents of the files a
-/// capture has read. A capture stores them before it asks the store's journal for anything, and
-/// writes nothing else of its own meanwhile, so a count that has risen says it has read the
-/// working tree and has the journal's lock, and nothing else, still to wait for.
-fn objects_in(environment: &kr_ipc::paths::EnvironmentPaths) -> usize {
-    let objects = environment
-        .state_dir()
-        .join(kr_changeset::store::CHANGESETS_DIRECTORY)
-        .join(kr_changeset::objects::OBJECTS_DIRECTORY);
-    let Ok(shelves) = std::fs::read_dir(objects) else {
-        return 0;
-    };
-    shelves
-        .filter_map(Result::ok)
-        .filter_map(|shelf| std::fs::read_dir(shelf.path()).ok())
-        .flat_map(|files| files.filter_map(Result::ok))
-        // A file still being written has a dot and a process number in its name.
-        .filter(|file| !file.file_name().to_string_lossy().contains('.'))
-        .count()
-}
-
 /// The versions the environment's change-set store holds, read from the store itself.
 fn versions_in(environment: &kr_ipc::paths::EnvironmentPaths) -> i64 {
     let store = rusqlite::Connection::open(
@@ -2997,12 +2982,13 @@ fn versions_in(environment: &kr_ipc::paths::EnvironmentPaths) -> i64 {
         .expect("counts the versions")
 }
 
-/// KR-REQ-19.04: a grant withdrawn while a node's change-set write waits for the change-set store
-/// stops the write. The node passed every check before its effect began; the grant is asked again
-/// inside the store's own transaction, under the daemon's hold, so the capture writes nothing once
-/// the grant is gone, and the node pauses on the refusal rather than failing. The grant is
-/// withdrawn once the capture has read the working tree and stored what it read, which is after
-/// the checks that come before the effect and before the store's transaction.
+/// KR-REQ-19.04: a grant withdrawn between a node's change-set write passing its checks and the
+/// change-set store's transaction stops the write. The node passed every check before its effect
+/// began; the grant is asked again inside the store's own transaction, under the daemon's hold, so
+/// the capture writes nothing once the grant is gone, and the node pauses on the refusal rather
+/// than failing. The capture is stopped after the check that comes before it reads the working
+/// tree, and the grant is withdrawn there, so the withdrawal cannot come before that check or
+/// after the store's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_grant_withdrawn_while_the_change_set_write_waits_writes_nothing() {
     let host = host().await;
@@ -3020,19 +3006,12 @@ async fn a_grant_withdrawn_while_the_change_set_write_waits_writes_nothing() {
     enable(&mut control, &host, &document).await;
     assert_eq!(versions_in(&environment), 0);
 
-    // Another writer holds the change-set store's write lock. The run passes every check the
-    // engine and the runner make, reads the working tree, and then waits for the store.
-    let store = rusqlite::Connection::open(
-        environment
-            .state_dir()
-            .join(kr_changeset::store::CHANGESETS_DIRECTORY)
-            .join(kr_changeset::store::STORE_FILE_NAME),
-    )
-    .expect("opens the change-set store");
-    store
-        .execute_batch("BEGIN IMMEDIATE")
-        .expect("another writer holds the store");
-    let stored_before = objects_in(&environment);
+    // The run passes every check the engine and the runner make, and its capture is stopped before
+    // it reads the working tree and asks the change-set store for anything.
+    let (arrived, go) = host
+        .controller
+        .automation()
+        .pause_the_capture_after_its_admission();
     let running = {
         let host_environment = host.environment_id;
         let endpoint = host.endpoint.clone();
@@ -3058,20 +3037,18 @@ async fn a_grant_withdrawn_while_the_change_set_write_waits_writes_nothing() {
                 .expect("the call reaches the daemon")
         })
     };
-    until("the capture to have stored what it read", || {
-        objects_in(&environment) > stored_before
-    })
-    .await;
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS))
+        .await
+        .expect("the wait for the capture ends")
+        .expect("the capture reached the place it is stopped at within the liveness bound");
 
-    // The grant is withdrawn while the write waits, and then the store is free again.
+    // The grant is withdrawn while the capture is stopped, and then the capture goes on.
     host.controller
         .sharing()
         .grants()
         .revoke(grant_id(19), kr_ipc::now_ms().get(), || Ok(()))
         .expect("the grant is withdrawn");
-    store
-        .execute_batch("COMMIT")
-        .expect("the other writer finishes");
+    go.send(()).expect("the capture goes on");
 
     let refused = running
         .await
@@ -3604,13 +3581,7 @@ async fn a_capture_that_requires_a_quiesced_tree_fails_and_names_why() {
         "nothing was captured"
     );
     // The journal keeps why.
-    let journal = rusqlite::Connection::open(
-        host._temp
-            .environment()
-            .state_dir()
-            .join(kr_automation::store::WORKFLOW_DB_NAME),
-    )
-    .expect("opens the workflow journal");
+    let journal = journal_reader(&host);
     let why: String = journal
         .query_row(
             "SELECT error_json FROM node_receipts WHERE run_id = ?1",
@@ -6785,19 +6756,13 @@ fn quiesced_capture_node(workspace: WorkspaceId) -> WorkflowNode {
 
 /// What the journal says a run's failed node came to.
 fn why_a_node_failed(host: &Host, run_id: kr_protocol::ids::WorkflowRunId) -> String {
-    rusqlite::Connection::open(
-        host._temp
-            .environment()
-            .state_dir()
-            .join(kr_automation::store::WORKFLOW_DB_NAME),
-    )
-    .expect("opens the workflow journal")
-    .query_row(
-        "SELECT error_json FROM node_receipts WHERE run_id = ?1",
-        [run_id.to_string()],
-        |row| row.get(0),
-    )
-    .expect("the failed node's reason")
+    journal_reader(host)
+        .query_row(
+            "SELECT error_json FROM node_receipts WHERE run_id = ?1",
+            [run_id.to_string()],
+            |row| row.get(0),
+        )
+        .expect("the failed node's reason")
 }
 
 /// Starts a person's session whose shell starts in `directory`, through the daemon's own create.

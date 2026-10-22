@@ -367,6 +367,11 @@ pub struct HostActions {
     closing: std::sync::Mutex<HashSet<kr_protocol::ids::ActionId>>,
     /// How many looks the sweep has finished, for this host's own tests.
     sweeps: PassCount,
+    /// Where this host's own tests stop a change-set capture that has passed the check made before
+    /// it reads the working tree, so that a grant can be withdrawn before the change-set store's
+    /// transaction asks again. Compiled away in every shipped build.
+    #[cfg(any(test, feature = "testing"))]
+    after_the_capture_is_admitted: Arc<crate::attention::Pause>,
 }
 
 /// The node dispatches this daemon is running, each with the state its cancellation sets.
@@ -566,6 +571,8 @@ impl ActionRunner for HostActions {
             refused: std::sync::Mutex::new(None),
         };
         let run_id = dispatch.run_id;
+        #[cfg(any(test, feature = "testing"))]
+        let after_the_capture_is_admitted = Arc::clone(&self.after_the_capture_is_admitted);
         // A node that makes a session takes its place among the running ones now, before the
         // engine has polled it, so a cancellation that arrives first still finds it. The place is
         // given up when the node's task ends, or here if nothing ever polls the future.
@@ -595,6 +602,8 @@ impl ActionRunner for HostActions {
                         // Asked before the working tree is read, so a grant already gone costs no
                         // read; the hold asks it again around each write.
                         held.still_authorised()?;
+                        #[cfg(any(test, feature = "testing"))]
+                        after_the_capture_is_admitted.wait();
                         capture(&changesets, &asked, run_id, &held)
                     })
                     .await
@@ -2752,6 +2761,8 @@ impl AutomationModule {
             holds: Arc::new(std::sync::Mutex::new(())),
             closing: std::sync::Mutex::new(HashSet::new()),
             sweeps: PassCount::default(),
+            #[cfg(any(test, feature = "testing"))]
+            after_the_capture_is_admitted: Arc::default(),
         });
         let host = Host {
             environment_id,
@@ -2848,6 +2859,21 @@ impl AutomationModule {
     #[must_use]
     pub fn sweep_passes(&self) -> u64 {
         self.actions.sweeps.get()
+    }
+
+    /// Arms the pause the next change-set capture of a workflow stops at once it has passed the
+    /// check made before it reads the working tree, and before it asks the change-set store for
+    /// anything. Returns the end that says the capture has arrived, and the end that lets it go.
+    /// The pause fires once.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn pause_the_capture_after_its_admission(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.actions.after_the_capture_is_admitted.arm()
     }
 
     /// Returns the service itself.
