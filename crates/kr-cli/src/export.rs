@@ -22,16 +22,19 @@
 //!   name, and given its name without replacing anything: an existing file, or a link to one, is
 //!   refused, and a failure leaves no partial file. Its mode is 0600 on Unix. On Windows it takes
 //!   the access list of the folder the person named, which is theirs to choose.
-//! * **The file says what it does not hold.** The archive keeps no time for any piece of output and
-//!   no size but the session's last, and it can have lost a range; each is declared.
+//! * **The file says what it does not hold.** The archive keeps the session's last size and not the
+//!   sizes before it, a piece of output may have no recorded time, and it can have lost a range;
+//!   each is declared.
 //!
-//! The file is one JSON document. A position in the output and a time are written as decimal
-//! strings, as the protocol writes every 64-bit value, so a reader that holds numbers as floating
-//! point does not lose their last digits; output bytes are base64url text, unpadded.
+//! The file is one JSON document, or an asciicast recording when the person asks for one. In the
+//! document a position in the output and a time are written as decimal strings, as the protocol
+//! writes every 64-bit value, so a reader that holds numbers as floating point does not lose their
+//! last digits; output bytes are base64url text, unpadded. The recording is asciicast v2, with its
+//! events at the times the output was written.
 
 use std::path::Path;
 
-use kr_client::session_export::{self, Bounds, PageSource, Stop};
+use kr_client::session_export::{self, Bounds, Form, PageSource, Stop};
 use kr_client::shown;
 use kr_client::shown::{Said, Shown};
 use kr_protocol::envelope::ParamsValue;
@@ -39,7 +42,9 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::SessionId;
 use kr_protocol::method::Method;
 use kr_protocol::privacy::{PrivacyReport, PrivacyStatusParams};
-use kr_protocol::recovery::{HistoryPageParams, HistoryPageResult};
+use kr_protocol::recovery::{
+    HistoryPageParams, HistoryPageResult, HistoryTimesParams, HistoryTimesResult,
+};
 use kr_protocol::scalars::{Nullable, U64};
 use kr_protocol::session::{SessionListParams, SessionListResult, SessionState, SessionSummary};
 
@@ -74,6 +79,8 @@ pub struct Summary {
     pub bytes_read: u64,
     /// How many of those bytes the file carries.
     pub bytes_carried: u64,
+    /// How many of the bytes carried have no recorded time.
+    pub bytes_untimed: u64,
     /// How many ranges of output the archive no longer holds.
     pub gaps: usize,
     /// Whether the read stopped at a bound, the bytes read or the size of the file, with output left.
@@ -115,6 +122,7 @@ pub async fn read<L: Link>(
     selector: &SessionSelector,
     max_bytes: u64,
     exported_at_ms: u64,
+    form: Form,
 ) -> Result<Exported> {
     check_bound(max_bytes)?;
     let listed: SessionListResult = ask(
@@ -157,6 +165,7 @@ pub async fn read<L: Link>(
             max_read_bytes: max_bytes,
             max_document_bytes: MAX_FILE_BYTES,
             max_chunks: session_export::MAX_CHUNKS,
+            form,
         },
         0,
         exported_at_ms,
@@ -170,6 +179,15 @@ pub async fn read<L: Link>(
         Stop::Document => CliError::Other(Shown::said(
             "the export could not be written out as a document",
         )),
+        // The host's words for why are its own and are not put on a person's terminal.
+        Stop::Untimed(_) => CliError::Unfinished {
+            code: ErrorCode::ResourceUnavailable,
+            message: shown!(
+                "no recording can be made of session {}, because the host has no record of when \
+                 any of its output was written; the semantic JSON export of it can be made",
+                session.display_number.get()
+            ),
+        },
     })?;
 
     let after: PrivacyReport = ask(link, Method::PrivacyStatus, &PrivacyStatusParams {}).await?;
@@ -191,6 +209,7 @@ pub async fn read<L: Link>(
             display_number: session.display_number.get(),
             bytes_read: composed.bytes_read,
             bytes_carried: composed.bytes_carried,
+            bytes_untimed: composed.bytes_untimed,
             gaps: composed.gaps,
             truncated: composed.truncated,
             omissions: composed.omissions,
@@ -240,6 +259,34 @@ impl<L: Link> PageSource for Pages<'_, L> {
 
     async fn page(&mut self, from_cursor: u64, max_bytes: u64) -> Result<HistoryPageResult> {
         page(self.link, self.session_id, from_cursor, max_bytes).await
+    }
+
+    /// Asks the daemon when the output between two cursors was written.
+    ///
+    /// A daemon of a release before the times were kept does not list the method, and refuses it as
+    /// it refuses any method it does not list: `PERMISSION_DENIED`. The same session has just been
+    /// paged by `history.page`, which asks for the same right over the same ingress, so a refusal of
+    /// this read after that page was answered is a daemon that does not know it, and its output
+    /// carries no time. Any other refusal is the daemon's own and is returned as it is.
+    async fn times(&mut self, from_cursor: u64, to_cursor: u64) -> Result<HistoryTimesResult> {
+        let params = HistoryTimesParams {
+            session_id: self.session_id,
+            from_cursor: U64::new(from_cursor),
+            to_cursor: U64::new(to_cursor),
+        };
+        match self.link.request(Method::HistoryTimes, &params).await? {
+            Err(refusal) if refusal.code == ErrorCode::PermissionDenied => Ok(HistoryTimesResult {
+                intervals: Vec::new(),
+                next_cursor: U64::new(to_cursor),
+                complete: true,
+                unavailable: Nullable::some(
+                    "the daemon of this environment is of a release that does not record \
+                         when output is produced"
+                        .to_owned(),
+                ),
+            }),
+            answer => decode(answer),
+        }
     }
 }
 

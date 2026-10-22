@@ -1594,20 +1594,35 @@ async fn export(
     let exported_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(0));
+    let form = match arguments.format {
+        kr_cli::cli::ExportFormat::Json => kr_client::session_export::Form::Json,
+        kr_cli::cli::ExportFormat::Asciicast => kr_client::session_export::Form::Asciicast,
+    };
     let exported =
         match kr_cli::bridge::environments::selected(paths, arguments.environment.as_deref())
             .await?
         {
             Selected::Local(known) => {
                 let mut client = open_controller(&known.paths, build_id()).await?;
-                kr_cli::export::read(&mut client, &selector, arguments.max_bytes, exported_at_ms)
-                    .await?
+                kr_cli::export::read(
+                    &mut client,
+                    &selector,
+                    arguments.max_bytes,
+                    exported_at_ms,
+                    form,
+                )
+                .await?
             }
             Selected::Enrolled(enrolment) => {
                 let mut link = kr_cli::bridge::session::open_running(&enrolment).await?;
-                let read =
-                    kr_cli::export::read(&mut link, &selector, arguments.max_bytes, exported_at_ms)
-                        .await;
+                let read = kr_cli::export::read(
+                    &mut link,
+                    &selector,
+                    arguments.max_bytes,
+                    exported_at_ms,
+                    form,
+                )
+                .await;
                 // A failure of the bridge is returned as the export's own, and is not said again.
                 link.finish_told().await;
                 read?
@@ -1625,21 +1640,31 @@ async fn export(
                     "path",
                     shown!("{}", kr_cli::shown::named(&arguments.output)),
                 )
-                .with("format", kr_client::session_export::FORMAT)
+                .with(
+                    "format",
+                    match form {
+                        kr_client::session_export::Form::Json => kr_client::session_export::FORMAT,
+                        kr_client::session_export::Form::Asciicast => {
+                            kr_client::session_export::RECORDING_FORMAT
+                        }
+                    },
+                )
                 .with("bytes_read", summary.bytes_read)
                 .with("bytes_carried", summary.bytes_carried)
+                .with("bytes_untimed", summary.bytes_untimed)
                 .with("gaps", summary.gaps)
                 .with("truncated", summary.truncated)
                 .with("omissions", summary.omissions.clone()),
         );
     } else {
         output::say(&shown!(
-            "session {} exported to {}: {} of {} bytes of retained output carried, {} gaps{}; the \
-             file declares {} omissions",
+            "session {} exported to {}: {} of {} bytes of retained output carried, {} of them with \
+             no recorded time, {} gaps{}; the file declares {} omissions",
             summary.display_number,
             kr_cli::shown::named(&arguments.output),
             summary.bytes_carried,
             summary.bytes_read,
+            summary.bytes_untimed,
             summary.gaps,
             if summary.truncated {
                 ", and the read stopped at a bound with output left"

@@ -8,9 +8,9 @@
 
 #![cfg(feature = "terminal")]
 
-use kr_client::session_export::{Bounds, Composed, MAX_CHUNKS, PageSource, Stop, compose};
+use kr_client::session_export::{Bounds, Composed, Form, MAX_CHUNKS, PageSource, Stop, compose};
 use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
-use kr_protocol::recovery::{HistoryGap, HistoryPageResult};
+use kr_protocol::recovery::{HistoryGap, HistoryPageResult, HistoryTimesResult, OutputTime};
 use kr_protocol::scalars::{Bytes, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::session::{
     ClosureReason, ClosureRecord, Dimensions, DisplayNumber, Durability, OwnershipCoverage,
@@ -30,6 +30,11 @@ struct Memory {
     lost: Option<(u64, u64)>,
     /// The size of each page asked for.
     asked: Vec<u64>,
+    /// When the output was written: the first cursor, the cursor after the last byte, the
+    /// wall-clock reading and whether the clock was proved.
+    intervals: Vec<(u64, u64, u64, bool)>,
+    /// Why the source has no times, when it has none.
+    no_times: Option<String>,
 }
 
 impl Memory {
@@ -40,6 +45,19 @@ impl Memory {
             page_limit: usize::MAX,
             lost: None,
             asked: Vec::new(),
+            intervals: Vec::new(),
+            no_times: None,
+        }
+    }
+
+    /// A history whose output was written in `intervals`.
+    fn timed(output: Vec<u8>, intervals: &[(u64, u64, u64)]) -> Self {
+        Self {
+            intervals: intervals
+                .iter()
+                .map(|&(from, to, at_ms)| (from, to, at_ms, true))
+                .collect(),
+            ..Self::of(output)
         }
     }
 }
@@ -85,6 +103,29 @@ impl PageSource for Memory {
             bytes: Bytes::new(self.output[start..end].to_vec()),
             oldest_retained_cursor: U64::new(0),
             gap: Nullable::null(),
+        })
+    }
+
+    async fn times(
+        &mut self,
+        from_cursor: u64,
+        to_cursor: u64,
+    ) -> Result<HistoryTimesResult, Self::Error> {
+        Ok(HistoryTimesResult {
+            intervals: self
+                .intervals
+                .iter()
+                .filter(|(from, to, _, _)| *to > from_cursor && *from < to_cursor)
+                .map(|&(from, to, at_ms, proven)| OutputTime {
+                    from_cursor: U64::new(from.max(from_cursor)),
+                    to_cursor: U64::new(to.min(to_cursor)),
+                    at_ms: TimestampMs::new(at_ms),
+                    proven,
+                })
+                .collect(),
+            next_cursor: U64::new(to_cursor),
+            complete: true,
+            unavailable: Nullable(self.no_times.clone()),
         })
     }
 }
@@ -153,6 +194,7 @@ fn bounds(max_read_bytes: u64, max_document_bytes: u64) -> Bounds {
         max_read_bytes,
         max_document_bytes,
         max_chunks: MAX_CHUNKS,
+        form: Form::Json,
     }
 }
 
@@ -356,4 +398,201 @@ async fn output_past_a_lost_range_is_output_left_behind() {
     };
     let whole = run(&mut source, bounds(10, 192 * MIB)).await;
     assert!(!whole.truncated, "nothing lies past the lost range");
+}
+
+fn cast(document: &[u8]) -> (Value, Vec<(f64, String)>) {
+    let text = std::str::from_utf8(document).expect("a recording is text");
+    let mut lines = text.lines();
+    let header: Value = serde_json::from_str(lines.next().expect("a header")).expect("JSON");
+    let events = lines
+        .map(|line| {
+            let event: Value = serde_json::from_str(line).expect("an event is JSON");
+            assert_eq!(event[1], "o", "{line}");
+            (
+                event[0].as_f64().expect("seconds"),
+                event[2].as_str().expect("text").to_owned(),
+            )
+        })
+        .collect();
+    (header, events)
+}
+
+fn cast_bounds() -> Bounds {
+    Bounds {
+        form: Form::Asciicast,
+        ..bounds(16 * MIB, 192 * MIB)
+    }
+}
+
+/// KR-REQ-25.25: each piece of output carries the time its first byte was written, a stretch the
+/// host recorded no time for carries none, and the bytes with none are counted and declared.
+#[tokio::test]
+async fn each_piece_of_output_carries_the_time_it_was_written_at() {
+    let mut source = Memory::timed(
+        b"aaaaaaaaaabbbbbbbbbbcccccccccc".to_vec(),
+        &[(0, 10, 1_000), (10, 20, 2_500)],
+    );
+    let composed = run(&mut source, bounds(16 * MIB, 192 * MIB)).await;
+    let file: Value = serde_json::from_slice(&composed.document).expect("JSON");
+    let times: Vec<Option<&str>> = file["output"]["chunks"]
+        .as_array()
+        .expect("chunks")
+        .iter()
+        .map(|chunk| chunk["at_ms"].as_str())
+        .collect();
+    assert_eq!(times, [Some("1000"), Some("2500"), None]);
+    assert_eq!(composed.bytes_untimed, 10);
+    let declared = file["omissions"]
+        .as_array()
+        .expect("omissions")
+        .iter()
+        .find(|omission| omission["kind"] == "output_timestamps")
+        .expect("the bytes with no time are declared");
+    assert_eq!(declared["count"], "10");
+}
+
+/// A host with no record of when output was written says why, once; the output carries no time, the
+/// bytes are counted, and the reason is in the declaration. The control: a host with the record
+/// declares nothing of the kind.
+#[tokio::test]
+async fn output_a_host_has_no_times_for_is_declared_with_the_hosts_reason() {
+    let mut source = Memory {
+        no_times: Some("no record was kept".to_owned()),
+        ..Memory::of(lines(100))
+    };
+    let composed = run(&mut source, bounds(16 * MIB, 192 * MIB)).await;
+    assert_eq!(composed.bytes_untimed, 100);
+    let file: Value = serde_json::from_slice(&composed.document).expect("JSON");
+    let declared = file["omissions"]
+        .as_array()
+        .expect("omissions")
+        .iter()
+        .find(|omission| omission["kind"] == "output_timestamps")
+        .expect("declared");
+    assert!(
+        declared["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("no record was kept")),
+        "{declared}"
+    );
+
+    let mut timed = Memory::timed(lines(100), &[(0, 100, 5)]);
+    let composed = run(&mut timed, bounds(16 * MIB, 192 * MIB)).await;
+    assert_eq!(composed.bytes_untimed, 0);
+    assert!(!composed.omissions.contains(&"output_timestamps"));
+}
+
+/// KR-REQ-25.25: a recording plays the output at the times it was written. Its header carries the
+/// session's size and the time of the first piece in whole seconds, its events are seconds since
+/// that piece and never go back, and what the engine dropped is declared in the header.
+#[tokio::test]
+async fn a_recording_plays_the_output_at_the_times_it_was_written() {
+    let output = b"first line\r\nsecond line\x07\r\nthird line\r\n".to_vec();
+    let mut source = Memory::timed(
+        output,
+        &[(0, 12, 10_000), (12, 26, 12_500), (26, 38, 12_400)],
+    );
+    let composed = run(&mut source, cast_bounds()).await;
+    let (header, events) = cast(&composed.document);
+    assert_eq!(header["version"], 2);
+    assert_eq!(
+        (header["width"].clone(), header["height"].clone()),
+        (100.into(), 30.into())
+    );
+    assert_eq!(header["timestamp"], 10);
+    assert!(
+        header["kalareach"]["omissions"]
+            .as_array()
+            .expect("omissions")
+            .iter()
+            .any(|omission| omission["kind"] == "bell"),
+        "{header}"
+    );
+    let seconds: Vec<f64> = events.iter().map(|(seconds, _)| *seconds).collect();
+    assert!(
+        seconds.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the recording never goes back: {seconds:?}"
+    );
+    assert_eq!(seconds.first().copied(), Some(0.0));
+    assert_eq!(
+        seconds.last().copied(),
+        Some(2.5),
+        "a piece written at an earlier reading than the one before it plays with it"
+    );
+    let played: String = events.iter().map(|(_, text)| text.as_str()).collect();
+    assert_eq!(
+        played, "first line\r\nsecond line\r\nthird line\r\n",
+        "the bell is not played"
+    );
+    assert!(!composed.omissions.contains(&"output_timestamps"));
+}
+
+/// A recording is made only of output that has a time: with none, there is nothing to play, and the
+/// composition says so rather than writing every event at nought.
+#[tokio::test]
+async fn a_recording_of_output_with_no_times_is_refused() {
+    let mut source = Memory {
+        no_times: Some("no record was kept".to_owned()),
+        ..Memory::of(lines(100))
+    };
+    match compose(&mut source, &session(), cast_bounds(), 0, 42).await {
+        Err(Stop::Untimed(reason)) => assert_eq!(reason.as_deref(), Some("no record was kept")),
+        Err(other) => panic!("stopped for another reason: {other:?}"),
+        Ok(_) => panic!("a recording was made of output that has no times"),
+    }
+}
+
+/// A piece cut in the middle of a character carries its start into the piece that follows it, and
+/// an event is never a half of one.
+#[tokio::test]
+async fn a_character_cut_between_two_intervals_is_played_whole() {
+    let mut source = Memory::timed(
+        "caf\u{e9}\r\n".as_bytes().to_vec(),
+        &[(0, 4, 1_000), (4, 7, 2_000)],
+    );
+    let composed = run(&mut source, cast_bounds()).await;
+    let (_, events) = cast(&composed.document);
+    let played: String = events.iter().map(|(_, text)| text.as_str()).collect();
+    assert_eq!(played, "caf\u{e9}\r\n");
+}
+
+/// Output timed one byte at a time makes a piece for every byte, and both documents are held to the
+/// limit on pieces and to their size as the output is read. The control: the same output under
+/// limits it fits is carried whole.
+#[tokio::test]
+async fn output_timed_one_byte_at_a_time_is_held_to_the_limits_in_both_documents() {
+    let output = lines(60_000);
+    let intervals: Vec<(u64, u64, u64)> =
+        (0..60_000_u64).map(|at| (at, at + 1, 1_000 + at)).collect();
+    for form in [Form::Json, Form::Asciicast] {
+        let free = Bounds {
+            form,
+            ..bounds(16 * MIB, 192 * MIB)
+        };
+        let mut source = Memory::timed(output.clone(), &intervals);
+        let whole = run(&mut source, free).await;
+        assert!(!whole.truncated, "{form:?}");
+
+        let few = Bounds {
+            max_chunks: 10_000,
+            ..free
+        };
+        let mut source = Memory::timed(output.clone(), &intervals);
+        let cut = run(&mut source, few).await;
+        assert!(cut.truncated, "{form:?}");
+        assert!(cut.omissions.contains(&"output_truncated"), "{form:?}");
+
+        let small = Bounds {
+            max_document_bytes: MIB,
+            ..free
+        };
+        let mut source = Memory::timed(output.clone(), &intervals);
+        let tight = run(&mut source, small).await;
+        assert!(
+            tight.document.len() as u64 <= MIB,
+            "{form:?}: the document is {} bytes",
+            tight.document.len()
+        );
+        assert!(tight.truncated, "{form:?}");
+    }
 }
