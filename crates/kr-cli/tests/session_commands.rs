@@ -356,6 +356,8 @@ async fn new_attach_detach_and_close_work_in_full_and_in_one_letter() {
     ] {
         let created = host.kr_json(&[
             new,
+            "--shell-mode",
+            "native_compat",
             "--invisible",
             "--headless",
             "--cwd",
@@ -475,6 +477,8 @@ async fn a_worker_on_macos_is_a_per_user_launchd_job_in_its_own_directory() {
     ] {
         let created = host.kr_json(&[
             "new",
+            "--shell-mode",
+            "native_compat",
             "--invisible",
             execution,
             "--cwd",

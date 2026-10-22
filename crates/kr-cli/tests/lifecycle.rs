@@ -513,6 +513,8 @@ impl Host {
         let work = self.work.display().to_string();
         let listed = self.kr_json(&[
             "new",
+            "--shell-mode",
+            "native_compat",
             "--invisible",
             "--headless",
             "--shell",

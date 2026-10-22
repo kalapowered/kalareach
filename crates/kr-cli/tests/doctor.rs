@@ -471,7 +471,13 @@ fn creating_with_no_host_says_what_to_set_up_and_installs_nothing() {
 
     let mut command = Command::new(kr());
     command
-        .args(["--json", "new", "--shell-mode", "native_compat", "--invisible"])
+        .args([
+            "--json",
+            "new",
+            "--shell-mode",
+            "native_compat",
+            "--invisible",
+        ])
         .env_clear()
         .env("PATH", &path)
         .env("HOME", &home)
