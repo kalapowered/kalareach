@@ -739,6 +739,31 @@ async fn a_chain_whose_budget_ran_out_is_rearmed_from_the_command_line() {
         before_the_request.contains("--generation 1"),
         "{before_the_request}"
     );
+    assert!(
+        !before_the_request.contains("--environment"),
+        "an environment nobody named is not named: {before_the_request}"
+    );
+
+    // Sent to an environment the command names, the repeat it prints names it too: without it, a
+    // repeat after a lost reply would be sent to this installation's own.
+    let mut budget = journal.get_budget(root).unwrap().expect("the budget");
+    run_out(&mut budget);
+    let environment = host.temp.environment_id().to_string();
+    let named = host.kr(&[
+        "workflow",
+        "rearm",
+        &root_text,
+        "--grant",
+        &grant_text,
+        "--environment",
+        &environment,
+    ]);
+    let before_the_request = String::from_utf8_lossy(&named.stderr);
+    assert_eq!(named.status.code(), Some(0), "{before_the_request}");
+    assert!(
+        before_the_request.contains(&format!("--generation 2 --environment {environment}")),
+        "{before_the_request}"
+    );
 
     // The chain has budget now, and a chain the daemon holds nothing for has none to rearm.
     let live = host.refused(&["workflow", "rearm", &root_text, "--grant", &grant_text]);

@@ -1497,8 +1497,9 @@ refused, with the exit code of a refusal by the daemon.
 Before it sends the request, the command prints on standard error the generation it asks to leave,
 and the command that repeats the request with that generation named:
 `kr workflow rearm <causal-root> --grant <grant> --generation <n>`, with the identifiers and the
-number filled in. A reply that does not arrive leaves no other way to know the number, and a repeat
-that names it is answered and gives no second budget. A run of the command without `--generation`
+number filled in, and `--environment <environment>` when the command was given one. A reply that
+does not arrive leaves no other way to know the number, and a repeat that names it is answered and
+gives no second budget. A run of the command without `--generation`
 can give a chain that has since run out again a second budget, because it reads the generation anew.
 When a failure is not the daemon's refusal, the command prints that line again.
 
