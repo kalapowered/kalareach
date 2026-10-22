@@ -1838,18 +1838,19 @@ async fn wired_desktop_bound() -> Wired {
 }
 
 // --------------------------------------------------------------------------------------------
-// KR-REQ-07.83: a login manager that never answers, on a host with no graphical login.
+// KR-REQ-07.83: a login manager that never answers, on a host with no graphical login (Linux), and
+// a launchd that never answers a graphical login's question (macOS).
 // --------------------------------------------------------------------------------------------
 
 /// The variable that tells a case it is the one running in a process of its own, and names where
 /// the login manager it was started with keeps its record.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const OWN_LOGIN_MANAGER: &str = "KR_CASE_LOGIN_MANAGER";
 
 /// A login manager that fails the way one that cannot be reached does the first time it is asked,
 /// which is when the session opens, and never answers again. It records the process that is
 /// waiting, so the case knows a reading is outstanding and can tell when that process is gone.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const UNANSWERING_LOGIN_MANAGER: &str = r#"#!/bin/sh
 here=$(dirname "$0")
 if mkdir "$here/asked-once" 2>/dev/null; then
@@ -1875,16 +1876,25 @@ echo "Failed to get session: No such session" >&2
 exit 1
 "#;
 
-/// Runs the named case again in a process of its own, whose search path holds a `loginctl` that
+/// The name the login manager's program is planted under: the one this platform's reading asks.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const PLANTED_LOGIN_MANAGER: &str = if cfg!(target_os = "macos") {
+    "launchctl"
+} else {
+    "loginctl"
+};
+
+/// Runs the named case again in a process of its own, whose search path holds a login manager that
 /// behaves as `script` says, and returns where that program keeps its record when this is that
 /// process.
 ///
-/// The platform reading finds its command by name on the process's own search path, and a test
-/// cannot change that in place: the path is shared with every other case running in this binary.
-/// So the case is started again, with only the search path it needs, and the outer call checks
+/// The platform reading finds its command by name on the process's own search path (macOS names it
+/// by its absolute path, and the case then tells the reading to run the planted program in its
+/// place), and a test cannot change either in place: both are shared with every other case running
+/// in this binary. So the case is started again, with only what it needs, and the outer call checks
 /// that the inner one ran and passed. In the outer process this returns nothing and the case ends
 /// there.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn in_a_process_with_this_login_manager(case: &str, script: &str) -> Option<std::path::PathBuf> {
     if let Some(directory) = std::env::var_os(OWN_LOGIN_MANAGER) {
         return Some(directory.into());
@@ -1892,23 +1902,43 @@ fn in_a_process_with_this_login_manager(case: &str, script: &str) -> Option<std:
     let home = tempfile::tempdir().expect("a directory on the internal disk");
     let bin = home.path().join("bin");
     std::fs::create_dir(&bin).expect("a directory for the program");
-    let source = home.path().join("loginctl.source");
+    let source = home.path().join("login-manager.source");
     std::fs::write(&source, script).expect("the program's text");
-    kr_ipc::testing::place_program(&source, &bin.join("loginctl"));
-    let output = std::process::Command::new(std::env::current_exe().expect("this test binary"))
-        .args(["--exact", case, "--nocapture", "--test-threads=1"])
-        .env(OWN_LOGIN_MANAGER, &bin)
-        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-        .env("XDG_SESSION_ID", "42")
-        .env("KR_CASE_LEADER", std::process::id().to_string())
-        .output()
-        .expect("starts the case in a process of its own");
+    kr_ipc::testing::place_program(&source, &bin.join(PLANTED_LOGIN_MANAGER));
+    // Its output goes to files, so that a case that has stopped can be read after it is ended.
+    let stdout = home.path().join("case.stdout");
+    let stderr = home.path().join("case.stderr");
+    let mut case_process =
+        std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args(["--exact", case, "--nocapture", "--test-threads=1"])
+            .env(OWN_LOGIN_MANAGER, &bin)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("XDG_SESSION_ID", "42")
+            .env("KR_CASE_LEADER", std::process::id().to_string())
+            .stdout(std::fs::File::create(&stdout).expect("a file for the case's output"))
+            .stderr(std::fs::File::create(&stderr).expect("a file for the case's errors"))
+            .spawn()
+            .expect("starts the case in a process of its own");
+    // The case ends when it is done. A case whose launch hold waited for the reading it was to be
+    // shown not to wait for would not end for as long as the reading is given, which is an hour, so
+    // the wait is bounded by a liveness deadline and a case that outlasts it is stopped and failed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    let ended = loop {
+        match case_process.try_wait().expect("the case can be waited for") {
+            Some(status) => break Some(status),
+            None if std::time::Instant::now() >= deadline => break None,
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    if ended.is_none() {
+        let _ = case_process.kill();
+        let _ = case_process.wait();
+    }
     // A reading the case left outstanding is a process this test started, and it is stopped here
     // whatever became of the case. It is only ever the recorded one, and only while it is still
     // the program that was waiting.
     if let Some(waiting) = waiting_reading(&bin)
-        && std::fs::read(format!("/proc/{waiting}/cmdline"))
-            .is_ok_and(|command| command.starts_with(b"sleep"))
+        && is_the_waiting_sleep(waiting)
     {
         let _ = std::process::Command::new("kill")
             .args(["-KILL", &waiting.to_string()])
@@ -1916,18 +1946,22 @@ fn in_a_process_with_this_login_manager(case: &str, script: &str) -> Option<std:
     }
     let said = format!(
         "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&std::fs::read(&stdout).unwrap_or_default()),
+        String::from_utf8_lossy(&std::fs::read(&stderr).unwrap_or_default())
     );
     assert!(
-        output.status.success() && said.contains("test result: ok. 1 passed"),
+        ended.is_some(),
+        "the case, run in a process of its own, did not end within its liveness deadline:\n{said}"
+    );
+    assert!(
+        ended.is_some_and(|status| status.success()) && said.contains("test result: ok. 1 passed"),
         "the case, run in a process of its own, did not pass:\n{said}"
     );
     None
 }
 
 /// Returns the process the unanswering login manager recorded as waiting, once it has.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn waiting_reading(record: &std::path::Path) -> Option<u32> {
     std::fs::read_to_string(record.join("waiting"))
         .ok()?
@@ -1938,9 +1972,33 @@ fn waiting_reading(record: &std::path::Path) -> Option<u32> {
 
 /// Returns whether a process is still in the process table, which one that has ended and not been
 /// reaped is.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn still_there(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
+    if cfg!(target_os = "linux") {
+        return std::path::Path::new(&format!("/proc/{pid}")).exists();
+    }
+    std::process::Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "pid="])
+        .output()
+        .is_ok_and(|listed| !listed.stdout.is_empty())
+}
+
+/// Returns whether a process is the `sleep` the unanswering login manager became, which is the
+/// only thing this suite stops by number.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_the_waiting_sleep(pid: u32) -> bool {
+    if cfg!(target_os = "linux") {
+        return std::fs::read(format!("/proc/{pid}/cmdline"))
+            .is_ok_and(|command| command.starts_with(b"sleep"));
+    }
+    std::process::Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .is_ok_and(|listed| {
+            String::from_utf8_lossy(&listed.stdout)
+                .trim()
+                .ends_with("sleep")
+        })
 }
 
 /// KR-REQ-07.83: a reading the platform never answers leaves the launch hold on its own deadline,
@@ -1959,7 +2017,13 @@ fn still_there(pid: u32) -> bool {
 /// launch as `EDITOR_BUSY`. All of that happens while the reading is still outstanding. Later the
 /// command the reading started is gone from the process table, which is what reaping it means,
 /// and the reading, folded in as an answer that establishes nothing, has not closed the session.
-#[cfg(target_os = "linux")]
+///
+/// On macOS the login manager is `launchctl`, which the platform reading runs by its absolute path,
+/// and a person is logged in at the console of the machine that runs the case. The case tells the
+/// reading to run the planted program in its place, so the question the host puts to launchd is
+/// the one that never answers, and nothing of the real launchd or the real login is consulted. The
+/// product's own deadline, command, kill and reap are what run.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_launch_hold_ends_on_its_own_deadline_while_the_login_manager_never_answers() {
     let Some(record) = in_a_process_with_this_login_manager(
@@ -1972,6 +2036,9 @@ async fn a_launch_hold_ends_on_its_own_deadline_while_the_login_manager_never_an
     // below is outstanding until the case ends it. A case that fails ends it too: the runtime
     // waits for the reading before the process can end, so a panic gives the command no time.
     kr_worker::desktop::platform::set_probe_deadline(Some(Duration::from_secs(60 * 60)));
+    // The reading runs the planted program, by name on the search path where this platform has the
+    // reading named that way, and by this where it has an absolute path.
+    kr_worker::desktop::platform::set_probe_program(Some(&record.join(PLANTED_LOGIN_MANAGER)));
     let ordinary_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
         kr_worker::desktop::platform::set_probe_deadline(Some(Duration::ZERO));

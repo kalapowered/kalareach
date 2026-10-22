@@ -241,6 +241,8 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
         // open for as long as it ran.
         #[cfg(windows)]
         let _inheriting = crate::windows::launch::inheriting();
+        #[cfg(feature = "testing")]
+        let program = probe_program(program);
         std::process::Command::new(program)
             .args(arguments)
             .stdin(std::process::Stdio::null())
@@ -390,6 +392,36 @@ pub fn set_probe_deadline(deadline: Option<std::time::Duration>) {
         u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX - 1)
     });
     PROBE_DEADLINE_ASKED_MS.store(millis, std::sync::atomic::Ordering::Release);
+}
+
+/// The program this host's own tests asked every platform command to run in place of the one it is
+/// given, or nothing when none did.
+#[cfg(feature = "testing")]
+static PROBE_PROGRAM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Runs `program` in place of the program every platform command is given, with the arguments it
+/// was given, for this host's own tests; `None` gives them back the programs they are shipped
+/// with.
+///
+/// A platform command is named by its absolute path on some platforms (macOS reads its graphical
+/// login through `/bin/launchctl`), so a test cannot put its own on the search path as it can for
+/// the others. The value is the process's, so a test that sets it runs in a process of its own.
+#[cfg(feature = "testing")]
+pub fn set_probe_program(program: Option<&std::path::Path>) {
+    *PROBE_PROGRAM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        program.map(|program| program.display().to_string());
+}
+
+/// The program a platform command runs: the one it is given, unless a test named another.
+#[cfg(feature = "testing")]
+fn probe_program(asked: &str) -> String {
+    PROBE_PROGRAM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_else(|| asked.to_owned())
 }
 
 /// The deadline a platform command is held to now: [`PROBE_DEADLINE`], unless a test moved it.
