@@ -1134,7 +1134,12 @@ fn a_run_that_writes_only_its_outputs_in_two_directories_attests_the_version() {
             write(directory, "target/debug/artefact", "built\n");
         },
     );
-    assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
+    assert_eq!(
+        result.tested_source,
+        TestedSource::UnmodifiedVersion,
+        "{}",
+        result.attestation
+    );
 }
 
 /// KR-REQ-14.34: the copy's own directory is a directory an output is in when the output is at
@@ -1253,6 +1258,26 @@ fn a_result_without_a_binding_it_could_establish_attests_nothing() {
     assert!(result.tested_version.0.is_none());
 }
 
+/// What a result about a run that wrote tens of thousands of files in one burst must say about the
+/// source: that it is the version. FSEvents drops reports when a burst is more than it can
+/// deliver, and falls behind by more than the host waits for, and the host then says its watcher
+/// cannot be trusted, with the result attesting nothing. That is right, and it is not what these
+/// cases are about, so on macOS it is the one other answer that is accepted.
+fn assert_the_source_is_not_in_doubt(result: &kr_protocol::changeset::MaterialisationResult) {
+    if cfg!(target_os = "macos")
+        && result.tested_source == TestedSource::Indeterminate
+        && result.attestation.contains("the watcher")
+    {
+        return;
+    }
+    assert_eq!(
+        result.tested_source,
+        TestedSource::UnmodifiedVersion,
+        "{}",
+        result.attestation
+    );
+}
+
 /// KR-REQ-25.20: a declared output over a bound is a reference and never a reason to doubt the
 /// source. A file over the byte bound is digested up to it and recorded with its whole length, and
 /// a directory with more entries than a listing holds is a truncated listing.
@@ -1274,7 +1299,7 @@ fn an_output_over_a_bound_is_a_reference_and_never_a_reason_to_doubt_the_source(
         declared(&fixture, &record, &["big.bin", "many"]).expect("the declaration is fine");
     let result = record_a_run(&fixture, made.materialisation_id, &report(), &outputs)
         .expect("the result is recorded");
-    assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
+    assert_the_source_is_not_in_doubt(&result);
     let big = result
         .outputs
         .iter()
@@ -1373,7 +1398,7 @@ fn an_unreadable_entry_at_the_bound_makes_a_truncated_listing() {
     let outputs = declared(&fixture, &record, &["out"]).expect("the declaration is fine");
     let result = record_a_run(&fixture, made.materialisation_id, &report(), &outputs)
         .expect("the result is recorded");
-    assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
+    assert_the_source_is_not_in_doubt(&result);
     let listing = result
         .outputs
         .iter()
@@ -1413,7 +1438,7 @@ fn an_output_whose_paths_fill_the_listing_is_a_truncated_listing() {
     let outputs = declared(&fixture, &record, &["out"]).expect("the declaration is fine");
     let result = record_a_run(&fixture, made.materialisation_id, &report(), &outputs)
         .expect("the result is recorded");
-    assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
+    assert_the_source_is_not_in_doubt(&result);
     let listing = result
         .outputs
         .iter()
@@ -1458,7 +1483,12 @@ fn an_output_below_a_directory_the_grant_keeps_out_is_reached_and_its_neighbours
     );
     let result = record_a_run(&fixture, made.materialisation_id, &report(), &outputs)
         .expect("the result is recorded");
-    assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
+    assert_eq!(
+        result.tested_source,
+        TestedSource::UnmodifiedVersion,
+        "{}",
+        result.attestation
+    );
 
     let made = copy("a neighbour of the output");
     write(
