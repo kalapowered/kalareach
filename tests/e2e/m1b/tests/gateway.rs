@@ -25,7 +25,7 @@ use kr_e2e_m1b::device::{Device, PairedHost, Remote};
 use kr_e2e_m1b::host::{Host, HostOptions, Preparation};
 use kr_e2e_m1b::run::{Run, ended_within, groups, running};
 use kr_e2e_m1b::view::View;
-use kr_e2e_m1b::window::{Window, answered};
+use kr_e2e_m1b::window::{Window, answered, contains};
 use kr_e2e_m1b::{LIVENESS, ceremony, shells};
 use kr_ipc::paths::EnvironmentPaths;
 use kr_plugin_catalogue::transport::RepositoryTransport;
@@ -74,6 +74,9 @@ const PROMPT: &str = "kr-session$ ";
 /// that loads the package's integration after it.
 const ZSHRC: &str =
     "PROMPT='kr-session$ '\nRPROMPT=''\nHISTFILE=''\nsetopt no_beep\nunsetopt prompt_sp\n";
+
+/// What the stand-in says when it runs as typed, with no gateway's address among its words.
+const RAN_AS_TYPED: &str = "codex-stand-in: serves";
 
 /// What the terminal writes when the server asks it for the approval of a command.
 const ASKED: &str = "TUI: the server asks for item/commandExecution/requestApproval";
@@ -737,6 +740,47 @@ impl Person {
         self.window.wait_for_screen(needle, why)
     }
 
+    /// Types `line`, which runs through the integration, and waits until the screen shows `needle`.
+    ///
+    /// The shell asks the worker what a line runs and waits for the answer for one second at most,
+    /// the product's bound; on a machine too loaded for the worker to answer in that time the line
+    /// runs as it was typed, and the stand-in, which is not told to serve a gateway, says what it
+    /// serves and ends. Nothing was started and nothing recorded, so the line is typed again once
+    /// the shell has the answer that was late, and the wait is for the screen to show `needle`,
+    /// whatever the number of lines it took.
+    fn types_until_it_shows(&self, line: &str, needle: &str, why: &str) -> Vec<String> {
+        let started = Instant::now();
+        loop {
+            let mark = self.window.mark();
+            self.types(line);
+            loop {
+                let rows = self.window.screen();
+                if rows.iter().any(|row| row.contains(needle)) {
+                    return rows;
+                }
+                if contains(
+                    &self.window.collected().since(mark),
+                    RAN_AS_TYPED.as_bytes(),
+                ) {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < LIVENESS,
+                    "{why}: waited {:?} for {needle:?}, and the screen is:\n{}",
+                    started.elapsed(),
+                    rows.join("\n")
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                started.elapsed() < LIVENESS,
+                "{why}: the line ran as typed each time it was typed in {:?}",
+                started.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// Exports the stand-in's variables for the next command: its variants, the file that releases
     /// it, and the file the server notes what it received in.
     fn exports(&self, ctx: &Context, variants: &str) {
@@ -909,8 +953,11 @@ fn kr_req_12_07_a_codex_typed_in_a_managed_root_shell_is_served_by_a_gateway_and
     let person = Person::enters(&ctx, &host);
     let release = release_of(&ctx);
     person.exports(&ctx, "wait-to-connect,leave-unanswered,stay");
-    person.types("codex resume");
-    let _ = person.sees("TUI: waiting to connect", "the terminal waits to connect");
+    let _ = person.types_until_it_shows(
+        "codex resume",
+        "TUI: waiting to connect",
+        "the terminal waits to connect",
+    );
 
     // The gateway exists before the terminal's session does: the server runs, the socket is
     // bound, the instance is announced and holds no request.
@@ -1069,8 +1116,11 @@ fn kr_req_12_06_a_gateway_served_terminals_unread_thread_suspends_rich_mutations
     let (_device, _paired, remote) = ctx.pair(&host);
     let person = Person::enters(&ctx, &host);
     person.exports(&ctx, "wait-to-connect,stay");
-    person.types("codex");
-    let _ = person.sees("TUI: waiting to connect", "the terminal waits to connect");
+    let _ = person.types_until_it_shows(
+        "codex",
+        "TUI: waiting to connect",
+        "the terminal waits to connect",
+    );
     let instance = first_instance(&ctx, &remote, person.session_id).application_instance_id;
     let before = ctx.binding(&remote, person.session_id, instance);
     assert_eq!(before.mode, IntegrationMode::Gateway);
@@ -1124,8 +1174,11 @@ fn kr_acc_006_a_daemon_killed_while_the_terminal_writes_leaves_its_agent_and_a_r
     let (device, paired, remote) = ctx.pair(&host);
     let person = Person::enters(&ctx, &host);
     person.exports(&ctx, "answer-when-released,ping-when-released,tick,stay");
-    person.types("codex");
-    let _ = person.sees(ASKED, "the terminal reaches the server through the gateway");
+    let _ = person.types_until_it_shows(
+        "codex",
+        ASKED,
+        "the terminal reaches the server through the gateway",
+    );
 
     // The device attaches and reads the session as it stands.
     let snapshot: EventsSnapshotResult = ctx
@@ -1330,8 +1383,11 @@ impl Stubborn {
     fn start(ctx: &Context, host: &Host<'_>) -> Self {
         let person = Person::enters(ctx, host);
         person.exports(ctx, "ignore-eof,ignore-term,leave-unanswered,stay");
-        person.types("codex");
-        let _ = person.sees(ASKED, "the terminal reaches the server through the gateway");
+        let _ = person.types_until_it_shows(
+            "codex",
+            ASKED,
+            "the terminal reaches the server through the gateway",
+        );
         let worker = host.worker_of(&person.session_id.to_string());
         let terminal = process_running(&ctx.run, "the terminal", &["--remote", "gw.sock"]);
         let server = process_running(&ctx.run, "the server", &["app-server"]);
@@ -1569,8 +1625,11 @@ fn kr_req_11_33_a_device_answers_an_approval_the_terminal_holds_and_the_late_ter
         &ctx,
         "answer-when-released,keep-reading,ping-when-released,stay",
     );
-    person.types("codex");
-    let _ = person.sees(ASKED, "the terminal reaches the server through the gateway");
+    let _ = person.types_until_it_shows(
+        "codex",
+        ASKED,
+        "the terminal reaches the server through the gateway",
+    );
     let instance = first_instance(&ctx, &remote, person.session_id).application_instance_id;
     let binding = ctx.binding_until(
         &remote,
@@ -1665,8 +1724,11 @@ fn kr_req_11_33_a_device_answer_to_a_request_the_terminal_answered_is_refused_an
     let (_device, _paired, remote) = ctx.pair(&host);
     let person = Person::enters(&ctx, &host);
     person.exports(&ctx, "answer-when-released,stay");
-    person.types("codex");
-    let _ = person.sees(ASKED, "the terminal reaches the server through the gateway");
+    let _ = person.types_until_it_shows(
+        "codex",
+        ASKED,
+        "the terminal reaches the server through the gateway",
+    );
     let instance = first_instance(&ctx, &remote, person.session_id).application_instance_id;
     let binding = ctx.binding_until(
         &remote,
@@ -1729,8 +1791,11 @@ fn kr_req_12_08_a_device_steers_cancels_and_prompts_through_what_the_released_pa
     let (_device, _paired, remote) = ctx.pair(&host);
     let person = Person::enters(&ctx, &host);
     person.exports(&ctx, "answer-when-released,keep-reading,stay");
-    person.types("codex");
-    let _ = person.sees(ASKED, "the terminal reaches the server through the gateway");
+    let _ = person.types_until_it_shows(
+        "codex",
+        ASKED,
+        "the terminal reaches the server through the gateway",
+    );
     let session = person.session_id;
     let instance = first_instance(&ctx, &remote, session).application_instance_id;
 
@@ -1890,8 +1955,11 @@ fn a_prompt_whose_server_dies_under_it_is_an_outcome_nobody_can_establish() {
         "export KR_STAND_IN_RECEIVED={}",
         received_by(&ctx).display()
     ));
-    person.types("codex");
-    let _ = person.sees("TUI: turn/completed", "the terminal's turn completes");
+    let _ = person.types_until_it_shows(
+        "codex",
+        "TUI: turn/completed",
+        "the terminal's turn completes",
+    );
     let session = person.session_id;
     let instance = first_instance(&ctx, &remote, session).application_instance_id;
     let idle = ctx.binding_until(
