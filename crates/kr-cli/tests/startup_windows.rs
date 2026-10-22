@@ -888,6 +888,8 @@ impl Host {
             .args([
                 "--json",
                 "new",
+                "--shell-mode",
+                "native_compat",
                 "--invisible",
                 "--headless",
                 "--cwd",
@@ -1182,6 +1184,8 @@ fn a_kr_new_in_the_job_its_parent_built() {
         .args([
             "--json",
             "new",
+            "--shell-mode",
+            "native_compat",
             "--invisible",
             "--headless",
             "--cwd",
@@ -1745,6 +1749,8 @@ fn clearing_the_start_leaves_a_worker_the_environments_task_started_running() {
         kr(&[
             "--json",
             "new",
+            "--shell-mode",
+            "native_compat",
             "--invisible",
             "--headless",
             "--cwd",

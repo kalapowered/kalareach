@@ -1529,7 +1529,7 @@ for distribution in "$first" "$second"; do
     fail "$distribution's daemon has root $daemon_root rather than this distribution's own"
   not_in_shared_storage "$distribution" daemon "$daemon_pid"
   # A session of the distribution's own, named by the identifier the create answered with.
-  session="$(inside "$distribution" "'$helper_path' --json new --invisible --shell /bin/sh" | compact)" ||
+  session="$(inside "$distribution" "'$helper_path' --json new --shell-mode native_compat --invisible --shell /bin/sh" | compact)" ||
     fail "$distribution could not be asked to create a session of its own"
   created="$(printf '%s' "$session" | json_string session_id)"
   [ -n "$created" ] ||
@@ -1769,7 +1769,7 @@ pass "the listing reported the stopped distribution from the cache and started n
 # Creating a session is the other action that starts what it names, and it starts more than a
 # refresh does: the distribution, and then the control daemon inside it, which the distribution's
 # own startup starts. Nothing here starts a daemon by hand.
-"$kr_exe" --json new --invisible --environment second --shell /bin/sh >"$run_dir/new-stopped.json" 2>&1 ||
+"$kr_exe" --json new --shell-mode native_compat --invisible --environment second --shell /bin/sh >"$run_dir/new-stopped.json" 2>&1 ||
   fail "creating a session in the stopped distribution failed: $(cat "$run_dir/new-stopped.json")"
 created_doc="$(compact <"$run_dir/new-stopped.json")"
 [ "$(state_of "$second")" = "Running" ] ||

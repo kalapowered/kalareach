@@ -1250,6 +1250,8 @@ pub struct HostArguments {
 pub enum HostCommand {
     /// Show or change whether this host keeps itself awake for work it has admitted.
     Power(PowerArguments),
+    /// Show or choose the shell mode a new session is created in when none is named.
+    ShellMode(ShellModeArguments),
     /// Show the terminal applications this host has, and which one a new window opens in.
     Terminal(TerminalArguments),
     /// Show or choose how `kr new` starts this environment's control daemon when none is running.
@@ -1455,6 +1457,19 @@ pub struct PowerArguments {
     /// and what it is doing are shown and nothing changes.
     #[arg(long)]
     pub set: Option<String>,
+}
+
+/// `kr host shell-mode`.
+#[derive(Args)]
+pub struct ShellModeArguments {
+    /// The mode `kr new` creates a session in when it is not given `--shell-mode`: `managed` or
+    /// `native_compat`. Without it, the mode in force and where it came from are shown and nothing
+    /// changes.
+    #[arg(long)]
+    pub set: Option<String>,
+    /// Remove the choice, so that the product default, `managed`, decides.
+    #[arg(long, conflicts_with = "set")]
+    pub clear: bool,
 }
 
 /// Which execution context a new session runs in.
@@ -1665,9 +1680,11 @@ pub struct NewArguments {
     /// The shell integration mode: `managed` or `native_compat`.
     ///
     /// `managed` launches a KalaReach-qualified shell package, with empty-prompt Ctrl-D and the
-    /// fenced launch. `native_compat` launches the selected stock shell and claims neither.
-    #[arg(long, default_value = "native_compat")]
-    pub shell_mode: String,
+    /// fenced launch. `native_compat` launches the selected stock shell and claims neither, and is
+    /// never an automatic fallback. When this is absent the host's own default is used: its
+    /// configuration's choice (`kr host shell-mode`), and otherwise `managed`.
+    #[arg(long)]
+    pub shell_mode: Option<String>,
     /// The palette the session starts with: `light`, `dark`, or `probe` to adopt this terminal's
     /// own foreground and background. The profile default is used when this is absent, and an
     /// invisible session cannot probe because it has no terminal.

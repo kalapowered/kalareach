@@ -341,7 +341,7 @@ echo "\$?" > "$run_root/evidence/checks.status"
 exec cat
 SCRIPT
 chmod +x "$run_root/bin/run-checks.sh"
-"$kr" new --invisible --desktop --cwd "$run_root" --shell "$run_root/bin/run-checks.sh" --json \
+"$kr" new --shell-mode native_compat --invisible --desktop --cwd "$run_root" --shell "$run_root/bin/run-checks.sh" --json \
   >"$run_root/evidence/create-checks.json"
 checks_display="$(read_json "$run_root/evidence/create-checks.json" display_number)"
 require "$(read_json "$run_root/evidence/create-checks.json" worker_profile)" "desktop_bound" \
@@ -541,7 +541,7 @@ exec cat
 SCRIPT
 chmod +x "$run_root/bin/run-tools.sh"
 
-"$kr" new --invisible --desktop --cwd "$run_root" --shell "$run_root/bin/run-tools.sh" --json \
+"$kr" new --shell-mode native_compat --invisible --desktop --cwd "$run_root" --shell "$run_root/bin/run-tools.sh" --json \
   >"$run_root/evidence/create-tools.json"
 tools_display="$(read_json "$run_root/evidence/create-tools.json" display_number)"
 for _ in $(seq 1 900); do

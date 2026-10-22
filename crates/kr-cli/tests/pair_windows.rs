@@ -850,6 +850,8 @@ impl WorkerHost {
                 .args([
                     "--json",
                     "new",
+                    "--shell-mode",
+                    "native_compat",
                     "--invisible",
                     "--headless",
                     "--cwd",

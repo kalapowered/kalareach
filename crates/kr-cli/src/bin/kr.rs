@@ -134,15 +134,15 @@ async fn run(cli: Cli) -> Result<Completion> {
             // Both modes are real choices, and neither is a substitute for the other: a managed
             // request the host cannot serve is refused by name rather than created as a stock
             // session, and the daemon decides that before it reserves anything.
-            let shell_mode = match arguments.shell_mode.as_str() {
-                "managed" => ShellMode::Managed,
-                "native_compat" => ShellMode::NativeCompat,
-                _ => {
-                    return Err(CliError::Usage(Shown::said(
-                        "the shell mode is managed or native_compat",
-                    )));
-                }
-            };
+            let shell_mode = arguments
+                .shell_mode
+                .as_deref()
+                .map(|named| {
+                    ShellMode::from_wire(named).ok_or_else(|| {
+                        CliError::Usage(Shown::said("the shell mode is managed or native_compat"))
+                    })
+                })
+                .transpose()?;
             // The environment the session is created in is the one the caller named, resolved
             // before anything connects. A selector that is ignored would create the session
             // somewhere else and say nothing about it.
@@ -216,6 +216,15 @@ async fn run(cli: Cli) -> Result<Completion> {
                 .execution
                 .chosen()
                 .unwrap_or(info.default_worker_profile);
+            // The request's mode where it names one, else this host's own default: its
+            // configuration's choice, then the managed shell. A host of an earlier release names
+            // none, and the product default stands for it.
+            let shell_mode = shell_mode.unwrap_or_else(|| {
+                info.default_shell_mode.map_or(
+                    kr_protocol::hostinfo::configuration::DEFAULT_SHELL_MODE,
+                    |chosen| chosen.mode,
+                )
+            });
             if !cli.json {
                 output::say(&report::execution_context_line(
                     profile,
@@ -924,6 +933,63 @@ async fn run(cli: Cli) -> Result<Completion> {
                              admitted, while it is on mains power",
                         ));
                     }
+                }
+                Ok(Completion::Done)
+            }
+            HostCommand::ShellMode(shell_mode) => {
+                let environment = kr_cli::resolve::select(&paths, None)?;
+                // The host's choice is one validated edit of this user's own configuration
+                // document, as the power setting is, and the daemon is asked what is in force
+                // afterwards, because the choice alone is not the answer: a request outranks it.
+                let change = match (shell_mode.set.as_deref(), shell_mode.clear) {
+                    (Some(named), _) => {
+                        Some(Some(ShellMode::from_wire(named).ok_or_else(|| {
+                            CliError::Usage(Shown::said(
+                                "the shell mode is managed or native_compat",
+                            ))
+                        })?))
+                    }
+                    (None, true) => Some(None),
+                    (None, false) => None,
+                };
+                if let Some(chosen) = change {
+                    let writers = kr_cli::barrier::hold_for_configuration(&environment.paths)?;
+                    let permit =
+                        kr_cli::barrier::permit(&writers, &kr_cli::doctor::configuration::WRITTEN)?;
+                    kr_cli::doctor::configuration::apply(
+                        &environment.paths,
+                        &kr_protocol::hostinfo::configuration::Change::ShellMode(chosen),
+                        &permit,
+                    )?;
+                }
+                let mut client = open_controller(&environment.paths, build_id()).await?;
+                let info: HostInfoResult =
+                    host_read(&mut client, &environment.paths, Method::HostInfo, &()).await?;
+                let (mode, source) = info.default_shell_mode.map_or(
+                    (
+                        kr_protocol::hostinfo::configuration::DEFAULT_SHELL_MODE,
+                        kr_protocol::hostinfo::configuration::ValueSource::Default,
+                    ),
+                    |chosen| (chosen.mode, chosen.source),
+                );
+                if cli.json {
+                    output::document(
+                        &Document::new()
+                            .with("ok", true)
+                            .with("environment_id", output::said(&environment.environment_id))
+                            .with(
+                                "shell_mode",
+                                Document::new()
+                                    .with("mode", mode.as_str())
+                                    .with("source", source.as_str()),
+                            ),
+                    );
+                } else {
+                    output::say(&shown!(
+                        "new sessions are created in {} mode unless a command names one (from {})",
+                        mode.as_str(),
+                        source.describe()
+                    ));
                 }
                 Ok(Completion::Done)
             }
@@ -1657,7 +1723,7 @@ async fn new_in_enrolled(
     enrolment: kr_protocol::identity::EnvironmentEnrolment,
     arguments: kr_cli::cli::NewArguments,
     presentation: Presentation,
-    shell_mode: ShellMode,
+    shell_mode: Option<ShellMode>,
     json: bool,
 ) -> Result<Completion> {
     // A terminal application opens where the session runs, and an enrolled environment has no
