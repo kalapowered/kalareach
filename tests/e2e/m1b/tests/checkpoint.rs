@@ -1243,6 +1243,8 @@ fn the_installed_package_is_bound_into_the_session_and_acts_through_its_broker()
     let work = run.work().display().to_string();
     let created = host.kr_json(&[
         "new",
+        "--shell-mode",
+        "native_compat",
         "--invisible",
         "--headless",
         "--shell",

@@ -75,7 +75,7 @@ def main(programs):
         else:
             raise SystemExit("the daemon of this release did not answer")
         created = subprocess.run(
-            [kr, "new", "--invisible", "--headless", "--cwd", run, "--shell", shell, "--json"],
+            [kr, "new", "--shell-mode", "native_compat", "--invisible", "--headless", "--cwd", run, "--shell", shell, "--json"],
             env=environment, capture_output=True, text=True, check=True,
         )
         display = str(json.loads(created.stdout)["display_number"])

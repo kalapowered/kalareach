@@ -1821,7 +1821,15 @@ impl Host {
 
     fn new_session_as(&self, kr: &Path, shell: &[&str]) -> (String, SessionId) {
         let cwd = self.tree.root().display().to_string();
-        let mut arguments = vec!["new", "--invisible", "--headless", "--cwd", &cwd];
+        let mut arguments = vec![
+            "new",
+            "--shell-mode",
+            "native_compat",
+            "--invisible",
+            "--headless",
+            "--cwd",
+            &cwd,
+        ];
         arguments.extend_from_slice(shell);
         arguments.extend_from_slice(&["--startup", "interactive", "--json"]);
         let output = self.run(kr, &arguments);
@@ -1885,6 +1893,8 @@ impl Host {
             kr,
             &[
                 "new",
+                "--shell-mode",
+                "native_compat",
                 "--invisible",
                 "--headless",
                 "--cwd",

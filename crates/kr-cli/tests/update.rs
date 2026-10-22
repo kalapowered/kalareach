@@ -7740,6 +7740,8 @@ impl Host {
             &self.store.stable(Program::Kr),
             &[
                 "new",
+                "--shell-mode",
+                "native_compat",
                 "--invisible",
                 "--headless",
                 "--cwd",

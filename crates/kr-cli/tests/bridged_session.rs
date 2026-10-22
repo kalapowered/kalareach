@@ -544,6 +544,8 @@ impl World {
         let created = self.run(&[
             "--json",
             "new",
+            "--shell-mode",
+            "native_compat",
             "--invisible",
             "--headless",
             "--environment",
@@ -2131,6 +2133,8 @@ async fn a_clipboard_write_from_a_session_on_this_host_reaches_its_terminal() {
     let created = world.run(&[
         "--json",
         "new",
+        "--shell-mode",
+        "native_compat",
         "--invisible",
         "--headless",
         "--shell",
@@ -2518,6 +2522,8 @@ async fn an_export_of_a_session_on_this_host_is_the_same_file() {
     let created = world.run(&[
         "--json",
         "new",
+        "--shell-mode",
+        "native_compat",
         "--invisible",
         "--headless",
         "--shell",
@@ -2916,6 +2922,8 @@ async fn an_enrolled_container_answers_a_bridge_and_a_session_made_through_it_li
     let created = world.run(&[
         "--json",
         "new",
+        "--shell-mode",
+        "native_compat",
         "--invisible",
         "--headless",
         "--environment",
@@ -3017,6 +3025,8 @@ async fn a_stopped_container_is_started_by_a_create_and_keeps_its_identity() {
     let created = world.run(&[
         "--json",
         "new",
+        "--shell-mode",
+        "native_compat",
         "--invisible",
         "--headless",
         "--environment",
