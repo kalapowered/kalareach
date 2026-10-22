@@ -20,6 +20,16 @@
 //! request in its ledger and its source frames whatever the lane does; what a loss costs is the
 //! component's view of it, and the loss says so.
 //!
+//! A loss is handed to the pump with the first entry that is newer than it, so that the pump applies
+//! the loss, and takes the snapshot it owes, before it offers that entry and not after. The lane
+//! loses ordinary entries before it loses a request, and refuses an entry larger than itself
+//! whatever waits, so the order of losses and entries is one the pump cannot assume: something lost
+//! after a request was pushed is newer than the request. Each waiting entry therefore carries what
+//! was lost between it and the entry before it, an entry pushed out for room passes what it
+//! carried, and itself, to the entry after it, and what is lost after the newest waiting entry
+//! waits for the next entry, or for the pump to find none. That is one record for each waiting
+//! entry, which the lane's own bound bounds.
+//!
 //! # The views
 //!
 //! Beside the entries the lane keeps one [`View`] for each binding, shared by the pump and the link.
@@ -124,6 +134,9 @@ pub struct Entry {
     /// holds something made in privacy mode however privacy mode stands then.
     pub private: bool,
     cost: u64,
+    /// What the lane lost between the entry before this one and this one: older than it, and handed
+    /// over with it.
+    loss_before: LaneLoss,
 }
 
 impl Entry {
@@ -193,13 +206,56 @@ impl LaneLoss {
     fn is_empty(&self) -> bool {
         self.terminal == Tally::default() && self.native.is_empty()
     }
+
+    /// Counts one lost entry.
+    fn add(&mut self, entry: &Entry) {
+        let bytes = entry.cost;
+        match &entry.source {
+            Source::Terminal(_) => self.terminal.add(bytes),
+            Source::Native(frame) => {
+                let at = self.native.iter().position(|loss| {
+                    loss.instance == frame.instance && loss.package == frame.package
+                });
+                let loss = if let Some(at) = at {
+                    &mut self.native[at]
+                } else {
+                    self.native.push(NativeLoss {
+                        instance: frame.instance,
+                        package: frame.package.clone(),
+                        tally: Tally::default(),
+                    });
+                    let last = self.native.len() - 1;
+                    &mut self.native[last]
+                };
+                loss.tally.add(bytes);
+            }
+        }
+    }
+
+    /// Counts everything `other` counts.
+    fn absorb(&mut self, other: Self) {
+        self.terminal.events = self.terminal.events.saturating_add(other.terminal.events);
+        self.terminal.bytes = self.terminal.bytes.saturating_add(other.terminal.bytes);
+        for theirs in other.native {
+            let at = self.native.iter().position(|loss| {
+                loss.instance == theirs.instance && loss.package == theirs.package
+            });
+            if let Some(at) = at {
+                let tally = &mut self.native[at].tally;
+                tally.events = tally.events.saturating_add(theirs.tally.events);
+                tally.bytes = tally.bytes.saturating_add(theirs.tally.bytes);
+            } else {
+                self.native.push(theirs);
+            }
+        }
+    }
 }
 
 /// What the pump took off the lane in one step.
 #[derive(Debug)]
 pub struct Taken {
-    /// What the lane lost since the pump last took anything, to be applied before the entry is
-    /// offered.
+    /// What the lane lost that is older than the entry, or all that it lost where no entry waits, to
+    /// be applied before the entry is offered.
     pub loss: Option<LaneLoss>,
     /// The oldest entry, where the lane held one.
     pub entry: Option<Entry>,
@@ -295,7 +351,9 @@ struct Inner {
     held: u64,
     in_flight_entries: u64,
     next_seq: u64,
-    pending_loss: LaneLoss,
+    /// What the lane lost after the newest entry that waits: newer than every entry that waits, so
+    /// it goes with the next entry pushed, or is handed over alone where none waits.
+    tail_loss: LaneLoss,
     account: Account,
     views: BTreeMap<BrokerBindingId, View>,
     checkpoints: BTreeMap<BrokerBindingId, Held>,
@@ -306,33 +364,40 @@ struct Inner {
 }
 
 impl Inner {
-    fn lose(&mut self, entry: &Entry, refused: bool) {
-        let bytes = entry.cost;
-        match &entry.source {
-            Source::Terminal(_) => self.pending_loss.terminal.add(bytes),
-            Source::Native(frame) => {
-                let losses = &mut self.pending_loss.native;
-                let at = losses.iter().position(|loss| {
-                    loss.instance == frame.instance && loss.package == frame.package
-                });
-                let loss = if let Some(at) = at {
-                    &mut losses[at]
-                } else {
-                    losses.push(NativeLoss {
-                        instance: frame.instance,
-                        package: frame.package.clone(),
-                        tally: Tally::default(),
-                    });
-                    let last = losses.len() - 1;
-                    &mut losses[last]
-                };
-                loss.tally.add(bytes);
-            }
-        }
+    /// Counts an entry that was never taken as lost: refused, or an ordinary entry that does not
+    /// fit. It is the newest thing the lane has seen, so it is newer than everything that waits.
+    fn lose_new(&mut self, entry: &Entry, refused: bool) {
+        self.tail_loss.add(entry);
         if refused {
-            self.account.refused.add(bytes);
+            self.account.refused.add(entry.cost);
         } else {
-            self.account.evicted.add(bytes);
+            self.account.evicted.add(entry.cost);
+        }
+    }
+
+    /// Counts an entry that was waiting as lost, pushed out for room. It, and what had been lost
+    /// before it, go with the first entry newer than it, or wait for one: that entry may be a
+    /// request, which the lane keeps while it loses ordinary entries.
+    fn lose_waiting(&mut self, mut lost: Entry) {
+        let mut carried = std::mem::take(&mut lost.loss_before);
+        carried.add(&lost);
+        self.account.evicted.add(lost.cost);
+        let request = self
+            .authoritative
+            .partition_point(|entry| entry.seq < lost.seq);
+        let request_is_next = self.authoritative.get(request).is_some_and(|waiting| {
+            self.ordinary
+                .front()
+                .is_none_or(|ordinary| waiting.seq < ordinary.seq)
+        });
+        let next = if request_is_next {
+            self.authoritative.get_mut(request)
+        } else {
+            self.ordinary.front_mut()
+        };
+        match next {
+            Some(next) => next.loss_before.absorb(carried),
+            None => self.tail_loss.absorb(carried),
         }
     }
 }
@@ -467,15 +532,16 @@ impl ObservationLane {
         let mut inner = self.inner();
         let seq = inner.next_seq;
         inner.next_seq = inner.next_seq.saturating_add(1);
-        let entry = Entry {
+        let mut entry = Entry {
             seq,
             source,
             at_ms,
             private: self.private.load(Ordering::Acquire),
             cost,
+            loss_before: LaneLoss::default(),
         };
         if cost > OBSERVATION_QUEUE_BYTES {
-            inner.lose(&entry, true);
+            inner.lose_new(&entry, true);
             drop(inner);
             self.wake.notify_one();
             return Pushed::Refused;
@@ -486,18 +552,20 @@ impl ObservationLane {
                 break;
             };
             inner.held = inner.held.saturating_sub(oldest.cost);
-            inner.lose(&oldest, false);
+            inner.lose_waiting(oldest);
         }
         if inner.held.saturating_add(cost) > OBSERVATION_QUEUE_BYTES {
             // Only authoritative entries are left (or the pump's own), and none is evicted.
             // An ordinary entry that does not fit is lost; an authoritative one is refused. Both
             // are counted, and the broker's own record of the request is what stays.
             let refused = entry.is_authoritative();
-            inner.lose(&entry, refused);
+            inner.lose_new(&entry, refused);
             drop(inner);
             self.wake.notify_one();
             return Pushed::Refused;
         }
+        // What was lost since the newest entry that waits is older than this one.
+        entry.loss_before = std::mem::take(&mut inner.tail_loss);
         inner.held = inner.held.saturating_add(cost);
         if entry.is_authoritative() {
             inner.authoritative.push_back(entry);
@@ -511,32 +579,38 @@ impl ObservationLane {
 
     // -- the pump -----------------------------------------------------------------------------
 
-    /// Takes the oldest entry, in the order it was pushed, together with everything the lane has
-    /// lost until now. The lane goes on counting the entry against its bound until
-    /// [`Self::finish`].
+    /// Takes the oldest entry, in the order it was pushed, together with the losses older than it.
+    /// The lane goes on counting the entry against its bound until [`Self::finish`].
     ///
     /// The loss and the entry are taken under one lock, so the loss is the pump's to apply before it
-    /// offers the entry, and every entry the lane lost is older than the one it hands over: the lane
-    /// loses its oldest entries first. What is lost after this call is newer than the entry, and the
-    /// next call brings it.
+    /// offers the entry. Each loss goes with the first entry newer than it. The lane loses ordinary
+    /// entries before it loses a request the upstream is waiting on, and refuses an entry larger
+    /// than itself whatever waits, so something lost after a request was pushed is newer than the
+    /// request: it is held back until the request has been taken, and comes with a later entry, or
+    /// alone where none waits. What is lost after this call is newer than the entry taken.
     pub fn take(&self) -> Taken {
         let mut inner = self.inner();
-        let loss = if inner.pending_loss.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut inner.pending_loss))
-        };
-        let from_authoritative = match (inner.ordinary.front(), inner.authoritative.front()) {
-            (None, None) => return Taken { loss, entry: None },
+        let from_request = match (inner.ordinary.front(), inner.authoritative.front()) {
+            (None, None) => {
+                let loss = std::mem::take(&mut inner.tail_loss);
+                return Taken {
+                    loss: (!loss.is_empty()).then_some(loss),
+                    entry: None,
+                };
+            }
             (Some(_), None) => false,
             (None, Some(_)) => true,
-            (Some(ordinary), Some(authoritative)) => authoritative.seq < ordinary.seq,
+            (Some(ordinary), Some(request)) => request.seq < ordinary.seq,
         };
-        let entry = if from_authoritative {
+        let mut entry = if from_request {
             inner.authoritative.pop_front()
         } else {
             inner.ordinary.pop_front()
         };
+        let loss = entry
+            .as_mut()
+            .map(|entry| std::mem::take(&mut entry.loss_before))
+            .filter(|loss| !loss.is_empty());
         if entry.is_some() {
             inner.in_flight_entries = inner.in_flight_entries.saturating_add(1);
         }
