@@ -724,8 +724,8 @@ mod tests {
     }
 
     /// KR-REQ-09.20, the part about the input stream: the view's writes go under the epoch of the
-    /// lease it was given, each with the next number of one increasing sequence, and a write made
-    /// under a take that no longer holds the lease is not numbered at all.
+    /// lease it was given, each with the next number of one increasing sequence, and a write of an
+    /// older take is not numbered at all.
     #[test]
     fn a_take_acquires_once_and_a_write_goes_under_its_epoch_in_order() {
         let mut lease = Lease::default();
