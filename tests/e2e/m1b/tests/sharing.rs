@@ -403,24 +403,26 @@ fn a_guest_is_shown_a_session_with_its_screen_and_loses_it_when_the_share_is_tak
         .unwrap_or_else(|left| panic!("the leg left processes running: {left}"));
 }
 
-/// A stopped worker, continued when this is dropped: a case that fails while the worker is held
-/// does not leave it stopped through the host's teardown.
-struct Held(kr_protocol::identity::ProcessStartIdentity);
+/// A worker held stopped, continued when this is dropped: a case that fails while the worker is
+/// stopped does not leave it stopped through the host's teardown.
+struct StoppedWorker(kr_protocol::identity::ProcessStartIdentity);
 
-impl Held {
-    /// Stops the worker, and waits until the kernel says it is stopped.
+impl StoppedWorker {
+    /// Stops the worker, and waits until the kernel says it is stopped. The guard exists before the
+    /// signal is sent, so a wait that fails still continues the worker.
     fn stop(worker: kr_protocol::identity::ProcessStartIdentity) -> Self {
-        kr_e2e_m1b::run::signal(&worker, rustix::process::Signal::STOP);
+        let stopped = Self(worker);
+        kr_e2e_m1b::run::signal(&stopped.0, rustix::process::Signal::STOP);
         let started = std::time::Instant::now();
-        while kr_e2e_m1b::run::stopped(&worker) != Some(true) {
+        while kr_e2e_m1b::run::stopped(&stopped.0) != Some(true) {
             assert!(started.elapsed() < LIVENESS, "the worker never stopped");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        Self(worker)
+        stopped
     }
 }
 
-impl Drop for Held {
+impl Drop for StoppedWorker {
     fn drop(&mut self) {
         kr_e2e_m1b::run::signal(&self.0, rustix::process::Signal::CONT);
     }
@@ -492,7 +494,7 @@ fn a_revocation_a_session_worker_has_not_fenced_is_pending_in_kr_and_complete_on
     let before = counter(&host.kr_json(&["device", "list"])["authority_revision"]);
 
     // The worker does not answer: it is stopped, and says nothing until it is continued.
-    let held = Held::stop(host.worker_of(&session_id.to_string()));
+    let stopped = StoppedWorker::stop(host.worker_of(&session_id.to_string()));
 
     let pending = host.kr(&["share", "revoke", &grant_id]);
     assert!(
@@ -515,7 +517,7 @@ fn a_revocation_a_session_worker_has_not_fenced_is_pending_in_kr_and_complete_on
     );
 
     // The worker answers again, and the same command now completes.
-    drop(held);
+    drop(stopped);
     let started = std::time::Instant::now();
     let revoked = loop {
         let again = host.kr(&["share", "revoke", &grant_id, "--json"]);
