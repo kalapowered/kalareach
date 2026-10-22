@@ -556,6 +556,7 @@ fn the_views_observe_builds_hold_the_names_the_reader_compares() {
             ("automation", Some(5)),
             ("mailbox", Some(3)),
             ("relay", Some(4)),
+            ("shell", Some(6)),
         ],
         "the sections that arrived with a level are the production table's"
     );
