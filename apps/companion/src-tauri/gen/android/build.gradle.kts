@@ -11,13 +11,15 @@ buildscript {
 
 /*
  * The platform TLS verifier's Kotlin half is published as a Maven artefact by the verifier's own
- * project, and the companion's platform plugin depends on it. The application resolves the plugin's
- * dependencies through its own repositories, so the repository is declared here for every project,
- * limited to the verifier's group. The artefact's version is the Rust crate's (the two must be the
- * same, so the application's build checks it against `Cargo.lock`), and its bytes are pinned there
- * as well as its version.
+ * project, and the companion's platform plugin depends on it. The Rust side calls the Kotlin side
+ * by name and layout, so the two are one component: the version linked is the one `Cargo.lock`
+ * holds for the crate that carries it, and a lock that holds two of them has no single answer, so
+ * the build stops. The application's build checks the bytes of what it links as well.
  *
- * Why version 0.2.0 and not the 0.1.1 that shipped in the crate: Android's check of a certificate's
+ * The repository is the project's archive branch at one commit, and serves the verifier's group
+ * and nothing else: no other repository can supply that group, and the archive supplies no other.
+ *
+ * Why 0.2.0 and not the 0.1.1 that shipped in the crate: Android's check of a certificate's
  * revocation status, inside the verifier's Kotlin half, fetches the revocation list a certificate
  * authority publishes over plain HTTP, and a release build allows no cleartext traffic. Let's
  * Encrypt, Google Trust Services and SSL.com no longer publish OCSP, so the certificates Cloudflare
@@ -27,15 +29,29 @@ buildscript {
  * application that permits cleartext only to the public authorities' revocation-list hosts and
  * leaves it off everywhere else. https://github.com/rustls/rustls-platform-verifier/issues/221
  */
+extra["rustlsPlatformVerifierKotlinVersion"] = run {
+    val lines = file("../../../../../Cargo.lock").readLines()
+    val locked = lines.indices.filter { lines[it].trim() == "name = \"rustls-platform-verifier-android\"" }
+        .map { at -> lines.drop(at + 1).first { it.trimStart().startsWith("version = ") }.substringAfter('"').substringBefore('"') }
+    check(locked.size == 1) {
+        "Cargo.lock holds ${locked.size} versions of rustls-platform-verifier-android: this build links one Kotlin half"
+    }
+    locked.single()
+}
+
 allprojects {
     repositories {
+        exclusiveContent {
+            forRepository {
+                maven {
+                    url = uri("https://github.com/rustls/rustls-platform-verifier/raw/1aa691352a5e0c215210dfc9a3c2f2078639dc91/android-release-support/maven/")
+                    metadataSources { mavenPom(); artifact() }
+                }
+            }
+            filter { includeGroup("org.rustls") }
+        }
         google()
         mavenCentral()
-        maven {
-            url = uri("https://github.com/rustls/rustls-platform-verifier/raw/maven-archive/android-release-support/maven/")
-            metadataSources { mavenPom(); artifact() }
-            content { includeGroup("org.rustls") }
-        }
     }
 }
 

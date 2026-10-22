@@ -54,8 +54,13 @@ dependencies {
     // which the application's root build declares for every project. It carries the network
     // security configuration that lets the verifier fetch the revocation lists certificate
     // authorities publish over HTTP: without it a release build, which allows no cleartext traffic,
-    // reports a certificate whose authority publishes only such a list as revoked.
-    implementation("org.rustls:rustls-platform-verifier:0.2.0")
+    // reports a certificate whose authority publishes only such a list as revoked. Its version is
+    // the one `Cargo.lock` holds for the crate that carries it, exactly: nothing else may raise it
+    // past the bytes the application's build checks, and it brings no dependency of its own.
+    implementation("org.rustls:rustls-platform-verifier") {
+        version { strictly(rootProject.extra["rustlsPlatformVerifierKotlinVersion"] as String) }
+        isTransitive = false
+    }
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }
