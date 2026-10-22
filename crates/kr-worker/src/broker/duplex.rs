@@ -41,7 +41,7 @@ use kr_protocol::gateway::{PendingState, ReverseOperation};
 use kr_protocol::ids::{
     ApplicationInstanceId, GatewayConnectionId, PendingResourceId, UpstreamRequestId,
 };
-use kr_protocol::metrics::{Adapter, Outcome};
+use kr_protocol::metrics::{Adapter, MetricOutcome};
 use kr_protocol::scalars::TimestampMs;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
@@ -1222,7 +1222,7 @@ impl Counted {
         })
     }
 
-    fn failed(&self, outcome: Outcome) {
+    fn failed(&self, outcome: MetricOutcome) {
         self.broker.adapter_failed(self.adapter, outcome);
     }
 }
@@ -1253,7 +1253,7 @@ fn class_rights(
 
 impl Dispatch {
     /// Counts one failure of this connection's adapter, where its package is a bundled one.
-    fn failed(&self, outcome: Outcome) {
+    fn failed(&self, outcome: MetricOutcome) {
         if let Some(counted) = &self.counted {
             counted.failed(outcome);
         }
@@ -1595,7 +1595,7 @@ impl Dispatch {
         let queued = self
             .upstream
             .queue(&body)
-            .inspect_err(|_| self.failed(Outcome::Unavailable))?;
+            .inspect_err(|_| self.failed(MetricOutcome::Unavailable))?;
         let turn_id = request.turn_id.clone();
         let counted = self.counted.clone();
         let failed = move |outcome| {
@@ -1605,13 +1605,13 @@ impl Dispatch {
         };
         Ok(PendingTransmission::carried(async move {
             if let Some(refusal) = queued.delivered().await.refusal() {
-                failed(Outcome::Unavailable);
+                failed(MetricOutcome::Unavailable);
                 return Err(refusal);
             }
             // The bytes went. What the upstream did with them is the upstream's to say, and until
             // it says so the operation is not one this host can record as applied.
             let Some(reply) = answered.within(ACKNOWLEDGEMENT_DEADLINE).await else {
-                failed(Outcome::Timeout);
+                failed(MetricOutcome::Timeout);
                 return Err(BrokerError::UpstreamUnavailable {
                     detail: format!(
                         "the operation reached the upstream and it did not answer within {} \
@@ -1647,7 +1647,7 @@ impl Dispatch {
 impl UpstreamDispatch for Dispatch {
     fn admit(&self, request: &UpstreamRequest) -> Result<()> {
         if self.upstream.is_closed() {
-            self.failed(Outcome::Unavailable);
+            self.failed(MetricOutcome::Unavailable);
             return Err(BrokerError::UpstreamUnavailable {
                 detail: "this connection has stopped taking frames".to_owned(),
             });
@@ -1693,7 +1693,7 @@ impl UpstreamDispatch for Dispatch {
 
     fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission> {
         if self.upstream.is_closed() {
-            self.failed(Outcome::Unavailable);
+            self.failed(MetricOutcome::Unavailable);
             return Err(BrokerError::UpstreamUnavailable {
                 detail: "this connection has stopped taking frames".to_owned(),
             });
@@ -1937,7 +1937,7 @@ impl Duplex {
             }
             for (id, client) in held.outstanding.expired() {
                 held.counted()
-                    .inspect(|counted| counted.failed(Outcome::Timeout));
+                    .inspect(|counted| counted.failed(MetricOutcome::Timeout));
                 held.refuse_to_client(&id, &client, "the upstream did not answer this request");
             }
             let stopping = Arc::clone(&held.stopping);
@@ -3624,7 +3624,7 @@ mod tests {
     }
 
     /// What the broker has counted of its adapters' failures, as adapter, outcome and count.
-    fn failures_counted(broker: &Broker) -> Vec<(Adapter, Outcome, u64)> {
+    fn failures_counted(broker: &Broker) -> Vec<(Adapter, MetricOutcome, u64)> {
         broker
             .metrics()
             .adapter_failure
@@ -3649,7 +3649,7 @@ mod tests {
             .expect_err("a connection that has stopped taking frames carries nothing");
         assert_eq!(
             failures_counted(&broker),
-            vec![(Adapter::Codex, Outcome::Unavailable, 1)]
+            vec![(Adapter::Codex, MetricOutcome::Unavailable, 1)]
         );
     }
 
@@ -3673,7 +3673,7 @@ mod tests {
             .expect_err("a frame nothing can read is not carried");
         assert_eq!(
             failures_counted(&broker),
-            vec![(Adapter::Codex, Outcome::Unavailable, 1)]
+            vec![(Adapter::Codex, MetricOutcome::Unavailable, 1)]
         );
 
         // The other end reads and never answers.
@@ -3688,7 +3688,7 @@ mod tests {
             .expect_err("an upstream that does not answer is not one that acted");
         assert_eq!(
             failures_counted(&broker),
-            vec![(Adapter::Codex, Outcome::Timeout, 1)]
+            vec![(Adapter::Codex, MetricOutcome::Timeout, 1)]
         );
     }
 }
