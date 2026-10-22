@@ -567,9 +567,11 @@ mutation to the worker. The worker holds the lease for at most five seconds. It 
 during the serial path just before writing the dispatch marker. It will refuse to run an action if
 its lease is not for a generation that it is accepting actions for, or if its lease is not for a
 revision that it has acknowledged for that generation and installed, or if its lease has ended. A
-stop of owned execution (`session.close`) and a local caller's action need no lease. Workers from
-the previous release cannot read a lease; the daemon does not send them one, and the daemon alone
-holds the lease for them.
+stop of owned execution (`session.close`) and a local caller's action need no lease. A worker
+of the release before reads the lease too, so the daemon sends it as it does to a worker of its own
+release. A worker of one of the two excluded early releases of that level cannot read it, and a host
+that has such a worker drains it before an update or a rollback (see "A host built at an excluded
+release" in the support window).
 
 ## Performance targets
 
