@@ -158,6 +158,17 @@ pub fn known() -> Vec<Known> {
             "OfflineValidityPolicy",
             "2de9e423e33e137cf44fce90d9474ebeff021e6fcb25eb1c85f55ed13a581c04",
         ),
+        // What the policy mirror keeps of the policy inside it.
+        known_protocol::<account::PolicyAuthorityLink>(
+            "policy-mirror",
+            "PolicyAuthorityLink",
+            "d9aab1ca1f34156f2a5541e55f6bbef63516ea7073ac3ca2f44cc250a20fdc19",
+        ),
+        known_protocol::<sharing::OfflineValidityPolicy>(
+            "policy-mirror",
+            "OfflineValidityPolicy",
+            "2de9e423e33e137cf44fce90d9474ebeff021e6fcb25eb1c85f55ed13a581c04",
+        ),
         known_protocol::<pairing::RevocationRequest>(
             "registry",
             "RevocationRequest",
