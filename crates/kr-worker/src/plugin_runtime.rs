@@ -26,6 +26,17 @@
 //! ships one asks for nothing, and neither does one whose last such binding has ended: it unbinds,
 //! drops its connection, and the runtime holds nothing of it.
 //!
+//! # What the link does once a component is registered
+//!
+//! A binding is reported `Registered` as soon as the runtime has its component, and is offered
+//! observations (`crate::plugin_observation`) only once the link has made it ready: its held
+//! checkpoint restored where there was one, and the snapshot after the restore answered. The link
+//! takes a checkpoint of a ready binding when it has been offered events and has been quiet for two
+//! seconds (or its last attempt is a minute old), holds it in memory, and restores it when the
+//! binding is registered again after the runtime was lost. Held checkpoints are never persisted, and
+//! privacy mode drops them. Every thirty seconds it asks the runtime what it is doing; a runtime
+//! that does not answer twice running is treated as lost.
+//!
 //! # When the runtime is lost
 //!
 //! The connection ends when the runtime does. Every registration on it is gone, and each binding
@@ -51,7 +62,7 @@ use kr_plugin_sdk::version::PackageVersion;
 use kr_plugin_service::client::PluginClient;
 use kr_plugin_service::error::ServiceError;
 use kr_plugin_service::protocol::{ComponentSource, Notice};
-use kr_plugin_service::vocabulary::{BindingActivity, BindingFacts, BindingId};
+use kr_plugin_service::vocabulary::{BindingActivity, BindingFacts};
 use kr_protocol::admission::{
     ComponentState, PluginRuntimeState, PluginRuntimeUnavailable, PluginRuntimeWanted,
 };
@@ -59,7 +70,9 @@ use kr_protocol::envelope::ControlFrame;
 use kr_protocol::ids::{BrokerBindingId, SessionId};
 
 use crate::broker::Broker;
-use crate::broker::component::ComponentWant;
+use crate::broker::component::{ComponentNote, ComponentWant};
+use crate::broker::observation::{Held, ObservationLane};
+use crate::plugin_observation::{CALL_WAIT, service_id};
 
 /// How long a request to the control daemon is given.
 ///
@@ -81,6 +94,13 @@ const STEADY: Duration = Duration::from_secs(60);
 /// cost of one registration each time, which this spaces out.
 const REFUSAL_DELAY: Duration = Duration::from_secs(30);
 
+/// How often the runtime is asked what it is doing while a binding is registered.
+const HEALTH_EVERY: Duration = Duration::from_secs(30);
+
+/// How many answers to the health question in a row may fail to come before the runtime is taken
+/// to be lost.
+const HEALTH_FAILURES: u32 = 2;
+
 /// What a binding that is waiting for the runtime is reported as doing, in turn.
 const ASKING: &str = "asking the control daemon for the plugin runtime";
 const CONNECTING: &str = "connecting to the plugin runtime";
@@ -100,9 +120,16 @@ pub struct RuntimeRequest {
 /// Registers the bindings that want a component with the plugin runtime, for as long as the broker
 /// lives.
 pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
-    let Some(changes) = broker.upgrade().map(|broker| broker.component_changes()) else {
+    let Some((changes, lane)) = broker
+        .upgrade()
+        .map(|broker| (broker.component_changes(), broker.observation()))
+    else {
         return;
     };
+    // The task that offers observations to the registered components lives as long as the link.
+    let _pump = AbortOnDrop(tokio::spawn(crate::plugin_observation::pump(Weak::clone(
+        &broker,
+    ))));
     let mut link = Link {
         request,
         client: None,
@@ -110,6 +137,9 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
         refused: BTreeMap::new(),
         pace: Pacing::default(),
         last_reason: None,
+        lane,
+        health_due: None,
+        health_failures: 0,
     };
     loop {
         let Some(wants) = broker.upgrade().map(|broker| broker.component_wants()) else {
@@ -117,6 +147,15 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
         };
         let delay = link.settle(&broker, wants).await;
         link.wait(&broker, &changes, delay).await;
+    }
+}
+
+/// Ends a task when it is dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -131,6 +170,13 @@ struct Link {
     pace: Pacing,
     /// Why the runtime was last not reachable, which a binding made while the link waits is told.
     last_reason: Option<String>,
+    /// What the worker has to offer the components, what each has missed, and the state held for
+    /// each.
+    lane: Arc<ObservationLane>,
+    /// When the runtime is next asked what it is doing.
+    health_due: Option<tokio::time::Instant>,
+    /// How many times in a row the runtime did not answer.
+    health_failures: u32,
 }
 
 /// One binding's refusal by the runtime.
@@ -224,12 +270,35 @@ enum Event {
 }
 
 impl Link {
-    /// Brings the runtime to what the broker wants of it, and says how long to leave before the
-    /// next attempt where this one did not get there.
+    /// Brings the runtime to what the broker wants of it, keeps up what a registered component
+    /// needs, and says how long to leave before the next attempt where this one did not get there.
     async fn settle(
         &mut self,
         broker: &Weak<Broker>,
         wants: Vec<ComponentWant>,
+    ) -> Option<Duration> {
+        // The streams producers push at all are the streams some binding takes.
+        self.lane.set_wanted(
+            wants
+                .iter()
+                .any(|want| want.observing && want.streams.semantic),
+            wants
+                .iter()
+                .any(|want| want.observing && want.streams.terminal),
+        );
+        let registering = self.register_wanted(broker, &wants).await;
+        let keeping = self.keep_up(broker, &wants).await;
+        match (registering, keeping) {
+            (Some(first), Some(second)) => Some(first.min(second)),
+            (delay, None) | (None, delay) => delay,
+        }
+    }
+
+    /// Brings the runtime's registrations to what the broker wants of it.
+    async fn register_wanted(
+        &mut self,
+        broker: &Weak<Broker>,
+        wants: &[ComponentWant],
     ) -> Option<Duration> {
         let wanted: BTreeSet<BrokerBindingId> = wants.iter().map(|want| want.binding_id).collect();
 
@@ -241,9 +310,13 @@ impl Link {
                 self.registered.clear();
                 break;
             };
-            match client.unbind(as_service_id(binding_id)).await {
+            match client.unbind(service_id(binding_id)).await {
                 Ok(_) | Err(ServiceError::Protocol { .. } | ServiceError::Disabled { .. }) => {
                     self.registered.remove(&binding_id);
+                    self.lane.forget(binding_id);
+                    if let Some(broker) = broker.upgrade() {
+                        broker.note_component(binding_id, ComponentNote::Clear);
+                    }
                 }
                 Err(error) => {
                     self.lose(broker, &error.to_string());
@@ -295,7 +368,7 @@ impl Link {
         }
 
         if self.client.is_none() {
-            let Some(client) = self.reach(broker, &pending, &wants).await else {
+            let Some(client) = self.reach(broker, &pending, wants).await else {
                 return Some(self.pace.remaining(tokio::time::Instant::now()));
             };
             self.hold(broker, Some(Arc::new(client)));
@@ -324,7 +397,7 @@ impl Link {
             );
             let registered = client
                 .register(
-                    as_service_id(want.binding_id),
+                    service_id(want.binding_id),
                     &identity,
                     &facts_of(want),
                     &want.executable,
@@ -336,10 +409,36 @@ impl Link {
                 )
                 .await;
             match registered {
-                Ok(_) => {
+                Ok(registration) => {
                     self.registered.insert(want.binding_id);
                     self.refused.remove(&want.binding_id);
+                    if let Some(strong) = broker.upgrade() {
+                        strong.note_component(
+                            want.binding_id,
+                            ComponentNote::Registration(if registration.cached {
+                                format!(
+                                    "loaded from the compiled-code cache in {} ms",
+                                    registration.elapsed_ms
+                                )
+                            } else {
+                                format!("compiled in {} ms", registration.elapsed_ms)
+                            }),
+                        );
+                    }
                     report(broker, want.binding_id, ComponentState::Registered, None);
+                    if let Err(error) = self.make_ready(broker, want).await {
+                        let reason = error.to_string();
+                        self.lose(broker, &reason);
+                        for want in wants {
+                            report(
+                                broker,
+                                want.binding_id,
+                                ComponentState::Unavailable,
+                                Some(&reason),
+                            );
+                        }
+                        return Some(self.pace.remaining(tokio::time::Instant::now()));
+                    }
                 }
                 // The runtime answered and said no: this component, not the runtime. The reason is
                 // the binding's, and it is offered again after a wait that grows.
@@ -353,7 +452,7 @@ impl Link {
                     self.lose(broker, &reason);
                     // The binding being registered and those behind it were told a step of the
                     // way; every one that wants a component is told what stopped it.
-                    for want in &wants {
+                    for want in wants {
                         report(
                             broker,
                             want.binding_id,
@@ -499,7 +598,14 @@ impl Link {
             };
             let notice = async {
                 match client.as_ref() {
-                    Some(client) => client.notice().await,
+                    // A document is read and dropped here, since nothing in the worker presents
+                    // one, so the many a busy component draws do not each cost a pass of the link.
+                    Some(client) => loop {
+                        match client.notice().await {
+                            Some(Notice::Document { .. }) => {}
+                            other => break other,
+                        }
+                    },
                     None => std::future::pending().await,
                 }
             };
@@ -519,14 +625,184 @@ impl Link {
                     broker.disable_rich(BrokerBindingId::new(binding_id), reason);
                 }
             }
-            // A document, a gap and a fault concern a call into the component, and nothing here
-            // makes one.
+            // A call into the component faulted and the binding survived it: a person is told
+            // which call and in whose words, and the third fault in a minute disables the binding.
+            Event::Notice(Some(Notice::Fault {
+                binding_id,
+                call,
+                detail,
+                faults_in_window,
+            })) => {
+                if let Some(broker) = broker.upgrade() {
+                    broker.note_component(
+                        BrokerBindingId::new(binding_id),
+                        ComponentNote::Fault(format!(
+                            "last fault, in {call}: {detail} ({faults_in_window} in the last \
+                             minute)"
+                        )),
+                    );
+                }
+            }
+            // The runtime's own queue lost observations and asked its component for a fresh
+            // snapshot. A document gap concerns a presentation nothing here reads.
+            Event::Notice(Some(Notice::Gap {
+                binding_id,
+                events,
+                bytes,
+                ..
+            })) if events > 0 => {
+                if let Some(broker) = broker.upgrade() {
+                    broker.note_component(
+                        BrokerBindingId::new(binding_id),
+                        ComponentNote::Loss(format!(
+                            "the plugin runtime's queue dropped {events} observations ({bytes} \
+                             bytes) and the component took a fresh snapshot"
+                        )),
+                    );
+                }
+            }
+            // A document nothing here reads.
             Event::Notice(Some(_)) => {}
         }
     }
 
+    /// Makes a binding ready to be offered observations: its held checkpoint restored where it has
+    /// one, and the snapshot after the restore answered.
+    ///
+    /// The observations between the checkpoint and this registration were not replayed, so a
+    /// restore is a loss, and the component is taken through a snapshot before it is offered
+    /// anything. A restore the component refuses leaves it as the registration made it, started
+    /// again from the live point.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure when the runtime cannot be reached.
+    async fn make_ready(
+        &mut self,
+        broker: &Weak<Broker>,
+        want: &ComponentWant,
+    ) -> Result<(), ServiceError> {
+        let Some(client) = self.client.clone() else {
+            return Ok(());
+        };
+        let binding = want.binding_id;
+        let held = self
+            .lane
+            .take_held(binding, want.package_digest, want.generation);
+        if let Some(held) = held {
+            let what = "the component's state was restored from a checkpoint, and the observations                         since it was taken were not replayed"
+                .to_owned();
+            let owed = self.lane.lose_unready(binding, what.clone());
+            let restored = client
+                .restore(service_id(binding), held.state, CALL_WAIT)
+                .await;
+            match restored {
+                Ok(called) if called.answered() => {
+                    match client.snapshot(service_id(binding), CALL_WAIT).await {
+                        Ok(_) => {
+                            self.lane.snapshot_answered(binding, owed);
+                        }
+                        Err(ServiceError::Unavailable { detail }) => {
+                            return Err(ServiceError::Unavailable { detail });
+                        }
+                        // The pump asks again before it offers anything.
+                        Err(_) => {}
+                    }
+                    if let Some(strong) = broker.upgrade() {
+                        strong.note_component(
+                            binding,
+                            ComponentNote::Loss(format!("{what}; a fresh snapshot was taken")),
+                        );
+                    }
+                }
+                Err(ServiceError::Unavailable { detail }) => {
+                    return Err(ServiceError::Unavailable { detail });
+                }
+                // Refused, faulted or not reached in time: the component is as the registration
+                // made it, and has nothing of the earlier state to be taken through a snapshot.
+                Ok(_) | Err(_) => {
+                    self.lane.snapshot_answered(binding, owed);
+                }
+            }
+        }
+        self.lane.set_ready(binding, true);
+        Ok(())
+    }
+
+    /// Takes the state of the bindings that are due it, and asks the runtime what it is doing when
+    /// it is time. Says how long to leave before either is due again.
+    async fn keep_up(
+        &mut self,
+        broker: &Weak<Broker>,
+        wants: &[ComponentWant],
+    ) -> Option<Duration> {
+        let client = self.client.clone()?;
+        if self.registered.is_empty() {
+            self.health_due = None;
+            return None;
+        }
+        let now = tokio::time::Instant::now();
+        let due = *self.health_due.get_or_insert(now + HEALTH_EVERY);
+        if now >= due {
+            self.health_due = Some(now + HEALTH_EVERY);
+            match client.health().await {
+                Ok(_) => self.health_failures = 0,
+                Err(ServiceError::Unavailable { detail }) => {
+                    self.lose(broker, &detail);
+                    return Some(self.pace.remaining(tokio::time::Instant::now()));
+                }
+                Err(_) => {
+                    self.health_failures = self.health_failures.saturating_add(1);
+                    if self.health_failures >= HEALTH_FAILURES {
+                        self.lose(broker, "the plugin runtime stopped answering");
+                        return Some(self.pace.remaining(tokio::time::Instant::now()));
+                    }
+                }
+            }
+        }
+        // One binding's state at a time; the next is taken on the next pass.
+        let now = tokio::time::Instant::now();
+        if let Some(binding) = self.lane.checkpoint_due(now).into_iter().next() {
+            self.lane.checkpoint_attempted(binding, now);
+            let want = wants.iter().find(|want| want.binding_id == binding);
+            match client.checkpoint(service_id(binding), CALL_WAIT).await {
+                Ok(called) => {
+                    if let (Some(state), Some(want)) = (called.state, want) {
+                        self.lane.hold(
+                            binding,
+                            Held {
+                                package_digest: want.package_digest,
+                                generation: want.generation,
+                                state,
+                            },
+                        );
+                    }
+                }
+                Err(ServiceError::Unavailable { detail }) => {
+                    self.lose(broker, &detail);
+                    return Some(self.pace.remaining(tokio::time::Instant::now()));
+                }
+                Err(_) => {}
+            }
+        }
+        let now = tokio::time::Instant::now();
+        let health = self
+            .health_due
+            .map_or(HEALTH_EVERY, |due| due.saturating_duration_since(now));
+        Some(
+            self.lane
+                .next_checkpoint(now)
+                .map_or(health, |checkpoint| checkpoint.min(health)),
+        )
+    }
+
     /// Records that the runtime is gone: every registration on it with it.
     fn lose(&mut self, broker: &Weak<Broker>, reason: &str) {
+        // Nothing is offered to a binding the runtime no longer holds, and what it held of the
+        // component's state stays, for the registration that follows.
+        self.lane.all_not_ready();
+        self.health_due = None;
+        self.health_failures = 0;
         for binding_id in std::mem::take(&mut self.registered) {
             report(
                 broker,
@@ -534,6 +810,9 @@ impl Link {
                 ComponentState::Unavailable,
                 Some(reason),
             );
+            if let Some(strong) = broker.upgrade() {
+                strong.note_component(binding_id, ComponentNote::Clear);
+            }
         }
         self.refused.clear();
         self.hold(broker, None);
@@ -577,11 +856,6 @@ fn report(
     if let Some(broker) = broker.upgrade() {
         broker.set_component_state(binding_id, state, reason);
     }
-}
-
-/// The runtime's name for a binding.
-fn as_service_id(binding_id: BrokerBindingId) -> BindingId {
-    BindingId::new(binding_id.get())
 }
 
 /// Which code the runtime is asked to run: the package, its release, the generation of its
