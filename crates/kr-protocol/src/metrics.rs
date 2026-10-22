@@ -21,10 +21,10 @@
 //!
 //! Local diagnostics. A host keeps its totals in memory for the life of the process and reports
 //! them to its owner, into a support bundle the owner chooses to write, and to a paired device
-//! that holds the right to manage the host. A device that holds only a right over a session is
-//! answered the host's diagnostics with nothing counted, because a count names a bundled connector
-//! that failed, which is a fact about the host and not about a session. No service receives them
-//! from the host. A total starts again when the process that counted it does.
+//! whose grant, as this host's policy and ceilings leave it, holds the right to manage the host.
+//! Any other device is answered the host's diagnostics without them, because a count names a
+//! bundled connector that failed, which is a fact about the host and not about a session. No
+//! service receives them from the host. A total starts again when the process that counted it does.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;

@@ -344,25 +344,7 @@ impl RemoteConnection {
             );
         };
         let answer = match route {
-            DeviceRead::Daemon => {
-                let answer = self.controller.read_method(&actor_id, request).await;
-                // What the host measured about itself is a fact about the host: it names a
-                // bundled connector that failed. It is read under the authority to manage the
-                // host and not under a right over a session, so a device without that authority
-                // is answered the diagnostics with nothing counted.
-                if entry.method == Method::HostDoctor
-                    && !decided
-                        .decision
-                        .decided
-                        .permitted
-                        .rights
-                        .contains(&kr_protocol::rights::ActionRight::HostManage)
-                {
-                    super::narrowing::without_host_metrics(answer)
-                } else {
-                    answer
-                }
-            }
+            DeviceRead::Daemon => self.controller.read_method(&actor_id, request).await,
             DeviceRead::Narrowed => {
                 // A recorded version is read only inside the grant: its environment, its session
                 // and the moment its history reaches back to, the check `changeset.materialize`
