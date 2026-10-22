@@ -1757,6 +1757,56 @@ fn a_viewer_is_shown_the_changes_its_history_reaches_and_no_earlier_ones() {
     );
 }
 
+/// KR-REQ-10.49: a change recorded last that the viewer's history does not reach, because the
+/// moment it carries is earlier than the viewer's bound, is not something more to ask for: the view
+/// goes past it and says nothing more is to come, and the next view is not empty with `more` set.
+#[test]
+fn a_change_the_viewer_does_not_reach_at_the_end_of_the_log_leaves_nothing_more_to_ask_for() {
+    let mut attention = engine();
+    for (sequence, version, at_ms) in [
+        (1_u64, 1_u64, 1_000_u64),
+        (2, 2, 2_000),
+        (3, 3, 3_000),
+        (4, 4, 500),
+    ] {
+        attention
+            .apply(&turn_completed(sequence, at_ms, version), reading(0))
+            .expect("the store records the decision");
+    }
+    let admits_one = |candidate: SessionId| candidate == session(1);
+    let viewer = Viewer::Device(DeviceScope {
+        grant_id: kr_protocol::ids::GrantId::new(Uuid::from_bytes([1; 16])),
+        session_view: true,
+        automation_manage: false,
+        host_manage: false,
+        admits_session: &admits_one,
+        history_from_ms: NOON + 2_000,
+    });
+    let page = attention
+        .changed(
+            &actor("device:phone"),
+            &viewer,
+            session(1),
+            100,
+            0,
+            Content::Narrowed,
+        )
+        .expect("the store is this owner's");
+    assert_eq!(page.result.changes.len(), 4, "the second and third turns");
+    assert!(
+        !page.result.more,
+        "the change recorded last is before the viewer's bound and is not more to come"
+    );
+    let all = attention
+        .changed_as(&actor("device:phone"), 100, 0, Content::Narrowed)
+        .expect("the store is this owner's");
+    assert_eq!(
+        page.result.to_cursor.get(),
+        all.to_cursor,
+        "and the view ends where the whole log does"
+    );
+}
+
 #[test]
 fn changed_since_a_visit_compares_the_acknowledged_cursor_with_the_current_events() {
     let mut attention = engine();
