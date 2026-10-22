@@ -793,6 +793,13 @@ impl RemoteConnection {
                     "this device's grant does not include the session's live screen",
                 ))
             }
+            // The attention inbox, the changed-since-last-visit view and review state of a device
+            // are decided where they are read, by the attention store: each is narrowed to the
+            // moment the grant's history reaches back to, from when the host first saw the
+            // condition or recorded the change. A paired device is served the host's own record
+            // and none of a session's text, since the store holds the moment it saw each record
+            // and not the moment the text the record names was produced.
+            Method::AttentionRead | Method::VisitChanged | Method::ReviewRead => Ok(()),
             // Everything else returns metadata or an effect rather than session content, or
             // content the session's worker holds to the scope this connection sends with the read:
             // an agent's snapshot and an approval's record. The registry's filter is recorded here
