@@ -301,6 +301,19 @@ impl Controller {
         self.after_the_retained_lookup.arm()
     }
 
+    /// Arms the pause the next automation mutation stops at once the admission it arrived under
+    /// has been asked, before the workflow journal's transaction asks it again. Returns the end
+    /// that says the mutation has arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_the_automation_admission(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.after_the_automation_admission.arm()
+    }
+
     /// Arms the pause the next network connection stops at once the transport has authorised it,
     /// before this host registers it. Returns the end that says the connection has arrived, and
     /// the end that lets it go. The pause fires once.
