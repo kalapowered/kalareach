@@ -1239,6 +1239,10 @@ mod a_withdrawal_that_meets_an_end_not_yet_written;
 #[cfg(test)]
 mod a_voice_receipt_from_an_earlier_build;
 
+/// What the daemon collects of the sessions that have closed, begun by the daemon itself.
+#[cfg(test)]
+mod a_collection_started_with_the_daemon;
+
 /// The transfer service's de-duplication records, forgotten on a clock this host can prove.
 #[cfg(test)]
 mod a_sweep_on_a_clock_in_doubt;
