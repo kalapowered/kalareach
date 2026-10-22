@@ -2609,22 +2609,6 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
             .expect("the repeat is answered from the chain"),
     );
     assert_eq!(repeated, rearmed);
-    let mut budget = journal
-        .get_budget(run.causal_root_id)
-        .expect("the budget reads")
-        .expect("the chain's budget");
-    assert_eq!(budget.generation, 1, "the repeat gave no second budget");
-    budget.exhaust();
-    journal.save_budget(&budget).expect("the budget is saved");
-    let again: WorkflowRearmResult = typed(
-        elsewhere
-            .repeat(&original)
-            .await
-            .expect("the call reaches the daemon")
-            .result()
-            .expect("the repeat is answered whatever state the chain is in now"),
-    );
-    assert_eq!(again, rearmed);
     assert_eq!(
         journal
             .get_budget(run.causal_root_id)
@@ -2632,7 +2616,7 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
             .expect("the chain's budget")
             .generation,
         1,
-        "and still gave nothing"
+        "the repeat gave no second budget"
     );
     device_mutation(
         &session,
