@@ -180,6 +180,47 @@ pub fn broker_grants(granted: &BTreeSet<PluginCapability>) -> BrokerGrants {
     BrokerGrants::granted(grants)
 }
 
+/// Which of the streams a component may be offered a binding's installation granted.
+///
+/// The `Observation` grant is one grant for four capabilities, and a binding that holds it may not
+/// be offered everything those four name: the connector's own upstream frames are
+/// `broker.semantic_events`, and the terminal's output is `terminal.stream`. A binding therefore
+/// keeps which of the two it was granted, and the plugin runtime's observations are offered by
+/// this and by nothing else.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Streams {
+    /// The connector's own upstream frames (`broker.semantic_events`).
+    pub semantic: bool,
+    /// The terminal's output (`terminal.stream`).
+    pub terminal: bool,
+}
+
+impl Streams {
+    /// The streams a set of effective capabilities grants.
+    #[must_use]
+    pub fn of(granted: &BTreeSet<PluginCapability>) -> Self {
+        Self {
+            semantic: granted.contains(&PluginCapability::BrokerSemanticEvents),
+            terminal: granted.contains(&PluginCapability::TerminalStream),
+        }
+    }
+
+    /// What two sets of streams both grant.
+    #[must_use]
+    pub const fn within(self, other: Self) -> Self {
+        Self {
+            semantic: self.semantic && other.semantic,
+            terminal: self.terminal && other.terminal,
+        }
+    }
+
+    /// Returns true when no stream is granted.
+    #[must_use]
+    pub const fn is_none(self) -> bool {
+        !self.semantic && !self.terminal
+    }
+}
+
 /// The grants and trust an admitted package gives a binding now.
 fn derived(read: &ReadPackage, granted: &BTreeSet<PluginCapability>, now: TimestampMs) -> Derived {
     Derived {
@@ -188,14 +229,16 @@ fn derived(read: &ReadPackage, granted: &BTreeSet<PluginCapability>, now: Timest
             ReadPackage::Connector(connector) => decoding_trust(connector, now),
             ReadPackage::Declarative(_) => None,
         },
+        streams: Streams::of(granted),
     }
 }
 
-/// A binding's grants and decoding trust.
+/// A binding's grants, decoding trust and observed streams.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Derived {
     grants: BrokerGrants,
     trust: Option<DecodingTrust>,
+    streams: Streams,
 }
 
 impl Binding {
@@ -435,7 +478,11 @@ impl BrokerState {
             )));
         }
         let granted = capabilities(&package.grants);
-        let Derived { grants, trust } = derived(&read, &granted, now);
+        let Derived {
+            grants,
+            trust,
+            streams,
+        } = derived(&read, &granted, now);
         if let Some(trust) = trust.as_ref() {
             trust.validate()?;
         }
@@ -453,6 +500,7 @@ impl BrokerState {
             package_digest,
             grants,
             trust,
+            streams,
             actions: BTreeMap::new(),
             rich_disabled: None,
             release: Some(LiveRelease {
@@ -499,6 +547,7 @@ impl BrokerState {
         );
         self.bindings.insert(binding_id, binding);
         self.component_states.remove(&binding_id);
+        self.component_notes.remove(&binding_id);
         self.component_changes.notify_one();
         self.settle_owed_rows(now);
         self.renew_every_gateway_evidence(now);
@@ -549,6 +598,7 @@ impl BrokerState {
         };
         if binding.grants == target.grants
             && same_trust(binding.trust.as_ref(), target.trust.as_ref())
+            && binding.streams == target.streams
         {
             return Ok(());
         }
@@ -556,12 +606,15 @@ impl BrokerState {
             trust.validate()?;
         }
         let kept = kept_within(binding, target);
-        if binding.grants != kept.grants || !same_trust(binding.trust.as_ref(), kept.trust.as_ref())
+        if binding.grants != kept.grants
+            || !same_trust(binding.trust.as_ref(), kept.trust.as_ref())
+            || binding.streams != kept.streams
         {
             let mut instance = None;
             if let Some(binding) = self.bindings.get_mut(&binding_id) {
                 binding.grants = kept.grants;
                 binding.trust = kept.trust;
+                binding.streams = kept.streams;
                 binding.frame = Some(frame);
                 instance = Some(binding.application_instance_id);
             }
@@ -578,6 +631,7 @@ impl BrokerState {
         let mut changed = binding.clone();
         changed.grants = target.grants.clone();
         changed.trust = target.trust.clone();
+        changed.streams = target.streams;
         changed.frame = Some(frame);
         let record = changed.record(TimestampMs::new(0));
         self.stored(now, "changing a binding's grants", |ledger| {
@@ -586,6 +640,7 @@ impl BrokerState {
         if let Some(binding) = self.bindings.get_mut(&binding_id) {
             binding.grants = changed.grants;
             binding.trust = changed.trust;
+            binding.streams = changed.streams;
             binding.frame = changed.frame;
         }
         self.owed_rows.remove(&binding_id);
@@ -801,6 +856,7 @@ impl BrokerState {
                 self.owed_rows.insert(binding_id);
                 self.revoked_settled(&binding.plugin_id, binding_id);
                 self.component_states.remove(&binding_id);
+                self.component_notes.remove(&binding_id);
                 self.component_changes.notify_one();
             }
         }
@@ -885,6 +941,7 @@ fn kept_trust(binding: &Binding, admitted: Derived) -> Derived {
     Derived {
         grants: admitted.grants,
         trust,
+        streams: admitted.streams,
     }
 }
 
@@ -906,7 +963,11 @@ fn kept_within(binding: &Binding, target: &Derived) -> Derived {
         }
         _ => None,
     };
-    Derived { grants, trust }
+    Derived {
+        grants,
+        trust,
+        streams: binding.streams.within(target.streams),
+    }
 }
 
 /// A binding on a release the admissions do not admit, narrowed by that release's cap: never
@@ -925,7 +986,11 @@ fn narrowed(binding: &Binding, cap: &BTreeSet<PluginCapability>) -> Derived {
     } else {
         None
     };
-    Derived { grants, trust }
+    Derived {
+        grants,
+        trust,
+        streams: binding.streams.within(Streams::of(cap)),
+    }
 }
 
 /// Returns true when two trust records grant the same, whenever each was granted.

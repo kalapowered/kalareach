@@ -534,6 +534,9 @@ impl WorkerService {
         // description facts as well.
         let description_facts = runtime.session().description_facts();
         broker.set_description_facts(description_facts.clone());
+        // The session's terminal output is offered to the components that observe it through the
+        // broker's lane, which costs the session one load per span while none does.
+        runtime.session().observe_with(broker.observation());
         // The broker is the bridge that says which launched agent a question's source belongs to
         // and the binding it asks under, so a switch it detects invalidates what was asked under
         // the binding it left.
@@ -4159,7 +4162,9 @@ impl WorkerService {
             return failure(RequestId::new(0), &error.to_protocol_error());
         }
         let session = self.runtime.session();
-        let completion = session.reconcile_privacy(&[&attention]);
+        let observation =
+            crate::broker::observation::ObservationPrivacy::over(self.broker.observation());
+        let completion = session.reconcile_privacy(&[&attention, &observation]);
         let privacy = session.privacy();
         let session_id = session.id();
         drop(session);
