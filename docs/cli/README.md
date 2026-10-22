@@ -1066,6 +1066,13 @@ authority this command's own connection was admitted under; the command opens a 
 again, so the report is the one this host is acting on rather than the one it was acting on a
 moment ago.
 
+A `metric` line follows the checks for each series this host has counted of what it measures about
+itself: how long a paired device was without a connection, the faults a terminal's parser met and
+the failures of an adapter, each under labels from a closed list. A host that has counted nothing
+prints no such line. `--json` carries the same series under `doctor.metrics`, and the support bundle
+below carries the lines as they are. The host guide's "What the host measures about itself" says
+what each one counts.
+
 The exit status is 0 when no check failed and 1 when one did. `--json` returns one document with
 `ok`, `host`, `doctor`, `configuration` and `environment`, and `bundle` when one was written.
 
