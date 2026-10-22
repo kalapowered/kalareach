@@ -3607,7 +3607,7 @@ async fn the_host_makes_a_backup_of_a_closed_session_and_its_configuration_once_
     let document: serde_json::Value =
         serde_json::from_slice(&members[&format!("sessions/{session}.json")])
             .expect("a session export");
-    assert_eq!(document["format"], "kalareach-session-export/1");
+    assert_eq!(document["format"], "kalareach-session-export/2");
     let output: Vec<u8> = document["output"]["chunks"]
         .as_array()
         .expect("chunks")
