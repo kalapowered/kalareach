@@ -1421,7 +1421,7 @@ async fn a_phone_with_no_ceremony_still_lists_what_its_host_asks() {
     );
 }
 
-/// KR-REQ-10.52: a ceremony the phone starts to offer after the application started reaches the page
+/// A ceremony the phone starts to offer after the application started reaches the page
 /// without a request coming or going, so the button is named for it as soon as it is known.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_page_is_told_when_the_ceremony_this_phone_offers_changes() {

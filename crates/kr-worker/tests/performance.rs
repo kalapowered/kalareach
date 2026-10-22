@@ -725,7 +725,7 @@ const OVER_THE_PROCESSOR_BOUND: f64 = 0.012;
 /// A figure under the memory bound, as every runner reads it.
 const UNDER_THE_MEMORY_BOUND_KIB: u64 = 360_000;
 
-/// KR-PERF-003: the processor figure is a claim about a reference host, so a host short of one
+/// The idle processor figure is a claim about a reference host, so a host short of one
 /// records the figure and names what it lacks rather than failing on it. Section 27's reference
 /// host has four processors and 8 GiB.
 #[test]
@@ -753,7 +753,7 @@ fn a_host_short_of_the_reference_host_records_the_idle_processor_figure_without_
     );
 }
 
-/// KR-PERF-003: where nothing read falls short of the reference host, the target is asserted.
+/// Where nothing read falls short of the reference host, the idle processor target is asserted.
 #[test]
 fn a_host_with_no_shortfall_fails_an_idle_processor_figure_over_the_bound() {
     let reference = record::Conditions::supplied(4, 8 * 1024, Some(0.0));
@@ -779,7 +779,7 @@ fn a_host_with_no_shortfall_fails_an_idle_processor_figure_over_the_bound() {
     assert_eq!(under.check(), Ok(()), "a figure under the bound passes");
 }
 
-/// KR-PERF-003: the memory bound is a size, so it is asserted on every host.
+/// The idle memory bound is a size, so it is asserted on every host.
 #[test]
 fn a_host_short_of_the_reference_host_still_fails_idle_memory_over_the_bound() {
     let short = record::Conditions::supplied(3, 7 * 1024, None);
@@ -1032,7 +1032,7 @@ impl Attached {
     }
 }
 
-/// KR-PERF-004: an attach waits for the disk to make three journal records durable, so a host whose
+/// An attach waits for the disk to make three journal records durable, so a host whose
 /// disk takes longer than a reference host's for a durable write records the figure and names the
 /// disk rather than failing on it.
 #[test]
@@ -1066,7 +1066,7 @@ fn a_host_with_a_slow_disk_records_the_attach_figure_without_asserting_it() {
     );
 }
 
-/// KR-PERF-004: where the disk is as fast as a reference host's, or was not read, the bound is
+/// Where the disk is as fast as a reference host's, or was not read, the bound is
 /// asserted, and so it is on a host short in any other way.
 #[test]
 fn a_host_with_a_fast_disk_fails_an_attach_over_the_bound() {

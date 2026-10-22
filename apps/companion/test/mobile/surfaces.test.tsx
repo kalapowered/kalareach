@@ -318,7 +318,7 @@ describe('the camera of the attachment picker, when the system refuses it (KR-RE
   })
 })
 
-describe("the owner's confirmations on a phone (KR-REQ-10.52)", () => {
+describe("the owner's confirmations on a phone", () => {
   const owed = (): ConfirmationRequest => ({
     reference: 'r-1',
     host_name: 'studio',

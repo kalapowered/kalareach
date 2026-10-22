@@ -124,7 +124,7 @@ for (const surface of ['ios', 'android'] as const) {
   }
 }
 
-// KR-REQ-10.52: a request the host asks a phone to confirm keeps the words the whole width of the
+// A request the host asks a phone to confirm keeps the words the whole width of the
 // row at the default text size on a phone 390 points wide, and the buttons go under them: beside
 // the words they took most of the row, and the title ran a word to a line.
 for (const surface of ['ios', 'android'] as const) {
