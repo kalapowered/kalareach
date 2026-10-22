@@ -162,31 +162,7 @@ describe('the attention inbox shows its newest read', () => {
   })
 })
 
-describe('change sets and retained artefacts show their newest read', () => {
-  const shows = (id: string) => screen.queryByTestId(`delete-${id}`) !== null
-
-  it('keeps the newer artefacts when two reads answer in reverse order', async () => {
-    const person = userEvent.setup()
-    const { port, controls } = fakeHost()
-    const held = controls.hold('storageStatus')
-    open(port, { view: 'changesets' })
-    await made(held, 1)
-    await answer(held, 0)
-    expect(shows('obj-2')).toBe(true)
-
-    // Each deletion reads the list again.
-    await person.click(screen.getByTestId('delete-obj-1'))
-    await made(held, 2)
-    await person.click(screen.getByTestId('delete-obj-2'))
-    await made(held, 3)
-
-    await answer(held, 2)
-    expect(shows('obj-2')).toBe(false)
-    await answer(held, 1)
-    expect(shows('obj-2')).toBe(false)
-    expect(shows('obj-1')).toBe(false)
-  })
-
+describe('change sets show their newest read', () => {
   it('lets a retry give way to a later one', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()
@@ -221,12 +197,13 @@ describe('change sets and retained artefacts show their newest read', () => {
     expect(screen.queryByText('This could not be read')).toBeNull()
   })
 
-  it('shows what it read when nothing changed in between', async () => {
+  it('shows what has left the host beside the change sets it read', async () => {
     const { port } = fakeHost()
     open(port, { view: 'changesets' })
     await waitFor(() => {
-      expect(shows('obj-2')).toBe(true)
+      expect(screen.queryByTestId('retained-artefacts')).not.toBeNull()
     })
+    expect(screen.getByTestId(`change-set-${CHANGE_SET}`)).toBeInTheDocument()
   })
 })
 

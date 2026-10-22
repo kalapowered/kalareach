@@ -70,6 +70,7 @@ import type {
   PendingResource,
   PluginListParams,
   PluginListResult,
+  PrivacyReport,
   ProjectedHyperlink,
   Question,
   QuestionAnswer,
@@ -1686,8 +1687,11 @@ export interface HostPort {
 
   changesetRead(params: ChangesetReadParams): Promise<ChangesetReadResult>
 
-  storageStatus(params: unknown): Promise<unknown>
-  storageObjectDelete(params: unknown, subject: SessionSubject): Promise<Settled>
+  /**
+   * Where privacy mode stands, and what has already left the host: the archives and notifications
+   * it sent and the devices that may hold a copy. They are listed and not erased.
+   */
+  privacyStatus(): Promise<PrivacyReport>
 
   /**
    * Opens a raw terminal view of one session, `grid` in size. Native code attaches it to the

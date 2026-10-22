@@ -131,6 +131,9 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     // actions that change who holds a session are attempts this application keeps its word about,
     // and the hand-over of control asks an owner device first.
     ("device_list", Some(Method::DeviceList)),
+    // What privacy mode reports: whether it is on, and the copies that have left the host and are
+    // shown rather than erased. The page lists them and offers no action on them.
+    ("privacy_status", Some(Method::PrivacyStatus)),
     ("grant_notices", None),
     ("session_screen_preview", Some(Method::SessionScreenPreview)),
     ("grant_create", Some(Method::GrantCreate)),
@@ -540,6 +543,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         review_acknowledge,
         changeset_read,
         device_list,
+        privacy_status,
         grant_notices,
         session_screen_preview,
         grant_create,
@@ -1517,6 +1521,12 @@ read_command!(
     /// Lists the devices paired with this host, which is who an invitation can be issued to.
     device_list, Method::DeviceList,
     kr_protocol::sharing::DeviceListParams => kr_protocol::sharing::DeviceListResult
+);
+read_command!(
+    /// Reads where privacy mode stands and what has already left the host: the archives and
+    /// notifications it sent and the devices that may hold a copy. They are shown and not erased.
+    privacy_status, Method::PrivacyStatus,
+    kr_protocol::privacy::PrivacyStatusParams => kr_protocol::privacy::PrivacyReport
 );
 /// Issues one invitation: a grant to a paired device, carrying the notices its issuer was shown.
 /// The host refuses one whose notices differ from what the grant actually carries.
@@ -3372,6 +3382,7 @@ mod tests {
         "review_acknowledge",
         "changeset_read",
         "device_list",
+        "privacy_status",
         "grant_notices",
         "grant_create",
         "grant_list",
@@ -3867,6 +3878,7 @@ mod tests {
             review_acknowledge,
             changeset_read,
             device_list,
+            privacy_status,
             session_screen_preview,
             grant_create,
             grant_list,
