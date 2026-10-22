@@ -494,6 +494,7 @@ mod tests {
             },
             machine: None,
             privacy,
+            default_shell_mode: None,
         }
     }
 

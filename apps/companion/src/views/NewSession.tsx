@@ -8,6 +8,11 @@
  * it keeps everything else and claims none of those three. The difference is shown here, side by
  * side, before anything is created, and again in the session's status.
  *
+ * Which shell the sheet starts on is the host's answer, not the page's: the host resolves the mode a
+ * session is created in when nothing names one (its configuration's choice, then the managed shell)
+ * and says which of the two it came from, and the sheet shows both. A choice made here is this
+ * session's own and changes nothing on the host.
+ *
  * A managed shell the host cannot qualify is refused with the host's reason. The page never creates
  * a stock shell in its place: choosing one from that refusal chooses it, and the person creates it.
  */
@@ -52,6 +57,25 @@ export const SHELL_DIFFERENCE: readonly {
 export const SHELL_COMMON =
   'Attaching, detaching and closing, file transfer, agents you start, and the terminal. Detach is always there.'
 
+/** The shell a host without an answer of its own creates: section 7 makes the managed shell the default. */
+const PRODUCT_DEFAULT: ShellMode = 'managed'
+
+/** What a person is told about where the host's default shell comes from. */
+export function defaultShellSaid(
+  host: Pick<HostInfoResult, 'default_shell_mode'>,
+  chosen: ShellMode
+): string {
+  const answered = host.default_shell_mode ?? null
+  const mode = answered?.mode ?? PRODUCT_DEFAULT
+  const which = mode === 'managed' ? 'the managed shell' : 'a stock shell'
+  const from =
+    answered?.source === 'host_configuration'
+      ? 'chosen in its configuration'
+      : 'the product default'
+  const said = `This host starts ${which} unless a session asks for another: ${from}.`
+  return chosen === mode ? said : `${said} Your choice here is for this session only.`
+}
+
 /** Why a creation did not happen, in the host's words. */
 interface Refusal {
   readonly title: string
@@ -73,7 +97,15 @@ export function NewSession({
 }): ReactNode {
   const { port, go, say } = useApp()
   const [directory, setDirectory] = useState('')
-  const [mode, setMode] = useState<ShellMode>('managed')
+  // What the person chose in this opening of the sheet; none until they choose, so the host's own
+  // answer decides what the sheet starts on.
+  const [chosen, setChosen] = useState<ShellMode | null>(null)
+  const [wasOpen, setWasOpen] = useState(open)
+  if (open !== wasOpen) {
+    // A sheet that opens again starts on the host's answer, not on the last opening's choice.
+    setWasOpen(open)
+    if (open) setChosen(null)
+  }
   const [host, setHost] = useState<HostInfoResult | null>(null)
   const [unread, setUnread] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
@@ -100,6 +132,7 @@ export function NewSession({
     return reads.stop
   }, [open, port])
 
+  const mode: ShellMode = chosen ?? host?.default_shell_mode?.mode ?? PRODUCT_DEFAULT
   const cwd = directory.trim()
   const ready = host !== null && cwd.length > 0 && !creating
 
@@ -190,7 +223,7 @@ export function NewSession({
               refusal.unqualified ? (
                 <Button
                   onClick={() => {
-                    setMode('native_compat')
+                    setChosen('native_compat')
                     setRefusal(null)
                   }}
                 >
@@ -221,7 +254,10 @@ export function NewSession({
           </span>
         </div>
 
-        <fieldset className="settings-group shell-choice">
+        <fieldset
+          className="settings-group shell-choice"
+          aria-describedby={host === null ? undefined : `${field}-default`}
+        >
           <legend>Shell</legend>
           <label className="choice-row">
             <input
@@ -230,7 +266,7 @@ export function NewSession({
               value="managed"
               checked={mode === 'managed'}
               onChange={() => {
-                setMode('managed')
+                setChosen('managed')
               }}
             />
             <span>
@@ -245,7 +281,7 @@ export function NewSession({
               value="native_compat"
               checked={mode === 'native_compat'}
               onChange={() => {
-                setMode('native_compat')
+                setChosen('native_compat')
               }}
             />
             <span>
@@ -254,6 +290,11 @@ export function NewSession({
             </span>
           </label>
         </fieldset>
+        {host === null ? null : (
+          <span className="form-hint" id={`${field}-default`} data-testid="shell-default">
+            {defaultShellSaid(host, mode)}
+          </span>
+        )}
 
         <ShellDifference chosen={mode} />
       </div>
