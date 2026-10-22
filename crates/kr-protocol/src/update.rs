@@ -522,9 +522,15 @@ const FLOOR_FORM: &str = "a floor's version is `<major>.<minor>`";
 ///
 /// An entry keeps `patch_revisions` beside `patches`. The release before package managers reads an
 /// entry by its shell, its identity and that member alone, and requires all three, so a manifest
-/// without it would be refused by every host still on that release. A release built before an entry
-/// said more has only those three, and is read as such: the members that say more are absent from
-/// it.
+/// without it would be refused by every host still on that release. This reader requires the three
+/// as well, so every release written while that release is in the support window writes
+/// `patch_revisions`. A release built before an entry said more has only those three, and is read
+/// as such: the members that say more are absent from it.
+///
+/// There is no reading for an entry that states `patches` and leaves `patch_revisions` out. No
+/// build wrote one that a host holds: such a release was never published, and the archives a
+/// proving run keeps are signed with a root of the run's own, which no host trusts. A reader for
+/// that form would be a second shape of data that does not exist.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseShell {
     /// Which shell: `zsh`, `bash`, `fish` or `powershell`.
@@ -1117,9 +1123,10 @@ impl ReleaseManifest {
     pub fn check(&self) -> Result<(), ManifestError> {
         for shell in &self.shells {
             let stated = shell.patches.iter().map(|patch| patch.revision.as_str());
-            if shell.upstream.is_some()
-                && !shell.patch_revisions.iter().map(String::as_str).eq(stated)
-            {
+            // An entry from a release built before entries said more states neither, and is not
+            // held to a list it does not have.
+            let says_more = shell.upstream.is_some() || !shell.patches.is_empty();
+            if says_more && !shell.patch_revisions.iter().map(String::as_str).eq(stated) {
                 return Err(ManifestError::Malformed(format!(
                     "the {} package lists other revisions in `patch_revisions` than its `patches` \
                      carry",
@@ -1965,6 +1972,9 @@ mod tests {
         written.shells[0].patch_revisions = vec!["1".to_owned(), "2".to_owned()];
         assert!(matches!(written.check(), Err(ManifestError::Malformed(_))));
         written.shells[0].patch_revisions = vec!["1".to_owned()];
+        assert!(written.check().is_err());
+        // An entry that states its patches and no upstream release is held to the same rule.
+        written.shells[0].upstream = None;
         assert!(written.check().is_err());
     }
 
