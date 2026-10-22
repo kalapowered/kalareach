@@ -1358,8 +1358,6 @@ async fn a_connection_that_admits_no_mutation_is_refused_by_the_daemon() {
 
 /// KR-REQ-09.16, KR-REQ-23.24: a retry whose freshness *and* authority have both gone is refused
 /// for the authority, rather than answered because the freshness went first.
-/// KR-REQ-02.08, the part that is about current state: the authority a retry is decided under is
-/// the authority in force now.
 ///
 /// Both are gone before the retry is submitted, which is the ordinary case rather than a race: what
 /// this proves is the order the admission answers in. A withdrawal that happens *during* a wait is
