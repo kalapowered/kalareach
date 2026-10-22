@@ -715,6 +715,124 @@ fn ownership_is_refused_while_the_worker_is_alive() {
 }
 
 #[test]
+fn two_recoveries_of_one_session_contend_and_the_second_is_refused() {
+    // KR-REQ-24.18: ownership is exclusive, and not by convention. A recovery, a collection or a
+    // migration of one session holds the session's lock for as long as it holds the ownership, so
+    // a second to ask is refused while the first stands, and is let in once the first is done.
+    let (_temp, archive) = host();
+    let session_id = session();
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    let first = archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("the first takes it");
+    let second = archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect_err("the stores are the first's while it stands");
+    assert_eq!(
+        second,
+        kr_controller::archive::OwnershipRefusal::Held {
+            session: session_id.to_string()
+        }
+    );
+    // Another session is not held by it.
+    archive
+        .take_ownership(session(), DisplayNumber::new(2), &ended)
+        .expect("another session is its own");
+    drop(first);
+    archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("once the first is done the session can be taken again");
+}
+
+#[test]
+fn a_collection_of_a_closed_session_is_refused_while_a_recovery_holds_it() {
+    // The collector and a crash recovery reach the same stores by different doors; the lock is
+    // what they have in common.
+    let (_temp, archive) = host();
+    let session_id = closed_session_with_history(&archive, true);
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    let recovery = archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("a recovery holds the session");
+    let refused = archive.own_closed(session_id, || Ok(false));
+    assert!(
+        matches!(
+            refused,
+            Err(kr_controller::archive::ClosedRefusal::Ownership(
+                kr_controller::archive::OwnershipRefusal::Held { .. }
+            ))
+        ),
+        "{refused:?}"
+    );
+    drop(recovery);
+    let collection = archive
+        .own_closed(session_id, || Ok(false))
+        .expect("the collection takes the session once the recovery is done");
+    assert!(
+        collection.ended().is_none(),
+        "it rests on a closure, not a death"
+    );
+}
+
+#[test]
+fn a_closed_session_a_worker_may_remain_for_is_not_owned_for_collection() {
+    // The evidence is asked with the lock held, and it is the caller's: here it says a worker may
+    // remain, so nothing is owned, and the lock is not kept by the refusal.
+    let (_temp, archive) = host();
+    let session_id = session();
+    let refused = archive.own_closed(session_id, || Ok(true));
+    assert!(
+        matches!(
+            refused,
+            Err(kr_controller::archive::ClosedRefusal::Ownership(
+                kr_controller::archive::OwnershipRefusal::WorkerMayRemain { .. }
+            ))
+        ),
+        "{refused:?}"
+    );
+    archive
+        .own_closed(session_id, || Ok(false))
+        .expect("a refusal gives the lock back");
+}
+
+#[test]
+#[cfg(unix)]
+fn ownership_is_refused_when_the_workers_endpoint_cannot_be_fenced() {
+    // A stale socket left beside a recovered journal is the state the fence exists to rule out, so
+    // an endpoint that is there and cannot be removed refuses ownership, and nothing is taken.
+    use std::os::unix::fs::PermissionsExt as _;
+    let (_temp, archive) = host();
+    let session_id = session();
+    let endpoint = PublishedEndpoint::of(&archive, DisplayNumber::new(1));
+    // The lock is made before the directory is made unwritable, which is the one thing under test.
+    drop(
+        archive
+            .own_closed(session_id, || Ok(false))
+            .expect("the lock is made"),
+    );
+    let directory = endpoint.0.parent().expect("a directory").to_path_buf();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+        .expect("makes the directory unwritable");
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    let refused = archive.take_ownership(session_id, DisplayNumber::new(1), &ended);
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+        .expect("puts the permissions back");
+    let refused = refused.expect_err("an endpoint that cannot be removed is not fenced");
+    assert!(
+        matches!(
+            refused,
+            kr_controller::archive::OwnershipRefusal::Unfenced { .. }
+        ),
+        "{refused}"
+    );
+    assert!(endpoint.exists());
+    archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("and once it can be removed, it is");
+    assert!(!endpoint.exists());
+}
+
+#[test]
 fn a_live_workers_endpoint_is_not_fenced_by_an_enquiry_that_is_refused() {
     // Fencing before validating would delete a working session's socket on the way to finding out
     // that it was working. Death is validated first, so a refusal leaves everything where it was.
@@ -753,10 +871,10 @@ fn ownership_fences_the_endpoint_once_death_is_validated() {
     let ownership = archive
         .take_ownership(session_id, DisplayNumber::new(1), &ended)
         .expect("a dead worker's stores are the archive's");
-    assert!(ownership.endpoint_fenced);
+    assert!(ownership.endpoint_fenced());
     assert!(!descriptor.exists(), "the descriptor was fenced");
     assert!(!endpoint.exists(), "the endpoint was fenced");
-    assert_eq!(ownership.session_id, session_id);
+    assert_eq!(ownership.session_id(), session_id);
 }
 
 #[test]
@@ -1455,12 +1573,116 @@ fn a_session_the_archive_holds_a_record_of_keeps_what_was_submitted_to_it() {
             .expect("records the closure");
     }
     assert!(
-        archive.retains_submissions(kept).expect("answers"),
+        archive
+            .retains_submissions(kept, None, None)
+            .expect("answers"),
         "a closed session keeps what was submitted to it"
     );
     assert!(
-        !archive.retains_submissions(session()).expect("answers"),
+        !archive
+            .retains_submissions(session(), None, None)
+            .expect("answers"),
         "a session this host has no record of keeps nothing"
+    );
+}
+
+/// A closure written `days` ago, for a session that keeps its output and no receipt.
+fn closed_days_ago(archive: &ArchiveService, days: u64) -> SessionId {
+    let session_id = session();
+    let mut record = closure(session_id, ClosureReason::CloseRequested);
+    record.closed_at_ms = TimestampMs::new(kr_ipc::now_ms().get() - days * DAY_MS);
+    {
+        let mut journal = journal_for(archive, session_id);
+        journal
+            .record_session(&summary(session_id))
+            .expect("records the summary");
+        journal
+            .record_closure(&record)
+            .expect("records the closure");
+    }
+    let mut history = kr_worker::history::OutputHistory::with_spool(
+        8,
+        archive.paths().session_spool(session_id),
+        kr_worker::history::SpoolLayout::new(8, 1 << 20),
+    )
+    .expect("a spool");
+    history.append(b"0123456789abcdef");
+    session_id
+}
+
+#[test]
+fn a_session_with_nothing_left_stops_keeping_what_was_submitted_to_it_after_thirty_days() {
+    // KR-REQ-20.21 and section 14: a submitted file follows its session's retention. The session's
+    // record is its journal and its spool, and a journal is never deleted, so what ends the
+    // retention is the session having nothing the retention governs left and being thirty days
+    // past its closure. A range that aged out is a gap and not a reason to keep a file for ever.
+    let (_temp, archive) = host();
+    let session_id = closed_days_ago(&archive, 31);
+    let now = kr_ipc::now_ms();
+
+    assert!(
+        archive
+            .retains_submissions(session_id, None, Some(now))
+            .expect("answers"),
+        "its output is still held"
+    );
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    let ownership = archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("ownership");
+    let collected = archive
+        .collect(&ownership, eight_days_on(), true)
+        .expect("collects");
+    assert_eq!(collected.output_bytes, 16, "{collected:?}");
+    drop(ownership);
+
+    let aged_out = archive.archive(session_id).expect("reads the archive");
+    assert!(
+        aged_out
+            .incompleteness
+            .iter()
+            .any(|missing| matches!(missing, Incompleteness::HistoryLost { .. })),
+        "the output that aged out is a gap: {:?}",
+        aged_out.incompleteness
+    );
+    assert!(
+        !archive
+            .retains_submissions(session_id, None, Some(now))
+            .expect("answers"),
+        "nothing is held and the closure is thirty-one days old"
+    );
+    assert!(
+        archive
+            .retains_submissions(session_id, None, None)
+            .expect("answers"),
+        "a clock the host cannot prove never ends it"
+    );
+    let earlier = TimestampMs::new(now.get() - 5 * DAY_MS);
+    assert!(
+        archive
+            .retains_submissions(session_id, None, Some(earlier))
+            .expect("answers"),
+        "a reading from before the thirtieth day does not either"
+    );
+}
+
+#[test]
+fn a_session_closed_less_than_thirty_days_ago_keeps_what_was_submitted_to_it() {
+    let (_temp, archive) = host();
+    let session_id = closed_days_ago(&archive, 2);
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    let ownership = archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("ownership");
+    archive
+        .collect(&ownership, eight_days_on(), true)
+        .expect("collects");
+    drop(ownership);
+    assert!(
+        archive
+            .retains_submissions(session_id, None, Some(kr_ipc::now_ms()))
+            .expect("answers"),
+        "the receipts' thirty days have not passed"
     );
 }
 
@@ -1472,7 +1694,11 @@ fn a_session_whose_journal_cannot_be_read_keeps_what_was_submitted_to_it() {
     let path = archive.paths().journal_database(session_id);
     std::fs::create_dir_all(path.parent().expect("a parent")).expect("the directory");
     std::fs::write(&path, b"this is not a database").expect("a file that is not a journal");
-    assert!(archive.retains_submissions(session_id).expect("answers"));
+    assert!(
+        archive
+            .retains_submissions(session_id, None, None)
+            .expect("answers")
+    );
 }
 
 #[test]

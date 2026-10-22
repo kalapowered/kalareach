@@ -609,6 +609,9 @@ impl Controller {
             return Ok(None);
         };
         // After ownership is taken, so a worker that wrote its closure in its last moments is read.
+        // The store is brought forward first, under the ownership just taken: every read below
+        // finds it at the current version and needs no hold of its own.
+        archive.bring_forward_owned(&ownership);
         let own_closure = self.recovered_closure(session_id).is_some();
         let _ = archive.recover_journal(&ownership);
         let fenced = if own_closure {

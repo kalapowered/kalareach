@@ -3301,9 +3301,12 @@ async fn the_sessions_noted_at_a_first_start_are_settled_once_none_of_them_can_r
     assert_eq!(tables(&journal()), 2);
     assert!(!submitted(&world, &actor, &belonging));
 
-    // It closes, but one launch was fenced after all, and its process runs.
+    // It closes just now, so what was submitted to it is within the thirty days a closed session
+    // keeps it, but one launch was fenced after all, and its process runs.
+    let mut closure = closure_of(world.session_id);
+    closure.closed_at_ms = kr_protocol::scalars::TimestampMs::new(controller.settled_now_ms());
     controller
-        .retire(&closure_of(world.session_id))
+        .retire(&closure)
         .await
         .expect("the closure is recorded");
     {

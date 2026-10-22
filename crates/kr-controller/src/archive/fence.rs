@@ -298,7 +298,7 @@ impl ArchiveService {
                 .iter()
                 .filter(|identity| {
                     !tracked.iter().any(|process| &process.identity == *identity)
-                        && **identity != ownership.ended
+                        && Some(*identity) != ownership.ended.as_ref()
                         && identity.pid.get() != u64::from(std::process::id())
                 })
                 .cloned()
