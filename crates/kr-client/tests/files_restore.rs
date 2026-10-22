@@ -856,6 +856,22 @@ async fn a_generation_the_checkpoint_refuses_is_refused_before_the_manifest_is_r
             .any(|call| call.contains("held to a checkpoint"))
     );
 
+    // A word that names an older generation does not cover the checkpoint's own: the service holds
+    // generation 5, which needs none, and it is not restored under a word the person gave for
+    // another.
+    let named = FilesRestore::prepare(
+        world.kit(),
+        Arc::clone(&source) as Arc<dyn RestoreSource>,
+        None,
+        Some(BackupGeneration::new(3)),
+    )
+    .await
+    .expect_err("the named generation is not what is held");
+    assert!(matches!(
+        named,
+        RestoreError::NamedGenerationNotHeld { named: 3, held: 5 }
+    ));
+
     // An older generation than the checkpoint, genuinely signed.
     let older = world.seal(3, &members);
     let source = Arc::new(Scripted::serving(&world, world.bundle(&shape())).publishing(&older));
@@ -1126,6 +1142,47 @@ async fn a_checkpoint_is_not_lowered_and_not_recorded_over_another_manifest_of_i
         held.checkpoints.iter().cloned().collect::<Vec<_>>(),
         [checkpoint_of(&newer)],
         "the higher checkpoint stays"
+    );
+
+    // The bundle this restore read records generation 6, and it restores generation 4 on the
+    // person's word. A later read that finds an older authentic bundle, one that records none, is
+    // not written on, because the write would put the checkpoint at 4 where this restore saw 6.
+    // The service replaces the bundle after the restore read it.
+    let known = world.seal(6, &members);
+    let source = Arc::new(
+        Scripted::serving(
+            &world,
+            world.bundle(&Shape {
+                checkpoint: Some(checkpoint_of(&known)),
+                ..Shape::default()
+            }),
+        )
+        .publishing(&sealed)
+        .honouring_the_hold(),
+    );
+    let prepared = FilesRestore::prepare(
+        world.kit(),
+        Arc::clone(&source) as Arc<dyn RestoreSource>,
+        None,
+        Some(BackupGeneration::new(4)),
+    )
+    .await
+    .expect("the named generation restores");
+    let bundle = Bundle::over(&source);
+    source.replace_bundle(world.bundle(&Shape::default()));
+    let refused = prepared
+        .record_checkpoint(&bundle, TimestampMs::new(9_000))
+        .await
+        .expect_err("the bundle went back");
+    assert_eq!(*bundle.writes.lock().expect("writes"), 0);
+    assert!(matches!(
+        refused,
+        RestoreError::Recovery(ref cause)
+            if matches!(**cause, RecoveryError::CheckpointWentBack { known: 6 })
+    ));
+    assert!(
+        bundle_held(&world, &source).checkpoints.is_empty(),
+        "nothing was written over the bundle the service now holds"
     );
 
     // Another restore recorded this very generation with another encrypted manifest.
