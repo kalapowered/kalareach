@@ -1207,9 +1207,11 @@ pub struct Dispatch {
 }
 
 /// Where the failures of one connection's adapter are counted for the host's own metrics.
+///
+/// The broker holds the dispatch this belongs to, so it holds the broker weakly.
 #[derive(Clone, Debug)]
 struct Counted {
-    broker: Arc<Broker>,
+    broker: std::sync::Weak<Broker>,
     adapter: Adapter,
 }
 
@@ -1217,13 +1219,41 @@ impl Counted {
     /// The adapter a connection's package is, where it is one the product bundles.
     fn of(broker: &Arc<Broker>, connection: &crate::broker::gateway::Connection) -> Option<Self> {
         Adapter::of_package(connection.table.plugin_id.as_str()).map(|adapter| Self {
-            broker: Arc::clone(broker),
+            broker: Arc::downgrade(broker),
             adapter,
         })
     }
 
     fn failed(&self, outcome: MetricOutcome) {
-        self.broker.adapter_failed(self.adapter, outcome);
+        if let Some(broker) = self.broker.upgrade() {
+            broker.adapter_failed(self.adapter, outcome);
+        }
+    }
+}
+
+/// Carries `work`, which ends in what the upstream did with one operation, on a task of its own
+/// where there is a runtime to run one.
+///
+/// What the worker waits for is bounded by its own deadline, and a caller that stops waiting drops
+/// what it was given. The wait for the upstream's answer and the count of an adapter that did not
+/// give one belong to the operation and not to its caller, so neither is lost with it.
+fn detached(
+    work: impl std::future::Future<Output = Result<UpstreamOutcome>> + Send + 'static,
+) -> PendingTransmission {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            let task = runtime.spawn(work);
+            PendingTransmission::carried(async move {
+                task.await.unwrap_or_else(|_| {
+                    Err(BrokerError::UpstreamUnavailable {
+                        detail: "the task that carried this operation ended without saying what \
+                                 the upstream did with it"
+                            .to_owned(),
+                    })
+                })
+            })
+        }
+        Err(_) => PendingTransmission::carried(work),
     }
 }
 
@@ -1603,7 +1633,7 @@ impl Dispatch {
                 counted.failed(outcome);
             }
         };
-        Ok(PendingTransmission::carried(async move {
+        Ok(detached(async move {
             if let Some(refusal) = queued.delivered().await.refusal() {
                 failed(MetricOutcome::Unavailable);
                 return Err(refusal);
@@ -3617,7 +3647,7 @@ mod tests {
             .expect("the broker opens"),
         );
         dispatch.counted = Some(Counted {
-            broker: Arc::clone(&broker),
+            broker: Arc::downgrade(&broker),
             adapter: Adapter::Codex,
         });
         (dispatch, broker)
@@ -3686,6 +3716,48 @@ mod tests {
             .outcome()
             .await
             .expect_err("an upstream that does not answer is not one that acted");
+        assert_eq!(
+            failures_counted(&broker),
+            vec![(Adapter::Codex, MetricOutcome::Timeout, 1)]
+        );
+    }
+
+    /// KR-REQ-26.43: an adapter that took a request and never answered it is counted as a timeout
+    /// when the worker's own deadline ends the caller's wait first: the count is the operation's,
+    /// and it is made at the adapter's deadline whether or not anyone is still waiting for it.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_26_43_an_unanswered_request_is_counted_though_its_caller_stopped_waiting() {
+        use kr_protocol::broker::PreparedOperation;
+        let (upstream, _peer) = tokio::io::duplex(64 * 1024);
+        let (dispatch, writes) = named_dispatch_over(upstream);
+        let (dispatch, broker) = counting(dispatch);
+        let transmission = dispatch
+            .submit(&named_action(
+                "turn.cancel",
+                Some(PreparedOperation::UpstreamCancel),
+            ))
+            .expect("the frame is queued");
+        tokio::spawn(writes);
+
+        // The caller gives up before the adapter's deadline.
+        tokio::time::timeout(
+            ACKNOWLEDGEMENT_DEADLINE - std::time::Duration::from_secs(5),
+            transmission.outcome(),
+        )
+        .await
+        .expect_err("the caller's own deadline passes first");
+        assert_eq!(
+            failures_counted(&broker),
+            Vec::new(),
+            "the adapter has not yet been given the time it was promised"
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        // The count is made by the operation's own task, which the paused clock has now run on to
+        // the adapter's deadline.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
             failures_counted(&broker),
             vec![(Adapter::Codex, MetricOutcome::Timeout, 1)]
