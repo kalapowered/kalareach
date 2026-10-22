@@ -680,6 +680,7 @@ impl Controller {
                             max_read_bytes: RETAINED_PER_SESSION_BYTES,
                             max_document_bytes: bounds.session_member_bytes,
                             max_chunks: session_export::MAX_CHUNKS,
+                            form: session_export::Form::Json,
                         },
                         candidate.retained_bytes,
                         now_ms,
@@ -1053,6 +1054,47 @@ impl PageSource for SpoolPages<'_> {
             .history_page(self.session_id, from_cursor, max_bytes)
             .map_err(Staging::Failed)
     }
+
+    async fn times(
+        &mut self,
+        from_cursor: u64,
+        to_cursor: u64,
+    ) -> std::result::Result<kr_protocol::recovery::HistoryTimesResult, Staging> {
+        use kr_protocol::scalars::{Nullable, TimestampMs, U64};
+
+        if self.lease.is_cancelled() {
+            return Err(Staging::Cancelled);
+        }
+        let answer = match self.archive.history_times(
+            self.session_id,
+            from_cursor,
+            to_cursor,
+            usize::try_from(kr_protocol::recovery::MAX_HISTORY_TIMES).unwrap_or(usize::MAX),
+        ) {
+            Ok(times) => kr_protocol::recovery::HistoryTimesResult {
+                intervals: times
+                    .marks
+                    .iter()
+                    .map(|mark| kr_protocol::recovery::OutputTime {
+                        from_cursor: U64::new(mark.from),
+                        to_cursor: U64::new(mark.to),
+                        at_ms: TimestampMs::new(mark.at_ms),
+                        proven: mark.proven,
+                    })
+                    .collect(),
+                next_cursor: U64::new(times.next_cursor),
+                complete: times.complete,
+                unavailable: Nullable::null(),
+            },
+            Err(why) => kr_protocol::recovery::HistoryTimesResult {
+                intervals: Vec::new(),
+                next_cursor: U64::new(to_cursor),
+                complete: true,
+                unavailable: Nullable::some(why.describe()),
+            },
+        };
+        Ok(answer)
+    }
 }
 
 impl Pass {
@@ -1114,6 +1156,7 @@ impl Pass {
                     max_read_bytes: RETAINED_PER_SESSION_BYTES,
                     max_document_bytes: self.bounds.session_member_bytes,
                     max_chunks: session_export::MAX_CHUNKS,
+                    form: session_export::Form::Json,
                 },
                 candidate.retained_bytes,
                 self.now_ms,
@@ -1281,7 +1324,7 @@ fn fingerprint_of(candidates: &[Candidate], configuration: Option<&[u8]>) -> Dig
 }
 
 /// What a pass can need on the disk it stages on: for each session, the smaller of the session
-/// member bound and forty times its retained output (a document is not four thirds of its output
+/// member bound and ninety times its retained output (a document is not four thirds of its output
 /// once its pieces are small), up to the total, with the configuration and room for the manifest.
 /// The ciphertext's overhead is a few kilobytes for each member, which the reserve left free covers.
 fn projected_bytes(
@@ -1297,9 +1340,11 @@ fn projected_bytes(
         if total >= bounds.total_bytes {
             break;
         }
-        total += bounds
-            .session_member_bytes
-            .min(candidate.retained_bytes.saturating_mul(40));
+        total += bounds.session_member_bytes.min(
+            candidate
+                .retained_bytes
+                .saturating_mul(session_export::MOST_A_BYTE_ADDS),
+        );
     }
     total
         .min(bounds.total_bytes)
