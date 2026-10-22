@@ -435,6 +435,37 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
     if !taken { invoke.reject("this build holds no voice call", code: "unavailable") }
   }
 
+  // MARK: Notifications
+
+  // What a phone knows about its notifications is the application's own, in a target this package
+  // cannot see, so each command is handed to the application's adapter by name (`PushLink`) and
+  // answered when the adapter answers.
+
+  @objc public func pushPermission(_ invoke: Invoke) { forwardPush(invoke) }
+  @objc public func pushAskPermission(_ invoke: Invoke) { forwardPush(invoke) }
+  @objc public func pushToken(_ invoke: Invoke) { forwardPush(invoke) }
+  @objc public func pushTokenChanged(_ invoke: Invoke) { forwardPush(invoke) }
+  @objc public func pushPendingSet(_ invoke: Invoke) { forwardPush(invoke) }
+  @objc public func pushPendingGet(_ invoke: Invoke) { forwardPush(invoke) }
+  @objc public func pushPendingClear(_ invoke: Invoke) { forwardPush(invoke) }
+  @objc public func pushLimitedKey(_ invoke: Invoke) { forwardPush(invoke) }
+  @objc public func pushRoute(_ invoke: Invoke) { forwardPush(invoke) }
+
+  /// Hands one command to the application's notification adapter and answers `invoke` with what it
+  /// answers.
+  private func forwardPush(_ invoke: Invoke) {
+    let reply: PushLink.Reply = { result, code, message in
+      if let result = result as String?, let object = PlatformPlugin.object(of: result) {
+        invoke.resolve(object)
+      } else {
+        invoke.reject(
+          (message as String?) ?? "notifications could not do that", code: (code as String?) ?? "engine")
+      }
+    }
+    let taken = PushLink.send(invoke.command, arguments: invoke.getRawArgs(), reply: reply)
+    if !taken { invoke.reject("this build holds no notification adapter", code: "unavailable") }
+  }
+
   /// A JSON object as the text the application's call speaks it in.
   private static func object(of json: String) -> JsonObject? {
     guard
