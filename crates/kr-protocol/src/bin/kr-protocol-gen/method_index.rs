@@ -300,7 +300,8 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         | Method::WorkflowEnable
         | Method::WorkflowPause
         | Method::WorkflowRun
-        | Method::WorkflowRead => at(AUTOMATION, "The five methods"),
+        | Method::WorkflowRearm
+        | Method::WorkflowRead => at(AUTOMATION, "The six methods"),
     }
 }
 
