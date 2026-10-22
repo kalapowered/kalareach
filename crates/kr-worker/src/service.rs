@@ -250,6 +250,9 @@ pub struct WorkerService {
     /// Woken when the session's journal commits a host event, a privacy transition, or a
     /// transition of a pending approval the broker records.
     journal_changes: Option<Arc<tokio::sync::Notify>>,
+    /// What this session's application is doing: the worker's own account of what holds the
+    /// terminal and what its agents are waiting for.
+    application: Arc<crate::application::Producer>,
     /// How many times a request for the attention sources has found nothing to answer with and
     /// begun to wait. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -423,6 +426,12 @@ impl WorkerService {
         &self.broker
     }
 
+    /// Returns what this session's application is doing, as the worker publishes it.
+    #[must_use]
+    pub const fn application(&self) -> &Arc<crate::application::Producer> {
+        &self.application
+    }
+
     /// Whether the session still counts `attachment_id` among the attachments made under a grant,
     /// for the host crates' own tests: an entry holds no lease, so nothing else shows one that
     /// outlived its attachment.
@@ -453,7 +462,8 @@ impl WorkerService {
                 Arc::clone(&self.broker),
                 config.environment_id,
             )
-            .with_views(Arc::downgrade(&self.runtime)),
+            .with_views(Arc::downgrade(&self.runtime))
+            .following(Arc::clone(&self.application)),
         );
         let backends = crate::broker::commands::CommandBackends::new(
             Arc::clone(&self.broker),
@@ -568,6 +578,24 @@ impl WorkerService {
             &shared_clock,
         )));
         let expired = tokio::sync::mpsc::unbounded_channel();
+        // What the session's application is doing is read from the broker and the question ledger
+        // when either changes, by a task that ends with the session. A worker built outside a
+        // runtime, which nothing can wake, follows nothing.
+        let application = crate::application::Producer::new(Arc::downgrade(&runtime));
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let clock = Arc::clone(&shared_clock);
+            handle.spawn(crate::application::follow_evidence(
+                Arc::clone(&application),
+                Arc::clone(&runtime),
+                Arc::clone(&broker),
+                Arc::clone(&questions),
+                journal_changes.clone(),
+                move || crate::questions::Now {
+                    utc_ms: kr_ipc::now_ms(),
+                    boot_ms: clock.boot_elapsed_ms(),
+                },
+            ));
+        }
         Ok(Self {
             runtime,
             identity,
@@ -601,6 +629,7 @@ impl WorkerService {
             journal_path: binding.journal_path,
             attention_reader: Mutex::new(None),
             journal_changes,
+            application,
             #[cfg(feature = "testing")]
             held_attention_requests: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
