@@ -2265,7 +2265,7 @@ async fn an_export_through_a_bridge_carries_the_output_and_none_of_its_side_effe
 
     let bytes = std::fs::read(&file).expect("the file was written");
     let document: Value = serde_json::from_slice(&bytes).expect("the file is JSON");
-    assert_eq!(document["format"], "kalareach-session-export/1");
+    assert_eq!(document["format"], "kalareach-session-export/2");
     assert_eq!(document["session"]["session_id"], session.as_str());
     assert_eq!(document["closure"]["reason"], "root_exit", "{document}");
     let output = exported_output(&document);
@@ -2287,12 +2287,7 @@ async fn an_export_through_a_bridge_carries_the_output_and_none_of_its_side_effe
     }
     let whole = String::from_utf8_lossy(&bytes);
     assert!(!whole.contains("c2VjcmV0LXRva2Vu"), "{whole}");
-    for kind in [
-        "clipboard_write",
-        "bell",
-        "terminal_query",
-        "output_timestamps",
-    ] {
+    for kind in ["clipboard_write", "bell", "terminal_query"] {
         assert!(
             document["omissions"]
                 .as_array()
@@ -2303,6 +2298,17 @@ async fn an_export_through_a_bridge_carries_the_output_and_none_of_its_side_effe
             document["omissions"]
         );
     }
+    // Whether the destination could prove its clock depends on the host, so that is not asserted;
+    // that every byte has a time does not.
+    assert!(
+        !document["omissions"]
+            .as_array()
+            .expect("omissions")
+            .iter()
+            .any(|omission| omission["kind"] == "output_timestamps"),
+        "every byte has a time: {}",
+        document["omissions"]
+    );
     assert_eq!(
         std::fs::metadata(&file)
             .expect("metadata")
@@ -2336,6 +2342,122 @@ async fn an_export_through_a_bridge_carries_the_output_and_none_of_its_side_effe
         bytes,
         "and is left as it was"
     );
+}
+
+/// KR-REQ-25.25 and KR-REQ-18.11: `kr export` of a closed session reads when the destination's
+/// worker wrote each part of the output, from the record the worker left, and writes it two ways.
+/// The semantic JSON gives each piece the wall-clock reading of its first byte; `--format asciicast`
+/// writes a recording that plays the same output at those times, with the clipboard write, the bell
+/// and the question counted in its header and none of them in its events. No time is invented: both
+/// lie between the moment the session was started and the moment it was closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_export_can_be_a_recording_that_plays_the_output_at_the_times_it_was_written() {
+    let world = World::start().await;
+    world.enrol_destination();
+    let started = kr_ipc::now_ms().get();
+    let session = a_closed_session_in_the_destination(&world);
+    let finished = kr_ipc::now_ms().get();
+
+    let json = world.export_path("timed-json");
+    let exported = world.run(&[
+        "--json",
+        "export",
+        &session,
+        "--environment",
+        "dest",
+        "--output",
+        json.to_str().expect("a path"),
+    ]);
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let document: Value =
+        serde_json::from_slice(&std::fs::read(&json).expect("the file")).expect("the file is JSON");
+    assert_eq!(document["format"], "kalareach-session-export/2");
+    let chunks = document["output"]["chunks"].as_array().expect("chunks");
+    assert!(!chunks.is_empty());
+    for chunk in chunks {
+        let at: u64 = chunk["at_ms"]
+            .as_str()
+            .unwrap_or_else(|| panic!("every piece has a time: {chunk}"))
+            .parse()
+            .expect("digits");
+        assert!(
+            (started..=finished).contains(&at),
+            "{at} is not in {started}..={finished}"
+        );
+    }
+    assert!(
+        !document["omissions"]
+            .as_array()
+            .expect("omissions")
+            .iter()
+            .any(|omission| omission["kind"] == "output_timestamps"),
+        "nothing carries no time: {}",
+        document["omissions"]
+    );
+
+    let cast = world.export_path("timed-cast");
+    let exported = world.run(&[
+        "--json",
+        "export",
+        &session,
+        "--environment",
+        "dest",
+        "--format",
+        "asciicast",
+        "--output",
+        cast.to_str().expect("a path"),
+    ]);
+    assert!(
+        exported.status.success(),
+        "{}; the destination's daemon logged {}",
+        String::from_utf8_lossy(&exported.stderr),
+        world.destination_daemon_log()
+    );
+    let said: Value = serde_json::from_slice(&exported.stdout).expect("kr printed JSON");
+    assert_eq!(said["format"], "kalareach-session-recording/1", "{said}");
+    let recording = std::fs::read_to_string(&cast).expect("the recording");
+    let mut lines = recording.lines();
+    let header: Value = serde_json::from_str(lines.next().expect("a header")).expect("JSON");
+    assert_eq!(header["version"], 2);
+    let begun = header["timestamp"].as_u64().expect("seconds");
+    assert!(
+        (started / 1000..=finished / 1000).contains(&begun),
+        "the recording begins at {begun}, outside {started}..={finished}"
+    );
+    let mut played = String::new();
+    let mut last = 0.0_f64;
+    let longest = (finished - started) as f64 / 1000.0;
+    for line in lines {
+        let event: Value = serde_json::from_str(line).expect("an event");
+        let at = event[0].as_f64().expect("seconds");
+        assert!(
+            at >= last && at <= longest,
+            "{at} after {last}, within {longest}"
+        );
+        last = at;
+        played.push_str(event[2].as_str().expect("text"));
+    }
+    assert!(played.contains("out-marker"), "{}", played.escape_debug());
+    assert!(played.contains("after-marker"));
+    for gone in ["\x1b]52", "\x07", "\x1b[c"] {
+        assert!(!played.contains(gone), "{}", gone.escape_debug());
+    }
+    let kinds: Vec<_> = header["kalareach"]["omissions"]
+        .as_array()
+        .expect("omissions")
+        .iter()
+        .map(|omission| omission["kind"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    for kind in ["clipboard_write", "bell", "terminal_query"] {
+        assert!(
+            kinds.iter().any(|found| found == kind),
+            "{kind} in {kinds:?}"
+        );
+    }
 }
 
 /// KR-REQ-18.11: an export of a session in a stopped environment is refused and starts nothing, where

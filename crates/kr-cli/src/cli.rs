@@ -1791,9 +1791,24 @@ pub struct ExportArguments {
     #[arg(long)]
     pub environment: Option<String>,
     /// The most retained output to read, in bytes. The start of what is retained is kept. The file
-    /// holds at most 192 MiB whatever this is, and keeps the start of the output the same way.
+    /// holds at most 192 MiB whatever this is, and keeps the start of the output the same way. A
+    /// session keeps at most 128 MiB, so 134217728 reads all of it.
     #[arg(long, default_value_t = crate::export::DEFAULT_MAX_BYTES)]
     pub max_bytes: u64,
+    /// What to write: the semantic JSON document, or an asciicast recording that plays the output
+    /// at the times it was written.
+    #[arg(long, value_enum, default_value_t = ExportFormat::Json)]
+    pub format: ExportFormat,
+}
+
+/// What `kr export` writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ExportFormat {
+    /// One JSON document: the session, its closure, and the output as pieces with their cursors and
+    /// the time each was written.
+    Json,
+    /// An asciicast v2 recording of the output, with the omissions declared in its header.
+    Asciicast,
 }
 
 /// `kr status`.
