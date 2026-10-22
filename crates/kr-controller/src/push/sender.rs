@@ -7,10 +7,12 @@
 //! same way and ends the authorisation when its device is unpaired.
 //!
 //! Both requests of either are managed-service requests and carry the one signature every such
-//! request carries, a [`ServiceRequestSignature`] over the gateway's origin, the method, a fresh
-//! nonce, the time and the digest of the body. The digest is [`PushRequest::digest`], the push
-//! request digest the gateway recomputes from the body it received, so a signature covers this
-//! body and this method and no other.
+//! request carries, a [`kr_protocol::service::ServiceRequestSignature`] over the gateway's
+//! origin, the method, a fresh nonce, the time and the digest of the body. The digest is
+//! [`PushRequest::digest`], the push request digest the gateway recomputes from the body it
+//! received, so a signature covers this body and this method and no other. The request is built
+//! by [`kr_client::services::push::signed_push_request_now`], the one builder an installation's
+//! requests are built by too.
 //!
 //! The gateway is the one the held credential names. A renewal proof covers that origin, and a
 //! gateway checks the origin it is asked under, so a renewal could not be carried to any other.
@@ -32,9 +34,7 @@ use kr_protocol::push::{
     PushSenderRevokeRequest, PushSenderState,
 };
 use kr_protocol::scalars::{AuthorisationKey, Nonce256, Signature64, TimestampMs};
-use kr_protocol::service::{
-    GatewayOrigin, ServiceRequestPayload, ServiceRequestSignature, ServiceRequestSigner,
-};
+use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 
 use super::Confirmation;
 use super::credentials::CredentialRenewal;
@@ -170,32 +170,9 @@ impl GatewaySenders {
         route: &str,
         body: &PushRequest,
     ) -> Result<ServiceHttpAnswer, String> {
-        let mut nonce = [0_u8; 32];
-        kr_crypto::random_bytes(&mut nonce)
-            .map_err(|error| format!("no fresh nonce could be drawn: {error}"))?;
-        let payload = ServiceRequestPayload {
-            body_digest: body
-                .digest()
-                .map_err(|error| format!("the request could not be digested: {error}"))?,
-            gateway_origin: origin.clone(),
-            method: body.method(),
-            nonce: Nonce256::from_bytes(nonce),
-            signed_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
-        };
-        let input = payload
-            .signing_input(ServiceRequestSigner::Host)
-            .map_err(|error| format!("the request could not be encoded: {error}"))?;
-        let signature = ServiceRequestSignature {
-            signature: self
-                .signer
-                .sign(&input)
-                .map_err(|error| error.to_string())?,
-            payload,
-            signer: ServiceRequestSigner::Host,
-            public_key: self.signer.public_key(),
-        };
-        let request = serde_json::to_vec(&SignedRequest { body, signature })
-            .map_err(|error| format!("the request could not be encoded: {error}"))?;
+        let request =
+            kr_client::services::push::signed_push_request_now(origin, body, &*self.signer)
+                .map_err(|error| error.to_string())?;
         let transport = self.transports.to(origin)?;
         let url = format!("{}{route}", origin.as_str());
         self.runtime
@@ -423,13 +400,6 @@ impl CredentialRenewal for GatewaySenders {
     }
 }
 
-/// A signed request, as the gateway reads it.
-#[derive(serde::Serialize)]
-struct SignedRequest<'a> {
-    body: &'a PushRequest,
-    signature: ServiceRequestSignature,
-}
-
 /// What the gateway answers a completed revocation with: the authorisation as it now stands.
 #[derive(serde::Deserialize)]
 struct Revoked {
@@ -535,6 +505,7 @@ mod tests {
     use kr_protocol::ids::{InstallationId, PushSenderRecordId, PushSenderRevision};
     use kr_protocol::push::{PushRatePolicy, PushSenderBinding};
     use kr_protocol::scalars::{EndpointKey, SecretBytes32, Uuid};
+    use kr_protocol::service::ServiceRequestSignature;
 
     use super::*;
 

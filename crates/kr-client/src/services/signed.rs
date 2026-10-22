@@ -74,6 +74,7 @@ use base64::Engine as _;
 use kr_protocol::authority::IdempotencyBehaviour;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::method::Method;
+use kr_protocol::push::PushRequest;
 use kr_protocol::scalars::{AuthorisationKey, Nonce256, TimestampMs};
 use kr_protocol::service::{
     BodyError, GatewayOrigin, SERVICE_REQUEST_FRESHNESS_MS, ServiceRequestPayload,
@@ -170,6 +171,9 @@ struct Sending<'a> {
     signed_at_ms: Option<u64>,
     account: Option<&'a AccountAuthorisation>,
     carriage: Carriage<'a>,
+    /// The body of a push request, whose signature covers [`PushRequest::digest`] and not the
+    /// digest of the document.
+    push: Option<&'a PushRequest>,
 }
 
 /// What a request whose success is content was answered: the bytes, or the refusal the service
@@ -284,6 +288,36 @@ impl SignedService {
         self.answer(path, method, body, request_limit).await?.data()
     }
 
+    /// Sends one signed push request, signed now, and returns the `data` of the gateway's envelope.
+    ///
+    /// The signature covers the body's own push digest ([`PushRequest::digest`]), the one the
+    /// gateway recomputes, and the method it names is the one the body belongs to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Refused`] for a refusal the gateway named, and [`ClientError::Host`]
+    /// for a request this client would not send, a transport failure and an answer this client
+    /// cannot read.
+    pub(super) async fn push_call(
+        &self,
+        path: &str,
+        body: &PushRequest,
+        request_limit: usize,
+    ) -> Result<serde_json::Value> {
+        let sending = Sending {
+            signed_at_ms: None,
+            account: None,
+            carriage: Carriage::Body,
+            push: Some(body),
+        };
+        let (answer, repeat) = self
+            .send(path, body.method(), body, request_limit, sending)
+            .await?;
+        answer_of(&answer, repeat)
+            .map_err(|error| unanswered(repeat, answer.status, error))?
+            .data()
+    }
+
     /// Sends one signed request, signed now, and returns what the service answered: its `data`, or
     /// the refusal it named, whole.
     ///
@@ -333,6 +367,7 @@ impl SignedService {
             signed_at_ms,
             account,
             carriage: Carriage::Body,
+            push: None,
         };
         let (answer, repeat) = self
             .send(path, method, body, request_limit, sending)
@@ -363,6 +398,7 @@ impl SignedService {
             signed_at_ms: None,
             account,
             carriage,
+            push: None,
         };
         let (answer, repeat) = self
             .send(path, method, body, request_limit, sending)
@@ -389,6 +425,7 @@ impl SignedService {
             signed_at_ms: None,
             account,
             carriage: Carriage::Body,
+            push: None,
         };
         let (answer, repeat) = self
             .send(path, method, body, request_limit, sending)
@@ -420,6 +457,7 @@ impl SignedService {
             signed_at_ms,
             account,
             carriage,
+            push,
         } = sending;
         let document = serde_json::to_value(body).map_err(|error| {
             Unanswered::NotSent(malformed(crate::shown!(
@@ -440,9 +478,10 @@ impl SignedService {
             None => None,
         };
         let request = self
-            .signed(
+            .sign(
                 method,
                 document.clone(),
+                push,
                 signed_at_ms.unwrap_or_else(now_ms),
             )
             .map_err(Unanswered::NotSent)?;
@@ -463,7 +502,7 @@ impl SignedService {
             return Ok((first, repeat));
         };
         tokio::time::sleep(delay).await;
-        let again = match self.signed(method, document, signed_at_ms.unwrap_or_else(now_ms)) {
+        let again = match self.sign(method, document, push, signed_at_ms.unwrap_or_else(now_ms)) {
             Ok(again) if again.len() <= request_limit => again,
             _ => return Ok((first, repeat)),
         };
@@ -498,6 +537,27 @@ impl SignedService {
             }
         }
         .map_err(Unanswered::Sent)
+    }
+
+    /// The bytes of one signed request: a push request's body under its own digest, or the document
+    /// under the canonical digest of a document.
+    fn sign(
+        &self,
+        method: Method,
+        document: serde_json::Value,
+        push: Option<&PushRequest>,
+        signed_at_ms: u64,
+    ) -> Result<Vec<u8>> {
+        match push {
+            Some(body) => super::push::signed_push_request(
+                &self.origin,
+                body,
+                &*self.signer,
+                signed_at_ms,
+                fresh_nonce()?,
+            ),
+            None => self.signed(method, document, signed_at_ms),
+        }
     }
 
     /// The bytes of one signed request: the document, and the credential over its digest.
