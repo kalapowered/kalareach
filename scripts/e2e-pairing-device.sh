@@ -192,7 +192,7 @@ if [ "$platform" = android ]; then
         "the scanner closes on Cancel"
         "the scanner fits the largest text size"
         "the attachment picker offers no file on a paired phone, and says nothing of the camera"
-        "a phone with no screen lock cannot confirm"
+        "a phone with no screen lock offers no way to confirm, and still lists the request"
         "the host's request is cancelled at the prompt"
         "the host's request is confirmed with the screen lock"
         "a new device is confirmed against its value"
@@ -200,8 +200,10 @@ if [ "$platform" = android ]; then
 else
     platform_checks=(
         "the host's request is cancelled at the alert"
+        "Face ID was asked, and a face that did not match confirmed nothing"
         "the host's request is confirmed with Face ID"
         "a new device is confirmed against its value"
+        "a pasted invitation was held through the system's paste question"
     )
 fi
 
@@ -315,9 +317,10 @@ feed_ios() { # <udid>
     done
 }
 
-# Face ID on the simulator: enrolled once, and a matching face sent each second from the moment the
-# test says the prompt is wanted until it says the prompt is done, since a match sent before the
-# system's prompt is up is lost.
+# Face ID on the simulator: enrolled once, and a face sent each second from the moment the test says
+# the prompt is wanted until it says the prompt is done, since a face sent before the system's prompt
+# is up is lost. The face matches unless the test says (`faceid-nomatch`) that it is to be one that
+# does not.
 enrol_face_id() { # <udid>
     xcrun simctl spawn "$1" notifyutil -s com.apple.BiometricKit.enrollmentChanged 1 >/dev/null 2>&1
     xcrun simctl spawn "$1" notifyutil -p com.apple.BiometricKit.enrollmentChanged >/dev/null 2>&1
@@ -326,7 +329,11 @@ enrol_face_id() { # <udid>
 match_face_id() { # <udid>
     while [ ! -e "$harness/finish" ]; do
         if [ -e "$harness/faceid-wanted" ] && [ ! -e "$harness/faceid-done" ]; then
-            xcrun simctl spawn "$1" notifyutil -p com.apple.BiometricKit_Sim.pearl.match >/dev/null 2>&1
+            if [ -e "$harness/faceid-nomatch" ]; then
+                xcrun simctl spawn "$1" notifyutil -p com.apple.BiometricKit_Sim.pearl.nomatch >/dev/null 2>&1
+            else
+                xcrun simctl spawn "$1" notifyutil -p com.apple.BiometricKit_Sim.pearl.match >/dev/null 2>&1
+            fi
         fi
         # Each prompt is its own: the test asks again by removing both files.
         sleep 1

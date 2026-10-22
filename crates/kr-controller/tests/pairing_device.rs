@@ -302,8 +302,10 @@ impl Run {
             .any(|each| each.request.confirmation_id == confirmation && !each.answered)
     }
 
-    /// A direct invitation whose secret has one bit flipped: nothing a host holds opens it.
-    async fn control(&self) {
+    /// A direct invitation whose secret has one bit flipped: nothing a host holds opens it. It is
+    /// offered as `<name>.png`, and its text, for a phase that pastes it, is the first line of
+    /// `secrets-<name>.txt`; the script says it is done with `<name>-done`.
+    async fn control(&self, name: &str) {
         let mut client = self.host.client().await;
         let client = &mut client;
         let invited = self.invite(client).await;
@@ -313,13 +315,13 @@ impl Run {
         payload.secret = SecretBytes32::from_bytes(secret);
         let text = text_of(payload);
         write_private(
-            &self.directory.join("secrets-control.txt"),
+            &self.directory.join(format!("secrets-{name}.txt")),
             secret_forms(&text, &secret).as_bytes(),
         );
-        write_private(&self.directory.join("control.png"), &qr_picture(&text));
+        write_private(&self.directory.join(format!("{name}.png")), &qr_picture(&text));
         assert!(
-            appears(&self.directory.join("control-done"), STEP).await,
-            "the script never said the phone had scanned the invitation"
+            appears(&self.directory.join(format!("{name}-done")), STEP).await,
+            "the script never said the phone had taken in the invitation"
         );
         let status = calls::owner_status(client, invited.invitation_id)
             .await
@@ -331,7 +333,7 @@ impl Run {
             .and_then(|view| view.candidate.0.as_ref())
             .is_some();
         self.say(
-            "control-result.txt",
+            &format!("{name}-result.txt"),
             &format!("candidate_locked={}\n", u8::from(locked)),
         );
         let _ = calls::cancel(self.environment, client, invited.invitation_id, false).await;
@@ -597,7 +599,7 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
             match name {
-                "control" => run.control().await,
+                "control" | "paste" => run.control(name).await,
                 "direct" => run.direct().await,
                 "code" => run.code(connections, port).await,
                 "confirm" => run.confirm().await,
@@ -611,7 +613,8 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
         phase("direct"),
         phase("code"),
         phase("confirm"),
-        phase("device")
+        phase("device"),
+        phase("paste")
     );
     accepting.abort();
     run.host.stop().await;
