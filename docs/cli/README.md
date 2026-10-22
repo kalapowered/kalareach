@@ -21,6 +21,7 @@ worker directly for what a session owns.
 | `kr agent-tools --stdio` | — | Run the contact tools for the agent that launched this process |
 | `kr doctor` | — | Read-only diagnostics, this host's effective configuration, and support bundles |
 | `kr host power` | — | Show or change whether this host stays awake for work it has admitted |
+| `kr host shell-mode` | — | Show or choose the shell mode a new session is created in when none is named |
 | `kr host terminal` | — | Show the terminal applications this host has, and which one a new window opens in |
 | `kr host startup` | — | Show or choose how `kr new` starts this environment's control daemon when none is running |
 | `kr host descriptions` | — | Show what session descriptions offer on this host, turn them on or off, and fetch the model's files |
@@ -198,6 +199,13 @@ Other commands never start a daemon. `kr list`, `kr status` and the rest answer 
 with the same setup action when none is running.
 
 ### Shell mode
+
+`kr new` without `--shell-mode` creates the session in this host's default mode: the choice in the
+host's configuration (`kr host shell-mode --set`), and otherwise `managed`. A request outranks the
+host's choice, and the host's choice outranks the product default; `native_compat` is a stock shell
+chosen on purpose and never an automatic fallback, so a host nobody has configured refuses a shell
+no installed package qualifies. `kr doctor` reports the mode in force as `shell.mode` with its
+source, and it applies to the sessions created afterwards.
 
 `native_compat` is the stock shell you name, run as an interactive session root shell. It keeps
 create, attach, detach, close, transfer and terminal presentation. It does **not** claim managed
@@ -1734,6 +1742,28 @@ platform's own listing said of it, and why none is held can carry what its facil
 line says each as its class and its length; `pmset -g assertions` on macOS lists the assertion
 itself. `docs/host/platforms.md` has the facility each platform uses and what an assertion does not
 promise.
+
+## `kr host shell-mode`
+
+`kr new` without `--shell-mode` creates the session in the mode this host defaults to, and this
+command shows and chooses it:
+
+```sh
+kr host shell-mode                      # the mode in force, and where it came from
+kr host shell-mode --set native_compat  # a stock shell, for sessions created from now on
+kr host shell-mode --set managed        # the qualified shell package
+kr host shell-mode --clear              # the product default, managed
+```
+
+The choice is one section of the versioned per-user host configuration document, and `--set` and
+`--clear` each apply one validated revision of it. It takes effect for the sessions created
+afterwards; a running session keeps the mode it was created in. A request outranks it
+(`kr new --shell-mode`, the companion's new-session form), and it outranks the product default,
+`managed`. The answer names the rung it came from: `host_configuration` or `default`. With
+`--json` the answer is `{ "ok": true, "environment_id": "...", "shell_mode": { "mode": "...",
+"source": "..." } }`. `native_compat` is a stock shell chosen on purpose and never an automatic
+fallback; `docs/host/README.md` has the document's schema and the order a request, the document and
+the default are taken in.
 
 ## `kr host machine`
 

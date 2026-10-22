@@ -57,8 +57,9 @@ pub struct NewSession {
     pub presentation: Presentation,
     /// The shell to launch, or none for the destination's configured default.
     pub shell: Option<String>,
-    /// The shell integration mode.
-    pub shell_mode: ShellMode,
+    /// The shell integration mode, or none for the destination's own default: its configuration's
+    /// choice, then the managed shell.
+    pub shell_mode: Option<ShellMode>,
     /// The working directory, in the destination, or none for the destination user's home.
     pub cwd: Option<String>,
     /// This terminal's size, where the session is attached.
@@ -229,14 +230,18 @@ pub async fn create(enrolment: &EnvironmentEnrolment, new: &NewSession) -> Resul
     made
 }
 
-/// The worker profile the destination creates sessions with unless the person chose one.
+/// What the destination creates sessions with unless the person chose: the worker profile and the
+/// shell mode.
 ///
 /// Reading the destination's configuration is what puts it into force, so a ceiling edited there
 /// takes effect during the read, and one that changes what a caller may do withdraws the authority
 /// this connection was admitted under. That is the change working, not a failure, so the read is
 /// made again on a new bridge, as a command on the destination's own host makes it again, and a
 /// second refusal is the answer. `link` is replaced by the new bridge.
-async fn default_profile<O, F>(link: &mut BridgedLink, reopen: O) -> Result<WorkerProfile>
+async fn destination_defaults<O, F>(
+    link: &mut BridgedLink,
+    reopen: O,
+) -> Result<(WorkerProfile, ShellMode)>
 where
     O: Fn() -> F,
     F: std::future::Future<Output = Result<BridgedLink>>,
@@ -248,7 +253,15 @@ where
         answer = link.request(Method::HostInfo, &()).await?;
     }
     let info: HostInfoResult = decode(answer)?;
-    Ok(info.default_worker_profile)
+    // A destination of an earlier release names no default, and its own commands named a mode.
+    // The product default stands for it.
+    Ok((
+        info.default_worker_profile,
+        info.default_shell_mode.map_or(
+            kr_protocol::hostinfo::configuration::DEFAULT_SHELL_MODE,
+            |chosen| chosen.mode,
+        ),
+    ))
 }
 
 async fn create_over<O, F>(link: &mut BridgedLink, new: &NewSession, reopen: O) -> Result<Created>
@@ -256,9 +269,15 @@ where
     O: Fn() -> F,
     F: std::future::Future<Output = Result<BridgedLink>>,
 {
-    let profile = match new.profile {
-        Some(profile) => profile,
-        None => default_profile(link, reopen).await?,
+    let (profile, shell_mode) = match (new.profile, new.shell_mode) {
+        (Some(profile), Some(shell_mode)) => (profile, shell_mode),
+        (chosen_profile, chosen_mode) => {
+            let (profile, shell_mode) = destination_defaults(link, reopen).await?;
+            (
+                chosen_profile.unwrap_or(profile),
+                chosen_mode.unwrap_or(shell_mode),
+            )
+        }
     };
     // The identity that answered is the one the enrolment names: the opening was refused otherwise.
     // It is read after the profile, which may have been read on a new bridge.
@@ -268,7 +287,7 @@ where
         environment_id,
         presentation: new.presentation,
         shell: Nullable(new.shell.clone()),
-        shell_mode: new.shell_mode,
+        shell_mode,
         cwd: Nullable::some(new.cwd.clone().unwrap_or(base.home)),
         dimensions: Nullable(new.dimensions),
         worker_profile: profile,
@@ -589,7 +608,7 @@ mod tests {
         let new = NewSession {
             presentation: Presentation::Invisible,
             shell: None,
-            shell_mode: ShellMode::NativeCompat,
+            shell_mode: Some(ShellMode::NativeCompat),
             cwd: None,
             dimensions: None,
             profile: Some(WorkerProfile::HeadlessUser),

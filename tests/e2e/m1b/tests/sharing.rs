@@ -83,6 +83,8 @@ fn new_session(host: &Host<'_>) -> (SessionId, String) {
     let work = host.run().work().display().to_string();
     let created = host.kr_json(&[
         "new",
+        "--shell-mode",
+        "native_compat",
         "--invisible",
         "--headless",
         "--shell",
