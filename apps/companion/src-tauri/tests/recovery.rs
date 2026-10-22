@@ -1,8 +1,9 @@
 //! Recovery, through the commands the page calls, against the sync service as a local Worker
 //! answered it.
 //!
-//! KR-REQ-20.15 and 20.18: the recovery bundle is committed before a writer is declared
-//! recovery-enabled, and bundle updates use the stable locator and compare-and-swap without
+//! KR-REQ-20.15 and 20.18: the recovery bundle is committed before the host's writer is declared
+//! recovery-enabled and before the host is set up under this computer's recovery, and bundle
+//! updates use the stable locator and compare-and-swap without
 //! reprinting the seed. KR-REQ-17.14: the sync service is a choice of its own, and the account's
 //! token goes only to the service the account is signed in to.
 //!
@@ -20,8 +21,8 @@ use companion_tauri::AppState;
 use companion_tauri::account::carrier::{Boxed, Carrier, Ending, Plan, Unavailable};
 use companion_tauri::account::{Account, AccountSlot};
 use companion_tauri::device::DeviceIdentity;
-use companion_tauri::recovery::{Recovery, SEED_SCOPE};
-use kr_client::recovery::{BundleStore, parse_kit};
+use companion_tauri::recovery::{HostCoverView, LeftView, Recovery, SEED_SCOPE};
+use kr_client::recovery::{BundleStore, HostBackups, parse_kit};
 use kr_client::services::account::{
     ACCOUNT_ORIGIN, AccountToken, AccountTokenSource, BACKUP_RESTORE_SCOPE, BACKUP_WRITE_SCOPE,
     Client, IssuedGrant, RECOVERY_BACKUP_SCOPES, REQUESTED_SCOPES, RefreshToken, SignedInAccount,
@@ -31,10 +32,15 @@ use kr_client::services::{
     managed_response_limits,
 };
 use kr_crypto::kdf::RecoverySeed;
-use kr_crypto::keys::AuthorisationKeyPair;
+use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
 use kr_crypto::sign::{SigningTranscript, sign};
 use kr_crypto::store::{MemoryStore, load_recovery_seed, store_recovery_seed};
-use kr_protocol::archive::{RecoveryBundle, RecoveryContext, RecoveryKit, TrustedWriter};
+use kr_protocol::archive::{RecoveryBundle, RecoveryContext, RecoveryKit};
+use kr_protocol::backup_read::BackupSignIn;
+use kr_protocol::backup_setup::{
+    BackupEnableParams, BackupEnableResult, BackupHostKeys, BackupSetupState, BackupStatusResult,
+    BackupStorageState, BackupStorageUnread,
+};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::scalars::{AuthorisationKey, Signature64, TimestampMs};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
@@ -354,13 +360,114 @@ fn now_ms() -> u64 {
     .expect("a time in range")
 }
 
-/// A writer a test enrols: a fresh key, named the way a bundle names one.
-fn a_writer() -> TrustedWriter {
-    let key = AuthorisationKeyPair::generate().expect("a key");
-    TrustedWriter {
-        writer_key_id: key.key_id(),
-        signing_key: *key.public(),
-        enrolled_at_ms: TimestampMs::new(1_700_000_000_000),
+/// The host on this computer, as far as this suite needs it: what its status says, the calls it is
+/// sent, and what it answers. The daemon itself is exercised against a real service and a real
+/// bundle in the controller's suite; what is held here is what the application does around it.
+struct Host {
+    status: Mutex<BackupStatusResult>,
+    keys: BackupHostKeys,
+    /// What the host answers to the setup, or nothing when the answer is lost.
+    answer: Mutex<Option<BackupEnableResult>>,
+    /// The setups it was sent, and whether the service held exactly their bundle at that moment.
+    enabled: Mutex<Vec<(BackupEnableParams, bool)>>,
+    statuses: Mutex<usize>,
+    /// Where the service's bundles are read from, to check the order of the calls.
+    held: Box<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>,
+}
+
+impl std::fmt::Debug for Host {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Host").finish_non_exhaustive()
+    }
+}
+
+impl Host {
+    /// A host that selects `service`, has a usable sign-in and is not set up.
+    fn new(computer: &Computer, service: &str) -> Self {
+        let writer = AuthorisationKeyPair::generate().expect("a key");
+        let producer = StoredEnvelopeKeyPair::generate().expect("a key");
+        let keys = BackupHostKeys {
+            writer_key_id: writer.key_id(),
+            writer_public_key: *writer.public(),
+            producer_key_id: producer.key_id(),
+            producer_public_key: *producer.public(),
+        };
+        let web = Arc::clone(computer.served.web());
+        Self {
+            status: Mutex::new(BackupStatusResult {
+                service: kr_protocol::scalars::Nullable::some(service.to_owned()),
+                sign_in: BackupSignIn::Usable,
+                privacy_mode: false,
+                setup: BackupSetupState::None {},
+                keys: kr_protocol::scalars::Nullable::some(keys.clone()),
+                storage: BackupStorageState::Unread {
+                    why: BackupStorageUnread::NoToken,
+                },
+                last_attempt: kr_protocol::scalars::Nullable::null(),
+            }),
+            keys,
+            answer: Mutex::new(None),
+            enabled: Mutex::new(Vec::new()),
+            statuses: Mutex::new(0),
+            held: Box::new(move |locator| web.bundle(locator)),
+        }
+    }
+
+    /// Answers the setup the way a host that carried it out does.
+    fn sets_up(&self) {
+        *self.answer.lock().expect("answer") = Some(BackupEnableResult::Enabled {
+            archive_id: kr_protocol::ids::ArchiveId::new(kr_protocol::scalars::Uuid::from_bytes(
+                [0; 16],
+            )),
+            kit_fingerprint: String::new(),
+            enabled_at_ms: TimestampMs::new(0),
+        });
+    }
+
+    fn with_setup(&self, setup: BackupSetupState) {
+        self.status.lock().expect("status").setup = setup;
+    }
+
+    fn setups_sent(&self) -> Vec<(BackupEnableParams, bool)> {
+        self.enabled.lock().expect("enabled").clone()
+    }
+}
+
+impl HostBackups for Host {
+    fn status(&self) -> ServiceFuture<'_, BackupStatusResult> {
+        *self.statuses.lock().expect("statuses") += 1;
+        let status = self.status.lock().expect("status").clone();
+        Box::pin(async move { Ok(status) })
+    }
+
+    fn enable<'a>(
+        &'a self,
+        params: &'a BackupEnableParams,
+    ) -> ServiceFuture<'a, BackupEnableResult> {
+        // The bundle is at the service, whole, before the host is asked: the host goes on only if
+        // what is there is the bytes it is given.
+        let there = (self.held)(&params.bundle_locator.to_string());
+        self.enabled.lock().expect("enabled").push((
+            params.clone(),
+            there.as_deref() == Some(params.sealed_bundle.as_slice()),
+        ));
+        let answer = self.answer.lock().expect("answer").clone();
+        Box::pin(async move {
+            match answer {
+                Some(BackupEnableResult::Enabled { .. }) => Ok(BackupEnableResult::Enabled {
+                    archive_id: params.archive_id,
+                    kit_fingerprint: params.kit_fingerprint.clone(),
+                    enabled_at_ms: params.enabled_at_ms,
+                }),
+                Some(other) => Ok(other),
+                None => Err(kr_client::ClientError::Host(
+                    kr_protocol::error::ProtocolError::new(
+                        ErrorCode::OutcomeUnknown,
+                        "the answer did not arrive".to_owned(),
+                    ),
+                )),
+            }
+        })
     }
 }
 
@@ -599,45 +706,221 @@ async fn a_kit_saved_over_an_existing_file_leaves_that_file_private_and_whole() 
     assert_eq!(mode & 0o777, 0o600, "the kit is private to its owner");
 }
 
-/// KR-REQ-20.15: a writer is declared recovery-enabled only with the evidence that the bundle
-/// naming it has landed, and a fresh device then reads the writer from the bundle.
+/// KR-REQ-20.15: the host's writer is named in this computer's bundle, and the bundle has landed at
+/// the service, before the host is asked to set its backups up under this computer's recovery; the
+/// host is sent this computer's recipient and the very bytes that are at the service, and the
+/// computer says the host is covered only after the host said it is set up. A fresh device holding
+/// only the kit then reads the writer, the producer and the archive from the bundle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_writer_is_declared_enabled_only_once_the_bundle_naming_it_has_landed() {
+async fn the_host_is_named_in_the_bundle_before_it_is_set_up_under_this_computers_recovery() {
     let computer = Computer::new().await;
     let page = computer.page().await;
     page.call("recovery_turn_on", json!({})).expect("on");
     let out = tempfile::tempdir().expect("a directory");
     let (_, kit) = page.kit(out.path());
+    let host = Host::new(&computer, computer.served.origin());
+    host.sets_up();
 
-    let writer = a_writer();
-    let enabled = page
+    let covered = page
         .recovery
-        .enable_writer(&page.account, writer.clone())
+        .cover_host(&page.account, &host, false)
         .await
-        .expect("the writer is enabled");
-    assert_eq!(enabled.writer_key_id(), writer.writer_key_id);
-    assert_eq!(enabled.bundle_position().write_sequence, 2);
+        .expect("the host is covered");
+    let seed = RecoverySeed::from_kit(&kit).expect("the kit's seed");
+    let recipient = *seed.recipient().expect("a recipient").public();
+    let fingerprint = kr_client::recovery::kit_fingerprint(&recipient);
+    assert_eq!(
+        covered,
+        HostCoverView::Covered {
+            kit_fingerprint: fingerprint.clone(),
+            replaced: None,
+            already: false
+        }
+    );
 
-    // By the time the evidence exists, the bundle at the stand-in's locator is the one naming the
-    // writer, under the same locator and without a new seed.
-    let (sequence, _) = computer
-        .served
-        .web()
-        .bundle_write(&kit.bundle_locator)
-        .expect("the bundle");
-    assert_eq!(sequence, 2);
+    // The host was asked once, with this computer's recipient and the bundle that was at the
+    // service when it was asked.
+    let sent = host.setups_sent();
+    assert_eq!(sent.len(), 1);
+    let (params, bundle_was_there) = &sent[0];
+    assert!(
+        bundle_was_there,
+        "the bundle landed before the host was asked"
+    );
+    assert_eq!(params.recovery_public_key, recipient);
+    assert_eq!(params.kit_fingerprint, fingerprint);
+    assert_eq!(params.bundle_locator.to_string(), kit.bundle_locator);
+    assert!(!params.replace);
+    assert_eq!(params.writer_key_id, host.keys.writer_key_id);
+    assert_eq!(params.producer_key_id, host.keys.producer_key_id);
+
+    // A device that holds only the kit reads what the host's archive needs from the bundle.
     let bundle = read_with_only_the_kit(&computer.served, &kit).await;
     assert_eq!(bundle.revision.get(), 2);
+    assert!(bundle.trusted_writers.iter().any(|held| {
+        held.writer_key_id == host.keys.writer_key_id
+            && held.signing_key == host.keys.writer_public_key
+    }));
+    assert!(bundle.trusted_producers.iter().any(|held| {
+        held.sender_key_id == host.keys.producer_key_id
+            && held.stored_envelope_key == host.keys.producer_public_key
+    }));
     assert!(
         bundle
-            .trusted_writers
+            .collections
             .iter()
-            .any(|held| held.writer_key_id == writer.writer_key_id)
+            .any(|held| held.archive_id == params.archive_id),
+        "the bundle names the archive the host will make"
     );
 }
 
-/// KR-REQ-20.15: a write whose answer is lost declares nothing and holds back every other write
-/// until it is settled, and a restart keeps that.
+/// KR-REQ-20.15: a host that cannot be covered as it stands is left as it is, and nothing is
+/// declared. Nothing reaches the service and the host is asked nothing more than its status, unless
+/// a replacement is asked for by name over a host set up under another kit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_cannot_be_covered_as_it_stands_is_left_alone_and_nothing_is_declared() {
+    let computer = Computer::new().await;
+
+    // Recovery is not on: the host is not asked, and nothing is written.
+    let page = computer.page().await;
+    let host = Host::new(&computer, computer.served.origin());
+    let refused = page
+        .recovery
+        .cover_host(&page.account, &host, false)
+        .await
+        .expect_err("recovery is off");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied);
+    assert_eq!(*host.statuses.lock().expect("statuses"), 0);
+    assert_eq!(writes_sent(&computer), 0);
+
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let before = writes_sent(&computer);
+    let left = |why: LeftView| HostCoverView::Left { why };
+
+    // Each way the host cannot be covered as it stands.
+    let ways: Vec<(&str, Box<dyn Fn(&Host)>, LeftView)> = vec![
+        (
+            "no service",
+            Box::new(|host| {
+                host.status.lock().expect("status").service =
+                    kr_protocol::scalars::Nullable::null();
+            }),
+            LeftView::NoService,
+        ),
+        (
+            "another service",
+            Box::new(|host| {
+                host.status.lock().expect("status").service =
+                    kr_protocol::scalars::Nullable::some("https://elsewhere.example".to_owned());
+            }),
+            LeftView::OtherService {
+                host: "elsewhere.example".to_owned(),
+            },
+        ),
+        (
+            "signed out",
+            Box::new(|host| {
+                host.status.lock().expect("status").sign_in = BackupSignIn::SignedOut;
+            }),
+            LeftView::SignIn {
+                sign_in: BackupSignIn::SignedOut,
+            },
+        ),
+        (
+            "a setup under way",
+            Box::new(|host| {
+                host.with_setup(BackupSetupState::InProgress {
+                    kit_fingerprints: vec!["AAAA-BBBB".to_owned()],
+                });
+            }),
+            LeftView::SetupUnderWay {
+                kit_fingerprints: vec!["AAAA-BBBB".to_owned()],
+            },
+        ),
+        (
+            "another kit",
+            Box::new(|host| {
+                host.with_setup(BackupSetupState::Committed {
+                    archive_id: kr_protocol::ids::ArchiveId::new(
+                        kr_protocol::scalars::Uuid::from_bytes([9; 16]),
+                    ),
+                    kit_fingerprint: "CCCC-DDDD".to_owned(),
+                    enabled_at_ms: TimestampMs::new(1),
+                    unusable: kr_protocol::scalars::Nullable::null(),
+                });
+            }),
+            LeftView::OtherKit {
+                host_fingerprint: "CCCC-DDDD".to_owned(),
+            },
+        ),
+    ];
+    for (name, arrange, why) in ways {
+        let host = Host::new(&computer, computer.served.origin());
+        host.sets_up();
+        arrange(&host);
+        let answer = page
+            .recovery
+            .cover_host(&page.account, &host, false)
+            .await
+            .unwrap_or_else(|refused| panic!("{name}: {refused:?}"));
+        assert_eq!(answer, left(why), "{name}");
+        assert!(
+            host.setups_sent().is_empty(),
+            "{name}: the host was not asked"
+        );
+        assert_eq!(
+            writes_sent(&computer),
+            before,
+            "{name}: nothing was written"
+        );
+    }
+
+    // A replacement asked for by name over a host set up under another kit goes ahead, under a new
+    // archive, and says which kit it replaced.
+    let host = Host::new(&computer, computer.served.origin());
+    host.sets_up();
+    let earlier = kr_protocol::ids::ArchiveId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
+    host.with_setup(BackupSetupState::Committed {
+        archive_id: earlier,
+        kit_fingerprint: "CCCC-DDDD".to_owned(),
+        enabled_at_ms: TimestampMs::new(1),
+        unusable: kr_protocol::scalars::Nullable::null(),
+    });
+    let replaced = page
+        .recovery
+        .cover_host(&page.account, &host, true)
+        .await
+        .expect("replaced");
+    assert!(matches!(
+        replaced,
+        HostCoverView::Covered { replaced: Some(ref kit), already: false, .. } if kit == "CCCC-DDDD"
+    ));
+    let sent = host.setups_sent();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].0.replace);
+    assert_ne!(sent[0].0.archive_id, earlier, "a new archive");
+
+    // A host that declines after the bundle is written is left as it is, and nothing is declared.
+    let host = Host::new(&computer, computer.served.origin());
+    *host.answer.lock().expect("answer") = Some(BackupEnableResult::Declined {
+        cause: kr_protocol::backup_setup::BackupEnableCause::BundleConflict {},
+    });
+    let declined = page
+        .recovery
+        .cover_host(&page.account, &host, false)
+        .await
+        .expect("an answer");
+    assert!(matches!(
+        declined,
+        HostCoverView::Left {
+            why: LeftView::Declined { .. }
+        }
+    ));
+}
+
+/// KR-REQ-20.15: a write of the bundle whose answer is lost declares nothing and keeps the host
+/// from being asked, holds back every other write until it is settled, and a restart keeps that;
+/// and a host that does not say how its setup ended is no evidence either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_write_whose_answer_was_lost_blocks_the_next_until_it_is_settled() {
     for (moment, landed) in [(Moment::After, true), (Moment::Before, false)] {
@@ -646,16 +929,21 @@ async fn a_write_whose_answer_was_lost_blocks_the_next_until_it_is_settled() {
         page.call("recovery_turn_on", json!({})).expect("on");
         let out = tempfile::tempdir().expect("a directory");
         let (_, kit) = page.kit(out.path());
+        let host = Host::new(&computer, computer.served.origin());
+        host.sets_up();
 
-        // The writer's bundle write is the second request to the route: a read, then the write.
+        // The bundle write is the second request to the route: a read, then the write.
         computer.served.web().fail(SYNC_PATH, 2, moment);
-        let writer = a_writer();
         let lost = page
             .recovery
-            .enable_writer(&page.account, writer.clone())
+            .cover_host(&page.account, &host, false)
             .await
             .expect_err("no evidence without an answer");
         assert_eq!(lost.code, ErrorCode::OutcomeUnknown, "{moment:?}");
+        assert!(
+            host.setups_sent().is_empty(),
+            "{moment:?}: the host is not asked"
+        );
         assert_eq!(page.view()["state"], "unsettled", "{moment:?}");
 
         // The application is closed and started again: the lost write is still outstanding.
@@ -672,7 +960,7 @@ async fn a_write_whose_answer_was_lost_blocks_the_next_until_it_is_settled() {
             let before = writes_sent(&computer);
             let blocked = page
                 .recovery
-                .enable_writer(&page.account, a_writer())
+                .cover_host(&page.account, &host, false)
                 .await
                 .expect_err("a write waits for the lost one");
             assert_eq!(blocked.code, ErrorCode::PermissionDenied, "{moment:?}");
@@ -681,37 +969,48 @@ async fn a_write_whose_answer_was_lost_blocks_the_next_until_it_is_settled() {
                 before,
                 "{moment:?}: nothing was sent"
             );
+            assert!(host.setups_sent().is_empty());
         }
 
         let settled = page
             .call("recovery_settle", json!({}))
             .expect("the lost write is settled");
         assert_eq!(settled["state"], "on", "{moment:?}");
-        let bundle = read_with_only_the_kit(&computer.served, &kit).await;
-        assert_eq!(
-            bundle
-                .trusted_writers
-                .iter()
-                .any(|held| held.writer_key_id == writer.writer_key_id),
-            landed,
-            "{moment:?}: the bundle names the writer only if the write landed"
-        );
 
-        // Settled, the next write goes, and a writer declared now is one the bundle names.
-        let enabled = page
+        // Settled, the next try goes: the host is asked with the bundle that is at the service.
+        let covered = page
             .recovery
-            .enable_writer(&page.account, writer.clone())
+            .cover_host(&page.account, &host, false)
             .await
-            .expect("the writer is enabled");
-        assert_eq!(enabled.writer_key_id(), writer.writer_key_id);
+            .expect("the host is covered");
+        assert!(
+            matches!(covered, HostCoverView::Covered { .. }),
+            "{moment:?}"
+        );
+        let sent = host.setups_sent();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].1, "{moment:?}: the bundle was at the service");
         let bundle = read_with_only_the_kit(&computer.served, &kit).await;
         assert!(
             bundle
                 .trusted_writers
                 .iter()
-                .any(|held| held.writer_key_id == writer.writer_key_id)
+                .any(|held| held.writer_key_id == host.keys.writer_key_id)
         );
     }
+
+    // A host that carried the setup out and did not say so is no evidence: the answer is unknown.
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let silent = Host::new(&computer, computer.served.origin());
+    let unknown = page
+        .recovery
+        .cover_host(&page.account, &silent, false)
+        .await
+        .expect_err("no answer from the host");
+    assert_eq!(unknown.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(silent.setups_sent().len(), 1, "the host was asked once");
 }
 
 /// The first write of all can be lost too. Whether it landed or not, settling it leaves recovery
