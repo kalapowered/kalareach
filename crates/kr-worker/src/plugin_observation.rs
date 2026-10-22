@@ -23,10 +23,10 @@
 //! a loss that arrives while it runs asks for another. What the component has missed is put in the
 //! binding's component report, where a person reads it, as counts and never as content.
 //!
-//! The lane gives the pump what it lost together with the entry it hands over, and the lane loses
-//! its oldest entries first, so what was lost is always older than the entry in hand: the loss is
-//! applied and its snapshot taken before the entry is offered, and what is lost while that runs is
-//! newer than the entry and is applied with the next.
+//! The lane gives the pump a loss with the first entry that is newer than it, and all of what it lost
+//! where none waits: the loss is applied and its snapshot taken before the entry is offered, and
+//! what is lost while that runs, or is newer than the entry because the lane lost it while a
+//! request waited, is applied with a later entry.
 //!
 //! Between the two sources there is no order, and none is claimed. Within a source the order is the
 //! order produced, and a snapshot is asked for after a loss and before any later entry is handed to
