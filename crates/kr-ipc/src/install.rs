@@ -2070,6 +2070,7 @@ mod tests {
                 },
                 version: 7,
                 migrates_from: 1,
+                reads_through: None,
             }],
             files: Vec::new(),
         };

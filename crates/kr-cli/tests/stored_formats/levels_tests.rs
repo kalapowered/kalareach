@@ -89,6 +89,7 @@ fn entry(version: u32) -> ReleaseStore {
         },
         version,
         migrates_from: 1,
+        reads_through: None,
     }
 }
 

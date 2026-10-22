@@ -75,13 +75,24 @@ use crate::error::{DeliveryError, Result};
 /// may have left this host in an object placed in a device's mailbox, which is a copy that left
 /// whether or not the push that refers to it ever did. A journal written under version 6, 7, 8 or 9
 /// is brought forward in place, once, when it is opened (`migrate_forward`); a journal written
-/// under a version below 6 or above 10 is refused rather than read with the columns of another
+/// under a version below 6 or above [`READS_THROUGH`] is refused rather than read with the columns of another
 /// shape, matched against bindings this build no longer computes the same way, or trusted to hold
 /// no request it should not.
 pub const SCHEMA_VERSION: i64 = 10;
 
 /// The oldest schema this build brings forward rather than refusing.
 pub const OLDEST_SCHEMA_VERSION: i64 = 6;
+
+/// The newest schema above [`SCHEMA_VERSION`] this build opens as it finds it, and writes nothing
+/// of.
+///
+/// Version 11 is version 10 without the `signed_authority_object` payload type of a sealed
+/// envelope, which nothing produces, and nothing else: its tables, columns and rows are version
+/// 10's. The release that writes it can be rolled back to this one, which opens the journal as it
+/// stands, and a journal this build opens at 11 is written only with the rows version 10 writes. A
+/// change to what the journal keeps beyond that takes version 12, and is read ahead by the release
+/// before the one that writes it.
+pub const READS_THROUGH: i64 = 11;
 
 /// The binding a notification is given when its destination is removed while an attempt is on the
 /// wire. A destination's digest is 64 hexadecimal characters, so no destination configured under
@@ -752,6 +763,13 @@ impl DeliveryJournal {
             }
             Some(version) if (OLDEST_SCHEMA_VERSION..SCHEMA_VERSION).contains(&version) => {
                 migrate_forward(&mut connection)?;
+                let journal = Self { connection };
+                journal.check_schema()?;
+                Ok(journal)
+            }
+            // A store of the next version, which a later release writes: opened as it stands, with
+            // its version left as it is.
+            Some(version) if (SCHEMA_VERSION + 1..=READS_THROUGH).contains(&version) => {
                 let journal = Self { connection };
                 journal.check_schema()?;
                 Ok(journal)
@@ -7224,7 +7242,7 @@ mod tests {
     /// the versions this build brings forward.
     #[test]
     fn a_journal_written_under_another_schema_version_is_refused() {
-        for version in [OLDEST_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
+        for version in [OLDEST_SCHEMA_VERSION - 1, READS_THROUGH + 1] {
             let directory = tempfile::tempdir().expect("a directory");
             let path = directory.path().join("delivery.sqlite3");
             drop(DeliveryJournal::open(&path).expect("a journal"));
@@ -7241,6 +7259,35 @@ mod tests {
                 "version {version} is refused"
             );
         }
+    }
+
+    /// A journal of the next version, which a later release writes, is opened as it stands: its
+    /// rows are read, a request is recorded in it, and its version is left as it was.
+    #[test]
+    fn a_journal_of_the_next_version_is_opened_as_it_stands_and_its_version_is_left_alone() {
+        assert_eq!(READS_THROUGH, SCHEMA_VERSION + 1, "the next version only");
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("delivery.sqlite3");
+        let held = {
+            let journal = DeliveryJournal::open(&path).expect("a journal");
+            journal.outstanding().expect("a count")
+        };
+        let connection = rusqlite::Connection::open(&path).expect("a connection");
+        connection
+            .execute(
+                "UPDATE delivery_schema SET version = ?1",
+                params![SCHEMA_VERSION + 1],
+            )
+            .expect("the version changes");
+        drop(connection);
+        let journal = DeliveryJournal::open(&path).expect("the next version is opened");
+        assert_eq!(journal.outstanding().expect("a count"), held);
+        drop(journal);
+        let connection = rusqlite::Connection::open(&path).expect("a connection");
+        let version: i64 = connection
+            .query_row("SELECT version FROM delivery_schema", [], |row| row.get(0))
+            .expect("a version");
+        assert_eq!(version, SCHEMA_VERSION + 1, "this build wrote nothing of it");
     }
 
     /// Makes the journal at `path` look exactly as version 6 wrote it: no credential column, and

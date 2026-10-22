@@ -218,7 +218,8 @@
           "table": "delivery_schema"
         },
         "version": 10,
-        "migrates_from": 6
+        "migrates_from": 6,
+        "reads_through": 11
       },
       "digest": "1e4145f3929171238eefc093c117cd82e6b99a8ef008b8b333dc0b42512a155a",
       "kept": [
