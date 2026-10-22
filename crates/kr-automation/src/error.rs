@@ -192,6 +192,19 @@ pub enum AutomationError {
         found_generation: u64,
     },
 
+    /// A rearm named a budget generation the chain is not on.
+    #[error(
+        "chain {root} is on budget generation {found}, and the request names generation {named}"
+    )]
+    GenerationMismatch {
+        /// The causal root ID.
+        root: CausalRootId,
+        /// The generation the request named.
+        named: u64,
+        /// The generation the chain's budget is on.
+        found: u64,
+    },
+
     /// The parent run was not found in host storage.
     #[error("parent run {0} not found in durable host store")]
     ParentRunNotFound(WorkflowRunId),
@@ -370,6 +383,13 @@ impl From<&AutomationError> for ProtocolError {
             AutomationError::StaleCausalGeneration { root, .. } => Self::new(
                 ErrorCode::CausalLimit,
                 format!("stale causal generation rejected for root {root}"),
+            ),
+            AutomationError::GenerationMismatch { root, named, found } => Self::new(
+                ErrorCode::DraftConflict,
+                format!(
+                    "chain {root} is on budget generation {found}, and the request names \
+                     generation {named}"
+                ),
             ),
             AutomationError::ParentRunNotFound(id) => Self::new(
                 ErrorCode::InvalidArgument,

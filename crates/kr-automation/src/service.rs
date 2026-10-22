@@ -1,16 +1,19 @@
 //! The environment automation service.
 //!
 //! Owns workflow definitions, runs and causal budgets.
-//! Dispatches the five methods of the `Automation` method group:
+//! Dispatches the six methods of the `Automation` method group:
 //! - `workflow.install`
 //! - `workflow.enable`
 //! - `workflow.pause`
 //! - `workflow.run`
+//! - `workflow.rearm`
 //! - `workflow.read`
 //!
-//! The four mutations are actions. Each one is performed inside one journal transaction together
-//! with the record of what it came to ([`WorkflowStore::act`]), and a repeat of an action is
-//! answered from that record ([`AutomationService::answered`]) rather than performed again.
+//! Four of the mutations are actions. Each one is performed inside one journal transaction
+//! together with the record of what it came to ([`WorkflowStore::act`]), and a repeat of an
+//! action is answered from that record ([`AutomationService::answered`]) rather than performed
+//! again. `workflow.rearm` keeps no record: it names the budget generation it leaves, and the
+//! chain's own state recognises a repeat of it.
 //!
 //! # Where a run comes from
 //!
@@ -39,8 +42,8 @@ use kr_protocol::attention::AttentionSource;
 use kr_protocol::automation::{
     NodeStatus, WorkflowAlert, WorkflowAlertKind, WorkflowDefinition, WorkflowEnableParams,
     WorkflowEnableResult, WorkflowInstallParams, WorkflowInstallResult, WorkflowPauseParams,
-    WorkflowPauseResult, WorkflowReadParams, WorkflowReadResult, WorkflowRunParams,
-    WorkflowRunResult,
+    WorkflowPauseResult, WorkflowReadParams, WorkflowReadResult, WorkflowRearmParams,
+    WorkflowRearmResult, WorkflowRunParams, WorkflowRunResult,
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{CausalRootId, EnvironmentId, GrantId, PluginId, WorkflowId, WorkflowRunId};
@@ -56,7 +59,7 @@ use crate::engine::WorkflowEngine;
 use crate::error::{AutomationError, Result};
 use crate::store::{
     ATTENTION_CONSUMER, ATTENTION_EVENTS, Acted, ActionKey, ActionRecord, AttentionSubject,
-    EVENT_NODE_SETTLED, InstalledDefinition, Journal, JournalEvent, JournalEventKind,
+    EVENT_NODE_SETTLED, InstalledDefinition, Journal, JournalEvent, JournalEventKind, Rearm,
     StoredRunRecord, Submitted, WorkflowStore,
 };
 
@@ -225,6 +228,17 @@ pub struct AdmittedTriggers {
     /// that could not be read or a journal that could not be written. The event it stopped at is
     /// still unread and is decided again on the next pass.
     pub stopped: Option<AutomationError>,
+}
+
+/// What a rearm came to: the generation the chain's budget is on, and the runs it continued that
+/// start now.
+#[derive(Debug)]
+pub struct Rearmed {
+    /// The answer to the request.
+    pub result: WorkflowRearmResult,
+    /// The continued runs that start now, for the host to execute. A request that was already
+    /// answered by an earlier copy of it starts none.
+    pub started: Vec<StartedRun>,
 }
 
 /// What an earlier submission of an action came to, as its method answers it.
@@ -1121,49 +1135,103 @@ impl AutomationService {
         })
     }
 
-    /// Rearms a causal chain under an authorised administrative request, and continues it.
+    /// Rearms a causal chain under an authorised administrative request, and continues it
+    /// (`workflow.rearm`).
     ///
-    /// The request is made under `grant_id`, which this host's grant store must hold as live, for
-    /// this environment, with the right to manage automation; a replayed or late event carries no
-    /// grant and cannot rearm anything. In one transaction, the chain's budget moves to a new
-    /// generation with fresh counters, and every descendant the exhausted budget refused is
-    /// admitted once, as a run of the same chain in the new generation, under its own workflow's
-    /// grant and limits: the chain goes on from where it was stopped. A continuation whose
-    /// workflow no longer runs, or whose admission is refused, is spent all the same. A descendant
-    /// of a run from the old generation that arrives afterwards is refused, and so is a replay of
-    /// one the rearm continued. Returns the continued runs that start now; one that waits for a
-    /// slot starts when one frees.
+    /// The request is made under `params.grant_reference`, which this host's grant store must hold
+    /// as live, for this environment, with the right to manage automation; a replayed or late
+    /// event carries no grant and cannot rearm anything. A paired device (`caller_grant`) names
+    /// the grant it holds and reaches only a chain that is its grant's, and a chain it may not
+    /// reach is answered as one this journal holds no budget for.
+    ///
+    /// In one transaction the chain's budget moves from the generation the request names to the
+    /// next, with fresh counters, and every descendant the exhausted budget refused is admitted
+    /// once, as a run of the same chain in the new generation, under its own workflow's grant and
+    /// limits: the chain goes on from where it was stopped. A continuation whose workflow no
+    /// longer runs, or whose admission is refused, is spent all the same. A descendant of a run
+    /// from the old generation that arrives afterwards is refused, and so is a replay of one the
+    /// rearm continued.
+    ///
+    /// The generation is what recognises a repeat. The request names the generation it leaves, so
+    /// the same request sent again, because its reply was lost, finds the chain already on the
+    /// next generation, is answered with it and starts nothing; the chain may have run out again
+    /// by then, and that is no reason to give it a second budget for a request that was answered.
+    /// Nothing is recorded for the request, because the chain's own state is what answers it.
+    ///
+    /// The runs that start now are in [`Rearmed::started`], for the host to execute; one that
+    /// waits for a slot starts when one frees.
     ///
     /// # Errors
     ///
-    /// Returns [`AutomationError::PermissionDenied`] for a grant that does not carry the right or
-    /// does not cover this environment, the grant store's refusal for a grant it does not hold as
-    /// live, [`AutomationError::InvalidArgument`] for a chain this journal holds no budget for, and
-    /// a storage error.
+    /// Returns [`AutomationError::PermissionDenied`] for a grant that does not carry the right,
+    /// does not cover this environment, or is not the one a paired device holds; the grant
+    /// store's refusal for a grant it does not hold as live; [`AutomationError::InvalidArgument`]
+    /// for a chain this journal holds no budget for (or that a device may not reach) and for one
+    /// whose budget has not run out; [`AutomationError::GenerationMismatch`] for a chain on
+    /// another generation; a lapsed admission; and a storage error.
     pub fn rearm(
         &self,
-        causal_root_id: CausalRootId,
-        grant_id: GrantId,
+        params: &WorkflowRearmParams,
+        admission: &(dyn Fn() -> Result<()> + Send + Sync),
+        caller_grant: Option<GrantId>,
         now_ms: u64,
-    ) -> Result<Vec<StartedRun>> {
-        let grant = self.authority.grant(grant_id, now_ms)?;
+    ) -> Result<Rearmed> {
+        if let Some(held) = caller_grant
+            && params.grant_reference != held
+        {
+            return Err(AutomationError::PermissionDenied(
+                "a paired device rearms a chain only under the grant it holds".to_owned(),
+            ));
+        }
+        let grant = self.authority.grant(params.grant_reference, now_ms)?;
         if !grant.permits(ActionRight::AutomationManage)
             || !grant.environment_selector.admits(self.environment_id)
         {
             return Err(AutomationError::PermissionDenied(format!(
-                "grant {grant_id} does not carry automation.manage in environment {}, which a \
-                 rearm needs",
-                self.environment_id
+                "grant {} does not carry automation.manage in environment {}, which a rearm \
+                 needs",
+                params.grant_reference, self.environment_id
             )));
         }
-        let (_budget, continued) = self.store.rearm_budget(
-            causal_root_id,
-            now_ms,
-            |journal, continuation, generation| {
-                self.continue_chain(journal, continuation, generation, now_ms)
-            },
-        )?;
-        Ok(continued)
+        let root = params.causal_root_id;
+        self.store.guarded(admission, |journal| {
+            // A chain belongs to the grant its root run acts under, and a device reaches only
+            // its own grant's. Another grant's chain is answered as a root nothing is known for.
+            if let Some(held) = caller_grant
+                && journal.chain_grant(root)? != Some(held)
+            {
+                return Err(AutomationError::InvalidArgument(
+                    "causal root not found".to_owned(),
+                ));
+            }
+            let rearm = journal.rearm_budget(
+                root,
+                params.generation.get(),
+                now_ms,
+                |journal, continuation, generation| {
+                    self.continue_chain(journal, continuation, generation, now_ms)
+                },
+            )?;
+            Ok(match rearm {
+                Rearm::Rearmed {
+                    generation,
+                    continued,
+                } => Rearmed {
+                    result: WorkflowRearmResult {
+                        causal_root_id: root,
+                        generation: U64::new(generation),
+                    },
+                    started: continued,
+                },
+                Rearm::Already { generation } => Rearmed {
+                    result: WorkflowRearmResult {
+                        causal_root_id: root,
+                        generation: U64::new(generation),
+                    },
+                    started: Vec::new(),
+                },
+            })
+        })
     }
 
     /// Admits one continuation of a rearmed chain, inside the rearm's transaction.

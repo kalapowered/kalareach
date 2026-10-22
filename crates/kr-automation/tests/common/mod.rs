@@ -115,6 +115,16 @@ pub trait Submit {
         params: &kr_protocol::automation::WorkflowRunParams,
         now_ms: u64,
     ) -> kr_automation::Result<kr_protocol::automation::WorkflowRunResult>;
+
+    /// `workflow.rearm` of the chain `root` under `grant`, leaving budget generation `leaves`, as
+    /// the host's owner would ask it.
+    fn submit_rearm(
+        &self,
+        root: kr_protocol::ids::CausalRootId,
+        grant: GrantId,
+        leaves: u64,
+        now_ms: u64,
+    ) -> kr_automation::Result<kr_automation::Rearmed>;
 }
 
 impl Submit for kr_automation::AutomationService {
@@ -185,6 +195,25 @@ impl Submit for kr_automation::AutomationService {
             now_ms,
         )
         .await
+    }
+
+    fn submit_rearm(
+        &self,
+        root: kr_protocol::ids::CausalRootId,
+        grant: GrantId,
+        leaves: u64,
+        now_ms: u64,
+    ) -> kr_automation::Result<kr_automation::Rearmed> {
+        self.rearm(
+            &kr_protocol::automation::WorkflowRearmParams {
+                causal_root_id: root,
+                grant_reference: grant,
+                generation: kr_protocol::scalars::U64::new(leaves),
+            },
+            &admitted,
+            None,
+            now_ms,
+        )
     }
 }
 

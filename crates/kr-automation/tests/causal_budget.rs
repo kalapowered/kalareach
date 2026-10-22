@@ -667,24 +667,25 @@ async fn rearm_is_authorised_and_refuses_late_descendants() {
     // Under a grant without the management right nothing changes, and neither does it under a
     // grant this host does not hold.
     let refused = service
-        .rearm(root, test_grant_id(2), 2_000)
+        .submit_rearm(root, test_grant_id(2), 0, 2_000)
         .expect_err("no right");
     assert!(
         refused.to_string().contains("automation.manage"),
         "{refused}"
     );
     service
-        .rearm(root, test_grant_id(9), 2_000)
+        .submit_rearm(root, test_grant_id(9), 0, 2_000)
         .expect_err("no such grant");
     assert!(service.store().get_budget(root).unwrap().unwrap().exhausted);
 
     let continued = service
-        .rearm(root, test_grant_id(1), 2_000)
+        .submit_rearm(root, test_grant_id(1), 0, 2_000)
         .expect("an authorised rearm");
     assert!(
-        continued.is_empty(),
+        continued.started.is_empty(),
         "a chain exhausted by hand refused no descendant to continue from"
     );
+    assert_eq!(continued.result.generation.get(), 1);
     let rearmed = service.store().get_budget(root).unwrap().unwrap();
     assert!(!rearmed.exhausted);
     assert_eq!(rearmed.generation, 1);
@@ -1052,15 +1053,19 @@ async fn a_rearm_continues_its_chain_once_and_late_descendants_stay_refused() {
 
     // Under a grant without the management right, nothing is rearmed or continued.
     service
-        .rearm(root, test_grant_id(2), 1_200)
+        .submit_rearm(root, test_grant_id(2), 0, 1_200)
         .expect_err("no right");
     assert!(service.store().get_budget(root).unwrap().unwrap().exhausted);
 
     let continued = service
-        .rearm(root, test_grant_id(1), 1_300)
+        .submit_rearm(root, test_grant_id(1), 0, 1_300)
         .expect("an authorised rearm");
-    assert_eq!(continued.len(), 1, "the refused descendant is continued");
-    let continuation = continued.into_iter().next().expect("one run");
+    assert_eq!(
+        continued.started.len(),
+        1,
+        "the refused descendant is continued"
+    );
+    let continuation = continued.started.into_iter().next().expect("one run");
     let record = service
         .store()
         .get_run_record(continuation.run_id())
@@ -1111,13 +1116,16 @@ async fn a_rearm_continues_its_chain_once_and_late_descendants_stay_refused() {
         "the late descendant never ran"
     );
 
-    // The continuation was spent: a second rearm has nothing to continue.
-    assert!(
-        service
-            .rearm(root, test_grant_id(1), 1_600)
-            .expect("an authorised rearm")
-            .is_empty()
-    );
+    // The continuation was spent: the same request again is told the chain went on, starts
+    // nothing, and leaves the new budget as the continuation spent it.
+    let again = service
+        .submit_rearm(root, test_grant_id(1), 0, 1_600)
+        .expect("the same request is answered");
+    assert!(again.started.is_empty());
+    assert_eq!(again.result.generation.get(), 1);
+    let kept = service.store().get_budget(root).unwrap().unwrap();
+    assert_eq!(kept.generation, 1);
+    assert_eq!(kept.total_runs, 1, "no second budget");
 }
 
 /// KR-REQ-25.17: an authorised rearm is what gives a chain its depth ceiling stopped a new budget.
@@ -1165,11 +1173,15 @@ async fn a_rearm_continues_a_chain_its_depth_ceiling_stopped() {
     assert_eq!(deepest(&service), DEFAULT_CAUSAL_DEPTH_LIMIT);
 
     let continued = service
-        .rearm(root, test_grant_id(1), 3_000)
+        .submit_rearm(root, test_grant_id(1), 0, 3_000)
         .expect("an authorised rearm");
-    assert_eq!(continued.len(), 1, "the descendant the ceiling refused");
+    assert_eq!(
+        continued.started.len(),
+        1,
+        "the descendant the ceiling refused"
+    );
     let ran = service
-        .execute(continued.into_iter().next().expect("one run"))
+        .execute(continued.started.into_iter().next().expect("one run"))
         .await
         .expect("the continuation runs");
     assert_eq!(ran.status, WorkflowRunStatus::Completed, "{ran:?}");
@@ -1235,32 +1247,293 @@ fn a_continuation_the_new_budget_refuses_is_spent() {
     // The rearm hands the continuation over once, and the new budget refuses it too.
     let mut handed = 0;
     store
-        .rearm_budget(root, 1_200, |journal, continuation, generation| {
-            handed += 1;
-            journal
-                .commit_trigger_and_run(
-                    kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([0x53; 16])),
-                    &def,
-                    &continuation.event_id,
-                    &past(generation, 1_000),
-                    1_200,
-                    Placement::Start,
-                    Inherited::DEFAULTS,
-                )
-                .expect_err("the new budget refuses it as well");
-            Ok(None::<()>)
+        .guarded(&common::admitted, |journal| {
+            journal.rearm_budget(root, 0, 1_200, |journal, continuation, generation| {
+                handed += 1;
+                journal
+                    .commit_trigger_and_run(
+                        kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([0x53; 16])),
+                        &def,
+                        &continuation.event_id,
+                        &past(generation, 1_000),
+                        1_200,
+                        Placement::Start,
+                        Inherited::DEFAULTS,
+                    )
+                    .expect_err("the new budget refuses it as well");
+                Ok(None::<()>)
+            })
         })
         .expect("the rearm");
     assert_eq!(handed, 1);
 
     let mut handed_again = 0;
     store
-        .rearm_budget(root, 1_300, |_, _, _| {
-            handed_again += 1;
-            Ok(None::<()>)
+        .guarded(&common::admitted, |journal| {
+            journal.rearm_budget(root, 1, 1_300, |_, _, _| {
+                handed_again += 1;
+                Ok(None::<()>)
+            })
         })
         .expect("a second rearm");
     assert_eq!(handed_again, 0, "the continuation was spent");
+}
+
+/// A chain whose first run has finished, with its budget run out as a breached ceiling would
+/// leave it, and the chain's root.
+async fn an_exhausted_chain(service: &AutomationService, number: u8) -> CausalRootId {
+    let def = recurring_workflow(
+        number,
+        "exhausted",
+        "tests.passed",
+        WorkflowActionKind::RunTests,
+    );
+    install_and_enable(service, &def, 1_000);
+    let root = service
+        .submit_run(&run_params(&def, "evt-root"), 1_000)
+        .await
+        .expect("the root runs")
+        .causal_root_id;
+    run_out(service, root);
+    root
+}
+
+/// Runs the chain's budget out, as a breached ceiling does.
+fn run_out(service: &AutomationService, root: CausalRootId) {
+    let mut budget = service.store().get_budget(root).unwrap().unwrap();
+    budget.exhaust();
+    service.store().save_budget(&budget).unwrap();
+}
+
+/// KR-REQ-25.17: a repeat of a rearm gives no second budget, even when the chain has run out
+/// again since the first copy of the request was answered.
+///
+/// The request names the generation it leaves. The first copy moves the chain from it to the next;
+/// a copy sent again, because the reply was lost, finds the chain past it and is answered with
+/// where the chain is, whatever state the new budget is in. A request that leaves the generation
+/// the chain is on rearms it again, which is the control: the repeat is told apart by the
+/// generation and not by the chain being in good standing.
+#[tokio::test]
+async fn a_repeat_of_a_rearm_gives_no_second_budget() {
+    let service = in_memory();
+    let root = an_exhausted_chain(&service, 60).await;
+
+    let first = service
+        .submit_rearm(root, test_grant_id(1), 0, 2_000)
+        .expect("an authorised rearm");
+    assert_eq!(first.result.generation.get(), 1);
+    assert!(!service.store().get_budget(root).unwrap().unwrap().exhausted);
+
+    // The chain runs out again before the copy of the request that was not answered arrives.
+    run_out(&service, root);
+    let repeat = service
+        .submit_rearm(root, test_grant_id(1), 0, 3_000)
+        .expect("the repeat is answered");
+    assert_eq!(repeat.result.generation.get(), 1, "told where the chain is");
+    assert!(repeat.started.is_empty());
+    let kept = service.store().get_budget(root).unwrap().unwrap();
+    assert_eq!(kept.generation, 1);
+    assert!(kept.exhausted, "the repeat gave the chain nothing");
+    assert_eq!(kept.rearmed_at_ms, Some(2_000), "and touched nothing");
+
+    // A generation the chain is not on and has not left is refused as a conflict.
+    let wrong = service
+        .submit_rearm(root, test_grant_id(1), 5, 3_500)
+        .expect_err("the chain is not on generation 5");
+    assert_eq!(code(&wrong), ErrorCode::DraftConflict, "{wrong}");
+
+    // The control: a request that leaves the generation the chain is on rearms it.
+    let second = service
+        .submit_rearm(root, test_grant_id(1), 1, 4_000)
+        .expect("the chain is on generation 1 and has run out");
+    assert_eq!(second.result.generation.get(), 2);
+    assert!(!service.store().get_budget(root).unwrap().unwrap().exhausted);
+}
+
+/// KR-REQ-25.17: a chain whose budget has not run out is not rearmed, and a root nothing is known
+/// for is a root nothing is known for.
+///
+/// Nothing about a live chain is stopped, and a rearm would advance its generation under the runs
+/// that are using the budget it has.
+#[tokio::test]
+async fn a_chain_whose_budget_has_not_run_out_is_not_rearmed() {
+    let service = in_memory();
+    let def = recurring_workflow(61, "live", "manual", WorkflowActionKind::AttentionNotice);
+    install_and_enable(&service, &def, 1_000);
+    let root = service
+        .submit_run(&run_params(&def, "evt-live"), 1_000)
+        .await
+        .expect("the root runs")
+        .causal_root_id;
+
+    let refused = service
+        .submit_rearm(root, test_grant_id(1), 0, 2_000)
+        .expect_err("nothing about the chain is stopped");
+    assert_eq!(code(&refused), ErrorCode::InvalidArgument, "{refused}");
+    let kept = service.store().get_budget(root).unwrap().unwrap();
+    assert_eq!((kept.generation, kept.rearmed_at_ms), (0, None));
+
+    let unknown = service
+        .submit_rearm(test_root_id(0x77), test_grant_id(1), 0, 2_000)
+        .expect_err("no such chain");
+    assert_eq!(code(&unknown), ErrorCode::InvalidArgument, "{unknown}");
+}
+
+/// KR-REQ-25.17: a paired device rearms only a chain that acts under the grant it holds, and names
+/// that grant. A chain it may not reach is answered as a root nothing is known for.
+#[tokio::test]
+async fn a_paired_device_rearms_only_a_chain_under_its_own_grant() {
+    // Grant 1 is the owner's workflow grant, and grant 3 is a device's, with management rights.
+    let table = common::every_right(&[test_grant_id(1), test_grant_id(3)]);
+    let service = AutomationService::in_memory(common::host(
+        Arc::new(MockActionRunner::new()),
+        table,
+        Arc::new(ManualClock::new(1_000)),
+    ))
+    .expect("a service");
+    let root = an_exhausted_chain(&service, 62).await;
+    let params = |grant: GrantId| kr_protocol::automation::WorkflowRearmParams {
+        causal_root_id: root,
+        grant_reference: grant,
+        generation: kr_protocol::scalars::U64::new(0),
+    };
+
+    let borrowed = service
+        .rearm(
+            &params(test_grant_id(1)),
+            &common::admitted,
+            Some(test_grant_id(3)),
+            2_000,
+        )
+        .expect_err("a device names the grant it holds");
+    assert_eq!(code(&borrowed), ErrorCode::PermissionDenied, "{borrowed}");
+
+    let other = service
+        .rearm(
+            &params(test_grant_id(3)),
+            &common::admitted,
+            Some(test_grant_id(3)),
+            2_000,
+        )
+        .expect_err("the chain is the owner's");
+    assert_eq!(code(&other), ErrorCode::InvalidArgument, "{other}");
+    assert!(
+        other.to_string().contains("not found"),
+        "it learns nothing of the chain: {other}"
+    );
+    assert!(service.store().get_budget(root).unwrap().unwrap().exhausted);
+
+    // The control: the grant the chain acts under, held by the device that asks.
+    let own = service
+        .rearm(
+            &params(test_grant_id(1)),
+            &common::admitted,
+            Some(test_grant_id(1)),
+            2_000,
+        )
+        .expect("a device rearms its own grant's chain");
+    assert_eq!(own.result.generation.get(), 1);
+}
+
+/// KR-REQ-25.17: an admission that no longer stands writes nothing, because it is asked before the
+/// rearm's first write.
+#[tokio::test]
+async fn a_rearm_whose_admission_has_lapsed_writes_nothing() {
+    let service = in_memory();
+    let root = an_exhausted_chain(&service, 63).await;
+    let lapsed = || {
+        Err(AutomationError::Lapsed {
+            code: ErrorCode::PermissionDenied,
+            detail: "the authority this request was admitted under was withdrawn".to_owned(),
+        })
+    };
+    let params = kr_protocol::automation::WorkflowRearmParams {
+        causal_root_id: root,
+        grant_reference: test_grant_id(1),
+        generation: kr_protocol::scalars::U64::new(0),
+    };
+
+    let refused = service
+        .rearm(&params, &lapsed, None, 2_000)
+        .expect_err("the admission lapsed");
+    assert_eq!(code(&refused), ErrorCode::PermissionDenied, "{refused}");
+    let kept = service.store().get_budget(root).unwrap().unwrap();
+    assert_eq!((kept.generation, kept.exhausted), (0, true));
+
+    // The control: the same request under an admission that stands rearms the chain.
+    service
+        .rearm(&params, &common::admitted, None, 2_000)
+        .expect("the admission stands");
+    assert_eq!(
+        service
+            .store()
+            .get_budget(root)
+            .unwrap()
+            .unwrap()
+            .generation,
+        1
+    );
+}
+
+/// KR-REQ-25.17: a rearm that fails part way leaves the chain as it was, the refused descendant
+/// still waiting for the rearm that will continue it.
+#[test]
+fn a_rearm_that_fails_part_way_leaves_the_chain_as_it_was() {
+    use kr_automation::{CausalContext, CausalParent};
+    let journal = tempfile::tempdir().expect("a journal directory");
+    let store = WorkflowStore::open(journal.path()).expect("the journal opens");
+    let def = recurring_workflow(64, "deep", "tests.passed", WorkflowActionKind::RunTests);
+    store.save_definition(&def, 1_000).unwrap();
+    let root_context = CausalContext::new_root();
+    let root = root_context.root_id;
+    let root_run = kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([0x61; 16]));
+    store
+        .commit_trigger_and_run(root_run, &def, "evt-root", &root_context, 1_000)
+        .expect("the root is admitted");
+    store
+        .commit_trigger_and_run(
+            kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([0x62; 16])),
+            &def,
+            "evt-deep",
+            &CausalContext {
+                root_id: root,
+                generation: 0,
+                depth: DEFAULT_CAUSAL_DEPTH_LIMIT + 1,
+                parent: Some(CausalParent {
+                    run_id: root_run,
+                    node_id: "step".to_owned(),
+                }),
+            },
+            1_100,
+        )
+        .expect_err("past the ceiling");
+
+    // The grant store cannot be read when the continuation is admitted.
+    let failed = store
+        .guarded(&common::admitted, |journal| {
+            journal.rearm_budget(root, 0, 1_200, |_, _, _| {
+                Err::<Option<()>, _>(AutomationError::AuthorityUnavailable(
+                    "the grant store is down".to_owned(),
+                ))
+            })
+        })
+        .expect_err("the rearm fails");
+    assert!(matches!(failed, AutomationError::AuthorityUnavailable(_)));
+    let kept = store.get_budget(root).unwrap().unwrap();
+    assert_eq!((kept.generation, kept.exhausted), (0, true));
+
+    // The continuation is still there for the rearm that succeeds.
+    let mut handed = 0;
+    store
+        .guarded(&common::admitted, |journal| {
+            journal.rearm_budget(root, 0, 1_300, |_, continuation, _| {
+                handed += 1;
+                assert_eq!(continuation.event_id, "evt-deep");
+                Ok(None::<()>)
+            })
+        })
+        .expect("the rearm");
+    assert_eq!(handed, 1);
 }
 
 /// KR-REQ-25.16: a chain the host admits holds section 25's defaults: depth 16, 64 runs, 100
