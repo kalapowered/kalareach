@@ -1086,10 +1086,18 @@ pub fn table() -> Vec<Store> {
                 kr_controller::grants::mirror::RECORD_VERSION,
             ),
             owned: Vec::new(),
-            kept: vec![Kept::Source(
-                "crates/kr-controller/src/grants/mirror.rs",
-                &["Record"],
-            )],
+            kept: vec![
+                Kept::Source("crates/kr-controller/src/grants/mirror.rs", &["Record"]),
+                Kept::Source(
+                    "crates/kr-controller/src/grants/durable.rs",
+                    &[
+                        "StoredPolicy",
+                        "StoredEnrolment",
+                        "StoredBinding",
+                        "StoredLeaseRecord",
+                    ],
+                ),
+            ],
         },
         Store {
             levels: None,
