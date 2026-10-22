@@ -8,6 +8,8 @@
 // helper another binary uses is dead code from this one's point of view.
 #![allow(dead_code)]
 
+pub mod terminal;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
 #[cfg(unix)]

@@ -69,6 +69,7 @@ use serde_json::Value;
 mod support;
 
 use support::kr;
+use support::terminal::{self, Answering};
 
 /// The scripted agent the session's shell runs.
 const SCRIPTED_AGENT: &str = include_str!("support/scripted_agent.sh");
@@ -472,7 +473,7 @@ impl Host {
                 quoted(&self.work)
             ),
         );
-        answered(window.answer_capability_queries(0));
+        window.answered(0, window.answer_capability_queries(0));
         window.wait_for(0, PROMPT.as_bytes(), "the new session's shell is reading");
         let listed = self.only_live_session();
         let session_id: SessionId = listed["session_id"]
@@ -1440,47 +1441,28 @@ async fn serve(
     drop(controller);
 }
 
-/// Everything a terminal has been sent, collected by a thread that never blocks the test.
+/// Everything a terminal has been sent, collected by a thread that never blocks the test and that
+/// types the replies the terminal owes as the questions they answer arrive.
 #[derive(Clone)]
 struct Screen {
-    seen: Arc<Mutex<Vec<u8>>>,
+    seen: terminal::Collected,
 }
 
 impl Screen {
-    fn collect(mut reader: Box<dyn Read + Send>) -> Self {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let collected = Arc::clone(&seen);
-        std::thread::spawn(move || {
-            let mut buffer = [0_u8; 4096];
-            while let Ok(read) = reader.read(&mut buffer) {
-                if read == 0 {
-                    break;
-                }
-                collected
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .extend_from_slice(&buffer[..read]);
-            }
-        });
-        Self { seen }
+    fn collect(reader: Box<dyn Read + Send>) -> Self {
+        Self {
+            seen: terminal::collect(reader),
+        }
     }
 
     /// How much the terminal has been sent so far. A later wait can start from here.
     fn mark(&self) -> usize {
-        self.seen
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .len()
+        terminal::mark(&self.seen)
     }
 
     /// What the terminal has been sent since a mark.
     fn since(&self, mark: usize) -> Vec<u8> {
-        self.seen
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(mark..)
-            .map(<[u8]>::to_vec)
-            .unwrap_or_default()
+        terminal::since(&self.seen, mark)
     }
 
     fn contains_since(&self, mark: usize, marker: &[u8]) -> bool {
@@ -1489,9 +1471,6 @@ impl Screen {
 
     /// Waits for `marker` to arrive after `mark`, and fails with what did arrive when it never
     /// does.
-    ///
-    /// It looks every two milliseconds, because one of the things that waits here is the thread
-    /// that answers `kr`'s capability queries, and that exchange has one second in all.
     fn wait_for(&self, mark: usize, marker: &[u8], what: &str) {
         let started = Instant::now();
         loop {
@@ -1525,7 +1504,7 @@ struct Window {
     _terminal: portable_pty::PtyPair,
     shell: Box<dyn portable_pty::Child + Send + Sync>,
     screen: Screen,
-    keys: Arc<Mutex<Box<dyn Write + Send>>>,
+    keys: terminal::Keys,
 }
 
 impl Window {
@@ -1552,7 +1531,7 @@ impl Window {
             .spawn_command(command)
             .expect("starts the window's shell");
         let screen = Screen::collect(terminal.master.try_clone_reader().expect("a reader"));
-        let keys = Arc::new(Mutex::new(terminal.master.take_writer().expect("a writer")));
+        let keys = terminal::keys(terminal.master.take_writer().expect("a writer"));
         Self {
             _terminal: terminal,
             shell,
@@ -1613,20 +1592,28 @@ impl Window {
     }
 
     /// Answers the next capability exchange `kr` starts on this terminal after `mark`.
-    fn answer_capability_queries(&self, mark: usize) -> std::thread::JoinHandle<()> {
-        let screen = self.screen.clone();
-        let keys = Arc::clone(&self.keys);
-        std::thread::spawn(move || {
-            screen.wait_for(
-                mark,
-                b"\x1b[c",
-                "kr asked this terminal what it is before attaching",
-            );
-            let mut keys = keys.lock().unwrap_or_else(PoisonError::into_inner);
-            keys.write_all(PROBE_ANSWER)
-                .expect("answers the capability queries");
-            keys.flush().expect("and the answer reaches kr");
-        })
+    ///
+    /// The reply is typed by the thread that collects what the terminal is sent, the moment the
+    /// question that ends the exchange has arrived: the exchange has one second in all.
+    fn answer_capability_queries(&self, mark: usize) -> Answering {
+        terminal::reply_to(
+            &self.screen.seen,
+            mark,
+            b"\x1b[c",
+            1,
+            PROBE_ANSWER,
+            &self.keys,
+        )
+    }
+
+    /// Requires that `queries`, started at `mark`, were answered.
+    fn answered(&self, mark: usize, queries: Answering) {
+        assert!(
+            queries.typed_within(LIVENESS_DEADLINE),
+            "kr asked this terminal what it is before attaching: the answer was not typed within \
+             {LIVENESS_DEADLINE:?}; the terminal was sent: {}",
+            String::from_utf8_lossy(&self.screen.since(mark)).escape_debug()
+        );
     }
 
     /// Waits until the terminal is back in line mode with echo, which is how `kr` found it.
@@ -1697,18 +1684,6 @@ impl Drop for Window {
     fn drop(&mut self) {
         let _ = self.shell.kill();
         let _ = self.shell.wait();
-    }
-}
-
-/// Waits for the thread answering a terminal's capability queries, and brings its failure here.
-fn answered(queries: std::thread::JoinHandle<()>) {
-    if let Err(panic) = queries.join() {
-        let detail = panic
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| panic.downcast_ref::<&str>().copied())
-            .unwrap_or("the thread answering the terminal's queries failed");
-        panic!("{detail}");
     }
 }
 
@@ -2215,7 +2190,7 @@ fn a_session_made_by_kr_new_carries_a_question_outlives_its_terminal_and_ends_wi
     let reattaching = first.mark();
     let queries = first.answer_capability_queries(reattaching);
     first.type_text(format!("{display}\r").as_bytes());
-    answered(queries);
+    first.answered(reattaching, queries);
     first.wait_for(
         reattaching,
         b"the screen as it is now",

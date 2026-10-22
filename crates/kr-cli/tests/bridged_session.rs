@@ -14,9 +14,8 @@
 
 #![cfg(unix)]
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kr_ipc::client::LocalClient;
@@ -29,6 +28,8 @@ use serde_json::Value;
 mod support;
 #[path = "../../kr-controller/tests/teardown/mod.rs"]
 mod teardown;
+
+use support::terminal::{self, Answering, Collected, Keys};
 
 /// How long a wait for something to happen is given. It fails when the thing never happens.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
@@ -745,8 +746,8 @@ struct Terminal {
     /// The modes the terminal was in before anything ran on it, which a command has to leave it in.
     before: rustix::termios::Termios,
     shell: Box<dyn portable_pty::Child + Send + Sync>,
-    seen: Arc<std::sync::Mutex<Vec<u8>>>,
-    writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
+    seen: Collected,
+    writer: Keys,
 }
 
 /// The descriptor a terminal's state is read through: a pseudo-terminal pair shares one line
@@ -773,14 +774,46 @@ impl Terminal {
     }
 
     fn text(&self) -> String {
-        String::from_utf8_lossy(
-            &self
-                .seen
-                .lock()
-                .map(|seen| seen.clone())
-                .unwrap_or_default(),
-        )
-        .into_owned()
+        String::from_utf8_lossy(&terminal::bytes(&self.seen)).into_owned()
+    }
+
+    /// Answers the command's questions about what this terminal is. The answer is typed by the
+    /// thread that collects what the terminal is sent, the moment the question that ends the
+    /// exchange has arrived: the exchange has one second in all.
+    fn answers_what_it_is(&self) {
+        let answering = self.replies_to_question(1, b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
+        self.typed(answering, "the command asked this terminal what it is");
+    }
+
+    /// Types `reply` the moment the terminal has been asked what it is `nth` times, by the command
+    /// or by a command it started.
+    fn replies_to_question(&self, nth: usize, reply: &[u8]) -> Answering {
+        terminal::reply_to(&self.seen, 0, b"\x1b[c", nth, reply, &self.writer)
+    }
+
+    /// Owes the replies to the first question the command asks this terminal and, when there is
+    /// one, to the second that the attachment it starts asks, and returns what waits for each.
+    ///
+    /// The second is owed first: the first reply lets the command go on, and the attachment's
+    /// exchange has one second in all from the moment it asks, so the reply to its question has to
+    /// be owed before the reply that lets it ask can be typed.
+    fn replies_to_the_questions(
+        &self,
+        first: &[u8],
+        second: Option<&[u8]>,
+    ) -> (Answering, Option<Answering>) {
+        let second = second.map(|reply| self.replies_to_question(2, reply));
+        (self.replies_to_question(1, first), second)
+    }
+
+    /// Requires that `answering` was typed, and names `what` was asked when it was not.
+    fn typed(&self, answering: Answering, what: &str) {
+        assert!(
+            answering.typed_within(LIVENESS_DEADLINE),
+            "{what}: the answer was not typed within {LIVENESS_DEADLINE:?}; the terminal was \
+             sent: {}",
+            self.text().escape_debug()
+        );
     }
 
     fn expect_within(&self, marker: &str, what: &str) {
@@ -891,23 +924,8 @@ impl World {
         }
         builder.cwd(directory);
         let shell = pty.slave.spawn_command(builder).expect("starts the shell");
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let collected = Arc::clone(&seen);
-        let mut reader = pty.master.try_clone_reader().expect("a reader");
-        std::thread::spawn(move || {
-            let mut buffer = [0_u8; 4096];
-            while let Ok(read) = reader.read(&mut buffer) {
-                if read == 0 {
-                    break;
-                }
-                if let Ok(mut seen) = collected.lock() {
-                    seen.extend_from_slice(&buffer[..read]);
-                }
-            }
-        });
-        let writer = Arc::new(std::sync::Mutex::new(
-            pty.master.take_writer().expect("a writer"),
-        ));
+        let seen = terminal::collect(pty.master.try_clone_reader().expect("a reader"));
+        let writer = terminal::keys(pty.master.take_writer().expect("a writer"));
         Terminal {
             before,
             pty,
@@ -926,8 +944,7 @@ impl World {
         ));
         // The command asks the terminal what it is before it changes anything, and a terminal
         // answers. Without the answer the bounded handshake fails and there is nothing to attach.
-        terminal.expect_within("\x1b[c", "the command asked this terminal what it is");
-        terminal.types("\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
+        terminal.answers_what_it_is();
         terminal
     }
 
@@ -938,8 +955,7 @@ impl World {
             "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
             support::kr().display()
         ));
-        terminal.expect_within("\x1b[c", "the command asked this terminal what it is");
-        terminal.types("\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
+        terminal.answers_what_it_is();
         terminal
     }
 }
@@ -1047,10 +1063,14 @@ fn a_created_session_attached_on_a_terminal(
         ),
         variables,
     );
-    terminal.expect_nth_within("\x1b[c", 1, "the command asked this terminal what it is");
-    terminal.types("\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c");
-    terminal.expect_nth_within("\x1b[c", 2, "the attachment asked this terminal what it is");
-    terminal.types("\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
+    let (colours, what_it_is) = terminal.replies_to_the_questions(
+        b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c",
+        Some(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c"),
+    );
+    terminal.typed(colours, "the command asked this terminal what it is");
+    if let Some(what_it_is) = what_it_is {
+        terminal.typed(what_it_is, "the attachment asked this terminal what it is");
+    }
     terminal
 }
 
@@ -1173,12 +1193,13 @@ async fn a_create_that_is_not_attached(answer_the_attachment: bool) -> String {
         support::kr().display()
     ));
     // The command asks this terminal for its colours, and the person types while it does.
-    terminal.expect_nth_within("\x1b[c", 1, "the command asked this terminal what it is");
-    terminal
-        .types("\x1b]10;rgb:ffff/ffff/ffff\x1b\\typed\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c");
-    if answer_the_attachment {
-        terminal.expect_nth_within("\x1b[c", 2, "the attachment asked this terminal what it is");
-        terminal.types("\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
+    let (colours, what_it_is) = terminal.replies_to_the_questions(
+        b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\typed\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c",
+        answer_the_attachment.then_some(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c".as_slice()),
+    );
+    terminal.typed(colours, "the command asked this terminal what it is");
+    if let Some(what_it_is) = what_it_is {
+        terminal.typed(what_it_is, "the attachment asked this terminal what it is");
     }
     terminal.expect_within("create-finished-", "the command ended");
     let text = terminal.text();
@@ -1336,12 +1357,15 @@ async fn what_was_typed_while_a_create_asked_for_colours_reaches_the_bridged_she
          --headless; printf 'create-finished-%s\\n' \"$?\"",
         support::kr().display()
     ));
-    terminal.expect_nth_within("\x1b[c", 1, "the command asked this terminal what it is");
     // The five bytes begin a command, which the person finishes once the shell is theirs.
-    terminal
-        .types("\x1b]10;rgb:ffff/ffff/ffff\x1b\\echo \x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c");
-    terminal.expect_nth_within("\x1b[c", 2, "the attachment asked this terminal what it is");
-    terminal.types("\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
+    let (colours, what_it_is) = terminal.replies_to_the_questions(
+        b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\echo \x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c",
+        Some(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c"),
+    );
+    terminal.typed(colours, "the command asked this terminal what it is");
+    if let Some(what_it_is) = what_it_is {
+        terminal.typed(what_it_is, "the attachment asked this terminal what it is");
+    }
     terminal.types("delivered-$((1+1))\r");
     // The command typed in two parts is run once, and the sum is not in what was typed.
     terminal.expect_within("delivered-2", "the command typed in two parts ran");
