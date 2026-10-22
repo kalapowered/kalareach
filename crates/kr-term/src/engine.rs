@@ -610,7 +610,7 @@ impl Engine {
                         // original bytes would take a physical terminal somewhere else.
                         disposition = DirectDisposition::RequireProjection;
                         self.diagnostics.record(
-                            DiagnosticKind::UnclassifiedSequence,
+                            DiagnosticKind::ParameterReduced,
                             event.span.start(),
                             now_ms,
                             "a parameter was reduced to what the grid can act on",
