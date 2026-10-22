@@ -51,6 +51,19 @@ fn entry(
         recording,
         version,
         migrates_from,
+        reads_through: None,
+    }
+}
+
+/// A store entry that reads through `version` above the one it writes.
+trait ReadsThrough {
+    fn reading_through(self, version: u32) -> Self;
+}
+
+impl ReadsThrough for ReleaseStore {
+    fn reading_through(mut self, version: u32) -> Self {
+        self.reads_through = Some(version);
+        self
     }
 }
 
@@ -760,7 +773,8 @@ pub fn table() -> Vec<Store> {
                 sqlite_table("delivery_schema"),
                 version(kr_delivery::journal::SCHEMA_VERSION),
                 version(kr_delivery::journal::OLDEST_SCHEMA_VERSION),
-            ),
+            )
+            .reading_through(version(kr_delivery::journal::READS_THROUGH)),
             owned: Vec::new(),
             kept: vec![
                 protocol::<push::PushDeliveryRequest>("PushDeliveryRequest"),

@@ -1175,6 +1175,11 @@ pub fn findings(lock: &Lock, observed: &[Observed], named: &[Named]) -> Vec<Stri
             found.push(format!(
                 "the store {name} is at version {code} in the code and {locked_version} in the lock: write the lock"
             ));
+        } else if now.entry.reads_through != locked.entry.reads_through {
+            found.push(format!(
+                "the store {name} reads through version {:?} in the code and {:?} in the lock: write the lock",
+                now.entry.reads_through, locked.entry.reads_through
+            ));
         } else if now.entry.migrates_from != locked.entry.migrates_from {
             found.push(format!(
                 "the store {name} migrates from version {} in the code and {} in the lock: write the lock",

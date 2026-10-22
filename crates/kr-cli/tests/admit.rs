@@ -519,6 +519,7 @@ fn an_update_that_fails_after_it_staged_the_release_is_not_offered_again() {
         recording: Recording::SqliteUserVersion,
         version: 1,
         migrates_from: 1,
+        reads_through: None,
     });
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).reading(stores);
     let second = home.prefix("Cellar", &two);
