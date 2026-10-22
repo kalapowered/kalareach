@@ -1,5 +1,7 @@
 import java.security.MessageDigest
 import java.util.Properties
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+import org.gradle.api.attributes.Attribute
 
 plugins {
     id("com.android.application")
@@ -159,7 +161,6 @@ afterEvaluate {
     val verifyNativeLibraries by tasks.registering {
         description = "Checks each native library's bytes against the digest this build pins."
         doLast {
-            val linked = configurations.getByName("releaseRuntimeClasspath").resolvedConfiguration.resolvedArtifacts
             val verifier = "org.rustls:rustls-platform-verifier:$rustlsPlatformVerifierKotlinVersion"
             if (verifier !in pinnedNativeLibraries) {
                 throw GradleException(
@@ -167,18 +168,33 @@ afterEvaluate {
                         "and this build pins no digest for it"
                 )
             }
-            for ((coordinates, pinned) in pinnedNativeLibraries) {
-                val found = linked.filter { it.moduleVersion.id.toString() == coordinates }
-                if (found.size != 1) {
-                    throw GradleException("the release build links $coordinates ${found.size} times: expected once")
+            // What each variant this build makes links for its runtime: the files it packages. A
+            // variant is a build type, debug or release, of one of the application's ABI flavors.
+            val variantClasspath = Regex("^[a-z0-9]*(Debug|Release)RuntimeClasspath$", RegexOption.IGNORE_CASE)
+            val classpaths = configurations.filter { it.isCanBeResolved && variantClasspath.matches(it.name) }
+            if (classpaths.isEmpty()) throw GradleException("this build has no runtime classpath to check")
+            for (classpath in classpaths) {
+                // The published archives, as the classpath resolves them: the modules from the
+                // repositories, in the form they are fetched in, and not the project's own.
+                val linked = classpath.incoming.artifactView {
+                    isLenient = true
+                    componentFilter { it is ModuleComponentIdentifier }
+                    attributes { attribute(Attribute.of("artifactType", String::class.java), "aar") }
+                }.artifacts.artifacts.associate { artifact ->
+                    val module = artifact.id.componentIdentifier as ModuleComponentIdentifier
+                    "${module.group}:${module.module}:${module.version}" to artifact.file
                 }
-                val digestBytes = MessageDigest.getInstance("SHA-256").digest(found.single().file.readBytes())
-                val digest = digestBytes.joinToString("") { b -> "%02x".format(b) }
-                if (digest != pinned) {
-                    throw GradleException(
-                        "the bytes of $coordinates are not the ones this build pins: expected " +
-                            "$pinned, found $digest"
-                    )
+                for ((coordinates, pinned) in pinnedNativeLibraries) {
+                    val file = linked[coordinates]
+                        ?: throw GradleException("${classpath.name} does not link $coordinates, which this build pins")
+                    val digestBytes = MessageDigest.getInstance("SHA-256").digest(file.readBytes())
+                    val digest = digestBytes.joinToString("") { b -> "%02x".format(b) }
+                    if (digest != pinned) {
+                        throw GradleException(
+                            "the bytes of $coordinates are not the ones this build pins: expected " +
+                                "$pinned, found $digest"
+                        )
+                    }
                 }
             }
         }
