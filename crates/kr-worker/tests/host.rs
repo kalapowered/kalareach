@@ -1741,6 +1741,171 @@ async fn a_closed_session_answers_with_the_record_its_worker_wrote() {
     );
 }
 
+/// How the session a create was retried for had ended.
+#[derive(Clone, Copy, Debug)]
+enum Ending {
+    /// Closed on request.
+    Closed,
+    /// Its worker was killed, and the daemon found it so.
+    Crashed,
+    /// Its worker was killed while the daemon was down, and the daemon that started afterwards
+    /// found it so.
+    CrashedWhileTheDaemonWasDown,
+}
+
+/// A create asked again, under its token, after its session ended answers with the session as it
+/// ended and starts nothing.
+///
+/// The daemon is asked to start a worker once, for the first create. The retry is answered from
+/// the closure record the first execution left: it is the same session, closed, with no endpoint,
+/// and the daemon asked its supervisor for no worker and holds no live session. The control is a
+/// create under another token, which starts a worker of its own, so the list of launches is one
+/// that would show a second.
+async fn a_create_retried_after_its_session_ended_starts_no_worker(ending: Ending) {
+    let host = Host::create().recording_launches();
+    let mut daemon = Some(host.start().await);
+    let mut client = host.client().await;
+    let params = create_params(host.environment_id, host.temp.root());
+    let token = ActionId::new(kr_ipc::new_uuid());
+    // The request is composed once, as a client does, and a retry sends that same request: from the
+    // same connection, or from a new one once the old is gone.
+    let request = client
+        .compose(
+            Method::SessionCreate,
+            token,
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("composes the request");
+    let created: SessionCreateResult = client
+        .repeat(&request)
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the create succeeds")
+        .to_typed()
+        .expect("decodes");
+    let session_id = created.session.session_id;
+    assert_eq!(
+        host.launches(),
+        [Requested::Worker(host.worker.clone())],
+        "the first create asked for the one worker"
+    );
+
+    match ending {
+        Ending::Closed => {
+            close(&mut client, &host, session_id).await;
+        }
+        Ending::Crashed => {
+            crash(&worker_of(&host, session_id));
+            closure_of(&mut client, session_id).await;
+        }
+        Ending::CrashedWhileTheDaemonWasDown => {
+            let worker = worker_of(&host, session_id);
+            drop(client);
+            daemon.take().expect("a daemon").stop().await;
+            crash(&worker);
+            daemon = Some(host.start().await);
+            client = host.client().await;
+            closure_of(&mut client, session_id).await;
+        }
+    }
+
+    let retried: SessionCreateResult = client
+        .repeat(&request)
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the retry is answered")
+        .to_typed()
+        .expect("decodes");
+    assert!(retried.deduplicated, "{ending:?}: the retry says it is one");
+    assert_eq!(
+        retried.session.session_id, session_id,
+        "{ending:?}: it is the session the first create made"
+    );
+    assert_eq!(
+        retried.session.state,
+        SessionState::Closed,
+        "{ending:?}: and the session is as it ended, not a live one"
+    );
+    assert!(
+        retried.endpoint.0.is_none(),
+        "{ending:?}: a closed session has no endpoint to attach to"
+    );
+    let live: SessionListResult = client
+        .request(
+            Method::SessionList,
+            &SessionListParams {
+                environment_id: Nullable::null(),
+                include_closed: false,
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the list succeeds")
+        .to_typed()
+        .expect("decodes");
+    assert!(
+        live.sessions.is_empty(),
+        "{ending:?}: the retry made no live session: {:?}",
+        live.sessions
+    );
+    let launches = host.launches();
+    assert_eq!(
+        launches
+            .iter()
+            .filter(|launch| matches!(launch, Requested::Worker(_)))
+            .count(),
+        1,
+        "{ending:?}: the retry asked for no second worker: {launches:?}"
+    );
+
+    // The control: another token is another create, and the list of launches shows it.
+    let another: SessionCreateResult = client
+        .mutate(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the create succeeds")
+        .to_typed()
+        .expect("decodes");
+    assert!(!another.deduplicated);
+    assert_ne!(another.session.session_id, session_id);
+    assert_eq!(
+        host.launches()
+            .iter()
+            .filter(|launch| matches!(launch, Requested::Worker(_)))
+            .count(),
+        2,
+        "{ending:?}: a create under another token asks for a worker of its own"
+    );
+    close(&mut client, &host, another.session.session_id).await;
+    drop(daemon);
+}
+
+/// KR-ACC-029: a create retried after its session was closed starts no worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_retried_after_its_session_closed_starts_no_worker() {
+    a_create_retried_after_its_session_ended_starts_no_worker(Ending::Closed).await;
+}
+
+/// KR-ACC-029: a create retried after its worker crashed starts no worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_retried_after_its_worker_crashed_starts_no_worker() {
+    a_create_retried_after_its_session_ended_starts_no_worker(Ending::Crashed).await;
+}
+
+/// KR-ACC-029: a create retried to a daemon that started after its worker crashed starts no worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_retried_to_a_daemon_that_found_its_worker_crashed_starts_no_worker() {
+    a_create_retried_after_its_session_ended_starts_no_worker(Ending::CrashedWhileTheDaemonWasDown)
+        .await;
+}
+
 async fn close(client: &mut LocalClient, host: &Host, session_id: SessionId) -> SessionCloseResult {
     let outcome = client
         .mutate(
