@@ -2901,8 +2901,12 @@ What the grant decides, for every request:
   this request was decided with, made where the attachment is admitted. See "What an attachment
   may do".
 * **History.** Retained history is not served to a device at all: its scope is the grant's lower
-  bound, that bound is a moment in time and a history page is a byte range, and a host that cannot
-  narrow content to a grant refuses it rather than serving more than the grant allows. The
+  bound, that bound is a moment in time and a history page is a byte range, and a host that does
+  not narrow a page to a grant refuses it rather than serving more than the grant allows. The host
+  records when each part of a closed session's output was written (see "When output was
+  produced"), which is what a page narrowed to a grant would be cut by. It serves no page cut that
+  way: bytes with no recorded time, or timed on a clock the worker could not prove, are never
+  served to a bound, and the daemon does not read a live session's record. The
   session's live screen and the stream that follows it are served when the grant includes them,
   and "the live screen" means the screen that is showing: a device's attachment is drawn the active
   buffer alone, and the rows of the buffer that is not showing are counted among what its
@@ -3757,9 +3761,19 @@ the spool take output again. A boundary that could not be written is tried again
 as well, which does not wait for it, because another program can hold that file for a moment: the
 first append after it is let go writes it and gives up the oldest segments.
 
-The host bound is applied on the worker's maintenance tick, from a reading of the environment's
-whole spool directory, so two sessions writing at once can take the host past it until the next
-tick. It is not a reservation, and it is not enforced ahead of the write.
+The host bound is applied from a reading of the environment's spool directories, so two sessions
+writing at once can take the host past it until the next pass. It is not a reservation, and it is
+not enforced ahead of the write. Two parties apply it, each to its own sessions, from the same
+reading. A live session's worker applies it on its maintenance tick. The control daemon applies it
+every minute to the sessions that have closed, taking the output of the session whose oldest segment
+was written longest ago first. The two keep no order between them, so a live session can give up
+output before a closed one does. The reading is the segment files, each sized by asking the file: a
+directory entry's size is what the file system last wrote into the directory, which Windows does not
+bring up to date while a handle to the file is open, so the measure asks each file itself. The file
+that records where a spool's output got to is not counted, and neither is anything else beside the
+segments. Both parties read the whole environment's bytes and each acts on its own sessions, so in
+the minute the daemon and a worker both find the host over the cap they can both give up output,
+and the host is then under the cap by what both took; it is not over it for longer than a pass.
 
 Eviction is not quiet. A retention pass records the cursor range it took and the bound that took
 it, and a reader asking for a cursor inside that range is told both: `history.page` returns the
@@ -3798,31 +3812,96 @@ and every page it serves says so.
 Receipts are not part of any of this. Section 20 gives them a separately budgeted store and 30
 days, so history pressure cannot delete a live dispatch barrier or a de-duplication record.
 
+### When output was produced
+
+The spool keeps bytes and cursors and no time, so a worker keeps a second record beside it: a list of
+intervals of the output's cursors, each with the wall-clock reading of the interval's first byte.
+Every byte of an interval was written at or after that reading, so a row is a lower bound on when
+each of its bytes was produced. That is the direction a reader deciding what a person may be shown
+needs: a byte reported earlier than it was is withheld from a reader whose rights begin later and
+never served to one. Output in no interval has no recorded time, and nothing here gives it one.
+
+Each row also says whether the worker could prove its wall clock at that moment. A reader that
+decides authority by time uses only rows for which it could. A reading is proven when two things
+hold. The worker's time contract trusts the wall clock, which is the answer that lets it collect
+by age, and which it withdraws when the clock steps back. And the wall clock has not gained more
+than two seconds on the host's continuous clock since the worker's last write of output. The
+continuous clock counts a suspension as the wall clock does, so a host that slept gains nothing on
+it. A step forward makes every later reading late by the step, which is the direction a reader
+cannot accept, so the first write of output after one, and every write after it for as long as
+the worker runs, is recorded as unproven. Privacy mode takes the record away and keeps this.
+
+An interval closes when the wall clock steps back or changes its standing, when it has lasted two
+seconds, or when it has lasted a tenth of a second and holds 256 bytes; the duration is measured on
+the continuous clock. Each of those three limits doubles for every 10,000 rows held, so a program
+that prints steadily keeps the times of its output for the whole seven days (at 40 bytes a second,
+about 50,000 rows) and a faster one for as long as the session's byte cap keeps its output. The
+record is bounded by rows and not by output: at 100,000 rows, including those a write has taken
+and not yet finished, later output continues the last interval if the clock has not stepped back
+or changed its standing since, and its time is then earlier than the truth. Other output after
+that has none, and so has output after a gap.
+
+The output path records into memory only. The worker's maintenance pass writes the rows, with
+neither the session's lock nor the dispatch barrier held, and the session's closure writes what is
+left, before the closure is recorded: a reader that finds the closure finds the times of the output
+up to it. A crash loses the rows since the last write, and the bytes they described read as having
+no time. The file is `output-times/<session>.sqlite` in the environment's state directory, a store
+of its own at version 1 that the stored-formats lock lists. It is built under another name and moved
+to its own when its schema is in it, so a file with the name always holds a version. It is beside the
+spool and not in it, so nothing that lists or measures a spool meets it. Privacy mode removes it
+with the output, and nothing is recorded while retention is off. Eviction removes the rows of output that went, at the next
+write, and the archive's collection does the same for a closed session.
+
+A rollback to the release before this one keeps every byte, cursor and gap, because that release
+reads a spool by its own rules and takes only the segment files; it ignores the index. While it runs,
+new output has no times, and its eviction and its privacy purge remove segments and leave the index
+file, whose rows describe output that is gone and are removed by the next pass of a release that
+knows the file. Until then the file holds instants and no content.
+
+`history.times` reads the intervals between two cursors of a closed session through the control
+daemon, at most 2,048 to an answer, with the cursor to ask from next. A session with no index, or
+one that cannot be read, is answered with no intervals and the reason, and what reads it says its
+output carries no time. It refuses a session whose worker the daemon has not seen end, as
+`history.page` does, and a paired device cannot ask it.
+
 ## The archive service
 
 A closed or crashed session's history, final receipts and retained resource references belong to
 the environment archive service, which is a controller module and not a surviving worker.
 
-**Ownership is taken, and only after the worker is gone.** The archive asks the kernel whether the
-recorded process is the process that was recorded (both the identifier and the start value, because
-the kernel reuses identifiers), and only a confirmed ending is death. Then it removes the worker's
-published endpoint and descriptor, and only then is anything opened. The order is that way round
-because the answer can be *no*: a daemon that fenced before it asked would delete a working
-session's socket on the way to finding out that it was working. A query the platform declines is not
-death either, and the archive leaves the session alone.
+**Ownership is taken, and only after the worker is gone.** The archive first takes the session's
+recovery lock, a file in the runtime directory that lives as long as the ownership does, so two
+recoveries, collections or migrations of one session are kept apart in one process and between
+processes, and the operating system gives the lock back with the process that held it. A second to
+ask is refused and left to the first. Then it asks the kernel whether the recorded process is the
+process that was recorded (both the identifier and the start value, because the kernel reuses
+identifiers), and only a confirmed ending is death. Then it removes the worker's published endpoint
+and descriptor, and only then is anything opened. An endpoint or a descriptor that is there and
+cannot be removed refuses the ownership, because a stale socket left beside a recovered journal is
+the state the fence is for; one that is already gone is fenced. A migration of a session's journal
+is a write and takes the same lock, and when another holds it the store is left as it is and read
+as unmigrated. The offline importer holds the environment's singleton lock instead, which no daemon
+can be running under.
 
-The removal is best effort, and the answer is one value: whether either half went. It does not
-say which. What makes the stores safe to open is the death this host confirmed, not the socket
-file: a worker the kernel says has ended cannot answer a socket whether or not the file is still
-on disk.
+The order is that way round because the answer can be *no*: a daemon that fenced before it asked
+would delete a working session's socket on the way to finding out that it was working. A query the
+platform declines is not death either, and the archive leaves the session alone. What makes the
+stores safe to open is the death this host confirmed and the lock it holds, not the socket file: a
+worker the kernel says has ended cannot answer a socket whether or not the file is still on disk, so
+the fence is made and its failure refuses the ownership, and it is not what the safety rests on.
+
+A session whose stores are collected without a death to validate (one that has closed) is owned the
+same way: the lock first, and then every piece of evidence the host holds that no worker remains,
+asked with the lock held. The registry's worker row, the closure's own list of a worker it never saw
+end and the published descriptor are all asked, and a session whose registry row has no closure, or
+whose launch is still under way, is a recovery's and not a collection's.
 
 A read of a closed session asks the same question first. A session this daemon has verified is
 refused with the endpoint to ask; so is one whose registry record names a process the kernel still
 describes, because a worker this daemon failed to verify at startup is absent from its directory
-and not absent from the machine. Ownership has no token that the read methods require and no lock
-that spans one recovery, so it is a rule this daemon keeps rather than one the store enforces, and two reconciliations of one session inside one daemon are not kept apart.
-Removing the endpoint is also best effort: a descriptor or a socket this host could not unlink
-leaves the fence reported as taken with one of its two halves undone.
+and not absent from the machine. Reads take no lock and need no ownership: they only read what is
+there, and the writes that could change it (a recovery, a collection, a migration) take the lock and
+the value.
 
 **A reader cannot create a worker.** Every read the archive serves is a read of what is already on
 disk. A history request never starts an execution, and a retried create is answered from the
@@ -3944,23 +4023,35 @@ that follows. A start runs the cleanup of every crashed session it finds, claime
 before waiting for any of them, so it waits for the longest and not for each in turn. A list or a
 barrier that meets several crashed sessions one after another waits for each in turn.
 
-**A closed session can be collected.** A session with no worker has no maintenance tick, so the
-archive has a collection of its own (`ArchiveService::collect`) that applies the bounds belonging
-to the session, under recovery ownership and after section 9's recovery rules have settled what
-the worker left unfinished: output past seven days and receipts past thirty, each on its own
-budget and only on a clock the caller can prove, and the session's own byte cap on any clock. It
-refuses a session whose published worker the kernel has not said ended, and it opens only stores
-that are there. Output and receipts are reported apart, each with what was removed, what is left
-and what could not be removed: a segment that could not be unlinked is still counted and still
-served until a later pass removes it. The host-wide cap is not part of it, because that is decided
-across the whole environment rather than one session at a time. Nothing runs this collection on a
-cadence: a closed session's output and receipts go when it is called.
+**A closed session is collected, by the daemon, on a cadence it starts with itself.** A session with
+no worker has no maintenance tick, so the archive has a collection of its own
+(`ArchiveService::collect`) that applies the bounds belonging to the session, under recovery
+ownership and after section 9's recovery rules have settled what the worker left unfinished: output
+past seven days and receipts past thirty, each on its own budget and only on a clock the caller can
+prove, and the session's own byte cap on any clock. It refuses a session whose published worker the
+kernel has not said ended, and it opens only stores that are there. Output and receipts are reported
+apart, each with what was removed, what is left and what could not be removed: a segment that could
+not be unlinked is still counted and still served until a later pass removes it; the rows of the
+time index for output that went are removed with it.
+
+The daemon runs that collection as it starts and then on two cadences in one task. Every minute it
+looks at the host-wide cap and, when the environment's spools hold more than 1 GiB, takes the
+oldest output of the sessions with no worker until the host is under it. Every hour it applies each
+closed session's own bounds, on the clock the daemon can prove, and it does not open again a
+session it found with nothing left to take. A session whose lock another holds is left to the
+next pass. The task holds the daemon weakly between passes, as the transfer sweep does.
 
 The transfer service's one retention question is answered here. Section 14 gives a submitted
-attachment its session's retention rather than the seven-day unused window, and the archive is
-what holds a closed session's record: a session it has a record of keeps what was submitted to it,
-one whose journal it cannot read keeps it too, because declining to delete is the answer that
-cannot lose a file, and one neither the registry nor the archive knows about keeps nothing.
+attachment its session's retention rather than the seven-day unused window. A session's retention
+is what the archive still holds of it, so a session keeps what was submitted to it while it holds a
+receipt or a byte of output, while something could not be read (declining to delete is the answer
+that cannot lose a file), while it has a summary and no closure (a session still starting, or one
+whose end was never recorded), and until thirty days after its closure. The thirty days are a
+decision of the wall clock and are made only on a clock the host can prove: without a proved
+reading the answer is *kept*, and a range that aged out is a gap and not a reason to keep a file for
+ever. A session the registry holds with a worker or a launch under way, or with no closure, keeps
+what was submitted to it; one neither the registry nor the archive knows about
+keeps nothing.
 
 ## The backup service
 
@@ -4593,6 +4684,17 @@ else holds can be recalled. Local deletion is logical cleanup of this host's own
 than a
 claim of physical secure erase: the files are unlinked and the rows are cleared, and nothing here
 says the bytes are unrecoverable from the device they were on.
+
+Copies held by authorised viewers are listed with the rest of what has left the host, because a device
+that was let see a session may hold what it was shown, on a screen or in its own scrollback, and this
+host cannot recall that: revoking the device ends what it can read from now on and nothing before.
+Each device that has held a grant with the right to view is listed once, as a *possible* copy, with
+the moment it first could view, whether the grant is still in force or was revoked, because the host
+records what a grant allows and not what a device was sent. A grant nobody has redeemed puts nothing
+on a device and is not listed, nor is one that cannot view. The entry is never deletable: there is
+no route through which this host could ask a device's own store to forget, and it offers no action
+for one. A grant store that cannot be read is named among what could not be listed, and the list is
+not shorter without saying so.
 
 Turning privacy mode off starts retention again from that moment, under a generation of its own.
 It reconstructs nothing, and the new generation is what keeps the private interval's own results
@@ -5555,9 +5657,11 @@ serving it from one of those would serve text written before a privacy transitio
 after it.
 
 Section 10 narrows retained content to the grant that asked for it, and this host cannot narrow a
-moment in time to an item's text, which is why it refuses a retained history page to a paired device
-outright. An attention item is not a history page, so it is narrowed rather than refused: a caller
-that did not arrive over the local socket is served the host's own record of a condition (which
+moment in time to an item's text: an item carries a sequence in its own source's records, which is
+not a cursor of any session's output, so the record of when output was produced gives it no time.
+That, and the absence of a page cut by a grant's bound, is why it refuses a retained history page to
+a paired device outright. An attention item is not a history page, so it is narrowed rather than
+refused: a caller that did not arrive over the local socket is served the host's own record of a condition (which
 rule, at what level, how often and when) with the text left out and said to be left out, and no
 model summary either. The changed-since-last-visit view holds only the changes the host recorded
 at or after the moment the caller's history reaches back to; the cursors still cover the others,
