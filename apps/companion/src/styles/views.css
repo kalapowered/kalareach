@@ -1725,6 +1725,11 @@
   flex: 1 1 14rem;
 }
 
+/* At the largest text size on a narrow screen the heading's longest word is wider than the row. */
+.confirmations h2 {
+  overflow-wrap: anywhere;
+}
+
 /* Under the words, the buttons start where the words do. The width is the screen's: a media query
    does not follow the text size the person chose. */
 @media (max-width: 30rem) {
