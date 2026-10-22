@@ -24,6 +24,17 @@ pub enum GenerationExpectation<'a> {
     /// The latest generation the owner verified. A generation at or after it is admitted; one
     /// before it is a replay, and one that claims it with another manifest is a substitution.
     Checkpoint(&'a ArchiveCheckpoint),
+    /// The latest generation the owner verified, with one older generation the person named and
+    /// accepts. Exactly that generation is admitted when it is older than the checkpoint, which a
+    /// service that was legitimately put back to an earlier state holds and can hold no other. A
+    /// generation that claims the checkpoint's own with another manifest is still a substitution,
+    /// and no other older generation is admitted.
+    AcceptingOlder {
+        /// The latest generation the owner verified.
+        checkpoint: &'a ArchiveCheckpoint,
+        /// The one older generation the person named.
+        accepted: BackupGeneration,
+    },
 }
 
 /// Where one archive stands against the checkpoint.
@@ -39,6 +50,11 @@ pub enum GenerationStanding {
     },
     /// It is older than the checkpoint, which is a service replaying an older valid backup.
     Replayed {
+        /// The generation the checkpoint names.
+        checkpoint: BackupGeneration,
+    },
+    /// It is older than the checkpoint and is the generation the person named and accepted.
+    OlderAccepted {
         /// The generation the checkpoint names.
         checkpoint: BackupGeneration,
     },
@@ -74,21 +90,33 @@ impl RestoreGeneration {
     /// Compares one descriptor against the checkpoint the owner trusts, if there is one.
     #[must_use]
     pub fn against(descriptor: &ArchiveDescriptor, expectation: GenerationExpectation<'_>) -> Self {
-        let standing = match expectation {
-            GenerationExpectation::Unverified => GenerationStanding::NoCheckpoint,
-            GenerationExpectation::Checkpoint(checkpoint)
-                if checkpoint.archive_id != descriptor.archive_id =>
-            {
+        let (checkpoint, accepted) = match expectation {
+            GenerationExpectation::Unverified => (None, None),
+            GenerationExpectation::Checkpoint(checkpoint) => (Some(checkpoint), None),
+            GenerationExpectation::AcceptingOlder {
+                checkpoint,
+                accepted,
+            } => (Some(checkpoint), Some(accepted)),
+        };
+        let standing = match checkpoint {
+            None => GenerationStanding::NoCheckpoint,
+            Some(checkpoint) if checkpoint.archive_id != descriptor.archive_id => {
                 GenerationStanding::OtherArchive {
                     checkpoint_archive: checkpoint.archive_id,
                 }
             }
-            GenerationExpectation::Checkpoint(checkpoint) => {
+            Some(checkpoint) => {
                 let trusted = checkpoint.backup_generation.get();
                 let offered = descriptor.backup_generation.get();
                 if offered < trusted {
-                    GenerationStanding::Replayed {
-                        checkpoint: checkpoint.backup_generation,
+                    if accepted == Some(descriptor.backup_generation) {
+                        GenerationStanding::OlderAccepted {
+                            checkpoint: checkpoint.backup_generation,
+                        }
+                    } else {
+                        GenerationStanding::Replayed {
+                            checkpoint: checkpoint.backup_generation,
+                        }
                     }
                 } else if offered > trusted {
                     GenerationStanding::Ahead {
@@ -114,7 +142,8 @@ impl RestoreGeneration {
 
     /// Whether this restore may go ahead.
     ///
-    /// Three refusals. A generation behind the checkpoint is a service replaying an older archive.
+    /// Three refusals. A generation behind the checkpoint is a service replaying an older archive,
+    /// unless the person named exactly that generation.
     /// One that claims the checkpoint's generation with another manifest is a substitution. And a
     /// checkpoint that is for another archive means the caller held an expectation and was handed
     /// a different collection: *no* checkpoint is the recovery-only case and goes ahead, but the
@@ -176,6 +205,11 @@ impl RestoreGeneration {
                  backup that was asked for and it is not being restored."
                     .to_owned()
             }
+            GenerationStanding::OlderAccepted { checkpoint } => format!(
+                "It is older than generation {} that the recovery bundle verified, and it is being \
+                 restored because that generation was named.",
+                checkpoint.get()
+            ),
             GenerationStanding::NoCheckpoint => {
                 "There is no verified generation to compare it with.".to_owned()
             }

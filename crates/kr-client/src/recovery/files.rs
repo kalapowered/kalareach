@@ -26,16 +26,26 @@
 //!    handed over whole. Nothing is written here and nothing is imported anywhere: the caller
 //!    puts the bytes in a place the person chose.
 //!
-//! The seed and the plaintext never leave this module's callers' process; [`RestoreSource`] is the
-//! only thing that reaches a service, and it carries ciphertext and public records.
+//! 7. **Then the checkpoint.** A restore that has written its files records the generation it
+//!    verified in the bundle ([`PreparedRestore::record_checkpoint`]), so the next restore can tell
+//!    a service that replays an older archive. The host that made the bundle holds no seed and so
+//!    cannot record one; this is the one party that holds the seed and a verified generation
+//!    together. It reads the bundle again, authenticates it, changes only that archive's
+//!    checkpoint, and writes it on by compare-and-swap, so a change another device made meanwhile
+//!    is carried through and never taken.
+//!
+//! The seed and the plaintext never leave this module's callers' process; [`RestoreSource`] and
+//! [`BundleWriter`] are the only things that reach a service, and they carry ciphertext and public
+//! records. The seed is kept for as long as a prepared restore is, because the checkpoint step
+//! needs the bundle's key, and it is cleared when the restore is dropped.
 
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_crypto::backup::{
-    ArchiveExpectation, ArchiveReader, GenerationExpectation, Material, OpenArchive,
-    RestoreGeneration, admit_for_restore, member_cap, member_material, open_archive,
+    ArchiveExpectation, ArchiveReader, GenerationExpectation, GenerationStanding, Material,
+    OpenArchive, RestoreGeneration, admit_for_restore, member_cap, member_material, open_archive,
 };
 use kr_crypto::kdf::{RecoveryRecipient, RecoverySeed};
 use kr_crypto::secret::SecretVec;
@@ -43,17 +53,19 @@ use kr_crypto::sign::SigningTranscript;
 use kr_crypto::stream;
 use kr_protocol::archive::{
     ArchiveCheckpoint, BACKUP_PUBLICATION_DOMAIN, BackupGenerationPublication, CollectionLocator,
-    MAX_MANIFEST_OBJECTS, MAX_MANIFEST_PAYLOAD_LEN, RecoveryKit, TrustedWriter,
+    MAX_MANIFEST_OBJECTS, MAX_MANIFEST_PAYLOAD_LEN, RecoveryContext, RecoveryKit, TrustedWriter,
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId};
-use kr_protocol::scalars::{Digest256, KeyId, StoredEnvelopeKey, TimestampMs, Uuid};
+use kr_protocol::scalars::{Digest256, KeyId, StoredEnvelopeKey, TimestampMs, U64, Uuid};
 use kr_protocol::service::GatewayOrigin;
 use serde::Serialize;
 
 use crate::error::ClientError;
+use crate::recovery::bundle::read_bundle;
 use crate::recovery::{
     FreshRestore, RecoveryError, RetrievalPolicy, ServiceAccess, TrustedMaterial,
+    advance_checkpoint,
 };
 use crate::services::{
     ServiceFuture, SyncBackupService, SyncDispatch, SyncExchanged, SyncFetched, SyncPosition,
@@ -179,12 +191,51 @@ pub trait RestoreSource: Send + Sync + fmt::Debug {
     ) -> ServiceFuture<'_, Vec<u8>>;
 }
 
+/// One write of the sealed bundle, as a restore sends it.
+pub struct BundleWrite<'a> {
+    /// The locator the kit prints.
+    pub locator: &'a str,
+    /// The place the bundle was read at. The write replaces the bundle only if it is still there.
+    pub expected: SyncPosition,
+    /// The identity this write goes out under.
+    pub request_id: Uuid,
+    /// The instant this write was signed at, in UTC milliseconds.
+    pub signed_at_ms: u64,
+    /// The sealed bundle.
+    pub sealed: &'a [u8],
+}
+
+/// What the service made of one write of the bundle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BundleWritten {
+    /// The write applied, and the bundle is now at this place.
+    Written(SyncPosition),
+    /// The bundle was not at the place the write named, and nothing was written.
+    Conflict,
+    /// The service asked to be left alone, and nothing was sent: ask again after this many seconds.
+    Wait {
+        /// Seconds until the service may be asked again.
+        seconds: u64,
+    },
+}
+
+/// Where a restore writes the bundle on, once it has verified a generation.
+///
+/// Like [`RestoreSource`] it reaches a service and carries ciphertext only: it has no seed and no
+/// plaintext, and the `kr` command's is the daemon's relay.
+pub trait BundleWriter: Send + Sync + fmt::Debug {
+    /// Writes the sealed bundle, if it is still at the place `write` names.
+    fn write<'a>(&'a self, write: BundleWrite<'a>) -> ServiceFuture<'a, BundleWritten>;
+}
+
 /// The bundle as the settings-sync client reads it, over a source, and refusing every write.
 struct BundleReader {
     source: Arc<dyn RestoreSource>,
     /// Whether the source answered that no bundle is held, so the caller can say that apart from a
     /// bundle that failed to authenticate.
     answered_absent: AtomicBool,
+    /// Where the first read found the bundle, which a later read is held to.
+    first_place: std::sync::Mutex<Option<SyncPosition>>,
 }
 
 impl fmt::Debug for BundleReader {
@@ -253,8 +304,15 @@ impl SyncBackupService for BundleReader {
                 ))
                 .unwrap_or(collection);
             let fetched = self.source.bundle(locator).await?;
-            if matches!(fetched, SyncFetched::Absent { .. }) {
-                self.answered_absent.store(true, Ordering::Relaxed);
+            match &fetched {
+                SyncFetched::Absent { .. } => self.answered_absent.store(true, Ordering::Relaxed),
+                SyncFetched::Held { position, .. } => {
+                    let mut first = self
+                        .first_place
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    first.get_or_insert(*position);
+                }
             }
             Ok(fetched)
         })
@@ -345,6 +403,26 @@ pub enum RestoreError {
         /// The generation the bundle's checkpoint records.
         checkpoint: u64,
     },
+    /// The service holds a generation of the archive that is older than the one the bundle's
+    /// checkpoint records, and the person named no generation that accepts it.
+    ///
+    /// The generation is the service's own, read without the checkpoint and verified as a restore
+    /// verifies one, so the person is told what is held and not what was claimed.
+    #[error(
+        "the service holds generation {held} of that archive, older than generation {checkpoint} \
+         that the recovery bundle verified"
+    )]
+    OlderThanTheCheckpoint {
+        /// The generation the bundle's checkpoint records.
+        checkpoint: u64,
+        /// The generation the service holds.
+        held: u64,
+    },
+    /// A generation older than the checkpoint was named for an archive whose bundle records none.
+    #[error(
+        "the recovery bundle records no checkpoint for that archive, so there is none to accept an older generation past"
+    )]
+    NoCheckpointToAcceptPast,
     /// The service holds no generation of the archive at all.
     #[error("the service holds no generation of that archive")]
     NoGeneration,
@@ -394,6 +472,15 @@ pub enum RestoreError {
     /// A member was asked for that the plan does not restore.
     #[error("that member is not one this restore's plan writes")]
     NotInPlan,
+    /// The recovery bundle changed under every attempt to record the checkpoint in it.
+    #[error("the recovery bundle kept changing while the verified generation was being recorded")]
+    BundleKeptMoving,
+    /// The service asked to be left alone while the checkpoint was being recorded.
+    #[error("the storage service asks this host to wait {seconds} more seconds")]
+    ServiceAskedToWait {
+        /// Seconds until the service may be asked again.
+        seconds: u64,
+    },
 }
 
 crate::debug_as_display!(RestoreError);
@@ -590,6 +677,9 @@ struct DigestInput<'a> {
     writer: KeyId,
     standing: String,
     bundle_revision: u64,
+    /// What the restore also does, besides writing files, that the person confirmed: a digest of
+    /// the configuration document it would write, or nothing.
+    applying: &'a str,
     members: Vec<DigestMember>,
 }
 
@@ -631,15 +721,15 @@ impl RestorePlan {
     }
 
     /// The digest the person confirms: a domain, the environment, the absolute destination (as the
-    /// bytes the operating system names it by) and everything the plan says, as lowercase
-    /// hexadecimal.
+    /// bytes the operating system names it by), everything the plan says and what else the restore
+    /// will do (`applying`, empty when nothing), as lowercase hexadecimal.
     ///
     /// A generation published between the preview and the confirmation changes it, so the
     /// confirmation is for the archive that was shown.
     ///
     /// Returns nothing when the plan cannot be encoded, which no plan this module makes is.
     #[must_use]
-    pub fn digest(&self, environment: &str, destination: &[u8]) -> Option<String> {
+    pub fn digest(&self, environment: &str, destination: &[u8], applying: &str) -> Option<String> {
         let input = DigestInput {
             environment,
             destination: destination
@@ -654,6 +744,7 @@ impl RestorePlan {
             writer: self.writer,
             standing: self.standing.describe(),
             bundle_revision: self.bundle_revision,
+            applying,
             members: self
                 .members
                 .iter()
@@ -824,7 +915,29 @@ pub struct PreparedRestore {
     recipient: RecoveryRecipient,
     sender: StoredEnvelopeKey,
     source: Arc<dyn RestoreSource>,
+    /// The kit's seed, kept for the one step after the files that needs the bundle's key.
+    seed: RecoverySeed,
+    /// Where the bundle is read from and written to.
+    context: RecoveryContext,
+    /// Where the first read found the bundle, which every later read is held to.
+    first_place: SyncPosition,
 }
+
+/// What recording the checkpoint did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointRecorded {
+    /// The bundle now records the verified generation, at this revision.
+    Written {
+        /// The bundle's revision after the write.
+        bundle_revision: u64,
+    },
+    /// The bundle already records this generation or a newer one of the archive, so it was left as
+    /// it is.
+    AlreadyThere,
+}
+
+/// How many times recording the checkpoint reads the bundle again after it moved.
+const CHECKPOINT_ATTEMPTS: usize = 4;
 
 impl fmt::Debug for PreparedRestore {
     /// What the plan says and nothing else: no key, no ciphertext, no plaintext.
@@ -843,6 +956,106 @@ impl PreparedRestore {
     #[must_use]
     pub const fn plan(&self) -> &RestorePlan {
         &self.plan
+    }
+
+    /// Records the generation this restore verified in the recovery bundle, so that the next
+    /// restore can tell a service that replays an older archive.
+    ///
+    /// The bundle is read again and authenticated under the kit's key, only this archive's
+    /// checkpoint is changed (see [`advance_checkpoint`]), and the result is written on at the
+    /// place it was read at. The revision moves here and nowhere else: one more than the bundle
+    /// that was read. A write the bundle has moved on from is a conflict, and the bundle is read
+    /// again and the change made on what is there; a write whose answer was lost is treated the
+    /// same way, because the next read either finds the checkpoint recorded or finds the bundle
+    /// where the lost write compared, and a request that arrives late then compares against a
+    /// place the bundle has left and changes nothing. Nothing is kept about an attempt, so no
+    /// attempt can be based on a state the bundle is no longer in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RestoreError::Recovery`] when the bundle does not authenticate, is of another
+    /// history than the restore read, records the generation with another manifest, or would be
+    /// sealed past the bound a service keeps; [`RestoreError::ServiceAskedToWait`] when the service
+    /// asked to be left alone; [`RestoreError::BundleKeptMoving`] when it moved under every
+    /// attempt; and [`RestoreError::Read`] when the service cannot be reached.
+    pub async fn record_checkpoint(
+        &self,
+        writer: &dyn BundleWriter,
+        now: TimestampMs,
+    ) -> Result<CheckpointRecorded, RestoreError> {
+        let verified = ArchiveCheckpoint {
+            archive_id: self.plan.archive_id,
+            backup_generation: self.plan.generation,
+            encrypted_manifest_hash: self.plan.manifest_hash,
+            verified_at_ms: now,
+        };
+        let reader = BundleReader {
+            source: Arc::clone(&self.source),
+            answered_absent: AtomicBool::new(false),
+            first_place: std::sync::Mutex::new(None),
+        };
+        let key = self
+            .seed
+            .bundle_key_for(&self.context)
+            .map_err(|error| RestoreError::Recovery(Box::new(error.into())))?;
+        let mut seen = self.first_place;
+        let mut last_failure: Option<ClientError> = None;
+        for _ in 0..CHECKPOINT_ATTEMPTS {
+            let read = read_bundle(&reader, &self.context, Some(seen), &self.seed)
+                .await
+                .map_err(from_recovery)?;
+            let Some(mut advanced) =
+                advance_checkpoint(&read.bundle, &verified).map_err(from_recovery)?
+            else {
+                return Ok(CheckpointRecorded::AlreadyThere);
+            };
+            advanced.revision = U64::new(read.bundle.revision.get().saturating_add(1));
+            advanced.written_at_ms = now;
+            let sealed = kr_crypto::archive::encrypt_recovery_bundle(&key, &advanced)
+                .map_err(|error| RestoreError::Recovery(Box::new(error.into())))?;
+            if sealed.len() as u64 > kr_protocol::sync::MAX_SEALED_RECOVERY_BUNDLE_BYTES {
+                return Err(RestoreError::Recovery(Box::new(
+                    RecoveryError::BundleTooLarge {
+                        len: sealed.len(),
+                        limit: kr_protocol::sync::MAX_SEALED_RECOVERY_BUNDLE_BYTES,
+                    },
+                )));
+            }
+            seen = read.position;
+            let request_id = kr_transport::random::fresh_uuid_v4().map_err(ClientError::from)?;
+            let written = writer
+                .write(BundleWrite {
+                    locator: &self.context.bundle_locator,
+                    expected: read.position,
+                    request_id,
+                    signed_at_ms: now.get(),
+                    sealed: &sealed,
+                })
+                .await;
+            match written {
+                Ok(BundleWritten::Written(place)) => {
+                    // A write that applied takes the next place in the order; one that stands still
+                    // is a service saying it wrote and did not.
+                    if place.recovery() != read.position.recovery()
+                        || place.write_sequence <= read.position.write_sequence
+                    {
+                        return Err(RestoreError::Recovery(Box::new(
+                            RecoveryError::BundleDidNotMoveOn { found: place },
+                        )));
+                    }
+                    return Ok(CheckpointRecorded::Written {
+                        bundle_revision: advanced.revision.get(),
+                    });
+                }
+                Ok(BundleWritten::Conflict) => {}
+                Ok(BundleWritten::Wait { seconds }) => {
+                    return Err(RestoreError::ServiceAskedToWait { seconds });
+                }
+                Err(error) if is_a_lost_answer(&error) => last_failure = Some(error),
+                Err(error) => return Err(RestoreError::Read(error)),
+            }
+        }
+        Err(last_failure.map_or(RestoreError::BundleKeptMoving, RestoreError::Read))
     }
 
     /// Reads one admitted member's ciphertext, opens it and hands over its plaintext.
@@ -885,6 +1098,26 @@ impl PreparedRestore {
     }
 }
 
+/// A recovery-layer failure as a restore reports it: the service's own when it was the service.
+fn from_recovery(error: RecoveryError) -> RestoreError {
+    match error {
+        RecoveryError::Service(error) => RestoreError::Read(error),
+        other => RestoreError::Recovery(Box::new(other)),
+    }
+}
+
+/// Whether a failed write may have reached the service: its answer was lost, or the service could
+/// not be reached for it. Any other failure is a refusal, and writing again would meet it again.
+fn is_a_lost_answer(error: &ClientError) -> bool {
+    matches!(
+        error.code(),
+        ErrorCode::OutcomeUnknown
+            | ErrorCode::UpstreamUnavailable
+            | ErrorCode::StorageUnavailable
+            | ErrorCode::ResourceUnavailable
+    )
+}
+
 /// Reads one whole object in ranges, and no more than its declared length.
 async fn read_whole(
     source: &dyn RestoreSource,
@@ -912,6 +1145,11 @@ impl FilesRestore {
     /// Opens the bundle, chooses the archive, verifies its newest publication and its manifest, and
     /// makes the plan. Nothing is written and nothing but the manifest object is read.
     ///
+    /// `accept_older` names the one generation older than the bundle's checkpoint that the person
+    /// accepts, for a service that was legitimately put back to an earlier state. A service that
+    /// holds that generation and nothing newer is restored from; one that holds any other older
+    /// generation is refused, and the refusal names what it holds.
+    ///
     /// # Errors
     ///
     /// Returns the first reason the restore cannot go on; see [`RestoreError`].
@@ -919,6 +1157,7 @@ impl FilesRestore {
         kit: RecoveryKit,
         source: Arc<dyn RestoreSource>,
         archive: Option<ArchiveId>,
+        accept_older: Option<BackupGeneration>,
     ) -> Result<PreparedRestore, RestoreError> {
         // 1. The kit's checksum, before anything is derived or asked.
         let seed = RecoverySeed::from_kit(&kit)
@@ -943,9 +1182,13 @@ impl FilesRestore {
         }
 
         // 2. The bundle, through a reader that cannot write.
+        let context = kit
+            .context(&origin)
+            .map_err(|_| RestoreError::OriginNotConfigured)?;
         let reader = Arc::new(BundleReader {
             source: Arc::clone(&source),
             answered_absent: AtomicBool::new(false),
+            first_place: std::sync::Mutex::new(None),
         });
         let mut fresh = FreshRestore::new(kit, RetrievalPolicy::Account);
         fresh
@@ -966,32 +1209,67 @@ impl FilesRestore {
             }
             Err(other) => return Err(RestoreError::Recovery(Box::new(other))),
         };
+        let first_place = reader
+            .first_place
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ok_or(RestoreError::BundleAbsent)?;
 
         // 3. One archive.
         let archive_id = choose_archive(&material, &origin, archive, source.as_ref()).await?;
         let checkpoint = material.checkpoint(archive_id).cloned();
-        let publication = source
-            .generation(archive_id, checkpoint.as_ref())
-            .await?
-            .ok_or_else(|| match &checkpoint {
-                Some(checkpoint) => RestoreError::NothingAsNewAsTheCheckpoint {
-                    checkpoint: checkpoint.backup_generation.get(),
+        let expectation = match (&checkpoint, accept_older) {
+            (Some(checkpoint), Some(accepted)) => GenerationExpectation::AcceptingOlder {
+                checkpoint,
+                accepted,
+            },
+            (Some(checkpoint), None) => GenerationExpectation::Checkpoint(checkpoint),
+            (None, Some(_)) => return Err(RestoreError::NoCheckpointToAcceptPast),
+            (None, None) => GenerationExpectation::Unverified,
+        };
+        // Held to the checkpoint, the service answers nothing when it holds nothing as new. Asked
+        // again without it, it says what it does hold, which is verified like any publication
+        // before it is named: the person is told what the service holds, not what it claims.
+        let mut asked_without_the_checkpoint = false;
+        let publication = match source.generation(archive_id, checkpoint.as_ref()).await? {
+            Some(publication) => publication,
+            None => match &checkpoint {
+                Some(checkpoint) => match source.generation(archive_id, None).await? {
+                    Some(held) => {
+                        asked_without_the_checkpoint = true;
+                        held
+                    }
+                    None => {
+                        return Err(RestoreError::NothingAsNewAsTheCheckpoint {
+                            checkpoint: checkpoint.backup_generation.get(),
+                        });
+                    }
                 },
-                None => RestoreError::NoGeneration,
-            })?;
+                None => return Err(RestoreError::NoGeneration),
+            },
+        };
 
         // 4. The publication, before an object is read.
-        let expectation = match &checkpoint {
-            Some(checkpoint) => GenerationExpectation::Checkpoint(checkpoint),
-            None => GenerationExpectation::Unverified,
-        };
         let verified = verify_publication(
             &publication,
             archive_id,
             &material.trusted_writers,
             expectation,
         )
-        .map_err(RestoreError::Publication)?;
+        .map_err(|refusal| match refusal {
+            PublicationRefusal::Generation(
+                RestoreGeneration {
+                    standing: GenerationStanding::Replayed { checkpoint },
+                    backup_generation,
+                    ..
+                },
+                _,
+            ) if asked_without_the_checkpoint => RestoreError::OlderThanTheCheckpoint {
+                checkpoint: checkpoint.get(),
+                held: backup_generation.get(),
+            },
+            other => RestoreError::Publication(other),
+        })?;
         let descriptor = &publication.payload.descriptor;
         let manifest_limit = stream::encrypted_len(MAX_MANIFEST_PAYLOAD_LEN) as u64;
         let declared = descriptor.encrypted_manifest.encrypted_len.get();
@@ -1006,7 +1284,6 @@ impl FilesRestore {
         let recipient = seed
             .recipient()
             .map_err(|error| RestoreError::Seed(Shown::crypto(&error)))?;
-        drop(seed);
         let reader_key_id = ArchiveReader::Recovery(&recipient).key_id();
         let wrap = kr_crypto::archive::manifest_wrap_for(descriptor, &reader_key_id)
             .ok_or(RestoreError::NoWrap)?;
@@ -1074,6 +1351,9 @@ impl FilesRestore {
             recipient,
             sender,
             source,
+            seed,
+            context,
+            first_place,
         })
     }
 }
