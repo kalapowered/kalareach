@@ -321,8 +321,14 @@ def scanner_fits_the_largest_text(phone: Phone, port: str) -> None:
             time.sleep(0.3)
         else:
             phone.give_up("the scanner did not open at the largest text size")
-        width = max(node["box"][2] for node in nodes)
-        height = max(node["box"][3] for node in nodes)
+        # The display's own size, not the widest node's: a node that runs past the screen is
+        # measured against the screen. `uiautomator` clips what it reports to the window, so a
+        # control wider than the screen shows as one that ends at its edge and this half cannot
+        # see it; the overlap below, and the page's own checks of the same layout, are what can.
+        size = re.findall(r"(\d+)x(\d+)", phone.run("shell", "wm", "size").stdout.decode("utf-8", "replace"))
+        if not size:
+            phone.give_up("the display's size could not be read")
+        width, height = (int(each) for each in size[-1])
         found = {node["label"]: node["box"] for node in nodes if node["label"] in (hint_words, "Cancel")}
         for name, box in found.items():
             if box[0] < 0 or box[1] < 0 or box[2] > width or box[3] > height:
