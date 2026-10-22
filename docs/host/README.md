@@ -1105,7 +1105,7 @@ A worker's lifetime belongs to the platform, not to the control daemon.
 | macOS | a per-session launchd job, bootstrapped into `gui/<uid>` and started once with `launchctl kickstart -p` | the kickstart output's process identifier, then `proc_pidinfo` |
 | Linux with systemd | a transient user *service*, `systemd-run --user --unit=... --collect -p Type=exec -p Restart=no` | `systemctl --user show -p MainPID`, then `/proc/<pid>/stat` |
 | other Unix | a child that leads a session of its own, reparented when the daemon exits | the spawned child |
-| Windows | the spawned child, outside the daemon's kill-on-close Job | the child's identifier and creation time |
+| Windows | a process the starter of the environment's scheduled task creates, in the user's logon session, outside every job the daemon runs in | the identity the starter read from the handle that created it |
 
 `kickstart -p`, never `-k`: the second restarts a job that is already running, which for a session
 worker means killing a live shell to start another one.
@@ -1810,6 +1810,30 @@ the task stays registered with no trigger, so nothing starts until a `kr new` af
 A `kr new` run over SSH on a machine where the user is signed in nowhere cannot use the task: the
 Task Scheduler does not start it, and `kr new` says so.
 Removing the task, as `kr host startup --clear` does, ends nothing it started.
+
+**How a worker is supervised.** The daemon creates no worker and no plugin runtime itself. For each
+launch it checks that the environment's task is the one this installation registers, opens the
+launch pipe, runs the task and waits. The task's starter reaches the pipe, is checked to be this
+installation's `kr-controller` of this user in the daemon's own login session, is handed the launch,
+creates the process suspended, checks it and lets it run, and reports it. The daemon records the
+identity the starter read from the handle that created the process. So a worker is in none of the
+jobs the daemon runs in, however those jobs are nested: a daemon that a job closes on, or a restart
+of the daemon, ends no worker. A worker gets the environment the Task Scheduler builds for the user,
+with the variables the launch names, and not the daemon's own. A host whose environment has no task,
+or has one that is not this installation's, starts nothing: the create fails and names
+`kr host startup --set standalone`, and `kr doctor` reports the same under "Workers outlive this
+daemon". A launch whose answer from the starter is lost is reported as uncertain, and its reservation keeps
+its slot, as on the other platforms.
+
+An environment's work stays in one login session, because signing out of a session ends that
+session's processes. A daemon that starts in a session other than the one an earlier daemon's
+workers, or its launches that were handed over, claimed or fenced, are still running in refuses to
+start. It reads each such process from the kernel before it adopts, recovers or accepts anything,
+and the refusal names the session and the processes. A process that has ended is not work, so a
+sign-out followed by a daemon in the next session is not refused, and neither is a restart of the
+machine. A plugin runtime that a daemon in another session left running is not session work: the
+next daemon adopts it at its next request, it ends with its own session's sign-out, and the daemon
+replaces it under the same bound as any other host that ends.
 
 ### A vendor's own sandbox
 

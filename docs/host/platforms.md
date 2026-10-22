@@ -63,14 +63,17 @@ session ends, the session closes with `desktop_lost` and you create a new one.
 the one this table says you probably have. The answer names the service mechanism it is about, and
 a claim that a headless session survives logout also names what makes it survive.
 
-On a host with no per-user service manager the fallback is a detached process: a worker leads a
-session of its own, and the plugin runtime a process group of its own, each reparented when the
+On a Unix host with no per-user service manager the fallback is a detached process: a worker leads
+a session of its own, and the plugin runtime a process group of its own, each reparented when the
 control daemon exits. A worker started that way is in whatever login context the control daemon
 is in, so a headless session there has the desktop's variables stripped
-rather than a login context of its own. `kr doctor` reports that as what it is. Windows uses that
-fallback, and a worker there is a child of the control daemon and runs in the logon session the
-daemon runs in, so a headless session there is a session with no desktop handles and no promise
-about the desktop rather than one that cannot reach it; its capability records say so.
+rather than a login context of its own. `kr doctor` reports that as what it is.
+
+Windows has no fallback and needs none: every worker and the plugin runtime are created by the
+starter of the environment's scheduled task, in the logon session of the user the task logs on as,
+so none is a child of the control daemon or in a job the daemon runs in. A headless session there
+is a session with no desktop handles and no promise about the desktop rather than one that cannot
+reach it; its capability records say so.
 
 ### The control daemon under the service start
 
