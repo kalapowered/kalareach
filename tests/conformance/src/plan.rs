@@ -2081,6 +2081,18 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
     },
     IgnoredRun {
         package: "kr-controller",
+        target: "--test managed_storage",
+        cases: &[
+            "a_closed_sessions_history_is_backed_up_by_the_daemon_to_a_local_worker_and_restored_with_only_the_kit",
+        ],
+        runs: Runs::Supplied {
+            file: "scripts/e2e-backup.sh",
+            line: "env \"$@\" cargo test --locked -p kr-controller --test managed_storage -- --ignored --exact \"$test\" --nocapture --test-threads=1 >\"$log\" 2>&1 || rc=$?",
+            names_with: &["run_daemon_test"],
+        },
+    },
+    IgnoredRun {
+        package: "kr-controller",
         target: "--test descriptions",
         cases: &[],
         runs: Runs::ByHand {
