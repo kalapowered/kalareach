@@ -735,6 +735,16 @@ impl Assembled {
         self
     }
 
+    /// The bytes of the program `name` this release is made of.
+    fn own_program_bytes(&self, name: &str) -> Vec<u8> {
+        let (_, copied, _, _) = self
+            .programs
+            .iter()
+            .find(|(known, ..)| *known == name)
+            .unwrap_or_else(|| panic!("the release has a program {name}"));
+        std::fs::read(copied).expect("the program")
+    }
+
     /// The bytes of the workspace's own program `name`.
     fn program_bytes(name: &str) -> Vec<u8> {
         let (_, copied, _, _) = programs()
@@ -796,14 +806,15 @@ impl Assembled {
 
     /// This release as one whose control daemon states the public major `major` on its local links
     /// and lists only that major to a device, wherever the daemon is started from; with `None`, as
-    /// one whose daemon states this build's own, even when the program that starts it states a
-    /// later major. The workspace's own daemon is kept beside as `kr-controller-real`.
+    /// one whose daemon states its own build's major, even when the program that starts it states a
+    /// later major. The release's own daemon is kept beside as `kr-controller-real`.
     fn whose_daemon_states(self, major: Option<u16>) -> Self {
         let setting = match major {
             Some(major) => format!("{LATER_MAJOR_VARIABLE}={major}"),
             None => format!("-u {LATER_MAJOR_VARIABLE}"),
         };
-        self.with_program("kr-controller-real", &Self::program_bytes("kr-controller"))
+        let daemon = self.own_program_bytes("kr-controller");
+        self.with_program("kr-controller-real", &daemon)
             .with_program(
                 "kr-controller",
                 format!(
