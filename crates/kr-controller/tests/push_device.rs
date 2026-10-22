@@ -251,9 +251,10 @@ fn deliveries_of(host: &Host) -> Vec<kr_delivery::journal::DeliveryRecord> {
         .expect("the daemon's journal")
 }
 
-/// Waits until the attention store holds `questions` pending questions and the daemon has taken
+/// Waits until every one of the `questions` the worker asked has been raised in the attention
+/// store (`answered` of them have since been answered and no longer pend) and the daemon has taken
 /// every one of them into its journal and produced from them.
-async fn settled(host: &Host, questions: usize, within: Duration) -> bool {
+async fn settled(host: &Host, questions: usize, answered: usize, within: Duration) -> bool {
     until(within, || {
         let taken = host
             .controller()
@@ -270,7 +271,7 @@ async fn settled(host: &Host, questions: usize, within: Duration) -> bool {
                             .count()
                     })
                     .unwrap_or(0);
-                raised >= questions && store.awaiting_delivery().ok() == Some(0)
+                raised + answered >= questions && store.awaiting_delivery().ok() == Some(0)
             })
             .unwrap_or(false);
         taken
@@ -545,6 +546,7 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
         held_destination = Some(record);
     }
     let mut asked_total = 0_usize;
+    let mut answered_total = 0_usize;
 
     // ---- A delivery (16.12, 16.13) ----------------------------------------------------------
     // A question the worker asks becomes a notification for the phone. Its text carries a marker
@@ -659,6 +661,7 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
         worker.held(&question).state == kr_protocol::question::QuestionState::Answered
     })
     .await;
+    answered_total += usize::from(answered_by_the_phone);
     let record = worker.held(&question).answer.0;
     report.insert(
         "question_answered_from_the_notification".to_owned(),
@@ -722,6 +725,7 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
                 boot_ms: kr_ipc::clock::boot_elapsed_ms(),
             },
         );
+        answered_total += usize::from(resolved_at_the_host.is_ok());
         report.insert(
             "second_resolved_at_the_host".to_owned(),
             json!(resolved_at_the_host.is_ok()),
@@ -817,7 +821,13 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
     let sent_so_far = fcm.sent().len();
     worker.ask_with_context("gone-2", "nothing may reach a destination out of service");
     asked_total += 1;
-    let settled_out = settled(&host, asked_total, DELIVERY_WAIT.min(run.left())).await;
+    let settled_out = settled(
+        &host,
+        asked_total,
+        answered_total,
+        DELIVERY_WAIT.min(run.left()),
+    )
+    .await;
     report.insert(
         "nothing_sent_while_out_of_service".to_owned(),
         json!(settled_out && fcm.sent().len() == sent_so_far),
@@ -890,7 +900,13 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
         worker.ask_with_context(&format!("burst-{number}"), "one of a burst");
     }
     asked_total += burst;
-    let burst_settled = settled(&host, asked_total, REGISTRATION_WAIT.min(run.left())).await;
+    let burst_settled = settled(
+        &host,
+        asked_total,
+        answered_total,
+        REGISTRATION_WAIT.min(run.left()),
+    )
+    .await;
     // Every record of the burst is at rest before it is counted: none is waiting for a first try,
     // on the wire, or waiting for another.
     let at_rest = until(DELIVERY_WAIT.min(run.left()), || {
@@ -1030,7 +1046,13 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
     let sent_end = fcm.sent().len();
     worker.ask_with_context("after-unpair", "nobody is left to tell");
     asked_total += 1;
-    let settled_end = settled(&host, asked_total, DELIVERY_WAIT.min(run.left())).await;
+    let settled_end = settled(
+        &host,
+        asked_total,
+        answered_total,
+        DELIVERY_WAIT.min(run.left()),
+    )
+    .await;
     report.insert(
         "nothing_sent_after_unpairing".to_owned(),
         json!(settled_end && fcm.sent().len() == sent_end),
