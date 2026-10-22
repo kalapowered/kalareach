@@ -436,8 +436,13 @@ impl WorkerService {
     /// gives the same report.
     #[must_use]
     pub fn metrics(&self) -> kr_protocol::metrics::MetricsReport {
+        self.metrics_of(&self.runtime.session())
+    }
+
+    /// The same, read under a hold of the session the caller already has.
+    fn metrics_of(&self, session: &Session) -> kr_protocol::metrics::MetricsReport {
         let faults = crate::metrics::parse_faults(
-            &self.runtime.session().terminal_diagnostics(),
+            &session.terminal_diagnostics(),
             kr_ipc::install::measured_environment(),
         );
         kr_protocol::metrics::MetricsReport::joined([faults, self.broker.metrics()])
@@ -7302,6 +7307,10 @@ impl WorkerService {
                     .flatten()
                     .map(U64::new),
             ),
+            metrics: Some(kr_protocol::metrics::WorkerMetrics::of(
+                &self.metrics_of(&session),
+            ))
+            .filter(|counted| !counted.is_empty()),
         })
     }
 

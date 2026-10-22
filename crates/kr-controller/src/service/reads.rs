@@ -141,6 +141,7 @@ impl Controller {
                         launch_profile: read.launch_profile,
                         last_command_block: read.last_command_block,
                         outstanding_launches: read.outstanding_launches,
+                        metrics: None,
                     });
                 }
                 // A worker that cannot be reached is not necessarily gone. Reconciliation asks the
@@ -192,6 +193,7 @@ impl Controller {
                     launch_profile: Nullable::null(),
                     last_command_block: Nullable::null(),
                     outstanding_launches: Nullable::null(),
+                    metrics: None,
                 })
             }
             None => Err(ControllerError::UnknownSession {

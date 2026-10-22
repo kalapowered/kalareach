@@ -434,6 +434,7 @@ fn live_session(
         launch_profile: Nullable::null(),
         last_command_block: Nullable::null(),
         outstanding_launches: Nullable::null(),
+        metrics: None,
     }
 }
 

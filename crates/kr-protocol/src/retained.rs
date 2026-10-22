@@ -367,6 +367,22 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
                  at the first client release (`docs/releases/packages.md`). A worker's journal \
                  keeps the summary in the shape every release reads and the application in a row \
                  of its own.",
+    },
+    Compatible {
+        at: "SessionReadResult.metrics",
+        reason: "A member that is absent from the wire when the worker has counted nothing of the \
+                 host's own metrics, and a worker of the retained level never writes it, so this \
+                 build's daemon reads what that level writes as a result that carries none, and \
+                 reports nothing of that worker's counts. A result that carries the member is \
+                 written only by a worker of this build, and the daemon takes the counts into its \
+                 own report without passing them on, so what a caller of the daemon reads is what \
+                 it read before. The member is made of strings the daemon reads against its own \
+                 closed lists and leaves out where it does not have the word, so a connector the \
+                 product bundles later or a class of fault added later does not change it and \
+                 needs no level of its own. An earlier release's reader, whose result is a closed \
+                 object, cannot read one that carries the member. No client was released, so \
+                 there is no shim: the public contract may change with a level move until public \
+                 1.0 freezes at the first client release (`docs/releases/packages.md`).",
     }],
 )
 .with_public_majors(include_str!("../retained/0.76/PUBLIC_MAJORS"))];

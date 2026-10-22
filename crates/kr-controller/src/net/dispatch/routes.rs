@@ -344,7 +344,19 @@ impl RemoteConnection {
             );
         };
         let answer = match route {
-            DeviceRead::Daemon => self.controller.read_method(&actor_id, request).await,
+            DeviceRead::Daemon => {
+                // What the host measured about itself goes to a device whose decision holds
+                // `host.manage`, and the workers are asked for their counts only for one.
+                let manages_host = decided
+                    .decision
+                    .decided
+                    .permitted
+                    .rights
+                    .contains(&kr_protocol::rights::ActionRight::HostManage);
+                self.controller
+                    .read_method(&actor_id, request, manages_host)
+                    .await
+            }
             DeviceRead::Narrowed => {
                 // A recorded version is read only inside the grant: its environment, its session
                 // and the moment its history reaches back to, the check `changeset.materialize`
@@ -361,7 +373,7 @@ impl RemoteConnection {
                 } else {
                     request
                 };
-                let answer = self.controller.read_method(&actor_id, request).await;
+                let answer = self.controller.read_method(&actor_id, request, false).await;
                 let narrowed = self.narrow(answer, &decided.acting);
                 if entry.method == Method::ChangesetRead {
                     super::narrowing::without_host_text(narrowed)
