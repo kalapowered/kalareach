@@ -3672,15 +3672,20 @@ mod tests {
         let (dispatch, _writes) = named_dispatch();
         let (dispatch, broker) = counting(dispatch);
         dispatch.upstream.close();
+        let cancel = || named_action("turn.cancel", Some(PreparedOperation::UpstreamCancel));
         dispatch
-            .admit(&named_action(
-                "turn.cancel",
-                Some(PreparedOperation::UpstreamCancel),
-            ))
+            .admit(&cancel())
             .expect_err("a connection that has stopped taking frames carries nothing");
         assert_eq!(
             failures_counted(&broker),
             vec![(Adapter::Codex, MetricOutcome::Unavailable, 1)]
+        );
+        dispatch
+            .submit(&cancel())
+            .expect_err("nor does it take an operation that was admitted before it stopped");
+        assert_eq!(
+            failures_counted(&broker),
+            vec![(Adapter::Codex, MetricOutcome::Unavailable, 2)]
         );
     }
 
