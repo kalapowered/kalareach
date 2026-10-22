@@ -116,6 +116,10 @@ fn new_session(host: &Host<'_>) -> (SessionId, String) {
 /// visible lines and what the live view includes before any invitation exists, and nothing is
 /// issued until the question is answered with `share`; a controller's share, which carries a
 /// consequence, is not issued by `--yes`.
+///
+/// KR-REQ-25.28, from the guest's side: a device paired as a guest through `kr pair invite --guest`
+/// lists no session and is offered none, the host's device list says its pairing opens no
+/// session, and it reads nothing of the session, before the share it is offered is accepted.
 #[test]
 fn a_guest_is_shown_a_session_with_its_screen_and_loses_it_when_the_share_is_taken_back() {
     let runtime = runtime();
