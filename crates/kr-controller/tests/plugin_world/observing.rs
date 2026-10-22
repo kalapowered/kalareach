@@ -634,6 +634,21 @@ impl Observing {
         }
     }
 
+    /// Waits until the worker has recorded that the binding's component was offered something since
+    /// its state was last asked for.
+    pub async fn until_offered(&self, number: u8) {
+        let lane = self.broker().observation();
+        until(
+            "the worker to have recorded what the component was offered",
+            || async {
+                lane.view(binding(number))
+                    .is_some_and(|view| view.offered_since_checkpoint > 0)
+                    .then_some(())
+            },
+        )
+        .await;
+    }
+
     /// Waits until the lane holds a state for a binding that says `part`, and returns it.
     pub async fn until_held(&self, number: u8, part: &str) -> String {
         let lane = self.broker().observation();
