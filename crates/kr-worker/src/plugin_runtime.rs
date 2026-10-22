@@ -611,6 +611,7 @@ impl Link {
             };
             tokio::select! {
                 () = changes.notified() => Event::Changed,
+                () = self.lane.until_state_is_owed() => Event::Changed,
                 () = timer => Event::Timer,
                 notice = notice => Event::Notice(notice),
             }
@@ -690,8 +691,10 @@ impl Link {
             .lane
             .take_held(binding, want.package_digest, want.generation);
         if let Some(held) = held {
-            let what = "the component's state was restored from a checkpoint, and the observations                         since it was taken were not replayed"
-                .to_owned();
+            let what =
+                "the component's state was restored from a checkpoint, and the observations \
+                 since it was taken were not replayed"
+                    .to_owned();
             let owed = self.lane.lose_unready(binding, what.clone());
             let restored = client
                 .restore(service_id(binding), held.state, CALL_WAIT)
