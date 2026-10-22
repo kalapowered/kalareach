@@ -433,6 +433,26 @@ confirmation on the invitation. On the emulator a phone with no screen lock says
 confirm, and offers the button once a lock is set. It searches the phone's log for the invitation's
 text and secret.
 
+`scripts/e2e-android-release.sh` shows that the minified Android release build checks who it is
+talking to, and that it can reach the deployed service. The build is signed with the debug key,
+checked as a package (`scripts/check-android-release-package.sh`: the verifier's network security
+configuration is in it, cleartext traffic is off except to certificate authorities' revocation-list
+hosts, and none of this project's hosts is among them), installed on the emulator and driven through
+its pairing screen. A local TLS server whose certificate a private authority issued records what the
+phone does: it connects, ends the handshake with a fatal alert after the server's hello, and sends no
+request, since the emulator trusts no such authority. That control is a refusal of an issuer, not of a
+name that does not match, and it cannot tell a build that kept the platform verifier from one that
+lost it. What tells them apart is a public origin whose certificate the system trusts and which
+offers no pairing (`KR_RELEASE_PUBLIC_ORIGIN=https://example.com`): with the verifier the screen says
+that the origin offers no pairing, and without the retention rule of `proguard-rules.pro` it says that
+the service could not be reached. `--without-keep-rule` builds that second package and puts the rule
+back. The run also makes one attempt, with a code no host holds, at the deployed service, whose room
+admits a socket for any locator and reserves nothing for an unknown one: it ends with the words for a
+code no host answered, and a build whose verifier cannot check the service's certificate ends with the
+words for a service that could not be reached. A release build with no network security configuration
+for the revocation-list fetch is that build: Android's revocation check needs a list over plain HTTP,
+and the certificates Cloudflare serves for the deployed service name nothing else.
+
 ## An owner's confirmations
 
 On a computer that is one of a host's owner devices, `src-tauri/src/owner.rs` asks each such host
