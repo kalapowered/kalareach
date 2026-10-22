@@ -232,7 +232,9 @@ async fn a_plugin_host_outlives_the_jobs_its_daemon_ran_in() {
             .lines()
             .map_while(std::result::Result::ok)
         {
-            if let Some(said) = line.strip_prefix("plugin host ready ") {
+            // The harness has written the test's name and its dots on the same line, unfinished,
+            // before the helper says anything.
+            if let Some((_, said)) = line.split_once("plugin host ready ") {
                 let _ = ready.send(said.to_owned());
             }
         }
