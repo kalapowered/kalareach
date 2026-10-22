@@ -1824,8 +1824,8 @@ methods! {
           the right to manage automation, and continue the chain from the descendants the \
           exhausted budget refused. A chain whose budget has not run out is refused. The request \
           names the generation it leaves, so a repeat of it after a lost reply is answered with \
-          the generation the chain went to and gives no second budget. Nothing an event carries \
-          can rearm a chain.";
+          the generation the chain went to while the chain is still on it, and no repeat gives a \
+          second budget. Nothing an event carries can rearm a chain.";
 
     WorkflowRead = "workflow.read", Automation,
     effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(AutomationManage)],
