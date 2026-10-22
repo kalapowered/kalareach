@@ -8,15 +8,8 @@
 //! its integration's grant confirmed and turned on in the configuration before the daemon starts.
 //! The owner's device is this repository's client library over iroh on loopback.
 //!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-12.07 | a plain `codex resume` typed in a managed root shell runs behind a gateway that exists before the terminal connects, with the name and vector typed and the integration's flags added; an absolute-path invocation runs as typed and a program found running is adopted and given none |
-//! | KR-REQ-12.06 | the binding of a gateway-served terminal whose thread selection nothing reads says so: no thread, rich mutations suspended for that reason before and after the terminal connects, a rich prompt refused for it, the terminal available throughout |
-//! | KR-REQ-11.22, KR-REQ-11.33, KR-REQ-12.11 | a paired device answers the approval of a real session through the released Codex package: the request is interpreted and answered once as the response Codex reads, the terminal's own late answer is not forwarded and does not end the connection, and in the other order the device's answer is refused because the request is resolved |
-//! | KR-REQ-11.28, KR-REQ-11.36, KR-REQ-12.08, KR-REQ-12.12, KR-REQ-12.06, KR-REQ-23.30 | the same session's typed operations: the binding names the thread and the running turn from the stream, a steer and the declared cancellation reach the server as the requests Codex reads, a prompt over a running turn and a queue the table does not declare are refused with nothing sent, and a prompt after the turn starts one |
-//! | KR-REQ-11.36 | a prompt whose server dies under it is an outcome nobody can establish |
-//! | KR-REQ-12.10, KR-ACC-006, KR-REQ-11.27 | the daemon killed while the terminal writes leaves the worker, terminal and server and the terminal's output; a restarted daemon serves the same agent, binding and pending request to a reconnecting device, which is drawn what the local terminal shows, and the terminal's answer reaches the server once, without the request being asked again |
-//! | KR-REQ-07.61, KR-REQ-07.66 | the session's closure, requested or by a worker's crash, ends the server that ignores the end of its input and a terminate, and what it started, by the identities the worker recorded |
+//! Each case carries, in a comment of its own, the requirement rows its assertions show; what a case
+//! shows is in that comment.
 //!
 //! Not claimed: Windows, where no gateway runs.
 
@@ -1479,13 +1472,12 @@ fn closure_of(host: &Host<'_>, display: &str) -> serde_json::Value {
     host.wait_until_closed(display)["closure"].clone()
 }
 
-/// KR-REQ-07.61 and KR-REQ-07.66: `kr close` of a session whose server ignores the end of its input
-/// and a terminate ends the server by force, the shell it started and the `sleep` below that, and
-/// the terminal, by the identities the worker recorded, and leaves nothing surviving. The server
-/// leads a group of its own, neither the terminal's nor the worker's, and the terminal is the
-/// foreground group of its tty. On a Mac the closure's coverage is incomplete, since the terminal's
-/// group is the boundary there and a descendant could leave it; nothing is claimed of the coverage
-/// elsewhere.
+/// KR-REQ-07.61: `kr close` of a session whose server ignores the end of its input and a terminate
+/// ends the server by force, the shell it started and the `sleep` below that, and the terminal, by
+/// the identities the worker recorded, and leaves nothing surviving. The server leads a group of
+/// its own, neither the terminal's nor the worker's, and the terminal is the foreground group of
+/// its tty. On a Mac the closure's coverage is incomplete, since the terminal's group is the
+/// boundary there and a descendant could leave it; nothing is claimed of the coverage elsewhere.
 ///
 /// Not claimed: Windows, where no gateway runs.
 #[test]
@@ -1719,14 +1711,13 @@ fn kr_req_11_33_a_device_answer_to_a_request_the_terminal_answered_is_refused_an
     ctx.close(&host);
 }
 
-/// KR-REQ-12.06, KR-REQ-12.08, KR-REQ-12.12, KR-REQ-11.28, KR-REQ-11.36 and KR-REQ-23.30: the
-/// typed operations of a real session through the Codex package the plugins repository publishes.
-/// The binding names the thread and the running turn from the stream, and the capability map says
-/// what the package's table lets a device do, a queue excepted. A prompt over the running turn and
-/// a queue the table does not declare are refused and send nothing. A steer and the package's
-/// declared cancellation reach the server as the requests Codex reads, naming the thread and the
-/// turn; the turn's end clears the binding's turn; and a prompt then starts a turn whose identifier
-/// the reply names.
+/// KR-REQ-12.06, KR-REQ-12.08 and KR-REQ-12.12: the typed operations of a real session through the
+/// Codex package the plugins repository publishes. The binding names the thread and the running
+/// turn from the stream, and the capability map says what the package's table lets a device do, a
+/// queue excepted. A prompt over the running turn and a queue the table does not declare are
+/// refused and send nothing. A steer and the package's declared cancellation reach the server as
+/// the requests Codex reads, naming the thread and the turn; the turn's end clears the binding's
+/// turn; and a prompt then starts a turn whose identifier the reply names.
 ///
 /// Not claimed: Windows, where no gateway runs.
 #[test]
@@ -1880,12 +1871,12 @@ fn kr_req_12_08_a_device_steers_cancels_and_prompts_through_what_the_released_pa
     ctx.close(&host);
 }
 
-/// KR-REQ-11.36: a prompt a device sends while the server dies under it is an outcome nobody can
-/// establish, and the caller is told so.
+/// A prompt a device sends while the server dies under it is an outcome nobody can establish, and
+/// the caller is told so: the host's own OUTCOME_UNKNOWN, and the prompt is not sent again.
 ///
 /// Not claimed: Windows, where no gateway runs.
 #[test]
-fn kr_req_11_36_a_prompt_whose_server_dies_under_it_is_an_outcome_nobody_can_establish() {
+fn a_prompt_whose_server_dies_under_it_is_an_outcome_nobody_can_establish() {
     let Some(ctx) = Context::start_released("gateway-server-dies") else {
         return;
     };
