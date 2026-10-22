@@ -290,7 +290,7 @@ fn print(outcome: &Outcome, json: bool) {
                 for line in planned.lines() {
                     output::say(&line);
                 }
-                say_left_out(&planned);
+                say_left_out(planned);
             }
         }
         Outcome::Restored {
@@ -379,7 +379,7 @@ fn print(outcome: &Outcome, json: bool) {
                 if let Some(words) = &configuration_words {
                     output::say(words);
                 }
-                say_left_out(&planned);
+                say_left_out(planned);
             }
         }
     }
