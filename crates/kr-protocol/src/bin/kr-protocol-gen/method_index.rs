@@ -119,7 +119,9 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         | Method::DeliveryDestinationList => at(DELIVERY, "Configuring and removing a destination"),
         Method::DeliveryDestinationSecretSet => at(DELIVERY, "Credentials"),
         Method::PrivacySet | Method::PrivacyStatus => at(HOST, "Privacy mode"),
-        Method::BackupRead => at(HOST, "Reading a backup for a restore"),
+        Method::BackupRead | Method::BackupBundleWrite => {
+            at(HOST, "Reading a backup for a restore")
+        }
         Method::BackupStatus | Method::BackupEnable => at(HOST, "Setting up backups"),
         Method::AccountSignIn | Method::AccountSignOut | Method::AccountStatus => {
             at(HOST, "Account sign-in")

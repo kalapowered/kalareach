@@ -36,11 +36,14 @@ use kr_client::recovery::bundle_collection;
 use kr_client::services::account::{AccountToken, AccountTokenSource, BACKUP_WRITE_SCOPE};
 use kr_client::services::{
     BackupManifestService, ManagedSyncService, ServiceFuture, ServiceSigner, StorageService,
-    SyncBackupService, SyncFetched,
+    SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRecoveryId, SyncRevision,
 };
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::{SigningTranscript, sign};
 use kr_protocol::archive::RecoveryContext;
+use kr_protocol::backup_bundle::{
+    BackupBundlePlace, BackupBundleWriteParams, BackupBundleWriteResult,
+};
 use kr_protocol::backup_read::{
     BACKUP_READ_MAX_BUNDLE_BYTES, BACKUP_READ_MAX_RANGE_BYTES, BackupBundle, BackupReadParams,
     BackupReadResult, BackupSignIn,
@@ -49,6 +52,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::pairing::GenerationCheckpoint;
 use kr_protocol::scalars::{AuthorisationKey, Bytes, Nullable, Signature64, U64};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
+use kr_protocol::sync::MAX_SEALED_RECOVERY_BUNDLE_BYTES;
 use kr_transport::config::ProxyUrl;
 
 use crate::account::HostAccount;
@@ -308,32 +312,119 @@ impl BackupRelay {
         match READING.scope(began, self.reach(params)).await {
             Ok(result) => Ok(result),
             Err(Failure::Local(error)) => Err(error),
-            Err(Failure::Exchange(error)) => {
-                let hold = Hold::of(&error);
-                if let Some(delay) = hold.retry_after {
-                    self.quiet.owe(delay);
-                    return Ok(wait(self.quiet.left().unwrap_or(delay)));
-                }
-                // The gate refused for a delay already on the record: that is what is answered.
-                if hold.code == ErrorCode::RateLimited
-                    && let Some(left) = self.quiet.left()
-                {
-                    return Ok(wait(left));
-                }
-                // The service's own text can repeat what it was asked, so a refusal by the service
-                // is its code and a sentence of this program's. Everything else failed on this
-                // host or on the way, and says what it is.
-                let detail = match &error {
-                    ClientError::Refused { .. } => local_words(hold.code).to_owned(),
-                    ClientError::Host(error) => error.message.clone(),
-                    other => other.to_string(),
-                };
-                Err(ControllerError::Refused {
-                    code: hold.code,
-                    detail,
-                })
-            }
+            Err(Failure::Exchange(error)) => self.refused(&error, "read").map(wait),
         }
+    }
+
+    /// What a failed exchange with the service comes to: the delay the service named, which is
+    /// recorded for everything that asks next and answered with what is left of it, or the
+    /// refusal in this program's words.
+    fn refused(&self, error: &ClientError, what: &str) -> Result<Duration> {
+        let hold = Hold::of(error);
+        if let Some(delay) = hold.retry_after {
+            self.quiet.owe(delay);
+            return Ok(self.quiet.left().unwrap_or(delay));
+        }
+        // The gate refused for a delay already on the record: that is what is answered.
+        if hold.code == ErrorCode::RateLimited
+            && let Some(left) = self.quiet.left()
+        {
+            return Ok(left);
+        }
+        // The service's own text can repeat what it was asked, so a refusal by the service is its
+        // code and a sentence of this program's. Everything else failed on this host or on the
+        // way, and says what it is.
+        let detail = match error {
+            ClientError::Refused { .. } => local_words(hold.code, what),
+            ClientError::Host(error) => error.message.clone(),
+            other => other.to_string(),
+        };
+        Err(ControllerError::Refused {
+            code: hold.code,
+            detail,
+        })
+    }
+
+    /// Writes the recovery bundle on by one compare-and-swap, which began under the privacy state
+    /// `began`.
+    ///
+    /// It moves a bundle that is there: the call names the place the bundle was read at, and a
+    /// service that holds it elsewhere answers [`BackupBundleWriteResult::Conflict`]. Nothing is
+    /// kept here about the write, so a write whose answer is lost is the caller's to read about.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] for a bundle over the bound a sealed bundle has
+    /// or a place that names no write, and otherwise a [`ControllerError`] whose code is the
+    /// service's and whose words are this program's, as [`Self::read`] does.
+    pub async fn write_bundle(
+        &self,
+        params: BackupBundleWriteParams,
+        began: Published,
+    ) -> Result<BackupBundleWriteResult> {
+        if params.sealed_bundle.as_slice().len() as u64 > MAX_SEALED_RECOVERY_BUNDLE_BYTES {
+            return Err(ControllerError::InvalidArgument(format!(
+                "a sealed recovery bundle is at most {MAX_SEALED_RECOVERY_BUNDLE_BYTES} bytes"
+            )));
+        }
+        if params.expected.write_sequence.get() == 0 {
+            return Err(ControllerError::InvalidArgument(
+                "a bundle is moved on from a write that is there, and the first write is one"
+                    .to_owned(),
+            ));
+        }
+        if let Some(left) = self.quiet.left() {
+            return Ok(write_wait(left));
+        }
+        match READING.scope(began, self.exchange(params)).await {
+            Ok(result) => Ok(result),
+            Err(Failure::Local(error)) => Err(error),
+            Err(Failure::Exchange(error)) => self.refused(&error, "write").map(write_wait),
+        }
+    }
+
+    /// Sends the one write that reaches the service.
+    async fn exchange(
+        &self,
+        params: BackupBundleWriteParams,
+    ) -> std::result::Result<BackupBundleWriteResult, Failure> {
+        let collection = bundle_collection(&RecoveryContext {
+            service_origin: self.origin.as_str().to_owned(),
+            bundle_locator: params.locator.to_string(),
+        });
+        let expected = SyncPosition {
+            write_sequence: params.expected.write_sequence.get(),
+            revision: Nullable(params.expected.revision.0.map(SyncRevision::new)),
+            recovery: Nullable(params.expected.recovery.0.map(SyncRecoveryId::new)),
+        };
+        let answered = self
+            .bundles
+            .compare_exchange(
+                &collection,
+                params.request_id,
+                params.signed_at_ms.get(),
+                Some(expected),
+                params.sealed_bundle.as_slice(),
+            )
+            .await?;
+        Ok(match answered {
+            SyncExchanged::Applied { position } => BackupBundleWriteResult::Written {
+                place: place_of(position),
+            },
+            SyncExchanged::Refused { current, .. } => BackupBundleWriteResult::Conflict {
+                current: Nullable(current.map(place_of)),
+            },
+            // The service ran nothing under this signature, and the caller's next write is signed
+            // again: the refusal is reported as one.
+            SyncExchanged::SignedBeforeCutoff => {
+                return Err(Failure::Local(ControllerError::Refused {
+                    code: ErrorCode::InvalidArgument,
+                    detail: "the service refused that write as signed before its cutoff, and \
+                             ran nothing"
+                        .to_owned(),
+                }));
+            }
+        })
     }
 
     /// Sends one read that reaches the service.
@@ -465,20 +556,44 @@ fn wait(left: Duration) -> BackupReadResult {
     }
 }
 
-/// What this program says of a service's refusal, whatever the service said.
-const fn local_words(code: ErrorCode) -> &'static str {
+/// The answer to a write for a service that asked to be left alone for `left` more.
+fn write_wait(left: Duration) -> BackupBundleWriteResult {
+    let whole = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+    BackupBundleWriteResult::Wait {
+        retry_after_seconds: U64::new(whole.max(1)),
+    }
+}
+
+/// Where a write left the bundle, as the protocol names a place.
+fn place_of(position: SyncPosition) -> BackupBundlePlace {
+    BackupBundlePlace {
+        write_sequence: U64::new(position.write_sequence),
+        revision: Nullable(position.revision.0.map(|revision| revision.get())),
+        recovery: Nullable(position.recovery().map(|recovery| recovery.get())),
+    }
+}
+
+/// What this program says of a service's refusal of a `what` (a read or a write), whatever the
+/// service said.
+fn local_words(code: ErrorCode, what: &str) -> String {
     match code {
-        ErrorCode::PermissionDenied => "the storage service did not accept this host's sign-in",
-        ErrorCode::HostNotConfigured => "the storage service says it is not set up for that",
-        ErrorCode::QuotaExceeded => "the account's storage allowance is spent",
-        ErrorCode::OutcomeUnknown => "the storage service did not finish answering that read",
+        ErrorCode::PermissionDenied => {
+            "the storage service did not accept this host's sign-in".to_owned()
+        }
+        ErrorCode::HostNotConfigured => {
+            "the storage service says it is not set up for that".to_owned()
+        }
+        ErrorCode::QuotaExceeded => "the account's storage allowance is spent".to_owned(),
+        ErrorCode::OutcomeUnknown => {
+            format!("the storage service did not finish answering that {what}")
+        }
         ErrorCode::RateLimited | ErrorCode::ServiceCapacity => {
-            "the storage service has no capacity for that read now"
+            format!("the storage service has no capacity for that {what} now")
         }
         ErrorCode::UpstreamUnavailable | ErrorCode::StorageUnavailable => {
-            "the storage service could not answer that read"
+            format!("the storage service could not answer that {what}")
         }
-        _ => "the storage service refused that read",
+        _ => format!("the storage service refused that {what}"),
     }
 }
 
