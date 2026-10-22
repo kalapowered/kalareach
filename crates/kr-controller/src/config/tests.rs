@@ -3,7 +3,7 @@
 use kr_protocol::desktop::CapabilityInvalidation;
 use kr_protocol::hostinfo::configuration::{
     Change, ConfigurationCeilings, ConfigurationDocument, ConfiguredEnrolmentBudgets,
-    DocumentState, EnrolmentBudgets, ValueEffect,
+    DocumentState, EnrolmentBudgets, ValueEffect, ValueSource,
 };
 use kr_protocol::hostinfo::export::Sentence;
 use kr_protocol::scalars::Nullable;
@@ -326,9 +326,10 @@ fn the_effective_report_names_every_value_its_source_and_its_effect() {
     assert_eq!(report.overrides.len(), 2);
     assert_eq!(
         report.values.len(),
-        6 + configuration::SELECTIONS.len() + 1 + 2,
-        "four preferences, two locations, every selection read at the next start, the agents the \
-         document names an ownership for and the two rows of the automation section"
+        6 + configuration::SELECTIONS.len() + 2 + 1 + 2,
+        "four preferences, two locations, every selection read at the next start, the two \
+         settings for descriptions, the agents the document names an ownership for and the two \
+         rows of the automation section"
     );
     for (row, selection) in report.values[6..].iter().zip(configuration::SELECTIONS) {
         assert_eq!(row.key, selection.key);
@@ -365,6 +366,100 @@ fn the_effective_report_names_every_value_its_source_and_its_effect() {
         secret_line(&report).render(),
         "no secure-store references are configured"
     );
+}
+
+/// KR-REQ-26.13: the two settings an owner has for descriptions are in the effective report with
+/// their source, and they apply as soon as they are written.
+///
+/// The daemon acts on them through the same resolver the report reads, so the rows and the
+/// settings it uses cannot differ.
+#[test]
+fn the_descriptions_settings_are_reported_with_their_source_and_apply_at_once() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+
+    let row = |report: &EffectiveConfiguration, key: &str| {
+        report
+            .values
+            .iter()
+            .find(|value| value.key == key)
+            .unwrap_or_else(|| panic!("the report has a {key} row"))
+            .clone()
+    };
+
+    // Nothing chosen: descriptions are on and inference on battery is off, as the product
+    // default, and the report says it is the default.
+    let report = reported(&environment);
+    let enabled = row(&report, "descriptions.enabled");
+    assert_eq!(enabled.value(), "true");
+    assert_eq!(enabled.source, ValueSource::Default);
+    assert_eq!(enabled.effect, ValueEffect::Immediately);
+    let on_battery = row(&report, "descriptions.on_battery");
+    assert_eq!(on_battery.value(), "false");
+    assert_eq!(on_battery.source, ValueSource::Default);
+    assert_eq!(on_battery.effect, ValueEffect::Immediately);
+
+    // The owner turns descriptions off and leaves the other setting alone.
+    let (applied, _) = edit_and_owed(
+        &environment,
+        &Change::Descriptions {
+            enabled: Some(false),
+            on_battery: None,
+        },
+    )
+    .expect("the owner's choice");
+    assert_eq!(applied.effect, ValueEffect::Immediately);
+    let report = reported(&environment);
+    let enabled = row(&report, "descriptions.enabled");
+    assert_eq!(enabled.value(), "false");
+    assert_eq!(enabled.source, ValueSource::HostConfiguration);
+    assert!(enabled.origin.is_present(), "and it says which document");
+    let on_battery = row(&report, "descriptions.on_battery");
+    assert_eq!(on_battery.value(), "false");
+    assert_eq!(
+        on_battery.source,
+        ValueSource::Default,
+        "the setting the edit did not name is still the default"
+    );
+
+    // Choosing the default value is still a choice: the row names the document.
+    edit_once(
+        &environment,
+        &Change::Descriptions {
+            enabled: None,
+            on_battery: Some(false),
+        },
+    )
+    .expect("the owner's second choice");
+    let on_battery = row(&reported(&environment), "descriptions.on_battery");
+    assert_eq!(on_battery.value(), "false");
+    assert_eq!(on_battery.source, ValueSource::HostConfiguration);
+}
+
+/// KR-REQ-26.13: a document the host cannot use turns descriptions off, and the report says what
+/// the host is acting on.
+#[test]
+fn an_unusable_document_reports_descriptions_off_and_the_daemon_acts_on_that() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    kr_ipc::paths::write_owner_only_file(
+        &kr_worker::config::document_path(&environment),
+        br#"{"version": 3, "revision": 1, "descriptions": {"enabled": "yes"}}"#,
+    )
+    .expect("writes a document that does not validate");
+
+    let report = reported(&environment);
+    assert_ne!(report.status.state, DocumentState::Loaded);
+    for key in ["descriptions.enabled", "descriptions.on_battery"] {
+        let row = report
+            .values
+            .iter()
+            .find(|value| value.key == key)
+            .unwrap_or_else(|| panic!("the report has a {key} row"));
+        assert_eq!(row.value(), "false", "{key} is off while the host fails closed");
+        assert_eq!(row.source, ValueSource::Default, "{key}");
+        assert_eq!(row.effect, ValueEffect::Immediately, "{key}");
+    }
 }
 
 /// KR-REQ-01.23: the configuration's diagnostics report the document, the order and the ceilings.
