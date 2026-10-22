@@ -1240,6 +1240,25 @@ Privacy mode drops that state and stops it being asked for, and a component that
 made while it was on is not asked again until it starts again. `docs/plugins/runtime.md` has the
 calls, the bounds and the order.
 
+The worker also asks a component to decode the native requests it records, for a binding whose
+package ships a component and is trusted to decode the request's method; the connector's table reads
+such a request only when no component of the kind is bound. The request is recorded and forwarded to
+the terminal first, and the terminal's own answer waits for nothing. A task of the link takes the
+decodes from a queue of thirty-two requests for all bindings and eight for one, and asks at most
+four components at once and one for each binding. With eight preparations of actions and one call
+each from the pump and the link, that stays within the sixteen calls a connection may have running
+and leaves room for a registration or an unbinding. A request whose component is unavailable,
+disabled or gone, and one the queue could not take, stays recorded and opaque for the terminal to
+answer, and the binding's report counts it by kind and never in the component's words. What a
+component answers is believed no further than the broker can check it against the request it holds
+and the table.
+
+The worker tells the runtime whether privacy mode stands: once on a new connection, before it
+registers anything on it, and again at each change. While it stands the runtime writes no document
+on that connection and sends the nodes that present a decoded request empty. The worker tells the
+runtime too the facts of the execution a binding is bound to, and each change of them, which a
+component reads at its next call.
+
 `docs/plugins/runtime.md` has the execution model, the per-instance limits, the compiled-code cache
 and the protocol.
 

@@ -211,6 +211,9 @@ another. A document the *worker's* queue dropped is reported to the worker as a 
 fresh one is then the worker's, because only the worker knows whether it still wants that binding's
 presentation.
 
+A document the host withholds because privacy mode stands is not one a queue dropped for want of room,
+and no gap is owed for it while it is withheld (see "Privacy mode at the host").
+
 A binding also holds a bounded number of unanswered calls. A caller whose deadline ran out has
 stopped waiting, but its request is still on the binding's thread until that thread reaches it, and
 the thread skips the ones whose callers have gone rather than spending a call's budget on an answer
