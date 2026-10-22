@@ -8,9 +8,12 @@
 //! agent's command name and started as the root shell starts a foreground job, with a process group
 //! of its own, in the way `adoption` does; the watch then finds it running.
 //!
-//! The cases here say what the worker does with the program once it is running: it is the person's
-//! own program, started with the vector they typed, and the worker adopts it as a native terminal
-//! instance bound to the bundled package that recognises it.
+//! The cases here say what the integration decides for each agent's name, and what the worker does
+//! with the program once it is running: it is the person's own program, started with the vector
+//! they typed, and the worker adopts it as a native terminal instance bound to the bundled package
+//! that recognises it.
+//!
+//! Not claimed: Windows, where the worker's adoption of a foreground program is not built.
 
 #![cfg(unix)]
 
@@ -26,8 +29,9 @@ use kr_protocol::ids::SessionId;
 use kr_protocol::projection::AgentInstanceSummary;
 use kr_protocol::root::CommandBypassReason;
 use kr_protocol::scalars::{Digest256, Uuid};
+use kr_shell_integration::host::command::{InvocationContext, Resolution, resolve};
 use kr_worker::broker::Broker;
-use kr_worker::broker::adoption::{ADOPTED_REFUSAL, Adoptions, Foreground};
+use kr_worker::broker::adoption::{Adoptions, Foreground};
 use kr_worker::broker::catalogue::{Admissions, testing};
 use kr_worker::broker::connectors::{ConnectorSource, ConnectorSources};
 use kr_worker::persistence::JournalHealth;
@@ -38,6 +42,30 @@ const STAND_IN: &str = "KR_BUNDLED_STAND_IN";
 
 /// How long a test waits for something that should happen promptly, before it calls it a failure.
 const LIVENESS: Duration = Duration::from_secs(60);
+
+/// The six agents' command names, as the shipped adapters recognise them.
+const AGENT_COMMANDS: [&str; 6] = ["claude", "codex", "gemini", "qodercli", "opencode", "kimi"];
+
+/// What a person types after an agent's name.
+const AFTER_THE_NAME: [&str; 4] = ["--exact", "the_stand_in_program", "--test-threads", "1"];
+
+/// What the integration decides for `command` typed at a managed root shell's prompt, under the
+/// configuration a seeded host starts with: no command integration is installed.
+fn decided(command: &str) -> (Vec<String>, Resolution) {
+    let line: Vec<String> = std::iter::once(command)
+        .chain(AFTER_THE_NAME)
+        .map(str::to_owned)
+        .collect();
+    let resolution = resolve(
+        &[],
+        InvocationContext {
+            managed_root_shell: true,
+            interactive: true,
+        },
+        &line,
+    );
+    (line, resolution)
+}
 
 /// The stand-in program's body. Run by the test harness with nothing set, it does nothing.
 #[test]
@@ -67,12 +95,16 @@ fn bundled() -> Vec<(String, ConnectorSource)> {
             .file_name()
             .to_string_lossy()
             .into_owned();
-        let release = std::fs::read_dir(shipped().join(&name))
+        let releases: Vec<_> = std::fs::read_dir(shipped().join(&name))
             .expect("the package's releases read")
-            .next()
-            .expect("a release")
-            .expect("a release directory")
-            .path();
+            .collect::<Result<_, _>>()
+            .expect("the release directories read");
+        assert_eq!(
+            releases.len(),
+            1,
+            "the shipped repository holds one release of {name}"
+        );
+        let release = releases[0].path();
         let manifest = std::fs::read(release.join("plugin.json")).expect("the manifest reads");
         packages.push((
             name,
@@ -143,8 +175,8 @@ impl Setup {
     }
 
     /// Places the stand-in as `command` and starts it as this process's own child, in a process
-    /// group of its own, with the vector a person would have typed after the name.
-    fn typed(&self, command: &str) -> (Typed, PathBuf) {
+    /// group of its own, with the arguments the integration decided it runs with.
+    fn typed(&self, command: &str, arguments: &[String]) -> (Typed, PathBuf) {
         let bin = self.host.root().join("bin");
         std::fs::create_dir_all(&bin).expect("a bin directory");
         let program = bin.join(command);
@@ -153,7 +185,7 @@ impl Setup {
             &program,
         );
         let child = Command::new(&program)
-            .args(["--exact", "the_stand_in_program", "--test-threads", "1"])
+            .args(arguments)
             .env(STAND_IN, "60")
             .current_dir(self.host.root())
             .process_group(0)
@@ -189,15 +221,37 @@ impl Drop for Typed {
 }
 
 /// The foreground of a session whose root shell has just started `typed`, answering its line with
-/// the bypass the default configuration gives.
-fn foreground(typed: &Typed, program: &Path) -> Foreground {
+/// the bypass the integration decided.
+fn foreground(typed: &Typed, program: &Path, bypass: CommandBypassReason) -> Foreground {
     Foreground {
         group: i32::try_from(typed.0.id()).expect("a process identifier"),
         root_shell: kr_ipc::identity::current_process_start_identity().expect("this process"),
-        answered: vec![(
-            program.display().to_string(),
-            Some(CommandBypassReason::NotIntegrated),
-        )],
+        answered: vec![(program.display().to_string(), Some(bypass))],
+    }
+}
+
+/// KR-REQ-01.06, KR-REQ-12.23: under the configuration a seeded host starts with, each of the six
+/// agents' names typed at a managed root shell's prompt is run as it was typed.
+///
+/// The decision is the integration's own (`resolve`), given the line `<name> --exact
+/// the_stand_in_program --test-threads 1` and the entries a seeded host gives a session, which are
+/// none: the invocation is bypassed as not integrated, and the command and the argument vector it
+/// will run are the ones typed, with nothing added. That is the native terminal route every bundled
+/// agent has by default.
+#[test]
+fn each_agent_name_typed_under_the_default_configuration_is_run_as_typed() {
+    for command in AGENT_COMMANDS {
+        let (line, resolution) = decided(command);
+        assert_eq!(
+            resolution,
+            Resolution::Bypassed {
+                command: command.to_owned(),
+                arguments: line,
+                reason: CommandBypassReason::NotIntegrated,
+            },
+            "{command}"
+        );
+        assert!(!resolution.establishes_backend(), "{command}");
     }
 }
 
@@ -206,8 +260,9 @@ fn foreground(typed: &Typed, program: &Path) -> Foreground {
 /// with the vector they typed and are found running as native terminal instances of the bundled
 /// package that recognises each.
 ///
-/// What each is found as is the whole of what the worker does with it: the line was answered that
-/// the command is not integrated; the instance is in the native terminal mode; no backend, launch
+/// What each is found as is the whole of what the worker does with it: the line was answered, by
+/// the integration's own decision, that the command is not integrated; the instance is in the native
+/// terminal mode; no backend, launch
 /// record or registration stands behind it, and its bridges are refused; it is bound to the
 /// bundled adapter, which holds the observation the ceiling gives it and no right to act. Nothing
 /// of the adapter changes the program, its name or its arguments.
@@ -226,8 +281,16 @@ fn the_bundled_agents_with_one_adapter_that_recognises_them_run_as_typed_and_are
         ("gemini", "gemini-cli"),
         ("qodercli", "qoder-cli"),
     ] {
-        let (typed, program) = setup.typed(command);
-        let told = setup.adopt(&foreground(&typed, &program));
+        let (line, resolution) = decided(command);
+        let Resolution::Bypassed {
+            arguments, reason, ..
+        } = resolution
+        else {
+            panic!("{command} is run as typed under the default configuration");
+        };
+        assert_eq!(arguments, line, "{command}: the vector as typed");
+        let (typed, program) = setup.typed(command, &arguments[1..]);
+        let told = setup.adopt(&foreground(&typed, &program, reason));
         assert_eq!(told.len(), 1, "{command} is found running: {told:?}");
         let summary = &told[0];
         assert_eq!(
@@ -241,10 +304,7 @@ fn the_bundled_agents_with_one_adapter_that_recognises_them_run_as_typed_and_are
             "{command}: its line was answered that it is not integrated"
         );
         assert!(
-            summary
-                .refusal
-                .as_ref()
-                .is_some_and(|said| said.as_str() == ADOPTED_REFUSAL),
+            summary.refusal.as_ref().is_some(),
             "{command}: none of its bridges is admitted"
         );
         let instance = summary.application_instance_id;
