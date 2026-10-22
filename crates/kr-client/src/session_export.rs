@@ -779,7 +779,7 @@ impl<'a> Collector<'a> {
         // carries its start into the piece that follows it, and bytes that are not text are not
         // written. They are counted with the bytes not carried.
         let mut dropped = 0;
-        cast_events(&self.sink, |_, _, _| {}, &mut dropped);
+        cast_events(&self.sink, |_, _| {}, &mut dropped);
         self.sink.tally.bytes_carried = self.sink.carried.saturating_sub(dropped);
         let declared = self.declared(untimed);
         let capacity = usize::try_from(self.projected()).unwrap_or(0);
