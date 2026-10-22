@@ -953,7 +953,7 @@ mod unix {
         /// on such a filesystem, so the list is read directly.
         #[cfg(target_os = "linux")]
         #[test]
-        fn only_the_filesystems_known_to_keep_change_times_are_trusted() {
+        fn only_the_linux_filesystems_known_to_keep_change_times_are_trusted() {
             for kept in [0xEF53, 0x0102_1994, 0x5846_5342, 0x9123_683E] {
                 assert!(super::known_type(kept).is_ok(), "{kept:#x}");
             }
@@ -966,7 +966,7 @@ mod unix {
         /// As on Linux; only APFS is trusted.
         #[cfg(target_os = "macos")]
         #[test]
-        fn only_the_filesystems_known_to_keep_change_times_are_trusted() {
+        fn only_apfs_is_trusted_to_keep_change_times() {
             assert!(super::known_name("apfs").is_ok());
             for other in ["nfs", "smbfs", "msdos", "exfat", "autofs"] {
                 assert!(super::known_name(other).is_err(), "{other}");
