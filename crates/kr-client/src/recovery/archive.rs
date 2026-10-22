@@ -75,7 +75,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ClientError;
 use crate::recovery::{
-    BundleStore, RecoveryError, Result, SETTINGS_FILENAME, WriterEnabled, export_settings,
+    ArchiveEntries, BundleStore, RecoveryError, Result, SETTINGS_FILENAME, WriterEnabled,
+    export_settings,
 };
 use crate::services::account::AccountTokenSource;
 use crate::services::backup::ManagedBackupManifestService;
@@ -225,37 +226,26 @@ impl SettingsArchive {
         manifest: &dyn BackupManifestService,
         now: TimestampMs,
     ) -> Result<Self> {
-        let locator = CollectionLocator {
-            service_origin: collection.service_origin.clone(),
-            locator: collection.archive_id.to_string(),
-            archive_id: collection.archive_id,
+        let entries = ArchiveEntries {
+            collection: CollectionLocator {
+                service_origin: collection.service_origin.clone(),
+                locator: collection.archive_id.to_string(),
+                archive_id: collection.archive_id,
+            },
+            writer: TrustedWriter {
+                writer_key_id: collection.writer.key_id(),
+                signing_key: *collection.writer.public(),
+                enrolled_at_ms: now,
+            },
+            producer: TrustedProducer {
+                sender_key_id: collection.producer.key_id(),
+                stored_envelope_key: *collection.producer.public(),
+                enrolled_at_ms: now,
+            },
         };
-        if !bundle.collections.contains(&locator) {
-            bundle.collections.push(locator);
-        }
-        let sender_key_id = collection.producer.key_id();
-        let mut producers: Vec<TrustedProducer> = bundle
-            .trusted_producers
-            .iter()
-            .filter(|held| held.sender_key_id != sender_key_id)
-            .cloned()
-            .collect();
-        producers.push(TrustedProducer {
-            sender_key_id,
-            stored_envelope_key: *collection.producer.public(),
-            enrolled_at_ms: now,
-        });
-        bundle.trusted_producers = producers.into_iter().collect();
-        let writer = TrustedWriter {
-            writer_key_id: collection.writer.key_id(),
-            signing_key: *collection.writer.public(),
-            enrolled_at_ms: now,
-        };
-        let enabled = bundles
-            .enable_writer(seed, bundle, writer.clone(), now)
-            .await?;
+        let enabled = entries.commit(bundles, seed, bundle, now).await?;
         manifest
-            .enrol(&enrolment(owner, &collection, writer, now)?)
+            .enrol(&enrolment(owner, &collection, entries.writer, now)?)
             .await?;
         Ok(Self {
             collection,
