@@ -1017,6 +1017,519 @@ async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_o
     }
 }
 
+/// The bundle the service holds for `world`, opened under the kit.
+fn stored_bundle(rig: &Rig, world: &World) -> RecoveryBundle {
+    let bytes = rig
+        .served
+        .web()
+        .bundle(&world.locator)
+        .expect("the service holds the bundle");
+    let key = world
+        .seed
+        .bundle_key_for(&RecoveryContext {
+            service_origin: rig.origin().to_owned(),
+            bundle_locator: world.locator.clone(),
+        })
+        .expect("a bundle key");
+    kr_crypto::archive::decrypt_recovery_bundle(&key, &bytes).expect("the bundle opens")
+}
+
+/// The checkpoint a restore of `sealed` records, as the bundle should hold it.
+fn checkpoint_of(sealed: &Sealed) -> ArchiveCheckpoint {
+    let descriptor = &sealed.publication.payload.descriptor;
+    ArchiveCheckpoint {
+        archive_id: archive(),
+        backup_generation: descriptor.backup_generation,
+        encrypted_manifest_hash: descriptor.encrypted_manifest.encrypted_object_hash,
+        verified_at_ms: TimestampMs::new(4_000),
+    }
+}
+
+/// KR-REQ-24.16, 20.12: the bundle a host's setup makes holds no checkpoint, because no generation
+/// exists then and the host holds no seed. A restore holds the kit and has verified a generation,
+/// so it records that generation in the bundle: a checkpoint for the archive, one revision on, and
+/// every writer, producer and collection the bundle held carried through as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_records_the_generation_it_verified_in_the_bundle() {
+    let world = World::new();
+    let rig = Rig::start(SignIn::Usable).await;
+    let held = members();
+    let sealed = seal(&world, 2, &borrowed(&held));
+    rig.put(&world, &sealed, None).await;
+    let before = stored_bundle(&rig, &world);
+    assert!(
+        before.checkpoints.iter().next().is_none(),
+        "a bundle a host makes carries no checkpoint"
+    );
+    let kit = rig.work.join("kit.txt");
+    std::fs::write(&kit, world.kit_text(&[rig.origin()])).expect("the kit file");
+    let kit_arg = kit.display().to_string();
+    let into = folder(&rig, "restored");
+    let into_arg = into.display().to_string();
+    let line = |more: &[&str]| {
+        let mut line = vec![
+            "backup",
+            "restore",
+            "--into",
+            &into_arg,
+            "--kit-file",
+            &kit_arg,
+        ];
+        line.extend_from_slice(more);
+        line.into_iter().map(str::to_owned).collect::<Vec<_>>()
+    };
+    let run = |line: Vec<String>| {
+        let rig = &rig;
+        async move {
+            let line: Vec<&str> = line.iter().map(String::as_str).collect();
+            rig.run(&line, None).await
+        }
+    };
+
+    let preview = run(line(&["--preview", "--json"])).await;
+    assert!(preview.status.success(), "{}", text(&preview.stderr));
+    let digest = digest_of(&preview);
+    let restored = run(line(&["--confirm-plan", &digest, "--json"])).await;
+    assert!(restored.status.success(), "{}", text(&restored.stderr));
+    let report: Value = serde_json::from_slice(&restored.stdout).expect("a document");
+    assert_eq!(report["checkpoint_recorded"], true, "{report}");
+
+    let after = stored_bundle(&rig, &world);
+    assert_eq!(
+        after.checkpoints.iter().cloned().collect::<Vec<_>>(),
+        [ArchiveCheckpoint {
+            verified_at_ms: after.checkpoints.iter().next().expect("one").verified_at_ms,
+            ..checkpoint_of(&sealed)
+        }],
+        "the bundle records the generation the restore verified, with its manifest"
+    );
+    assert_eq!(after.revision.get(), before.revision.get() + 1);
+    assert_eq!(after.collections, before.collections);
+    assert_eq!(after.trusted_writers, before.trusted_writers);
+    assert_eq!(after.trusted_producers, before.trusted_producers);
+
+    // The same restore again finds its generation recorded and leaves the bundle as it is.
+    let into_again = folder(&rig, "again");
+    let again_arg = into_again.display().to_string();
+    let again = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &again_arg,
+                "--kit-file",
+                &kit_arg,
+                "--preview",
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    assert!(again.status.success(), "{}", text(&again.stderr));
+    let again_digest = digest_of(&again);
+    let again = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &again_arg,
+                "--kit-file",
+                &kit_arg,
+                "--confirm-plan",
+                &again_digest,
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    assert!(again.status.success(), "{}", text(&again.stderr));
+    assert_eq!(
+        stored_bundle(&rig, &world),
+        after,
+        "nothing newer to record"
+    );
+}
+
+/// KR-REQ-24.16: a bundle that records a generation makes a service that offers an older one a
+/// refusal that names both and the way through, and the way through is a person's own word: the
+/// one generation, accepted, restores and leaves the checkpoint where it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_service_that_offers_a_generation_older_than_the_bundles_checkpoint_is_refused_by_name() {
+    let world = World::new();
+    let rig = Rig::start(SignIn::Usable).await;
+    let held = members();
+    let newer = seal(&world, 2, &borrowed(&held));
+    let older = seal(&world, 1, &borrowed(&held));
+    // The service holds generation 1 and the bundle records generation 2.
+    rig.put(&world, &older, Some(checkpoint_of(&newer))).await;
+    let kit = rig.work.join("kit.txt");
+    std::fs::write(&kit, world.kit_text(&[rig.origin()])).expect("the kit file");
+    let kit_arg = kit.display().to_string();
+    let into = folder(&rig, "restored");
+    let into_arg = into.display().to_string();
+    let stored_before = rig.served.web().bundle(&world.locator).expect("a bundle");
+
+    let refused = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--preview",
+            ],
+            None,
+        )
+        .await;
+    assert!(!refused.status.success());
+    let said = text(&refused.stderr);
+    assert!(said.contains("generation 1"), "{said}");
+    assert!(said.contains("older than generation 2"), "{said}");
+    assert!(said.contains("--accept-older 1"), "{said}");
+    assert!(names(&into).is_empty(), "nothing was written");
+
+    // A generation the service does not hold is not accepted, and the refusal says what it holds.
+    let wrong = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--preview",
+                "--accept-older",
+                "5",
+            ],
+            None,
+        )
+        .await;
+    assert!(!wrong.status.success());
+    assert!(
+        text(&wrong.stderr).contains("--accept-older 1"),
+        "{}",
+        text(&wrong.stderr)
+    );
+
+    // The one generation the service holds, named, is shown in the plan and restores.
+    let preview = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--preview",
+                "--accept-older",
+                "1",
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    assert!(preview.status.success(), "{}", text(&preview.stderr));
+    let plan: Value = serde_json::from_slice(&preview.stdout).expect("a document");
+    assert!(
+        plan["standing"]
+            .as_str()
+            .is_some_and(|standing| standing.contains("was named")),
+        "{plan}"
+    );
+    let digest = digest_of(&preview);
+    // The confirmation is for the plan that named the generation: without the flag, the same
+    // digest does not write.
+    let without = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--confirm-plan",
+                &digest,
+            ],
+            None,
+        )
+        .await;
+    assert!(!without.status.success());
+    assert!(names(&into).is_empty());
+    let restored = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--confirm-plan",
+                &digest,
+                "--accept-older",
+                "1",
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    assert!(restored.status.success(), "{}", text(&restored.stderr));
+    assert!(names(&into).contains(&"session-0001.json".to_owned()));
+    assert_eq!(
+        rig.served.web().bundle(&world.locator).expect("a bundle"),
+        stored_before,
+        "the checkpoint is not lowered, and nothing newer is recorded"
+    );
+}
+
+/// A configuration document for a backup to carry: the device's settings an owner chose, and the
+/// things a restore must not take, which this host's own document does not have.
+fn backed_up_configuration() -> Vec<u8> {
+    use kr_protocol::desktop::SleepInhibitionSetting;
+    use kr_protocol::hostinfo::configuration::{
+        ConfigurationDocument, ControllerStartup, contents,
+    };
+
+    let mut document = ConfigurationDocument::empty();
+    document.revision = 9;
+    document.preferences.sleep_inhibition = Nullable::some(SleepInhibitionSetting::BatteryToo);
+    document.descriptions.enabled = Nullable::some(true);
+    // What no restore may move: a restriction, the service this host selects, how its daemon starts.
+    document.ceilings.session_limit = Nullable::some(1);
+    document.storage.origin = Nullable::some("https://elsewhere.example".to_owned());
+    document.startup.controller = Nullable::some(ControllerStartup::Standalone);
+    contents(&document).into_bytes()
+}
+
+/// The host's own document, as the daemon and every command read it.
+fn host_document(rig: &Rig) -> kr_protocol::hostinfo::configuration::ConfigurationDocument {
+    let environment = rig.temp.environment();
+    kr_cli::doctor::configuration::load(&environment)
+        .document
+        .expect("the host's document is usable")
+}
+
+/// KR-REQ-20.17: a restore applies the device's configuration when it is asked to, and only that:
+/// the preferences and the settings of descriptions come back; a ceiling, the service this host
+/// selects and how its daemon starts stay as the host has them, however the backup's document
+/// states them. The plan the person confirms says what changes, and a document that moved since
+/// is not written over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_applies_the_devices_configuration_and_nothing_that_restricts_or_redirects_it() {
+    use kr_protocol::desktop::SleepInhibitionSetting;
+
+    let world = World::new();
+    let rig = Rig::start(SignIn::Usable).await;
+    let held: Vec<(String, Vec<u8>)> = vec![
+        (session_name(0x01), plaintext("session one: ", 300)),
+        (
+            "host/configuration.json".to_owned(),
+            backed_up_configuration(),
+        ),
+    ];
+    let sealed = seal(&world, 1, &borrowed(&held));
+    rig.put(&world, &sealed, None).await;
+    let kit = rig.work.join("kit.txt");
+    std::fs::write(&kit, world.kit_text(&[rig.origin()])).expect("the kit file");
+    let kit_arg = kit.display().to_string();
+    let into = folder(&rig, "restored");
+    let into_arg = into.display().to_string();
+    let before = host_document(&rig);
+    assert_eq!(before.preferences.sleep_inhibition, Nullable::null());
+
+    // Without the option the file is a file to read, and the host's document is as it was.
+    let plain = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--preview",
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    assert!(plain.status.success(), "{}", text(&plain.stderr));
+    let plain_plan: Value = serde_json::from_slice(&plain.stdout).expect("a document");
+    assert_eq!(plain_plan["applies_configuration"], false);
+
+    let preview = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--preview",
+                "--apply-configuration",
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    assert!(preview.status.success(), "{}", text(&preview.stderr));
+    let plan: Value = serde_json::from_slice(&preview.stdout).expect("a document");
+    assert_eq!(plan["applies_configuration"], true);
+    let changes: Vec<&str> = plan["configuration_changes"]
+        .as_array()
+        .expect("the changes")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(changes.contains(&"the sleep setting"), "{changes:?}");
+    assert!(changes.contains(&"the description settings"), "{changes:?}");
+    assert_ne!(
+        digest_of(&preview),
+        digest_of(&plain),
+        "the confirmation covers what is applied"
+    );
+    let digest = digest_of(&preview);
+    assert_eq!(host_document(&rig), before, "a preview changes nothing");
+
+    // The host's document moves after the plan was shown: the confirmation is for another document.
+    let moved = rig.run(&["host", "power", "--set", "off"], None).await;
+    assert!(moved.status.success(), "{}", text(&moved.stderr));
+    let refused = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--confirm-plan",
+                &digest,
+                "--apply-configuration",
+            ],
+            None,
+        )
+        .await;
+    assert!(!refused.status.success());
+    assert!(names(&into).is_empty(), "nothing was written");
+    assert_eq!(
+        host_document(&rig).preferences.sleep_inhibition,
+        Nullable::some(SleepInhibitionSetting::Off),
+        "the document stands as the person left it"
+    );
+
+    // The plan shown for the document as it now stands is the one that writes.
+    let again = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--preview",
+                "--apply-configuration",
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    assert!(again.status.success(), "{}", text(&again.stderr));
+    let again_digest = digest_of(&again);
+    let applied = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--confirm-plan",
+                &again_digest,
+                "--apply-configuration",
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    assert!(applied.status.success(), "{}", text(&applied.stderr));
+    let after = host_document(&rig);
+    assert_eq!(
+        after.preferences.sleep_inhibition,
+        Nullable::some(SleepInhibitionSetting::BatteryToo),
+        "the preference came back"
+    );
+    assert_eq!(after.descriptions.enabled, Nullable::some(true));
+    assert_eq!(
+        after.ceilings, before.ceilings,
+        "a restriction is not restored"
+    );
+    assert_eq!(
+        after.storage, before.storage,
+        "the service this host selects is its own"
+    );
+    assert_eq!(
+        after.startup, before.startup,
+        "how its daemon starts is its own"
+    );
+    assert_eq!(after.network, before.network);
+    assert!(after.revision > before.revision, "one validated edit");
+}
+
+/// KR-REQ-20.17: a configuration from a release newer than this one reads is not applied, by
+/// whatever the loader would have left out of it, and the restore stops before it writes anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_configuration_from_a_newer_release_is_not_applied_and_nothing_is_written() {
+    let world = World::new();
+    let rig = Rig::start(SignIn::Usable).await;
+    let held: Vec<(String, Vec<u8>)> = vec![
+        (session_name(0x01), plaintext("session one: ", 300)),
+        (
+            "host/configuration.json".to_owned(),
+            br#"{"version":1,"level":99,"revision":9,"a_section_of_a_newer_release":{}}"#.to_vec(),
+        ),
+    ];
+    let sealed = seal(&world, 1, &borrowed(&held));
+    rig.put(&world, &sealed, None).await;
+    let kit = rig.work.join("kit.txt");
+    std::fs::write(&kit, world.kit_text(&[rig.origin()])).expect("the kit file");
+    let into = folder(&rig, "restored");
+    let before = host_document(&rig);
+    let refused = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into.display().to_string(),
+                "--kit-file",
+                &kit.display().to_string(),
+                "--preview",
+                "--apply-configuration",
+            ],
+            None,
+        )
+        .await;
+    assert!(!refused.status.success());
+    assert!(
+        text(&refused.stderr).contains("newer release"),
+        "{}",
+        text(&refused.stderr)
+    );
+    assert!(names(&into).is_empty());
+    assert_eq!(host_document(&rig), before);
+}
+
 /// What this host keeps of itself, read through its own interfaces: its stored secrets, its
 /// configuration document and its paired devices.
 async fn host_state(rig: &Rig) -> String {
@@ -1693,11 +2206,12 @@ async fn restore_through_the_library_pausing(
 ) {
     use kr_cli::backup::directory::Destination;
     use kr_cli::backup::restore::{Decision, Privacy as _, Run, restore_with};
-    use kr_cli::backup::source::DaemonSource;
+    use kr_cli::backup::source::{DaemonBundleWriter, DaemonSource};
     use kr_cli::cli::EnvironmentSelector;
     use kr_cli::daemon::Daemon;
 
     let paths = fixture.rig.temp.paths();
+    let bundles = DaemonBundleWriter::new(paths.clone(), None);
     let selector = EnvironmentSelector { environment: None };
     let mut privacy = TurnsPrivacyOnAfterTheLastMember {
         asking: Daemon::open(paths, &selector).await.expect("a connection"),
@@ -1720,6 +2234,9 @@ async fn restore_through_the_library_pausing(
     let environment = fixture.rig.temp.environment_id().to_string();
     let run = |decision| Run {
         source: Arc::clone(&source) as _,
+        bundles: &bundles,
+        accept_older: None,
+        configuration: None,
         began: &began,
         destination: &destination,
         environment: environment.clone(),
