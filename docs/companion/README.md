@@ -822,7 +822,7 @@ answer never came back.
   were when the list cannot be removed. On Windows a new file has the permissions of the folder the
   person chose, and a file that already existed keeps its own. The page is sent none of its
   contents.
-- Saving the kit as a QR code draws the kit's own text, the document a person could have typed, at error correction level Q as an SVG with a four-module quiet zone, and writes it where the save dialog put it with the same owner-only rules as the text kit. The code holds the whole kit, the seed included, and the card says so.
+- Saving the kit as a QR code draws the kit's own text, the document a person could have typed, at error correction level Q as an SVG with a four-module quiet zone, and writes it where the save dialog put it with the same owner-only rules as the text kit. The file has a print size, about six centimetres across for a typical kit. The code holds the whole kit, the seed included, and the card says so. The SVG text that holds it is built in one buffer, sized beforehand and cleared when it is dropped; the encoder's own copy of the code (`qrcodegen::QrCode`) is one this program cannot clear, so it stays in memory until it is dropped.
 - An offline copy is a file of ciphertext. The card lists the archives the recovery bundle names, each with the newest generation the service holds of it, and writes the bundle alone or the bundle with one archive's newest generation to the file the save dialog returned. This computer reads the service with the account to make it, authenticates the bundle with the kit and opens the archive's manifest in memory to find the objects it names; nothing decrypted is written or sent, and the file holds no kit text. Reading the service is not a host's privacy-mode matter, so privacy mode does not stop it. The file opens with the kit alone, with `kr backup restore --from-export`. An archive of more than 256 MiB of ciphertext is refused by name and restored from the service instead.
 - Covering the host on this computer (`recovery_cover_host`, `Recovery::cover_host`) is how the
   host's backup writer is made recovery-enabled. A kit opens the archives a host makes only if the
@@ -838,9 +838,14 @@ answer never came back.
   the only way to put it under this recovery is a replacement: the card offers it as a second,
   confirmed choice, and the host then starts a new archive under this recovery. What it backed up
   before stays at the service and opens only with the earlier kit; the host stops adding to it and
-  does not remove its old backups. A refusal after the bundle was written leaves a bundle that names
-  an archive the host never made, which a restore lists as holding nothing. The card covers the
-  host on this computer only: a paired host cannot be asked for its status.
+  does not remove its old backups. A host that declines, or refuses the call, has recorded nothing,
+  so the bundle is written again without the archive it was made to name, and the card says why the
+  host declined and that its backups were not changed. A setup whose answer was lost keeps its
+  entry in the bundle until the next try finds the setup if it landed; if it did not land, the
+  entry names an archive the host never made, which a restore lists as holding nothing. A setup is
+  told from another by the recipient's public key that the host's status carries, and not by the
+  fingerprint, which is 40 bits of it: the fingerprint is for people. The card covers the host on
+  this computer only: a paired host cannot be asked for its status.
 
 The bundle is reached with this device's signature and the account's token, and the token goes only
 to the service the account is signed in to. When the sync service setting names another service,
