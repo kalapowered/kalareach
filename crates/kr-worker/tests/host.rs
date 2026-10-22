@@ -1900,6 +1900,9 @@ async fn a_create_retried_after_its_worker_crashed_starts_no_worker() {
 }
 
 /// KR-ACC-029: a create retried to a daemon that started after its worker crashed starts no worker.
+///
+/// The daemon that answers is not the one that took the first create: it holds only what that one
+/// left on disk, and what it found of the session when it started.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_create_retried_to_a_daemon_that_found_its_worker_crashed_starts_no_worker() {
     a_create_retried_after_its_session_ended_starts_no_worker(Ending::CrashedWhileTheDaemonWasDown)
