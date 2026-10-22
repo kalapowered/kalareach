@@ -156,6 +156,11 @@ retained="$("$sdk/cmdline-tools/latest/bin/apkanalyzer" dex packages --defined-o
     | grep -c 'org.rustls.platformverifier' || true)"
 say "the package defines $retained entries of the platform verifier"
 
+# What the package carries for the verifier's revocation check (a release build allows no cleartext
+# traffic): its network security configuration.
+package_status=0
+"$here/scripts/check-android-release-package.sh" "$apk" | tee -a "$log" || package_status=$?
+
 # ---- The host --------------------------------------------------------------------------------
 
 say "building the server the phone is pointed at"
@@ -293,5 +298,11 @@ if [ -n "${KR_RELEASE_PUBLIC_ORIGIN:-}" ]; then
         say "check=the verifier accepted the certificate of ${KR_RELEASE_PUBLIC_ORIGIN} ok=0 detail=$(grep 'public control' "$out" | head -1)"
         status=2
     fi
+fi
+if [ "$package_status" = 0 ]; then
+    say "check=the package carries the network security configuration the verifier's revocation check needs ok=1"
+else
+    say "check=the package carries the network security configuration the verifier's revocation check needs ok=0"
+    status=2
 fi
 [ "$status" = 0 ] || exit 2
