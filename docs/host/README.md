@@ -1905,9 +1905,12 @@ An environment's work stays in one login session, because signing out of a sessi
 session's processes. A daemon that starts in a session other than the one an earlier daemon's
 workers, or its launches that were handed over, claimed or fenced, are still running in refuses to
 start. It reads each such process from the kernel before it adopts, recovers or accepts anything,
-and the refusal names the session and the processes. A process that has ended is not work, so a
-sign-out followed by a daemon in the next session is not refused, and neither is a restart of the
-machine. A plugin runtime that a daemon in another session left running is not session work: the
+and the refusal names the session and the processes, and says to sign in to that session and end
+the work there, to end those processes, or to restart the machine. A process that has ended is not
+work, so a sign-out followed by a daemon in the next session is not refused, and neither is a
+restart of the machine. Nor is a number that now belongs to a process of another account, which
+the account that runs the daemon cannot open: its own processes are created by its own task. A
+plugin runtime that a daemon in another session left running is not session work: the
 next daemon adopts it at its next request, it ends with its own session's sign-out, and the daemon
 replaces it under the same bound as any other host that ends.
 

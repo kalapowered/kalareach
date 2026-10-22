@@ -407,10 +407,24 @@ async fn a_daemon_does_not_take_over_work_that_runs_in_another_login_session() {
             "a daemon took over {left:?} work in another session"
         ));
         assert!(
-            refused.contains("login session") && refused.contains(&elsewhere.session.to_string()),
+            refused.contains(&format!("in session {}", elsewhere.session)),
             "the refusal names the session the work is in: {refused}"
         );
     }
+
+    // An earlier record may name the number the process now has, with the start of one that has
+    // ended: it is the later record that is work, and the earlier one does not hide it.
+    let stale = kr_protocol::identity::ProcessStartIdentity::new(
+        elsewhere.identity.pid.get(),
+        elsewhere.identity.source,
+        elsewhere.identity.start_value.get() - 1,
+    );
+    let host = TempHost::create();
+    leave(&host, Left::Worker, &stale);
+    leave(&host, Left::Claimed, &elsewhere.identity);
+    start_daemon(&host)
+        .await
+        .expect_err("a record of an ended process does not hide a record of a live one");
 
     // What runs in this daemon's own session is its to take over.
     let here = std::process::Command::new(system("PING.EXE"))
@@ -442,6 +456,43 @@ async fn a_daemon_does_not_take_over_work_that_runs_in_another_login_session() {
         .await
         .expect("a worker that has ended in another session is not work");
     let _ = here.0.kill();
+}
+
+/// KR-REQ-07.58: a recorded number that now belongs to a process this account cannot open is not
+/// work in another session. The processes of an environment are created by a task of the account
+/// that runs its daemon, which can open them, so a number it cannot open is another account's
+/// process, and a daemon that refused to start for it could not be cleared by anything but a
+/// restart of the machine. The account that runs this finds such a number among the processes of
+/// the machine when it has one; a run that is to have one, as the standard account of the sign-out
+/// leg does, says so in `KR_EXPECT_UNOPENABLE_PROCESS`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recorded_process_this_account_cannot_open_is_not_work_in_another_session() {
+    use kr_ipc::identity::{ProcessState, process_state};
+    use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
+
+    let unopenable = (4..100_000_u64).step_by(4).find_map(|pid| {
+        let recorded =
+            ProcessStartIdentity::new(pid, ProcessStartSource::WindowsProcessCreationTime, 1);
+        matches!(process_state(&recorded), ProcessState::Unknown { .. }).then_some(recorded)
+    });
+    let Some(recorded) = unopenable else {
+        assert!(
+            std::env::var_os("KR_EXPECT_UNOPENABLE_PROCESS").is_none(),
+            "this account was to find a process it cannot open and found none"
+        );
+        return;
+    };
+    println!(
+        "the process this account cannot open: {}",
+        recorded.pid.get()
+    );
+    for left in [Left::Worker, Left::Claimed] {
+        let host = TempHost::create();
+        leave(&host, left, &recorded);
+        start_daemon(&host).await.unwrap_or_else(|refused| {
+            panic!("{left:?} work on a number it cannot open: {refused}")
+        });
+    }
 }
 
 /// Ends the process it holds when it is dropped.
