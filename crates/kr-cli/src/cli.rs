@@ -170,6 +170,18 @@ pub struct BackupRestoreArguments {
     /// `--preview` or this, the command asks at a terminal.
     #[arg(long, value_name = "DIGEST")]
     pub confirm_plan: Option<String>,
+    /// Restore a generation older than the one the recovery bundle last verified, for a service
+    /// that was put back to an earlier state on purpose. It names that one generation: the service
+    /// has to hold exactly it and nothing newer. Without it, a service that holds an older
+    /// generation than the bundle verified is refused as one that replays an old backup.
+    #[arg(long, value_name = "GENERATION")]
+    pub accept_older: Option<u64>,
+    /// Apply the device configuration in the backup to this host: its preferences, profiles, default
+    /// profile, description settings and agent choices. The plan shows what changes. Ceilings, the
+    /// services this host selects, secret references, workflow commands and how its control daemon
+    /// is started stay as they are.
+    #[arg(long)]
+    pub apply_configuration: bool,
 }
 
 /// The environment one command acts in.

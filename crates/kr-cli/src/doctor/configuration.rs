@@ -74,6 +74,25 @@ pub fn validate(paths: &EnvironmentPaths, change: &Change) -> Result<()> {
 /// another record, and [`CliError::Ipc`] when the environment's directories cannot be made or
 /// checked, or the document cannot be written.
 pub fn apply(paths: &EnvironmentPaths, change: &Change, permit: &Permit<'_>) -> Result<u64> {
+    apply_over(paths, change, permit, None)
+}
+
+/// [`apply`] for a change that was shown to the person against a document, and may be written only
+/// over that document.
+///
+/// `baseline` is the document the change was prepared against and shown for. If the document on
+/// disk is not that one when the writers' lock is held, nothing is written: the person confirmed a
+/// change to one document, and a document that moved since is another.
+///
+/// # Errors
+///
+/// As [`apply`], and [`CliError::Usage`] when the document is not the baseline.
+pub fn apply_over(
+    paths: &EnvironmentPaths,
+    change: &Change,
+    permit: &Permit<'_>,
+    baseline: Option<&configuration::Loaded>,
+) -> Result<u64> {
     permit.require(&WRITTEN)?;
     // An edit is a first use of the environment as much as a daemon's start is: on a host where no
     // daemon has run yet, the state directory the lock lives in does not exist. It is made here,
@@ -89,7 +108,18 @@ pub fn apply(paths: &EnvironmentPaths, change: &Change, permit: &Permit<'_>) -> 
             Shown::root(paths.state_dir())
         ))
     })?;
-    let edited = configuration::edit(&load(paths), change).map_err(|refused| refusal(&refused))?;
+    let current = load(paths);
+    if let Some(baseline) = baseline
+        && (current.status.state != baseline.status.state
+            || current.revision() != baseline.revision()
+            || current.document != baseline.document)
+    {
+        return Err(CliError::Usage(Shown::said(
+            "this host's configuration changed after it was shown for confirmation, so nothing \
+             was written; run the command again",
+        )));
+    }
+    let edited = configuration::edit(&current, change).map_err(|refused| refusal(&refused))?;
     configuration::still_current(&edited, &load(paths)).map_err(|refused| refusal(&refused))?;
     let path = document_path(paths);
     if let Some(parent) = path.parent() {
