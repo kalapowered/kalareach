@@ -9,13 +9,17 @@ use std::collections::VecDeque;
 
 use kr_client::session_export::FORMAT;
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::error::ProtocolError;
 use kr_protocol::ids::{ActionId, ActionWindowId, EnvironmentId, SessionEpoch, SessionId};
 use kr_protocol::local::LocalBuild;
 use kr_protocol::privacy::{
     PrivacyCompletion, PrivacyReport, PrivacySession, PrivacySessionStanding,
 };
-use kr_protocol::recovery::{HistoryGap, HistoryGapCause, HistoryPageParams};
+use kr_protocol::recovery::{
+    HistoryGap, HistoryGapCause, HistoryPageParams, HistoryTimesParams, HistoryTimesResult,
+    OutputTime,
+};
 use kr_protocol::scalars::{Bytes, TimestampMs, Uuid};
 use kr_protocol::session::{
     ClosureReason, ClosureRecord, Dimensions, DisplayNumber, Durability, OwnershipCoverage,
@@ -33,10 +37,26 @@ enum Step {
     Refuses(Method, ProtocolError),
 }
 
+/// What the scripted daemon says when it is asked when output was written, which an export asks
+/// after every page that holds output and which no case scripts step by step.
+enum Times {
+    /// A daemon of a release that does not list the method: it refuses as it refuses any method it
+    /// does not list.
+    Unlisted,
+    /// A daemon that records times: the intervals, as first cursor, cursor after the last byte and
+    /// wall-clock reading.
+    Recorded(Vec<(u64, u64, u64)>),
+    /// A daemon that has no record of this session's times, and says why.
+    NoneKept(&'static str),
+    /// A daemon that refuses for a reason of its own.
+    Refuses(ProtocolError),
+}
+
 /// A daemon that answers the questions an export asks, in order, and records each one.
 struct Scripted {
     steps: VecDeque<Step>,
     asked: Vec<(Method, ParamsValue)>,
+    times: Times,
 }
 
 impl Scripted {
@@ -44,12 +64,31 @@ impl Scripted {
         Self {
             steps: steps.into(),
             asked: Vec::new(),
+            times: Times::Unlisted,
         }
     }
 
-    /// The methods the export asked, in order.
+    /// The same daemon, answering when output was written as `times` says.
+    fn with_times(mut self, times: Times) -> Self {
+        self.times = times;
+        self
+    }
+
+    /// The methods the export asked, in order, leaving out the questions about when output was
+    /// written, which follow every page of output.
     fn methods(&self) -> Vec<Method> {
-        self.asked.iter().map(|(method, _)| *method).collect()
+        self.asked
+            .iter()
+            .map(|(method, _)| *method)
+            .filter(|method| *method != Method::HistoryTimes)
+            .collect()
+    }
+
+    /// Whether the export asked when output was written.
+    fn asked_for_times(&self) -> bool {
+        self.asked
+            .iter()
+            .any(|(method, _)| *method == Method::HistoryTimes)
     }
 
     /// The cursors the export asked history pages from, in order.
@@ -82,10 +121,43 @@ impl Link for Scripted {
         method: Method,
         params: &T,
     ) -> Result<Answer> {
-        self.asked.push((
-            method,
-            ParamsValue::from_typed(params).expect("parameters encode"),
-        ));
+        let encoded = ParamsValue::from_typed(params).expect("parameters encode");
+        self.asked.push((method, encoded.clone()));
+        if method == Method::HistoryTimes {
+            let asked: HistoryTimesParams = encoded.to_typed().expect("times parameters");
+            return Ok(match &self.times {
+                Times::Unlisted => Err(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "the method is not in the registry",
+                )),
+                Times::Refuses(refusal) => Err(refusal.clone()),
+                Times::NoneKept(reason) => Ok(ParamsValue::from_typed(&HistoryTimesResult {
+                    intervals: Vec::new(),
+                    next_cursor: asked.to_cursor,
+                    complete: true,
+                    unavailable: Nullable::some((*reason).to_owned()),
+                })
+                .expect("an answer")),
+                Times::Recorded(recorded) => Ok(ParamsValue::from_typed(&HistoryTimesResult {
+                    intervals: recorded
+                        .iter()
+                        .filter(|(from, to, _)| {
+                            *to > asked.from_cursor.get() && *from < asked.to_cursor.get()
+                        })
+                        .map(|&(from, to, at_ms)| OutputTime {
+                            from_cursor: U64::new(from.max(asked.from_cursor.get())),
+                            to_cursor: U64::new(to.min(asked.to_cursor.get())),
+                            at_ms: TimestampMs::new(at_ms),
+                            proven: true,
+                        })
+                        .collect(),
+                    next_cursor: asked.to_cursor,
+                    complete: true,
+                    unavailable: Nullable::null(),
+                })
+                .expect("an answer")),
+            });
+        }
         match self.steps.pop_front() {
             Some(Step::Ok(expected, answer)) => {
                 assert_eq!(method, expected, "the export asked for something else");
@@ -288,7 +360,25 @@ impl Read {
 }
 
 async fn export(link: &mut Scripted, max_bytes: u64) -> Result<Exported> {
-    read(link, &SessionSelector::Display(1), max_bytes, 42).await
+    read(
+        link,
+        &SessionSelector::Display(1),
+        max_bytes,
+        42,
+        Form::Json,
+    )
+    .await
+}
+
+async fn record(link: &mut Scripted) -> Result<Exported> {
+    read(
+        link,
+        &SessionSelector::Display(1),
+        DEFAULT_MAX_BYTES,
+        42,
+        Form::Asciicast,
+    )
+    .await
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -1175,7 +1265,11 @@ async fn the_document_is_the_same_bytes_for_the_same_session() {
         page_with(1_000, after, Some(WITH_SIDE_EFFECTS.len() as u64)),
         end(1_000 + after.len() as u64),
         privacy(false, 4, &[]),
-    ]);
+    ])
+    .with_times(Times::Recorded(vec![
+        (0, WITH_SIDE_EFFECTS.len() as u64, 1_700_000_000_000),
+        (1_000, 1_000 + after.len() as u64, 1_700_000_004_250),
+    ]));
     let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
         .await
         .expect("exports");
@@ -1183,5 +1277,122 @@ async fn the_document_is_the_same_bytes_for_the_same_session() {
         exported.document,
         include_bytes!("golden/session-export.json"),
         "the document differs from the one a reader has"
+    );
+}
+
+/// KR-REQ-25.25: a daemon that records when output was written has it in the file, a piece at a
+/// time, and a recording made from the same read plays at those times. The first asks nothing the
+/// second does not.
+#[tokio::test]
+async fn a_daemon_that_records_times_gives_the_file_and_the_recording_the_times() {
+    let steps = || {
+        vec![
+            listing(vec![closed(1)]),
+            privacy(false, 4, &[]),
+            page(0, b"first\r\n"),
+            page(7, b"second\r\n"),
+            end(15),
+            privacy(false, 4, &[]),
+        ]
+    };
+    let times = || Times::Recorded(vec![(0, 7, 5_000), (7, 15, 6_500)]);
+
+    let mut daemon = Scripted::new(steps()).with_times(times());
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    let file = Read::of(&exported);
+    let stamped: Vec<_> = file.0["output"]["chunks"]
+        .as_array()
+        .expect("chunks")
+        .iter()
+        .map(|chunk| chunk["at_ms"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(stamped, [Some("5000".to_owned()), Some("6500".to_owned())]);
+    assert!(file.omission("output_timestamps").is_none(), "{}", file.0);
+    assert_eq!(exported.summary.bytes_untimed, 0);
+
+    let mut daemon = Scripted::new(steps()).with_times(times());
+    let recorded = record(&mut daemon).await.expect("records");
+    let text = std::str::from_utf8(&recorded.document).expect("text");
+    let mut lines = text.lines();
+    let header: Value = serde_json::from_str(lines.next().expect("a header")).expect("JSON");
+    assert_eq!(header["version"], 2);
+    assert_eq!(header["timestamp"], 5);
+    let events: Vec<Value> = lines
+        .map(|line| serde_json::from_str(line).expect("an event"))
+        .collect();
+    assert_eq!(events.len(), 2, "{text}");
+    assert_eq!(events[0][0].as_f64(), Some(0.0));
+    assert_eq!(events[1][0].as_f64(), Some(1.5));
+    assert_eq!(events[1][2], "second\r\n");
+    assert!(daemon.asked_for_times());
+}
+
+/// KR-REQ-25.25: a daemon of a release that does not list the method refuses it as it refuses any
+/// method it does not list. After it has paged the session, that refusal means the output has no
+/// time: the file is made and declares the bytes, and a recording is refused with the reason and
+/// writes nothing. Another refusal is not that, and is the daemon's answer.
+#[tokio::test]
+async fn a_daemon_that_does_not_record_times_gives_a_file_without_them_and_no_recording() {
+    let steps = || {
+        vec![
+            listing(vec![closed(1)]),
+            privacy(false, 4, &[]),
+            page(0, b"abc"),
+            end(3),
+            privacy(false, 4, &[]),
+        ]
+    };
+
+    let mut daemon = Scripted::new(steps());
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    let file = Read::of(&exported);
+    assert_eq!(file.count("output_timestamps"), Some(3), "{}", file.0);
+    assert!(file.0["output"]["chunks"][0]["at_ms"].is_null());
+    assert_eq!(exported.summary.bytes_untimed, 3);
+
+    let mut daemon = Scripted::new(steps());
+    let refused = record(&mut daemon).await.expect_err("nothing to play");
+    assert!(matches!(refused, CliError::Unfinished { .. }), "{refused}");
+    assert!(
+        refused.to_string().contains("no record of when"),
+        "{refused}"
+    );
+
+    let mut daemon = Scripted::new(steps()).with_times(Times::Refuses(ProtocolError::new(
+        ErrorCode::StorageUnavailable,
+        "the index is on a disk that is gone",
+    )));
+    let failed = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect_err("a refusal of its own is the answer");
+    assert!(matches!(failed, CliError::Refused(_)), "{failed}");
+}
+
+/// A daemon that has the session and no record of its times says so, and the file names the host's
+/// reason beside the bytes it counts.
+#[tokio::test]
+async fn a_daemon_with_no_record_of_a_sessions_times_gives_its_reason() {
+    let mut daemon = Scripted::new(vec![
+        listing(vec![closed(1)]),
+        privacy(false, 4, &[]),
+        page(0, b"abc"),
+        end(3),
+        privacy(false, 4, &[]),
+    ])
+    .with_times(Times::NoneKept("no record was kept"));
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    let file = Read::of(&exported);
+    let declared = file.omission("output_timestamps").expect("declared");
+    assert!(
+        declared["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("no record was kept")),
+        "{declared}"
     );
 }
