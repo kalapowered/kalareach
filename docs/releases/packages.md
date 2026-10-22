@@ -140,7 +140,7 @@ The surface is these four things:
   sends, and the frames of `kr bridge`. `crates/kr-protocol/src/worker_surface.rs` holds the first
   two as tables: the worker refuses a method that has no row, and `kr-protocol-gen` writes the
   tables to `crates/kr-protocol/worker-surface.json`;
-- the protocol the plugin host speaks, `PLUGIN_HOST_PROTOCOL`;
+- the protocol the plugin host speaks, `PLUGIN_HOST_PROTOCOL`, and, for each retained level, the protocol that level recorded, which the control daemon has a route for (`RETAINED_PLUGIN_HOST_PROTOCOLS`);
 - the table of public majors.
 
 The shell bridge's `root.*` methods are not in it, and neither are the hook's registration, its
