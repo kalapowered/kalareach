@@ -1321,7 +1321,36 @@ async fn a_diagnostics_answer_is_written_with_the_metrics_only_under_a_decision_
         Some(0),
         "written under one that does not, it counts nothing"
     );
+    assert!(
+        matches!(
+            state_of(&kept_by_the_manager.frames()[0]),
+            Some(kr_cbor::CanonicalValue::Map(map)) if map.get("counted").is_some()
+        ),
+        "the manager is given the report as the host's counted state"
+    );
+    assert!(
+        matches!(
+            state_of(&kept_by_the_viewer.frames()[0]),
+            Some(kr_cbor::CanonicalValue::Text(word)) if word == "withheld"
+        ),
+        "and the viewer is told the host withholds it, which is not a report of nothing"
+    );
     drop(controller);
+}
+
+/// The `metrics` member of a diagnostics answer as the wire carries it.
+fn state_of(frame: &ControlFrame) -> Option<kr_cbor::CanonicalValue> {
+    let ControlFrame::Response(kr_protocol::envelope::Response {
+        outcome: kr_protocol::envelope::Outcome::Ok(value),
+        ..
+    }) = frame
+    else {
+        panic!("not the diagnostics' answer: {frame:?}");
+    };
+    let kr_cbor::CanonicalValue::Map(map) = value.as_value() else {
+        panic!("not a map: {value:?}");
+    };
+    map.get("metrics").cloned()
 }
 
 /// A diagnostics request of a paired device.
