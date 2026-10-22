@@ -27,6 +27,10 @@ use super::{Controller, encode, parse};
 /// How long a closing worker is watched before the controller stops waiting for it to end.
 pub const CLOSURE_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// All the time a daemon that starts gives the directories its live sessions started in to open,
+/// together. It bounds that one pass, not the whole start.
+const SESSION_PLACE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How soon the end of a worker whose connection is gone is looked for again.
 const WORKER_ENDING_LOOK: std::time::Duration = std::time::Duration::from_millis(25);
 
@@ -901,85 +905,89 @@ impl Controller {
     /// ended while that worker still runs. This runs before anything is served, so nothing can
     /// hold a repository yet.
     ///
+    /// Every session is registered at once, unplaced, under the registry's lock, which is held
+    /// from the reading of the reservations to the last registration and no longer: a closure
+    /// written meanwhile waits for it and ends the session this has registered, instead of
+    /// ending nothing and leaving the registration behind. The directories the sessions started
+    /// in are opened after the lock is let go, since a directory on a network mount that does not
+    /// answer holds whatever waits for it. They are opened together, each on a thread of its own,
+    /// and [`SESSION_PLACE_BUDGET`] is all the time this gives them. A session is placed where its
+    /// directory answered, and only if it is still registered; one whose directory did not answer
+    /// stays unplaced, which every hold waits for, until it ends.
+    ///
     /// # Errors
     ///
     /// Returns an error when the registry cannot be read.
     pub(super) async fn register_the_sessions_found_alive(&self) -> Result<()> {
         use crate::registry::LaunchPhase;
-        let mut open = Vec::new();
-        let mut unaccounted = Vec::new();
-        // The registry is held from the reading of the reservations to the last registration, so a
-        // closure written meanwhile waits for it and ends the session this has registered, instead
-        // of ending nothing and leaving the registration behind.
-        let registry = self.registry.lock().await;
-        for phase in [
-            LaunchPhase::Spawned,
-            LaunchPhase::Claimed,
-            LaunchPhase::Live,
-            LaunchPhase::Fenced,
-        ] {
-            open.extend(registry.reservations_in(phase)?);
-        }
-        for (session_id, closure) in registry.closures()? {
-            if !closure
-                .surviving
-                .iter()
-                .any(|resource| resource.kind == UNACCOUNTED_WORKER)
-            {
-                continue;
-            }
-            if let Some(reservation) = registry.reservation_for_session(session_id)?
-                && let Some(identity) = reservation.launcher_identity.clone()
-                && !matches!(
-                    kr_ipc::identity::process_state(&identity),
-                    kr_ipc::identity::ProcessState::Ended
-                )
-            {
-                unaccounted.push((reservation, identity));
-            }
-        }
         let project = Arc::clone(self.project().service());
-        let places = |reservations: Vec<crate::registry::Reservation>| {
-            let project = Arc::clone(&project);
-            move || {
-                reservations
-                    .into_iter()
-                    .map(|reservation| {
-                        let place = reservation
-                            .create_intent
-                            .as_deref()
-                            .and_then(|recorded| super::create::recorded_create(recorded).ok())
-                            .map_or(kr_project::holds::SessionPlace::Unknown, |create| {
-                                project.session_place(create.cwd.as_ref().map(String::as_str))
-                            });
-                        (reservation.session_id, place)
-                    })
-                    .collect::<Vec<_>>()
-            }
-        };
-        let (open_places, unaccounted_places) = tokio::task::spawn_blocking({
-            let open = places(open);
-            let unaccounted_reservations = unaccounted
-                .iter()
-                .map(|(reservation, _)| reservation.clone())
-                .collect::<Vec<_>>();
-            let unaccounted = places(unaccounted_reservations);
-            move || (open(), unaccounted())
-        })
-        .await
-        .map_err(|_| ControllerError::RegistryUnavailable {
-            detail: "this daemon stopped before it registered the sessions it found alive"
-                .to_owned(),
-        })?;
-        for (session_id, place) in open_places {
-            project.holds().adopt_session(session_id, place);
-        }
-        for ((session_id, place), (_, identity)) in unaccounted_places.into_iter().zip(unaccounted)
+        let mut to_place: Vec<(SessionId, Option<String>)> = Vec::new();
         {
-            project.holds().adopt_session(session_id, place);
-            self.end_session_when_ended(session_id, identity, false);
+            let registry = self.registry.lock().await;
+            let mut open = Vec::new();
+            let mut unaccounted = Vec::new();
+            for phase in [
+                LaunchPhase::Spawned,
+                LaunchPhase::Claimed,
+                LaunchPhase::Live,
+                LaunchPhase::Fenced,
+            ] {
+                open.extend(registry.reservations_in(phase)?);
+            }
+            for (session_id, closure) in registry.closures()? {
+                if !closure
+                    .surviving
+                    .iter()
+                    .any(|resource| resource.kind == UNACCOUNTED_WORKER)
+                {
+                    continue;
+                }
+                if let Some(reservation) = registry.reservation_for_session(session_id)?
+                    && let Some(identity) = reservation.launcher_identity.clone()
+                    && !matches!(
+                        kr_ipc::identity::process_state(&identity),
+                        kr_ipc::identity::ProcessState::Ended
+                    )
+                {
+                    unaccounted.push((reservation, identity));
+                }
+            }
+            for reservation in &open {
+                project.holds().adopt_session(
+                    reservation.session_id,
+                    kr_project::holds::SessionPlace::Unknown,
+                );
+                to_place.extend(directory_of(reservation));
+            }
+            for (reservation, identity) in unaccounted {
+                project.holds().adopt_session(
+                    reservation.session_id,
+                    kr_project::holds::SessionPlace::Unknown,
+                );
+                to_place.extend(directory_of(&reservation));
+                self.end_session_when_ended(reservation.session_id, identity, false);
+            }
         }
-        drop(registry);
+        let directories: BTreeSet<Option<String>> = to_place
+            .iter()
+            .map(|(_, directory)| directory.clone())
+            .collect();
+        let places =
+            places_within(project.environment_id(), &directories, SESSION_PLACE_BUDGET).await;
+        for (session_id, directory) in to_place {
+            if let Some(place) = places.get(&directory) {
+                project.holds().place_session(session_id, place.clone());
+            }
+        }
+        let unanswered = directories.len() - places.len();
+        if unanswered > 0 {
+            eprintln!(
+                "kr-controller: {unanswered} directories that live sessions started in did not \
+                 answer within {} seconds, so those sessions count against every capture until \
+                 they end",
+                SESSION_PLACE_BUDGET.as_secs()
+            );
+        }
         Ok(())
     }
 
@@ -1269,6 +1277,55 @@ impl Controller {
             }
         })
     }
+}
+
+/// The session of a reservation with the directory its recorded request asks it to start in, where
+/// the request can be read: no directory is the worker's own default, the root. `None` where the
+/// request cannot be read, so the session cannot be placed.
+fn directory_of(reservation: &crate::registry::Reservation) -> Option<(SessionId, Option<String>)> {
+    let create = super::create::recorded_create(reservation.create_intent.as_deref()?).ok()?;
+    Some((reservation.session_id, create.cwd.as_ref().cloned()))
+}
+
+/// Opens each of `directories` as a session's start directory and returns the place of every one
+/// that answered within `budget`, which is all the time the whole set is given.
+///
+/// Each directory is opened on a thread of its own that nothing waits for: a thread stuck on a
+/// mount that never answers is left there, so it holds neither the other directories nor the end
+/// of this daemon's runtime or process. It holds the environment's identity and nothing else. A
+/// thread that cannot be started leaves its directory without an answer.
+async fn places_within(
+    environment_id: kr_protocol::ids::EnvironmentId,
+    directories: &BTreeSet<Option<String>>,
+    budget: std::time::Duration,
+) -> std::collections::BTreeMap<Option<String>, kr_project::holds::SessionPlace> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let (answers, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+    let mut asked = 0_usize;
+    for directory in directories {
+        let (directory, answers) = (directory.clone(), answers.clone());
+        let started = std::thread::Builder::new()
+            .name("kr-session-place".to_owned())
+            .spawn(move || {
+                let place =
+                    kr_project::holds::session_place_in(environment_id, directory.as_deref());
+                let _ = answers.send((directory, place));
+            });
+        if started.is_ok() {
+            asked += 1;
+        }
+    }
+    drop(answers);
+    let mut places = std::collections::BTreeMap::new();
+    while places.len() < asked {
+        match tokio::time::timeout_at(deadline, arrivals.recv()).await {
+            Ok(Some((directory, place))) => {
+                places.insert(directory, place);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    places
 }
 
 /// Whether a worker that has ended shows that its session left nothing running: no claim took its

@@ -363,6 +363,20 @@ impl WorkspaceHolds {
         self.state().sessions.insert(session, place);
     }
 
+    /// Says where a session started that was registered as [`SessionPlace::Unknown`] because the
+    /// directory it started in had not been opened yet.
+    ///
+    /// Only a session that is still registered and still unplaced changes. One that has ended
+    /// since stays ended, so a late answer never registers a writer, and a place that is known is
+    /// never replaced.
+    pub fn place_session(&self, session: SessionId, place: SessionPlace) {
+        if let Some(registered) = self.state().sessions.get_mut(&session)
+            && *registered == SessionPlace::Unknown
+        {
+            *registered = place;
+        }
+    }
+
     /// Records that a session has ended and can no longer write.
     pub fn end_session(&self, session: SessionId) {
         self.state().sessions.remove(&session);
@@ -568,6 +582,25 @@ fn identity_chain(
     Some(chain)
 }
 
+/// Where a session that is asked to start in `directory` starts, as [`ProjectService::session_place`]
+/// answers it, for a caller that has no service to ask: one that gives the work to a thread it
+/// may leave behind when the directory is on a mount that does not answer, which then holds only
+/// the environment's identity.
+#[must_use]
+pub fn session_place_in(
+    environment_id: kr_protocol::ids::EnvironmentId,
+    directory: Option<&str>,
+) -> SessionPlace {
+    let path = match directory {
+        None => Path::new("/"),
+        Some(named) if Path::new(named).is_absolute() => Path::new(named),
+        Some(_) => return SessionPlace::Unknown,
+    };
+    identity_chain(environment_id, path).map_or(SessionPlace::Unknown, |chain| {
+        SessionPlace::Chain(chain.into_iter().collect())
+    })
+}
+
 /// What a writer of a directory writes, given the chain of identities the directory opened to: the
 /// directory and everything above it, or anywhere when it could not be opened.
 fn footprint_of_chain(chain: Option<Vec<ObjectIdentity>>) -> Footprint {
@@ -605,16 +638,12 @@ impl ProjectService {
 
     /// Where a session that is asked to start in `directory` starts. No directory is the
     /// worker's own default, the root; one that is not absolute, or cannot be opened, is unknown.
+    ///
+    /// This opens the directory and every directory above it, so it waits for as long as a
+    /// mount on the way takes to answer.
     #[must_use]
     pub fn session_place(&self, directory: Option<&str>) -> SessionPlace {
-        let path = match directory {
-            None => Path::new("/"),
-            Some(named) if Path::new(named).is_absolute() => Path::new(named),
-            Some(_) => return SessionPlace::Unknown,
-        };
-        identity_chain(self.environment_id, path).map_or(SessionPlace::Unknown, |chain| {
-            SessionPlace::Chain(chain.into_iter().collect())
-        })
+        session_place_in(self.environment_id, directory)
     }
 
     /// Registers a writer of the directory a path names, or of the one it would be in.
@@ -974,6 +1003,39 @@ mod tests {
             .try_hold(reach())
             .expect("a hold keeps writers off and excludes no other hold");
         drop((first, second, elsewhere, unknown));
+    }
+
+    /// KR-REQ-14.32: a session registered with no known place counts against every hold until it
+    /// is placed, once; a late placing never registers a session that has ended, and never moves
+    /// a place that is known.
+    #[test]
+    fn a_session_is_placed_once_and_only_while_it_is_alive() {
+        let holds = registry();
+        holds.adopt_session(session(1), SessionPlace::Unknown);
+        assert_eq!(
+            holds.try_hold(reach()).expect_err("an unplaced session"),
+            Refusal::SessionsBound(1)
+        );
+        holds.place_session(session(1), SessionPlace::Chain(identities(&[30, 31])));
+        drop(
+            holds
+                .try_hold(reach())
+                .expect("the session started elsewhere"),
+        );
+        holds.place_session(session(1), SessionPlace::Chain(identities(&[3])));
+        drop(
+            holds
+                .try_hold(reach())
+                .expect("a place that is known is not replaced"),
+        );
+
+        holds.adopt_session(session(2), SessionPlace::Unknown);
+        holds.end_session(session(2));
+        holds.place_session(session(2), SessionPlace::Chain(identities(&[3])));
+        assert!(
+            !holds.has_session(session(2)),
+            "a session that ended before it was placed stays ended"
+        );
     }
 
     /// KR-REQ-14.32: a session is refused where a hold stands, and registers nowhere; one that

@@ -7026,6 +7026,111 @@ async fn a_restarted_daemon_counts_a_session_with_no_readable_request_against_ev
     host.clients.abort();
 }
 
+/// How long [`a_restarted_daemon_serves_though_a_live_sessions_directory_never_answers`] waits for
+/// the restarted daemon before it calls the start blocked. It only ends a start that is stuck: a
+/// start that is not stuck returns once the daemon has waited out what it allows a directory, and
+/// the case does not wait for this.
+#[cfg(target_os = "linux")]
+const HUNG_START_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// KR-REQ-14.32: a daemon that starts does not wait without limit on the directory a live session
+/// started in. The directory of one session is now under a mount that never answers, as a network
+/// mount does whose server has gone: the daemon serves, that session counts against every hold
+/// from then on, and a session whose directory answers is placed where it started, not counted
+/// against the repository it is outside of.
+///
+/// The mount is a user-space filesystem that is attached and never served, which this account can
+/// place with the helper its distribution installs; a host without it leaves the case out and
+/// says why, unless `KR_REQUIRE_FUSE` is set. The mount is placed while no daemon runs, over the
+/// directory the first session started in, whose shell stays in the directory the mount hides. It
+/// and the second session's directory are below a directory of their own, away from the
+/// repository and from everything the host removes when it is torn down, so that letting go of a
+/// stuck start never removes anything through the mount. The first session is created first and
+/// its directory sorts first, so that a daemon which opened the directories one after another
+/// would wait on the mount before it reached the second. The second session is placed within the
+/// time the daemon allows the whole pass, which is long beside what a local directory takes.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_daemon_serves_though_a_live_sessions_directory_never_answers() {
+    use kr_ipc::testing::hung_mount::HungMount;
+
+    let outer = tempfile::TempDir::new().expect("a directory of its own on the internal disk");
+    let probe = outer.path().join("probe");
+    std::fs::create_dir(&probe).expect("a place to try a mount");
+    if HungMount::attach_where_possible(&probe).is_none() {
+        return;
+    }
+    let mounted = outer.path().join("a-mounted");
+    let elsewhere = outer.path().join("b-elsewhere");
+    std::fs::create_dir(&mounted).expect("the directory the mount will be put on");
+    std::fs::create_dir(&elsewhere).expect("a directory outside every tree");
+    assert!(
+        mounted < elsewhere,
+        "the first session's directory sorts first"
+    );
+
+    let (host, apart) = working_host_apart().await;
+    let mut control = client(&host).await;
+    let (project, _checkout) =
+        adopted_project(&mut control, host.environment_id, host.work()).await;
+    let tree = worktree_of(
+        &mut control,
+        host.environment_id,
+        project,
+        host.work(),
+        "tree",
+    )
+    .await;
+    let hung = session_in(&mut control, &host, &mounted).await;
+    let other = session_in(&mut control, &host, &elsewhere).await;
+    drop(control);
+    host.clients.abort();
+
+    let mount = Arc::new(std::sync::Mutex::new(None));
+    let restart = restarted_after(host, apart, {
+        let (mount, mounted) = (Arc::clone(&mount), mounted.clone());
+        move |_| {
+            *mount.lock().expect("the mount's holder") =
+                Some(HungMount::attach(&mounted).expect("the mount is placed"));
+        }
+    });
+    let host = match tokio::time::timeout(HUNG_START_GUARD, restart).await {
+        Ok(host) => host,
+        Err(_) => {
+            // Letting the mount go ends a call still waiting on it, so the daemon's stuck thread
+            // ends and the runtime can be dropped.
+            drop(mount.lock().expect("the mount's holder").take());
+            panic!("a restarted daemon waits on a live session's directory that never answers");
+        }
+    };
+
+    let service = Arc::clone(host.controller.project().service());
+    let opened = service
+        .open_workspace_repository(tree)
+        .expect("the worktree opens")
+        .identity();
+    assert_eq!(
+        service
+            .hold_workspace(tree, opened.work_tree, opened.git_dir)
+            .expect("the records read")
+            .expect_err("the session that could not be placed is in the way of every hold"),
+        kr_project::holds::Refusal::SessionsBound(1),
+        "and the one that could be placed is not"
+    );
+    drop(mount.lock().expect("the mount's holder").take());
+    let mut control = client(&host).await;
+    close_session(&mut control, &host, &hung).await;
+    assert!(
+        service
+            .hold_workspace(tree, opened.work_tree, opened.git_dir)
+            .expect("the records read")
+            .is_ok(),
+        "the session started outside every tree never counted against this one"
+    );
+    close_session(&mut control, &host, &other).await;
+    host.clients.abort();
+}
+
 /// KR-REQ-14.32: a session whose worker ended while no daemon ran is closed by the daemon that
 /// starts and is not counted as a writer, so a hold on a tree of its repository is granted at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
