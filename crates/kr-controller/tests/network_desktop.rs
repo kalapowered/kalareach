@@ -453,8 +453,22 @@ async fn demand_reaches(session: &kr_client::session::Session, pending: u64) -> 
     }
 }
 
-/// The process the platform's own listing is asked about, from the sentence the host gives for the
-/// assertion it holds.
+/// What the host's owner reads of it at the host, which is what the host says of itself unabridged:
+/// a device is told the same in the export form, where the process an assertion is held for is
+/// withheld as a name.
+async fn owner_reads(host: &Host) -> HostInfoResult {
+    let mut local = host.client().await;
+    typed(
+        &local
+            .request(Method::HostInfo, &())
+            .await
+            .expect("the call reaches the daemon")
+            .expect("host.info is served on the local socket"),
+    )
+}
+
+/// The process the platform's own listing is asked about, from the sentence the host gives its owner
+/// for the assertion it holds.
 fn holder_process(holder: &str) -> &str {
     holder
         .split("process ")
@@ -466,21 +480,15 @@ fn holder_process(holder: &str) -> &str {
         .expect("the holder names the process the assertion is held for")
 }
 
-/// Whether the operating system's own listing of sleep assertions names `process`, where the
-/// platform has one this suite can ask.
+/// Whether the operating system's own listing of sleep assertions names `process` as the one an
+/// assertion is held for, where the platform has a listing this suite can ask.
+///
+/// The number is matched whole: a process number is a prefix of other numbers.
 fn the_platform_lists(process: &str) -> Option<bool> {
-    let (program, arguments, wanted) = if cfg!(target_os = "macos") {
-        (
-            "/usr/bin/pmset",
-            vec!["-g", "assertions"],
-            format!("(pid {process})"),
-        )
+    let (program, arguments) = if cfg!(target_os = "macos") {
+        ("/usr/bin/pmset", vec!["-g", "assertions"])
     } else if cfg!(target_os = "linux") {
-        (
-            "systemd-inhibit",
-            vec!["--list", "--no-legend"],
-            process.to_owned(),
-        )
+        ("systemd-inhibit", vec!["--list", "--no-legend"])
     } else {
         return None;
     };
@@ -488,7 +496,18 @@ fn the_platform_lists(process: &str) -> Option<bool> {
         .args(arguments)
         .output()
         .ok()?;
-    Some(String::from_utf8_lossy(&output.stdout).contains(&wanted))
+    let printed = String::from_utf8_lossy(&output.stdout);
+    Some(printed.lines().any(|line| {
+        if cfg!(target_os = "macos") {
+            // `Details: caffeinate asserting on behalf of 'cat' (pid 4242)`: the closing
+            // parenthesis ends the number, so another process whose number begins with this one is
+            // not named.
+            line.contains(&format!("(pid {process})"))
+        } else {
+            // `WHO UID USER PID COMM WHAT WHY MODE`: the fourth column is the process.
+            line.split_whitespace().nth(3) == Some(process)
+        }
+    }))
 }
 
 /// KR-REQ-03.27: what the agent in a session waits for is the host's own sleep demand, read by a
@@ -527,16 +546,21 @@ async fn kr_req_03_27_what_an_agent_waits_for_is_a_pending_request_a_device_read
         power.holder.is_present(),
         "an assertion is held exactly when the host names its holder"
     );
-    if power.active {
+    let held_for = if power.active {
         assert_eq!(
             power.reason.as_ref().copied(),
             Some(kr_protocol::desktop::InhibitionReason::PendingRequests),
             "the reason is the request that is waiting"
         );
-        let process = holder_process(power.holder.0.as_deref().expect("a holder"));
-        if let Some(listed) = the_platform_lists(process) {
+        // The process the assertion is held for is the owner's to read: a device is told it was
+        // withheld, as a name.
+        let owner = owner_reads(&adopted.host).await;
+        let holder = owner.power.holder.0.expect("the owner reads the holder");
+        let process = holder_process(&holder).to_owned();
+        if let Some(listed) = the_platform_lists(&process) {
             assert!(listed, "the platform's own listing names process {process}");
         }
+        Some(process)
     } else {
         // What the platform said about its facility leaves this host as its class and length, so
         // a device is told that the host says why and not the words.
@@ -544,7 +568,8 @@ async fn kr_req_03_27_what_an_agent_waits_for_is_a_pending_request_a_device_read
             power.withheld_reason.is_present(),
             "a host that cannot hold the assertion says why it does not: {power:?}"
         );
-    }
+        None
+    };
 
     worker
         .service
@@ -561,17 +586,21 @@ async fn kr_req_03_27_what_an_agent_waits_for_is_a_pending_request_a_device_read
             },
         )
         .expect("the person withdraws the question");
-    let released = demand_reaches(&session, 0).await;
-    assert!(!released.power.active, "the assertion ends with the demand");
-    if let Some(holder) = power.holder.0.as_deref() {
-        let process = holder_process(holder);
-        if let Some(listed) = the_platform_lists(process) {
+    // Where the platform confirmed the assertion, the host lets it go by its own review of its
+    // demand: nothing here asks the host anything while this waits, so a read does not do the
+    // releasing.
+    if let Some(process) = held_for.as_deref() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while the_platform_lists(process) == Some(true) {
             assert!(
-                !listed,
-                "and the platform's listing stops naming process {process}"
+                tokio::time::Instant::now() < deadline,
+                "the platform's listing still names process {process} after the demand ended"
             );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
+    let released = demand_reaches(&session, 0).await;
+    assert!(!released.power.active, "the assertion ends with the demand");
 
     // An approval the connector's table answers.
     let upstream = std::sync::Arc::new(Upstream::default());
