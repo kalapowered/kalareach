@@ -41,7 +41,8 @@ pub const fn fault_of(kind: DiagnosticKind) -> Option<Fault> {
         | DiagnosticKind::ResponseLaneDegraded
         // A well-formed effect with nowhere to go, kept as a host event.
         | DiagnosticKind::SideEffectWithoutDestination
-        // A well-formed clipboard write the host refused.
+        // A clipboard write the host refused: its size, its policy or a payload that is not
+        // base64, which the diagnostic does not tell apart, so none is counted as a fault.
         | DiagnosticKind::ClipboardWriteRejected
         // A well-formed pop of a stack that was already empty.
         | DiagnosticKind::TitleStackUnderflow
