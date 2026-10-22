@@ -45,6 +45,7 @@
 //! | [`rendezvous`] | The rendezvous room's frames, and the codec of the pairing messages it relays |
 //! | [`confirmation`] | Requesting, listing and answering an owner confirmation |
 //! | [`mailbox`] | Stored mailbox envelopes and their size buckets |
+//! | [`metrics`] | The metrics a host reports about itself, their closed labels, the vector both repositories hold their declaration to and the recorder that counts them |
 //! | [`service`] | The credential every managed-service method authenticates with |
 //! | [`push`] | Push registration, sender authorisation and delivery |
 //! | [`delivery`] | The credential an external notification destination sends with |
@@ -153,6 +154,7 @@ pub mod local;
 pub mod machine;
 pub mod mailbox;
 pub mod method;
+pub mod metrics;
 pub mod ordering;
 pub mod organisation;
 pub mod pairing;
