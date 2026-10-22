@@ -1,23 +1,28 @@
 /**
- * Change sets, and the retained artefacts a privacy generation left behind.
+ * Change sets, and what privacy mode shows has already left the host.
  *
- * Both are lists of things the person may act on, and both have the same rule underneath: nothing
- * is removed because it looked stale. A change set is an immutable captured version: this shows
- * exactly what it holds and what it left out, every version of it beside the one read, and marking
- * one reviewed records that this version was reviewed and changes nothing else. A retained artefact
- * is deleted only by an action that is about that artefact.
+ * Both are lists the person reads, and both have the same rule underneath: nothing is removed
+ * because it looked stale. A change set is an immutable captured version: this shows exactly what it
+ * holds and what it left out, every version of it beside the one read, and marking one reviewed
+ * records that this version was reviewed and changes nothing else. What has left the host is shown
+ * as the host reports it, with whether the host has any way to ask for its removal, and nothing
+ * here offers an action the host cannot perform.
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 
-import type { ChangesetReadResult, ReviewReadResult, ReviewState } from '@kalareach/protocol'
+import type {
+  ChangesetReadResult,
+  PrivacyReport,
+  ReviewReadResult,
+  ReviewState
+} from '@kalareach/protocol'
 
 import { Badge, Banner, Button, Card, CommitButton } from '../components/ui'
 import { useApp } from '../app/state'
 import { failureCode, failureMessage, watch, type HostPort, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
 import { outcomeMessage, outcomeTone } from '../model/receipts'
-import type { RetainedArtefacts } from '../model/pending'
 
 /** The largest page of review state one read asks for. */
 const PAGE_REVIEWS = '200'
@@ -109,7 +114,7 @@ export function ChangeSets(): ReactNode {
   const [reviews, setReviews] = useState<ReviewReadResult | null>(null)
   // Each listed change set's newest version, by its identifier.
   const [versions, setVersions] = useState<ReadonlyMap<string, ChangesetReadResult>>(new Map())
-  const [retained, setRetained] = useState<RetainedArtefacts | null>(null)
+  const [privacy, setPrivacy] = useState<PrivacyReport | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
   // Every read, on opening, after an action and on a retry, is made under one watch with no
@@ -148,16 +153,16 @@ export function ChangeSets(): ReactNode {
         if (!current()) return
         setFailure(failureMessage(error))
       })
-    // What a privacy generation left behind is its own read, and one this host may not answer:
-    // the change sets are shown whether or not it does.
-    ask(() => port.storageStatus({}))
-      .then((storage) => {
+    // What has left the host is its own read, and one this host may not answer: the change sets
+    // are shown whether or not it does.
+    ask(() => port.privacyStatus())
+      .then((report) => {
         if (!current()) return
-        setRetained(storage as RetainedArtefacts)
+        setPrivacy(report)
       })
       .catch(() => {
         if (!current()) return
-        setRetained(null)
+        setPrivacy(null)
       })
   }, [port])
 
@@ -324,66 +329,48 @@ export function ChangeSets(): ReactNode {
         </div>
       )}
 
-      {retained ? (
+      {privacy ? (
         <section className="stack" data-testid="retained-artefacts">
           <header className="page-heading">
             <div>
               <p className="eyebrow">Privacy</p>
-              <h2>What is still held</h2>
+              <h2>What has left this host</h2>
               <p>
-                {retained.privacy_mode
-                  ? `Privacy mode has been on since generation ${retained.privacy_generation}. Nothing new is retained. These were uploaded or delivered before that, and they are still there.`
+                {privacy.enabled
+                  ? `Privacy mode is on, at generation ${privacy.generation}. Nothing new is retained. These were sent or shown before then, and they are still out there.`
                   : 'Privacy mode is off. New sessions retain their history.'}
               </p>
             </div>
           </header>
           <Card>
             <div className="card-body">
-              {retained.artefacts.length === 0 ? (
-                <p className="muted small">Nothing is held from before that point.</p>
+              {privacy.exported.length === 0 ? (
+                <p className="muted small">Nothing this host knows of has left it.</p>
               ) : null}
-              {retained.artefacts.map((artefact) => (
-                <div className="divided-row" key={artefact.object_id}>
+              {privacy.exported.map((copy) => (
+                <div className="divided-row" key={`${copy.kind}\n${copy.reference}`}>
                   <div className="spacer">
-                    <strong>{artefact.description}</strong>
+                    <strong>{copy.kind}</strong>
                     <p className="muted small">
-                      {artefact.location} · {Math.round(artefact.byte_len / 1024)} KB
+                      {copy.reference} · left {new Date(Number(copy.left_at_ms)).toLocaleString()}
                     </p>
-                    {artefact.held_by_other_party ? (
-                      <p className="small warning-text" data-testid="held-elsewhere">
-                        This copy is on someone else&apos;s device. Deleting here cannot reach it.
-                      </p>
-                    ) : null}
+                    <p className="small" data-testid="removal">
+                      {copy.deletable
+                        ? 'This host can ask for its removal. This page does not offer it.'
+                        : 'This host has no way to ask for its removal. Whoever holds the copy can remove it.'}
+                    </p>
                   </div>
-                  <CommitButton
-                    tone="danger"
-                    disabled={artefact.held_by_other_party}
-                    data-testid={`delete-${artefact.object_id}`}
-                    onCommit={() => {
-                      port
-                        .storageObjectDelete({ object_id: artefact.object_id }, {})
-                        .then((result) => {
-                          say(
-                            outcomeMessage(
-                              'Deleted, which removes the record rather than the physical bytes',
-                              result
-                            ),
-                            outcomeTone(result)
-                          )
-                          load()
-                        })
-                        .catch((error: unknown) => {
-                          say(failureMessage(error), 'danger')
-                        })
-                    }}
-                  >
-                    Delete this one
-                  </CommitButton>
                 </div>
               ))}
+              {privacy.unlisted.map((missing) => (
+                <p className="small warning-text" data-testid="unlisted" key={missing.subsystem}>
+                  Not everything could be listed. {missing.subsystem}: {missing.reason}.
+                </p>
+              ))}
               <p className="small faint">
-                Each of these is deleted on its own. Nothing here removes a backup collection you
-                did not name, and local deletion is a logical cleanup rather than a secure erase.
+                A copy somebody else holds cannot be recalled from here, and a device that was let
+                see a session may keep what it was shown after it is revoked. Local deletion is a
+                logical cleanup rather than a secure erase.
               </p>
             </div>
           </Card>

@@ -1256,6 +1256,10 @@ mod a_voice_receipt_from_an_earlier_build;
 #[cfg(test)]
 mod a_collection_started_with_the_daemon;
 
+/// The copies that authorised viewers may hold, listed among what has left the host.
+#[cfg(test)]
+mod a_copy_a_viewer_may_hold;
+
 /// The sessions a daemon finds recorded in an earlier boot, when another recovery holds one.
 #[cfg(test)]
 mod a_previous_boot_left_to_a_held_recovery;
