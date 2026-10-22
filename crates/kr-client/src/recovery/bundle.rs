@@ -262,6 +262,35 @@ impl BundleStore {
         }
     }
 
+    /// Returns the sealed bundle as the service holds it now, provided it is the bundle this
+    /// store last read or wrote, and refuses it otherwise.
+    ///
+    /// For a caller that has to hand the very bytes at the locator to a party that will compare
+    /// them: another device's write between the commit and this read is a conflict, and the bytes
+    /// of the other write are not returned as if they were this store's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryError::BundleConflict`] when the bundle at the locator is not the one this
+    /// store holds, and a service error when the fetch fails or the locator holds no bundle.
+    pub async fn sealed_as_committed(&self) -> Result<Vec<u8>> {
+        let held = self
+            .service
+            .fetch(&bundle_collection(&self.context))
+            .await
+            .map_err(RecoveryError::Service)?;
+        let SyncFetched::Held { ciphertext, .. } = held else {
+            return Err(RecoveryError::Service(nothing_held("recovery bundle")));
+        };
+        match &self.baseline {
+            Some(baseline) if baseline.sealed == sealed_digest(&ciphertext) => Ok(ciphertext),
+            other => Err(RecoveryError::BundleConflict {
+                expected: other.as_ref().map(|baseline| baseline.position),
+                retained: None,
+            }),
+        }
+    }
+
     /// Returns what became of the last write whose answer never arrived.
     ///
     /// [`None`] until one is lost. It stays until the next answered commit, because what was
