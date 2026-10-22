@@ -1599,6 +1599,11 @@
   margin-bottom: var(--gap-5);
 }
 
+/* At the largest text size on a narrow screen the heading's longest word is wider than the row. */
+.confirmations h2 {
+  overflow-wrap: anywhere;
+}
+
 .confirmation-list {
   display: flex;
   flex-direction: column;
@@ -1644,6 +1649,21 @@
   align-items: center;
   gap: var(--gap-2);
   margin-left: auto;
+  max-inline-size: 100%;
+}
+
+/* On a phone the words keep the whole width of the row and the actions go under them: beside them
+   the buttons would take most of the row, and the title would run a word to a line. The width is
+   the screen's, since a media query does not follow the text size the person chose. */
+@media (max-width: 30rem) {
+  .confirmation-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .confirmation-actions {
+    margin-left: 0;
+  }
 }
 
 .confirmations .warning-text {

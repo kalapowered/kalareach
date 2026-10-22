@@ -123,3 +123,71 @@ for (const surface of ['ios', 'android'] as const) {
     })
   }
 }
+
+// KR-REQ-10.52: a request the host asks a phone to confirm keeps the words the whole width of the
+// row at the default text size on a phone 390 points wide, and the buttons go under them: beside
+// the words they took most of the row, and the title ran a word to a line.
+for (const surface of ['ios', 'android'] as const) {
+  for (const [ceremony, buttons] of [
+    ['face_id', ['Confirm with Face ID', 'Not now']],
+    ['none', ['Not now']]
+  ] as const) {
+    test(`gives the words of a request to confirm the row, with the buttons under them, on ${surface} with ${ceremony === 'none' ? 'no ceremony' : 'a ceremony'}`, async ({
+      page
+    }) => {
+      await page.setViewportSize({ width: 390, height: 844 })
+      await page.goto(`/harness.html?surface=${surface}&tab=attention`)
+      await expect(page.locator('.m-shell')).toBeVisible()
+      await page.evaluate((kind) => {
+        window.krTestHost?.setConfirmations({
+          ceremony: kind,
+          requests: [
+            {
+              reference: 'request-1',
+              host_name: 'studio',
+              title: 'Add a device',
+              detail: 'Confirm adding Pixel 8 (Android) to studio, which may view sessions for 60 minutes.',
+              value: 'f3c1 46fd',
+              facts: [],
+              notice: null,
+              statement: null,
+              reading: null,
+              expires_at_ms: Date.now() + 600_000,
+              checkable: true
+            }
+          ]
+        })
+      }, ceremony)
+      const row = page.getByTestId('confirmation-row')
+      await expect(row).toBeVisible()
+      for (const name of buttons) {
+        await expect(row.getByRole('button', { name, exact: true })).toBeVisible()
+      }
+      const where = await row.evaluate((element) => {
+        const words = element.querySelector('.spacer')?.getBoundingClientRect()
+        const actions = element.querySelector('.confirmation-actions')?.getBoundingClientRect()
+        const whole = element.getBoundingClientRect()
+        if (words === undefined || actions === undefined) throw new Error('the row has no words or no buttons')
+        return { row: whole.width, words: words.width, wordsBottom: words.bottom, actionsTop: actions.top }
+      })
+      expect(where.words, 'the words take most of the row').toBeGreaterThan(where.row * 0.8)
+      expect(where.actionsTop, 'the buttons are under the words').toBeGreaterThanOrEqual(where.wordsBottom - 1)
+      await page.screenshot({ path: shot(`confirmation-${surface}-${ceremony}`) })
+      expect(await overrunning(page, '[data-testid="confirmations"]')).toEqual([])
+    })
+  }
+}
+
+// The words about the camera arrive in a region a screen reader watches. With nothing to say, the
+// region takes no room and stays in the accessibility tree, so the first words that arrive are heard.
+for (const surface of ['ios', 'android'] as const) {
+  test(`keeps the camera's status region in the accessibility tree while it is empty, on ${surface}`, async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.goto(`/harness.html?surface=${surface}&session=8a7b6c50-22bb-4c3d-8e4f-000000000101`)
+    const region = page.getByTestId('camera-notice')
+    await expect(region).toBeEmpty()
+    await expect(page.getByRole('status').and(region), 'the empty region is one a screen reader finds').toHaveCount(1)
+    const box = await region.boundingBox()
+    expect(box?.height ?? 0, 'the empty region takes no room').toBeLessThanOrEqual(2)
+  })
+}
