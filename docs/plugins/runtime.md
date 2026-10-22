@@ -169,6 +169,10 @@ admitted even after every ordinary observation has gone, the admission is refuse
 broker still holds the request and its proven native path, and what is unavailable is the rich
 interpretation of it rather than the request. A dropped request would be a decision nobody made.
 
+The worker has a lane of its own in front of this queue, with the same bound and the same rules, so
+that the terminal's read loop and the gateway's reader never wait for the connection to the host
+either. `What a worker observes`, below, describes it.
+
 ## What happens to a document nobody is reading
 
 Three bounded queues stand between a component and a worker that has stopped reading, and none of
@@ -445,6 +449,69 @@ A component's bytes travel as a location rather than as a payload: a control fra
 it verified against the catalogue, and the host checks the file against that digest before compiling
 anything. The path has to be inside the packages directory the host was started with; one outside it
 is refused by name.
+
+### What a worker observes
+
+A worker offers a component the part of its session that the installation lets it see. Three things
+have to hold: the binding's package ships a component, the binding holds the observation grant, and
+the installation granted the stream. `broker.semantic_events` grants the connector's own upstream
+frames and `terminal.stream` grants the terminal's output. The worker reads the grants for each
+entry, so a stream the owner withdraws stops with the next entry. A component is offered nothing
+before the worker has registered it and made it ready, and nothing once its rich capabilities are
+disabled.
+
+| Stream | Provenance | What the component is offered |
+| --- | --- | --- |
+| the connector's upstream frames | `native_protocol` | the bytes of a frame whose method the connector's table lists and does not class as credential or configuration access, to the bindings of the package whose table read the connection; a request the upstream is waiting on carries the identifier the upstream gave it |
+| the terminal's output | `terminal_scrape` | each span as the owner's terminal receives it, in pieces of at most 256 KiB |
+
+A frame whose method the table does not list is not offered, because nothing says it carries no
+credential. The frames and replies of the native client, the broker's own record of what it read,
+and process observation are not offered either.
+
+The producers never call the runtime. The terminal's read loop and the gateway's reader push what
+they have onto the worker's observation lane and carry on. The lane holds at most 4 MiB, counting the
+entry being sent. An entry that does not fit pushes out the oldest ordinary entries until it does,
+and the lane counts what it lost. A request the upstream is waiting on is never pushed out. If only
+such requests remain, the new entry is refused and counted, and the broker still holds the request
+in its ledger with its source frame.
+
+One task of the link, the pump, takes entries in the order they were pushed. An upstream frame goes
+as an `event` the pump waits to have answered, so the answer says whether the binding's queue took
+it, and the wait is bounded by the client's five seconds. Terminal output goes as an `event` the pump
+does not wait for: the client holds at most 256 of them and 4 MiB, a task of the client writes them,
+and a full hand-off refuses the span at once. A runtime that does not answer is passed over for ten
+seconds, then for twice as long after each failure up to two minutes, and each entry passed over is
+counted. The two sources have no order between them, and each keeps the order it was pushed in.
+
+Whatever a component does not get is a numbered loss: an entry the lane pushed out or refused, one
+the pump passed over, one the host's queue refused. Before the component is offered anything later,
+the worker asks it for a fresh snapshot, once the client has written what it already held. A loss
+that arrives while a snapshot runs has a number of its own and asks for another. A snapshot the
+component answers or declines discharges its number. One that does not reach the component is asked
+for again after a wait that doubles from one second to thirty.
+
+The link keeps three more things. When a component has been offered something since its state was
+last asked for and has then been left alone for two seconds, or its last request is a minute old or
+there has been none, the link asks it for a checkpoint. The worker keeps checkpoints in memory only, at most 8 MiB in all, under
+the package's digest and the instance's source generation, so a new execution never restores an
+earlier one's state. When a binding is registered again, after the runtime was replaced for example,
+the link restores the checkpoint it holds, takes a snapshot, and only then makes the binding ready.
+The observations between the checkpoint and the new registration are not replayed, and the
+component's report says so.
+
+Every thirty seconds the link asks the runtime what it is doing. Two answers in a row that do not
+come count as losing the runtime: the bindings are reported unavailable with the reason, and the link
+asks the daemon for the runtime again. A runtime that has taken no event for ten seconds has stopped
+reading, and the client's writer ends the connection, which the link treats the same way.
+
+A component's report carries how it was registered (compiled, with the time it took, or loaded from
+the compiled-code cache), what it last missed, and its last fault, in the words the runtime gave.
+
+Privacy mode does not stop observation for live use. While it is on, the worker takes and holds no
+component state. Turning it on drops the state held, and a component that was offered something
+while it was on is not asked for its state again until it starts again, since what it holds may be
+what it was offered.
 
 ## Where the broker fits
 
