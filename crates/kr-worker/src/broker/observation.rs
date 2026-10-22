@@ -195,6 +195,16 @@ impl LaneLoss {
     }
 }
 
+/// What the pump took off the lane in one step.
+#[derive(Debug)]
+pub struct Taken {
+    /// What the lane lost since the pump last took anything, to be applied before the entry is
+    /// offered.
+    pub loss: Option<LaneLoss>,
+    /// The oldest entry, where the lane held one.
+    pub entry: Option<Entry>,
+}
+
 /// What a push became.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pushed {
@@ -218,8 +228,9 @@ pub struct Account {
 /// What one binding's component has missed, and where the worker stands with it.
 #[derive(Clone, Debug, Default)]
 pub struct View {
-    /// Whether the binding may be offered anything: registered, its checkpoint restored where there
-    /// was one, and the snapshot after the restore answered.
+    /// Whether the binding may be offered anything: registered, and its checkpoint restored where
+    /// there was one. A restore is a loss, so the binding may be ready while it owes a snapshot, and
+    /// is offered nothing until the snapshot has been taken.
     pub ready: bool,
     /// The number of the latest loss.
     pub lost_seq: u64,
@@ -270,8 +281,8 @@ impl View {
 pub struct Held {
     /// The package digest it was taken under.
     pub package_digest: kr_protocol::scalars::Digest256,
-    /// The instance's source generation it was taken under: a new execution never restores an
-    /// earlier one's state.
+    /// The source generation of the instance the component was registered in when the state was
+    /// taken: state is never restored into another generation.
     pub generation: u64,
     /// The state, as the component returned it.
     pub state: Vec<u8>,
@@ -498,17 +509,23 @@ impl ObservationLane {
 
     // -- the pump -----------------------------------------------------------------------------
 
-    /// Takes the oldest entry, in the order it was pushed. The lane goes on counting it against its
-    /// bound until [`Self::finish`].
-    pub fn take(&self) -> Option<Entry> {
+    /// Takes the oldest entry, in the order it was pushed, together with everything the lane has
+    /// lost until now. The lane goes on counting the entry against its bound until
+    /// [`Self::finish`].
+    ///
+    /// The loss and the entry are taken under one lock, so the loss is the pump's to apply before it
+    /// offers the entry, and every entry the lane lost is older than the one it hands over: the lane
+    /// loses its oldest entries first. What is lost after this call is newer than the entry, and the
+    /// next call brings it.
+    pub fn take(&self) -> Taken {
         let mut inner = self.inner();
-        // What the lane has lost is owed to the components before anything later is handed to them,
-        // and it is the pump's to apply: while a loss waits, no entry is taken.
-        if !inner.pending_loss.is_empty() {
-            return None;
-        }
+        let loss = if inner.pending_loss.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut inner.pending_loss))
+        };
         let from_authoritative = match (inner.ordinary.front(), inner.authoritative.front()) {
-            (None, None) => return None,
+            (None, None) => return Taken { loss, entry: None },
             (Some(_), None) => false,
             (None, Some(_)) => true,
             (Some(ordinary), Some(authoritative)) => authoritative.seq < ordinary.seq,
@@ -517,9 +534,11 @@ impl ObservationLane {
             inner.authoritative.pop_front()
         } else {
             inner.ordinary.pop_front()
-        }?;
-        inner.in_flight_entries = inner.in_flight_entries.saturating_add(1);
-        Some(entry)
+        };
+        if entry.is_some() {
+            inner.in_flight_entries = inner.in_flight_entries.saturating_add(1);
+        }
+        Taken { loss, entry }
     }
 
     /// Says the pump has finished with the entry it took.
@@ -527,12 +546,6 @@ impl ObservationLane {
         let mut inner = self.inner();
         inner.held = inner.held.saturating_sub(entry.cost);
         inner.in_flight_entries = inner.in_flight_entries.saturating_sub(1);
-    }
-
-    /// Returns true while the lane has lost something the pump has not yet applied.
-    #[must_use]
-    pub fn loss_pending(&self) -> bool {
-        !self.inner().pending_loss.is_empty()
     }
 
     /// Waits until something may have been pushed, or a binding's silence or retry may be over.
@@ -548,15 +561,6 @@ impl ObservationLane {
     /// Wakes the pump.
     pub fn nudge(&self) {
         self.wake.notify_one();
-    }
-
-    /// Takes what the lane has lost since this was last called.
-    pub fn take_loss(&self) -> Option<LaneLoss> {
-        let mut inner = self.inner();
-        if inner.pending_loss.is_empty() {
-            return None;
-        }
-        Some(std::mem::take(&mut inner.pending_loss))
     }
 
     /// Returns the lane's account of what it has lost, since it began.
@@ -702,9 +706,9 @@ impl ObservationLane {
     }
 
     /// Records that something was offered to the binding, which is one more thing its state holds
-    /// that has not been taken. `made_in_privacy` says whether privacy mode was on when the worker
-    /// had it.
-    pub fn offered(&self, binding: BrokerBindingId, now: Instant, made_in_privacy: bool) {
+    /// that has not been taken. Whether it was made in privacy mode is marked before the hand-over
+    /// ([`Self::expose`]), not here.
+    pub fn offered(&self, binding: BrokerBindingId, now: Instant) {
         let mut inner = self.inner();
         let Some(view) = inner.views.get_mut(&binding) else {
             return;
@@ -712,9 +716,6 @@ impl ObservationLane {
         let first = view.offered_since_checkpoint == 0;
         view.offered_since_checkpoint = view.offered_since_checkpoint.saturating_add(1);
         view.last_offer = Some(now);
-        if made_in_privacy || self.private.load(Ordering::Acquire) {
-            view.private_content = true;
-        }
         drop(inner);
         if first {
             self.checkpoint_wake.notify_one();
@@ -759,6 +760,18 @@ impl ObservationLane {
             .filter(|until| *until > now)
             .map(|until| until.saturating_duration_since(now))
             .min()
+    }
+
+    /// Marks that a component is about to be handed something made in privacy mode, or while it
+    /// stood, before the hand-over, so that an answer that does not come back cannot leave the
+    /// component holding it unmarked.
+    pub fn expose(&self, binding: BrokerBindingId, made_in_privacy: bool) {
+        if !(made_in_privacy || self.private.load(Ordering::Acquire)) {
+            return;
+        }
+        if let Some(view) = self.inner().views.get_mut(&binding) {
+            view.private_content = true;
+        }
     }
 
     // -- checkpoints --------------------------------------------------------------------------
