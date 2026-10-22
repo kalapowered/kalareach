@@ -411,6 +411,8 @@ fn the_descriptions_settings_are_reported_with_their_source_and_apply_at_once() 
     )
     .expect("the owner's choice");
     assert_eq!(applied.effect, ValueEffect::Immediately);
+    // An applied edit holds the writers' lock until it is dropped.
+    drop(applied);
     let report = reported(&environment);
     let enabled = row(&report, "descriptions.enabled");
     assert_eq!(enabled.value(), "false");
