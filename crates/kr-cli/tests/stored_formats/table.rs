@@ -1445,7 +1445,7 @@ pub fn named() -> Vec<Named> {
         leaf(
             StoreScope::Environment,
             "login-session",
-            "written only on Windows, which keeps no store of releases; a record that does not decode is an error that names it",
+            "an earlier release wrote it on Windows, which keeps no store of releases; nothing reads it",
         ),
         leaf(
             StoreScope::Environment,

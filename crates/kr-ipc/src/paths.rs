@@ -494,15 +494,6 @@ impl EnvironmentPaths {
         self.runtime_dir.join("claims")
     }
 
-    /// Returns the file that records which login session this environment's work runs in.
-    ///
-    /// In the state directory, because it has to outlive the daemon that wrote it: a replacement
-    /// daemon reads it before it takes over anything ([`crate::starter`]).
-    #[must_use]
-    pub fn session_record(&self) -> PathBuf {
-        self.state_dir.join("login-session")
-    }
-
     #[cfg(unix)]
     fn endpoint(&self, role: &str) -> Result<Endpoint> {
         Endpoint::from_path(self.runtime_dir.join(format!("{role}.sock")))
