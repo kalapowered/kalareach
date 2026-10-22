@@ -1965,8 +1965,8 @@ fn kr_req_12_08_a_device_steers_cancels_and_prompts_through_what_the_released_pa
     ctx.close(&host);
 }
 
-/// KR-GOAL-19: a prompt a device sends while the server dies under it is an outcome nobody can
-/// establish, and the caller is told so.
+/// A prompt a device sends while the server dies under it is an outcome nobody can establish, and
+/// the caller is told so.
 ///
 /// The prompt reached the upstream before the upstream went: the server noted its request, and then
 /// ended. The device is told `OUTCOME_UNKNOWN`, which is neither a refusal it could retry nor a
