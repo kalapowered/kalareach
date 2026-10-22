@@ -152,6 +152,50 @@ final class PairingTests: DeviceTestCase {
         return alert
     }
 
+    /// Waits until the review that was under way has ended, which is when the button that starts one
+    /// can be pressed again.
+    private func waitForTheReviewToEnd() {
+        eventually("the review to end") { app.buttons["Confirm with Face ID"].firstMatch.isEnabled }
+    }
+
+    /// Goes on from the alert to Face ID, which the script sends a face that does not match, and
+    /// cancels the system's sheet once it says the face was not recognised: Face ID was asked, did
+    /// not know the person, and confirmed nothing. The first use of Face ID by this application asks
+    /// the person once, in a prompt of the system that names the application: it is answered as the
+    /// person would be.
+    private func continueAndFailFaceID() {
+        try? FileManager.default.removeItem(atPath: path("faceid-wanted"))
+        try? FileManager.default.removeItem(atPath: path("faceid-done"))
+        touch("faceid-nomatch")
+        confirmAlert().buttons["Continue"].tap()
+        touch("faceid-wanted")
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let end = Date().addingTimeInterval(90)
+        var cancelled = false
+        while Date() < end, !cancelled {
+            if shows("Confirmed.") {
+                XCTFail("confirmed with a face that did not match")
+                break
+            }
+            let question = springboard.alerts.matching(NSPredicate(format: "label CONTAINS 'KalaReach'")).firstMatch
+            if question.exists, question.buttons["OK"].exists {
+                question.buttons["OK"].tap()
+                say("PROMPT answered OK")
+                continue
+            }
+            // The sheet offers "Try Face ID Again" once it has looked at a face and not known it.
+            if springboard.buttons["Try Face ID Again"].firstMatch.exists, springboard.buttons["Cancel"].firstMatch.exists {
+                screenshot("faceid-sheet")
+                springboard.buttons["Cancel"].firstMatch.tap()
+                cancelled = true
+            }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        XCTAssertTrue(cancelled, "the system's Face ID sheet never said the face was not recognised")
+        try? FileManager.default.removeItem(atPath: path("faceid-nomatch"))
+        touch("faceid-done")
+    }
+
     /// Goes on from the alert to Face ID, which the script then matches. The first use of Face ID
     /// by this application asks the person once, in a prompt of the system that names the
     /// application: it is answered as the person would, and nothing else of the system is touched.
@@ -250,9 +294,10 @@ final class PairingTests: DeviceTestCase {
     }
 
     /// The host asks its owner to confirm, and the phone is an owner device. The request is listed on
-    /// Attention; the alert the phone draws first is cancelled, which confirms nothing and leaves the
-    /// request listed and the invitation behind it refused; then the same request is confirmed with
-    /// Face ID and the host spends that confirmation on the invitation.
+    /// Attention; the alert the phone draws first is cancelled, and then Face ID is shown a face that
+    /// does not match and cancelled at the system's sheet. Neither confirms anything, and both leave
+    /// the request listed and the invitation behind it refused; then the same request is confirmed
+    /// with a face that matches and the host spends that confirmation on the invitation.
     func test4TheHostsRequestIsConfirmedWithFaceID() {
         openAttention()
         touch("go-confirm")
@@ -263,7 +308,13 @@ final class PairingTests: DeviceTestCase {
         screenshot("confirm-alert")
         alert.buttons["Cancel"].tap()
         waitToShow("Not confirmed. Nothing changed.")
+        waitForTheReviewToEnd()
         say("PAIRING the host's request is cancelled at the alert")
+        // Past the alert, Face ID itself must run: a face that does not match confirms nothing.
+        pressConfirm()
+        continueAndFailFaceID()
+        waitForTheReviewToEnd()
+        say("PAIRING Face ID was asked, and a face that did not match confirmed nothing")
         touch("confirm-cancelled")
         waitFor("challenge-open.txt")
         XCTAssertTrue(read("challenge-open.txt").hasPrefix("unanswered=1"), "the cancelled request was answered: \(read("challenge-open.txt"))")
@@ -289,5 +340,44 @@ final class PairingTests: DeviceTestCase {
         continueToFaceID()
         waitFor("device-result.txt", timeout: 90)
         say("PAIRING a new device is confirmed against its value")
+    }
+
+    /// An invitation on the pasteboard is held through the system's question about pasting it. iOS
+    /// asks the person once whether this application may read what another application copied, and
+    /// the application is not in front while the question is up: what it was holding must not be
+    /// let go of for that. The question is answered as the person would, and the invitation is then
+    /// still there to pair with.
+    func test6APastedInvitationIsHeldThroughTheSystemsPasteQuestion() {
+        openHosts()
+        touch("go-paste")
+        waitFor("secrets-paste.txt")
+        let text = read("secrets-paste.txt").components(separatedBy: "\n").first ?? ""
+        XCTAssertFalse(text.isEmpty, "the host wrote no invitation to paste")
+        UIPasteboard.general.string = text
+        press("Paste invitation")
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        var asked = false
+        let end = Date().addingTimeInterval(60)
+        while Date() < end, !shows("Invitation from a host") {
+            for owner in [springboard, app] {
+                let allow = owner.buttons["Allow Paste"].firstMatch
+                if allow.exists {
+                    allow.tap()
+                    asked = true
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        say("PROMPT paste question \(asked ? "answered" : "not asked")")
+        waitToShow("Invitation from a host", timeout: 30)
+        // Still held once the question is gone: it is pressed, and the attempt starts and ends. The
+        // phone is paired with this host already, so the attempt ends before the host is asked; what
+        // matters is that "Pair" was there to press.
+        press("Pair")
+        waitToShow("Pairing did not finish")
+        touch("paste-done")
+        waitFor("done-paste")
+        XCTAssertEqual(read("paste-result.txt"), "candidate_locked=0", "the host locked a candidate on a changed secret")
+        say("PAIRING a pasted invitation was held through the system's paste question")
     }
 }
